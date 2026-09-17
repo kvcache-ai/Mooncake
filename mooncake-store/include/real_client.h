@@ -15,12 +15,13 @@
 #include <unordered_set>
 #include <vector>
 
-#include "pyclient.h"
-#include "client_service.h"
+#include "common/client_buffer_allocation.h"
 #include "client_buffer.h"
+#include "client_service.h"
 #include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
-#include "utils.h"
+#include "common/network.h"
+#include "pyclient.h"
 #include "rpc_types.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -145,6 +146,17 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) override;
+
+    // Read only from the supplied snapshot. Never re-query a key or renew a
+    // lease: an expired snapshot fails with LEASE_EXPIRED.
+    std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache &query_result_cache);
 
     /**
      * @brief Batch query object placement/lease metadata for later read reuse
@@ -540,6 +552,18 @@ class RealClient : public PyClient {
             &cached_query_results,
         int32_t device_id, const UUID &client_id);
 
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_staged_shm_helper(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &dummy_buffer_sizes,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
+        int32_t device_id, const UUID &client_id);
+
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
     tl::expected<void, ErrorCode> map_shm_internal(int fd,
@@ -621,7 +645,8 @@ class RealClient : public PyClient {
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key,
-        const QueryResultCache *query_result_cache = nullptr);
+        const QueryResultCache *query_result_cache = nullptr,
+        bool allow_query_refresh = true);
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
@@ -641,7 +666,8 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const std::vector<size_t> *buffer_capacities = nullptr,
-        const QueryResultCache *query_result_cache = nullptr);
+        const QueryResultCache *query_result_cache = nullptr,
+        bool allow_query_refresh = true);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
@@ -966,6 +992,17 @@ class RealClient : public PyClient {
         void *shm_buffer = nullptr;
         size_t shm_size = 0;
         uintptr_t dummy_base_addr = 0;
+        // Whether this receiver-side mapping was registered with SPDK for NoF
+        // zero-copy (see RealClient::map_shm_internal_with_device). Must be
+        // unregistered before munmap on every teardown path.
+        bool spdk_registered = false;
+        // Set when the transfer engine's unregisterLocalMemory() failed during
+        // teardown: TE still holds this region (RdmaTransport does not
+        // deregister the MR when the metadata update fails, and
+        // TransferEngineImpl keeps its region record), so the mapping must not
+        // be munmapped until a later retry releases it (see
+        // RetryQuarantinedShmsLocked).
+        bool te_unregister_pending = false;
         bool is_ascend = false;
         bool is_ipc = false;
         // Ascend physical device id from dummy (dummy-real RPC).
@@ -1021,6 +1058,19 @@ class RealClient : public PyClient {
     bool map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
                                         uint64_t dummy_addr, size_t dst_offset,
                                         size_t size, void *&out_real) const;
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_shm_helper_impl(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &dummy_buffer_sizes,
+        const std::vector<size_t> *buffer_capacities,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
+        int32_t device_id, const UUID &client_id);
 
     tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
         const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
@@ -1090,6 +1140,18 @@ class RealClient : public PyClient {
     void ReleaseAllMountedSegmentRecords();
     void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
     void ReleaseAllAllocatedSegmentRecords();
+
+    // MappedShm whose spdk_mem_unregister() (spdk_registered) or transfer
+    // engine unregisterLocalMemory() (te_unregister_pending) failed during
+    // teardown. The mapping is deliberately retained (never munmapped) so
+    // neither SPDK nor the transfer engine keeps a registration to a
+    // freed/reused VA; retried on later teardown entry points. Guarded by
+    // dummy_client_mutex_.
+    std::vector<MappedShm> quarantine_shms_;
+
+    // Re-attempt TE + SPDK unregister and munmap of quarantine_shms_. Caller
+    // must hold dummy_client_mutex_. Failures stay quarantined.
+    void RetryQuarantinedShmsLocked();
 };
 
 }  // namespace mooncake

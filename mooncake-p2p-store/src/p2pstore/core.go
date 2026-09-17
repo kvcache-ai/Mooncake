@@ -20,6 +20,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // When the data size larger than MAX_CHUNK_SIZE bytes, we split them into multiple buffers and registered separately.
@@ -35,8 +36,25 @@ type P2PStore struct {
 	localServerName    string
 	catalog            *Catalog
 	memory             *RegisteredMemory
-	metadata           *Metadata
-	transfer           *TransferEngine
+	metadata           metadataStore
+	transfer           transferEngine
+}
+
+type metadataStore interface {
+	Close() error
+	Create(context.Context, string, *Payload) error
+	Put(context.Context, string, *Payload) error
+	Update(context.Context, string, *Payload, int64) (bool, error)
+	Get(context.Context, string) (*Payload, int64, error)
+	List(context.Context, string) ([]*Payload, error)
+}
+
+type transferEngine interface {
+	batchTransport
+	Close()
+	GetLocalIpAndPort() (string, error)
+	registerLocalMemory(uintptr, uint64, string) error
+	unregisterLocalMemory(uintptr) error
 }
 
 const DEFAULT_PORT int = 12345
@@ -314,15 +332,6 @@ func buffersFromLists(addrList []uintptr, sizeList []uint64) []Buffer {
 	return buffers
 }
 
-// unregisterBuffersTimes undoes `times` rounds of registration. Each successful
-// doGetReplica pass increments the refcount of every buffer once, so rollback
-// must unregister the same number of times to actually release them.
-func (store *P2PStore) unregisterBuffersTimes(bufferList []Buffer, maxShardSize uint64, times int) {
-	for i := 0; i < times; i++ {
-		store.unregisterBuffers(bufferList, maxShardSize)
-	}
-}
-
 func contains(slice []Location, value Location) bool {
 	for _, item := range slice {
 		if item == value {
@@ -351,6 +360,44 @@ func isSubsetOf(old *Payload, new *Payload) bool {
 	return true
 }
 
+func hasSameLayout(old *Payload, new *Payload) bool {
+	if old.Size != new.Size || old.MaxShardSize != new.MaxShardSize ||
+		len(old.SizeList) != len(new.SizeList) || len(old.Shards) != len(new.Shards) {
+		return false
+	}
+	for i := range old.SizeList {
+		if old.SizeList[i] != new.SizeList[i] {
+			return false
+		}
+	}
+	for i := range old.Shards {
+		if old.Shards[i].Length != new.Shards[i].Length {
+			return false
+		}
+	}
+	return true
+}
+
+// reconcilePayloadAfterTransfer decides whether a transfer must be retried
+// after its metadata snapshot changed. A retry is only needed when at least
+// one source used by the completed transfer disappeared.
+func reconcilePayloadAfterTransfer(payload *Payload, revision int64,
+	newPayload *Payload, newRevision int64) (*Payload, int64, bool, error) {
+	if newPayload == nil {
+		return nil, newRevision, false, ErrPayloadNotFound
+	}
+	if revision == newRevision {
+		return payload, revision, false, nil
+	}
+	if !hasSameLayout(payload, newPayload) {
+		return nil, newRevision, false, ErrInvalidArgument
+	}
+	// Carry the latest revision forward even when the completed transfer is
+	// still valid (for example, another replica was added). This avoids
+	// finalizing against a stale CAS revision and preserves concurrent updates.
+	return newPayload, newRevision, !isSubsetOf(payload, newPayload), nil
+}
+
 func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []uintptr, sizeList []uint64) error {
 	if len(addrList) != len(sizeList) || len(addrList) == 0 {
 		return ErrInvalidArgument
@@ -368,30 +415,35 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 		return ErrPayloadNotFound
 	}
 	replicaBuffers := buffersFromLists(addrList, sizeList)
-	successfulRounds := 0
 	for {
+		registrationMaxShardSize := payload.MaxShardSize
 		err = store.doGetReplica(ctx, payload, addrList, sizeList)
 		if err != nil {
-			// doGetReplica rolled back its own round; undo earlier rounds.
-			store.unregisterBuffersTimes(replicaBuffers, payload.MaxShardSize, successfulRounds)
+			// doGetReplica rolls back the current round on failure.
 			return err
 		}
-		successfulRounds++
-		newPayload, recheckRevision, err := store.metadata.Get(ctx, name)
+		newPayload, newRevision, err := store.metadata.Get(ctx, name)
 		if err != nil {
-			store.unregisterBuffersTimes(replicaBuffers, payload.MaxShardSize, successfulRounds)
+			store.unregisterBuffers(replicaBuffers, registrationMaxShardSize)
 			return err
 		}
-		if revision == recheckRevision {
+		var retry bool
+		payload, revision, retry, err = reconcilePayloadAfterTransfer(
+			payload, revision, newPayload, newRevision)
+		if err != nil {
+			store.unregisterBuffers(replicaBuffers, registrationMaxShardSize)
+			return err
+		}
+		if !retry {
 			break
 		}
-		if isSubsetOf(payload, newPayload) {
-			break
-		}
+		// The completed transfer used a source that disappeared. Drop this
+		// round's registration before retrying against the latest snapshot.
+		store.unregisterBuffers(replicaBuffers, registrationMaxShardSize)
 	}
 	err = store.updatePayloadMetadata(ctx, name, addrList, sizeList, payload, revision)
 	if err != nil {
-		store.unregisterBuffersTimes(replicaBuffers, payload.MaxShardSize, successfulRounds)
+		store.unregisterBuffers(replicaBuffers, payload.MaxShardSize)
 		return err
 	}
 	return nil
@@ -475,34 +527,64 @@ func performTransferOnce(ctx context.Context, transport batchTransport, source u
 		return STATUS_FAILED, err
 	}
 
-	for isTransferInFlight(status) {
-		select {
-		case <-ctx.Done():
-			if _, drainErr := drainTransfer(transport, batchID); drainErr != nil {
-				return STATUS_FAILED, drainErr
-			}
-			return STATUS_FAILED, ctx.Err()
-		default:
-			status, _, err = transport.getTransferStatus(batchID, 0)
-			if err != nil {
-				return STATUS_FAILED, err
-			}
-		}
+	status, err = waitTransfer(ctx, transport, batchID)
+	if err != nil {
+		return STATUS_FAILED, err
 	}
-
 	return status, nil
 }
 
-// drainTransfer polls the batch until its task reaches a terminal state so
-// the batch can be freed.
-func drainTransfer(transport batchTransport, batchID BatchID) (int, error) {
+// Polling schedule for waitTransfer. The first pollSpinBudget polls run
+// back-to-back so short transfers still complete with no added latency;
+// after that the poller backs off exponentially from pollMinInterval to
+// pollMaxInterval. The cap stays small because some transports (for example
+// the NVLink async transport) only advance completion state when polled.
+const (
+	pollSpinBudget  = 128
+	pollMinInterval = 100 * time.Microsecond
+	pollMaxInterval = time.Millisecond
+)
+
+// sleepFn is the sleep used between polls. Tests replace it to observe the
+// backoff schedule without depending on wall-clock timing.
+var sleepFn = time.Sleep
+
+// waitTransfer polls task 0 of batchID until it reaches a terminal state.
+// The task is always driven to a terminal state, even if ctx is cancelled
+// (the engine refuses to free a batch with in-flight tasks). Cancellation
+// is then authoritative: if ctx is done by the time the task is terminal,
+// ctx.Err() is returned regardless of the observed status.
+//
+// doGetReplica starts one goroutine per shard, so for a checkpoint-sized
+// payload hundreds of pollers may be active at once. Spinning them all at
+// full speed for a transfer that takes seconds buys nothing in completion
+// latency and saturates cores; the spin budget plus backoff keeps the
+// fast path for small transfers while bounding CPU on large ones.
+func waitTransfer(ctx context.Context, transport batchTransport, batchID BatchID) (int, error) {
 	status := STATUS_WAITING
-	for isTransferInFlight(status) {
+	interval := pollMinInterval
+	for polls := 0; ; polls++ {
 		var err error
 		status, _, err = transport.getTransferStatus(batchID, 0)
 		if err != nil {
 			return STATUS_FAILED, err
 		}
+		if !isTransferInFlight(status) {
+			break
+		}
+		if polls < pollSpinBudget {
+			continue
+		}
+		sleepFn(interval)
+		if interval < pollMaxInterval {
+			interval *= 2
+			if interval > pollMaxInterval {
+				interval = pollMaxInterval
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return STATUS_FAILED, err
 	}
 	return status, nil
 }

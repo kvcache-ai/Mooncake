@@ -3,20 +3,25 @@ add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
     types.cpp
-    utils.cpp
-    mmap_arena.cpp
+    common/network.cpp
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
     config/distributed_storage_config.cpp
+    config/rpc_protocol_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
-    utils/file_util.cpp)
+    common/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    config/ha_cluster_namespace_config.cpp
     config/local_file_snapshot_config.cpp
+    config/redis_connection_config.cpp
+    config/s3_client_config.cpp
+    segment_allocator_registration.cpp
+    client_offboarding.cpp
     master_service.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
@@ -24,6 +29,14 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/region_driver.cpp
     placement/index.cpp
     placement/replica_allocator.cpp
+    segment/catalog.cpp
+    segment/pool.cpp
+    segment/pool_mount.cpp
+    segment/snapshot.cpp
+    ha/snapshot/allocator_snapshot_codec.cpp
+    ha/snapshot/store_resource_snapshot_codec.cpp
+    segment/pool_write_access.cpp
+    segment/pool_read_access.cpp
     segment.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
@@ -49,6 +62,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/batch_oplog/writer.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.cpp
+    ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.cpp
+    ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.cpp
     ha/snapshot/snapshot_maintenance_lease.cpp
     ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/local_ssd_codec.cpp
@@ -72,20 +87,28 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
-    client_buffer_allocation.cpp
+    common/client_buffer_allocation.cpp
+    mmap_arena.cpp
+    config/hugepage_config.cpp
+    config/mmap_arena_config.cpp
+    common/mmap_buffer.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
-    nvme_kv_backend.cpp
-    nvme_kv_connector.cpp
-    nvme_kv_executor_io_uring.cpp
-    nvme_kv_executor_ioctl.cpp
-    nvme_kv_executor_util.cpp
-    nvme_kv_key_codec.cpp
-    nvme_kv_key_conflict_policy.cpp
-    nvme_kv_object_layout.cpp
+    nvme_kv/backend.cpp
+    nvme_kv/connector.cpp
+    nvme_kv/config/connector_config.cpp
+    nvme_kv/config/io_concurrency_config.cpp
+    nvme_kv/config/u32_parser.cpp
+    nvme_kv/executor_io_uring.cpp
+    nvme_kv/executor_ioctl.cpp
+    nvme_kv/executor_util.cpp
+    nvme_kv/key_codec.cpp
+    nvme_kv/key_conflict_policy.cpp
+    nvme_kv/object_layout.cpp
     transfer_task.cpp
+    config/fileread_worker_pool_config.cpp
     posix_file.cpp
     client_buffer.cpp
     aligned_client_buffer.cpp
@@ -95,14 +118,21 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    config/client_host_identity_config.cpp
     config/client_metric_config.cpp
     config/file_storage_config.cpp
+    config/bucket_backend_config.cpp
     config/file_per_key_config.cpp
     config/client_auto_port_config.cpp
+    config/client_auto_discovery_config.cpp
+    config/cxl_segment_config.cpp
+    config/client_numa_config.cpp
     config/local_hot_cache_config.cpp
+    config/nof_register_config.cpp
     config/offset_allocator_backend_config.cpp
     config/replica_selection_config.cpp
     config/rpc_timeout_config.cpp
+    config/spdk_controller_config.cpp
     config/transfer_submitter_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
@@ -119,7 +149,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     engram/engram_store.cpp)
 
 if(BUILD_UNIT_TESTS)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -162,13 +192,33 @@ int main(int argc, char**) {
   endif()
 endif()
 
+# Alibaba Cloud OSS adapter (REST API with OSS V4 signing).
+find_package(CURL QUIET)
+find_package(OpenSSL QUIET)
+if(CURL_FOUND AND OpenSSL_FOUND)
+  message(STATUS "Alibaba Cloud OSS adapter: Enabled")
+  set(MOONCAKE_OSS_ADAPTER_ENABLED
+      TRUE
+      CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES config/oss_adapter_config.cpp
+       storage/distributed/oss_adapter.cpp)
+  list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
+  add_definitions(-DHAVE_OSS_ADAPTER)
+else()
+  message(
+    STATUS "Alibaba Cloud OSS adapter: Disabled (requires CURL and OpenSSL)")
+  set(MOONCAKE_OSS_ADAPTER_ENABLED
+      FALSE
+      CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
+endif()
+
 # Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)
 if(AWSSDK_FOUND)
   message(STATUS "AWS SDK found: ${AWSSDK_VERSION}")
   set(HAVE_AWS_SDK TRUE)
   # Add S3 related source files
-  list(APPEND MOONCAKE_STORE_MASTER_SOURCES utils/s3_helper.cpp)
+  list(APPEND MOONCAKE_STORE_MASTER_SOURCES common/s3_helper.cpp)
 else()
   message(STATUS "AWS SDK not found, S3 functionality will be disabled")
   set(HAVE_AWS_SDK FALSE)
@@ -258,6 +308,10 @@ if(USE_NOF)
   add_subdirectory(spdk)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES ${SPDK_WRAPPER_SOURCES})
 
+  # The master's NoF heartbeat probe also goes through SpdkWrapper.
+  list(APPEND MOONCAKE_STORE_MASTER_SOURCES ${SPDK_WRAPPER_SOURCES}
+       config/spdk_controller_config.cpp)
+
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
       CACHE PATH "SPDK include directory")
@@ -270,6 +324,16 @@ if(USE_NOF)
   set(DPDK_LIB_DIR
       "/usr/local/lib"
       CACHE PATH "DPDK static library directory")
+
+  set(SPDK_ISA_L_LIB_DIR
+      "${CMAKE_SOURCE_DIR}/extern/spdk/isa-l/.libs"
+      CACHE PATH "isa-l static library directory")
+  if(NOT EXISTS "${SPDK_ISA_L_LIB_DIR}/libisal.a")
+    message(
+      FATAL_ERROR
+        "isa-l not found at ${SPDK_ISA_L_LIB_DIR}/libisal.a. Run "
+        "`sudo bash dependencies.sh --with-spdk`, or set -DSPDK_ISA_L_LIB_DIR.")
+  endif()
 
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
@@ -323,6 +387,7 @@ if(USE_NOF)
       crypto
       aio
       z
+      -L${SPDK_ISA_L_LIB_DIR}
       isal
       elf
       ibverbs
@@ -431,8 +496,9 @@ add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
 set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(mooncake_store_client_objects
-                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+target_include_directories(
+  mooncake_store_client_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
+                                        ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(
   mooncake_store_client_objects
   PRIVATE mooncake_store_shared_objects
@@ -489,9 +555,14 @@ add_library(
                                $<TARGET_OBJECTS:mooncake_store_master_objects>)
 target_include_directories(mooncake_store_master
                            PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
+if(USE_NOF)
+  target_include_directories(mooncake_store_master_objects
+                             PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+endif()
 target_link_libraries(
   mooncake_store_master
-  PRIVATE mooncake_local_ssd
+  PRIVATE ${SPDK_STATIC_LIBS}
+          mooncake_local_ssd
           cachelib_memory_allocator
           ${ETCD_WRAPPER_LIB}
           glog::glog

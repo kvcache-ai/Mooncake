@@ -91,6 +91,9 @@ struct XferBenchConfig {
     static int rpc_server_port;
     static std::string xport_type;
     static std::string backend;
+    static bool use_hugepage;
+    static size_t hugepage_size;
+    static std::string hugetlbfs_path;
     static bool notifi;
     static std::string tent_transport_hint;
     static std::string tent_intent_type;

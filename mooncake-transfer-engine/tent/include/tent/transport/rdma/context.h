@@ -43,6 +43,18 @@ class RdmaEndPoint;
 class EndpointStore;
 class RdmaTransport;
 
+struct RdmaAddressSnapshot {
+    uint16_t lid = 0;
+    std::string gid;
+    int gid_index = -1;
+};
+
+enum class RdmaAddressRefreshResult {
+    UNCHANGED = 0,
+    CHANGED = 1,
+    FAILED = 2,
+};
+
 class RdmaContext {
     friend class RdmaCQ;
     friend class RdmaEndPoint;
@@ -101,11 +113,22 @@ class RdmaContext {
     const std::string name() const { return device_name_; }
 
    public:
-    uint16_t lid() const { return lid_; }
+    // Take lid/gid/index under one lock so a bootstrap never mixes values from
+    // two address generations while the monitor thread refreshes the port.
+    RdmaAddressSnapshot address() const;
 
-    std::string gid() const;
+    uint16_t lid() const { return address().lid; }
 
-    int gidIndex() const { return gid_index_; }
+    std::string gid() const { return address().gid; }
+
+    int gidIndex() const { return address().gid_index; }
+
+    // Re-query the port's LID and GID. Auto-GID mode repeats the initial
+    // selection; an explicit gid_index keeps that index and refreshes its
+    // value. The new address is published before it becomes visible locally.
+    RdmaAddressRefreshResult refreshAddress(
+        RdmaAddressSnapshot *previous = nullptr,
+        RdmaAddressSnapshot *current = nullptr);
 
     ibv_context *nativeContext() const { return native_context_; }
 
@@ -193,6 +216,11 @@ class RdmaContext {
     size_t num_comp_channel_ = 0;
     std::vector<ibv_comp_channel *> comp_channel_;
 
+    // The monitor thread may refresh these while bootstrap handlers read
+    // them. address_mutex_ keeps each lid/gid/index snapshot self-consistent;
+    // address_refresh_mutex_ serializes hardware reprobes and publication.
+    mutable std::mutex address_mutex_;
+    std::mutex address_refresh_mutex_;
     uint16_t lid_ = 0;
     // Set by openDevice() and refreshed by refreshPortAttributes() on the
     // monitor thread. Today every runtime reader is that same thread;

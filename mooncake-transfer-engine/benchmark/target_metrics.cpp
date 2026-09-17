@@ -133,6 +133,8 @@ bool appendTargetMetricsJsonl(const std::string& path,
         return false;
     }
     output << root.dump() << '\n';
+    // Closing flushes buffered output and can reveal delayed write errors.
+    output.close();
     if (!output) {
         *error = "failed to write target JSONL output: " + path;
         return false;

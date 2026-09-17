@@ -368,6 +368,9 @@ gpu_id + thread_id
   is explicitly enabled or disabled by tebench — the engine reads the
   transport enable list from the `MC_TENT_CONF` config file (see Section
   5.8 for multi-transport scenarios).
+  Classic `--backend=classic --xport_type=shm` also uses this flag: DRAM
+  buffers come from POSIX shm and are `mbind`'d onto the same NUMA node as
+  `numa_alloc_onnode` before registering `cpu:<node>`.
 * `--tent_intent_type` : attach a standard transfer intent to every request,
   such as `foreground_get`, `background_prefetch`, or `checkpoint`. This is
   useful for validating intent-specific transport and QoS policy selection.
