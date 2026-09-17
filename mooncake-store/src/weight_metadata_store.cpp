@@ -889,8 +889,7 @@ WeightMetadataStore::Publish(const WeightOperationMutation& mutation) {
         return tl::make_unexpected(WeightManagementError::CONFLICT);
     }
     if (!mutation.previous.has_value() &&
-        mutation.next->operation_id ==
-            std::numeric_limits<uint64_t>::max()) {
+        mutation.next->operation_id == std::numeric_limits<uint64_t>::max()) {
         return tl::make_unexpected(WeightManagementError::GENERATION_EXHAUSTED);
     }
     revisions_[mutation.metadata.identity] = *mutation.metadata.next;
@@ -928,6 +927,11 @@ WeightMetadataStore::PrepareDelete(const DeleteWeightRevisionRequest& request,
         return tl::make_unexpected(WeightManagementError::NOT_FOUND);
     }
     if (revision->second.availability == WeightAvailabilityState::DELETED) {
+        if (!MatchesIdempotentRetryGeneration(
+                revision->second.metadata_generation,
+                request.expected_metadata_generation)) {
+            return tl::make_unexpected(WeightManagementError::STALE_GENERATION);
+        }
         return WeightMetadataMutation{
             .identity = request.identity,
             .previous = revision->second,

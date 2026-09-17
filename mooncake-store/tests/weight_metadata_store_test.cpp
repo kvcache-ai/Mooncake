@@ -80,22 +80,19 @@ TEST(WeightMetadataStoreTest, BeginIsIdempotent) {
     auto retried = metadata_store.Publish(*retry);
     ASSERT_TRUE(retried.has_value());
     EXPECT_EQ(first, *retried);
-
 }
 
 TEST(WeightMetadataStoreTest, RejectsNonCanonicalWeightObjectNames) {
     WeightMetadataStore metadata_store;
     auto noncanonical_begin = BeginRequest();
     noncanonical_begin.payload_group_id = "valid-but-non-canonical-group";
-    auto rejected =
-        metadata_store.PrepareBeginImport(noncanonical_begin, 100);
+    auto rejected = metadata_store.PrepareBeginImport(noncanonical_begin, 100);
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT, rejected.error());
 
     auto importing = PublishBegin(metadata_store, BeginRequest());
     auto noncanonical_manifest = Manifest();
-    noncanonical_manifest.manifest_key =
-        "valid-but-non-canonical-manifest";
+    noncanonical_manifest.manifest_key = "valid-but-non-canonical-manifest";
     rejected = metadata_store.PrepareCommitImport(
         CommitWeightImportRequest{
             .identity = importing.identity,
@@ -185,7 +182,7 @@ TEST(WeightMetadataStoreTest, AbortRetryRequiresAdjacentGeneration) {
 TEST(WeightMetadataStoreTest, LookupAndPaginationAreExactAndDeterministic) {
     WeightMetadataStore metadata_store;
     for (const auto& [revision, generation] :
-        std::vector<std::pair<std::string, uint64_t>>{
+         std::vector<std::pair<std::string, uint64_t>>{
              {"step-20", 2}, {"step-10", 3}, {"step-10", 1}}) {
         auto request = BeginRequest(Identity(revision, generation));
         PublishBegin(metadata_store, request);
@@ -256,8 +253,7 @@ TEST(WeightMetadataStoreTest, LeaseReplayAdvancesAllocatorWatermark) {
     auto replayed = source.PrepareAcquireLease(
         AcquireWeightRevisionLeaseRequest{
             .identity = source_ready.identity,
-            .expected_metadata_generation =
-                source_ready.metadata_generation,
+            .expected_metadata_generation = source_ready.metadata_generation,
             .holder = "worker-1",
             .ttl_ms = 100,
         },
@@ -273,8 +269,7 @@ TEST(WeightMetadataStoreTest, LeaseReplayAdvancesAllocatorWatermark) {
     auto next = replay_target.PrepareAcquireLease(
         AcquireWeightRevisionLeaseRequest{
             .identity = target_ready.identity,
-            .expected_metadata_generation =
-                target_ready.metadata_generation,
+            .expected_metadata_generation = target_ready.metadata_generation,
             .holder = "worker-2",
             .ttl_ms = 100,
         },
@@ -303,8 +298,7 @@ TEST(WeightMetadataStoreTest, LeaseReplayRejectsExhaustedAllocatorId) {
 
     auto published = replay_target.Publish(*replayed);
     ASSERT_FALSE(published.has_value());
-    EXPECT_EQ(WeightManagementError::GENERATION_EXHAUSTED,
-              published.error());
+    EXPECT_EQ(WeightManagementError::GENERATION_EXHAUSTED, published.error());
 }
 
 TEST(WeightMetadataStoreTest, ExcludesConcurrentResidencyOperations) {
@@ -558,8 +552,7 @@ TEST(WeightMetadataStoreTest, OperationReplayAdvancesAllocatorWatermark) {
     auto replayed = source.PrepareStartOperation(
         StartWeightResidencyOperationRequest{
             .identity = source_ready.identity,
-            .expected_metadata_generation =
-                source_ready.metadata_generation,
+            .expected_metadata_generation = source_ready.metadata_generation,
             .target_residency = WeightResidencyState::COLD,
         },
         300);
@@ -567,8 +560,7 @@ TEST(WeightMetadataStoreTest, OperationReplayAdvancesAllocatorWatermark) {
     ASSERT_TRUE(replay_target.Publish(*replayed).has_value());
 
     const auto snapshot = replay_target.ExportSnapshot();
-    EXPECT_EQ(replayed->next->operation_id + 1,
-              snapshot.next_operation_id);
+    EXPECT_EQ(replayed->next->operation_id + 1, snapshot.next_operation_id);
     WeightMetadataStore restored;
     EXPECT_TRUE(restored.RestoreSnapshot(snapshot).has_value());
 
@@ -610,8 +602,7 @@ TEST(WeightMetadataStoreTest, OperationReplayRejectsExhaustedAllocatorId) {
 
     auto published = replay_target.Publish(*replayed);
     ASSERT_FALSE(published.has_value());
-    EXPECT_EQ(WeightManagementError::GENERATION_EXHAUSTED,
-              published.error());
+    EXPECT_EQ(WeightManagementError::GENERATION_EXHAUSTED, published.error());
 }
 
 TEST(WeightMetadataStoreTest, RestoresMultipleCompletedOperations) {
@@ -701,6 +692,52 @@ TEST(WeightMetadataStoreTest, DeleteRetainsAbsentTombstone) {
     EXPECT_EQ(WeightResidencyState::ABSENT, deleted->residency);
     EXPECT_TRUE(
         metadata_store.IsManagedGroup(deleted->manifest.payload_group_id));
+}
+
+TEST(WeightMetadataStoreTest, DeletedTombstoneRetryRequiresGenerationFence) {
+    WeightMetadataStore metadata_store;
+    auto ready = PublishReady(metadata_store);
+    auto start = metadata_store.PrepareDelete(
+        DeleteWeightRevisionRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = ready.metadata_generation,
+        },
+        300);
+    ASSERT_TRUE(start.has_value());
+    auto deleting = metadata_store.Publish(*start);
+    ASSERT_TRUE(deleting.has_value());
+    auto finish = metadata_store.PrepareFinishDelete(
+        ready.identity, deleting->metadata_generation, 400);
+    ASSERT_TRUE(finish.has_value());
+    auto deleted = metadata_store.Publish(*finish);
+    ASSERT_TRUE(deleted.has_value());
+
+    auto current = metadata_store.PrepareDelete(
+        DeleteWeightRevisionRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = deleted->metadata_generation,
+        },
+        500);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_TRUE(current->no_op);
+
+    auto adjacent = metadata_store.PrepareDelete(
+        DeleteWeightRevisionRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = deleted->metadata_generation - 1,
+        },
+        500);
+    ASSERT_TRUE(adjacent.has_value());
+    EXPECT_TRUE(adjacent->no_op);
+
+    auto stale = metadata_store.PrepareDelete(
+        DeleteWeightRevisionRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = deleted->metadata_generation - 2,
+        },
+        500);
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(WeightManagementError::STALE_GENERATION, stale.error());
 }
 
 TEST(WeightMetadataStoreTest, OnlyOneConcurrentCasCandidatePublishes) {

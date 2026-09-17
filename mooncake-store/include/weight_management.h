@@ -416,8 +416,7 @@ inline WeightValidationResult ValidateWeightRevisionMetadata(
     if (!metadata.manifest.manifest_key.empty() &&
         metadata.manifest.manifest_key !=
             MakeWeightManifestKey(metadata.identity)) {
-        return WeightValidationResult::Failure(
-            "manifest_key is not canonical");
+        return WeightValidationResult::Failure("manifest_key is not canonical");
     }
     if (metadata.metadata_generation == 0 ||
         metadata.metadata_generation == std::numeric_limits<uint64_t>::max()) {
