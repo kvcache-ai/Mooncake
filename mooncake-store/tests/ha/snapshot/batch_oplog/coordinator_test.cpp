@@ -350,13 +350,25 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
     using Operation = HAMetricManager::SnapshotOperation;
     const auto before = metrics.get_snapshot_operation(Operation::Publish);
     const auto lost = metrics.get_snapshot_runtime().lease_lost_total;
+    objects.on_upload = [] {
+        throw std::runtime_error("upload failed with held lease");
+    };
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, coordinator.RunOnce());
+    EXPECT_EQ(lost, metrics.get_snapshot_runtime().lease_lost_total);
+    objects.on_upload = [&] {
+        active_lease->Release();
+        throw std::runtime_error("upload failed after lease loss");
+    };
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, coordinator.RunOnce());
+    EXPECT_EQ(lost + 1, metrics.get_snapshot_runtime().lease_lost_total);
+
     objects.on_upload = [&] {
         backend->pause_replay = true;
         add_batch(2);
         active_lease->Release();
     };
     EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, coordinator.RunOnce());
-    EXPECT_EQ(lost + 1, metrics.get_snapshot_runtime().lease_lost_total);
+    EXPECT_EQ(lost + 2, metrics.get_snapshot_runtime().lease_lost_total);
     EXPECT_EQ(before.errors + 1,
               metrics.get_snapshot_operation(Operation::Publish).errors);
     EXPECT_EQ(2u, metrics.get_snapshot_runtime().catch_up_target_batch);

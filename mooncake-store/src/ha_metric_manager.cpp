@@ -2,6 +2,8 @@
 
 #include <glog/logging.h>
 
+#include "standby_state_machine.h"
+
 #include <iomanip>
 #include <sstream>
 
@@ -507,6 +509,13 @@ std::string HAMetricManager::serialize_metrics() {
                << name << " " << value << "\n";
         };
         gauge("enabled", snapshot.enabled ? 1 : 0);
+        const auto state = static_cast<StandbyState>(get_standby_state());
+        const bool active = state == StandbyState::CONNECTING ||
+                            state == StandbyState::SYNCING ||
+                            state == StandbyState::WATCHING ||
+                            state == StandbyState::RECOVERING ||
+                            state == StandbyState::RECONNECTING;
+        gauge("active", snapshot.enabled && active ? 1 : 0);
         const auto now_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch())

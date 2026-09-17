@@ -369,13 +369,22 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         return result;
     }
 
-    auto release_lease = [&] {
-        if (!lease->IsHeld()) {
-            HAMetricManager::instance().update_snapshot_runtime(
-                [](auto& metrics) { ++metrics.lease_lost_total; });
-        }
-        (void)lease->Release();
-    };
+    // Observe and release on every exit, before making the attempt idle.
+    const auto observe_lease_loss =
+        [](SnapshotMaintenanceLease* held) noexcept {
+            try {
+                if (!held->IsHeld()) {
+                    HAMetricManager::instance().update_snapshot_runtime(
+                        [](auto& metrics) { ++metrics.lease_lost_total; });
+                }
+            } catch (...) {
+                LOG(WARNING)
+                    << "Failed to observe snapshot maintenance lease state";
+            }
+            (void)held->Release();
+        };
+    std::unique_ptr<SnapshotMaintenanceLease, decltype(observe_lease_loss)>
+        lease_observer(lease.get(), observe_lease_loss);
     bool cancel_before_capture = false;
     bool promotion_before_capture = false;
     {
@@ -386,7 +395,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     if (cancel_before_capture) {
         HAMetricManager::instance().record_snapshot_skip(
             promotion_before_capture ? Skip::Promotion : Skip::Stopped);
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
@@ -400,7 +409,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
             HAMetricManager::instance().record_snapshot_skip(Skip::NoNewBatch);
         const ErrorCode result =
             read_error == ErrorCode::OK ? ErrorCode::OK : read_error;
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(result, true);
         return result;
     }
@@ -416,7 +425,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     if (!capture || capture->last_included_batch_id <= *reread_latest) {
         HAMetricManager::instance().record_snapshot_skip(
             capture ? Skip::NoNewBatch : Skip::CaptureUnavailable);
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
@@ -430,7 +439,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         HAMetricManager::instance().record_snapshot_skip(Skip::Promotion);
         standby_.CancelBatchOpLogSnapshotCapture();
         standby_.EndBatchOpLogSnapshotCapture(*capture);
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
@@ -457,7 +466,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         capture_active_ = false;
     }
     if (!descriptor) {
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(ErrorCode::INTERNAL_ERROR, true);
         return ErrorCode::INTERNAL_ERROR;
     }
@@ -474,7 +483,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
             LOG(WARNING) << "Failed to clean snapshot candidate after stop: "
                          << cleanup.error();
         }
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
@@ -541,7 +550,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
             LOG(WARNING) << "Batch OpLog pruning threw unknown exception";
         }
     }
-    release_lease();
+    lease_observer.reset();
     FinishAttempt(publish_error, true);
     return publish_error;
 }

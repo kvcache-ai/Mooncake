@@ -1,4 +1,5 @@
 #include "ha_metric_manager.h"
+#include "standby_state_machine.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -49,6 +50,33 @@ class HAMetricManagerTest : public ::testing::Test {
 
     HAMetricManager& M() { return HAMetricManager::instance(); }
 };
+
+TEST_F(HAMetricManagerTest,
+       SnapshotActivityFollowsStandbyLifecycleWithoutDroppingCounters) {
+    M().reset_snapshot_runtime(true);
+    using Operation = HAMetricManager::SnapshotOperation;
+    for (const auto state :
+         {StandbyState::CONNECTING, StandbyState::WATCHING,
+          StandbyState::PROMOTING, StandbyState::PROMOTED, StandbyState::FAILED,
+          StandbyState::STOPPED, StandbyState::CONNECTING}) {
+        M().set_standby_state(static_cast<int64_t>(state));
+        const bool active = state == StandbyState::CONNECTING ||
+                            state == StandbyState::WATCHING;
+        EXPECT_EQ(active ? 1 : 0,
+                  FindSerializedMetricValue(M().serialize_metrics(),
+                                            "ha_snapshot_active"));
+        const auto before =
+            M().get_snapshot_operation(Operation::Publish).total;
+        M().record_snapshot_operation(Operation::Publish, 0,
+                                      std::chrono::steady_clock::now());
+        EXPECT_EQ(before + 1,
+                  M().get_snapshot_operation(Operation::Publish).total);
+    }
+    M().reset_snapshot_runtime(false);
+    EXPECT_EQ(0, FindSerializedMetricValue(M().serialize_metrics(),
+                                           "ha_snapshot_active"));
+    M().set_standby_state(static_cast<int64_t>(StandbyState::STOPPED));
+}
 
 TEST_F(HAMetricManagerTest, SnapshotMetricsResetGaugesAndKeepCounters) {
     using Operation = HAMetricManager::SnapshotOperation;

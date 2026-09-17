@@ -149,12 +149,8 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
             return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
         }
         auto poll = reader.PollOnce();
-        const auto cursor = reader.GetLastAppliedDurablePrefix();
         HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
-            metrics.suffix_batches =
-                cursor && cursor->batch_id >= start.batch_id
-                    ? cursor->batch_id - start.batch_id
-                    : 0;
+            metrics.suffix_batches += poll.applied_batches;
             if (poll.durable_prefix_present)
                 metrics.durable_batch = std::max(metrics.durable_batch,
                                                  poll.durable_prefix.batch_id);
@@ -407,6 +403,10 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
     }
     if (floor_error == ErrorCode::OK) {
         minimum_snapshot_batch = std::max(minimum_snapshot_batch, floor);
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            metrics.compaction_floor =
+                std::max(metrics.compaction_floor, floor);
+        });
     }
 
     for (const std::string& pointer_key :

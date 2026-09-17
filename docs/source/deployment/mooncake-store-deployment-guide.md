@@ -202,7 +202,8 @@ All names in the table have the `ha_snapshot_` prefix:
 
 | Metric suffix | Meaning |
 | --- | --- |
-| `enabled` | Whether the current standby uses batch snapshots; legacy mode is 0. |
+| `enabled` | Whether the runtime is configured for batch snapshots; legacy mode is 0. |
+| `active` | `enabled` and standby state is connecting, syncing, watching, recovering, or reconnecting. Filter snapshot freshness/capacity alerts on this gauge; it is 0 during promotion, after stop, and after fatal failure. Historical observations and in-flight operation counters remain available. |
 | `latest_present`, `fallback_present`, `count` | Decodable pointers observed locally (0–2); not proof that all referenced artifacts remain intact. |
 | `latest_age_seconds`, `fallback_age_seconds` | Time since the observed descriptor's creation, computed at scrape time. Missing pointers and future timestamps report 0; check `*_present` to distinguish absence. |
 | `bytes`, `chunk_bytes`, `chunk_count` | Size/count of the last fully verified upload or successful snapshot restore. Total bytes include segments, chunks, manifest, and descriptor; they do not measure the whole bucket or imply publication success. |
