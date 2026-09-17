@@ -561,23 +561,24 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
     }
     XferBenchTimer timer;
     CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
-    while (true) {
-        uint64_t success_count = 0;
-        for (uint64_t i = 0; i < batch_size; ++i) {
-            mooncake::TransferStatus overall_status;
-            CHECK_FAIL(engine_->getTransferStatus(batch_id, i, overall_status));
-            if (overall_status.s == TransferStatusEnum::COMPLETED) {
-                success_count++;
-            } else if (overall_status.s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "Failed transfer detected";
-                exit(EXIT_FAILURE);
-            }
+    while (g_te_running) {
+        mooncake::TransferStatus overall_status;
+        CHECK_FAIL(engine_->getBatchTransferStatus(batch_id, overall_status));
+        if (overall_status.s == TransferStatusEnum::COMPLETED) {
+            auto duration = timer.lap_us();
+            CHECK_FAIL(engine_->freeBatchID(batch_id));
+            return duration;
         }
-        if (success_count == batch_size) break;
+        if (overall_status.s == TransferStatusEnum::FAILED ||
+            overall_status.s == TransferStatusEnum::TIMEOUT ||
+            overall_status.s == TransferStatusEnum::CANCELED ||
+            overall_status.s == TransferStatusEnum::INVALID) {
+            LOG(ERROR) << "Failed transfer detected";
+            exit(EXIT_FAILURE);
+        }
     }
-    auto duration = timer.lap_us();
-    CHECK_FAIL(engine_->freeBatchID(batch_id));
-    return duration;
+    (void)engine_->freeBatchID(batch_id);
+    return -1.0;
 }
 
 }  // namespace tent
