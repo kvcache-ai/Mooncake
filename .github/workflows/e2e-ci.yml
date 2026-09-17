@@ -32,7 +32,7 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'run-e2e-ci'
-    uses: ./.github/workflows/ci-ascend.yml
+    uses: ./.github/workflows/ci_ascend.yml
     with:
       checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
     secrets: inherit
@@ -41,7 +41,7 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'run-e2e-ci'
-    uses: ./.github/workflows/ci-rocm.yml
+    uses: ./.github/workflows/ci_rocm.yml
     with:
       checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
 
@@ -49,7 +49,7 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'run-e2e-ci'
-    uses: ./.github/workflows/ci-integration.yml
+    uses: ./.github/workflows/integration-test.yml
     with:
       pr_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
       pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
@@ -61,7 +61,7 @@ jobs:
       github.event.label.name == 'run-e2e-ci'
     needs:
       - build-wheel-rocm
-    uses: ./.github/workflows/ci-integration-rocm.yml
+    uses: ./.github/workflows/integration-test-rocm.yml
     with:
       checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
     secrets: inherit

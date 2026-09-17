@@ -1,25 +1,52 @@
 # CI layout
 
-GitHub Actions requires workflow YAML files directly under `.github/workflows/`;
-workflow subdirectories are not supported. Use these filename groups:
+Keep workflow entry points at their established paths directly under
+`.github/workflows/`: GitHub Actions does not discover workflow subdirectories.
 
-- `ci.yml`: main pull-request build and test entry point (kept stable for API callers).
-- `ci-*`: platform builds, integration tests, nightly tests, and CI triggers.
-- `release*`: wheel releases, pre-releases, and container image publishing.
-- `automation-*`: repository maintenance, assistants, CI cancellation, and docs deployment.
-- `_*`: reusable wheel build and publish workflows.
+Workflows declare triggers, permissions, runners, job dependencies, build options,
+and the sequence of named steps. Shared implementation belongs in composite
+actions under `.github/actions/` or scripts here, not copied inline shell blocks.
 
-CI implementation scripts are grouped here by purpose:
+## Shared steps
 
-- `common/`: shared service startup, readiness, cleanup, and diagnostics.
+The PR and nightly source-build jobs use these composite actions:
+
+- `setup-etcd`: install etcd 3.6.1 and start/check the local service.
+- `setup-sccache`: install the compiler cache and export Actions cache credentials.
+- `setup-cuda-runtime`: expose the driver library selected in `build/CMakeCache.txt`.
+- `setup-metadata-server`: start the Python HTTP metadata service and export its
+  PID as `NIGHTLY_METADATA_SERVER_PID` for the later nightly API suite to stop.
+- `run-ctest`: run the `build/` suite with shared runtime environment settings;
+  optionally write JUnit results and reserve RPC port 50052.
+- `ctest-diagnostics`: preserve failure logs and JUnit reports.
+
+These actions require checkout first and run from the repository root on Linux.
+Service setup actions start job-scoped background processes; they are not intended
+for repeated invocation within a job or unmanaged persistent hosts. CUDA runtime
+setup requires CMake configuration first. CTest requires a completed build and
+metadata service. Keep failure-only diagnostics at the workflow level so its
+condition and artifact identity remain explicit.
+
+For example, after building and starting services:
+
+```yaml
+- name: Run unit tests
+  id: ctest
+  uses: ./.github/actions/run-ctest
+  with:
+    junit-report: build/test-results/ctest.xml
+```
+
+Platform-specific build flags, permissions, secrets, matrices, and job IDs remain
+in the workflows. Do not hide these behind a universal shell dispatcher.
+
+## Script directories
+
+- `common/`: service lifecycle helpers for smoke and integration suites.
 - `smoke/`: RPC, Store API, SSD offload, and Rust smoke suites.
 - `integration/`: Go integration suite.
 - `release/`: TestPyPI wheel validation.
-- `tests/`: unit tests for CI scripts and helpers.
-
-When moving a script or workflow, update callers, path filters, relative imports,
-and documentation together. Preserve workflow display names and job identifiers
-so this organization does not change check names.
+- `tests/`: unit tests for CI scripts and shared actions.
 
 Run lightweight tests from the repository root:
 

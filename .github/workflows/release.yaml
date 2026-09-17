@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 jobs:
-  # Skip semver pre-release tags (e.g. v1.0.0-rc1); those are handled by release-prerelease.yaml.
+  # Skip semver pre-release tags (e.g. v1.0.0-rc1); those are handled by pre-release.yaml.
   build:
     if: ${{ !contains(github.ref_name, '-') }}
     strategy:

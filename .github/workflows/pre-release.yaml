@@ -289,7 +289,7 @@ jobs:
   tone-integration:
     name: Validate T-one integration with TestPyPI wheel
     needs: [version-stamp, consume-testpypi]
-    uses: ./.github/workflows/ci-integration.yml
+    uses: ./.github/workflows/integration-test.yml
     with:
       testpypi_version: ${{ needs.version-stamp.outputs.package_version }}
     secrets: inherit
