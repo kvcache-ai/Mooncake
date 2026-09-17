@@ -49,26 +49,6 @@ If the current leader fails or becomes partitioned from the network, the remaini
 
 In both modes, the leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
 
-(client-c-api)=
-## Client C++ API
-
-The `Client` class provides the primary interface for Mooncake Store operations:
-
-| API | Description |
-|-----|-------------|
-| `Init` | Initialize the client with metadata server, protocol, and master address |
-| `Get` | Retrieve object data into pre-registered local memory slices |
-| `Put` | Store object data with configurable replication and persistence |
-| `Upsert` / `BatchUpsert` | Insert or update with existing placement reuse |
-| `Remove` | Delete an object and all its replicas |
-| `CreateCopyTask` / `CreateMoveTask` | Asynchronous cross-node data transfer |
-| `QueryTask` | Monitor the status of async copy/move tasks |
-| `BatchQueryIp` | Discover network locations of storage nodes |
-| `BatchReplicaClear` | Batch clear replicas on specific segments |
-| `QueryByRegex` / `RemoveByRegex` | Query or delete objects matching a regex |
-
-For full API signatures, parameter details, and usage examples, see the [Mooncake Store C++ API Reference](../../api-reference/cpp/mooncake-store.md).
-
 ## Master Service
 
 The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication
@@ -835,9 +815,16 @@ Note that the HTTP metadata server is designed for single-node deployments and d
 
 For detailed guidance on monitoring master metrics, Prometheus endpoints, and health checks, see the [Observability guide](../../getting_started/observability.md).
 
-## Mooncake Store Python API
+## Mooncake Store API
 
-**Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html)
+Mooncake Store can be accessed through Python, C++, and HTTP APIs.
+
+For full API signatures, parameter details, and usage examples, see:
+
+- [Mooncake Store Python API](../../api-reference/python/mooncake-store.md)
+- [Mooncake Store C++ API Reference](../../api-reference/cpp/mooncake-store.md)
+- [Mooncake Store HTTP Service](../../api-reference/http/http-service.md)
+
 
 ## Version Management Policy
 
