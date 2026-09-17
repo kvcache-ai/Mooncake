@@ -312,6 +312,13 @@ enum class ErrorCode : int32_t {
     // Parameter errors (Range: -600 to -699)
     INVALID_PARAMS = -600,  ///< Invalid parameters.
     ILLEGAL_CLIENT = -601,  ///< Illegal client to do the operation.
+    // Dummy-client buffer address is not covered by any
+    // segment mapped in RealClient (context missing after monitor eviction,
+    // or the buffer was never / is no longer registered). Returned to the
+    // dummy client so it can clear its local 'registered' flag and let the
+    // next register_buffer do a REAL re-registration (without this the
+    // client-side flag stays true and re-registration is silently skipped).
+    DUMMY_BUFFER_NOT_MAPPED = -610,
 
     // Engine operation errors (Range: -700 to -799)
     INVALID_WRITE = -700,    ///< Invalid write operation.
