@@ -49,7 +49,8 @@ class ObjectIndex {
         if (!inserted) {
             return false;
         }
-        it->second->generation_ = ++generation_counter_;
+        it->second->generation_.store(++generation_counter_,
+                                      std::memory_order_relaxed);
         return true;
     }
 
@@ -80,8 +81,7 @@ class ObjectIndex {
         return route_.size();
     }
 
-    // True when no object is currently routed. The tenant aggregate composes
-    // this with the other containers it owns.
+    // True when no object is currently routed.
     [[nodiscard]] bool Empty() const {
         std::shared_lock<std::shared_mutex> lock(route_lock_);
         return route_.empty();

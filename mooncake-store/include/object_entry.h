@@ -8,6 +8,7 @@
 // only through WithExclusiveAccess or WithSharedAccess, which hold it for the
 // callback, so a caller cannot act on half of a compound operation.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -60,7 +61,9 @@ class ObjectEntry {
     // Monotonic generation assigned by ObjectIndex at route publication
     // (0 = never published). Lets a holder distinguish the entry it holds from
     // a later replacement of the same key.
-    [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
+    [[nodiscard]] uint64_t generation() const noexcept {
+        return generation_.load(std::memory_order_relaxed);
+    }
 
     // Runs `fn(envelope, state)` with the entry held exclusively and returns
     // whatever `fn` returns. Lock order: entry → route → metadata spin lock,
@@ -83,7 +86,10 @@ class ObjectEntry {
     friend class ObjectIndex;  // assigns generation_ at route publication
 
     std::unique_ptr<ObjectMetadata> metadata_;
-    uint64_t generation_{0};
+    // Atomic because publication writes it under the route lock while a holder
+    // reads it without any lock. Relaxed: the number is only compared, it
+    // carries no other state.
+    std::atomic<uint64_t> generation_{0};
     // Mutable so a const entry can still be read under the shared lock.
     mutable std::shared_mutex mutex_;
     State state_ GUARDED_BY(mutex_);
