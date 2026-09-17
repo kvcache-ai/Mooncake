@@ -874,6 +874,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        ScopedClientViewPublish publish_client_view(*this);
         auto [record_it, inserted] = client_liveness_records_.try_emplace(
             client_id, std::make_shared<ClientLivenessRecord>(
                            ClientLivenessRecord::Clock::now()));
@@ -991,6 +992,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     -> tl::expected<void, ErrorCode> {
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        ScopedClientViewPublish publish_client_view(*this);
         auto [record_it, record_inserted] =
             client_liveness_records_.try_emplace(
                 client_id, std::make_shared<ClientLivenessRecord>(
@@ -3013,6 +3015,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     }
 
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    ScopedClientViewPublish publish_client_view(*this);
     const auto current = client_liveness_records_.find(job.client_id);
     if (current != client_liveness_records_.end() &&
         current->second == job.liveness) {
@@ -3445,6 +3448,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     }
     // The ordered writer initializes its sequence from durable_prefix.
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    ScopedClientViewPublish publish_client_view(*this);
     std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>
@@ -7985,12 +7989,21 @@ size_t MasterService::GetKeyCount() const {
     return total;
 }
 
+void MasterService::PublishClientViewLocked() {
+    std::atomic_store_explicit(
+        &client_view_,
+        std::shared_ptr<const ClientView>(std::make_shared<ClientView>(
+            ClientView{client_liveness_records_, ok_client_})),
+        std::memory_order_release);
+}
+
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> lock(client_mutex_);
-    const auto record_it = client_liveness_records_.find(client_id);
+    const auto view =
+        std::atomic_load_explicit(&client_view_, std::memory_order_acquire);
+    const auto record_it = view->liveness_records.find(client_id);
     bool observation_accepted = false;
-    if (record_it != client_liveness_records_.end()) {
+    if (record_it != view->liveness_records.end()) {
         const auto observation =
             record_it->second->Observe(ClientLivenessRecord::Clock::now());
         observation_accepted =
@@ -8002,7 +8015,7 @@ auto MasterService::Ping(const UUID& client_id)
         }
     }
     const ClientStatus client_status =
-        observation_accepted && ok_client_.contains(client_id)
+        observation_accepted && view->ok_clients.contains(client_id)
             ? ClientStatus::OK
             : ClientStatus::NEED_REMOUNT;
     return PingResponse(view_version_, client_status);
@@ -8039,6 +8052,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    ScopedClientViewPublish publish_client_view(*this);
     auto [record_it, inserted] = client_liveness_records_.try_emplace(
         client_id, std::make_shared<ClientLivenessRecord>(
                        ClientLivenessRecord::Clock::now()));
@@ -10592,6 +10606,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
 
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
+        ScopedClientViewPublish publish_client_view(*this);
         ok_client_.clear();
         client_host_id_.clear();
         client_liveness_records_.clear();
@@ -10695,6 +10710,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
 
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
+        ScopedClientViewPublish publish_client_view(*this);
         client_liveness_records_ = std::move(records);
     }
     MasterMetricManager::instance().reset_client_liveness_metrics(
@@ -12219,6 +12235,7 @@ void MasterService::ClientMonitorFunc() {
                     {
                         std::unique_lock<std::shared_mutex> client_lock(
                             client_mutex_);
+                        ScopedClientViewPublish publish_client_view(*this);
                         const auto current =
                             client_liveness_records_.find(client_id);
                         CHECK(current != client_liveness_records_.end());
