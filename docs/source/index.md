@@ -127,13 +127,13 @@ performance/vllm/index
 
 design/architecture
 design/transfer-engine/index
-design/mooncake-reshard/index
 design/tent/overview
 design/store/mooncake-store
 design/mooncake-backend-pg
 design/mooncake-ep
-design/p2p-store
 design/conductor/index
+design/mooncake-reshard/index
+design/p2p-store
 design/hicache-design
 :::
 
