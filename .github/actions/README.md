@@ -39,9 +39,3 @@ For example, after building and starting services:
 
 Platform-specific build flags, permissions, secrets, matrices, and job IDs remain
 in the workflows. Do not hide these behind a universal shell dispatcher.
-
-## Local validation
-
-```sh
-python -m unittest discover -s .github/actions/tests -v
-```

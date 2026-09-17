@@ -1,27 +1,44 @@
 #!/bin/bash
 
-CONTAINER_NAME=${CONTAINER_NAME:-"mooncake-ci-test"}
+CONTAINER_NAME=${CONTAINER_NAME:-"mooncake-rocm-ci"}
 MODEL_CACHE=${MODEL_CACHE:-"/root/.cache"}
-if [ "${CI_ACCELERATOR:-cuda}" != "cuda" ]; then
-    echo "This controller only supports cuda; use the other platform's test directory" >&2
+MOONCAKE_RUNTIME_CACHE=${MOONCAKE_RUNTIME_CACHE:-}
+HF_TOKEN_FILE=${HF_TOKEN_FILE:-"/etc/mooncake-ci/huggingface.token"}
+if [ "${CI_ACCELERATOR:-rocm}" != "rocm" ]; then
+    echo "This controller only supports rocm; use the other platform's test directory" >&2
     exit 2
 fi
-CI_ACCELERATOR=cuda
+CI_ACCELERATOR=rocm
 
-REGISTRY_ADDR_SGLANG=${REGISTRY_ADDR_SGLANG:-"lmsysorg/sglang:latest"}
-REGISTRY_ADDR_VLLM=${REGISTRY_ADDR_VLLM:-"vllm/vllm-openai:latest"}
-MOONCAKE_SGLANG_BASE_GPU_ID=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}
-MOONCAKE_EPD_ENCODER_GPU_ID=${MOONCAKE_EPD_ENCODER_GPU_ID:-0}
-MOONCAKE_EPD_PREFILL_GPU_ID=${MOONCAKE_EPD_PREFILL_GPU_ID:-4}
-MOONCAKE_EPD_DECODE_GPU_ID=${MOONCAKE_EPD_DECODE_GPU_ID:-6}
-MOONCAKE_VLLM_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-6,7}
-MOONCAKE_SGLANG_MEM_FRACTION_STATIC=${MOONCAKE_SGLANG_MEM_FRACTION_STATIC:-}
-MOONCAKE_CI_TIER=${MOONCAKE_CI_TIER:-"full"}
-USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-true}
+: "${REGISTRY_ADDR_SGLANG:?REGISTRY_ADDR_SGLANG is required for ROCm}"
+: "${REGISTRY_ADDR_VLLM:?REGISTRY_ADDR_VLLM is required for ROCm}"
+: "${MOONCAKE_CI_TIER:?MOONCAKE_CI_TIER is required for ROCm}"
+: "${MOONCAKE_RENDER_DEVICES:?MOONCAKE_RENDER_DEVICES is required for ROCm}"
+: "${MOONCAKE_GPU_INDICES:?MOONCAKE_GPU_INDICES is required for ROCm}"
+: "${MOONCAKE_CPUSET_CPUS:?MOONCAKE_CPUSET_CPUS is required for ROCm}"
+: "${MOONCAKE_CPUSET_MEMS:?MOONCAKE_CPUSET_MEMS is required for ROCm}"
+: "${MOONCAKE_RDMA_DEVICES:?MOONCAKE_RDMA_DEVICES is required for ROCm}"
+: "${MOONCAKE_RDMA_NETDEVS:?MOONCAKE_RDMA_NETDEVS is required for ROCm}"
+: "${MOONCAKE_TRANSFER_DEVICE:?MOONCAKE_TRANSFER_DEVICE is required for ROCm}"
+: "${MOONCAKE_GID_INDEX:?MOONCAKE_GID_INDEX is required for ROCm}"
+: "${MOONCAKE_SGLANG_BASE_GPU_ID:?MOONCAKE_SGLANG_BASE_GPU_ID is required for ROCm}"
+: "${MOONCAKE_EPD_ENCODER_GPU_ID:?MOONCAKE_EPD_ENCODER_GPU_ID is required for ROCm}"
+: "${MOONCAKE_EPD_PREFILL_GPU_ID:?MOONCAKE_EPD_PREFILL_GPU_ID is required for ROCm}"
+: "${MOONCAKE_EPD_DECODE_GPU_ID:?MOONCAKE_EPD_DECODE_GPU_ID is required for ROCm}"
+: "${MOONCAKE_VLLM_VISIBLE_DEVICES:?MOONCAKE_VLLM_VISIBLE_DEVICES is required for ROCm}"
+: "${MOONCAKE_SGLANG_MEM_FRACTION_STATIC:?MOONCAKE_SGLANG_MEM_FRACTION_STATIC is required for ROCm}"
+: "${MOONCAKE_RUNTIME_CACHE:?MOONCAKE_RUNTIME_CACHE is required for ROCm}"
+: "${AINIC_VERSION:?AINIC_VERSION is required for ROCm}"
+USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-false}
 
+MOONCAKE_RENDER_DEVICES=${MOONCAKE_RENDER_DEVICES:-}
+MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES:-}
+MOONCAKE_CPUSET_CPUS=${MOONCAKE_CPUSET_CPUS:-}
+MOONCAKE_CPUSET_MEMS=${MOONCAKE_CPUSET_MEMS:-}
+AINIC_VERSION=${AINIC_VERSION:-}
 HUGGINGFACE_MIRROR=${HUGGINGFACE_MIRROR:-"https://hf-mirror.com"}
 USE_MODELSCOPE=${USE_MODELSCOPE:-false}
-REMOTE_TEST_DIR=${REMOTE_TEST_DIR:-"/tmp/Mooncake_tone/mooncake_ci_test"}
+REMOTE_TEST_DIR=${REMOTE_TEST_DIR:-"/var/lib/mooncake-ci/work"}
 LOCAL_IP=${LOCAL_IP}
 REMOTE_IP=${REMOTE_IP}
 ARTIFACT_ID=${ARTIFACT_ID:-}
@@ -33,43 +50,44 @@ WHEEL_DIR_VLLM=${WHEEL_DIR_VLLM:-$WHEEL_DIR}
 GIT_REPO=${GIT_REPO:-}
 MOONCAKE_ENV_UNHEALTHY=false
 
-if [ "$MOONCAKE_CI_TIER" != "full" ]; then
-    echo "ERROR: cuda controller requires MOONCAKE_CI_TIER=full" >&2
+if [ "$MOONCAKE_CI_TIER" != "core-4gpu" ]; then
+    echo "ERROR: rocm controller requires MOONCAKE_CI_TIER=core-4gpu" >&2
     exit 2
 fi
 All_TEST_SCRIPTS_SGLANG=(
     "test_hicache_storage_mooncake_backend.sh"
-    "test_disaggregation_different_tp.sh"
     "test_1p1d_erdma.sh"
     "test_epd_sglang.sh"
-    "test_moe_mooncake.sh"
 )
 
 All_TEST_SCRIPTS_VLLM=(
     "test_vllm_1p1d_erdma.sh"
 )
 
-REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-"$REMOTE_IP"}
-SSH_CMD=${SSH_CMD:-"ssh -o StrictHostKeyChecking=no"}
-RSYNC_RSH=${RSYNC_RSH:-"ssh -o StrictHostKeyChecking=no"}
-SCP_CMD=${SCP_CMD:-"scp -o StrictHostKeyChecking=no"}
+# The ROCm cluster uses a dedicated CI identity and pinned host key. Keep
+# the serving/RDMA address separate from the SSH management endpoint.
+: "${REMOTE_SSH_TARGET:?REMOTE_SSH_TARGET is required for ROCm}"
+: "${MOONCAKE_SSH_CONFIG:?MOONCAKE_SSH_CONFIG is required for ROCm}"
+SSH_CMD=${SSH_CMD:-"ssh -F ${MOONCAKE_SSH_CONFIG}"}
+RSYNC_RSH=${RSYNC_RSH:-"ssh -F ${MOONCAKE_SSH_CONFIG}"}
+SCP_CMD=${SCP_CMD:-"scp -F ${MOONCAKE_SSH_CONFIG}"}
 
 readonly REMOTE_SSH_TARGET SSH_CMD RSYNC_RSH SCP_CMD
 
-TONE_TESTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
-RUN_DIR="$TONE_TESTS_DIR/run"
+ROCM_TESTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
+RUN_DIR="$ROCM_TESTS_DIR/run"
 
-. $TONE_TESTS_DIR/scripts/common.sh
+. $ROCM_TESTS_DIR/scripts/common.sh
 
 get_test_type() {
     local test_name=$1
 
-    if [ ! -f "$TONE_TESTS_DIR/scripts/$test_name" ]; then
+    if [ ! -f "$ROCM_TESTS_DIR/scripts/$test_name" ]; then
         echo "unknown"
         return 1
     fi
 
-    local test_type=$(grep "^TEST_TYPE=" "$TONE_TESTS_DIR/scripts/$test_name" | head -n 1 | cut -d'"' -f2)
+    local test_type=$(grep "^TEST_TYPE=" "$ROCM_TESTS_DIR/scripts/$test_name" | head -n 1 | cut -d'"' -f2)
 
     if [ -z "$test_type" ]; then
         echo "unknown"
@@ -165,6 +183,8 @@ export CONTAINER_NAME=${CONTAINER_NAME}
 export CI_ACCELERATOR=${CI_ACCELERATOR}
 export MOONCAKE_CI_TIER=${MOONCAKE_CI_TIER}
 export MODEL_CACHE=${MODEL_CACHE}
+export MOONCAKE_RUNTIME_CACHE=${MOONCAKE_RUNTIME_CACHE}
+export HF_TOKEN_FILE=${HF_TOKEN_FILE}
 export REGISTRY_ADDR_SGLANG=${REGISTRY_ADDR_SGLANG}
 export REGISTRY_ADDR_VLLM=${REGISTRY_ADDR_VLLM}
 export USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR}
@@ -175,16 +195,25 @@ export WHEEL_DIR=${WHEEL_DIR}
 export GIT_REPO=${GIT_REPO}
 export LOCAL_IP=${LOCAL_IP}
 export REMOTE_IP=${REMOTE_IP}
-export BASE_DIR=${TONE_TESTS_DIR}
+export BASE_DIR=${ROCM_TESTS_DIR}
 export TEST_RUN_DIR=${RUN_DIR}
 export TEST_RESULT_DIR=${RUN_DIR}/logs
 export REMOTE_TEST_DIR=${REMOTE_TEST_DIR}
+export MOONCAKE_RENDER_DEVICES="${MOONCAKE_RENDER_DEVICES}"
+export MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES}
+export MOONCAKE_CPUSET_CPUS=${MOONCAKE_CPUSET_CPUS}
+export MOONCAKE_CPUSET_MEMS=${MOONCAKE_CPUSET_MEMS}
 export MOONCAKE_SGLANG_BASE_GPU_ID=${MOONCAKE_SGLANG_BASE_GPU_ID}
 export MOONCAKE_EPD_ENCODER_GPU_ID=${MOONCAKE_EPD_ENCODER_GPU_ID}
 export MOONCAKE_EPD_PREFILL_GPU_ID=${MOONCAKE_EPD_PREFILL_GPU_ID}
 export MOONCAKE_EPD_DECODE_GPU_ID=${MOONCAKE_EPD_DECODE_GPU_ID}
 export MOONCAKE_VLLM_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES}
 export MOONCAKE_SGLANG_MEM_FRACTION_STATIC=${MOONCAKE_SGLANG_MEM_FRACTION_STATIC}
+export MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES}
+export MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS}
+export MOONCAKE_TRANSFER_DEVICE=${MOONCAKE_TRANSFER_DEVICE}
+export MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX}
+export AINIC_VERSION=${AINIC_VERSION}
 EOF
 
     echo "===== Preparing local machine ====="
@@ -203,7 +232,7 @@ validated_remote_test_dir() {
     local remote_dir=$1
     local allowed_root
 
-    allowed_root=/tmp/Mooncake_tone/mooncake_ci_test
+    allowed_root=/var/lib/mooncake-ci/work
 
     if ! [[ "$remote_dir" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
         echo "ERROR: REMOTE_TEST_DIR contains unsupported characters: $remote_dir" >&2
@@ -250,7 +279,7 @@ prepare_double_env(){
         return 1
     fi
 
-    if ! rsync -av -e "$RSYNC_RSH" "${TONE_TESTS_DIR}/" \
+    if ! rsync -av -e "$RSYNC_RSH" "${ROCM_TESTS_DIR}/" \
         "$REMOTE_SSH_TARGET:${REMOTE_TEST_DIR}/"; then
         echo "ERROR: Failed to sync files to remote server" >&2
         return 1
@@ -329,7 +358,7 @@ run_single_test(){
     fi
 
     source "$RUN_DIR/.shrc"
-    cd "$TONE_TESTS_DIR/scripts"
+    cd "$ROCM_TESTS_DIR/scripts"
     source "./$test_name"
 
     local log_dir="${BASE_DIR}/run/logs/$(basename "$test_name" .sh)"
@@ -368,7 +397,7 @@ run_all_tests(){
     fi
 
     source "$RUN_DIR/.shrc"
-    cd "$TONE_TESTS_DIR/scripts"
+    cd "$ROCM_TESTS_DIR/scripts"
 
     local all_passed=true
     local test_index=0
@@ -415,7 +444,7 @@ run_all_tests(){
 }
 
 show_help(){
-    echo "Mooncake TONE CI Controller"
+    echo "Mooncake ROCM CI Controller"
     echo "Usage: $0 <command> [args]"
     echo ""
     echo "Commands:"

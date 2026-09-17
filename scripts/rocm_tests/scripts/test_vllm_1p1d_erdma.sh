@@ -3,7 +3,7 @@
 test_case_name="test_vllm_1p1d_erdma"
 TEST_TYPE="double"
 
-SUPPORT_MODELS=("Qwen/Qwen3-8B" "deepseek-ai/DeepSeek-V2-Lite")
+SUPPORT_MODELS=("Qwen/Qwen3-8B")
 
 PID_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}/run/pids/${test_case_name}
 BASE_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}
@@ -35,12 +35,20 @@ start_server()
 
     local kv_config_json
 
-    kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\"}"
+    # This lane is serialized smoke coverage for basic connector
+    # correctness. It does not exercise concurrent sender workers; that
+    # remains separate coverage while vllm-project/vllm#44238 is unresolved.
+    echo "ROCm vLLM coverage: serialized Mooncake connector smoke (num_workers=1)"
+    kv_config_json="{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"$kv_role\",\"kv_connector_extra_config\":{\"num_workers\":1}}"
 
     local env_vars
 
-    local gpu_memory_utilization=0.85
-    env_vars="CUDA_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-6,7}"
+    # The MI350X default allocates roughly 233 GiB of KV cache per rank,
+    # producing 72 multi-GiB dma-buf registrations against every visible
+    # RNIC. The connector smoke test needs only a small cache and the RoCE
+    # rail selected by the runner profile.
+    local gpu_memory_utilization=0.3
+    env_vars="ROCR_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} HIP_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} MC_MAX_CONCURRENT_REG_MR=1 MC_TE_FILTERS=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
 
     local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization ${gpu_memory_utilization} --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
 

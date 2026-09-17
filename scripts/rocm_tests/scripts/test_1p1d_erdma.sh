@@ -28,7 +28,9 @@ start_server()
         mode_name=decode
     fi
 
-    local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}"
+    local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-0}"
+
+    extra_args="${extra_args} --disaggregation-ib-device=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
 
     if ! launch_sglang_server "$model_name" "$host" "30001" "$sglang_server_log_path" "$mode_name" "$extra_args"; then
         return 1
