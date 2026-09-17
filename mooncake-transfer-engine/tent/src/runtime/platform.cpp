@@ -14,6 +14,10 @@
 
 #include "tent/runtime/platform.h"
 
+#include <mutex>
+#include <unordered_set>
+#include <vector>
+
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
 #elif defined(USE_HIP)
@@ -50,6 +54,30 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
 #endif
     });
     return *g_instance;
+}
+
+Status Platform::synchronizeDevices(const Topology* topology) {
+    (void)topology;
+    return Status::OK();
+}
+
+std::vector<int> Platform::topologyDeviceIndices(const Topology* topology,
+                                                 Topology::MemType mem_type) {
+    std::vector<int> devices;
+    if (!topology) return devices;
+
+    std::unordered_set<int> seen;
+    const size_t mem_count = topology->getMemCount();
+    for (size_t i = 0; i < mem_count; ++i) {
+        const auto* mem =
+            topology->getMemEntry(static_cast<Topology::MemID>(i));
+        if (!mem || mem->type != mem_type) continue;
+        LocationParser parser(mem->name);
+        const int device = parser.index();
+        if (device < 0 || !seen.insert(device).second) continue;
+        devices.push_back(device);
+    }
+    return devices;
 }
 }  // namespace tent
 }  // namespace mooncake

@@ -146,6 +146,20 @@ static inline std::string getCurrentDateTime() {
     return oss.str();
 }
 
+static inline std::string formatEpochMicroseconds(uint64_t epoch_us) {
+    if (epoch_us == 0) return "legacy(0)";
+
+    const auto seconds = static_cast<std::time_t>(epoch_us / 1000000);
+    const auto micros = epoch_us % 1000000;
+    std::tm local_time{};
+    localtime_r(&seconds, &local_time);
+
+    std::ostringstream oss;
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
+        << std::setw(6) << std::setfill('0') << micros;
+    return oss.str();
+}
+
 uint16_t getDefaultHandshakePort();
 
 template <typename T>

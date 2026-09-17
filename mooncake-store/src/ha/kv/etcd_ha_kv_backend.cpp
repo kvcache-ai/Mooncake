@@ -22,6 +22,8 @@ EtcdHelper::TxnCompareKind ToEtcdCompareKind(KvCompareKind kind) {
             return EtcdHelper::TxnCompareKind::kValueEquals;
         case KvCompareKind::kKeyNotExists:
             return EtcdHelper::TxnCompareKind::kKeyNotExists;
+        case KvCompareKind::kCreateRevisionEquals:
+            return EtcdHelper::TxnCompareKind::kCreateRevisionEquals;
     }
     return EtcdHelper::TxnCompareKind::kValueEquals;
 }
@@ -80,7 +82,8 @@ ErrorCode EtcdHaKvBackend::Txn(const KvTxn& txn) {
     for (const auto& compare : txn.compares) {
         compares.push_back({.key = compare.key,
                             .kind = ToEtcdCompareKind(compare.kind),
-                            .expected_value = compare.expected_value});
+                            .expected_value = compare.expected_value,
+                            .expected_revision = compare.expected_revision});
     }
 
     std::vector<EtcdHelper::TxnPut> puts;

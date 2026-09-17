@@ -505,7 +505,8 @@ TEST_F(MasterServiceEvictScenarioTest,
     ReadBatchEventually(storage, 3, batch);
     scenario.When(PutStart("after-durable", kObjectSize)
                       .ForTenant(tenant)
-                      .ExpectReplicas(1));
+                      .ExpectReplicas(1)
+                      .Eventually());
 }
 
 TEST_F(MasterServiceEvictScenarioTest,

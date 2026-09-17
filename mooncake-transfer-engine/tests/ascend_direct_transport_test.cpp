@@ -2097,6 +2097,34 @@ TEST_F(AscendDirectTransportTest,
 }
 
 TEST_F(AscendDirectTransportTest,
+       Standalone_SingleEndpoint_IgnoresDestDeviceId) {
+    globalConfig().ascend_agent_mode = false;
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    constexpr int kDeviceCount = 4;
+    mock_acl::set_device_count(kDeviceCount);
+    g_device_id = 3;
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    std::vector<std::string> endpoints = {"127.0.0.1:7400"};
+    addMultiEndpointRemoteSegment(transport->meta(), 1, "single_endpoint",
+                                  "127.0.0.1", endpoints, /*dest_device_id=*/2,
+                                  0x10000, kTransferBufSize);
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:7400")
+        << "A single remote endpoint is used as-is, even when dest "
+           "buffer device_id is not 0";
+}
+
+TEST_F(AscendDirectTransportTest,
        Standalone_FabricMem_SameHostSelectsDestBufferEngine) {
     // Fabric mem is a Store-TE feature, so the TE must be store-init for the
     // transport to capture use_fabric_mem_=true.

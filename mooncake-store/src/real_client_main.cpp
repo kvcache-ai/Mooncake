@@ -6,6 +6,7 @@
 #include "common.h"
 #include "config.h"
 #include "real_client.h"
+#include "version.h"
 
 using namespace mooncake;
 
@@ -110,10 +111,14 @@ int main(int argc, char *argv[]) {
     // spawning threads, leading to missing signal processing.
     mooncake::ResourceTracker::getInstance();
 
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);
     }
+
+    LOG(INFO) << "Mooncake real client version: "
+              << mooncake::MOONCAKE_DISPLAY_VERSION;
 
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
     size_t local_buffer_size = string_to_byte_size(FLAGS_local_buffer_size);

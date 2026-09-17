@@ -236,38 +236,13 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         }
     }
 
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    // CachelibBufferAllocator may throw an exception if the size or base is
-    // invalid for the slab allocator.
-    try {
-        // Create allocator based on the configured type
-        switch (segment_manager_->memory_allocator_) {
-            case BufferAllocatorType::CACHELIB:
-                allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
-                break;
-            case BufferAllocatorType::OFFSET:
-                allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
-                break;
-            default:
-                LOG(ERROR) << "segment_name=" << segment.name
-                           << ", error=unknown_memory_allocator="
-                           << static_cast<int>(
-                                  segment_manager_->memory_allocator_);
-                return ErrorCode::INVALID_PARAMS;
-        }
-
-        if (!allocator) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=failed_to_create_allocator";
-            return ErrorCode::INVALID_PARAMS;
-        }
-    } catch (...) {
-        LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=exception_during_allocator_creation";
-        return ErrorCode::INVALID_PARAMS;
+    auto created =
+        CreateBufferAllocator(segment_manager_->memory_allocator_, segment.name,
+                              buffer, size, segment.te_endpoint);
+    if (!created) {
+        return created.error();
     }
+    auto allocator = std::move(*created);
 
     allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
@@ -1222,37 +1197,13 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         }
     }
 
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    try {
-        switch (nof_segment_manager_->memory_allocator_) {
-            case BufferAllocatorType::CACHELIB:
-                allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint,
-                    ReplicaType::NOF_SSD);
-                break;
-            case BufferAllocatorType::OFFSET:
-                allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint,
-                    ReplicaType::NOF_SSD);
-                break;
-            default:
-                LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
-                           << ", error=unknown_memory_allocator="
-                           << static_cast<int>(
-                                  nof_segment_manager_->memory_allocator_);
-                return ErrorCode::INVALID_PARAMS;
-        }
-
-        if (!allocator) {
-            LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
-                       << ", error=failed_to_create_allocator";
-            return ErrorCode::INVALID_PARAMS;
-        }
-    } catch (...) {
-        LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
-                   << ", error=exception_during_allocator_creation";
-        return ErrorCode::INVALID_PARAMS;
+    auto created = CreateBufferAllocator(
+        nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
+        segment.te_endpoint, ReplicaType::NOF_SSD);
+    if (!created) {
+        return created.error();
     }
+    auto allocator = std::move(*created);
 
     allocator->AttachUsageTracker(nof_segment_manager_->usage_tracker_);
     nof_segment_manager_->allocator_manager_.addAllocator(segment.name,
@@ -1469,8 +1420,8 @@ void SegmentManager::releaseCapacityMetrics() {
     }
 }
 
-void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
-                                            const size_t cxl_size) {
+ErrorCode SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
+                                                 size_t cxl_size) {
     LOG(INFO) << "Init CXL global allocator.";
     LOG(INFO) << "[CXL] create allocator with "
               << "path=" << cxl_path << " base=0x" << std::hex
@@ -1478,14 +1429,20 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
               << std::fixed << std::setprecision(2)
               << cxl_size / (1024.0 * 1024 * 1024) << " GB)";
 
-    auto allocator = std::make_shared<CachelibBufferAllocator>(
-        cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    auto created =
+        CreateBufferAllocator(BufferAllocatorType::CACHELIB, cxl_path,
+                              DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    if (!created) {
+        return created.error();
+    }
+    auto allocator = std::move(*created);
     allocator->AttachUsageTracker(usage_tracker_);
     {
         std::unique_lock<std::shared_mutex> lock(segment_mutex_);
         cxl_global_allocator_ = std::move(allocator);
     }
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
+    return ErrorCode::OK;
 }
 
 bool SegmentManager::HasSegmentByEndpoint(const std::string& endpoint) const {

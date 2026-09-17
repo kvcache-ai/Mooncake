@@ -37,10 +37,10 @@ struct PromotionDecision {
     bool promoted_any() const { return !promote_indices.empty(); }
 };
 
-// Historical policy (as implemented in Workers::promoteTimedOutRequests today):
-// the pass drains the whole queue, inspects ONLY the head entry, and if the
-// head has timed out it promotes EVERY entry in the queue. This is the behavior
-// #2528 flags as unintended:
+// Default policy (Workers::promoteTimedOutRequests when
+// transports/rdma/priority_promotion_per_entry is false): the pass drains the
+// whole queue, inspects ONLY the head entry, and if the head has timed out it
+// promotes EVERY entry in the queue. Issue #2528 flags this as unintended:
 //   * decision is head-only but applied to the whole queue -> freshly enqueued
 //     entries that are not starving get promoted alongside the starving head;
 //   * if the head has NOT timed out, later timed-out entries are not promoted.
@@ -68,10 +68,10 @@ inline PromotionDecision DecidePromotionHeadOnly(
     return d;
 }
 
-// Per-entry policy: promote exactly the entries that have themselves timed out,
-// leaving freshly enqueued entries in place. This is the behavior #2528
-// proposes; kept here next to the historical policy so a test can contrast the
-// two and a follow-up fix can switch Workers over to it.
+// Opt-in per-entry policy (transports/rdma/priority_promotion_per_entry=true):
+// promote exactly the entries that have themselves timed out, leaving freshly
+// enqueued entries in place. Workers::promoteTimedOutRequests selects this or
+// DecidePromotionHeadOnly from the config flag.
 inline PromotionDecision DecidePromotionPerEntry(
     const std::vector<uint64_t>& enqueue_ts, uint64_t current_ts,
     uint64_t promotion_timeout_ns) {

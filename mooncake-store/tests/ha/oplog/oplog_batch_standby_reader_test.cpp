@@ -108,6 +108,28 @@ TEST(OpLogBatchStandbyReaderTest, MissingPrefixWaitsWithoutLegacyFallback) {
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());
 }
 
+TEST(OpLogBatchStandbyReaderTest, ResumesAfterSnapshotBatchCursor) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 2),
+                          EncodeOpLogBatchRecord(MakeBatch(2, 2, 2))));
+
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    applier.Recover(1);
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+    ASSERT_EQ(ErrorCode::OK,
+              reader.SetBaselineCursor({.batch_id = 1, .last_seq = 1}));
+
+    const auto result = reader.PollOnce();
+    EXPECT_EQ(ErrorCode::OK, result.error);
+    EXPECT_EQ(1u, result.applied_entries);
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+}
+
 TEST(OpLogBatchStandbyReaderTest, MissingPrefixAfterObservationFailsClosed) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,

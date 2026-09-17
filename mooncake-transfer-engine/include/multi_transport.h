@@ -15,14 +15,17 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <functional>
 #include <unordered_map>
 
 #include "transport/transport.h"
 
 namespace mooncake {
+class TransferEngineImpl;
 class TransferEngineImplTestPeer;
 
 class MultiTransport {
+    friend class TransferEngineImpl;
     friend class TransferEngineImplTestPeer;
 
    public:
@@ -85,6 +88,9 @@ class MultiTransport {
     void *getBaseAddr();
 
    private:
+    Status freeBatchID(BatchID batch_id,
+                       const std::function<void()> &before_delete);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries,
                           std::vector<size_t> *task_sizes);

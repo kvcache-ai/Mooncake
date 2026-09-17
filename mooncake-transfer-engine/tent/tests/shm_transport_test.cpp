@@ -366,6 +366,66 @@ TEST(ShmTransportTest, NeedsRefreshCacheKeepsExistingMappings) {
     ASSERT_TRUE(transport.uninstall().ok());
 }
 
+// Regression for the all-or-nothing submission contract: a mid-batch
+// relocation failure (the second of three requests targets an unknown
+// segment) must return an error without executing any transfer. The
+// sub-batch must stay empty and the valid first request's data must not
+// have been copied, otherwise the engine's submit-stage failover would
+// execute the accepted prefix twice.
+TEST(ShmTransportTest, SubmitIsAllOrNothingWhenRelocateFailsMidBatch) {
+    constexpr size_t kLen = 16;
+    constexpr SegmentID kUnknownSegment = 0x7fff;
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ShmTransport transport;
+    std::string local_segment_name = "shm_test_segment";
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, metadata, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 8).ok());
+
+    // Real destination memory for the valid requests; stays zeroed unless
+    // a transfer executes despite the mid-batch failure.
+    std::vector<uint8_t> target(kLen, 0);
+    std::vector<uint8_t> source(kLen, 0xA5);
+    auto makeRequest = [&](SegmentID target_id, uint64_t target_offset) {
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = source.data();
+        req.target_id = target_id;
+        req.target_offset = target_offset;
+        req.length = kLen;
+        return req;
+    };
+    std::vector<Request> requests{
+        makeRequest(LOCAL_SEGMENT_ID,
+                    reinterpret_cast<uint64_t>(target.data())),
+        // Unknown target segment: relocation fails fast with an error.
+        makeRequest(kUnknownSegment, 0x1000),
+        makeRequest(LOCAL_SEGMENT_ID,
+                    reinterpret_cast<uint64_t>(target.data()))};
+
+    auto status = transport.submitTransferTasks(batch, requests);
+    EXPECT_FALSE(status.ok());
+
+    // Nothing was accepted: the sub-batch is unchanged.
+    auto* shm_batch = dynamic_cast<ShmSubBatch*>(batch);
+    ASSERT_NE(shm_batch, nullptr);
+    EXPECT_EQ(shm_batch->task_list.size(), 0u);
+    TransferStatus ts{};
+    EXPECT_FALSE(transport.getTransferStatus(batch, 0, ts).ok());
+
+    // Nothing was executed: the target still reads as zeroed (the old
+    // per-request loop would have already copied request 0's pattern).
+    for (size_t i = 0; i < kLen; ++i) EXPECT_EQ(target[i], 0u);
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

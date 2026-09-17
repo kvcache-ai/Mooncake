@@ -15,7 +15,9 @@
 #ifndef TCP_TRANSPORT_H_
 #define TCP_TRANSPORT_H_
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -35,6 +37,14 @@ struct TcpParams {
     uint64_t retry_max_delay_ms = 2'000;  // 2s max backoff
     size_t max_concurrent_tasks = 16;     // worker thread pool size
 };
+
+// Next sleep used by doTransferWithRetry after a failed attempt. Kept as a
+// pure function so the cap is unit-testable without standing up a peer.
+inline uint64_t nextTcpRetryDelay(uint64_t delay_ms, uint64_t cap) {
+    return std::min(delay_ms * 2, cap);
+}
+
+class TcpTransportTestPeer;
 
 struct TcpTask {
     Request request;
@@ -64,6 +74,8 @@ struct TcpSubBatch : public Transport::SubBatch {
 };
 
 class TcpTransport : public Transport {
+    friend class TcpTransportTestPeer;
+
    public:
     TcpTransport();
 

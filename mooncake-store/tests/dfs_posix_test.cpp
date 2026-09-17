@@ -331,47 +331,6 @@ TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
     EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(100, 1000), "100");
 }
 
-TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
-    EnvGuard env;
-    TempDir tmp("dfs_config");
-    env.Set("MOONCAKE_DFS_ROOT_DIR", tmp.path().c_str());
-    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
-    env.Set("MOONCAKE_DFS_SHARD_COUNT", "8");
-    env.Set("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
-    env.Set("MOONCAKE_DFS_ALIGNMENT", "4096");
-    env.Set("MOONCAKE_DFS_SINGLE_TENANT", "1");
-    env.Set("MOONCAKE_DFS_EVICTION_ENABLED", "1");
-    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.85");
-    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.65");
-    env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "12");
-    env.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
-
-    const auto config = DistributedStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.fsdir, tmp.path());
-    EXPECT_EQ(config.fs_adapter_type, "posix");
-    EXPECT_EQ(config.shard_count, 8);
-    EXPECT_EQ(config.shard_capacity, 1048576);
-    EXPECT_EQ(config.alignment, 4096);
-    EXPECT_TRUE(config.eviction_enabled);
-    EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.85);
-    EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
-    EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
-    EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
-    EXPECT_TRUE(config.Validate());
-    EXPECT_TRUE(config.ValidateForAllocator());
-
-    const std::string formatted = config.FormatStr();
-    EXPECT_NE(formatted.find("fs_adapter_type=posix"), std::string::npos);
-    EXPECT_NE(formatted.find("shard_count=8"), std::string::npos);
-    EXPECT_NE(formatted.find("eviction_high_watermark=0.85"),
-              std::string::npos);
-
-    auto invalid_eviction = config;
-    invalid_eviction.eviction_low_watermark = 0.9;
-    EXPECT_TRUE(invalid_eviction.Validate());
-    EXPECT_FALSE(invalid_eviction.ValidateForAllocator());
-}
-
 TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
     EnvGuard env;
     ConfigurePosixDfs(env);

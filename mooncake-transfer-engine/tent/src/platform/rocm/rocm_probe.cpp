@@ -263,6 +263,20 @@ MemoryType RocmPlatform::getMemoryType(void* addr) {
     return MTYPE_CPU;
 }
 
+int RocmPlatform::getPointerDeviceId(void* addr) {
+    hipPointerAttribute_t attributes{};
+    if (hipPointerGetAttributes(&attributes, addr) != hipSuccess) {
+        // Clear the latched error so it cannot surface at an unrelated
+        // hipGetLastError() call site.
+        hipGetLastError();
+        return HIPStreamPool::kCurrentDevice;
+    }
+    if (attributes.type != hipMemoryTypeDevice) {
+        return HIPStreamPool::kCurrentDevice;
+    }
+    return attributes.device;
+}
+
 static inline uintptr_t alignPage(uintptr_t address) {
     const static size_t kPageSize = 4096;
     return address & ~(kPageSize - 1);

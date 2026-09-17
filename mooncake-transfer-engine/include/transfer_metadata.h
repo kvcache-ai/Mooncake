@@ -107,6 +107,7 @@ class TransferMetadata {
     struct SegmentDesc {
         std::string name;
         std::string protocol;
+        uint64_t metadata_version{0};
         // this is for rdma/shm/urma
         std::vector<DeviceDesc> devices;
         Topology topology;
@@ -155,6 +156,7 @@ class TransferMetadata {
     struct RpcMetaDesc {
         std::string ip_or_host_name;
         uint16_t rpc_port;
+        uint64_t metadata_version{0};
 #ifdef USE_BAREX
         uint16_t barex_port;
 #endif
@@ -270,6 +272,8 @@ class TransferMetadata {
         const std::string &segment_name, bool force_rpc_update);
     int getRpcMetaEntryInternal(const std::string &server_name,
                                 RpcMetaDesc &desc, bool force_update);
+    int publishSegmentDesc(const std::string &segment_name,
+                           const SegmentDesc &desc);
     int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
     std::shared_ptr<TransferMetadata::SegmentDesc> decodeSegmentDesc(
         Json::Value &segmentJSON, const std::string &segment_name);

@@ -180,14 +180,14 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
-# Stage migrated Python modules and the legacy Reshard package for the combined
+# Stage migrated root Python modules and the legacy Reshard package for the combined
 # wheel builder. Each tracked source remains in its authoritative tree.
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 MIGRATED_PYTHON_MODULES=(
     buffer_pool.py
-    ep.py
     mooncake_config.py
+    ep.py
     mooncake_ep_buffer.py
     mooncake_elastic_buffer.py
 )
@@ -493,6 +493,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcudart.so* \
     --exclude libmooncake_ep_device.so* \
     --exclude libmooncake_pg_device.so* \
+    --exclude libnccl.so* \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \

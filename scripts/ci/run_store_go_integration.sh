@@ -2,6 +2,11 @@
 
 set -e -o pipefail
 
+# shellcheck source=scripts/ci/services.sh
+source "$(dirname "${BASH_SOURCE[0]}")/services.sh"
+: "${RUNNER_TEMP:=${TMPDIR:-/tmp}}"
+trap 'ci_cleanup_services "$?"' EXIT
+
 : "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be set}"
 : "${MOONCAKE_STORE_CLUSTER_ID:?MOONCAKE_STORE_CLUSTER_ID must be set}"
 
@@ -14,12 +19,12 @@ case "${MOONCAKE_STORE_GO_SANITIZED:-0}" in
         ;;
 esac
 
-"$GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master" \
+ci_start_service master "$RUNNER_TEMP/mooncake-master.log" \
+    "$GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master" \
     --eviction_high_watermark_ratio=0.95 \
     --cluster_id="$MOONCAKE_STORE_CLUSTER_ID" \
-    --port 50051 &
-master_pid=$!
-sleep 3
+    --port 50051
+ci_wait_service master 50051
 
 cd "$GITHUB_WORKSPACE/mooncake-store/go"
 export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:${LD_LIBRARY_PATH:-}"
@@ -79,5 +84,3 @@ if $sanitized; then
     test_env=(ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 "${test_env[@]}")
 fi
 env "${test_env[@]}" go test -v ./tests/...
-
-kill "$master_pid" 2>/dev/null || true

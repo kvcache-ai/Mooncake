@@ -59,16 +59,12 @@ class AllocationStrategyParameterizedTest
         const std::string& segment_name, size_t base_offset,
         size_t size = 64 * MiB) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
-        switch (allocator_type_) {
-            case BufferAllocatorType::CACHELIB:
-                return std::make_shared<CachelibBufferAllocator>(
-                    segment_name, base, size, segment_name);
-            case BufferAllocatorType::OFFSET:
-                return std::make_shared<OffsetBufferAllocator>(
-                    segment_name, base, size, segment_name);
-            default:
-                throw std::invalid_argument("Invalid allocator type");
+        auto allocator = CreateBufferAllocator(allocator_type_, segment_name,
+                                               base, size, segment_name);
+        if (!allocator) {
+            throw std::invalid_argument("Invalid allocator test parameters");
         }
+        return std::move(*allocator);
     }
 
     BufferAllocatorType allocator_type_;

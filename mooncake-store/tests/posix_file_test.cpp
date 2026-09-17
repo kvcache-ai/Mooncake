@@ -1,9 +1,13 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <array>
+#include <cerrno>
+#include <csignal>
 #include <cstdlib>
 #include <memory>
 #include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <sys/uio.h>
 #include <string_view>
@@ -164,6 +168,50 @@ TEST_F(PosixFileTest, VectorizedWrite) {
                         << toString(result.error());
     EXPECT_EQ(*result, data1.size() + data2.size());
     EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
+}
+
+// A short pwritev must be treated as a failed write. Otherwise the PosixFile
+// destructor has no failure state and leaves a truncated object on disk.
+TEST_F(PosixFileTest, ShortVectorizedWriteRemovesPartialFile) {
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+    const std::string partial_filename =
+        "short_vector_write_" + std::to_string(getpid()) + ".tmp";
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "Failed to fork short-write test";
+
+    if (child == 0) {
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR) _exit(10);
+
+        const struct rlimit limit = {4096, 4096};
+        if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(11);
+
+        int fd =
+            open(partial_filename.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) _exit(12);
+
+        std::string data(8192, 'x');
+        {
+            PosixFile posix_file(partial_filename, fd);
+            iovec iov{data.data(), data.size()};
+            auto result = posix_file.vector_write(&iov, 1, 0);
+            if (result || result.error() != ErrorCode::FILE_WRITE_FAIL)
+                _exit(13);
+        }
+
+        if (access(partial_filename.c_str(), F_OK) == 0) _exit(14);
+        if (errno != ENOENT) _exit(15);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    unlink(partial_filename.c_str());
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+#else
+    GTEST_SKIP() << "RLIMIT_FSIZE/SIGXFSZ is unavailable on this platform";
+#endif
 }
 
 // Test vectorized read operation

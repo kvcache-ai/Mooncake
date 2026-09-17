@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <limits>
+#include <random>
 
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/random.h"
@@ -79,6 +80,7 @@ struct XferBenchConfig {
     static std::string workload_classes_json;
     static double qos_link_capacity_gbps;
     static std::string qos_output_jsonl;
+    static std::string result_output_jsonl;
     static uint64_t request_interval_us;
     static uint64_t deadline_us;
     static int deadline_tight_threads;
@@ -261,7 +263,17 @@ static inline void fillData(void* addr, size_t length, uint8_t seed) {
         return;
     }
 #endif
-    memset(addr, seed, length);
+    if (XferBenchConfig::xport_type != "hp_tcp" ||
+        !XferBenchConfig::check_consistency) {
+        memset(addr, seed, length);
+        return;
+    }
+    // A constant byte pattern cannot detect reordered or duplicated slices.
+    std::mt19937 data(seed);
+    auto* bytes = static_cast<uint8_t*>(addr);
+    for (size_t i = 0; i < length; ++i) {
+        bytes[i] = static_cast<uint8_t>(data());
+    }
 }
 
 static inline uint8_t fillData(void* addr, size_t length) {
@@ -304,6 +316,10 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
         return;
     }
 #endif
+    if (XferBenchConfig::xport_type == "hp_tcp" &&
+        XferBenchConfig::check_consistency) {
+        fillData(ref_data.data(), length, seed);
+    }
     if (memcmp(addr, ref_data.data(), length)) {
         LOG(FATAL) << "Inconsistent data detected";
     }

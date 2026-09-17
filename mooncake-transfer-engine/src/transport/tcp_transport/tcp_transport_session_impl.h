@@ -921,8 +921,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 };
 
 struct TcpContext {
-    TcpContext(short port, ValidateAddrFn validate_addr)
-        : acceptor(io_context), validate_addr_(std::move(validate_addr)) {
+    TcpContext(TcpIoPool& pool, short port, ValidateAddrFn validate_addr)
+        : pool_(pool),
+          io_context(pool.context(0)),
+          acceptor(io_context),
+          validate_addr_(std::move(validate_addr)) {
         std::error_code ec;
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
 
@@ -950,21 +953,30 @@ struct TcpContext {
     }
 
     void doAccept() {
-        acceptor.async_accept([this](asio::error_code ec, tcpsocket socket) {
-            if (!ec) {
-                asio::error_code nodelay_ec;
-                socket.set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
-                auto socket_ptr =
-                    std::make_shared<tcpsocket>(std::move(socket));
-                auto session =
-                    std::make_shared<ServerSession>(socket_ptr, validate_addr_);
-                session->start();
-            }
-            doAccept();
-        });
+        // Round-robin each accepted connection onto a shard so ServerSession
+        // I/O spreads across io threads. The accept handler runs on shard 0
+        // (the acceptor's context); the accepted socket lives on the target
+        // shard, so start its session there.
+        acceptor.async_accept(
+            pool_.context(pool_.nextShardIndex()),
+            [this](asio::error_code ec, tcpsocket socket) {
+                if (!ec) {
+                    asio::error_code nodelay_ec;
+                    socket.set_option(asio::ip::tcp::no_delay(true),
+                                      nodelay_ec);
+                    auto socket_ptr =
+                        std::make_shared<tcpsocket>(std::move(socket));
+                    auto session = std::make_shared<ServerSession>(
+                        socket_ptr, validate_addr_);
+                    asio::post(socket_ptr->get_executor(),
+                               [session] { session->start(); });
+                }
+                doAccept();
+            });
     }
 
-    asio::io_context io_context;
+    TcpIoPool& pool_;
+    asio::io_context& io_context;
     asio::ip::tcp::acceptor acceptor;
     ValidateAddrFn validate_addr_;
 };

@@ -47,6 +47,12 @@ void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
 std::string EngineNameForDestAddr(
     const std::vector<TransferMetadata::BufferDesc>& buffers,
     const std::vector<std::string>& endpoints, uint64_t dest_addr) {
+    // A single-engine TE (embedded/standalone) publishes one endpoint at
+    // index 0, while buffer device_id is the logical NPU id and is often
+    // >= 1. That id is not an engine index.
+    if (endpoints.size() == 1) {
+        return endpoints.front();
+    }
     for (const auto& buf : buffers) {
         if (dest_addr < buf.addr || dest_addr - buf.addr >= buf.length) {
             continue;

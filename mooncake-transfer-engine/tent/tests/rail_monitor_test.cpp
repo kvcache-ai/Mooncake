@@ -316,6 +316,43 @@ TEST(RailMonitorRecoverTest, FindBestAfterRecovery) {
 // pause would expire in ~2s.
 // ---------------------------------------------------------------------------
 
+// Segment metadata is copy-on-write: a new Topology object with the same
+// NIC/memory wiring must not rebuild rail_states_ (that would reset
+// error_count) and must not treat the reload as a first-time config log.
+TEST(RailMonitorLoadTest, SameLayoutReloadPreservesErrorCount) {
+    auto local1 = makeSingleNicTopology("mlx5_0");
+    auto remote1 = makeSingleNicTopology("mlx5_1");
+    auto local2 = makeSingleNicTopology("mlx5_0");
+    auto remote2 = makeSingleNicTopology("mlx5_1");
+    Config cfg;
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local1, remote1, "", &cfg).ok());
+
+    rail.markFailed(0, 0);
+    rail.markFailed(0, 0);
+    EXPECT_TRUE(rail.available(0, 0))
+        << "Two failures are below the default threshold of 3";
+
+    ASSERT_TRUE(rail.load(local2, remote2, "", &cfg).ok());
+    rail.markFailed(0, 0);
+    EXPECT_FALSE(rail.available(0, 0))
+        << "COW snapshot refresh must not reset rail error_count";
+}
+
+TEST(RailMonitorLoadTest, DifferentLayoutRebuildsMapping) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote_old = makeSingleNicTopology("mlx5_1");
+    auto remote_new = makeSingleNicTopology("mlx5_2");
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote_old).ok());
+    for (int i = 0; i < 3; ++i) rail.markFailed(0, 0);
+    EXPECT_FALSE(rail.available(0, 0));
+
+    ASSERT_TRUE(rail.load(local, remote_new).ok());
+    EXPECT_TRUE(rail.available(0, 0))
+        << "A real topology change must rebuild rails from a clean state";
+}
+
 TEST(RailMonitorRecoverTest, CooldownDoesNotCarryOverAfterRecovery) {
     auto local = makeSingleNicTopology("mlx5_0");
     auto remote = makeSingleNicTopology("mlx5_1");

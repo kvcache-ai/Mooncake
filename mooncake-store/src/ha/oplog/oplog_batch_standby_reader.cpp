@@ -29,6 +29,26 @@ OpLogBatchStandbyReader::OpLogBatchStandbyReader(std::string cluster_id,
                                                  OpLogApplier& applier)
     : storage_(std::move(cluster_id), backend), applier_(applier) {}
 
+ErrorCode OpLogBatchStandbyReader::SetBaselineCursor(
+    const DurablePrefix& cursor) {
+    if ((cursor.batch_id == 0) != (cursor.last_seq == 0)) {
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+    const uint64_t expected = applier_.GetExpectedSequenceId();
+    if (expected == 0 || IsSequenceOlder(expected - 1, cursor.last_seq)) {
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+    batch_format_seen_ = true;
+    require_complete_history_ = cursor.batch_id == 0;
+    last_observed_prefix_ = cursor;
+    last_applied_durable_prefix_ = cursor;
+    last_applied_batch_id_ = cursor.batch_id;
+    last_scanned_batch_last_seq_ =
+        cursor.batch_id == 0 ? std::nullopt
+                             : std::optional<uint64_t>(cursor.last_seq);
+    return ErrorCode::OK;
+}
+
 OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     size_t max_batches) {
     OpLogBatchStandbyPollResult result;
@@ -99,15 +119,24 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         return result;
     }
     for (const auto& batch : batches) {
-        if (last_scanned_batch_last_seq_ &&
-            (last_applied_batch_id_ == UINT64_MAX ||
-             batch.batch_id != last_applied_batch_id_ + 1)) {
+        if (last_applied_batch_id_ == UINT64_MAX ||
+            (last_applied_batch_id_ != 0 &&
+             batch.batch_id != last_applied_batch_id_ + 1) ||
+            (last_applied_batch_id_ == 0 && require_complete_history_ &&
+             batch.batch_id != 1)) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
             return result;
         }
-        if (last_scanned_batch_last_seq_ &&
-            (*last_scanned_batch_last_seq_ == UINT64_MAX ||
-             batch.first_seq != *last_scanned_batch_last_seq_ + 1)) {
+        const std::optional<uint64_t> expected_first_seq =
+            last_scanned_batch_last_seq_
+                ? std::optional<uint64_t>(
+                      *last_scanned_batch_last_seq_ == UINT64_MAX
+                          ? 0
+                          : *last_scanned_batch_last_seq_ + 1)
+                : (require_complete_history_ ? std::optional<uint64_t>(1)
+                                             : std::nullopt);
+        if (expected_first_seq && (*expected_first_seq == 0 ||
+                                   batch.first_seq != *expected_first_seq)) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
             return result;
         }

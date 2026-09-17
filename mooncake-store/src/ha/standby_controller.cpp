@@ -246,7 +246,37 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             return tl::unexpected(promote_error);
         }
 
-        // Atomic promote + export (final catch-up happens inside)
+        if (standby_service_->IsBatchOpLogSnapshotMode()) {
+            auto handoff = standby_service_->PromoteAndDetachBatchOpLogStore();
+            if (!handoff) {
+                standby_service_->Stop();
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    standby_running_ = false;
+                    last_standby_error_ = handoff.error();
+                }
+                NotifyRuntimeStateIfChanged();
+                return tl::unexpected(handoff.error());
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                standby_running_ = false;
+                last_standby_error_ = ErrorCode::OK;
+            }
+            NotifyRuntimeStateIfChanged();
+
+            PromotionContext ctx;
+            ctx.applied_seq_id = handoff->applied_cursor.last_seq;
+            ctx.metadata_store = std::move(handoff->metadata_store);
+            ctx.segments = std::move(handoff->segments);
+            ctx.applied_cursor = handoff->applied_cursor;
+            ctx.producer_view_version = handoff->producer_view_version;
+            ctx.max_replica_id = handoff->max_replica_id;
+            return ctx;
+        }
+
+        // Atomic legacy promote + export (final catch-up happens inside).
         StandbySnapshot snapshot;
         ErrorCode err = standby_service_->PromoteAndExportSnapshot(snapshot);
         if (err != ErrorCode::OK) {

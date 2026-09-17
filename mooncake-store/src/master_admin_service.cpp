@@ -21,6 +21,7 @@
 #include "master_metric_manager.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -501,6 +502,20 @@ void MasterAdminServer::HandleHealth(coro_http::coro_http_request&,
     WriteJsonResponse(resp, coro_http::status_type::ok, payload);
 }
 
+struct HttpVersionResponse {
+    std::string version;
+    std::string display_version;
+};
+YLT_REFL(HttpVersionResponse, version, display_version);
+
+void MasterAdminServer::HandleVersion(coro_http::coro_http_request&,
+                                      coro_http::coro_http_response& resp) {
+    WriteJsonResponse(
+        resp, coro_http::status_type::ok,
+        HttpVersionResponse{.version = GetMooncakeStoreVersion(),
+                            .display_version = MOONCAKE_DISPLAY_VERSION});
+}
+
 struct HttpLeaderResponse {
     bool present{false};
     std::optional<std::string> leader_address;
@@ -583,10 +598,10 @@ struct HttpKvEventsStatusResponse {
     uint64_t published_batches{0};
     uint64_t published_events{0};
     uint64_t dropped_events{0};
-    uint64_t skipped_unparsed_keys{0};
+    uint64_t skipped_keyless_events{0};
 };
 YLT_REFL(HttpKvEventsStatusResponse, enabled, published_batches,
-         published_events, dropped_events, skipped_unparsed_keys);
+         published_events, dropped_events, skipped_keyless_events);
 
 void MasterAdminServer::HandleKvEventsStatus(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
@@ -598,7 +613,7 @@ void MasterAdminServer::HandleKvEventsStatus(
             payload.published_batches = stats.published_batches;
             payload.published_events = stats.published_events;
             payload.dropped_events = stats.dropped_events;
-            payload.skipped_unparsed_keys = stats.skipped_unparsed_keys;
+            payload.skipped_keyless_events = stats.skipped_keyless_events;
             WriteJsonResponse(resp, coro_http::status_type::ok, payload);
         });
 }
@@ -1217,6 +1232,10 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/health", [this](coro_http_request& req, coro_http_response& resp) {
             HandleHealth(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/version", [this](coro_http_request& req, coro_http_response& resp) {
+            HandleVersion(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/role", [this](coro_http_request& req, coro_http_response& resp) {

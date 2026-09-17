@@ -1,8 +1,8 @@
 name: Pre-Release
 
-# Build the same core wheel matrix as the stable release workflows, publish the
-# exact artifacts to TestPyPI, then consume them in smoke and T-one tests.
-# No production PyPI or GitHub Release publication happens here.
+# Build the same core wheel matrix as the stable release workflows and attach
+# the artifacts to a GitHub Pre-release. Also publish the exact artifacts to
+# TestPyPI, then consume them in smoke and T-one tests. No production PyPI upload.
 on:
   push:
     tags:
@@ -74,6 +74,32 @@ jobs:
       architecture: ${{ matrix.architecture }}
       artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.package_version }}
+
+  publish-github-release:
+    name: Upload wheels to GitHub Pre-release
+    needs: build
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: pre-release-github-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Download all pre-release wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-release
+          pattern: mooncake-wheel*pre-release*
+          merge-multiple: true
+
+      - name: Upload wheels to GitHub Pre-release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: true
+          make_latest: false
+          files: mooncake-wheel/dist-release/*.whl
+          fail_on_unmatched_files: true
 
   publish-testpypi:
     name: Validate and publish wheels to TestPyPI

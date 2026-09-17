@@ -68,6 +68,8 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleHealth(coro_http::coro_http_request& req,
                       coro_http::coro_http_response& resp);
+    void HandleVersion(coro_http::coro_http_request& req,
+                       coro_http::coro_http_response& resp);
     void HandleRole(coro_http::coro_http_request& req,
                     coro_http::coro_http_response& resp);
     void HandleHaStatus(coro_http::coro_http_request& req,

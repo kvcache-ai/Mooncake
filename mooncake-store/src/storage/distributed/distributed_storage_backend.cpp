@@ -3,9 +3,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <limits>
-#include <sstream>
 
-#include "environ.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "types.h"
 #include "utils.h"
@@ -34,126 +32,6 @@ bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
 }
 
 }  // namespace
-
-bool DistributedStorageConfig::Validate() const {
-    if (fsdir.empty()) {
-        LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
-        return false;
-    }
-    if (!std::filesystem::path(fsdir).is_absolute()) {
-        LOG(ERROR)
-            << "DistributedStorageConfig: fsdir must be an absolute path: "
-            << fsdir;
-        return false;
-    }
-    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix") {
-        LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
-                   << fs_adapter_type;
-        return false;
-    }
-    if (shard_count <= 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
-        return false;
-    }
-    if (shard_capacity == 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must > 0";
-        return false;
-    }
-    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
-        LOG(ERROR) << "DistributedStorageConfig: alignment must be power of 2";
-        return false;
-    }
-    if (shard_capacity % alignment != 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must align";
-        return false;
-    }
-    if (!single_tenant) {
-        LOG(ERROR) << "DistributedStorageConfig: Currently, DFS requires "
-                      "single_tenant=true";
-        return false;
-    }
-    return true;
-}
-
-bool DistributedStorageConfig::ValidateForAllocator() const {
-    if (!Validate()) return false;
-
-    if (eviction_low_watermark < 0.0 || eviction_low_watermark > 1.0 ||
-        eviction_high_watermark < 0.0 || eviction_high_watermark > 1.0 ||
-        eviction_low_watermark >= eviction_high_watermark) {
-        LOG(ERROR) << "DistributedStorageConfig: eviction watermarks must "
-                      "satisfy 0 <= low < high <= 1, low="
-                   << eviction_low_watermark
-                   << ", high=" << eviction_high_watermark;
-        return false;
-    }
-    if (deferred_free_duration.count() < 0) {
-        LOG(ERROR) << "DistributedStorageConfig: deferred_free_duration must "
-                      "be non-negative, seconds="
-                   << deferred_free_duration.count();
-        return false;
-    }
-    if (eviction_enabled && eviction_check_interval.count() <= 0) {
-        LOG(ERROR) << "DistributedStorageConfig: eviction_check_interval must "
-                      "be positive when eviction is enabled, seconds="
-                   << eviction_check_interval.count();
-        return false;
-    }
-    return true;
-}
-
-DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
-    DistributedStorageConfig config;
-    config.fsdir = Environ::GetString(
-        "MOONCAKE_DFS_ROOT_DIR",
-        Environ::GetString("MOONCAKE_DISTRIBUTED_ROOT_DIR", config.fsdir));
-    if (!std::filesystem::path(config.fsdir).is_absolute()) {
-        config.fsdir = std::filesystem::absolute(config.fsdir).string();
-    }
-    config.fs_adapter_type =
-        Environ::GetString("MOONCAKE_DFS_FS_ADAPTER",
-                           Environ::GetString("MOONCAKE_DISTRIBUTED_FS_TYPE",
-                                              config.fs_adapter_type));
-    config.enable_health_check =
-        Environ::GetBool("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", false);
-    config.shard_count =
-        Environ::GetInt("MOONCAKE_DFS_SHARD_COUNT", config.shard_count);
-    config.shard_capacity = Environ::GetUInt64("MOONCAKE_DFS_SHARD_CAPACITY",
-                                               config.shard_capacity);
-    config.alignment =
-        Environ::GetUInt64("MOONCAKE_DFS_ALIGNMENT", config.alignment);
-    config.single_tenant =
-        Environ::GetBool("MOONCAKE_DFS_SINGLE_TENANT", config.single_tenant);
-    config.eviction_enabled = Environ::GetBool("MOONCAKE_DFS_EVICTION_ENABLED",
-                                               config.eviction_enabled);
-    config.eviction_high_watermark = Environ::GetDouble(
-        "MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", config.eviction_high_watermark);
-    config.eviction_low_watermark = Environ::GetDouble(
-        "MOONCAKE_DFS_EVICTION_LOW_WATERMARK", config.eviction_low_watermark);
-    config.deferred_free_duration = std::chrono::seconds(Environ::GetInt(
-        "MOONCAKE_DFS_DEFERRED_FREE_SECONDS",
-        static_cast<int>(config.deferred_free_duration.count())));
-    config.eviction_check_interval = std::chrono::seconds(Environ::GetInt(
-        "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
-        static_cast<int>(config.eviction_check_interval.count())));
-    return config;
-}
-
-std::string DistributedStorageConfig::FormatStr() const {
-    std::ostringstream oss;
-    oss << "fsdir=" << fsdir << ", fs_adapter_type=" << fs_adapter_type
-        << ", enable_health_check=" << enable_health_check
-        << ", shard_count=" << shard_count
-        << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment
-        << ", single_tenant=" << single_tenant
-        << ", eviction_enabled=" << eviction_enabled
-        << ", eviction_high_watermark=" << eviction_high_watermark
-        << ", eviction_low_watermark=" << eviction_low_watermark
-        << ", deferred_free_seconds=" << deferred_free_duration.count()
-        << ", eviction_check_interval_seconds="
-        << eviction_check_interval.count();
-    return oss.str();
-}
 
 DistributedStorageBackend::DistributedStorageBackend(
     const FileStorageConfig& file_storage_config,

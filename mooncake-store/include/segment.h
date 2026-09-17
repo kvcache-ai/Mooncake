@@ -450,8 +450,8 @@ class SegmentManager {
         return usage_tracker_->GetUsage();
     }
 
-    void initializeCxlAllocator(const std::string& cxl_path,
-                                const size_t cxl_size);
+    ErrorCode initializeCxlAllocator(const std::string& cxl_path,
+                                     size_t cxl_size);
 
     // Endpoint-based segment queries (for standby restore)
     bool HasSegmentByEndpoint(const std::string& endpoint) const;

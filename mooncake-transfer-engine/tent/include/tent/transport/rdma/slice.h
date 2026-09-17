@@ -107,15 +107,41 @@ struct RdmaSlice {
     std::weak_ptr<RdmaEndPoint> ep_weak_ptr;
     TransferStatusEnum word = TransferStatusEnum::INITIAL;
     int qp_index = 0;
+    // Worker lane that enqueued this slice: the one whose inflight_slice_set
+    // holds it. Whichever lane later sweeps the slice off a queue pair must
+    // hand the set entry back to this one -- with qp_pools several lanes can
+    // share a queue pair, so the sweeper is often somebody else. -1 until
+    // Workers::submit() picks a lane. Atomic because a retry re-points it to
+    // the lane that re-queued the slice (Workers::submitFromTick) while the
+    // lane it is leaving may still hold a set entry it has not drained, and
+    // reads that entry to route the removal home.
+    std::atomic<int> owner_worker{-1};
+    // Worker lane whose inflight_slices counts this slice, -1 while none
+    // does. Each accounting the slice carries names the counter it sits in,
+    // so whichever path takes it out -- its own completion, another lane's
+    // sweep of the queue pair they share, the timeout pass that finds it
+    // already terminal -- exchanges the field for -1 and pays back exactly
+    // what it read; a second path reads -1 and does nothing. Usually the
+    // owner lane, but a retry moves the count in one exchange
+    // (Workers::submitFromTick) while the old set entry drains later.
+    std::atomic<int> counted_lane{-1};
     int retry_count = 0;
     // Flat (source,target) combination index last tried by
     // selectFallbackDevice; the next fallback resumes just past it so retries
     // rotate through all combinations with wraparound instead of hammering one.
     int last_fallback_idx = -1;
     bool failed = false;
-    // True while DeviceSelector accounts this slice against source_dev_id.
-    // The worker clears it exactly once on completion, failure, or cancel.
-    bool quota_charged = false;
+    // Device DeviceSelector accounts this slice against, -1 while none.
+    // Same discipline as counted_lane: whoever releases the charge --
+    // completion, failure, timeout or cancel -- exchanges it for -1 and
+    // pays that device, so a fallback that has already rewritten
+    // source_dev_id cannot misdirect the release. Atomic because on a pooled
+    // QP the timeout sweep and the CQ poller run on different workers.
+    std::atomic<int> charged_dev{-1};
+    // Device whose posted backlog counts this slice: set when the work
+    // request reaches the hardware, -1 again once the slice leaves the queue
+    // pair. A charged slice waiting in a worker queue is not posted.
+    std::atomic<int> posted_dev{-1};
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
     // Non-owning pointer to the per-worker RailMonitor for this slice's

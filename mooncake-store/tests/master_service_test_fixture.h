@@ -163,6 +163,39 @@ class MasterServiceTest : public ::testing::Test {
         return std::nullopt;
     }
 
+    // Exposes the private medium-normalization helpers to test bodies: the
+    // fixture is a friend of MasterService, but the classes gtest derives from
+    // it are not, so TEST_F cannot reach them without this hop.
+    std::optional<std::vector<std::string>> KvMediaForKey(
+        MasterService& service, const std::string& key,
+        const TenantId& tenant_id = TenantId::Default()) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, service.MakeObjectIdentityForRequest(key, tenant_id));
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+        return MasterService::KvMediaForMetadata(accessor.Get());
+    }
+
+    std::optional<std::vector<std::string>> KvRemovalMediaForKey(
+        MasterService& service, const std::string& key,
+        const TenantId& tenant_id = TenantId::Default()) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, service.MakeObjectIdentityForRequest(key, tenant_id));
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+        return MasterService::KvMediaForRemoval(accessor.Get());
+    }
+
+    // Lets a test line up a key with a shard the RemoveAll scan has already
+    // passed, which is the only way to reproduce the commit/clear ordering race
+    // deterministically.
+    size_t ShardIndexForKey(MasterService& service, const std::string& key,
+                            const TenantId& tenant_id = TenantId::Default()) {
+        return service.getShardIndex(tenant_id, key);
+    }
+
     void UpsertSoftPinDeadlineIndexForTest(
         MasterService& service, const std::string& key, size_t shard_idx,
         const std::chrono::system_clock::time_point& deadline,

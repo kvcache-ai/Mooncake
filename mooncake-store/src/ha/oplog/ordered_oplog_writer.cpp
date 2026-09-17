@@ -268,6 +268,20 @@ OrderedOpLogWriter::GetTerminalState() const {
     return impl_->terminal_state;
 }
 
+void OrderedOpLogWriter::SetTerminalCallback(TerminalCallback callback) {
+    std::optional<OrderedOpLogWriterTerminalState> terminal;
+    TerminalCallback notify;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->terminal_callback = std::move(callback);
+        notify = impl_->terminal_callback;
+        terminal = impl_->terminal_state;
+    }
+    if (terminal && notify) {
+        notify(*terminal);
+    }
+}
+
 void OrderedOpLogWriter::Start() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->running || impl_->stop_requested) {

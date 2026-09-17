@@ -536,7 +536,7 @@ class Buffer:
             (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x,
             packed_recv_count,
             handle,
-            EventOverlap(event, tensors_to_record if async_finish else None),
+            EventOverlap(event, tensors_to_record if async_finish or return_recv_hook else None),
             hook,
         )
 
@@ -677,7 +677,7 @@ class Buffer:
         )
         return (
             combined_x,
-            EventOverlap(event, tensors_to_record if async_finish else None),
+            EventOverlap(event, tensors_to_record if async_finish or return_recv_hook else None),
             hook,
         )
 
