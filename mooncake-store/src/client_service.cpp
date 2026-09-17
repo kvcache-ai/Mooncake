@@ -39,6 +39,7 @@
 #include "types.h"
 #include "client_buffer.h"
 #include "common/network.h"
+#include "config/client_host_identity_config.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "config/client_auto_discovery_config.h"
@@ -396,7 +397,8 @@ Client::Client(const std::string& local_hostname,
                      metrics_ ? &metrics_->master_client_metric : nullptr,
                      tenant_id),
       local_hostname_(local_hostname),
-      host_id_(ResolveMooncakeHostId(local_hostname)),
+      host_id_(
+          ClientHostIdentityConfig::FromEnvironment(local_hostname).host_id),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
@@ -2508,7 +2510,7 @@ void Client::healDanglingLocalDiskBatchStarts(
             }
             continue;
         }
-        op.replicas = retry_responses[r].value();
+        op.replicas = std::move(retry_responses[r].value());
         op.RecordAllocatedReplicas();
         if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
             op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2590,7 +2592,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start put operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2680,7 +2682,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start upsert operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,

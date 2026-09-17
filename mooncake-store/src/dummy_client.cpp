@@ -183,6 +183,10 @@ constexpr bool can_invoke_when_disconnected() {
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     auto pool = client_accessor_.GetClientPool();
 
     if constexpr (!can_invoke_when_disconnected<ServiceMethod>()) {
@@ -216,6 +220,11 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<ResultType, ErrorCode>>(
+            input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+    }
     auto pool = client_accessor_.GetClientPool();
     if (!connected_.load()) {
         LOG(ERROR) << "Dummy Client not connected";
@@ -266,7 +275,28 @@ DummyClient::DummyClient()
     mooncake::init_ylt_log_level();
 }
 
-DummyClient::~DummyClient() { tearDownAll(); }
+DummyClient::~DummyClient() {
+    // Teardown-order invariant (review #3943): an in-flight RPC never touches
+    // the members tearDownAll() resets. The RPC path holds a ScopedCall
+    // across the whole round trip and otherwise touches only the client pool
+    // (kept alive process-wide by the registry), atomic flags like
+    // connected_, by-value arguments, and the drain's shared State.
+    // shm_helper_, the registered-buffer tables, the local/hot-cache mappings
+    // and the ping thread are only ever accessed synchronously on caller
+    // threads, outside the drain's scope; a caller racing ~DummyClient is a
+    // usage-level data race no teardown order can fix.
+    //
+    // The reverse order is impossible: unregister_shm() is itself an RPC and
+    // the ping thread is only joined inside tearDownAll(), so draining first
+    // would reject the unmap and spin the reconnection loop for the whole
+    // wait (#3943 review).
+    tearDownAll();
+    // Never release the pool under a suspended request coroutine (#3909).
+    if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "DummyClient teardown: RPCs still in flight after 30s "
+                      "drain; releasing the pool regardless";
+    }
+}
 
 void DummyClient::ObserveTransferMetric(TransferOperationKind kind,
                                         const char* op_name, size_t bytes,
@@ -926,7 +956,17 @@ int DummyClient::unregister_device_buffer_for_reconnect(void* buffer) {
 
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         static_cast<uint64_t>(buffer_addr), client_id_);
-    if (ret.has_value()) registered_device_buffers_.erase(buffer_addr);
+    // Same contract as unregister_buffer: the receiver removes the mapping on
+    // INTERNAL_ERROR too (unmapped, or quarantined when the SPDK or transfer
+    // engine unregister fails), and INVALID_PARAMS means the server has no such
+    // mapping, so drop the local bookkeeping then; keep it on RPC_FAIL /
+    // RPC_TIMEOUT where the server may not have run (see unregister_buffer).
+    // No extra locking here: the function-scope lock above is already held.
+    if (ret.has_value() ||
+        (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
+                              ret.error() == ErrorCode::INVALID_PARAMS))) {
+        registered_device_buffers_.erase(buffer_addr);
+    }
     return to_py_ret(ret);
 }
 
@@ -1015,14 +1055,20 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         }
         size = align_up(size, alignment);
     }
-    // Check bounds
+    // Check bounds. The buffer must be the segment base and the size must match
+    // either the caller's original request (ShmSegment::requested_size) or the
+    // padded mapping size (shm->size, aligned up to the hugepage/2MB boundary
+    // for SPDK registration). Both are valid: IPC always sends shm->size, and
+    // legacy callers may pass the padded size directly.
     if (reinterpret_cast<uint8_t*>(buffer) !=
             reinterpret_cast<uint8_t*>(shm->base_addr) ||
-        size != shm->size) {
+        (size != shm->requested_size && size != shm->size)) {
         LOG(ERROR) << "Invalid buffer address or size for registration: "
                       "Buffer addr: "
                    << buffer << ", need addr: " << shm->base_addr
-                   << ", buffer size: " << size << ", need size: " << shm->size;
+                   << ", buffer size: " << size
+                   << ", need size: " << shm->requested_size
+                   << " (padded: " << shm->size << ")";
         return -1;
     }
 
@@ -1096,7 +1142,20 @@ int DummyClient::unregister_buffer(void* buffer) {
     }
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         reinterpret_cast<uint64_t>(buffer), client_id_);
-    if (ret.has_value()) {
+    // INTERNAL_ERROR means the receiver still executed the teardown and removed
+    // the segment from its active mappings: it unmaps normally, or -- when the
+    // SPDK or transfer engine unregister fails -- quarantines the mapping
+    // (retained, never reused for new registrations). Either way the old
+    // mapping is no longer usable on the receiver, so drop the local flag for
+    // INTERNAL_ERROR and for INVALID_PARAMS (server has no such mapping). Keep
+    // it on RPC_FAIL / RPC_TIMEOUT: the RPC may never have reached the server,
+    // or the receiver may have refused before touching anything (Ascend context
+    // setup failure in unregister_shm_buffer_internal returns RPC_FAIL for
+    // exactly that reason), so the mapping can still be alive and a retry must
+    // reach the receiver.
+    if (ret.has_value() ||
+        (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
+                              ret.error() == ErrorCode::INVALID_PARAMS))) {
         shm->registered = false;
     }
     return to_py_ret(ret);

@@ -18,6 +18,8 @@ add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
 target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 if(USE_TENT)
+  # Match the compatibility shim public class definition and enable the
+  # MC_USE_TENT regression cases in transport_uint_test.cpp.
   target_compile_definitions(transport_uint_test PRIVATE USE_TENT)
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
@@ -416,6 +418,12 @@ target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
                                                              gtest gtest_main)
 add_test(NAME rdma_transport_submit_task_test
          COMMAND rdma_transport_submit_task_test)
+
+add_executable(rdma_buffer_range_index_test
+               ${WORKSPACE}/rdma_buffer_range_index_test.cpp)
+target_link_libraries(rdma_buffer_range_index_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+add_test(NAME rdma_buffer_range_index_test COMMAND rdma_buffer_range_index_test)
 
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)

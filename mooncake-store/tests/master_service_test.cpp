@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
 
 #include <glog/logging.h>
@@ -26,7 +27,6 @@
 
 #include "tenant_quota_policy_store.h"
 #include "types.h"
-#include "common/network.h"
 #include "master_service_test_fixture.h"
 
 namespace mooncake::test {
@@ -303,16 +303,18 @@ TEST_F(MasterServiceTest, SoftPinDeadlineCalculationSaturatesAtMaximum) {
     using Clock = std::chrono::system_clock;
 
     const auto normal_now = Clock::time_point(std::chrono::seconds(10));
-    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now, 25),
+    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now,
+                                            std::chrono::milliseconds(25)),
               normal_now + std::chrono::milliseconds(25));
-    EXPECT_EQ(ComputeSoftPinDeadlineForTest(
-                  normal_now, std::numeric_limits<uint64_t>::max()),
+    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now,
+                                            std::chrono::milliseconds::max()),
               Clock::time_point::max());
 
     const auto near_max =
         Clock::time_point::max() - std::chrono::milliseconds(5);
-    EXPECT_EQ(ComputeSoftPinDeadlineForTest(near_max, 10),
-              Clock::time_point::max());
+    EXPECT_EQ(
+        ComputeSoftPinDeadlineForTest(near_max, std::chrono::milliseconds(10)),
+        Clock::time_point::max());
 }
 
 #ifdef USE_NOF
@@ -738,7 +740,7 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
 // key belongs to, commit there, and the clear must be withheld.
 TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
     MasterService service;
-    service.SetKvTenantEpochTrackingForTesting(true);
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
@@ -754,41 +756,44 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
 
     const size_t racer_shard = ShardIndexForKey(service, "racer_key");
     bool committed = false;
-    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
-        // Commit exactly once, immediately after the scan releases the shard
-        // the new key hashes to, so the scan can never observe it.
-        if (shard != racer_shard || committed) {
-            return;
-        }
-        committed = true;
-        ASSERT_TRUE(service
-                        .PutStart(context.client_id, "racer_key",
-                                  TenantId::Default(), 1024, config)
-                        .has_value());
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "racer_key",
-                                TenantId::Default(), ReplicaType::ALL)
-                        .has_value());
-    });
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
+        [&](size_t shard) {
+            // Commit exactly once, immediately after the scan releases the
+            // shard the new key hashes to, so the scan can never observe it.
+            if (shard != racer_shard || committed) {
+                return;
+            }
+            committed = true;
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, "racer_key",
+                                      TenantId::Default(), 1024, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, "racer_key",
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        });
 
     service.RemoveAll(true);
-    service.SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     auto exists = service.ExistKey("racer_key", TenantId::Default());
     ASSERT_TRUE(exists.has_value());
     EXPECT_TRUE(exists.value()) << "the raced commit must still be live";
 
-    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
+    EXPECT_EQ(0u,
+              MasterServiceTestPeer(service).GetKvClearedPublishedForTesting())
         << "a clear here would retract racer_key, which was just announced";
-    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+    EXPECT_EQ(
+        1u, MasterServiceTestPeer(service).GetKvClearedSuppressedForTesting());
 }
 
 // The mirror image: with no concurrent commit the epoch is unchanged, so the
 // clear must still go out. Without this the fix could pass by never publishing.
 TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
     MasterService service;
-    service.SetKvTenantEpochTrackingForTesting(true);
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
@@ -804,8 +809,10 @@ TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
 
     service.RemoveAll(true);
 
-    EXPECT_EQ(1u, service.GetKvClearedPublishedForTesting());
-    EXPECT_EQ(0u, service.GetKvClearedSuppressedForTesting());
+    EXPECT_EQ(1u,
+              MasterServiceTestPeer(service).GetKvClearedPublishedForTesting());
+    EXPECT_EQ(
+        0u, MasterServiceTestPeer(service).GetKvClearedSuppressedForTesting());
 }
 
 // The tenant-scoped overload reads the epoch before its scan instead of at
@@ -813,7 +820,7 @@ TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
 // rule.
 TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
     MasterService service;
-    service.SetKvTenantEpochTrackingForTesting(true);
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
@@ -829,27 +836,30 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
 
     const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
     bool committed = false;
-    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
-        if (shard != racer_shard || committed) {
-            return;
-        }
-        committed = true;
-        ASSERT_TRUE(service
-                        .PutStart(context.client_id, "scoped_racer",
-                                  TenantId::Default(), 1024, config)
-                        .has_value());
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "scoped_racer",
-                                TenantId::Default(), ReplicaType::ALL)
-                        .has_value());
-    });
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
+        [&](size_t shard) {
+            if (shard != racer_shard || committed) {
+                return;
+            }
+            committed = true;
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, "scoped_racer",
+                                      TenantId::Default(), 1024, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, "scoped_racer",
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        });
 
     service.RemoveAll(TenantId::Default(), true);
-    service.SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
-    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting());
-    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+    EXPECT_EQ(0u,
+              MasterServiceTestPeer(service).GetKvClearedPublishedForTesting());
+    EXPECT_EQ(
+        1u, MasterServiceTestPeer(service).GetKvClearedSuppressedForTesting());
 }
 
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
@@ -972,62 +982,6 @@ TEST_F(MasterServiceTest, TenantScopedPutsAndRemovesUpdateGlobalKeyCount) {
 
     ASSERT_TRUE(service_->Remove(key, tenant_b, /*force=*/true).has_value());
     EXPECT_EQ(service_->GetKeyCount(), 0u);
-}
-
-TEST_F(MasterServiceTest,
-       ResolveMooncakeHostIdUsesLocalHostnameAndRejectsLoopback) {
-    ScopedEnvVar host_id("MOONCAKE_HOST_ID");
-
-    EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
-    EXPECT_EQ(ResolveMooncakeHostId("hostB:5001"), "hostB");
-    EXPECT_EQ(ResolveMooncakeHostId("[2001:db8::1]:5000"), "2001:db8::1");
-    EXPECT_TRUE(ResolveMooncakeHostId("localhost:5000").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("127.0.0.1:5000").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("0.0.0.0:5000").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("::1").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("[::1]:5000").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("::").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("[::]").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("[::]:5000").empty());
-}
-
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdPrefersDeploymentOverride) {
-    ScopedEnvVar host_id("MOONCAKE_HOST_ID", "  kubernetes-node-a  ");
-
-    EXPECT_EQ(ResolveMooncakeHostId("10.244.1.17:5000"), "kubernetes-node-a");
-}
-
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdNormalizesEndpointOverride) {
-    ScopedEnvVar host_id("MOONCAKE_HOST_ID", "  kubernetes-node-a:5000  ");
-
-    EXPECT_EQ(ResolveMooncakeHostId("10.244.1.17:5000"), "kubernetes-node-a");
-}
-
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdFallsBackForEmptyOverride) {
-    {
-        ScopedEnvVar host_id("MOONCAKE_HOST_ID", "");
-        EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
-    }
-
-    {
-        ScopedEnvVar host_id("MOONCAKE_HOST_ID", " \t ");
-        EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
-    }
-}
-
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdRejectsInvalidOverride) {
-    const std::vector<const char*> invalid_host_ids = {
-        "localhost",  "localhost:5000",
-        "127.0.0.1",  "127.0.0.1:5000",
-        "0.0.0.0",    "0.0.0.0:5000",
-        "::1",        "[::1]",
-        "[::1]:5000", "::",
-        "[::]",       "[::]:5000"};
-    for (const char* invalid_host_id : invalid_host_ids) {
-        ScopedEnvVar host_id("MOONCAKE_HOST_ID", invalid_host_id);
-        EXPECT_TRUE(ResolveMooncakeHostId("hostB:5000").empty())
-            << invalid_host_id;
-    }
 }
 
 TEST_F(MasterServiceTest, MasterConfigParsesLocalFirstStrategy) {
@@ -1736,13 +1690,110 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     const size_t buckets_before = MetadataBucketCount(*service_, target_shard);
     ASSERT_GT(buckets_before, kShrinkMinBucketCount);
 
-    service_->RunBatchEvictForTesting(1.0, 1.0);
+    MasterServiceTestPeer(*service_).RunBatchEvictForTesting(1.0, 1.0);
 
     const size_t buckets_after = MetadataBucketCount(*service_, target_shard);
     ASSERT_GT(buckets_after, 0u);
     // Without the post-eviction shrink the bucket array would still sit at
     // its high-water mark and this assertion would fail.
     EXPECT_LT(buckets_after, buckets_before / 2);
+}
+
+TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
+    // Regression for the lease-expire / client-offboarding delete path.
+    // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
+    // keys from a shared tenant; erase() never returns bucket memory, so a
+    // tenant that loses most (but not all) of its keys would keep its
+    // high-water bucket array forever and RSS would never drop. The shrink
+    // pass at the end of ClearStaleHandles mirrors the one in BatchEvict.
+    auto service = std::make_unique<MasterService>();
+    PauseReplicaCleanup(*service);
+
+    constexpr size_t kSegmentSize = 1024 * 1024 * 128;
+    const std::string stale_segment_name = "clear_shrink_stale_segment";
+    const std::string live_segment_name = "clear_shrink_live_segment";
+    const auto stale_segment = PrepareSimpleSegment(
+        *service, stale_segment_name, 0x300000000, kSegmentSize);
+    const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
+                                                   0x400000000, kSegmentSize);
+
+    // Gather keys on one shard so its metadata map grows past the shrink
+    // floor; spreading them across all 1024 shards would leave each map tiny.
+    const size_t target_shard =
+        MetadataShardIndex(*service, "clear_shrink_key_0");
+    // A few live keys keep the shared tenant alive after the sweep (partial
+    // drain, not full erase); the rest are swept and must trigger a shrink.
+    constexpr size_t kLiveKeys = 128;
+    constexpr size_t kTotalKeys = 2 * kShrinkMinBucketCount;
+
+    std::vector<std::string> stale_keys;
+    std::vector<std::string> live_keys;
+    for (size_t i = 0; stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
+        ASSERT_LT(i, 5000000u)
+            << "could not gather enough keys on shard " << target_shard;
+        const std::string key = "clear_shrink_key_" + std::to_string(i);
+        if (MetadataShardIndex(*service, key) != target_shard) {
+            continue;
+        }
+
+        const bool on_live = live_keys.size() < kLiveKeys;
+        const UUID& client_id =
+            on_live ? live_segment.client_id : stale_segment.client_id;
+        const std::string& segment_name =
+            on_live ? live_segment_name : stale_segment_name;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {segment_name};
+
+        ASSERT_TRUE(
+            service->PutStart(client_id, key, TenantId::Default(), 1024, config)
+                .has_value())
+            << "key=" << key;
+        ASSERT_TRUE(service
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value())
+            << "key=" << key;
+        (on_live ? live_keys : stale_keys).push_back(key);
+    }
+    ASSERT_GT(stale_keys.size(), live_keys.size());
+
+    const size_t buckets_before = MetadataBucketCount(*service, target_shard);
+    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
+
+    // Unmount the stale segment, then sweep inline. The tenant survives
+    // because the live segment still holds keys, so the metadata map is only
+    // partially drained — exactly the case that leaks bucket memory without
+    // the shrink.
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    // GetKeyCount counts physical metadata, so it distinguishes "swept" from
+    // "merely hidden by the unmount".
+    EXPECT_EQ(live_keys.size(), service->GetKeyCount());
+
+    const size_t buckets_after = MetadataBucketCount(*service, target_shard);
+    ASSERT_GT(buckets_after, 0u);
+    // Without the post-sweep shrink the bucket array would stay at its
+    // high-water mark and this assertion would fail.
+    EXPECT_LT(buckets_after, buckets_before / 2);
+    // The shrunk map must still be large enough to hold every live key.
+    EXPECT_GE(buckets_after, live_keys.size());
+
+    for (const auto& key : live_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(get_result.has_value()) << "key=" << key << " was swept";
+        ASSERT_EQ(1u, get_result->replicas.size()) << "key=" << key;
+    }
+    for (const auto& key : stale_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get_result.has_value()) << "key=" << key;
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error())
+            << "key=" << key;
+    }
 }
 
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {
