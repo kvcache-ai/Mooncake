@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 namespace mooncake::adaptive_cc {
 
@@ -125,6 +126,10 @@ class DomainState {
     std::atomic<uint64_t> probe_failures_{0};
     std::atomic<uint64_t> probe_epoch_{0};
     std::atomic<bool> poller_stalled_{false};
+
+    std::mutex probe_mutex_;
+    uint64_t active_probe_permits_ = 0;
+    bool probe_draining_ = false;
 
     uint32_t high_pressure_streak_ = 0;
     uint32_t low_pressure_streak_ = 0;

@@ -381,6 +381,205 @@ TEST(AdaptiveCongestionControlTest, QuarantineProbesThenRecovers) {
     EXPECT_EQ(snapshot(route).window_bytes, 64u);
 }
 
+TEST(AdaptiveCongestionControlTest, ProbeSuccessWaitsForInflightResults) {
+    Config config = testConfig();
+    config.hard_error_threshold = 1;
+    DomainState device(config);
+    DomainState route(config);
+    Signals fatal;
+    fatal.fatal_failures = 1;
+    recordCurrent(route, fatal);
+    controlTick(route, 1'000);
+    controlTick(route, 11'000);
+    ASSERT_EQ(snapshot(route).state, PathState::kProbing);
+
+    Permit first;
+    Permit second;
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 8, first), Decision::kAllow);
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 8, second), Decision::kAllow);
+
+    ASSERT_TRUE(
+        complete(first, OutcomeClass::kSuccess, FailureScope::kOperation));
+    controlTick(route, 12'000);
+    EXPECT_EQ(snapshot(route).state, PathState::kProbing);
+    Permit late;
+    EXPECT_EQ(tryAcquire(pathFor(device, route), 1, late), Decision::kDefer);
+
+    ASSERT_TRUE(
+        complete(second, OutcomeClass::kRouteTimeout, FailureScope::kRoute));
+    controlTick(route, 13'000);
+    EXPECT_EQ(snapshot(route).state, PathState::kQuarantined);
+}
+
+TEST(AdaptiveCongestionControlTest, ProbeRecoversAfterAllSuccesses) {
+    Config config = testConfig();
+    config.hard_error_threshold = 1;
+    DomainState device(config);
+    DomainState route(config);
+    Signals fatal;
+    fatal.fatal_failures = 1;
+    recordCurrent(route, fatal);
+    controlTick(route, 1'000);
+    controlTick(route, 11'000);
+
+    Permit first;
+    Permit second;
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 8, first), Decision::kAllow);
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 8, second), Decision::kAllow);
+    ASSERT_TRUE(
+        complete(first, OutcomeClass::kSuccess, FailureScope::kOperation));
+    controlTick(route, 12'000);
+    ASSERT_EQ(snapshot(route).state, PathState::kProbing);
+
+    ASSERT_TRUE(
+        complete(second, OutcomeClass::kSuccess, FailureScope::kOperation));
+    controlTick(route, 13'000);
+    EXPECT_EQ(snapshot(route).state, PathState::kHealthy);
+}
+
+TEST(AdaptiveCongestionControlTest, ZeroByteProbesStillWaitForEveryOutcome) {
+    Config config = testConfig();
+    config.hard_error_threshold = 1;
+    DomainState device(config);
+    DomainState route(config);
+    Signals fatal;
+    fatal.fatal_failures = 1;
+    recordCurrent(route, fatal);
+    controlTick(route, 1'000);
+    controlTick(route, 11'000);
+
+    Permit first;
+    Permit second;
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 0, first), Decision::kAllow);
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 0, second), Decision::kAllow);
+    ASSERT_TRUE(
+        complete(first, OutcomeClass::kSuccess, FailureScope::kOperation));
+    controlTick(route, 12'000);
+    ASSERT_EQ(snapshot(route).state, PathState::kProbing);
+
+    ASSERT_TRUE(
+        complete(second, OutcomeClass::kRouteTimeout, FailureScope::kRoute));
+    controlTick(route, 13'000);
+    EXPECT_EQ(snapshot(route).state, PathState::kQuarantined);
+}
+
+TEST(AdaptiveCongestionControlTest, RouteRejectionRollsBackProbePermit) {
+    Config config = testConfig();
+    config.hard_error_threshold = 1;
+    DomainState device(config);
+    DomainState route(config);
+    Signals fatal;
+    fatal.fatal_failures = 1;
+    recordCurrent(device, fatal);
+    recordCurrent(route, fatal);
+    controlTick(device, 1'000);
+    controlTick(route, 1'000);
+    controlTick(device, 11'000);
+
+    Permit rejected;
+    EXPECT_EQ(tryAcquire(pathFor(device, route), 8, rejected),
+              Decision::kAvoid);
+    EXPECT_FALSE(rejected.active());
+
+    Permit probe;
+    ASSERT_EQ(tryAcquire({&device, nullptr, generation(device), 0}, 8, probe),
+              Decision::kAllow);
+    ASSERT_TRUE(
+        complete(probe, OutcomeClass::kSuccess, FailureScope::kOperation));
+    controlTick(device, 12'000);
+    EXPECT_EQ(snapshot(device).state, PathState::kHealthy);
+}
+
+TEST(AdaptiveCongestionControlTest, ProbeFailureWinsConcurrentControlTick) {
+    for (uint32_t round = 0; round < 200; ++round) {
+        Config config = testConfig();
+        config.hard_error_threshold = 1;
+        DomainState device(config);
+        DomainState route(config);
+        Signals fatal;
+        fatal.fatal_failures = 1;
+        recordCurrent(route, fatal);
+        controlTick(route, 1'000);
+        controlTick(route, 11'000);
+
+        Permit first;
+        Permit second;
+        ASSERT_EQ(tryAcquire(pathFor(device, route), 8, first),
+                  Decision::kAllow);
+        ASSERT_EQ(tryAcquire(pathFor(device, route), 8, second),
+                  Decision::kAllow);
+        ASSERT_TRUE(
+            complete(first, OutcomeClass::kSuccess, FailureScope::kOperation));
+        controlTick(route, 12'000);
+        ASSERT_EQ(snapshot(route).state, PathState::kProbing);
+
+        std::atomic<bool> start{false};
+        bool completed = false;
+        std::thread failure([&] {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            completed = complete(second, OutcomeClass::kRouteTimeout,
+                                 FailureScope::kRoute);
+        });
+        std::thread tick([&] {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            controlTick(route, 13'000);
+        });
+        start.store(true, std::memory_order_release);
+        failure.join();
+        tick.join();
+        ASSERT_TRUE(completed);
+        controlTick(route, 14'000);
+        EXPECT_EQ(snapshot(route).state, PathState::kQuarantined)
+            << "round=" << round;
+    }
+}
+
+TEST(AdaptiveCongestionControlTest, ProbeAdmissionClosesAcrossAcquireRace) {
+    for (uint32_t round = 0; round < 200; ++round) {
+        Config config = testConfig();
+        config.hard_error_threshold = 1;
+        DomainState device(config);
+        DomainState route(config);
+        Signals fatal;
+        fatal.fatal_failures = 1;
+        recordCurrent(route, fatal);
+        controlTick(route, 1'000);
+        controlTick(route, 11'000);
+
+        Permit first;
+        ASSERT_EQ(tryAcquire(pathFor(device, route), 8, first),
+                  Decision::kAllow);
+        ASSERT_TRUE(
+            complete(first, OutcomeClass::kSuccess, FailureScope::kOperation));
+
+        Permit concurrent;
+        Decision decision = Decision::kAvoid;
+        std::atomic<bool> start{false};
+        std::thread acquire([&] {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            decision = tryAcquire(pathFor(device, route), 1, concurrent);
+        });
+        std::thread tick([&] {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            controlTick(route, 12'000);
+        });
+        start.store(true, std::memory_order_release);
+        acquire.join();
+        tick.join();
+        if (decision == Decision::kAllow) {
+            ASSERT_TRUE(complete(concurrent, OutcomeClass::kSuccess,
+                                 FailureScope::kOperation));
+        }
+        controlTick(route, 13'000);
+        EXPECT_EQ(snapshot(route).state, PathState::kHealthy)
+            << "round=" << round;
+    }
+}
+
 TEST(AdaptiveCongestionControlTest, FailedProbeStartsAnotherCooldown) {
     DomainState device(testConfig());
     DomainState route(testConfig());
@@ -405,7 +604,8 @@ TEST(AdaptiveCongestionControlTest, FailedProbeStartsAnotherCooldown) {
     EXPECT_EQ(snapshot(route).state, PathState::kProbing);
 }
 
-TEST(AdaptiveCongestionControlTest, OldProbeCannotCompleteANewerProbeEpoch) {
+TEST(AdaptiveCongestionControlTest,
+     OldProbeDoesNotBlockOrCompleteANewerProbeEpoch) {
     DomainState device(testConfig());
     DomainState route(testConfig());
     Signals fatal;
@@ -428,16 +628,16 @@ TEST(AdaptiveCongestionControlTest, OldProbeCannotCompleteANewerProbeEpoch) {
     controlTick(route, 22'000);
     ASSERT_EQ(snapshot(route).state, PathState::kProbing);
 
-    ASSERT_TRUE(
-        complete(old_probe, OutcomeClass::kSuccess, FailureScope::kOperation));
-    controlTick(route, 23'000);
-    EXPECT_EQ(snapshot(route).state, PathState::kProbing);
-
     Permit fresh_probe;
     ASSERT_EQ(tryAcquire(pathFor(device, route), 8, fresh_probe),
               Decision::kAllow);
     ASSERT_TRUE(complete(fresh_probe, OutcomeClass::kSuccess,
                          FailureScope::kOperation));
+    controlTick(route, 23'000);
+    EXPECT_EQ(snapshot(route).state, PathState::kHealthy);
+
+    ASSERT_TRUE(
+        complete(old_probe, OutcomeClass::kSuccess, FailureScope::kOperation));
     controlTick(route, 24'000);
     EXPECT_EQ(snapshot(route).state, PathState::kHealthy);
 }
