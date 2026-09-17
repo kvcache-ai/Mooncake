@@ -84,6 +84,28 @@ if(WITH_TE)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(engine PRIVATE CUDA::cudart)
   endif()
+
+  if(BUILD_UNIT_TESTS AND USE_TENT)
+    add_test(
+      NAME tent_python_send_probe_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+        "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
+        PYTHONPATH=$<TARGET_FILE_DIR:engine>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_send_probe.py)
+    add_test(
+      NAME tent_python_first_buffer_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+        "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
+        PYTHONPATH=$<TARGET_FILE_DIR:engine>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
+    set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
+  endif()
 endif()
 
 set(ALLOCATOR_SO_PATH
@@ -216,9 +238,10 @@ if(NOT SKBUILD)
     if(USE_NOF)
       install(
         FILES
-          "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ssd_register.py"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ssd_unregister.py"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/spdk_tgt_create.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_administration.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_ssd_register.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_ssd_unregister.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/spdk_tgt_create.py"
         DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
     endif()
   endif()

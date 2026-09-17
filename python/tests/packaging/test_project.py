@@ -59,6 +59,20 @@ def test_dependency_boundaries_are_declared() -> None:
         "structured",
         "vllm",
     }
+    assert metadata["optional-dependencies"]["administration"] == ["paramiko"]
+
+
+def test_legacy_wheel_administration_extra_matches_root_project() -> None:
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    legacy = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+
+    assert (
+        legacy["project"]["optional-dependencies"]["administration"]
+        == project["project"]["optional-dependencies"]["administration"]
+    )
+    assert not any("paramiko" in dep for dep in legacy["project"]["dependencies"])
 
 
 def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
@@ -150,9 +164,6 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
         "pg.py",
         "structured_object_store.py",
         "dataproto_catalog.py",
-        "mooncake_ssd_register.py",
-        "mooncake_ssd_unregister.py",
-        "spdk_tgt_create.py",
     ):
         assert (REPOSITORY_ROOT / "mooncake-wheel" / "mooncake" / module).is_file()
 
@@ -213,6 +224,35 @@ def test_cli_build_inputs_use_the_canonical_sources() -> None:
     ):
         assert f"../python/mooncake/{module}" in integration_cmake
         assert f"../mooncake-wheel/mooncake/{module}" not in integration_cmake
+
+
+def test_ssd_administration_modules_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    direct_install = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    modules = (
+        "_administration.py",
+        "mooncake_ssd_register.py",
+        "mooncake_ssd_unregister.py",
+        "spdk_tgt_create.py",
+    )
+
+    for module in modules:
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+        assert f"../python/mooncake/{module}" in direct_install
+        assert f"../mooncake-wheel/mooncake/{module}" not in direct_install
+        assert module in legacy_builder
+
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "ssd" / "test_spdk_tgt_create.py"
+    ).is_file()
+    assert not (
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_spdk_tgt_create.py"
+    ).exists()
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(

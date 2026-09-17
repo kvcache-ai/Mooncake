@@ -195,10 +195,14 @@ class Workers {
     void applyContextEvent(int dev_id, RdmaContext& context,
                            const ibv_async_event& event);
 
-    // Everything a recovered port needs: resume the context, re-seed its
-    // bandwidth and make it selectable again. Shared by the
-    // IBV_EVENT_PORT_ACTIVE path and by resumePausedContexts().
-    void activateContext(int dev_id, RdmaContext& context);
+    // Re-query and publish one context's GID/LID.
+    RdmaAddressRefreshResult refreshAddress(RdmaContext& context);
+
+    // Everything a recovered port needs: refresh its address, resume the
+    // context, re-seed its bandwidth and make it selectable again. Shared by
+    // the IBV_EVENT_PORT_ACTIVE path and by resumePausedContexts(). Returns
+    // false when the address cannot be refreshed, keeping the context paused.
+    bool activateContext(int dev_id, RdmaContext& context);
 
     // Re-read the link speed after a port event and re-seed the selector if
     // it changed; a link that returns at the same speed keeps what it

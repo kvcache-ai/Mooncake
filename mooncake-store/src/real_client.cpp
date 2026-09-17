@@ -10,6 +10,7 @@
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
+#include <cstring>
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -17,18 +18,25 @@
 #include <vector>
 
 #include "real_client.h"
+#include "common/client_buffer_allocation.h"
+#include "common/mmap_aligned.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
+#include "batch_read_fanout.h"
 #include "common.h"
 #include "config.h"
+#include "config/rpc_protocol_config.h"
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
+#include "config/cxl_segment_config.h"
+#include "config/hugepage_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
-#include "utils.h"
+#include "common/network.h"
+#include "common/result.h"
 #include "rpc_types.h"
 #include "file_storage.h"
 #include "device/accelerator_registry.h"
@@ -102,6 +110,28 @@ bool RestoreAgentModeDeviceZero() {
         return false;
     }
     return true;
+}
+
+void *AllocateAscendStoreSegment(size_t segment_size,
+                                 const std::string &protocol, bool use_hugepage,
+                                 bool defer_hugetlb, size_t *mapped_size) {
+    size_t actual_size = 0;
+    AscendHostAllocFn host_alloc = nullptr;
+    size_t host_align = 0;
+    size_t alloc_size = segment_size;
+    if (use_hugepage && !globalConfig().ascend_use_fabric_mem) {
+        host_align = get_hugepage_size_from_env();
+        alloc_size = align_up(segment_size, host_align);
+        host_alloc =
+            static_cast<AscendHostAllocFn>(allocate_buffer_mmap_memory);
+    }
+    void *ptr = ascend_allocate_memory_best_effort(alloc_size, protocol,
+                                                   &actual_size, host_alloc,
+                                                   host_align, defer_hugetlb);
+    if (ptr != nullptr) {
+        *mapped_size = actual_size;
+    }
+    return ptr;
 }
 #endif
 
@@ -278,6 +308,23 @@ tl::expected<void, ErrorCode> set_context_if_needed(const std::string &protocol,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
+}
+
+// DummyClient copy RPCs do not carry device_id; setup_dummy already stored it
+// on each mapped SHM. Use that so the RPC thread has an ACL context before TE
+// submitTransfer / aclrtGetDevice.
+template <typename MappedShms>
+tl::expected<void, ErrorCode> set_context_from_dummy_shms(
+    const std::string &protocol, const MappedShms &mapped_shms,
+    const char *action) {
+    int32_t device_id = kInvalidPhysicalDeviceId;
+    for (const auto &shm : mapped_shms) {
+        if (shm.device_id != kInvalidPhysicalDeviceId) {
+            device_id = shm.device_id;
+            break;
+        }
+    }
+    return set_context_if_needed(protocol, device_id, action);
 }
 #endif
 
@@ -718,8 +765,7 @@ void ResourceTracker::startSignalThread() {
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
-    const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
-    use_hugepage_ = (hp != nullptr);
+    use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
 }
 
 RealClient::~RealClient() {
@@ -764,8 +810,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_client_http_server, int client_http_port) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
-    const bool should_use_hugepage =
-        use_hugepage_ && this->protocol != "ubshmem";
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
         auto ascend_setup = setup_ascend_internal(local_buffer_size);
@@ -873,7 +917,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     use_spdk_dma_for_client_buffer = true;
 #endif
     client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage,
+        local_buffer_size, this->protocol,
+        use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
         use_spdk_dma_for_client_buffer);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
@@ -902,17 +947,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // registration limit split it into balanced chunks; other transports use
     // one segment.
     if (protocol == "cxl") {
-        size_t cxl_dev_size = 0;
-        const char *env = std::getenv("MC_CXL_DEV_SIZE");
-        if (env) {
-            cxl_dev_size =
-                TryParseInteger<size_t>(env, {.trim_ascii_whitespace = true,
-                                              .allow_leading_plus = true})
-                    .value_or(0);
-        } else {
+        const auto cxl_config = CxlSegmentConfig::FromEnvironment();
+        if (!cxl_config.device_size.has_value()) {
             LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
+        const size_t cxl_dev_size = *cxl_config.device_size;
 
         void *ptr = client_->GetBaseAddr();
         LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
@@ -964,7 +1004,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
 
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && should_use_hugepage;
+            protocol == "rdma" && use_hugepage_;
 
         while (global_segment_size > 0) {
             size_t segment_size =
@@ -982,7 +1022,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
-                size_t page_sz = should_use_hugepage
+                size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
                 mapped_size =
@@ -990,22 +1030,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
                                                     page_sz);
                 seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
-            } else if (should_use_hugepage) {
+#ifdef USE_ASCEND_DIRECT
+            } else if (protocol == "ascend" || protocol == "ubshmem") {
+                ptr = AllocateAscendStoreSegment(
+                    segment_size, this->protocol, use_hugepage_,
+                    parallel_hugetlb_population, &mapped_size);
+#endif
+            } else if (use_hugepage_) {
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
                                                   get_hugepage_size_from_env(),
                                                   parallel_hugetlb_population);
-#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-            } else if ((protocol == "ascend" || protocol == "ubshmem") &&
-                       globalConfig().ascend_use_fabric_mem) {
-                size_t actual_size = 0;
-                ptr = ascend_allocate_memory_best_effort(
-                    segment_size, this->protocol, &actual_size);
-                if (ptr) {
-                    mapped_size = actual_size;
-                }
-#endif
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -1022,8 +1058,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                       << current_glbseg_size << " of " << total_glbseg_size;
 
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
-                ascend_segment_ptrs_.emplace_back(
-                    ptr, AscendSegmentDeleter{this->protocol});
+                if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{mapped_size});
+                } else {
+                    ascend_segment_ptrs_.emplace_back(
+                        ptr, AscendSegmentDeleter{this->protocol});
+                }
             } else if (this->protocol == "sunrise_link") {
 #if defined(USE_SUNRISE)
                 sunrise_segment_ptrs_.emplace_back(ptr,
@@ -1036,7 +1077,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
-            } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
+            } else if (!seg_numa_nodes.empty() || use_hugepage_) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
@@ -1422,6 +1463,26 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             if (seg.shm_buffer == nullptr) {
                 continue;
             }
+#ifdef USE_NOF
+            // Unregister the SPDK registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the SPDK
+            // translation is gone; if unregister fails, retain the mapping
+            // (quarantine) so the VA cannot be reused while SPDK still holds a
+            // translation to it.
+            if (seg.spdk_registered) {
+                if (SpdkWrapper::GetInstance().UnregisterMemory(
+                        seg.shm_buffer, seg.shm_size) != 0) {
+                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
+                                  "during teardown: "
+                               << seg.shm_buffer
+                               << "; quarantining mapping (never munmap)";
+                    quarantine_shms_.push_back(std::move(seg));
+                    seg.shm_buffer = nullptr;
+                    continue;
+                }
+                seg.spdk_registered = false;
+            }
+#endif
             if (seg.is_ascend) {
                 teardown_ascend_shm_buffer(seg);
             } else if (munmap(seg.shm_buffer, seg.shm_size) != 0) {
@@ -1434,7 +1495,57 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
         shm_it = shm_contexts_.erase(shm_it);
     }
+    // Re-attempt quarantined segments (unregister failed during this teardown
+    // or an earlier one). Any that still fail are retained until process exit,
+    // which is safe: they are never munmapped, so SPDK's translations never
+    // point at freed/reused virtual addresses.
+    RetryQuarantinedShmsLocked();
     return {};
+}
+
+void RealClient::RetryQuarantinedShmsLocked() {
+    auto it = quarantine_shms_.begin();
+    while (it != quarantine_shms_.end()) {
+        // The transfer engine may still hold this region (unregisterLocalMemory
+        // failed earlier): retry it first, and never munmap while TE still has
+        // the MR registered, or a later mmap reusing this VA would collide
+        // (ERR_ADDRESS_OVERLAPPED) or DMA to unmapped memory.
+        if (it->te_unregister_pending) {
+            if (!client_) {
+                // No client left to retry against (torn down). Conservatively
+                // retain the mapping rather than risk a stale TE registration;
+                // it is released by the OS at process exit.
+                ++it;
+                continue;
+            }
+            if (!client_->unregisterLocalMemory(it->shm_buffer, true)) {
+                ++it;
+                continue;
+            }
+            it->te_unregister_pending = false;
+        }
+#ifdef USE_NOF
+        // A quarantined segment may still have a live SPDK registration: only
+        // munmap once the translation is actually released.
+        if (it->spdk_registered) {
+            if (SpdkWrapper::GetInstance().UnregisterMemory(
+                    it->shm_buffer, it->shm_size) != 0) {
+                ++it;
+                continue;
+            }
+            it->spdk_registered = false;
+        }
+#endif
+        if (munmap(it->shm_buffer, it->shm_size) != 0) {
+            LOG(ERROR) << "Failed to munmap quarantined shm: " << it->shm_name
+                       << ", error: " << strerror(errno);
+            ++it;
+            continue;
+        }
+        LOG(INFO) << "Released quarantined shared memory: " << it->shm_name
+                  << ", size: " << it->shm_size;
+        it = quarantine_shms_.erase(it);
+    }
 }
 
 int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
@@ -2013,6 +2124,13 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "put");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
 
     return put_internal(key, value, config, context.client_buffer_allocator);
 }
@@ -2115,6 +2233,13 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "put_batch");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
 
     return put_batch_internal(keys, values, config,
                               context.client_buffer_allocator);
@@ -2211,6 +2336,13 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "put_parts");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
 
     return put_parts_internal(key, values, config,
                               context.client_buffer_allocator);
@@ -2416,9 +2548,38 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     }
 #endif
 
-    // Map shared memory from FD
-    void *shm_buffer =
-        mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    // Map shared memory from FD.
+    void *shm_buffer = nullptr;
+#ifdef USE_NOF
+    // Register this receiver-side mapping with SPDK for NoF zero-copy.
+    // spdk_mem_register is per-process: the sender (ShmHelper::allocate)
+    // registers ITS mapping, and in the dummy/real split the NoF submit runs
+    // HERE on our mapping of the shared fd, so it must be registered too. Gated
+    // on the same env as the sender (MC_STORE_REGISTER_SPDK=1). On SPDK < 26.09
+    // the base must be 2MB-aligned, so when we will register and the sender
+    // padded shm_size to a 2MB multiple, map the fd at a 2MB-aligned address
+    // (mmap_shm_2mb_aligned). If shm_size is not a 2MB multiple (env mismatch:
+    // sender didn't pad), fall back to a plain mmap and let the registration
+    // attempt fail non-fatally.
+    const bool register_spdk = ShmHelper::is_register_spdk_enabled();
+    if (register_spdk && (shm_size % SZ_2MB == 0)) {
+        shm_buffer = mmap_shm_2mb_aligned(shm_size, fd);
+        if (shm_buffer == MAP_FAILED) {
+            // 2MB-aligned MAP_FIXED fails for HugeTLB fds whose base must be
+            // hugepage-aligned (e.g. 1GB hugepages): fall back to a plain mmap,
+            // which lets the kernel pick a hugepage-aligned base (2MB or 1GB,
+            // both multiples of 2MB). Registration below then succeeds for
+            // those fds; for non-hugetlb fds that fail alignment it degrades
+            // non-fatally.
+            shm_buffer = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, fd, 0);
+        }
+    } else
+#endif
+    {
+        shm_buffer =
+            mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    }
     if (shm_buffer == MAP_FAILED) {
         LOG(ERROR) << "Failed to map shared memory from fd: " << fd
                    << ", name: " << shm_name << ", error: " << strerror(errno);
@@ -2462,6 +2623,76 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
             ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
     }
 
+    // Ensure push_back below cannot reallocate and throw bad_alloc after the
+    // SPDK registration succeeded (which would leak the registration and the
+    // mapping). If reserve itself throws it happens before registration.
+    context.mapped_shms.reserve(context.mapped_shms.size() + 1);
+
+#ifdef USE_NOF
+    // Register this mapping with SPDK for NoF zero-copy. Non-fatal on failure:
+    // the buffer stays usable for all non-NoF paths. Placed after the
+    // error-returning paths above so no failure path leaves a dangling SPDK
+    // registration (the unregister below is symmetric on every teardown path).
+    if (register_spdk) {
+        if (!SpdkWrapper::IsRegistrableRange(shm.shm_buffer, shm.shm_size)) {
+            // Reached by the fallback mmap above when it cannot place the
+            // mapping at a 2MB-aligned base (e.g. a non-hugetlb fd). SPDK
+            // rejects such a range before marking anything (memory.c:344), so
+            // skipping the attempt keeps the teardown below able to munmap.
+            LOG(WARNING) << "Received shm is not 2MB-aligned; not registering "
+                            "with SPDK: "
+                         << shm.shm_buffer << ", size=" << shm.shm_size
+                         << "; NoF zero-copy transfers to this buffer will be "
+                            "unavailable";
+        } else {
+            const int register_rc = SpdkWrapper::GetInstance().RegisterMemory(
+                shm.shm_buffer, shm.shm_size);
+            if (register_rc == 0) {
+                shm.spdk_registered = true;
+            } else if (register_rc == -EBUSY) {
+                // Already registered, so SPDK marked nothing new for us. Do NOT
+                // roll back: the unregister below would clear the existing
+                // registration (memory.c:358-366 detects it, 445-466 clears
+                // it). Retain the mapping and let teardown retry.
+                LOG(ERROR) << "Received shm is already registered with SPDK: "
+                           << shm.shm_buffer << ", size=" << shm.shm_size
+                           << "; retaining mapping";
+                shm.spdk_registered = true;
+            } else {
+                LOG(WARNING) << "Failed to register received shm with SPDK: "
+                             << shm.shm_buffer << ", size=" << shm.shm_size
+                             << "; NoF zero-copy transfers to this buffer will "
+                                "be unavailable";
+                // spdk_mem_register() marks the range in g_mem_reg_map before
+                // running its notify callbacks and does NOT roll back on
+                // failure (SPDK v23.01.1, memory.c:370-384), and in iova=va it
+                // can already have installed the IOMMU mapping when a later
+                // step fails (memory.c:1092-1107). This unregister is the only
+                // chance to undo that, and only a 0 return proves it worked:
+                // -EINVAL is also returned for a half-marked range
+                // (memory.c:426) and, in iova=va, for an incomplete translation
+                // before the IOMMU is unmapped (memory.c:1216-1224); it covers
+                // a failure before anything was mapped as well, and the two
+                // cannot be told apart, so retaining a clean mapping is the
+                // accepted cost. Mirrors ShmHelper::allocate.
+                const int rollback_rc =
+                    SpdkWrapper::GetInstance().UnregisterMemory(shm.shm_buffer,
+                                                                shm.shm_size);
+                if (rollback_rc != 0) {
+                    LOG(ERROR)
+                        << "Failed to roll back incomplete SPDK registration: "
+                        << shm.shm_buffer << ", size: " << shm.shm_size
+                        << ", rc: " << rollback_rc
+                        << "; treating the range as registered so teardown "
+                           "retries the unregister and quarantines the mapping "
+                           "instead of munmapping";
+                    shm.spdk_registered = true;
+                }
+            }
+        }
+    }
+#endif
+
     context.mapped_shms.push_back(std::move(shm));
 
     LOG(INFO) << "Mapped new shared memory: " << shm_name
@@ -2481,21 +2712,86 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     auto &context = it->second;
     context.client_buffer_allocator.reset();
 
+    // Retry previously quarantined segments (unregister failed earlier) before
+    // tearing down this context.
+    RetryQuarantinedShmsLocked();
+
+    bool failed = false;
+    // Keep the quarantine push_back below from reallocating (and throwing
+    // bad_alloc) in the middle of tearing a context down.
+    quarantine_shms_.reserve(quarantine_shms_.size() +
+                             context.mapped_shms.size());
     for (auto &shm : context.mapped_shms) {
-        if (shm.shm_buffer) {
-            auto rc = client_->unregisterLocalMemory(shm.shm_buffer, true);
-            if (!rc) {
-                LOG(ERROR) << "Failed to unregister memory";
-                munmap(shm.shm_buffer, shm.shm_size);
-                context.mapped_shms.clear();
-                shm_contexts_.erase(it);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            munmap(shm.shm_buffer, shm.shm_size);
+        if (!shm.shm_buffer) {
+            continue;
         }
+        // Unregister with the transfer engine first: TE retains its region
+        // record when unregisterLocalMemory() fails and
+        // RdmaTransport::unregisterLocalMemoryInternal returns before
+        // deregistering the MR, so munmapping here would leave TE registered
+        // for an address a later mmap can reuse (ERR_ADDRESS_OVERLAPPED, or DMA
+        // to unmapped memory).
+        const bool te_ok = static_cast<bool>(
+            client_->unregisterLocalMemory(shm.shm_buffer, true));
+#ifdef USE_NOF
+        // Unregister the SPDK registration BEFORE munmap, mirroring
+        // ShmHelper::free()/cleanup(). munmap is only safe once the SPDK
+        // translation is gone.
+        bool spdk_ok = true;
+        if (shm.spdk_registered) {
+            spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
+                          shm.shm_buffer, shm.shm_size) == 0;
+        }
+#else
+        const bool spdk_ok = true;
+#endif
+        if (te_ok && spdk_ok) {
+#ifdef USE_NOF
+            shm.spdk_registered = false;
+#endif
+            // Both unregisters succeeded, so the VA is no longer referenced by
+            // TE or SPDK and can be released. Siblings that fail are handled by
+            // their own iterations, so a single failure does not leak the rest.
+            munmap(shm.shm_buffer, shm.shm_size);
+            shm.shm_buffer = nullptr;
+            continue;
+        }
+        // Unregister failed: retain the mapping (never munmap) so neither TE
+        // nor SPDK keeps a registration to a freed/reused VA, and quarantine it
+        // for a retry on a later teardown entry point.
+        if (!te_ok) {
+            LOG(ERROR) << "Failed to unregister memory: " << shm.shm_name
+                       << "; quarantining mapping (never munmap)";
+        }
+#ifdef USE_NOF
+        if (!spdk_ok) {
+            LOG(ERROR) << "Failed to unregister received shm from SPDK: "
+                       << shm.shm_buffer
+                       << "; quarantining mapping (never munmap)";
+        }
+#endif
+        shm.te_unregister_pending = !te_ok;
+#ifdef USE_NOF
+        // Record only the side that is still registered. Clear spdk_registered
+        // when the SPDK unregister above succeeded even though the mapping
+        // stays quarantined: a later RetryQuarantinedShmsLocked() would
+        // otherwise call spdk_mem_unregister() a second time, get the benign
+        // -EINVAL no-op for an already released range (SPDK memory.c: no
+        // segment is marked REGISTERED), treat it as a failure, and keep the
+        // mapping quarantined (never munmapped) forever.
+        shm.spdk_registered = !spdk_ok;
+#endif
+        quarantine_shms_.push_back(std::move(shm));
+        // std::move leaves raw pointer members unchanged; clear it so the
+        // moved-from entry cannot be munmapped a second time.
+        shm.shm_buffer = nullptr;
+        failed = true;
     }
     context.mapped_shms.clear();
     shm_contexts_.erase(it);
+    if (failed) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return {};
 }
 
@@ -2706,11 +3002,16 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     auto &context = it->second;
     context.client_buffer_allocator.reset();
 
+    // Retry previously quarantined segments (unregister failed earlier) before
+    // tearing down this context.
+    RetryQuarantinedShmsLocked();
+
     // Move regions out before cleanup so failure paths cannot erase the map
     // entry while iterating (undefined behavior) or double-erase at the end.
     std::vector<MappedShm> shms = std::move(context.mapped_shms);
     context.mapped_shms.clear();
 
+    bool failed = false;
     for (auto &shm : shms) {
         if (!shm.shm_buffer) {
             continue;
@@ -2718,6 +3019,11 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
         if (shm.is_ascend) {
             teardown_ascend_shm_buffer(shm);
         } else {
+            // Unregister with the transfer engine first: TE retains its region
+            // record when unregisterLocalMemory() fails (see
+            // unmap_shm_internal), so munmapping here would leave TE registered
+            // for an address a later mmap can reuse.
+            bool te_ok = true;
 #ifdef USE_ASCEND_DIRECT
             auto context_result = set_context_if_needed(protocol, shm.device_id,
                                                         "POSIX shm cleanup");
@@ -2730,15 +3036,56 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
                 // Host POSIX shm mapped via map_shm_internal (memfd); not
                 // Ascend VMM/IPC.
                 if (shm.shm_size > 0 && client_) {
-                    auto res =
+                    const auto res =
                         client_->unregisterLocalMemory(shm.shm_buffer, true);
                     if (!res) {
-                        LOG(WARNING) << "Failed to unregister local memory for "
-                                        "POSIX shm: "
-                                     << shm.shm_name
-                                     << ", error: " << toString(res.error());
+                        te_ok = false;
+                        LOG(ERROR) << "Failed to unregister local memory for "
+                                      "POSIX shm: "
+                                   << shm.shm_name
+                                   << ", error: " << toString(res.error())
+                                   << "; quarantining mapping (never munmap)";
                     }
                 }
+            // Unregister the SPDK registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the SPDK
+            // translation is gone.
+            bool spdk_ok = true;
+#ifdef USE_NOF
+            if (shm.spdk_registered) {
+                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
+                              shm.shm_buffer, shm.shm_size) == 0;
+            }
+#endif
+            if (!te_ok || !spdk_ok) {
+                // Unregister failed: retain the mapping (never munmap) so
+                // neither TE nor SPDK keeps a registration to a freed/reused
+                // VA, and quarantine it for a retry on a later teardown entry
+                // point.
+                if (!spdk_ok) {
+                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
+                                  "during unmap: "
+                               << shm.shm_buffer
+                               << "; quarantining mapping (never munmap)";
+                }
+                shm.te_unregister_pending = !te_ok;
+#ifdef USE_NOF
+                // Clear spdk_registered when the SPDK unregister above
+                // succeeded: see unmap_shm_internal (a stale flag makes the
+                // retry re-unregister an already released range, get -EINVAL,
+                // and keep the mapping quarantined forever).
+                shm.spdk_registered = !spdk_ok;
+#endif
+                quarantine_shms_.push_back(std::move(shm));
+                // std::move leaves raw pointer members unchanged; clear it so
+                // the moved-from entry cannot be munmapped a second time.
+                shm.shm_buffer = nullptr;
+                failed = true;
+                continue;
+            }
+#ifdef USE_NOF
+            shm.spdk_registered = false;
+#endif
             if (munmap(shm.shm_buffer, shm.shm_size) != 0) {
                 LOG(ERROR) << "Failed to munmap POSIX shared memory: "
                            << shm.shm_name << ", error: " << strerror(errno);
@@ -2749,6 +3096,9 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
         }
     }
     shm_contexts_.erase(it);
+    if (failed) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return {};
 }
 
@@ -2779,6 +3129,11 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
         return {};
     }
     auto &context = it->second;
+    bool unregister_failed = false;
+
+    // Retry previously quarantined segments (unregister failed earlier) before
+    // handling this buffer.
+    RetryQuarantinedShmsLocked();
 
     // Find the shm corresponding to this dummy address
     auto shm_it = context.mapped_shms.end();
@@ -2803,22 +3158,85 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
             auto context_result = set_context_if_needed(
                 protocol, shm_it->device_id, "POSIX shm unregister");
             if (!context_result) {
-                return context_result;
+                // Nothing was torn down: the mapping, its TE region and its
+                // SPDK registration are all still live here, and shm_it stays
+                // in context.mapped_shms. Report RPC_FAIL instead of
+                // propagating INVALID_PARAMS, which the two early returns above
+                // use for "the receiver holds no such mapping": the caller must
+                // be able to tell "nothing was registered here" apart from "the
+                // teardown did not run", so that it keeps its local bookkeeping
+                // and retries instead of leaking this mapping until process
+                // exit. DummyClient::unregister_buffer() only drops its
+                // shm->registered flag for OK / INTERNAL_ERROR /
+                // INVALID_PARAMS.
+                LOG(ERROR) << "Cannot unregister shm buffer for client_id="
+                           << client_id
+                           << ": could not set the Ascend context for device "
+                           << shm_it->device_id
+                           << ", error: " << toString(context_result.error())
+                           << "; no teardown performed, mapping retained";
+                return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
 #endif
-            auto rc = client_->unregisterLocalMemory(shm_it->shm_buffer, true);
-            if (!rc) {
+            // Unregister with the transfer engine first: TE retains its region
+            // record when unregisterLocalMemory() fails (see
+            // unmap_shm_internal), so munmapping here would leave TE registered
+            // for an address a later mmap can reuse.
+            const bool te_ok = static_cast<bool>(
+                client_->unregisterLocalMemory(shm_it->shm_buffer, true));
+            if (!te_ok) {
                 LOG(ERROR) << "Failed to unregister memory: "
-                           << shm_it->shm_name;
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            if (munmap(shm_it->shm_buffer, shm_it->shm_size) != 0) {
-                LOG(ERROR) << "Failed to munmap shared memory: "
                            << shm_it->shm_name
-                           << ", error: " << strerror(errno);
+                           << "; quarantining mapping (never munmap)";
+            }
+            // Unregister the SPDK registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the SPDK
+            // translation is gone.
+            bool spdk_ok = true;
+#ifdef USE_NOF
+            if (shm_it->spdk_registered) {
+                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
+                              shm_it->shm_buffer, shm_it->shm_size) == 0;
+            }
+#endif
+            if (!te_ok || !spdk_ok) {
+                // Unregister failed: retain the mapping (never munmap) so
+                // neither TE nor SPDK keeps a registration to a freed/reused
+                // VA, and quarantine it for a retry on a later teardown entry
+                // point.
+                if (!spdk_ok) {
+                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
+                                  "during unregister: "
+                               << shm_it->shm_buffer
+                               << "; quarantining mapping (never munmap)";
+                }
+                shm_it->te_unregister_pending = !te_ok;
+#ifdef USE_NOF
+                // Clear spdk_registered when the SPDK unregister above
+                // succeeded: see unmap_shm_internal (a stale flag makes the
+                // retry re-unregister an already released range, get -EINVAL,
+                // and keep the mapping quarantined forever).
+                shm_it->spdk_registered = !spdk_ok;
+#endif
+                quarantine_shms_.push_back(std::move(*shm_it));
+                // std::move leaves raw pointer members unchanged; clear it so
+                // the moved-from entry cannot be munmapped again (the entry is
+                // erased just below).
+                shm_it->shm_buffer = nullptr;
+                unregister_failed = true;
             } else {
-                LOG(INFO) << "Unmapped and cleaned up shared memory: "
-                          << shm_it->shm_name << ", size: " << shm_it->shm_size;
+#ifdef USE_NOF
+                shm_it->spdk_registered = false;
+#endif
+                if (munmap(shm_it->shm_buffer, shm_it->shm_size) != 0) {
+                    LOG(ERROR)
+                        << "Failed to munmap shared memory: "
+                        << shm_it->shm_name << ", error: " << strerror(errno);
+                } else {
+                    LOG(INFO)
+                        << "Unmapped and cleaned up shared memory: "
+                        << shm_it->shm_name << ", size: " << shm_it->shm_size;
+                }
             }
         }
     }
@@ -2826,6 +3244,9 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     // Remove shm from list
     context.mapped_shms.erase(shm_it);
 
+    if (unregister_failed) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return {};
 }
 
@@ -2993,6 +3414,13 @@ RealClient::acquire_buffer_dummy(const std::string &key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result = set_context_from_dummy_shms(
+        protocol, context.mapped_shms, "get_buffer");
+    if (!context_result) {
+        return tl::unexpected(context_result.error());
+    }
+#endif
 
     auto buffer_handle =
         get_buffer_internal(key, context.client_buffer_allocator);
@@ -3118,6 +3546,16 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
             r = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         return results;
     }
+#ifdef USE_ASCEND_DIRECT
+    auto context_result = set_context_from_dummy_shms(
+        protocol, ctx_it->second.mapped_shms, "batch_get_buffer");
+    if (!context_result) {
+        for (auto &r : results) {
+            r = tl::unexpected(context_result.error());
+        }
+        return results;
+    }
+#endif
 
     // Use batch_get_buffer_internal with dummy's allocator
     lock.unlock();
@@ -3187,6 +3625,7 @@ RealClient::batch_get_buffer_internal(
         QueryResult query_result;
         std::unique_ptr<BufferHandle> buffer_handle;
         std::vector<Slice> slices;
+        uint64_t total_size;
     };
     struct DiskKeyOp {
         size_t original_index;
@@ -3212,7 +3651,7 @@ RealClient::batch_get_buffer_internal(
             continue;
         }
 
-        auto query_result_values = query_results[i].value();
+        const auto &query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             continue;
@@ -3276,7 +3715,8 @@ RealClient::batch_get_buffer_internal(
             .key = key,
             .query_result = FilterQueryResult(query_result_values, replica),
             .buffer_handle = std::move(buffer_handle),
-            .slices = std::move(slices)});
+            .slices = std::move(slices),
+            .total_size = total_size});
     }
 
     if (valid_ops.empty() && disk_ops.empty()) {
@@ -3291,7 +3731,12 @@ RealClient::batch_get_buffer_internal(
         batch_keys.reserve(valid_ops.size());
         batch_query_results.reserve(valid_ops.size());
 
-        for (auto &op : valid_ops) {
+        // The slice map is keyed by string, so duplicate keys would collapse
+        // onto one destination. Transfer each unique key once (first
+        // occurrence as primary) and fan the verified bytes out locally.
+        const auto dedup = PlanDuplicateKeys(valid_ops);
+        for (const size_t op_idx : dedup.primaries) {
+            auto &op = valid_ops[op_idx];
             batch_keys.push_back(op.key);
             batch_query_results.push_back(op.query_result);
             batch_slices[op.key] = op.slices;
@@ -3300,16 +3745,48 @@ RealClient::batch_get_buffer_internal(
         auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
 
-        // 4. Process results and create BufferHandles
-        for (size_t i = 0; i < valid_ops.size(); ++i) {
+        std::vector<tl::expected<int64_t, ErrorCode>> op_status(
+            valid_ops.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        for (size_t i = 0; i < batch_get_results.size(); ++i) {
+            const size_t op_idx = dedup.primaries[i];
             if (batch_get_results[i]) {
+                op_status[op_idx] =
+                    static_cast<int64_t>(valid_ops[op_idx].total_size);
+            } else {
+                LOG(ERROR) << "BatchGet failed for key '"
+                           << valid_ops[op_idx].key
+                           << "': " << toString(batch_get_results[i].error());
+                op_status[op_idx] =
+                    tl::make_unexpected(batch_get_results[i].error());
+            }
+        }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
+            const auto &dup_op = valid_ops[dup_idx];
+            const auto &primary_op = valid_ops[primary_idx];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_idx,
+                .primary_result_index = primary_idx,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [dst = dup_op.slices, src = primary_op.slices,
+                         size = primary_op.total_size, key = dup_op.key]() {
+                    return CopySlicesMaybeDevice(
+                        dst, src, size, "duplicate fan-out, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, op_status);
+
+        // 4. Process results and create BufferHandles. Duplicates copied from
+        // their primary above, before any handle is moved out here.
+        for (size_t i = 0; i < valid_ops.size(); ++i) {
+            if (op_status[i]) {
                 auto &op = valid_ops[i];
                 final_results[op.original_index] =
                     std::make_shared<BufferHandle>(
                         std::move(*op.buffer_handle));
-            } else {
-                LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
-                           << "': " << toString(batch_get_results[i].error());
             }
         }
     }
@@ -3320,8 +3797,11 @@ RealClient::batch_get_buffer_internal(
         std::unordered_map<std::string,
                            std::unordered_map<std::string, std::vector<Slice>>>
             offload_objects;
-        // Build key -> disk_ops index for result lookup
+        // Build key -> first disk_ops index for result lookup. The maps are
+        // keyed by string, so duplicate keys transfer once via the first
+        // occurrence and its verified bytes are fanned out locally below.
         std::unordered_map<std::string, size_t> disk_key_to_idx;
+        std::vector<std::pair<size_t, size_t>> duplicate_disk_ops;
 
         for (size_t idx = 0; idx < disk_ops.size(); ++idx) {
             auto &op = disk_ops[idx];
@@ -3337,14 +3817,21 @@ RealClient::batch_get_buffer_internal(
                 LOG(ERROR) << "No LOCAL_DISK replica found for key: " << op.key;
                 continue;
             }
+            auto [primary_it, first_seen] =
+                disk_key_to_idx.emplace(op.key, idx);
+            if (!first_seen) {
+                duplicate_disk_ops.emplace_back(idx, primary_it->second);
+                continue;
+            }
             const auto &replica = *replica_ptr;
             offload_objects[replica.get_local_disk_descriptor()
                                 .transport_endpoint]
                 .emplace(op.key, std::vector<Slice>{
                                      {op.buffer_handle->ptr(), op.total_size}});
-            disk_key_to_idx[op.key] = idx;
         }
 
+        std::vector<tl::expected<int64_t, ErrorCode>> op_status(
+            disk_ops.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
         for (auto &[endpoint, objects] : offload_objects) {
             if (objects.empty()) continue;
             auto read_result =
@@ -3362,15 +3849,48 @@ RealClient::batch_get_buffer_internal(
                             << "SSD checksum verification failed for key '"
                             << key
                             << "': " << toString(checksum_result.error());
+                        op_status[idx_it->second] =
+                            tl::make_unexpected(checksum_result.error());
                         continue;
                     }
-                    final_results[op.original_index] =
-                        std::make_shared<BufferHandle>(
-                            std::move(*op.buffer_handle));
+                    op_status[idx_it->second] =
+                        static_cast<int64_t>(op.total_size);
                 } else {
                     LOG(ERROR) << "SSD read failed for key '" << key
                                << "': " << toString(read_result.error());
+                    op_status[idx_it->second] =
+                        tl::make_unexpected(read_result.error());
                 }
+            }
+        }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_idx, primary_idx] : duplicate_disk_ops) {
+            const auto &dup_op = disk_ops[dup_idx];
+            const auto &primary_op = disk_ops[primary_idx];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_idx,
+                .primary_result_index = primary_idx,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [dst = dup_op.buffer_handle->ptr(),
+                         src = primary_op.buffer_handle->ptr(),
+                         size = primary_op.total_size, key = dup_op.key]() {
+                    return CopyMaybeDevice(
+                        dst, src, size, "duplicate SSD fan-out, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, op_status);
+
+        // Duplicates copied from their primary above, before any handle is
+        // moved out here.
+        for (size_t idx = 0; idx < disk_ops.size(); ++idx) {
+            if (op_status[idx]) {
+                auto &op = disk_ops[idx];
+                final_results[op.original_index] =
+                    std::make_shared<BufferHandle>(
+                        std::move(*op.buffer_handle));
             }
         }
     }
@@ -3455,7 +3975,13 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
             };
         }
     }
-    if (local_buffer_region_.has_value()) {
+    // A CUDA/UVA address can numerically fall inside the host-side local
+    // buffer range.  Only treat that range as an implicit writable region for
+    // host pointers; device destinations must be explicitly registered.
+    const bool is_device_pointer = device::GetAcceleratorRegistry()
+                                       .RuntimeAccelerators()
+                                       .FindDeviceForPointer(buffer) != nullptr;
+    if (!is_device_pointer && local_buffer_region_.has_value()) {
         const auto base =
             reinterpret_cast<uintptr_t>(local_buffer_region_->base);
         if (target >= base) {
@@ -3472,7 +3998,8 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
-    const std::string &key, const QueryResultCache *query_result_cache) {
+    const std::string &key, const QueryResultCache *query_result_cache,
+    bool allow_query_refresh) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3485,6 +4012,14 @@ RealClient::resolve_ranged_read_metadata(
             return build_ranged_read_metadata_from_query_result(key,
                                                                 cached->second);
         }
+        if (!allow_query_refresh) {
+            return tl::unexpected(cached == query_result_cache->end()
+                                      ? ErrorCode::INVALID_PARAMS
+                                      : ErrorCode::LEASE_EXPIRED);
+        }
+    }
+    if (!allow_query_refresh) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return build_ranged_read_metadata_from_query_result(key,
                                                         client_->Query(key));
@@ -3796,7 +4331,7 @@ RealClient::get_into_ranges_internal(
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
     const std::vector<size_t> *buffer_capacities,
-    const QueryResultCache *query_result_cache) {
+    const QueryResultCache *query_result_cache, bool allow_query_refresh) {
     auto results = build_ranged_read_internal_error_results(
         buffers.size(), all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     if (!client_) {
@@ -3830,7 +4365,8 @@ RealClient::get_into_ranges_internal(
         auto found = metadata_cache.find(key);
         if (found != metadata_cache.end()) return found->second;
         return metadata_cache
-            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache))
+            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache,
+                                                       allow_query_refresh))
             .first->second;
     };
 
@@ -3876,6 +4412,38 @@ RealClient::get_into_ranges_internal(
             if (metadata.replica.is_memory_replica()) {
                 if (client_->CanUseLocalMemcpy(metadata.replica) &&
                     runtime_accelerator.FindDeviceForPointer(buffers[i])) {
+                    if (!allow_query_refresh) {
+                        for (size_t k = 0; k < range_results.size(); ++k) {
+                            if (dst_offsets[k] > capacities[i] ||
+                                sizes[k] > capacities[i] - dst_offsets[k] ||
+                                is_object_range_overflow(
+                                    src_offsets[k], sizes[k],
+                                    static_cast<size_t>(metadata.total_size))) {
+                                continue;
+                            }
+                            if (metadata.query_result.IsLeaseExpired()) {
+                                range_results[k] =
+                                    tl::unexpected(ErrorCode::LEASE_EXPIRED);
+                                continue;
+                            }
+                            // Even a full-object snapshot read must bypass
+                            // the key-based hot cache, which may hold a newer
+                            // version than the supplied replica descriptor.
+                            std::vector<Slice> slices{
+                                {static_cast<char *>(buffers[i]) +
+                                     dst_offsets[k],
+                                 sizes[k]}};
+                            auto query_result = FilterQueryResult(
+                                metadata.query_result, metadata.replica, false);
+                            auto read = client_->Get(keys[j], query_result,
+                                                     slices, src_offsets[k]);
+                            range_results[k] =
+                                read
+                                    ? tl::expected<int64_t, ErrorCode>(sizes[k])
+                                    : tl::unexpected(read.error());
+                        }
+                        continue;
+                    }
                     // Planning cache entries may be close to expiry. Renew and
                     // reselect the replica before copying into device memory.
                     auto refresh_result = resolve_ranged_read_metadata(keys[j]);
@@ -3967,6 +4535,10 @@ RealClient::get_into_ranges_internal(
                 range_results[k] = execute_ranged_read(
                     keys[j], buffers[i], dst_offset, src_offsets[k], sizes[k],
                     metadata, false, false);
+                if (!allow_query_refresh && range_results[k] &&
+                    metadata.query_result.IsLeaseExpired()) {
+                    range_results[k] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+                }
             }
         }
     }
@@ -4002,7 +4574,7 @@ RealClient::get_into_ranges_internal(
     };
 
     // Planning may consume most of a short lease; renew before submission.
-    if (!scatter_leases.empty()) refresh_leases();
+    if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
     auto operation = client_->SubmitScatter(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =
@@ -4015,7 +4587,9 @@ RealClient::get_into_ranges_internal(
     }
 
     while (true) {
-        const auto delay = next_refresh_delay();
+        const auto delay = allow_query_refresh
+                               ? next_refresh_delay()
+                               : std::chrono::nanoseconds::max();
         const auto status = delay == std::chrono::nanoseconds::max()
                                 ? operation->wait()
                                 : operation->waitFor(delay);
@@ -4023,6 +4597,19 @@ RealClient::get_into_ranges_internal(
         refresh_leases();
     }
     return results;
+}
+
+std::vector<std::vector<std::vector<int64_t>>>
+RealClient::get_into_ranges_from_snapshot(
+    const std::vector<void *> &buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const QueryResultCache &query_result_cache) {
+    return convert_ranged_read_results(get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes, nullptr,
+        &query_result_cache, false));
 }
 
 std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
@@ -5019,6 +5606,41 @@ RealClient::get_into_ranges_shm_helper(
     const std::map<std::string, CachedQueryResultResponse>
         &cached_query_results,
     int32_t device_id, const UUID &client_id) {
+    return get_into_ranges_shm_helper_impl(
+        dummy_buffers, std::vector<size_t>(dummy_buffers.size()), nullptr,
+        all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        cached_query_results, device_id, client_id);
+}
+
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+RealClient::get_into_ranges_staged_shm_helper(
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &dummy_buffer_sizes,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results,
+    int32_t device_id, const UUID &client_id) {
+    return get_into_ranges_shm_helper_impl(
+        dummy_buffers, dummy_buffer_sizes, &dummy_buffer_sizes, all_keys,
+        all_dst_offsets, all_src_offsets, all_sizes, cached_query_results,
+        device_id, client_id);
+}
+
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+RealClient::get_into_ranges_shm_helper_impl(
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &dummy_buffer_sizes,
+    const std::vector<size_t> *buffer_capacities,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results,
+    int32_t device_id, const UUID &client_id) {
 #ifdef USE_ASCEND_DIRECT
     if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
             device_id)) {
@@ -5041,10 +5663,10 @@ RealClient::get_into_ranges_shm_helper(
             ErrorCode::INVALID_PARAMS);
     }
 
-    std::vector<size_t> capacities;
+    std::vector<size_t> mapped_capacities;
     auto real_buffers_result = map_dummy_addrs_to_real_ptrs(
-        it->second, dummy_buffers, std::vector<size_t>(dummy_buffers.size()),
-        client_id, &capacities);
+        it->second, dummy_buffers, dummy_buffer_sizes, client_id,
+        buffer_capacities == nullptr ? &mapped_capacities : nullptr);
     if (!real_buffers_result) {
         return build_ranged_read_internal_error_results(
             dummy_buffers.size(), all_keys, all_dst_offsets,
@@ -5053,9 +5675,13 @@ RealClient::get_into_ranges_shm_helper(
 
     auto query_result_cache =
         build_query_result_cache_from_cached_results(cached_query_results);
+    const std::vector<size_t> *capacities = &mapped_capacities;
+    if (buffer_capacities != nullptr) {
+        capacities = buffer_capacities;
+    }
     return get_into_ranges_internal(
         real_buffers_result.value(), all_keys, all_dst_offsets, all_src_offsets,
-        all_sizes, &capacities,
+        all_sizes, capacities,
         query_result_cache.empty() ? nullptr : &query_result_cache);
 }
 
@@ -5146,6 +5772,10 @@ RealClient::batch_get_into_internal(
     std::vector<ValidKeyInfo> valid_operations;
     std::unordered_map<std::string, ValidLocalDiskKeyInfo>
         valid_local_disk_operations;
+    // Fan-out jobs for duplicate LOCAL_DISK keys, built during the scan
+    // below; the copies run after the SSD reads, from the first
+    // occurrence's verified buffer.
+    std::vector<DuplicateFanOutJob> local_disk_dup_jobs;
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
@@ -5166,7 +5796,7 @@ RealClient::batch_get_into_internal(
         }
 
         // Validate replica list
-        auto query_result_values = query_results[i].value();
+        const auto &query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -5197,6 +5827,27 @@ RealClient::batch_get_into_internal(
         }
 
         if (replica.is_local_disk_replica()) {
+            if (valid_local_disk_operations.count(key)) {
+                // Duplicate key: the first occurrence stays the transfer
+                // primary; its verified bytes are fanned out to this
+                // duplicate's buffer after the SSD reads below.
+                const auto &primary = valid_local_disk_operations.at(key);
+                local_disk_dup_jobs.push_back(DuplicateFanOutJob{
+                    .dup_result_index = i,
+                    .primary_result_index = primary.original_index,
+                    .key = key,
+                    .dup_bytes = total_size,
+                    .primary_bytes = primary.total_size,
+                    .copy = [dst = buffers[i],
+                             src = buffers[primary.original_index],
+                             size = total_size, key]() {
+                        return CopyMaybeDevice(
+                            dst, src, size,
+                            "duplicate SSD fan-out, key: " + key);
+                    }});
+                results[i] = static_cast<int64_t>(total_size);
+                continue;
+            }
             std::vector<Slice> key_slices;
             allocateSlices(key_slices, replica, buffers[i]);
             valid_local_disk_operations.emplace(
@@ -5251,7 +5902,12 @@ RealClient::batch_get_into_internal(
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
 
-    for (const auto &op : valid_operations) {
+    // The slice map is keyed by string, so duplicate keys would collapse onto
+    // one destination. Transfer each unique key once (first occurrence as
+    // primary) and fan the verified bytes out to duplicate buffers locally.
+    const auto dedup = PlanDuplicateKeys(valid_operations);
+    for (const size_t op_idx : dedup.primaries) {
+        const auto &op = valid_operations[op_idx];
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
         batch_slices[op.key] = op.slices;
@@ -5263,7 +5919,7 @@ RealClient::batch_get_into_internal(
 
         // Process transfer results
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
-            const auto &op = valid_operations[j];
+            const auto &op = valid_operations[dedup.primaries[j]];
 
             if (!batch_get_results[j]) {
                 const auto error = batch_get_results[j].error();
@@ -5272,6 +5928,24 @@ RealClient::batch_get_into_internal(
                 results[op.original_index] = tl::unexpected(error);
             }
         }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
+            const auto &dup_op = valid_operations[dup_idx];
+            const auto &primary_op = valid_operations[primary_idx];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_op.original_index,
+                .primary_result_index = primary_op.original_index,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [dst = dup_op.slices, src = primary_op.slices,
+                         size = dup_op.total_size, key = dup_op.key]() {
+                    return CopySlicesMaybeDevice(
+                        dst, src, size, "duplicate fan-out, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, results);
     }
 
     // ---- File-backed replicas: BatchGet into temp buffers, then scatter ----
@@ -5282,8 +5956,12 @@ RealClient::batch_get_into_internal(
         std::vector<size_t> disk_batch_indices;
         std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
             disk_temp_handles;
+        // Duplicate keys share the first occurrence's temp buffer; the
+        // verified bytes are scattered into every duplicate destination
+        // after the batch read.
+        const auto disk_dedup = PlanDuplicateKeys(disk_operations);
 
-        for (size_t di = 0; di < disk_operations.size(); ++di) {
+        for (const size_t di : disk_dedup.primaries) {
             auto &op = disk_operations[di];
             const auto &replica = op.replica;
             const char *replica_type =
@@ -5338,6 +6016,33 @@ RealClient::batch_get_into_internal(
                 }
             }
         }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_di, primary_di] : disk_dedup.duplicates) {
+            const auto &dup_op = disk_operations[dup_di];
+            const auto &primary_op = disk_operations[primary_di];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_op.original_index,
+                .primary_result_index = primary_op.original_index,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [&disk_temp_handles, dst = dup_op.dst_buffer,
+                         size = dup_op.total_size, key = dup_op.key,
+                         is_dfs = dup_op.replica.is_dfs_replica()]()
+                    -> tl::expected<void, ErrorCode> {
+                    auto handle_it = disk_temp_handles.find(key);
+                    if (handle_it == disk_temp_handles.end()) {
+                        return tl::make_unexpected(
+                            ErrorCode::NO_AVAILABLE_HANDLE);
+                    }
+                    return CopyMaybeDevice(
+                        dst, handle_it->second->ptr(), size,
+                        std::string(is_dfs ? "DFS" : "DISK") +
+                            " duplicate read, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, results);
     }
 
     // Prepare batch transfer data structures
@@ -5381,6 +6086,9 @@ RealClient::batch_get_into_internal(
             }
         }
     }
+
+    // Fan verified LOCAL_DISK primary bytes out to duplicate destinations.
+    FanOutDuplicates(local_disk_dup_jobs, results);
 
     auto end_time = std::chrono::steady_clock::now();
     [[maybe_unused]] auto elapsed_time =
@@ -5432,7 +6140,7 @@ int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
         return -1;
     }
 
-    if (size == 0) {
+    if (size == 0 && metadata_size == 0) {
         LOG(WARNING) << "Attempting to put empty data for key: " << key;
         return 0;
     }
@@ -5514,7 +6222,7 @@ std::vector<int> RealClient::batch_get_session_start(
             continue;
         }
 
-        auto query_result = query_results[i].value();
+        const auto &query_result = query_results[i].value();
         if (query_result.IsLeaseExpired()) {
             results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
             get_sessions_.erase(keys[i]);
@@ -6208,8 +6916,19 @@ RealClient::batch_get_into_multi_buffers_internal(
                              // (BatchGet)
     };
 
+    // A duplicate of a disk/offload key: not transferred itself, receives the
+    // first occurrence's verified bytes in the fan-out passes below.
+    struct DuplicateDiskOp {
+        size_t original_index;
+        std::string key;
+        std::vector<void *> buffers;
+        std::vector<size_t> sizes;
+        uint64_t total_size;
+    };
+
     std::vector<ValidKeyInfo> valid_operations;
     std::unordered_map<std::string, DiskKeyInfo> valid_local_disk_ops;
+    std::vector<DuplicateDiskOp> duplicate_disk_ops;
     valid_operations.reserve(num_keys);
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
@@ -6225,7 +6944,7 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Validate replica list
-        auto query_result_values = query_results[i].value();
+        const auto &query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
@@ -6268,6 +6987,19 @@ RealClient::batch_get_into_multi_buffers_internal(
                    replica.is_disk_replica() || replica.is_dfs_replica()) {
             // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
             // (zero-copy). DISK/DFS use a contiguous temp buffer at read time.
+            if (valid_local_disk_ops.count(key)) {
+                // Duplicate key: the first occurrence stays the transfer
+                // primary; its verified bytes fan out to this duplicate's
+                // buffers in the read paths below.
+                duplicate_disk_ops.push_back(
+                    DuplicateDiskOp{.original_index = i,
+                                    .key = key,
+                                    .buffers = all_buffers[i],
+                                    .sizes = all_sizes[i],
+                                    .total_size = total_size});
+                results.emplace_back(static_cast<int64_t>(total_size));
+                continue;
+            }
             valid_local_disk_ops.emplace(
                 key,
                 DiskKeyInfo{.key = key,
@@ -6307,7 +7039,12 @@ RealClient::batch_get_into_multi_buffers_internal(
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
         batch_keys.reserve(valid_operations.size());
         batch_query_results.reserve(valid_operations.size());
-        for (auto &op : valid_operations) {
+        // The slice map is keyed by string, so duplicate keys would collapse
+        // onto one destination. Transfer each unique key once (first
+        // occurrence as primary) and fan the verified bytes out locally.
+        const auto dedup = PlanDuplicateKeys(valid_operations);
+        for (const size_t op_idx : dedup.primaries) {
+            const auto &op = valid_operations[op_idx];
             batch_keys.push_back(op.key);
             batch_query_results.push_back(op.query_result);
             batch_slices[op.key] = op.slices;
@@ -6318,7 +7055,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                               prefer_alloc_in_same_node);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
-            const auto &op = valid_operations[j];
+            const auto &op = valid_operations[dedup.primaries[j]];
             if (!batch_get_results[j]) {
                 const auto error = batch_get_results[j].error();
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
@@ -6326,6 +7063,24 @@ RealClient::batch_get_into_multi_buffers_internal(
                 results[op.original_index] = tl::unexpected(error);
             }
         }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
+            const auto &dup_op = valid_operations[dup_idx];
+            const auto &primary_op = valid_operations[primary_idx];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_op.original_index,
+                .primary_result_index = primary_op.original_index,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [dst = dup_op.slices, src = primary_op.slices,
+                         size = dup_op.total_size, key = dup_op.key]() {
+                    return CopySlicesMaybeDevice(
+                        dst, src, size, "duplicate fan-out, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, results);
     }
 
     // ---- LOCAL_DISK / file-backed replica read paths ----
@@ -6402,6 +7157,29 @@ RealClient::batch_get_into_multi_buffers_internal(
                     }
                 }
             }
+
+            // Fan verified LOCAL_DISK primary bytes out to duplicate
+            // destination buffer lists.
+            std::vector<DuplicateFanOutJob> dup_jobs;
+            for (const auto &dup : duplicate_disk_ops) {
+                const auto &primary_op = valid_local_disk_ops.at(dup.key);
+                if (!primary_op.is_local_disk) continue;
+                dup_jobs.push_back(DuplicateFanOutJob{
+                    .dup_result_index = dup.original_index,
+                    .primary_result_index = primary_op.original_index,
+                    .key = dup.key,
+                    .dup_bytes = dup.total_size,
+                    .primary_bytes = primary_op.total_size,
+                    .copy = [dst = SlicesFromBuffers(dup.buffers, dup.sizes),
+                             src = SlicesFromBuffers(primary_op.buffers,
+                                                     primary_op.sizes),
+                             size = dup.total_size, key = dup.key]() {
+                        return CopySlicesMaybeDevice(
+                            dst, src, size,
+                            "duplicate SSD fan-out, key: " + key);
+                    }});
+            }
+            FanOutDuplicates(dup_jobs, results);
         }
 
         // DISK/DFS: one batched BatchGet into temp buffers, then scatter.
@@ -6494,6 +7272,39 @@ RealClient::batch_get_into_multi_buffers_internal(
                         continue;
                 }
             }
+
+            // Fan the primary's verified temp bytes out to duplicate
+            // destination buffer lists (device-aware, same as primaries).
+            std::vector<DuplicateFanOutJob> dup_jobs;
+            for (const auto &dup : duplicate_disk_ops) {
+                const auto &primary_op = valid_local_disk_ops.at(dup.key);
+                if (primary_op.is_local_disk) continue;
+                dup_jobs.push_back(DuplicateFanOutJob{
+                    .dup_result_index = dup.original_index,
+                    .primary_result_index = primary_op.original_index,
+                    .key = dup.key,
+                    .dup_bytes = dup.total_size,
+                    .primary_bytes = primary_op.total_size,
+                    .copy = [&temp_handles,
+                             dst = SlicesFromBuffers(dup.buffers, dup.sizes),
+                             size = dup.total_size, key = dup.key,
+                             is_dfs = primary_op.replica.is_dfs_replica()]()
+                        -> tl::expected<void, ErrorCode> {
+                        auto handle_it = temp_handles.find(key);
+                        if (handle_it == temp_handles.end()) {
+                            return tl::make_unexpected(
+                                ErrorCode::NO_AVAILABLE_HANDLE);
+                        }
+                        return CopySlicesMaybeDevice(
+                            dst,
+                            {Slice{handle_it->second->ptr(),
+                                   static_cast<size_t>(size)}},
+                            size,
+                            std::string(is_dfs ? "DFS" : "DISK") +
+                                " duplicate read, key: " + key);
+                    }});
+            }
+            FanOutDuplicates(dup_jobs, results);
             // temp_handles: BufferHandle RAII releases allocator memory
         }
     }
@@ -6967,8 +7778,7 @@ RealClient::batch_get_into_offload_object_internal(
 
 ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
-    const char *value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
@@ -6995,6 +7805,19 @@ ClientRequester::ClientRequester() {
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
             pool_conf, GetStoreRpcClientIoContextPool());
+}
+
+ClientRequester::~ClientRequester() {
+    if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "ClientRequester teardown: offload RPCs still in "
+                      "flight after 30s drain; those calls lose their "
+                      "responses, but the pools stay alive so no late resume "
+                      "touches freed state";
+    }
+    // The pools host ylt reconnect coroutines that reference pool storage
+    // whether or not a user call is in flight (#3909), so the collection is
+    // never freed (#3943 review).
+    detail::KeepClientPoolsAlive(std::move(client_pools_));
 }
 
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
@@ -7032,6 +7855,10 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
     const std::string &client_addr, Args &&...args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     auto client_pool = client_pools_->at(client_addr);
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {

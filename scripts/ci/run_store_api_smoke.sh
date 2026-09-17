@@ -23,3 +23,12 @@ python scripts/test_async_store.py
 python scripts/test_copy_move_api.py
 python -m unittest mooncake-wheel.tests.test_safetensor_functions
 python scripts/test_drain_http_api.py --timeout-sec 90
+
+# Exercise the serialized-object and external read paths through Dummy RPC.
+ci_start_service dummy-client "$RUNNER_TEMP/mooncake-dummy-client.log" \
+  mooncake_client --host=127.0.0.1 --global_segment_size="128 MB" \
+  --local_buffer_size="64 MB"
+ci_wait_service dummy-client 50052
+DEFAULT_KV_LEASE_TTL=500 python -m unittest discover \
+  -s mooncake-wheel/tests -p test_dummy_client.py \
+  -k tensor_from -k test_external_host -v

@@ -12,7 +12,7 @@
 #include "master_service.h"
 #include "rpc_helper.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "version.h"
 
 namespace mooncake {
@@ -1695,6 +1695,15 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
         });
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<int, ErrorCode> WrappedMasterService::GetDfsShardCount() const {
+    return master_service_.GetDfsShardCount();
+}
+
+tl::expected<int, ErrorCode> WrappedMasterService::ExpandDfsShards(
+    int shard_count) {
+    return master_service_.ExpandDfsShards(shard_count);
 }
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
