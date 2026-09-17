@@ -1,9 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <utility>
 
 namespace mooncake {
@@ -13,6 +17,21 @@ enum class ClientLivenessState {
     SUSPECTED,
     OFFLINE,
 };
+
+// Readable spelling for log lines and diagnostics; operator-facing messages
+// should not print the numeric enum value.
+[[nodiscard]] constexpr std::string_view toString(
+    ClientLivenessState state) noexcept {
+    switch (state) {
+        case ClientLivenessState::ACTIVE:
+            return "ACTIVE";
+        case ClientLivenessState::SUSPECTED:
+            return "SUSPECTED";
+        case ClientLivenessState::OFFLINE:
+            return "OFFLINE";
+    }
+    return "UNKNOWN";
+}
 
 enum class ClientLivenessTransition {
     NONE,
@@ -57,13 +76,24 @@ class ClientLivenessRecord {
         RetainingGuard(const RetainingGuard&) = delete;
         RetainingGuard& operator=(const RetainingGuard&) = delete;
         RetainingGuard(RetainingGuard&&) noexcept = default;
-        RetainingGuard& operator=(RetainingGuard&&) noexcept = default;
+        RetainingGuard& operator=(RetainingGuard&&) = delete;
+
+        // Commit successful work without reacquiring the transition mutex.
+        [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
+            assert(lock_.owns_lock());
+            return record_.CommitObservation(
+                now, record_.state_.load(std::memory_order_relaxed));
+        }
 
        private:
         friend class ClientLivenessRecord;
-        explicit RetainingGuard(std::unique_lock<std::mutex>&& lock)
-            : lock_(std::move(lock)) {}
+        RetainingGuard(ClientLivenessRecord& record,
+                       std::unique_lock<std::mutex>&& lock)
+            : record_(record), lock_(std::move(lock)) {}
 
+        // Non-null and fixed for this guard's lifetime; move construction
+        // transfers the lock, but move assignment must not rebind the record.
+        ClientLivenessRecord& record_;
         std::unique_lock<std::mutex> lock_;
     };
 
@@ -94,7 +124,7 @@ class ClientLivenessRecord {
             ClientLivenessState::OFFLINE) {
             return std::nullopt;
         }
-        return RetainingGuard(std::move(lock));
+        return RetainingGuard(*this, std::move(lock));
     }
 
     [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
@@ -115,7 +145,7 @@ class ClientLivenessRecord {
             return ClientLivenessObservation::OBSERVATION_WITHHELD;
         }
 
-        return CommitObservationLocked(now, current_state);
+        return CommitObservation(now, current_state);
     }
 
     [[nodiscard]] ClientLivenessTransition Evaluate(
@@ -145,8 +175,7 @@ class ClientLivenessRecord {
                 case ClientLivenessState::ACTIVE:
                     if (now - last_liveness_at_ >= active_ttl) {
                         suspected_since_ = now;
-                        state_.store(ClientLivenessState::SUSPECTED,
-                                     std::memory_order_release);
+                        SetState(ClientLivenessState::SUSPECTED);
                         transition = ClientLivenessTransition::BECAME_SUSPECTED;
                     }
                     break;
@@ -155,8 +184,7 @@ class ClientLivenessRecord {
                         // Publish the external barrier before OFFLINE so a
                         // concurrent snapshot cannot miss terminal work.
                         std::forward<ReserveRetirement>(reserve_retirement)();
-                        state_.store(ClientLivenessState::OFFLINE,
-                                     std::memory_order_release);
+                        SetState(ClientLivenessState::OFFLINE);
                         transition = ClientLivenessTransition::BECAME_OFFLINE;
                     }
                     break;
@@ -173,13 +201,44 @@ class ClientLivenessRecord {
         return transition;
     }
 
+    using TransitionObserver =
+        std::function<void(ClientLivenessState, ClientLivenessState)>;
+
+    // The observer runs under the transition lock, in state-change order. It
+    // must not throw or reenter the record; use it to enqueue work, not to run
+    // resource cleanup. Install before publishing a newly registered record.
+    void SetTransitionObserver(TransitionObserver observer) {
+        std::lock_guard<std::mutex> lock(transition_mutex_);
+        on_transition_ = std::move(observer);
+        observer_enabled_.store(true, std::memory_order_release);
+    }
+
+    // Disable future observer calls without acquiring the transition lock, so
+    // registration rollback may call this while holding a RetainingGuard.
+    // The owner must serialize removal against state-changing operations;
+    // already queued notifications are not retracted.
+    void DisableTransitionObserver() {
+        observer_enabled_.store(false, std::memory_order_release);
+    }
+
    private:
-    [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
+    TransitionObserver on_transition_;
+    std::atomic<bool> observer_enabled_{false};
+
+    void SetState(ClientLivenessState next) {
+        const auto previous = state_.load(std::memory_order_relaxed);
+        state_.store(next, std::memory_order_release);
+        if (observer_enabled_.load(std::memory_order_acquire) &&
+            on_transition_) {
+            on_transition_(previous, next);
+        }
+    }
+
+    [[nodiscard]] ClientLivenessObservation CommitObservation(
         TimePoint now, ClientLivenessState current_state) {
         last_liveness_at_ = now;
         if (current_state == ClientLivenessState::SUSPECTED) {
-            state_.store(ClientLivenessState::ACTIVE,
-                         std::memory_order_release);
+            SetState(ClientLivenessState::ACTIVE);
             return ClientLivenessObservation::RECOVERED_ACTIVE;
         }
         return ClientLivenessObservation::REFRESHED_ACTIVE;
@@ -190,5 +249,10 @@ class ClientLivenessRecord {
     TimePoint last_liveness_at_;
     TimePoint suspected_since_{};
 };
+
+// Read-only, shared identity of one client registration. Resources retain this
+// handle; mutable liveness records and operation admission belong to the
+// manager.
+using ClientSessionSharedPtr = std::shared_ptr<const ClientLivenessRecord>;
 
 }  // namespace mooncake

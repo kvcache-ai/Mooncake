@@ -30,6 +30,7 @@
 #include "background_worker.h"
 #include "client_liveness.h"
 #include "client_offboarding.h"
+#include "client_session_manager.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "lease.h"
@@ -134,7 +135,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
- * 1. client_mutex_
+ * 1. the session registry mutex
  * 2. tenant_quota_policy_mutex_
  * 3. snapshot_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
@@ -785,8 +786,8 @@ class MasterService {
      * function is idempotent.
      *
      * Drops the client's LOCAL_DISK registration and then its LOCAL_DISK
-     * replicas -- the outcome the client-expiry branch of ClientMonitorFunc
-     * reaches after one client_ttl. Exposing it as an operation lets a store
+     * replicas -- the outcome of client offboarding after liveness expiry.
+     * Exposing it as an operation lets a store
      * that is shutting down deregister while it can still serve, instead of
      * leaving the master advertising it as an owner until the TTL elapses.
      * Object metadata whose last replica was on that disk is erased, exactly
@@ -1057,30 +1058,18 @@ class MasterService {
     // tenant_eviction_high_watermark_ratio are both enabled.
     void EvictTenantsOverWatermark();
 
-    std::shared_ptr<ClientLivenessRecord> FindClientRecord(
-        const UUID& client_id) const;
     // Caller holds the Replica owner's retaining guard.
     auto AddReplicaForRetainedClient(const UUID& client_id,
                                      const std::string& key,
                                      const TenantId& tenant_id,
                                      Replica& replica)
         -> tl::expected<bool, ErrorCode>;
-    // Caller must hold client_mutex_.
-    std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
-        const;
-    void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
-    std::string GetClientHostId(const UUID& client_id) const;
 
     void ClearInvalidHandles();
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
-    // Clear completed LOCAL_DISK replicas owned by exactly this client, in
-    // all shards. Owner-targeted on purpose: a liveness-complement sweep
-    // classifies by absence from a point-in-time set, so an owner that
-    // mounts and registers between taking that set and the sweep reaching
-    // its shard would be swept as stale. A predicate on the owner id cannot
-    // misclassify a concurrent mount, whatever the interleaving.
+    void ClearInvalidHandlesLocked();
+    // Clear completed LOCAL_DISK replicas owned by exactly this client during
+    // explicit unmount, even if its session still retains resources.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
     // Shard walk shared by the two sweeps above; removes completed replicas
     // matching is_stale, erasing a key when no valid replica remains. Each
@@ -1091,9 +1080,10 @@ class MasterService {
     // shard until the sweep moved on.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
+    void OnClientSessionChanged(const ClientSessionEvent& event);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     bool ShouldSkipSnapshotForClientOffboarding() const {
-        return client_offboarding_worker_.HasPending();
+        return client_session_manager_.HasPendingOffboarding();
     }
 
     std::string FormatTimestamp(
@@ -2111,9 +2101,7 @@ class MasterService {
         bool would_invalidate{false};
     };
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
-        const ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
-        const;
+        const ObjectMetadata& metadata) const;
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale) const;
@@ -2141,11 +2129,10 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client no longer retains resources.
-    bool CleanupStaleHandles(
-        const std::string& key, const TenantId& tenant_id,
-        TenantState& tenant_state, ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
-        MetadataShardAccessorRW* shard = nullptr);
+    bool CleanupStaleHandles(const std::string& key, const TenantId& tenant_id,
+                             TenantState& tenant_state,
+                             ObjectMetadata& metadata,
+                             MetadataShardAccessorRW* shard = nullptr);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (quota release, promotion-task cancellation, disk-replica
     // shard bookkeeping) instead of duplicating it.
@@ -2383,9 +2370,9 @@ class MasterService {
             }
             // Automatically clean up invalid handles (memory replicas only).
             // Note: We only check memory replicas here to avoid lock order
-            // violation (client_mutex_ must be acquired before metadata shard).
-            // local_disk replicas are cleaned up by ClearInvalidHandles() in
-            // ClientMonitorFunc.
+            // violation (the session registry mutex must be acquired before
+            // metadata shard). Local-disk replicas are cleaned up by the
+            // client offboarding worker.
             if (!(service_->enable_ha_ && service_->enable_oplog_) &&
                 tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
@@ -2396,8 +2383,8 @@ class MasterService {
                 const auto previous_kv_media =
                     service_->KvMediaSnapshot(it_->second);
                 // Erase invalid memory replicas (those with unmounted
-                // segments). No client_mutex_ needed since we only check memory
-                // replicas.
+                // segments). No session registry lock is needed since we only
+                // check memory replicas.
                 const uint64_t before_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
                 std::vector<ReplicaID> removed_replica_ids;
@@ -2669,22 +2656,8 @@ class MasterService {
 
     ViewVersionId view_version_;
 
-    // Client related members
-    mutable std::shared_mutex client_mutex_;
-    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
-                       boost::hash<UUID>>
-        client_liveness_records_;
-    std::unordered_set<UUID, boost::hash<UUID>>
-        ok_client_;  // client with ok status
-    std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
-    ClientOffboardingWorker client_offboarding_worker_{this};
-    void ClientMonitorFunc();
-    std::thread client_monitor_thread_;
-    std::atomic<bool> client_monitor_running_{false};
-    static constexpr uint64_t kClientMonitorSleepMs =
-        1000;  // 1000 ms sleep between client monitor checks
-    const int64_t client_active_ttl_sec_;
-    const int64_t client_suspicion_ttl_sec_;
+    // Owns monitoring and offboarding; resource coordination is a listener.
+    ClientSessionManager client_session_manager_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
@@ -2776,7 +2749,7 @@ class MasterService {
         std::string source_segment;
         std::string target_segment;
         std::string target_domain;
-        std::shared_ptr<ClientLivenessRecord> source_liveness;
+        ClientSessionSharedPtr source_session;
     };
 
     DynamicReplicationMode dynamic_replication_mode_{

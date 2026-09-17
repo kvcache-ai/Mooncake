@@ -1280,6 +1280,54 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result.error());
 }
 
+TEST_F(MasterServiceTest, StaleCleanupUsesLocalDiskSessionState) {
+    MasterService service;
+    // Drive liveness synchronously, without the offboarding worker removing
+    // replicas before the generic stale-handle sweep can inspect them.
+    StopClientSessionsForTest(service);
+    auto memory_segment = MakeSegment("cleanup_memory_owner");
+    const UUID memory_owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(memory_segment, memory_owner).has_value());
+    const auto key =
+        PutObjectOnSegment(service, memory_owner, memory_segment.name);
+
+    auto disk_segment = MakeSegment("cleanup_disk_owner", 0x400000000);
+    const UUID disk_owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(disk_segment, disk_owner).has_value());
+    Replica disk(disk_owner, 1024, "disk-endpoint", ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service.AddReplica(disk_owner, key, TenantId::Default(), disk)
+                    .has_value());
+    const auto record = FindClientLivenessForTest(service, disk_owner);
+    ASSERT_TRUE(record);
+
+    const auto expect_replica_count = [&](size_t count) {
+        auto result = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->replicas.size(), count);
+    };
+    ClearInvalidHandlesForTest(service);
+    expect_replica_count(2);
+
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::hours(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ClearInvalidHandlesForTest(service);
+    // Recover after sweeping so the read API exposes the retained disk replica.
+    ASSERT_EQ(record->Observe(now),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    expect_replica_count(2);
+
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    ClearInvalidHandlesForTest(service);
+    expect_replica_count(1);
+}
+
 TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
@@ -2854,7 +2902,6 @@ TEST_F(MasterServiceTest, ReMountDoesNotRecoverSuspectedClient) {
         liveness->Evaluate(ClientLivenessRecord::Clock::now(),
                            std::chrono::seconds::zero(), std::chrono::hours(1)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
 
     ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
     EXPECT_EQ(liveness->state(), ClientLivenessState::SUSPECTED);
@@ -2880,7 +2927,6 @@ TEST_F(MasterServiceTest,
         liveness->Evaluate(ClientLivenessRecord::Clock::now(),
                            std::chrono::seconds::zero(), std::chrono::hours(1)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
 
     auto upsert =
         service.UpsertStart(client_id, key, TenantId::Default(), 1024, config);
@@ -2908,7 +2954,7 @@ TEST_F(MasterServiceTest,
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = liveness;
+    job.retired_session = liveness;
     job.pending_prepare_segments.push_back(
         {.segment_id = segment.id,
          .segment_name = segment.name,
@@ -2943,8 +2989,8 @@ TEST_F(MasterServiceTest,
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = FindClientLivenessForTest(service, client_id);
-    ASSERT_TRUE(job.liveness);
+    job.retired_session = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.retired_session);
     job.pending_prepare_segments = {
         {.segment_id = prepared_segment.id,
          .segment_name = prepared_segment.name,
@@ -2976,6 +3022,44 @@ TEST_F(MasterServiceTest,
     EXPECT_TRUE(job.prepared_segments.empty());
     EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+}
+
+TEST_F(MasterServiceTest, SessionManagerOwnsOffboardingShutdown) {
+    for (bool finish_cleanup : {false, true}) {
+        SCOPED_TRACE(finish_cleanup);
+        MasterServiceConfig config;
+        config.client_active_ttl_sec = 1;
+        config.client_suspicion_ttl_sec = 1;
+        MasterService service(config);
+        const UUID client_id = generate_uuid();
+        auto segment = MakeSegment("session_shutdown_segment");
+        ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+        size_t capacity = 0;
+        ASSERT_EQ(ErrorCode::OK,
+                  PrepareUnmountSegmentForTest(service, segment.id, capacity));
+
+        // UNMOUNTING keeps the automatically scheduled cleanup retrying.
+        WaitUntil([&] { return HasPendingOffboardingForTest(service); },
+                  std::chrono::seconds(10));
+        QuiesceClientSessionsForTest(service);
+        ASSERT_TRUE(HasPendingOffboardingForTest(service));
+        if (finish_cleanup) {
+            ASSERT_EQ(ErrorCode::OK,
+                      CommitUnmountSegmentForTest(service, segment.id,
+                                                  client_id, capacity));
+            // Quiesce stops monitoring, not the cleanup worker or barrier.
+            WaitUntil([&] { return !HasPendingOffboardingForTest(service); },
+                      std::chrono::seconds(10));
+            EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+        }
+        StopClientSessionsForTest(service);
+        EXPECT_FALSE(HasPendingOffboardingForTest(service));
+        if (!finish_cleanup) {
+            ASSERT_EQ(ErrorCode::OK,
+                      CommitUnmountSegmentForTest(service, segment.id,
+                                                  client_id, capacity));
+        }
+    }
 }
 
 }  // namespace mooncake::test

@@ -4,6 +4,8 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <type_traits>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -111,6 +113,69 @@ TEST(ClientLivenessRecordTest, RetirementIsReservedBeforeOfflineIsPublished) {
                       EXPECT_EQ(record.state(), ClientLivenessState::OFFLINE);
                   }),
               ClientLivenessTransition::BECAME_OFFLINE);
+}
+
+TEST(ClientLivenessRecordTest, TransitionObserverReportsOnlyStateChanges) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+    using State = ClientLivenessState;
+    std::vector<std::pair<State, State>> transitions;
+    record.SetTransitionObserver([&](State previous, State current) {
+        EXPECT_EQ(record.state(), current);
+        transitions.emplace_back(previous, current);
+    });
+    (void)record.Observe(initial + 1s);
+    (void)record.Evaluate(initial + 11s, 10s, 20s);
+    (void)record.ObserveAndRun(initial + 12s, [] { return false; });
+    (void)record.Observe(initial + 13s);
+    (void)record.Evaluate(initial + 23s, 10s, 20s);
+    (void)record.Evaluate(initial + 43s, 10s, 20s);
+    (void)record.Observe(initial + 44s);
+    EXPECT_EQ(transitions, (std::vector<std::pair<State, State>>{
+                               {State::ACTIVE, State::SUSPECTED},
+                               {State::SUSPECTED, State::ACTIVE},
+                               {State::ACTIVE, State::SUSPECTED},
+                               {State::SUSPECTED, State::OFFLINE}}));
+}
+
+TEST(ClientLivenessRecordTest, ObserverCanBeDisabledWhileRetainingGuardIsHeld) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+    int notifications = 0;
+    record.SetTransitionObserver([&](auto, auto) { ++notifications; });
+    {
+        auto guard = record.TryAcquireRetainingGuard();
+        ASSERT_TRUE(guard);
+        record.DisableTransitionObserver();
+    }
+    (void)record.Evaluate(initial + 10s, 10s, 20s);
+    EXPECT_EQ(notifications, 0);
+    record.SetTransitionObserver([&](auto, auto) { ++notifications; });
+    (void)record.Observe(initial + 11s);
+    EXPECT_EQ(notifications, 1);
+}
+
+TEST(ClientLivenessRecordTest, MovedRetainingGuardCanCommitObservation) {
+    static_assert(
+        std::is_move_constructible_v<ClientLivenessRecord::RetainingGuard>);
+    static_assert(
+        !std::is_move_assignable_v<ClientLivenessRecord::RetainingGuard>);
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+    (void)record.Evaluate(initial + 10s, 10s, 20s);
+    ASSERT_EQ(record.state(), ClientLivenessState::SUSPECTED);
+    {
+        auto guard = record.TryAcquireRetainingGuard();
+        ASSERT_TRUE(guard);
+        auto moved = std::move(*guard);
+        EXPECT_EQ(moved.Observe(initial + 11s),
+                  ClientLivenessObservation::RECOVERED_ACTIVE);
+        EXPECT_EQ(record.state(), ClientLivenessState::ACTIVE);
+    }
+    EXPECT_EQ(record.Evaluate(initial + 20s, 10s, 20s),
+              ClientLivenessTransition::NONE);
+    EXPECT_EQ(record.Evaluate(initial + 21s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
 }
 
 }  // namespace

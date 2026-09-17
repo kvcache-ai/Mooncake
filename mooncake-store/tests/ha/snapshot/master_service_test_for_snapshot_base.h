@@ -750,6 +750,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // ==================== Core Test Method ====================
 
     static void AssertRestoredClientAffiliations(MasterService* service) {
+        const auto records = service->client_session_manager_.SnapshotRecords();
+        const auto find_record = [&](const UUID& client_id) {
+            const auto it = records.find(client_id);
+            return it == records.end() ? nullptr : it->second;
+        };
         std::unordered_set<const ClientLivenessRecord*> known_records;
         {
             auto segment_access = service->segment_manager_.getSegmentAccess();
@@ -757,14 +762,13 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             ASSERT_EQ(segment_access.GetAllSegments(segments), ErrorCode::OK);
             for (const auto& [segment, owner] : segments) {
                 (void)segment;
-                const auto record =
-                    service->client_liveness_records_.find(owner);
-                ASSERT_NE(record, service->client_liveness_records_.end());
-                known_records.insert(record->second.get());
+                const auto record = find_record(owner);
+                ASSERT_TRUE(record);
+                known_records.insert(record.get());
             }
         }
         for (const auto& owner : service->local_ssd_manager_.GetClientIds()) {
-            ASSERT_TRUE(service->client_liveness_records_.contains(owner));
+            ASSERT_TRUE(find_record(owner));
         }
 
         for (const auto& shard : service->metadata_shards_) {
@@ -774,19 +778,16 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                     (void)key;
                     for (const auto& replica : metadata.GetAllReplicas()) {
                         if (replica.is_memory_replica()) {
-                            const auto record = replica.getClientLiveness();
+                            const auto record = replica.getClientSession();
                             ASSERT_TRUE(record);
                             EXPECT_TRUE(known_records.contains(record.get()));
                         } else if (replica.is_local_disk_replica()) {
                             const auto owner =
                                 replica.get_local_disk_client_id();
                             ASSERT_TRUE(owner.has_value());
-                            const auto record =
-                                service->client_liveness_records_.find(*owner);
-                            ASSERT_NE(record,
-                                      service->client_liveness_records_.end());
-                            EXPECT_TRUE(
-                                replica.isAffiliatedWith(record->second));
+                            const auto record = find_record(*owner);
+                            ASSERT_TRUE(record);
+                            EXPECT_TRUE(replica.isAffiliatedWith(record));
                         }
                     }
                 }
