@@ -165,6 +165,29 @@ void expectForcedTcpConstraint(const tent::Config& config) {
     EXPECT_FALSE(config.get("transports/rdma/enable", true));
 }
 
+TEST(TransferEngineTentCompatibilityTest,
+     IntApiReturnsClassicNegativeErrCodes) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-error-codes"), 0);
+
+    // closeSegment() on a handle that was never opened fails inside TENT with
+    // kInvalidArgument. The classic int API contract is 0 on success and a
+    // NEGATIVE ERR_* on failure -- callers test `ret < 0`, and the Store client
+    // even compares against ERR_ADDRESS_NOT_REGISTERED specifically. Before the
+    // fix the shim returned (int)status.code(), i.e. the POSITIVE TENT code
+    // (+1 here), so a failure looked non-negative and was silently treated as
+    // success. Refs #3995 (P1-error-codes).
+    const int rc = engine.closeSegment(1ull << 40);
+    EXPECT_EQ(rc, ERR_INVALID_ARGUMENT);
+    EXPECT_LT(rc, 0);
+}
+
 TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");
     ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);

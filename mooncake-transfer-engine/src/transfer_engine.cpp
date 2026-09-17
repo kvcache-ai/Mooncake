@@ -582,10 +582,58 @@ Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
         return impl_->CheckSegmentStatus(sid);
 }
 
+namespace {
+// Translate a TENT Status into the classic negative ERR_* code that pre-TENT
+// callers of the int-returning TransferEngine API expect.
+//
+// TENT's Status::Code enum is dense and non-negative and does NOT share
+// numbering with the classic codes -- e.g. TENT kDeviceNotFound == 4 while
+// ERR_DEVICE_NOT_FOUND == -6, and TENT kNotImplemented == 200 collides with the
+// classic kMetadata magnitude. Returning (int)status.code() therefore both
+// flipped the sign (callers test `ret < 0`, so a positive code looked like
+// success) and reported the wrong error -- the Store client, for instance,
+// specifically tolerates ERR_ADDRESS_NOT_REGISTERED. Map each TENT code to its
+// classic equivalent; success stays 0. Unmapped/internal failures fall back to
+// ERR_CONTEXT, mirroring how the Status-returning shim methods already collapse
+// unknown TENT failures to Status::Context. Refs #3995 (P1-error-codes).
+int tentStatusToErrCode(const mooncake::tent::Status& status) {
+    if (status.ok()) return 0;
+    using Code = mooncake::tent::Status::Code;
+    switch (status.code()) {
+        case Code::kInvalidArgument:
+            return ERR_INVALID_ARGUMENT;
+        case Code::kTooManyRequests:
+            return ERR_TOO_MANY_REQUESTS;
+        case Code::kAddressNotRegistered:
+            return ERR_ADDRESS_NOT_REGISTERED;
+        case Code::kDeviceNotFound:
+            return ERR_DEVICE_NOT_FOUND;
+        case Code::kMalformedJson:
+            return ERR_MALFORMED_JSON;
+        case Code::kInvalidMetadataType:
+        case Code::kMetadataError:
+        case Code::kNeedsRefreshCache:
+            return ERR_METADATA;
+        case Code::kRdmaError:
+        case Code::kRpcServiceError:
+        case Code::kRpcConnectionError:
+            return ERR_ENDPOINT;
+        case Code::kCudaError:
+            return ERR_MEMORY;
+        case Code::kNotImplemented:
+            return ERR_NOT_IMPLEMENTED;
+        case Code::kInvalidEntry:
+        case Code::kInternalError:
+        default:
+            return ERR_CONTEXT;
+    }
+}
+}  // namespace
+
 int TransferEngine::closeSegment(SegmentHandle handle) {
     if (use_tent_) {
         auto status = impl_tent_->closeSegment(handle);
-        return (int)status.code();
+        return tentStatusToErrCode(status);
     } else
         return impl_->closeSegment(handle);
 }
@@ -606,7 +654,7 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
         if (!location.empty() && location != kWildcardLocation)
             option.location = location;
         auto status = impl_tent_->registerLocalMemory(addr, length, option);
-        return (int)status.code();
+        return tentStatusToErrCode(status);
     } else
         return impl_->registerLocalMemory(addr, length, location,
                                           remote_accessible, update_metadata);
@@ -615,7 +663,7 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
 int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
     if (use_tent_) {
         auto status = impl_tent_->unregisterLocalMemory(addr);
-        return (int)status.code();
+        return tentStatusToErrCode(status);
     } else
         return impl_->unregisterLocalMemory(addr, update_metadata);
 }
@@ -648,7 +696,7 @@ int TransferEngine::registerLocalMemoryBatch(
         }
         auto status =
             impl_tent_->registerLocalMemory(addr_list, size_list, option);
-        return (int)status.code();
+        return tentStatusToErrCode(status);
     } else {
         return impl_->registerLocalMemoryBatch(buffer_list, location);
     }
@@ -658,7 +706,7 @@ int TransferEngine::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
     if (use_tent_) {
         auto status = impl_tent_->unregisterLocalMemory(addr_list);
-        return (int)status.code();
+        return tentStatusToErrCode(status);
     } else {
         return impl_->unregisterLocalMemoryBatch(addr_list);
     }
@@ -750,7 +798,7 @@ int TransferEngine::getNotifies(
             desc.notify_msg = entry.msg;
             notifies.push_back(desc);
         }
-        return (int)status.code();
+        return tentStatusToErrCode(status);
     } else
         return impl_->getNotifies(notifies);
 }
@@ -762,7 +810,7 @@ int TransferEngine::sendNotifyByID(SegmentID target_id,
         notifi.name = notify_msg.name;
         notifi.msg = notify_msg.notify_msg;
         auto status = impl_tent_->sendNotification(target_id, notifi);
-        return (int)status.code();
+        return tentStatusToErrCode(status);
     } else
         return impl_->sendNotifyByID(target_id, notify_msg);
 }
@@ -775,10 +823,10 @@ int TransferEngine::sendNotifyByName(std::string remote_agent,
         notifi.msg = notify_msg.notify_msg;
         SegmentHandle handle;
         auto status = impl_tent_->openSegment(handle, remote_agent);
-        if (!status.ok()) return (int)status.code();
+        if (!status.ok()) return tentStatusToErrCode(status);
         status = impl_tent_->sendNotification(handle, notifi);
         impl_tent_->closeSegment(handle);
-        return (int)status.code();
+        return tentStatusToErrCode(status);
     } else
         return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);
 }
@@ -1074,7 +1122,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
     int closeSegment(SegmentHandle handle) {
 #ifdef USE_TENT
         if (backend_.tent)
-            return static_cast<int>(backend_.tent->closeSegment(handle).code());
+            return tentStatusToErrCode(backend_.tent->closeSegment(handle));
 #endif
         return backend_.legacy->closeSegment(handle);
     }
