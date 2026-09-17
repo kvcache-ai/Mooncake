@@ -259,6 +259,8 @@ add_ha_test(batch_oplog_snapshot_provider_test
             ha/snapshot/batch_oplog/provider_test.cpp)
 add_ha_test(batch_oplog_snapshot_publisher_test
             ha/snapshot/batch_oplog/publisher_test.cpp)
+add_ha_test(batch_oplog_pruning_coordinator_test
+            ha/snapshot/batch_oplog/pruning_coordinator_test.cpp)
 add_ha_test(batch_oplog_snapshot_gc_test ha/snapshot/batch_oplog/gc_test.cpp)
 add_ha_test(batch_oplog_snapshot_coordinator_test
             ha/snapshot/batch_oplog/coordinator_test.cpp)
