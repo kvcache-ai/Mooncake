@@ -43,6 +43,9 @@
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 #endif
+#if defined(USE_1825)
+#include "transport/rdma_transport/ascend_ub_hal.h"
+#endif
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
@@ -640,6 +643,16 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
     mrMeta.addr = addr;
+#if defined(USE_1825)
+    // kHostReg names the plain ibv_reg_mr path; it does not imply that addr is
+    // host memory. ascendUbRegister performs the actual Ascend HBM check.
+    const bool uses_plain_ibv_reg_mr =
+        exp.method == DmabufExport::Method::kHostReg;
+    if (uses_plain_ibv_reg_mr) {
+        int ret = ascendUbRegister(addr, length);
+        if (ret != 0) return ERR_CONTEXT;
+    }
+#endif
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
@@ -657,6 +670,17 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
+#if defined(USE_1825)
+        int saved_errno = errno;
+        if (uses_plain_ibv_reg_mr) {
+            int ret = ascendUbUnregister(addr, length);
+            if (ret != 0) {
+                LOG(ERROR) << "Failed to roll back Ascend UB registration for "
+                           << addr << " (" << length << " bytes)";
+            }
+        }
+        errno = saved_errno;
+#endif
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
                     << length << " dmabuf_offset " << exp.offset;
         return ERR_CONTEXT;
@@ -709,13 +733,17 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
     }
+    int ub_ret = 0;
+#if defined(USE_1825)
+    ub_ret = ascendUbUnregister(region_addr, region_length);
+#endif
     if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
         PLOG(WARNING) << "Failed to restore fork state for memory region at "
                       << region_addr << " (" << region_length
                       << " bytes), deregister already succeeded";
     }
     memory_region_map_.erase(iter);
-    return 0;
+    return ub_ret == 0 ? 0 : ERR_CONTEXT;
 }
 
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
@@ -734,7 +762,13 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
     if (ret != 0) {
         return ret;
     }
-    return ibv_dereg_mr(mrMeta.mr);
+    ret = ibv_dereg_mr(mrMeta.mr);
+    if (ret != 0) return ret;
+#if defined(USE_1825)
+    ret = ascendUbUnregister(addr, length);
+    if (ret != 0) return ERR_CONTEXT;
+#endif
+    return 0;
 }
 
 uint32_t RdmaContext::rkey(void *addr) {
