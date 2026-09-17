@@ -19,6 +19,7 @@
 
 #include "real_client.h"
 #include "common/client_buffer_allocation.h"
+#include "common/mmap_aligned.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
@@ -1462,6 +1463,26 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             if (seg.shm_buffer == nullptr) {
                 continue;
             }
+#ifdef USE_NOF
+            // Unregister the SPDK registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the SPDK
+            // translation is gone; if unregister fails, retain the mapping
+            // (quarantine) so the VA cannot be reused while SPDK still holds a
+            // translation to it.
+            if (seg.spdk_registered) {
+                if (SpdkWrapper::GetInstance().UnregisterMemory(
+                        seg.shm_buffer, seg.shm_size) != 0) {
+                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
+                                  "during teardown: "
+                               << seg.shm_buffer
+                               << "; quarantining mapping (never munmap)";
+                    quarantine_shms_.push_back(std::move(seg));
+                    seg.shm_buffer = nullptr;
+                    continue;
+                }
+                seg.spdk_registered = false;
+            }
+#endif
             if (seg.is_ascend) {
                 teardown_ascend_shm_buffer(seg);
             } else if (munmap(seg.shm_buffer, seg.shm_size) != 0) {
@@ -1474,7 +1495,57 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
         shm_it = shm_contexts_.erase(shm_it);
     }
+    // Re-attempt quarantined segments (unregister failed during this teardown
+    // or an earlier one). Any that still fail are retained until process exit,
+    // which is safe: they are never munmapped, so SPDK's translations never
+    // point at freed/reused virtual addresses.
+    RetryQuarantinedShmsLocked();
     return {};
+}
+
+void RealClient::RetryQuarantinedShmsLocked() {
+    auto it = quarantine_shms_.begin();
+    while (it != quarantine_shms_.end()) {
+        // The transfer engine may still hold this region (unregisterLocalMemory
+        // failed earlier): retry it first, and never munmap while TE still has
+        // the MR registered, or a later mmap reusing this VA would collide
+        // (ERR_ADDRESS_OVERLAPPED) or DMA to unmapped memory.
+        if (it->te_unregister_pending) {
+            if (!client_) {
+                // No client left to retry against (torn down). Conservatively
+                // retain the mapping rather than risk a stale TE registration;
+                // it is released by the OS at process exit.
+                ++it;
+                continue;
+            }
+            if (!client_->unregisterLocalMemory(it->shm_buffer, true)) {
+                ++it;
+                continue;
+            }
+            it->te_unregister_pending = false;
+        }
+#ifdef USE_NOF
+        // A quarantined segment may still have a live SPDK registration: only
+        // munmap once the translation is actually released.
+        if (it->spdk_registered) {
+            if (SpdkWrapper::GetInstance().UnregisterMemory(
+                    it->shm_buffer, it->shm_size) != 0) {
+                ++it;
+                continue;
+            }
+            it->spdk_registered = false;
+        }
+#endif
+        if (munmap(it->shm_buffer, it->shm_size) != 0) {
+            LOG(ERROR) << "Failed to munmap quarantined shm: " << it->shm_name
+                       << ", error: " << strerror(errno);
+            ++it;
+            continue;
+        }
+        LOG(INFO) << "Released quarantined shared memory: " << it->shm_name
+                  << ", size: " << it->shm_size;
+        it = quarantine_shms_.erase(it);
+    }
 }
 
 int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
@@ -2477,9 +2548,38 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     }
 #endif
 
-    // Map shared memory from FD
-    void *shm_buffer =
-        mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    // Map shared memory from FD.
+    void *shm_buffer = nullptr;
+#ifdef USE_NOF
+    // Register this receiver-side mapping with SPDK for NoF zero-copy.
+    // spdk_mem_register is per-process: the sender (ShmHelper::allocate)
+    // registers ITS mapping, and in the dummy/real split the NoF submit runs
+    // HERE on our mapping of the shared fd, so it must be registered too. Gated
+    // on the same env as the sender (MC_STORE_REGISTER_SPDK=1). On SPDK < 26.09
+    // the base must be 2MB-aligned, so when we will register and the sender
+    // padded shm_size to a 2MB multiple, map the fd at a 2MB-aligned address
+    // (mmap_shm_2mb_aligned). If shm_size is not a 2MB multiple (env mismatch:
+    // sender didn't pad), fall back to a plain mmap and let the registration
+    // attempt fail non-fatally.
+    const bool register_spdk = ShmHelper::is_register_spdk_enabled();
+    if (register_spdk && (shm_size % SZ_2MB == 0)) {
+        shm_buffer = mmap_shm_2mb_aligned(shm_size, fd);
+        if (shm_buffer == MAP_FAILED) {
+            // 2MB-aligned MAP_FIXED fails for HugeTLB fds whose base must be
+            // hugepage-aligned (e.g. 1GB hugepages): fall back to a plain mmap,
+            // which lets the kernel pick a hugepage-aligned base (2MB or 1GB,
+            // both multiples of 2MB). Registration below then succeeds for
+            // those fds; for non-hugetlb fds that fail alignment it degrades
+            // non-fatally.
+            shm_buffer = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, fd, 0);
+        }
+    } else
+#endif
+    {
+        shm_buffer =
+            mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    }
     if (shm_buffer == MAP_FAILED) {
         LOG(ERROR) << "Failed to map shared memory from fd: " << fd
                    << ", name: " << shm_name << ", error: " << strerror(errno);
@@ -2523,6 +2623,76 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
             ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
     }
 
+    // Ensure push_back below cannot reallocate and throw bad_alloc after the
+    // SPDK registration succeeded (which would leak the registration and the
+    // mapping). If reserve itself throws it happens before registration.
+    context.mapped_shms.reserve(context.mapped_shms.size() + 1);
+
+#ifdef USE_NOF
+    // Register this mapping with SPDK for NoF zero-copy. Non-fatal on failure:
+    // the buffer stays usable for all non-NoF paths. Placed after the
+    // error-returning paths above so no failure path leaves a dangling SPDK
+    // registration (the unregister below is symmetric on every teardown path).
+    if (register_spdk) {
+        if (!SpdkWrapper::IsRegistrableRange(shm.shm_buffer, shm.shm_size)) {
+            // Reached by the fallback mmap above when it cannot place the
+            // mapping at a 2MB-aligned base (e.g. a non-hugetlb fd). SPDK
+            // rejects such a range before marking anything (memory.c:344), so
+            // skipping the attempt keeps the teardown below able to munmap.
+            LOG(WARNING) << "Received shm is not 2MB-aligned; not registering "
+                            "with SPDK: "
+                         << shm.shm_buffer << ", size=" << shm.shm_size
+                         << "; NoF zero-copy transfers to this buffer will be "
+                            "unavailable";
+        } else {
+            const int register_rc = SpdkWrapper::GetInstance().RegisterMemory(
+                shm.shm_buffer, shm.shm_size);
+            if (register_rc == 0) {
+                shm.spdk_registered = true;
+            } else if (register_rc == -EBUSY) {
+                // Already registered, so SPDK marked nothing new for us. Do NOT
+                // roll back: the unregister below would clear the existing
+                // registration (memory.c:358-366 detects it, 445-466 clears
+                // it). Retain the mapping and let teardown retry.
+                LOG(ERROR) << "Received shm is already registered with SPDK: "
+                           << shm.shm_buffer << ", size=" << shm.shm_size
+                           << "; retaining mapping";
+                shm.spdk_registered = true;
+            } else {
+                LOG(WARNING) << "Failed to register received shm with SPDK: "
+                             << shm.shm_buffer << ", size=" << shm.shm_size
+                             << "; NoF zero-copy transfers to this buffer will "
+                                "be unavailable";
+                // spdk_mem_register() marks the range in g_mem_reg_map before
+                // running its notify callbacks and does NOT roll back on
+                // failure (SPDK v23.01.1, memory.c:370-384), and in iova=va it
+                // can already have installed the IOMMU mapping when a later
+                // step fails (memory.c:1092-1107). This unregister is the only
+                // chance to undo that, and only a 0 return proves it worked:
+                // -EINVAL is also returned for a half-marked range
+                // (memory.c:426) and, in iova=va, for an incomplete translation
+                // before the IOMMU is unmapped (memory.c:1216-1224); it covers
+                // a failure before anything was mapped as well, and the two
+                // cannot be told apart, so retaining a clean mapping is the
+                // accepted cost. Mirrors ShmHelper::allocate.
+                const int rollback_rc =
+                    SpdkWrapper::GetInstance().UnregisterMemory(shm.shm_buffer,
+                                                                shm.shm_size);
+                if (rollback_rc != 0) {
+                    LOG(ERROR)
+                        << "Failed to roll back incomplete SPDK registration: "
+                        << shm.shm_buffer << ", size: " << shm.shm_size
+                        << ", rc: " << rollback_rc
+                        << "; treating the range as registered so teardown "
+                           "retries the unregister and quarantines the mapping "
+                           "instead of munmapping";
+                    shm.spdk_registered = true;
+                }
+            }
+        }
+    }
+#endif
+
     context.mapped_shms.push_back(std::move(shm));
 
     LOG(INFO) << "Mapped new shared memory: " << shm_name
@@ -2542,21 +2712,86 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     auto &context = it->second;
     context.client_buffer_allocator.reset();
 
+    // Retry previously quarantined segments (unregister failed earlier) before
+    // tearing down this context.
+    RetryQuarantinedShmsLocked();
+
+    bool failed = false;
+    // Keep the quarantine push_back below from reallocating (and throwing
+    // bad_alloc) in the middle of tearing a context down.
+    quarantine_shms_.reserve(quarantine_shms_.size() +
+                             context.mapped_shms.size());
     for (auto &shm : context.mapped_shms) {
-        if (shm.shm_buffer) {
-            auto rc = client_->unregisterLocalMemory(shm.shm_buffer, true);
-            if (!rc) {
-                LOG(ERROR) << "Failed to unregister memory";
-                munmap(shm.shm_buffer, shm.shm_size);
-                context.mapped_shms.clear();
-                shm_contexts_.erase(it);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            munmap(shm.shm_buffer, shm.shm_size);
+        if (!shm.shm_buffer) {
+            continue;
         }
+        // Unregister with the transfer engine first: TE retains its region
+        // record when unregisterLocalMemory() fails and
+        // RdmaTransport::unregisterLocalMemoryInternal returns before
+        // deregistering the MR, so munmapping here would leave TE registered
+        // for an address a later mmap can reuse (ERR_ADDRESS_OVERLAPPED, or DMA
+        // to unmapped memory).
+        const bool te_ok = static_cast<bool>(
+            client_->unregisterLocalMemory(shm.shm_buffer, true));
+#ifdef USE_NOF
+        // Unregister the SPDK registration BEFORE munmap, mirroring
+        // ShmHelper::free()/cleanup(). munmap is only safe once the SPDK
+        // translation is gone.
+        bool spdk_ok = true;
+        if (shm.spdk_registered) {
+            spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
+                          shm.shm_buffer, shm.shm_size) == 0;
+        }
+#else
+        const bool spdk_ok = true;
+#endif
+        if (te_ok && spdk_ok) {
+#ifdef USE_NOF
+            shm.spdk_registered = false;
+#endif
+            // Both unregisters succeeded, so the VA is no longer referenced by
+            // TE or SPDK and can be released. Siblings that fail are handled by
+            // their own iterations, so a single failure does not leak the rest.
+            munmap(shm.shm_buffer, shm.shm_size);
+            shm.shm_buffer = nullptr;
+            continue;
+        }
+        // Unregister failed: retain the mapping (never munmap) so neither TE
+        // nor SPDK keeps a registration to a freed/reused VA, and quarantine it
+        // for a retry on a later teardown entry point.
+        if (!te_ok) {
+            LOG(ERROR) << "Failed to unregister memory: " << shm.shm_name
+                       << "; quarantining mapping (never munmap)";
+        }
+#ifdef USE_NOF
+        if (!spdk_ok) {
+            LOG(ERROR) << "Failed to unregister received shm from SPDK: "
+                       << shm.shm_buffer
+                       << "; quarantining mapping (never munmap)";
+        }
+#endif
+        shm.te_unregister_pending = !te_ok;
+#ifdef USE_NOF
+        // Record only the side that is still registered. Clear spdk_registered
+        // when the SPDK unregister above succeeded even though the mapping
+        // stays quarantined: a later RetryQuarantinedShmsLocked() would
+        // otherwise call spdk_mem_unregister() a second time, get the benign
+        // -EINVAL no-op for an already released range (SPDK memory.c: no
+        // segment is marked REGISTERED), treat it as a failure, and keep the
+        // mapping quarantined (never munmapped) forever.
+        shm.spdk_registered = !spdk_ok;
+#endif
+        quarantine_shms_.push_back(std::move(shm));
+        // std::move leaves raw pointer members unchanged; clear it so the
+        // moved-from entry cannot be munmapped a second time.
+        shm.shm_buffer = nullptr;
+        failed = true;
     }
     context.mapped_shms.clear();
     shm_contexts_.erase(it);
+    if (failed) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return {};
 }
 
@@ -2767,11 +3002,16 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     auto &context = it->second;
     context.client_buffer_allocator.reset();
 
+    // Retry previously quarantined segments (unregister failed earlier) before
+    // tearing down this context.
+    RetryQuarantinedShmsLocked();
+
     // Move regions out before cleanup so failure paths cannot erase the map
     // entry while iterating (undefined behavior) or double-erase at the end.
     std::vector<MappedShm> shms = std::move(context.mapped_shms);
     context.mapped_shms.clear();
 
+    bool failed = false;
     for (auto &shm : shms) {
         if (!shm.shm_buffer) {
             continue;
@@ -2779,6 +3019,11 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
         if (shm.is_ascend) {
             teardown_ascend_shm_buffer(shm);
         } else {
+            // Unregister with the transfer engine first: TE retains its region
+            // record when unregisterLocalMemory() fails (see
+            // unmap_shm_internal), so munmapping here would leave TE registered
+            // for an address a later mmap can reuse.
+            bool te_ok = true;
 #ifdef USE_ASCEND_DIRECT
             auto context_result = set_context_if_needed(protocol, shm.device_id,
                                                         "POSIX shm cleanup");
@@ -2791,15 +3036,56 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
                 // Host POSIX shm mapped via map_shm_internal (memfd); not
                 // Ascend VMM/IPC.
                 if (shm.shm_size > 0 && client_) {
-                    auto res =
+                    const auto res =
                         client_->unregisterLocalMemory(shm.shm_buffer, true);
                     if (!res) {
-                        LOG(WARNING) << "Failed to unregister local memory for "
-                                        "POSIX shm: "
-                                     << shm.shm_name
-                                     << ", error: " << toString(res.error());
+                        te_ok = false;
+                        LOG(ERROR) << "Failed to unregister local memory for "
+                                      "POSIX shm: "
+                                   << shm.shm_name
+                                   << ", error: " << toString(res.error())
+                                   << "; quarantining mapping (never munmap)";
                     }
                 }
+            // Unregister the SPDK registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the SPDK
+            // translation is gone.
+            bool spdk_ok = true;
+#ifdef USE_NOF
+            if (shm.spdk_registered) {
+                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
+                              shm.shm_buffer, shm.shm_size) == 0;
+            }
+#endif
+            if (!te_ok || !spdk_ok) {
+                // Unregister failed: retain the mapping (never munmap) so
+                // neither TE nor SPDK keeps a registration to a freed/reused
+                // VA, and quarantine it for a retry on a later teardown entry
+                // point.
+                if (!spdk_ok) {
+                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
+                                  "during unmap: "
+                               << shm.shm_buffer
+                               << "; quarantining mapping (never munmap)";
+                }
+                shm.te_unregister_pending = !te_ok;
+#ifdef USE_NOF
+                // Clear spdk_registered when the SPDK unregister above
+                // succeeded: see unmap_shm_internal (a stale flag makes the
+                // retry re-unregister an already released range, get -EINVAL,
+                // and keep the mapping quarantined forever).
+                shm.spdk_registered = !spdk_ok;
+#endif
+                quarantine_shms_.push_back(std::move(shm));
+                // std::move leaves raw pointer members unchanged; clear it so
+                // the moved-from entry cannot be munmapped a second time.
+                shm.shm_buffer = nullptr;
+                failed = true;
+                continue;
+            }
+#ifdef USE_NOF
+            shm.spdk_registered = false;
+#endif
             if (munmap(shm.shm_buffer, shm.shm_size) != 0) {
                 LOG(ERROR) << "Failed to munmap POSIX shared memory: "
                            << shm.shm_name << ", error: " << strerror(errno);
@@ -2810,6 +3096,9 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
         }
     }
     shm_contexts_.erase(it);
+    if (failed) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return {};
 }
 
@@ -2840,6 +3129,11 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
         return {};
     }
     auto &context = it->second;
+    bool unregister_failed = false;
+
+    // Retry previously quarantined segments (unregister failed earlier) before
+    // handling this buffer.
+    RetryQuarantinedShmsLocked();
 
     // Find the shm corresponding to this dummy address
     auto shm_it = context.mapped_shms.end();
@@ -2864,22 +3158,85 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
             auto context_result = set_context_if_needed(
                 protocol, shm_it->device_id, "POSIX shm unregister");
             if (!context_result) {
-                return context_result;
+                // Nothing was torn down: the mapping, its TE region and its
+                // SPDK registration are all still live here, and shm_it stays
+                // in context.mapped_shms. Report RPC_FAIL instead of
+                // propagating INVALID_PARAMS, which the two early returns above
+                // use for "the receiver holds no such mapping": the caller must
+                // be able to tell "nothing was registered here" apart from "the
+                // teardown did not run", so that it keeps its local bookkeeping
+                // and retries instead of leaking this mapping until process
+                // exit. DummyClient::unregister_buffer() only drops its
+                // shm->registered flag for OK / INTERNAL_ERROR /
+                // INVALID_PARAMS.
+                LOG(ERROR) << "Cannot unregister shm buffer for client_id="
+                           << client_id
+                           << ": could not set the Ascend context for device "
+                           << shm_it->device_id
+                           << ", error: " << toString(context_result.error())
+                           << "; no teardown performed, mapping retained";
+                return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
 #endif
-            auto rc = client_->unregisterLocalMemory(shm_it->shm_buffer, true);
-            if (!rc) {
+            // Unregister with the transfer engine first: TE retains its region
+            // record when unregisterLocalMemory() fails (see
+            // unmap_shm_internal), so munmapping here would leave TE registered
+            // for an address a later mmap can reuse.
+            const bool te_ok = static_cast<bool>(
+                client_->unregisterLocalMemory(shm_it->shm_buffer, true));
+            if (!te_ok) {
                 LOG(ERROR) << "Failed to unregister memory: "
-                           << shm_it->shm_name;
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            if (munmap(shm_it->shm_buffer, shm_it->shm_size) != 0) {
-                LOG(ERROR) << "Failed to munmap shared memory: "
                            << shm_it->shm_name
-                           << ", error: " << strerror(errno);
+                           << "; quarantining mapping (never munmap)";
+            }
+            // Unregister the SPDK registration before munmap (see
+            // unmap_shm_internal). munmap is only safe once the SPDK
+            // translation is gone.
+            bool spdk_ok = true;
+#ifdef USE_NOF
+            if (shm_it->spdk_registered) {
+                spdk_ok = SpdkWrapper::GetInstance().UnregisterMemory(
+                              shm_it->shm_buffer, shm_it->shm_size) == 0;
+            }
+#endif
+            if (!te_ok || !spdk_ok) {
+                // Unregister failed: retain the mapping (never munmap) so
+                // neither TE nor SPDK keeps a registration to a freed/reused
+                // VA, and quarantine it for a retry on a later teardown entry
+                // point.
+                if (!spdk_ok) {
+                    LOG(ERROR) << "Failed to unregister received shm from SPDK "
+                                  "during unregister: "
+                               << shm_it->shm_buffer
+                               << "; quarantining mapping (never munmap)";
+                }
+                shm_it->te_unregister_pending = !te_ok;
+#ifdef USE_NOF
+                // Clear spdk_registered when the SPDK unregister above
+                // succeeded: see unmap_shm_internal (a stale flag makes the
+                // retry re-unregister an already released range, get -EINVAL,
+                // and keep the mapping quarantined forever).
+                shm_it->spdk_registered = !spdk_ok;
+#endif
+                quarantine_shms_.push_back(std::move(*shm_it));
+                // std::move leaves raw pointer members unchanged; clear it so
+                // the moved-from entry cannot be munmapped again (the entry is
+                // erased just below).
+                shm_it->shm_buffer = nullptr;
+                unregister_failed = true;
             } else {
-                LOG(INFO) << "Unmapped and cleaned up shared memory: "
-                          << shm_it->shm_name << ", size: " << shm_it->shm_size;
+#ifdef USE_NOF
+                shm_it->spdk_registered = false;
+#endif
+                if (munmap(shm_it->shm_buffer, shm_it->shm_size) != 0) {
+                    LOG(ERROR)
+                        << "Failed to munmap shared memory: "
+                        << shm_it->shm_name << ", error: " << strerror(errno);
+                } else {
+                    LOG(INFO)
+                        << "Unmapped and cleaned up shared memory: "
+                        << shm_it->shm_name << ", size: " << shm_it->shm_size;
+                }
             }
         }
     }
@@ -2887,6 +3244,9 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     // Remove shm from list
     context.mapped_shms.erase(shm_it);
 
+    if (unregister_failed) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return {};
 }
 
