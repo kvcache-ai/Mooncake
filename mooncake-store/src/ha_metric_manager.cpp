@@ -2,6 +2,8 @@
 
 #include <glog/logging.h>
 
+#include "standby_state_machine.h"
+
 #include <iomanip>
 #include <sstream>
 
@@ -11,6 +13,52 @@ namespace mooncake {
 HAMetricManager& HAMetricManager::instance() {
     static HAMetricManager static_instance;
     return static_instance;
+}
+
+void HAMetricManager::reset_snapshot_runtime(bool enabled) {
+    std::lock_guard<std::mutex> lock(snapshot_runtime_mutex_);
+    const auto lease_lost = snapshot_runtime_.lease_lost_total;
+    const auto floor_advances = snapshot_runtime_.floor_advances_total;
+    snapshot_runtime_ = {};
+    snapshot_runtime_.lease_lost_total = lease_lost;
+    snapshot_runtime_.floor_advances_total = floor_advances;
+    snapshot_runtime_.enabled = enabled;
+    snapshot_runtime_.skip_reason =
+        enabled ? SnapshotSkipReason::None : SnapshotSkipReason::Disabled;
+    // Event counters survive service replacement, like writer retry counters.
+}
+
+HAMetricManager::SnapshotRuntime HAMetricManager::get_snapshot_runtime() const {
+    std::lock_guard<std::mutex> lock(snapshot_runtime_mutex_);
+    return snapshot_runtime_;
+}
+
+HAMetricManager::SnapshotOperationStats HAMetricManager::get_snapshot_operation(
+    SnapshotOperation operation) const {
+    std::lock_guard<std::mutex> lock(snapshot_runtime_mutex_);
+    return snapshot_operations_[static_cast<size_t>(operation)];
+}
+
+void HAMetricManager::record_snapshot_skip(SnapshotSkipReason reason) {
+    std::lock_guard<std::mutex> lock(snapshot_runtime_mutex_);
+    if (!snapshot_runtime_.enabled) return;
+    snapshot_runtime_.skip_reason = reason;
+    if (reason != SnapshotSkipReason::None)
+        ++snapshot_skips_[static_cast<size_t>(reason)];
+}
+
+void HAMetricManager::record_snapshot_operation(
+    SnapshotOperation operation, int64_t error,
+    std::chrono::steady_clock::time_point start) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    std::lock_guard<std::mutex> lock(snapshot_runtime_mutex_);
+    if (!snapshot_runtime_.enabled) return;
+    auto& stats = snapshot_operations_[static_cast<size_t>(operation)];
+    ++stats.total;
+    stats.errors += error != 0;
+    stats.elapsed_us += elapsed;
 }
 
 uint64_t HAMetricManager::activate_writer_runtime(
@@ -445,6 +493,107 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(batch_record_retry_total_);
 #endif
     serialize_metric(state_transitions_total_);
+
+    {
+        SnapshotRuntime snapshot;
+        decltype(snapshot_operations_) operation_stats;
+        decltype(snapshot_skips_) skips;
+        {
+            std::lock_guard<std::mutex> lock(snapshot_runtime_mutex_);
+            snapshot = snapshot_runtime_;
+            operation_stats = snapshot_operations_;
+            skips = snapshot_skips_;
+        }
+        auto gauge = [&ss](const char* name, auto value) {
+            ss << "# TYPE ha_snapshot_" << name << " gauge\nha_snapshot_"
+               << name << " " << value << "\n";
+        };
+        gauge("enabled", snapshot.enabled ? 1 : 0);
+        const auto state = static_cast<StandbyState>(get_standby_state());
+        const bool active = state == StandbyState::CONNECTING ||
+                            state == StandbyState::SYNCING ||
+                            state == StandbyState::WATCHING ||
+                            state == StandbyState::RECOVERING ||
+                            state == StandbyState::RECONNECTING;
+        gauge("active", snapshot.enabled && active ? 1 : 0);
+        const auto now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        const auto age = [now_ms](std::optional<int64_t> created) {
+            return created && now_ms > *created ? (now_ms - *created) / 1000
+                                                : 0;
+        };
+        gauge("latest_present",
+              snapshot.latest_created_at_ms.has_value() ? 1 : 0);
+        gauge("fallback_present",
+              snapshot.fallback_created_at_ms.has_value() ? 1 : 0);
+        gauge("latest_age_seconds", age(snapshot.latest_created_at_ms));
+        gauge("fallback_age_seconds", age(snapshot.fallback_created_at_ms));
+        gauge("count", snapshot.latest_created_at_ms.has_value() +
+                           snapshot.fallback_created_at_ms.has_value());
+        gauge("candidate_floor", snapshot.candidate_floor);
+        ss << "# TYPE ha_snapshot_floor_advances_total "
+              "counter\nha_snapshot_floor_advances_total "
+           << snapshot.floor_advances_total << "\n";
+        gauge("bytes", snapshot.snapshot_bytes);
+        gauge("chunk_bytes", snapshot.chunk_bytes);
+        gauge("chunk_count", snapshot.chunk_count);
+        gauge("capture_pause_us", snapshot.capture_pause_us);
+        gauge("suffix_batches", snapshot.suffix_batches);
+        gauge("catch_up_target_batch", snapshot.catch_up_target_batch);
+        gauge("catch_up_target_sequence", snapshot.catch_up_target_sequence);
+        gauge("durable_batch", snapshot.durable_batch);
+        gauge("applied_batch", snapshot.applied_batch);
+        gauge("latest_batch", snapshot.latest_batch);
+        gauge("fallback_batch", snapshot.fallback_batch);
+        gauge("compaction_floor", snapshot.compaction_floor);
+        gauge("gc_orphan_prefixes", snapshot.gc_orphan_prefixes);
+        gauge("gc_deleted_prefixes", snapshot.gc_deleted_prefixes);
+        gauge("uncompacted_batches",
+              snapshot.durable_batch > snapshot.compaction_floor
+                  ? snapshot.durable_batch - snapshot.compaction_floor
+                  : 0);
+        ss << "# TYPE ha_snapshot_lease_lost_total "
+              "counter\nha_snapshot_lease_lost_total "
+           << snapshot.lease_lost_total << "\n";
+        static constexpr const char* reasons[] = {
+            "none",         "disabled",
+            "interval",     "in_flight",
+            "stopped",      "promotion",
+            "no_new_batch", "catch_up",
+            "lease_busy",   "capture_unavailable",
+            "no_fallback",  "invalid_pair",
+            "floor_ahead"};
+        static_assert(std::size(reasons) ==
+                      static_cast<size_t>(SnapshotSkipReason::Count));
+        ss << "# TYPE ha_snapshot_skip_reason gauge\n";
+        for (size_t i = 0; i < std::size(reasons); ++i)
+            ss << "ha_snapshot_skip_reason{reason=\"" << reasons[i] << "\"} "
+               << (static_cast<size_t>(snapshot.skip_reason) == i ? 1 : 0)
+               << "\n";
+        ss << "# TYPE ha_snapshot_skips_total counter\n";
+        for (size_t i = 0; i < std::size(reasons); ++i)
+            ss << "ha_snapshot_skips_total{reason=\"" << reasons[i] << "\"} "
+               << skips[i] << "\n";
+        static constexpr const char* operations[] = {
+            "schedule", "upload", "bootstrap", "replay",
+            "publish",  "gc",     "prune",     "rebootstrap"};
+        static_assert(std::size(operations) ==
+                      static_cast<size_t>(SnapshotOperation::Count));
+        ss << "# TYPE ha_snapshot_operations_total counter\n"
+           << "# TYPE ha_snapshot_errors_total counter\n"
+           << "# TYPE ha_snapshot_duration_us_total counter\n";
+        for (size_t i = 0; i < std::size(operations); ++i) {
+            const auto& stats = operation_stats[i];
+            const std::string label =
+                std::string("{operation=\"") + operations[i] + "\"} ";
+            ss << "ha_snapshot_operations_total" << label << stats.total << "\n"
+               << "ha_snapshot_errors_total" << label << stats.errors << "\n"
+               << "ha_snapshot_duration_us_total" << label << stats.elapsed_us
+               << "\n";
+        }
+    }
 
     const auto writer = get_writer_runtime();
     ss << "# HELP ha_writer_accepting Whether the batch OpLog writer accepts "
