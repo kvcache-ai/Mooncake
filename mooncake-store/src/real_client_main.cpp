@@ -6,6 +6,7 @@
 #include "common.h"
 #include "config.h"
 #include "common/byte_size.h"
+#include "glog_compat.h"
 #include "real_client.h"
 #include "version.h"
 
@@ -117,7 +118,9 @@ int main(int argc, char *argv[]) {
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (!FLAGS_log_dir.empty()) {
-        google::InitGoogleLogging(argv[0]);
+        // MC_LOG_DIR may have initialized glog (and set FLAGS_log_dir) from
+        // a static initializer before main — see glog_compat.h.
+        mooncake::InitGoogleLoggingOnce(argv[0]);
     }
 
     LOG(INFO) << "Mooncake real client version: "

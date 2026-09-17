@@ -25,6 +25,7 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "common/network.h"
+#include "glog_compat.h"
 
 #include "master_config.h"
 #include "version.h"
@@ -1508,7 +1509,9 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     if (!FLAGS_log_dir.empty()) {
-        google::InitGoogleLogging(argv[0]);
+        // MC_LOG_DIR may have initialized glog (and set FLAGS_log_dir) from
+        // a static initializer before main — see glog_compat.h.
+        mooncake::InitGoogleLoggingOnce(argv[0]);
         // Merge all master logs into a single journal file in --log_dir,
         // reusing glog: every record is already written to its own severity
         // file and all lower ones, so the INFO sink is a complete journal.
