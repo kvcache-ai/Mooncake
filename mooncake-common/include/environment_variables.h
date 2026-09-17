@@ -196,6 +196,13 @@ struct NoFRegisterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_NOF_TRTYPE);
 };
 
+struct NoFDebugEnvironmentVariables {
+    // Preserve the legacy case-insensitive true tokens and strtol syntax;
+    // neither parser trims trailing whitespace.
+    MC_DEFINE_ENV_VAR(std::string, MC_NOF_DEBUG);
+    MC_DEFINE_ENV_VAR(std::string, MC_NOF_DEBUG_INTERVAL_MS);
+};
+
 struct SpdkControllerEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint32_t, MC_NVME_NUM_IO_QUEUES);
     MC_DEFINE_ENV_VAR(uint32_t, MC_NVME_IO_QUEUE_SIZE);

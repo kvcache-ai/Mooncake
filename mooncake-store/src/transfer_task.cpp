@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include "config/transfer_submitter_config.h"
+#include "config/nof_debug_config.h"
 #include "config/fileread_worker_pool_config.h"
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
@@ -42,38 +43,12 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
-static bool IsTruthyEnv(const char* value) {
-    if (!value) {
-        return false;
-    }
-    std::string normalized(value);
-    std::transform(
-        normalized.begin(), normalized.end(), normalized.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return normalized == "1" || normalized == "true" || normalized == "yes" ||
-           normalized == "on";
-}
-
 static bool IsSpdkNofDebugEnabled() {
-    static const bool enabled = IsTruthyEnv(std::getenv("MC_NOF_DEBUG"));
-    return enabled;
+    return mooncake::NoFDebugConfig::IsEnabledAtFirstUse();
 }
 
 static int GetSpdkNofDebugIntervalMs() {
-    static const int interval_ms = []() {
-        const char* raw_value = std::getenv("MC_NOF_DEBUG_INTERVAL_MS");
-        if (!raw_value) {
-            return 1000;
-        }
-        char* end_ptr = nullptr;
-        long parsed = std::strtol(raw_value, &end_ptr, 10);
-        if (end_ptr == raw_value || (end_ptr != nullptr && *end_ptr != '\0') ||
-            parsed <= 0) {
-            return 1000;
-        }
-        return static_cast<int>(parsed);
-    }();
-    return interval_ms;
+    return mooncake::NoFDebugConfig::IntervalMsAtFirstUse();
 }
 
 static int GetSpdkNofSubmitChunkBytes() {
