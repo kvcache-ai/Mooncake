@@ -1,12 +1,12 @@
-#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_RING_ALL_REDUCE_H
-#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_RING_ALL_REDUCE_H
+#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_ALL_REDUCE_H
+#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_ALL_REDUCE_H
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 
 #include "control_plane/control_types.h"
-#include "device_comm/device_collective/protocols/ring/ring_types.cuh"
+#include "device_comm/device_collective/algorithms/ring/ring_types.cuh"
 #include "device_comm/device_transfer/transfer_region.h"
 #include "error_types.h"
 #include "gpu_runtime.h"
@@ -20,19 +20,19 @@ class ControlUpdateBuilder;
 // Owns the host-side decisions specific to Ring AllReduce. The common runtime
 // supplies view-epoch signal storage, ordering, and recovery lifecycle; the
 // Ring Plan supplies the exact peers that preparation must check.
-class RingAllReduceProtocol {
+class RingAllReduceAlgorithm {
    public:
-    static PGResult<std::unique_ptr<RingAllReduceProtocol>> create(
+    static PGResult<std::unique_ptr<RingAllReduceAlgorithm>> create(
         DeviceTransferService& transfer_service,
         DeviceCollectiveWorkspace& workspace,
         const uint64_t* view_epoch_signals, InvocationState* invocation_state,
         ControlMailbox* control_mailbox, uint64_t timeout_ticks,
         int device_index, InGroupRank self_rank, uint32_t max_group_size);
 
-    ~RingAllReduceProtocol() noexcept;
+    ~RingAllReduceAlgorithm() noexcept;
 
-    RingAllReduceProtocol(const RingAllReduceProtocol&) = delete;
-    RingAllReduceProtocol& operator=(const RingAllReduceProtocol&) = delete;
+    RingAllReduceAlgorithm(const RingAllReduceAlgorithm&) = delete;
+    RingAllReduceAlgorithm& operator=(const RingAllReduceAlgorithm&) = delete;
 
     // These methods update only the host Plan. Runtime publication is a
     // separate step that encodes the complete collective state below.
@@ -50,16 +50,16 @@ class RingAllReduceProtocol {
                            int32_t* failed_ranks_hint) const;
 
    private:
-    RingAllReduceProtocol(DeviceTransferService& transfer_service,
-                          DeviceCollectiveWorkspace& workspace,
-                          const DeviceTransferHandle* transfer_handle,
-                          const uint64_t* view_epoch_signals,
-                          InvocationState* invocation_state,
-                          ControlMailbox* control_mailbox,
-                          uint64_t timeout_ticks, int device_index,
-                          InGroupRank self_rank, uint32_t max_group_size,
-                          RegionSlice signals,
-                          RingSignalLayout signal_layout) noexcept;
+    RingAllReduceAlgorithm(DeviceTransferService& transfer_service,
+                           DeviceCollectiveWorkspace& workspace,
+                           const DeviceTransferHandle* transfer_handle,
+                           const uint64_t* view_epoch_signals,
+                           InvocationState* invocation_state,
+                           ControlMailbox* control_mailbox,
+                           uint64_t timeout_ticks, int device_index,
+                           InGroupRank self_rank, uint32_t max_group_size,
+                           RegionSlice signals,
+                           RingSignalLayout signal_layout) noexcept;
 
     PGResult<void> initializeDeviceState();
     void releaseDeviceState() noexcept;
@@ -89,4 +89,4 @@ class RingAllReduceProtocol {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_RING_ALL_REDUCE_H
+#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_ALL_REDUCE_H

@@ -7,17 +7,13 @@
 #include <transport/device/device_ops.cuh>
 
 #include "common_types.h"
-#include "device_comm/device_assert.cuh"
+#include "device_comm/device_utils/device_assert.cuh"
+#include "device_comm/device_utils/device_timeout.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cuh"
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.cuh"
 
 namespace mooncake {
-
-__device__ __forceinline__ bool transferTimedOut(uint64_t start,
-                                                 uint64_t timeout_ticks) {
-    return timeout_ticks != 0 && clock64() - start >= timeout_ticks;
-}
 
 // Rolling comparison keeps "reached" meaningful across uint64_t overflow as
 // long as producer and consumer remain less than half the range apart.
@@ -34,11 +30,11 @@ class TransferTicket {
     __device__ __forceinline__ TransferResult
     wait(cooperative_groups::thread_block block) const {
         switch (route_) {
-            case DeviceRouteKind::P2p:
+            case DeviceRouteType::P2p:
                 return p2p_.wait(block);
-            case DeviceRouteKind::HostProxy:
+            case DeviceRouteType::HostProxy:
                 return host_proxy_.wait(block);
-            case DeviceRouteKind::Unreachable:
+            case DeviceRouteType::Unreachable:
                 return TransferResult::RouteUnavailable;
         }
         PG_DEVICE_UNREACHABLE();
@@ -51,13 +47,13 @@ class TransferTicket {
     __device__ __forceinline__ TransferTicket() = default;
 
     __device__ __forceinline__ explicit TransferTicket(P2pTransferTicket ticket)
-        : route_(DeviceRouteKind::P2p), p2p_(ticket) {}
+        : route_(DeviceRouteType::P2p), p2p_(ticket) {}
 
     __device__ __forceinline__ explicit TransferTicket(
         HostProxyTransferTicket ticket)
-        : route_(DeviceRouteKind::HostProxy), host_proxy_(ticket) {}
+        : route_(DeviceRouteType::HostProxy), host_proxy_(ticket) {}
 
-    DeviceRouteKind route_ = DeviceRouteKind::Unreachable;
+    DeviceRouteType route_ = DeviceRouteType::Unreachable;
     P2pTransferTicket p2p_;
     HostProxyTransferTicket host_proxy_;
 };
@@ -73,14 +69,14 @@ class TransferLane {
                          service_->local_staging_region.contains(
                              request.local_ptr, request.size));
 
-        switch (route.kind) {
-            case DeviceRouteKind::P2p:
+        switch (route.type) {
+            case DeviceRouteType::P2p:
                 return TransferTicket(
                     p2pPut(route.p2p.mapped_region_address, request.local_ptr,
                            request.remote_offset, request.size, request.signal,
                            block));
 
-            case DeviceRouteKind::HostProxy: {
+            case DeviceRouteType::HostProxy: {
                 // The source buffer may have been filled cooperatively. Every
                 // writer publishes its bytes to system scope before the leader
                 // hands the device address to the host worker.
@@ -94,7 +90,7 @@ class TransferLane {
                     service_->lane_results + lane_index_, block));
             }
 
-            case DeviceRouteKind::Unreachable:
+            case DeviceRouteType::Unreachable:
                 return TransferTicket();
         }
         PG_DEVICE_UNREACHABLE();
@@ -105,19 +101,19 @@ class TransferLane {
     signal(GlobalRank rank, const SignalRequest& request,
            cooperative_groups::thread_block block) const {
         const auto& route = service_->routes[rank];
-        switch (route.kind) {
-            case DeviceRouteKind::P2p:
+        switch (route.type) {
+            case DeviceRouteType::P2p:
                 return TransferTicket(p2pSignal(route.p2p.mapped_region_address,
                                                 request.signal, block));
 
-            case DeviceRouteKind::HostProxy:
+            case DeviceRouteType::HostProxy:
                 return TransferTicket(hostProxySignal(
                     service_->host_proxy_command_slots,
                     route.host_proxy.remote_region_address, rank,
                     request.signal, request.timeout_ticks, lane_index_,
                     service_->lane_results + lane_index_, block));
 
-            case DeviceRouteKind::Unreachable:
+            case DeviceRouteType::Unreachable:
                 return TransferTicket();
         }
         PG_DEVICE_UNREACHABLE();
@@ -141,7 +137,7 @@ class TransferLane {
                         break;
                     }
                 }
-                if (transferTimedOut(start_ticks, request.timeout_ticks)) {
+                if (deviceTimedOut(start_ticks, request.timeout_ticks)) {
                     break;
                 }
             }

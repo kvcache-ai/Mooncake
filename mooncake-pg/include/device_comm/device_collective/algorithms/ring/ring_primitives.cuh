@@ -1,13 +1,13 @@
-#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_RING_PRIMITIVES_CUH
-#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_RING_PRIMITIVES_CUH
+#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_PRIMITIVES_CUH
+#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_PRIMITIVES_CUH
 
 #include <cstdint>
 
 #include <cooperative_groups.h>
 
-#include "device_comm/device_assert.cuh"
+#include "device_comm/device_utils/device_assert.cuh"
 #include "device_comm/device_collective/device_collective_kernel.cuh"
-#include "device_comm/device_collective/protocols/ring/ring_types.cuh"
+#include "device_comm/device_collective/algorithms/ring/ring_types.cuh"
 #include "device_comm/device_primitives/payload_writer.cuh"
 #include "device_comm/device_primitives/value_primitives.cuh"
 #include "device_comm/device_transfer/transfer_lane.cuh"
@@ -427,4 +427,4 @@ class RingPrimitives {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_RING_PRIMITIVES_CUH
+#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_PRIMITIVES_CUH

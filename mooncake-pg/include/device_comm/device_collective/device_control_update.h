@@ -10,7 +10,7 @@
 namespace mooncake {
 
 // Device control updates carry control-plane changes, such as a Ring Plan and
-// protocol reset or a same-device active-ranks mirror copy, without launching
+// algorithm reset or a same-device active-ranks mirror copy, without launching
 // CUDA work from a control or recovery thread.
 //
 // The host builds one complete update in ordinary memory and publishes it to a
@@ -21,14 +21,14 @@ namespace mooncake {
 //
 // This indirection avoids a recovery deadlock. A failed collective leaves its
 // last channel CTA resident while it waits for the host recovery worker to
-// advance ready_generation. If that host worker enqueues Plan resets or mirror
-// copies through the CUDA runtime and synchronizes the update stream, those
-// operations may be unable to complete before that CTA exits and lets the
+// complete the recovery handshake. If that host worker enqueues Plan resets or
+// mirror copies through the CUDA runtime and synchronizes the update stream,
+// those operations may be unable to complete before that CTA exits and lets the
 // failed kernel complete. The host worker then waits for the CUDA update, while
 // the CTA waits for the worker: neither can make progress.
 //
 // CPU publication followed by execution in the last channel CTA breaks that
-// cycle. Ordinary Plan and protocol updates use the same mechanism at the next
+// cycle. Ordinary Plan and algorithm updates use the same mechanism at the next
 // collective boundary. Caller-owned active-ranks mirrors use it only while a
 // failed collective is parked; normal updates synchronize those mirrors
 // directly so non-collective completion retains its existing semantics.

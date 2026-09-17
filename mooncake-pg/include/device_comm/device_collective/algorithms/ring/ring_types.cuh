@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_RING_TYPES_CUH
-#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_RING_TYPES_CUH
+#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_TYPES_CUH
+#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_TYPES_CUH
 
 #include <cstdint>
 
@@ -20,7 +20,7 @@ inline constexpr uint64_t kMaxRingPayloadSlotSize = 512ull * 1024;  // 512 KiB
 static_assert(kMaxRingPayloadSlotSize % kRingPayloadAlignment == 0);
 
 // Defines the [kind][channel][signaling rank][slot] byte offsets within one
-// Ring protocol instance's signal slice. The slice belongs to the rank
+// Ring algorithm instance's signal slice. The slice belongs to the rank
 // receiving the signal; the rank dimension identifies the peer writing it.
 struct RingSignalLayout {
     uint32_t max_group_size = 0;
@@ -137,7 +137,7 @@ struct RingPeerTarget {
 
 // Complete published resource and topology binding read by a Ring AllReduce
 // kernel. Rolling sequence state lives next to it in RingAllReduceDeviceState.
-// A control update replaces the Plan while protocol execution is quiescent, so
+// A control update replaces the Plan while algorithm execution is quiescent, so
 // a kernel needs only the state pointer and its per-invocation request.
 struct RingAllReducePlan {
     const DeviceTransferHandle* transfer_handle = nullptr;
@@ -165,7 +165,7 @@ struct RingAllReducePlan {
 
 using RingAllReducePlanSlot = PlanSlot<RingAllReducePlan>;
 
-// Ordinary device memory owned by one Ring AllReduce protocol instance. None
+// Ordinary device memory owned by one Ring AllReduce algorithm instance. None
 // of this state is registered or published to peers.
 struct alignas(256) RingAllReduceDeviceState {
     RingAllReducePlanSlot plan;
@@ -194,4 +194,4 @@ cudaError_t launchRingAllReduceKernel(const RingAllReduceKernelArgs& request,
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_RING_TYPES_CUH
+#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_ALGORITHMS_RING_TYPES_CUH

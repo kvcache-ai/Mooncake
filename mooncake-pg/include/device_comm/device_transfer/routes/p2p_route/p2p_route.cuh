@@ -6,7 +6,7 @@
 #include <cooperative_groups.h>
 #include <transport/device/device_ops.cuh>
 
-#include "device_comm/device_assert.cuh"
+#include "device_comm/device_utils/device_assert.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
 
 namespace mooncake {
