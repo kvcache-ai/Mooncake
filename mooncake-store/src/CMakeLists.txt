@@ -117,6 +117,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     registered_pinned_memory.cpp
     dummy_client.cpp
     shm_helper.cpp
+    config/shm_spdk_registration_config.cpp
     file_storage.cpp
     config/client_host_identity_config.cpp
     config/client_metric_config.cpp
