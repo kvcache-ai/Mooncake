@@ -6,9 +6,14 @@ target_link_libraries(
   PUBLIC gflags::gflags glog::glog
   PRIVATE JsonCpp::JsonCpp pthread)
 
-if(USE_1825)
-  target_compile_definitions(rdma_transport PRIVATE USE_1825)
-  target_link_libraries(rdma_transport PUBLIC ${CMAKE_DL_LIBS})
+if(USE_ASCEND_RDMA)
+  target_compile_definitions(rdma_transport PRIVATE USE_ASCEND_RDMA)
+  target_include_directories(
+    rdma_transport PRIVATE ${ASCEND_INCLUDE_DIR}
+                           ${ASCEND_INCLUDE_DIR}/experiment/ascend_hal)
+  target_link_directories(rdma_transport PUBLIC ${ASCEND_LIB_DIR}
+                          ${ASCEND_TOOLKIT_ROOT}/devlib)
+  target_link_libraries(rdma_transport PUBLIC ascendcl ascend_hal)
   message(STATUS "Ascend UB segment registration for RDMA is enabled")
 endif()
 
