@@ -189,6 +189,8 @@ RdmaTransport::RdmaTransport() {
 }
 
 RdmaTransport::~RdmaTransport() {
+    notify_running_.store(false, std::memory_order_release);
+    if (notify_worker_.joinable()) notify_worker_.join();
 #ifdef CONFIG_USE_BATCH_DESC_SET
     for (auto &entry : batch_desc_set_) delete entry.second;
     batch_desc_set_.clear();
@@ -250,7 +252,24 @@ int RdmaTransport::install(std::string &local_server_name,
         return ret;
     }
 
+    if (std::any_of(context_list_.begin(), context_list_.end(),
+                    [](const auto &context) {
+                        return context->nativeNotifyEnabled();
+                    })) {
+        notify_running_.store(true, std::memory_order_release);
+        notify_worker_ = std::thread(&RdmaTransport::notifyWorkerThread, this);
+    }
     return 0;
+}
+
+void RdmaTransport::notifyWorkerThread() {
+    while (notify_running_.load(std::memory_order_acquire)) {
+        int completed = 0;
+        for (const auto &context : context_list_)
+            completed += std::max(0, context->pollNotificationCq());
+        if (!completed)
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
 }
 
 int RdmaTransport::preTouchMemory(void *addr, size_t length) {
@@ -1083,6 +1102,46 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 RdmaTransport::SegmentID RdmaTransport::getSegmentID(
     const std::string &segment_name) {
     return metadata_->getSegmentID(segment_name);
+}
+
+int RdmaTransport::sendNativeNotify(
+    const std::string &peer_server_name,
+    const TransferMetadata::NotifyDesc &notify) {
+    if (!RdmaEndPoint::notificationFits(notify)) return ERR_NOT_IMPLEMENTED;
+    if (context_list_.empty() || !context_list_.front()->nativeNotifyEnabled())
+        return ERR_NOT_IMPLEMENTED;
+    auto peer = metadata_->getSegmentDescByName(peer_server_name);
+    if (!peer) return ERR_METADATA;
+    if (peer->devices.empty()) return ERR_NOT_IMPLEMENTED;
+    auto context = context_list_.front();
+    const auto *device = &peer->devices.front();
+    for (const auto &candidate : peer->devices)
+        if (candidate.name == context->deviceName()) {
+            device = &candidate;
+            break;
+        }
+    auto path = MakeNicPath(peer->nicPathServerName(), device->name);
+    auto lifecycle_lock = context->lockEndpointLifecycle(path);
+    if (!context->active() || context->isConnectPaused(path))
+        return ERR_ENDPOINT;
+    auto endpoint = context->endpoint(path);
+    if (!endpoint) return ERR_ENDPOINT;
+    // Neither handshake RPCs nor send-slot waits may hold the lifecycle gate:
+    // passive setup and retirement need it to make progress.
+    lifecycle_lock.unlock();
+    int ret =
+        endpoint->readyToSend() ? 0 : endpoint->setupConnectionsByActive();
+    lifecycle_lock.lock();
+    if (context->findEndpoint(path) != endpoint || !context->active())
+        return ERR_ENDPOINT;
+    lifecycle_lock.unlock();
+    if (!ret) ret = endpoint->sendNotification(notify);
+    // Never replay a send whose delivery is uncertain. A later call may
+    // create a fresh endpoint after a link fault, using the normal lifecycle.
+    lifecycle_lock.lock();
+    if (endpoint->retired() || endpoint->notificationNeedsReconnect())
+        context->deleteEndpointByPtr(endpoint.get());
+    return ret;
 }
 
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
