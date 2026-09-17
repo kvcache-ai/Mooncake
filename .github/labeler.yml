@@ -9,6 +9,13 @@ store:
       - 'mooncake-store/**/*'
       - 'python/mooncake/async_store.py'
       - 'python/tests/store/*async_store*'
+      - 'python/mooncake/mooncake_ssd_*.py'
+      - 'python/mooncake/spdk_tgt_create.py'
+      - 'python/tests/ssd/**/*'
+
+Mooncake Conductor:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-conductor/**/*'
 
 Transfer Engine:
   - changed-files:
@@ -20,7 +27,12 @@ PyTorch Backend:
 
 Mooncake EP:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-ep/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-ep/**/*'
+      - 'python/mooncake/ep.py'
+      - 'python/mooncake/mooncake_elastic_buffer.py'
+      - 'python/mooncake/mooncake_ep_buffer.py'
+      - 'python/tests/ep/**/*'
 
 Installation:
   - changed-files:
@@ -60,7 +72,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
-      - 'python/tests/store/*async_store*'
+      - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:

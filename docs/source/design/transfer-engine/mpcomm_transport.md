@@ -311,6 +311,21 @@ listener would otherwise collide; see the note on port uniqueness above.
 
 ---
 
+## Measured Performance
+
+Numbers from a two-node cross-machine run on **AMD Turin CPUs with 8x400 Gbps CX-7 NICs**, two NUMA
+nodes per host, transferring host DRAM. Utilisation is against the line rate of the NICs actually in
+use (400 Gbps = 50 GB/s each).
+
+| Layer | Workload | Bandwidth | NICs in use | Utilisation |
+|-------|----------|-----------|-------------|-------------|
+| Transfer Engine | `tebench`, READ | **392 GB/s** | 8 (2 NUMA) | 98% |
+| Transfer Engine | `tebench`, WRITE | **392 GB/s** | 8 (2 NUMA) | 98% |
+| Mooncake Store | `get_tensor_into` | **190 GB/s** | 4 (1 NUMA) | 95% |
+| Mooncake Store | `put_tensor_from` | **191 GB/s** | 4 (1 NUMA) | 95.5% |
+
+---
+
 ## GPU (Device) Memory
 
 MPComm transfers device memory as well as host DRAM, so VRAM segments are supported in all four

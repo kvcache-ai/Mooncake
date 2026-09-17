@@ -121,6 +121,12 @@ TENT accepts the same classic Transfer Engine priority-matrix JSON format:
 }
 ```
 
+Keys must match discovered location names (`cpu:N`, `cuda:N`, `hip:N` on AMD).
+TENT accepts the legacy AMD prefix `rocm:N` when parsing matrices so existing
+configs keep working — such keys are canonicalized to `hip:N` on load, and
+specifying both `rocm:N` and `hip:N` for the same device is rejected as a
+conflict. Discovery and dumps emit `hip:N`, matching classic TE.
+
 Preferred HCAs map to topology rank 0; available/fallback HCAs map to rank 1.
 
 Configuration priority (highest first):
@@ -536,7 +542,7 @@ Status receiveNotification(std::vector<Notification>& notifi_list);
 
 Receives pending notifications from peers.
 
-- `notifi_list`: Output vector of received notifications.
+- `notifi_list`: Output vector of received notifications. The vector is cleared on entry, so each call reports only what that call delivered; a caller reusing one buffer across polls does not see the previous batch again. (Note that the classic Transfer Engine's `getNotifies()` appends instead of replacing.)
 - Return value: `Status::OK()` on success; otherwise a non-OK status.
 - Typical use: Polling loop to trigger follow-up actions on received data.
 
@@ -593,7 +599,7 @@ using Location = std::string;
 const static std::string kWildcardLocation = "*";
 ```
 
-Location strings identify device affinity: `"cpu:0"`, `"cuda:0"`, `"cuda:1"`, etc. Use `"*"` for automatic detection.
+Location strings identify device affinity: `"cpu:0"`, `"cuda:0"`, `"hip:0"`, etc. Use `"*"` for automatic detection. On AMD GPUs the canonical prefix is `hip:` (same as classic TE). The legacy TENT prefix `rocm:` is still accepted when parsing locations and custom NIC matrices.
 
 ### TransportType
 
