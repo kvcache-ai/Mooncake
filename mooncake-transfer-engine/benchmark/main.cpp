@@ -315,11 +315,17 @@ int main(int argc, char* argv[]) {
                           "--xport_type=shm or rdma";
             return EXIT_FAILURE;
         }
+        if (XferBenchConfig::hugepage_size == static_cast<size_t>(-1)) {
+            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, 1GB, or a byte "
+                          "count (2097152, 536870912, 1073741824)";
+            return EXIT_FAILURE;
+        }
         const size_t hp = XferBenchConfig::hugepage_size == 0
                               ? mooncake::SharedMemoryOptions::kHugepage2MB
                               : XferBenchConfig::hugepage_size;
         if (!mooncake::SharedMemoryOptions::isSupportedHugepageSize(hp)) {
-            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, or 1GB";
+            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, 1GB, or a byte "
+                          "count (2097152, 536870912, 1073741824)";
             return EXIT_FAILURE;
         }
         if (XferBenchConfig::total_buffer_size % hp != 0) {

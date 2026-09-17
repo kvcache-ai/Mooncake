@@ -15,7 +15,11 @@
 #include "utils.h"
 
 #include <gflags/gflags.h>
+#include <cctype>
+#include <charconv>
 #include <iostream>
+#include <optional>
+#include <string_view>
 
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
@@ -105,8 +109,10 @@ DEFINE_bool(use_hugepage, false,
             "classic DRAM: SHM allocates on hugetlbfs; RDMA allocates with "
             "MAP_HUGETLB so ibv_reg_mr does not explode NIC PTEs on 4K pages. "
             "Length must be a multiple of hugepage_size. No 4K fallback.");
-DEFINE_uint64(hugepage_size, 0,
-              "Hugepage size in bytes: 2MB, 512MB, or 1GB. "
+DEFINE_string(hugepage_size, "0",
+              "Hugepage size: 2MB, 512MB, or 1GB (same as "
+              "MC_STORE_HUGEPAGE_SIZE), or the size in bytes "
+              "(2097152, 536870912, 1073741824). "
               "0 defaults to 2MB when --use_hugepage is set.");
 DEFINE_string(
     hugetlbfs_path, "",
@@ -168,6 +174,51 @@ std::string XferBenchConfig::tent_intent_type;
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
 
+namespace {
+
+std::string_view trimFlag(std::string_view text) {
+    while (!text.empty() &&
+           std::isspace(static_cast<unsigned char>(text.front()))) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() &&
+           std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
+bool equalsIgnoreCase(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        unsigned char ca = static_cast<unsigned char>(a[i]);
+        unsigned char cb = static_cast<unsigned char>(b[i]);
+        if (ca >= 'A' && ca <= 'Z')
+            ca = static_cast<unsigned char>(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z')
+            cb = static_cast<unsigned char>(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// Store labels 2MB/512MB/1GB, or a raw byte count. Empty/"0" → 0.
+std::optional<size_t> parseHugepageSizeFlag(std::string_view raw) {
+    raw = trimFlag(raw);
+    if (raw.empty() || raw == "0") return 0;
+    if (equalsIgnoreCase(raw, "2MB")) return 2ULL << 20;
+    if (equalsIgnoreCase(raw, "512MB")) return 512ULL << 20;
+    if (equalsIgnoreCase(raw, "1GB")) return 1ULL << 30;
+    size_t bytes = 0;
+    const auto* first = raw.data();
+    const auto* last = raw.data() + raw.size();
+    const auto [ptr, ec] = std::from_chars(first, last, bytes);
+    if (ec == std::errc{} && ptr == last) return bytes;
+    return std::nullopt;
+}
+
+}  // namespace
+
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
     seg_type_mix = FLAGS_seg_type_mix;
@@ -204,7 +255,8 @@ void XferBenchConfig::loadFromFlags() {
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;
     use_hugepage = FLAGS_use_hugepage;
-    hugepage_size = FLAGS_hugepage_size;
+    const auto parsed_hp = parseHugepageSizeFlag(FLAGS_hugepage_size);
+    hugepage_size = parsed_hp.value_or(static_cast<size_t>(-1));
     hugetlbfs_path = FLAGS_hugetlbfs_path;
     notifi = FLAGS_notifi;
     tent_transport_hint = FLAGS_tent_transport_hint;
