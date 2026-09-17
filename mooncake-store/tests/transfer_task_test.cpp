@@ -9,7 +9,10 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "types.h"
@@ -81,6 +84,14 @@ TEST(TransferIntentTest, ParsesLegacyIntegerValues) {
     EXPECT_EQ(TransferIntentFromInt(3), TransferIntent::kMigration);
     EXPECT_FALSE(TransferIntentFromInt(-1).has_value());
     EXPECT_FALSE(TransferIntentFromInt(4).has_value());
+}
+
+TEST(TransferScatterApiTest, SubmitterOwnsScatterOperation) {
+    using ScatterRanges = std::vector<TransferEngine::ScatterTransferRange>;
+    static_assert(std::is_same_v<
+                  decltype(std::declval<TransferSubmitter&>().submitScatter(
+                      std::declval<const ScatterRanges&>())),
+                  StoreScatterTransferOperation>);
 }
 
 // Test MemcpyOperationState functionality
@@ -221,6 +232,74 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
         EXPECT_EQ(completions[i], 1u);
     }
 }
+
+#ifdef USE_TENT
+TEST_F(TransferTaskTest, TransferSubmitterScatterUsesTentDataPath) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17934"), 0);
+    if (!engine.isUsingTent()) GTEST_SKIP() << "TENT is unavailable";
+
+    constexpr size_t kSize = 128;
+    std::vector<char> source(kSize, 'T'), destination(kSize, 0);
+    std::vector<size_t> offsets{0};
+    std::vector<size_t> lengths{kSize};
+    ASSERT_EQ(engine.registerLocalMemory(source.data(), kSize, "cpu:0"), 0);
+    ASSERT_EQ(engine.registerLocalMemory(destination.data(), kSize, "cpu:0"),
+              0);
+
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
+    auto operation = submitter.submitScatter(
+        {{.opcode = TransferRequest::READ,
+          .remote_segment = engine.getLocalIpAndPort(),
+          .remote_base_offset = reinterpret_cast<uintptr_t>(source.data()),
+          .remote_size = kSize,
+          .local_buffer = destination.data(),
+          .local_capacity = kSize,
+          .local_offsets = offsets,
+          .remote_offsets = offsets,
+          .lengths = lengths}},
+        TransferIntent::kForegroundGet);
+    ASSERT_TRUE(operation.wait().ok());
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(engine.freeEngine(), 0);
+}
+
+TEST_F(TransferTaskTest, TransferSubmitterScatterContainsCallbackFailure) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17935"), 0);
+    if (!engine.isUsingTent()) GTEST_SKIP() << "TENT is unavailable";
+
+    std::vector<char> source(8, 'T'), destination(8, 0);
+    std::vector<size_t> offsets{0};
+    std::vector<size_t> lengths{8};
+    ASSERT_EQ(engine.registerLocalMemory(source.data(), source.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(engine.registerLocalMemory(destination.data(), destination.size(),
+                                         "cpu:0"),
+              0);
+
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
+    auto operation = submitter.submitScatter(
+        {{.opcode = TransferRequest::READ,
+          .remote_segment = engine.getLocalIpAndPort(),
+          .remote_base_offset = reinterpret_cast<uintptr_t>(source.data()),
+          .remote_size = source.size(),
+          .local_buffer = destination.data(),
+          .local_capacity = destination.size(),
+          .local_offsets = offsets,
+          .remote_offsets = {},
+          .lengths = lengths,
+          .on_fragment_complete =
+              [](size_t, const Status&) {
+                  throw std::runtime_error("callback failure");
+              }}},
+        TransferIntent::kForegroundGet);
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_EQ(engine.freeEngine(), 0);
+}
+#endif
 
 #ifdef USE_CUDA
 TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedGpuBuffers) {

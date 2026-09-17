@@ -14,10 +14,25 @@
 
 #include <chrono>
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <thread>
 #include <unordered_map>
+
+namespace mooncake {
+namespace {
+
+bool isTransferEngineEnvEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "off") != 0 && std::strcmp(value, "no") != 0;
+}
+
+}  // namespace
+}  // namespace mooncake
 
 #ifndef USE_TENT
 #include "transfer_engine.h"
@@ -398,7 +413,8 @@ void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
 }  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+    if (isTransferEngineEnvEnabled("MC_USE_TENT") ||
+        isTransferEngineEnvEnabled("MC_USE_TEV1")) {
         use_tent_ = true;
     }
     if (!use_tent_) {
@@ -408,7 +424,8 @@ TransferEngine::TransferEngine(bool auto_discover) {
 
 TransferEngine::TransferEngine(bool auto_discover,
                                const std::vector<std::string>& filter) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+    if (isTransferEngineEnvEnabled("MC_USE_TENT") ||
+        isTransferEngineEnvEnabled("MC_USE_TEV1")) {
         use_tent_ = true;
     }
     if (!use_tent_) {

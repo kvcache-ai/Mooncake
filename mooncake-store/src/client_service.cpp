@@ -1444,11 +1444,33 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers,
     TransferIntent intent) {
-    if (!transfer_submitter_) {
+    if (!transfer_engine_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
-    return transfer_submitter_->submitScatter(transfers, intent);
+    int intent_value = 0;
+    switch (intent) {
+        case TransferIntent::kUnspecified:
+            intent_value = 0;
+            break;
+        case TransferIntent::kForegroundGet:
+            intent_value = 1;
+            break;
+        case TransferIntent::kBackgroundPrefetch:
+            intent_value = 2;
+            break;
+        case TransferIntent::kMigration:
+            intent_value = 3;
+            break;
+        default:
+            LOG(ERROR) << "Invalid transfer intent: "
+                       << static_cast<int>(intent);
+            return std::nullopt;
+    }
+    auto mutable_transfers = transfers;
+    for (auto& transfer : mutable_transfers)
+        transfer.intent_type = intent_value;
+    return transfer_engine_->submitScatter(mutable_transfers);
 }
 
 std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
@@ -1460,6 +1482,16 @@ std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
         return std::nullopt;
     }
     return SubmitScatter(transfers, *parsed_intent);
+}
+
+std::optional<StoreScatterTransferOperation> Client::SubmitScatterNative(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    TransferIntent intent) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+    return transfer_submitter_->submitScatter(transfers, intent);
 }
 
 struct BatchGetOperation {
@@ -4543,7 +4575,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         return results;
     }
 
-    auto operation = SubmitScatter(builder.ranges(), intent);
+    auto operation = SubmitScatterNative(builder.ranges(), intent);
     if (!operation) {
         LOG(ERROR) << "Failed to submit batch range read";
         for (auto& result : results) {
@@ -4646,7 +4678,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
         return results;
     }
 
-    auto operation = SubmitScatter(builder.ranges(), intent);
+    auto operation = SubmitScatterNative(builder.ranges(), intent);
     if (!operation) {
         LOG(ERROR) << "Failed to submit batch range write";
         for (auto& result : results) {

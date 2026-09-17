@@ -203,6 +203,10 @@ class Client {
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         int intent);
 
+    std::optional<StoreScatterTransferOperation> SubmitScatterNative(
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+        TransferIntent intent = TransferIntent::kUnspecified);
+
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects

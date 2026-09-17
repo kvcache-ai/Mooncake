@@ -318,6 +318,28 @@ class TransferFuture {
     std::shared_ptr<OperationState> state_;
 };
 
+class StoreScatterTransferOperation {
+   public:
+    StoreScatterTransferOperation(StoreScatterTransferOperation&&) noexcept;
+    StoreScatterTransferOperation& operator=(
+        StoreScatterTransferOperation&&) noexcept;
+    ~StoreScatterTransferOperation();
+
+    StoreScatterTransferOperation(const StoreScatterTransferOperation&) =
+        delete;
+    StoreScatterTransferOperation& operator=(
+        const StoreScatterTransferOperation&) = delete;
+
+    Status wait();
+    Status waitFor(std::chrono::nanoseconds timeout);
+
+   private:
+    class Impl;
+    explicit StoreScatterTransferOperation(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+    friend class TransferSubmitter;
+};
+
 /**
  * @brief Memory copy operation descriptor
  */
@@ -617,10 +639,10 @@ class TransferSubmitter {
         return submitRangeWrite(replica, slices, dst_offset, *parsed_intent);
     }
 
-    TransferEngine::ScatterTransferOperation submitScatter(
+    StoreScatterTransferOperation submitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
-    TransferEngine::ScatterTransferOperation submitScatter(
+    StoreScatterTransferOperation submitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         int intent) {
         return submitScatter(transfers, TransferIntentFromInt(intent).value_or(
