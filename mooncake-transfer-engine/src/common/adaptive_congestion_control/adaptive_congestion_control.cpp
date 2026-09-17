@@ -114,7 +114,25 @@ struct CoreAccess {
         }
         if (state->config_.mode == Mode::kObserve) {
             addSaturating(state->inflight_bytes_, bytes);
-            return {Decision::kAllow, true, false};
+            if (generation ==
+                    state->generation_.load(std::memory_order_acquire) &&
+                state->state_.load(std::memory_order_acquire) ==
+                    PathState::kProbing) {
+                std::lock_guard<std::mutex> lock(state->probe_mutex_);
+                if (generation ==
+                        state->generation_.load(std::memory_order_acquire) &&
+                    state->state_.load(std::memory_order_acquire) ==
+                        PathState::kProbing &&
+                    !state->probe_draining_ &&
+                    state->active_probe_permits_ !=
+                        std::numeric_limits<uint64_t>::max()) {
+                    ++state->active_probe_permits_;
+                    return {
+                        Decision::kAllow, true,
+                        state->probe_epoch_.load(std::memory_order_relaxed)};
+                }
+            }
+            return {Decision::kAllow, true, 0};
         }
         if (generation != state->generation_.load(std::memory_order_acquire)) {
             return {Decision::kAvoid, false, false};
