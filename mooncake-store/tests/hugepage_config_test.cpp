@@ -6,7 +6,7 @@
 #include <optional>
 #include <string>
 
-#include "../src/config/hugepage_config.h"
+#include "../client/config/hugepage_config.h"
 
 namespace mooncake {
 namespace {

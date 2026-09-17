@@ -7,8 +7,8 @@
 #include <optional>
 #include <string>
 
-#include "../src/config/oss_adapter_config.h"
-#include "storage/distributed/oss_adapter.h"
+#include "../client/config/oss_adapter_config.h"
+#include "client/storage/distributed/oss_adapter.h"
 
 namespace mooncake {
 namespace {

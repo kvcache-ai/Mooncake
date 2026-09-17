@@ -1,4 +1,4 @@
-#include "master_service.h"
+#include "master/master_service.h"
 #include "master_service/master_service_test_peer.h"
 
 #include <algorithm>
@@ -15,7 +15,7 @@
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
-#include "types.h"
+#include "common/types.h"
 
 DEFINE_uint64(
     num_objects, 0,

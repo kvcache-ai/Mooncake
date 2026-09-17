@@ -22,7 +22,7 @@
 #endif
 
 #include "config.h"
-#include "real_client.h"
+#include "client/real_client.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");

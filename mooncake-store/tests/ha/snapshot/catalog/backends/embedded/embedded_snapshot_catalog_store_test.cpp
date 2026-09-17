@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-#include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
+#include "master/ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 
 namespace mooncake::test {
 

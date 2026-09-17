@@ -10,12 +10,12 @@
 #include <csignal>
 #include <ylt/coro_http/coro_http_client.hpp>
 
-#include "client_service.h"
+#include "client/client_service.h"
 #include "common/network.h"
 #include "default_config.h"
-#include "real_client.h"
+#include "client/real_client.h"
 #include "test_server_helpers.h"
-#include "version.h"
+#include "common/version.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");

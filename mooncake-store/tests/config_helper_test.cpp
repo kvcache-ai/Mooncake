@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "config_helper.h"
+#include "common/config_helper.h"
 
 namespace mooncake::test {
 namespace {

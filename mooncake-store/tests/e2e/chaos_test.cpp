@@ -8,9 +8,9 @@
 
 #include "client_wrapper.h"
 #include "e2e_utils.h"
-#include "ha/leadership/leader_coordinator_factory.h"
+#include "master/ha/leadership/leader_coordinator_factory.h"
 #include "process_handler.h"
-#include "types.h"
+#include "common/types.h"
 
 USE_engine_flags;
 FLAG_etcd_endpoints;

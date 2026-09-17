@@ -1,5 +1,5 @@
-#include "segment/catalog.h"
-#include "placement/replica_allocator.h"
+#include "master/segment/catalog.h"
+#include "master/placement/replica_allocator.h"
 
 #include <gtest/gtest.h>
 
@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-#include "local_ssd/manager.h"
-#include "placement/index.h"
+#include "common/local_ssd/manager.h"
+#include "master/placement/index.h"
 #include "test_buffer_allocator.h"
 
 namespace mooncake::test {

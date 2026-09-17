@@ -1,4 +1,4 @@
-#include "ha/oplog/oplog_test_failpoint.h"
+#include "master/ha/oplog/oplog_test_failpoint.h"
 
 #include <gtest/gtest.h>
 

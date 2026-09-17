@@ -6,9 +6,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "allocator.h"
-#include "client_service.h"
-#include "types.h"
+#include "master/allocator.h"
+#include "client/client_service.h"
+#include "common/types.h"
 
 namespace mooncake {
 namespace testing {

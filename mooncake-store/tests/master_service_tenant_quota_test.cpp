@@ -1,4 +1,4 @@
-#include "master_service.h"
+#include "master/master_service.h"
 #include "master_service/master_service_test_peer.h"
 
 #include <atomic>
@@ -18,9 +18,9 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
-#include "allocation_strategy.h"
-#include "tenant_quota_policy_store.h"
-#include "types.h"
+#include "master/allocation_strategy.h"
+#include "master/tenant_quota_policy_store.h"
+#include "common/types.h"
 
 namespace mooncake::test {
 

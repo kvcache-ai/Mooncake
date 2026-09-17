@@ -6,9 +6,9 @@
 #include <hiredis/hiredis.h>
 #include <ylt/util/tl/expected.hpp>
 
-#include "ha/common/redis/redis_connection.h"
-#include "ha/ha_types.h"
-#include "types.h"
+#include "master/ha/common/redis/redis_connection.h"
+#include "master/ha/ha_types.h"
+#include "common/types.h"
 
 namespace mooncake {
 namespace testing {

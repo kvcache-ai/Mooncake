@@ -7,7 +7,7 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_http/coro_http_client.hpp>
 
-#include "http_metadata_server.h"
+#include "master/http_metadata_server.h"
 #include "common/network.h"
 
 namespace mooncake::testing {

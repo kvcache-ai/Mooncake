@@ -10,12 +10,12 @@
 #include <unordered_set>
 #include <ylt/coro_http/coro_http_client.hpp>
 
-#include "client_metric.h"
+#include "client/client_metric.h"
 #include "common/network.h"
 #include "environment_variables.h"
-#include "real_client.h"
+#include "client/real_client.h"
 #include "test_server_helpers.h"
-#include "version.h"
+#include "common/version.h"
 
 namespace mooncake::test {
 namespace {

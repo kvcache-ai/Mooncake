@@ -7,7 +7,7 @@
 #include <optional>
 #include <string>
 
-#include "config/rpc_timeout_config.h"
+#include "client/config/rpc_timeout_config.h"
 
 namespace mooncake {
 namespace {

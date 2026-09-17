@@ -5,9 +5,9 @@
 #include <cstring>
 #include <limits>
 
-#include "engram/engram_store.h"
-#include "engram/engram_store_config.h"
-#include "pyclient.h"
+#include "client/engram/engram_store.h"
+#include "client/engram/engram_store_config.h"
+#include "client/pyclient.h"
 
 namespace py = pybind11;
 using namespace mooncake;

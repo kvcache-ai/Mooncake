@@ -1,4 +1,4 @@
-#include "deadline_scheduler.h"
+#include "common/deadline_scheduler.h"
 
 #include <gtest/gtest.h>
 
@@ -8,7 +8,7 @@
 #include <thread>
 #include <vector>
 
-#include "types.h"
+#include "common/types.h"
 
 namespace mooncake::test {
 namespace {

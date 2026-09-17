@@ -7,7 +7,7 @@
 #include <unordered_map>
 
 #include "client_wrapper.h"
-#include "types.h"
+#include "common/types.h"
 #include "e2e_utils.h"
 
 // Command line flags

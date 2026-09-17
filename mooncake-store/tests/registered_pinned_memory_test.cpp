@@ -1,6 +1,6 @@
 #define MOONCAKE_STORE_TEST
-#include "../src/registered_pinned_memory.h"
-#include "../src/config/registered_pinned_memory_config.h"
+#include "../client/registered_pinned_memory.h"
+#include "../client/config/registered_pinned_memory_config.h"
 
 #include <array>
 #include <cstdlib>

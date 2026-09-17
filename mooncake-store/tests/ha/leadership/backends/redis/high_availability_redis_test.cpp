@@ -12,10 +12,10 @@
 
 #include <hiredis/hiredis.h>
 
-#include "ha/leadership/leader_coordinator_factory.h"
+#include "master/ha/leadership/leader_coordinator_factory.h"
 #include "ha/common/redis/redis_test_utils.h"
 #include "ha/leadership/high_availability_test_fixture.h"
-#include "types.h"
+#include "common/types.h"
 
 namespace mooncake {
 namespace testing {

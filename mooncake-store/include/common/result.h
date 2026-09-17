@@ -14,8 +14,8 @@
 
 #include <ylt/util/tl/expected.hpp>
 
-#include "rpc_types.h"
-#include "types.h"
+#include "common/rpc_types.h"
+#include "common/types.h"
 
 namespace mooncake {
 

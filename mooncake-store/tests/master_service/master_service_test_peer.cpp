@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <cassert>
 
-#include "ha/snapshot/catalog/snapshot_catalog_store.h"
+#include "master/ha/snapshot/catalog/snapshot_catalog_store.h"
 #ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
+#include "common/spdk/spdk_wrapper.h"
 #endif
 
 namespace mooncake::test {

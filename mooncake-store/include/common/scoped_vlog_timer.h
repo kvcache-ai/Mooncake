@@ -9,7 +9,7 @@
 #include <type_traits>  // Required for std::true_type, std::false_type
 #include <utility>
 
-#include "types.h"
+#include "common/types.h"
 #include "common/result.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"

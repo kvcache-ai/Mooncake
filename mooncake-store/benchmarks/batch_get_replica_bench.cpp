@@ -36,7 +36,7 @@
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 
-#include "master_client.h"
+#include "client/master_client.h"
 
 static constexpr uint64_t KiB = 1024;
 static constexpr uint64_t MiB = 1024 * KiB;

@@ -1,5 +1,5 @@
-#include "ha/oplog/oplog_batch_codec.h"
-#include "ha/oplog/oplog_batch_types.h"
+#include "master/ha/oplog/oplog_batch_codec.h"
+#include "master/ha/oplog/oplog_batch_types.h"
 
 #include <gtest/gtest.h>
 #include <xxhash.h>

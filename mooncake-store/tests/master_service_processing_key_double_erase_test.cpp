@@ -5,7 +5,7 @@
 // walk dereferencing the chain-end nullptr).
 //
 // The bug — MasterService::MetadataAccessorRW constructor
-// (mooncake-store/include/master_service.h):
+// (mooncake-store/include/master/master_service.h):
 //
 //     if (!it_->second.IsValid()) {
 //         const bool had_processing =
@@ -54,7 +54,7 @@
 // that into a clean test failure. After the fix the child exits 0 (PutEnd
 // simply reports OBJECT_NOT_FOUND) and the test passes.
 
-#include "master_service.h"
+#include "master/master_service.h"
 #include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>

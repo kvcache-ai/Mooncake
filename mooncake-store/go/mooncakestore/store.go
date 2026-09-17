@@ -18,7 +18,7 @@
 package mooncakestore
 
 /*
-#include "store_c.h"
+#include "client/store_c.h"
 #include <stdlib.h>
 */
 import "C"

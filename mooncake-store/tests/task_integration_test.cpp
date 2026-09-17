@@ -15,15 +15,15 @@
 #include <ylt/struct_json/json_writer.h>
 #include <ylt/reflection/user_reflect_macro.hpp>
 
-#include "client_service.h"
-#include "master_client.h"
-#include "task_manager.h"
-#include "types.h"
-#include "common/client_buffer_allocation.h"
+#include "client/client_service.h"
+#include "client/master_client.h"
+#include "master/task_manager.h"
+#include "common/types.h"
+#include "client/common/client_buffer_allocation.h"
 #include "common/network.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
-#include "allocator.h"
+#include "master/allocator.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");

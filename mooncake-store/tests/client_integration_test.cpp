@@ -18,11 +18,11 @@
 #include <thread>
 #include <chrono>
 
-#include "allocator.h"
-#include "client_service.h"
-#include "real_client.h"
-#include "types.h"
-#include "common/client_buffer_allocation.h"
+#include "master/allocator.h"
+#include "client/client_service.h"
+#include "client/real_client.h"
+#include "common/types.h"
+#include "client/common/client_buffer_allocation.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
 #include "crc_checksum.h"

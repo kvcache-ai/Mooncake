@@ -1,6 +1,6 @@
-#include "ha/common/redis/redis_connection.h"
+#include "master/ha/common/redis/redis_connection.h"
 
-#include "../src/config/redis_connection_config.h"
+#include "../master/config/redis_connection_config.h"
 
 #include <gtest/gtest.h>
 

@@ -1,5 +1,5 @@
-#include "master_config.h"
-#include "ha/snapshot/batch_oplog/config.h"
+#include "master/master_config.h"
+#include "master/ha/snapshot/batch_oplog/config.h"
 
 #include <gtest/gtest.h>
 

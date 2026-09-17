@@ -6,7 +6,7 @@
 #include <optional>
 #include <string>
 
-#include "storage_backend.h"
+#include "client/storage_backend.h"
 
 namespace mooncake {
 

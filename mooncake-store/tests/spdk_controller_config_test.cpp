@@ -1,4 +1,4 @@
-#include "../src/config/spdk_controller_config.h"
+#include "../common/config/spdk_controller_config.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

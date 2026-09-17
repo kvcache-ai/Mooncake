@@ -11,10 +11,10 @@
 #include <thread>
 #include <vector>
 
-#include "allocator.h"
-#include "client_service.h"
-#include "types.h"
-#include "common/client_buffer_allocation.h"
+#include "master/allocator.h"
+#include "client/client_service.h"
+#include "common/types.h"
+#include "client/common/client_buffer_allocation.h"
 
 // Configuration flags
 DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");

@@ -16,9 +16,9 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 
-#include "allocator.h"
-#include "client_service.h"
-#include "types.h"
+#include "master/allocator.h"
+#include "client/client_service.h"
+#include "common/types.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
 

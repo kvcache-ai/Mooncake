@@ -1,11 +1,11 @@
-#include "segment/region_driver.h"
+#include "master/segment/region_driver.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <vector>
 
-#include "master_metric_manager.h"
+#include "master/master_metric_manager.h"
 
 namespace mooncake {
 namespace {

@@ -1,4 +1,4 @@
-#include "hot_standby_service.h"
+#include "master/hot_standby_service.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -16,16 +16,16 @@
 
 #include <xxhash.h>
 
-#include "ha_metric_manager.h"
-#include "master_service.h"
-#include "metadata_store.h"
-#include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_codec.h"
-#include "ha/oplog/oplog_batch_storage.h"
-#include "ha/oplog/oplog_types.h"
+#include "master/ha_metric_manager.h"
+#include "master/master_service.h"
+#include "master/metadata_store.h"
+#include "master/ha/kv/ha_kv_backend.h"
+#include "master/ha/oplog/oplog_batch_codec.h"
+#include "master/ha/oplog/oplog_batch_storage.h"
+#include "master/ha/oplog/oplog_types.h"
 #ifdef STORE_USE_ETCD
-#include "etcd_helper.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
+#include "common/etcd_helper.h"
+#include "master/ha/kv/etcd_ha_kv_backend.h"
 #endif
 
 namespace mooncake::test {

@@ -6,7 +6,7 @@
 #include <optional>
 #include <string>
 
-#include "client_metric.h"
+#include "client/client_metric.h"
 #include "environment_variables.h"
 
 namespace mooncake {

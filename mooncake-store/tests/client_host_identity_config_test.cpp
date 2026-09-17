@@ -1,4 +1,4 @@
-#include "../src/config/client_host_identity_config.h"
+#include "../client/config/client_host_identity_config.h"
 
 #include <gtest/gtest.h>
 

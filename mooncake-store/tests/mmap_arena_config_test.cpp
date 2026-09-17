@@ -6,7 +6,7 @@
 #include <optional>
 #include <string>
 
-#include "../src/config/mmap_arena_config.h"
+#include "../client/config/mmap_arena_config.h"
 
 namespace mooncake {
 namespace {

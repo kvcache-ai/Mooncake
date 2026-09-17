@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "config/distributed_storage_config.h"
+#include "common/config/distributed_storage_config.h"
 
 namespace mooncake {
 

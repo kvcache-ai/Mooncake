@@ -1,4 +1,4 @@
-#include "allocation_strategy.h"
+#include "master/allocation_strategy.h"
 
 #include <gtest/gtest.h>
 
@@ -15,10 +15,10 @@
 #include <unordered_set>
 #include <vector>
 
-#include "allocator.h"
-#include "local_ssd/manager.h"
-#include "segment.h"
-#include "types.h"
+#include "master/allocator.h"
+#include "common/local_ssd/manager.h"
+#include "master/segment.h"
+#include "common/types.h"
 
 namespace mooncake {
 

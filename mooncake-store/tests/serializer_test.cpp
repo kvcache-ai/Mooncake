@@ -1,9 +1,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "serializer.h"
-#include "serialize/serializer.h"
-#include "segment.h"
+#include "common/serializer.h"
+#include "master/serialize/serializer.h"
+#include "master/segment.h"
 
 namespace mooncake::test {
 

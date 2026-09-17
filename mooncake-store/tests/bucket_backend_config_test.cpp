@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-#include "config/bucket_backend_config.h"
+#include "client/config/bucket_backend_config.h"
 
 namespace mooncake {
 namespace {

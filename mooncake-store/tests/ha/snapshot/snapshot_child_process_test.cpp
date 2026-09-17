@@ -1,15 +1,15 @@
-#include "master_service.h"
+#include "master/master_service.h"
 #include "master_service/master_service_test_peer.h"
-#include "master_snapshot_manager.h"
-#include "master_snapshot_repository.h"
-#include "master_metric_manager.h"
-#include "ha/snapshot/catalog/snapshot_catalog_store.h"
-#include "ha/snapshot/object/snapshot_object_store.h"
+#include "master/master_snapshot_manager.h"
+#include "master/master_snapshot_repository.h"
+#include "master/master_metric_manager.h"
+#include "master/ha/snapshot/catalog/snapshot_catalog_store.h"
+#include "master/ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/snapshot_test_utils.h"
 #ifdef STORE_USE_ETCD
-#include "etcd_helper.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_storage.h"
+#include "common/etcd_helper.h"
+#include "master/ha/kv/etcd_ha_kv_backend.h"
+#include "master/ha/oplog/oplog_batch_storage.h"
 #endif
 
 #include <glog/logging.h>

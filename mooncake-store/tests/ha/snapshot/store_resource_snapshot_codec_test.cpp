@@ -1,4 +1,4 @@
-#include "ha/snapshot/store_resource_snapshot_codec.h"
+#include "master/ha/snapshot/store_resource_snapshot_codec.h"
 
 #include <gtest/gtest.h>
 #include <msgpack.hpp>
@@ -12,14 +12,14 @@
 #include <vector>
 
 #include "common/zstd_util.h"
-#include "ha/snapshot/local_ssd_codec.h"
-#include "master_metric_manager.h"
-#include "segment.h"
-#include "segment/pool.h"
-#include "segment/pool_read_access.h"
-#include "segment/pool_write_access.h"
-#include "segment/snapshot.h"
-#include "serialize/serializer.h"
+#include "master/ha/snapshot/local_ssd_codec.h"
+#include "master/master_metric_manager.h"
+#include "master/segment.h"
+#include "master/segment/pool.h"
+#include "master/segment/pool_read_access.h"
+#include "master/segment/pool_write_access.h"
+#include "master/segment/snapshot.h"
+#include "master/serialize/serializer.h"
 
 namespace mooncake::ha {
 namespace {

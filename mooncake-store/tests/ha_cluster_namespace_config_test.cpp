@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-#include "../src/config/ha_cluster_namespace_config.h"
+#include "../master/config/ha_cluster_namespace_config.h"
 
 namespace mooncake {
 namespace {

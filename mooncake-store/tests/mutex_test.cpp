@@ -1,4 +1,4 @@
-#include "mutex.h"
+#include "common/mutex.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

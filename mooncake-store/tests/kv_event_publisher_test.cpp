@@ -7,7 +7,7 @@
 #include <unistd.h>
 #include <vector>
 
-#include "kv_event/kv_event_publisher.h"
+#include "master/kv_event/kv_event_publisher.h"
 
 #if defined(MOONCAKE_ENABLE_KV_EVENTS) && MOONCAKE_ENABLE_KV_EVENTS
 #include <msgpack.hpp>

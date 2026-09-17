@@ -14,10 +14,10 @@
 #include <thread>
 #include <vector>
 
-#include "etcd_helper.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_storage.h"
-#include "ha/oplog/oplog_types.h"
+#include "common/etcd_helper.h"
+#include "master/ha/kv/etcd_ha_kv_backend.h"
+#include "master/ha/oplog/oplog_batch_storage.h"
+#include "master/ha/oplog/oplog_types.h"
 #include "tools/oplog_batch_auditor.h"
 
 DEFINE_string(endpoints, "127.0.0.1:2379", "Etcd endpoints");

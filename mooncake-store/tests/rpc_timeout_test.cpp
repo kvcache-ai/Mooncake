@@ -34,10 +34,10 @@
 #include <optional>
 #include <string>
 
-#include "master_client.h"
-#include "pyclient.h"
+#include "client/master_client.h"
+#include "client/pyclient.h"
 #include "test_server_helpers.h"
-#include "types.h"
+#include "common/types.h"
 
 namespace mooncake {
 namespace {

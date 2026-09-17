@@ -1,5 +1,5 @@
 #include "master_service_test_fixture.h"
-#include "rpc_service.h"
+#include "master/rpc_service.h"
 
 #include <glog/logging.h>
 

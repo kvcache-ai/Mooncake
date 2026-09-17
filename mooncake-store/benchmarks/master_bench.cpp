@@ -24,7 +24,7 @@
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 
-#include "master_client.h"
+#include "client/master_client.h"
 
 // Size units for better readability
 static constexpr size_t KiB = 1024;

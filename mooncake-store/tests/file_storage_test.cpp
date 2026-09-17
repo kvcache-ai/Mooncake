@@ -8,14 +8,14 @@
 #include <string>
 #include <thread>
 
-#include "allocator.h"
-#include "client_metric.h"
+#include "master/allocator.h"
+#include "client/client_metric.h"
 #include "common/network.h"
-#include "file_storage.h"
-#include "storage_backend.h"
-#include "tenant_id.h"
+#include "client/file_storage.h"
+#include "client/storage_backend.h"
+#include "common/tenant_id.h"
 #include "test_server_helpers.h"
-#include "common/client_buffer_allocation.h"
+#include "client/common/client_buffer_allocation.h"
 #include "utils/common.h"
 
 namespace mooncake {

@@ -10,11 +10,11 @@
 #include <thread>
 #include <vector>
 
-#include "allocator.h"
-#include "client_service.h"
+#include "master/allocator.h"
+#include "client/client_service.h"
 #include "test_server_helpers.h"
-#include "types.h"
-#include "common/client_buffer_allocation.h"
+#include "common/types.h"
+#include "client/common/client_buffer_allocation.h"
 #include "common/network.h"
 
 namespace mooncake {

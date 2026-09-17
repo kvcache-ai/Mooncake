@@ -29,7 +29,7 @@ fn main() {
     let include_dir = std::env::var("MOONCAKE_STORE_INCLUDE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| manifest_dir.join("../include"));
-    let header = include_dir.join("store_c.h");
+    let header = include_dir.join("client/store_c.h");
     let out = manifest_dir.join("src/generated/ffi_dlopen_bindings.rs");
 
     let bindings = bindgen::Builder::default()

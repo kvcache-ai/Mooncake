@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "common/client_buffer_allocation.h"
+#include "client/common/client_buffer_allocation.h"
 
 #if defined(__has_feature)
 #define MC_HAS_FEATURE(x) __has_feature(x)

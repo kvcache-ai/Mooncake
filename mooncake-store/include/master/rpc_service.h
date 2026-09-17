@@ -1,0 +1,354 @@
+#pragma once
+
+#include <csignal>
+
+#include <string>
+#include <boost/functional/hash.hpp>
+#include <cstdint>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/util/tl/expected.hpp>
+
+#include "master/master_service.h"
+#include "common/types.h"
+#include "common/rpc_types.h"
+#include "master/master_config.h"
+#include "master/kv_event/kv_event_publisher.h"
+#include "master/segment.h"
+
+namespace mooncake {
+
+// Forward declaration
+class HttpMetadataServer;
+class WrappedMasterService {
+   public:
+    void SetBatchOpLogTerminalCallback(
+        OrderedOpLogWriter::TerminalCallback callback);
+    void StopBatchOpLogWriter();
+    // Constructor with optional metadata-cleanup-on-timeout configuration.
+    // - http_metadata_server: in-process pointer used when the HTTP metadata
+    //   server is co-located in the master process (nullptr = not co-located).
+    // - http_metadata_remote_url: http(s) connection string used when the
+    //   metadata server is deployed separately (empty = none). Only consulted
+    //   when http_metadata_server is nullptr. If both are unset, cleanup is
+    //   disabled.
+    WrappedMasterService(const WrappedMasterServiceConfig& config,
+                         HttpMetadataServer* http_metadata_server = nullptr,
+                         const std::string& http_metadata_remote_url = "");
+
+    ~WrappedMasterService();
+
+    tl::expected<bool, ErrorCode> ExistKey(
+        const std::string& key, const std::string& tenant_id = "default");
+
+    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats();
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
+
+    tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids);
+
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name);
+
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    GetReplicaListByRegex(const std::string& str,
+                          const std::string& tenant_id = "default");
+
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
+        const std::string& key, const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys,
+                        const std::string& tenant_id = "default");
+
+    // Read-only admin variants: no lease grants, no promotion, no metric
+    // updates.
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
+                                const std::string& tenant_id = "default");
+
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
+        const std::string& key, const std::string& tenant_id = "default");
+
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+        const UUID& client_id, const std::string& key,
+        const uint64_t slice_length, const ReplicateConfig& config,
+        const std::string& tenant_id = "default");
+
+    tl::expected<void, ErrorCode> PutEnd(
+        const UUID& client_id, const ObjectMeta& object_meta,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    tl::expected<void, ErrorCode> PutRevoke(
+        const UUID& client_id, const std::string& key,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const std::vector<uint64_t>& slice_lengths,
+                  const ReplicateConfig& config,
+                  const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+        const UUID& client_id, const std::string& key,
+        const uint64_t slice_length, const ReplicateConfig& config,
+        const std::string& tenant_id = "default");
+
+    tl::expected<void, ErrorCode> UpsertEnd(
+        const UUID& client_id, const ObjectMeta& object_meta,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    tl::expected<void, ErrorCode> UpsertRevoke(
+        const UUID& client_id, const std::string& key,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const UUID& client_id,
+                     const std::vector<std::string>& keys,
+                     const std::vector<uint64_t>& slice_lengths,
+                     const ReplicateConfig& config,
+                     const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
+
+    tl::expected<void, ErrorCode> Remove(
+        const std::string& key, bool force = false,
+        const std::string& tenant_id = "default");
+
+    tl::expected<long, ErrorCode> RemoveByRegex(
+        const std::string& str, bool force = false,
+        const std::string& tenant_id = "default");
+
+    long RemoveAll(bool force = false,
+                   const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<void, ErrorCode>> BatchRemove(
+        const std::vector<std::string>& keys, bool force = false,
+        const std::string& tenant_id = "default");
+
+    tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
+                                               const UUID& client_id);
+
+    tl::expected<void, ErrorCode> MountNoFSegment(const NoFSegment& segment,
+                                                  const UUID& client_id);
+
+    tl::expected<void, ErrorCode> ReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id);
+
+    tl::expected<void, ErrorCode> ReMountNoFSegment(
+        const std::vector<NoFSegment>& segments, const UUID& client_id);
+
+    tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
+                                                 const UUID& client_id);
+
+    tl::expected<void, ErrorCode> GracefulUnmountSegment(
+        const UUID& segment_id, const UUID& client_id,
+        uint64_t grace_period_ms);
+
+    tl::expected<void, ErrorCode> UnmountNoFSegment(const UUID& segment_id,
+                                                    const UUID& client_id);
+
+    [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
+    GetAllNoFSegments();
+
+    [[nodiscard]] tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
+    GetNoFSegmentsByName(const std::string& segment_name);
+
+    tl::expected<std::string, ErrorCode> GetFsdir();
+
+    tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
+
+    tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
+
+    tl::expected<std::string, ErrorCode> ServiceReady();
+
+    [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
+
+    tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
+    ListTenantQuotaSnapshots();
+    tl::expected<TenantQuotaSnapshot, ErrorCode> GetTenantQuotaSnapshot(
+        const std::string& tenant_id);
+    tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
+        const std::string& tenant_id, uint64_t requested_quota_bytes);
+    tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
+    DeleteTenantQuotaPolicy(const std::string& tenant_id);
+    tl::expected<uint64_t, ErrorCode> GetTenantQuotaAllocatableCapacityBytes();
+
+    tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
+
+    tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
+
+    tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
+    GetSegmentsDetailForAdmin();
+
+    tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
+        const std::string& segment);
+
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
+                                                        bool enable_offloading);
+
+    tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
+        const UUID& client_id);
+
+    tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
+    OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    tl::expected<bool, ErrorCode> PollRemoveAll(const UUID& client_id);
+
+    tl::expected<void, ErrorCode> ReportSsdCapacity(
+        const UUID& client_id, int64_t ssd_total_capacity_bytes);
+
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
+    // Promotion-on-hit RPCs.
+    tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
+    PromotionObjectHeartbeat(const UUID& client_id);
+
+    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t size,
+        const std::vector<std::string>& preferred_segments);
+
+    tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
+
+    tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
+
+    // Admin-only, grow-only DFS capacity management. Existing placements remain
+    // valid.
+    tl::expected<int, ErrorCode> GetDfsShardCount() const;
+    tl::expected<int, ErrorCode> ExpandDfsShards(int shard_count);
+
+    tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+
+    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
+        const std::string& segment_name);
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
+
+    // Internal method called by supervisor during promotion; NOT an RPC
+    // endpoint.
+    tl::expected<void, ErrorCode> RestoreFromStandby(
+        const std::vector<StandbyObjectEntry>& objects,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments);
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        BatchOpLogPromotionHandoff handoff,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::string& tenant_id,
+        const std::vector<std::string>& targets);
+
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& tenant_id,
+                                                 const std::string& source,
+                                                 const std::string& target);
+
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
+
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& request);
+
+    tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    tl::expected<CopyStartResponse, ErrorCode> DynamicReplicaCopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
+
+    tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
+                                          const std::string& key,
+                                          const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
+
+    tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
+                                             const std::string& key,
+                                             const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
+
+    tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& src_segment,
+        const std::string& tgt_segment);
+
+    tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
+                                          const std::string& key,
+                                          const std::string& tenant_id);
+
+    tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
+                                             const std::string& key,
+                                             const std::string& tenant_id);
+
+    tl::expected<void, ErrorCode> EvictDiskReplica(const UUID& client_id,
+                                                   const std::string& key,
+                                                   const std::string& tenant_id,
+                                                   ReplicaType replica_type);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id, ReplicaType replica_type);
+
+    bool KvEventsEnabled() const;
+    KvEventPublisher::Stats GetKvEventStats() const;
+
+   private:
+    MasterService master_service_;
+};
+
+void RegisterRpcService(coro_rpc::coro_rpc_server& server,
+                        mooncake::WrappedMasterService& wrapped_master_service);
+
+}  // namespace mooncake

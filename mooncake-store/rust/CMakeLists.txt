@@ -15,7 +15,7 @@ add_custom_command(
     MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}
     # Directory containing libmooncake_store.a (or .so).
     MOONCAKE_STORE_LIB_DIR=${CMAKE_CURRENT_BINARY_DIR}/../src
-    # Directory containing store_c.h.
+    # Include root containing client/store_c.h.
     MOONCAKE_STORE_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../include cargo
     build --release
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

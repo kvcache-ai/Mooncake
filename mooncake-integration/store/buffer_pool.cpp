@@ -17,9 +17,9 @@
 #include <unordered_set>
 #include <utility>
 
-#include "pyclient.h"
-#include "real_client.h"
-#include "types.h"
+#include "client/pyclient.h"
+#include "client/real_client.h"
+#include "common/types.h"
 
 namespace py = pybind11;
 

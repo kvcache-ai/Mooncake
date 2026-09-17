@@ -7,8 +7,8 @@
 #include <limits>
 #include <string>
 
-#include "ha/snapshot/batch_oplog/promotion.h"
-#include "master_service.h"
+#include "master/ha/snapshot/batch_oplog/promotion.h"
+#include "master/master_service.h"
 
 DEFINE_uint64(objects, 100000, "Synthetic standby object count");
 DEFINE_uint64(chunk_objects, 1000, "Objects drained per chunk");

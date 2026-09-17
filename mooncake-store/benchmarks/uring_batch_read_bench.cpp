@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "file_interface.h"
+#include "common/file_interface.h"
 
 #ifdef USE_URING
 namespace {

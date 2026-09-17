@@ -4,7 +4,7 @@
 
 #include <memory>
 
-#include "eviction_strategy.h"
+#include "master/eviction_strategy.h"
 
 namespace mooncake {
 

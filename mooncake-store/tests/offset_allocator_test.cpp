@@ -1,8 +1,8 @@
-#include "allocator.h"
-#include "offset_allocator/offset_allocator.h"
-#include "mutex.h"
-#include "serializer.h"
-#include "types.h"
+#include "master/allocator.h"
+#include "master/offset_allocator/offset_allocator.h"
+#include "common/mutex.h"
+#include "common/serializer.h"
+#include "common/types.h"
 
 #include <gtest/gtest.h>
 

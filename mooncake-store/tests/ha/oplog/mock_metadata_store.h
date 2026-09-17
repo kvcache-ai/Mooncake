@@ -5,8 +5,8 @@
 #include <optional>
 #include <string>
 
-#include "metadata_store.h"
-#include "types.h"
+#include "master/metadata_store.h"
+#include "common/types.h"
 
 namespace mooncake::test {
 

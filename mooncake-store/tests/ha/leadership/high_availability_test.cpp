@@ -15,14 +15,14 @@
 #include <thread>
 
 #ifdef STORE_USE_ETCD
-#include "etcd_helper.h"
+#include "common/etcd_helper.h"
 #endif
 #include "common/network.h"
-#include "ha/leadership/leader_coordinator_factory.h"
+#include "master/ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/high_availability_test_fixture.h"
-#include "ha/leadership/master_service_supervisor.h"
-#include "master_service.h"
-#include "types.h"
+#include "master/ha/leadership/master_service_supervisor.h"
+#include "master/master_service.h"
+#include "common/types.h"
 
 namespace mooncake {
 namespace testing {

@@ -27,7 +27,7 @@
 
 #include "client_wrapper.h"
 #include "test_server_helpers.h"
-#include "types.h"
+#include "common/types.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "ibp6s0",

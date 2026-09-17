@@ -590,7 +590,7 @@ jobs:
               - '.github/workflows/**'
             tent:
               - 'mooncake-transfer-engine/**'
-              - 'mooncake-store/src/transfer_task.cpp'
+              - 'mooncake-store/client/transfer_task.cpp'
               - 'mooncake-store/tests/transfer_task_test.cpp'
               - 'mooncake-store/tests/CMakeLists.txt'
               - 'mooncake-common/**'

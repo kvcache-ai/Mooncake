@@ -1,4 +1,4 @@
-#include "ha/oplog/oplog_batch_storage.h"
+#include "master/ha/oplog/oplog_batch_storage.h"
 
 #include <gtest/gtest.h>
 #include <xxhash.h>
@@ -13,12 +13,12 @@
 #include <thread>
 #include <vector>
 
-#include "etcd_helper.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
-#include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_codec.h"
-#include "ha/oplog/oplog_batch_types.h"
-#include "ha/snapshot/batch_oplog/metadata.h"
+#include "common/etcd_helper.h"
+#include "master/ha/kv/etcd_ha_kv_backend.h"
+#include "master/ha/kv/ha_kv_backend.h"
+#include "master/ha/oplog/oplog_batch_codec.h"
+#include "master/ha/oplog/oplog_batch_types.h"
+#include "master/ha/snapshot/batch_oplog/metadata.h"
 
 namespace mooncake::test {
 namespace {

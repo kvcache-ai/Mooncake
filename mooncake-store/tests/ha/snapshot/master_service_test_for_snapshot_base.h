@@ -1,13 +1,13 @@
 #pragma once
 
-#include "master_service.h"
+#include "master/master_service.h"
 #include "master_service/master_service_test_peer.h"
-#include "master_snapshot_manager.h"
-#include "master_metric_manager.h"
-#include "segment.h"
-#include "ha/snapshot/catalog/snapshot_catalog_store.h"
-#include "ha/snapshot/object/snapshot_object_store.h"
-#include "task_manager.h"
+#include "master/master_snapshot_manager.h"
+#include "master/master_metric_manager.h"
+#include "master/segment.h"
+#include "master/ha/snapshot/catalog/snapshot_catalog_store.h"
+#include "master/ha/snapshot/object/snapshot_object_store.h"
+#include "master/task_manager.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -27,7 +27,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "types.h"
+#include "common/types.h"
 
 // TODO metrics consistency
 namespace mooncake::test {

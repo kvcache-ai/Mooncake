@@ -263,7 +263,7 @@ fn main() {
     println!("cargo:rustc-link-lib=mooncake_local_ssd");
 
     // Dependencies of mooncake_store that must be satisfied at link time.
-    // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
+    // The list mirrors what mooncake-store/cmake/CMakeLists.txt links against.
     println!("cargo:rustc-link-lib=transfer_engine");
     println!("cargo:rustc-link-lib=mooncake_common"); // Environ::Get() and other common utilities
     println!("cargo:rustc-link-lib=base"); // mooncake::Status etc.
@@ -426,7 +426,7 @@ fn main() {
     let include_dir =
         env::var("MOONCAKE_STORE_INCLUDE_DIR").unwrap_or_else(|_| "../include".to_string());
 
-    let header = format!("{include_dir}/store_c.h");
+    let header = format!("{include_dir}/client/store_c.h");
 
     println!("cargo:rerun-if-changed={header}");
     println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");

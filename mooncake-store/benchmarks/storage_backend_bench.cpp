@@ -92,7 +92,7 @@
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
-#include "storage_backend.h"
+#include "client/storage_backend.h"
 
 namespace fs = std::filesystem;
 

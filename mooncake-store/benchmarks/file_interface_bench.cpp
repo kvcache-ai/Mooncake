@@ -15,7 +15,7 @@
 #include <unistd.h>
 #include <glog/logging.h>
 
-#include "file_interface.h"
+#include "common/file_interface.h"
 
 using namespace mooncake;
 
