@@ -1,5 +1,6 @@
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <vector>
@@ -23,6 +24,7 @@ struct BufferKey {
 struct RequestBoundaryInfo {
     std::optional<BufferKey> source_key;
     std::optional<BufferKey> target_key;
+    uint64_t max_merge_bytes{std::numeric_limits<uint64_t>::max()};
 };
 
 struct MergeResult {
@@ -90,6 +92,11 @@ TEST(RequestMergeTest, MergesAdjacentRequestsInsideSameRegisteredBuffers) {
     EXPECT_EQ(merged.request_list[0].length, 2048u);
     EXPECT_EQ(merged.task_lookup.at(0), 0u);
     EXPECT_EQ(merged.task_lookup.at(1), 0u);
+    for (uint64_t limit : {1024, 2048}) {
+        for (auto& boundary : boundaries) boundary.max_merge_bytes = limit;
+        EXPECT_EQ(mergeRequests(requests, boundaries, true).request_list.size(),
+                  limit == 1024 ? 2u : 1u);
+    }
 }
 
 TEST(RequestMergeTest, KeepsNonContiguousRequestsSplit) {

@@ -75,7 +75,7 @@ elseif(USE_MUSA OR USE_MACA)
                   "${_pg_platform_name} compiler (${_pg_device_compiler_name})")
   endif()
   list(APPEND _pg_device_flags "-DUSE_${_pg_platform_name}"
-       ${_pg_platform_device_flags})
+       "-DMOONCAKE_EP_USE_${_pg_platform_name}=1" ${_pg_platform_device_flags})
 
   add_custom_command(
     OUTPUT "${_pg_device_object}"

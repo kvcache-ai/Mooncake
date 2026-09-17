@@ -55,7 +55,15 @@ thread_local CoroRpcAgent tl_rpc_agent;
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
                                      std::string& response) {
     std::string request;
-    return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+    auto status =
+        tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+    if (status.IsRpcServiceError()) {
+        // A failed stale connection is discarded by the RPC agent. Retry this
+        // read-only operation once; other control RPCs may have side effects.
+        return tl_rpc_agent.call(server_addr, GetSegmentDesc, request,
+                                 response);
+    }
+    return status;
 }
 
 Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
@@ -87,9 +95,30 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     return decodeBootstrapResponse(response_raw, response);
 }
 
+Status ControlClient::bootstrapUb(const std::string& server_addr,
+                                  const UbBootstrapDesc& request,
+                                  UbBootstrapDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(
+        tl_rpc_agent.call(server_addr, BootstrapUb, request_raw, response_raw));
+    try {
+        response = json::parse(response_raw).get<UbBootstrapDesc>();
+    } catch (const std::exception& e) {
+        return Status::MalformedJson(
+            std::string("Malformed UB bootstrap response: ") + e.what() +
+            LOC_MARK);
+    }
+    return Status::OK();
+}
+
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
+    // Check before addition/allocation or reading the caller's source buffer.
+    if (length > kTcpMaxWriteBytes)
+        return Status::InvalidArgument("TCP WRITE exceeds RPC payload limit");
     std::string response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     std::string request;
@@ -118,6 +147,8 @@ Status ControlClient::sendData(const std::string& server_addr,
 Status ControlClient::recvData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
+    if (length > kTcpMaxReadBytes)
+        return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc));
@@ -274,6 +305,11 @@ ControlService::ControlService(const std::string& type,
     // on the same thread. Offload matches Delegate: the connection coroutine
     // suspends, copies run on the blocking executor, and other RPCs proceed.
     rpc_server_->registerFunction(
+        BootstrapUb,
+        [this](const std::string_view& request, std::string& response) {
+            onBootstrapUb(request, response);
+        });
+    rpc_server_->registerFunction(
         SendData,
         [this](const std::string_view& request, std::string& response) {
             onSendData(request, response);
@@ -324,6 +360,10 @@ ControlService::ControlService(const std::string& type,
 ControlService::~ControlService() {
     // Stop RPC workers while callback state and synchronization primitives are
     // still alive. Member destruction would otherwise tear them down first.
+    {
+        std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
+        ub_bootstrap_callback_ = {};
+    }
     rpc_server_.reset();
 }
 
@@ -436,6 +476,37 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
     response = j.dump();
 }
 
+void ControlService::onBootstrapUb(const std::string_view& request,
+                                   std::string& response) {
+    UbBootstrapDesc response_desc;
+    try {
+        auto request_desc =
+            json::parse(std::string(request)).get<UbBootstrapDesc>();
+        int ret = -1;
+        {
+            // Callback replacement during uninstall is serialized with
+            // invocation, so an in-flight bootstrap cannot outlive the UB
+            // transport object it targets.
+            std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
+            if (ub_bootstrap_callback_) {
+                ret = ub_bootstrap_callback_(request_desc, response_desc);
+            } else {
+                response_desc.reply_msg =
+                    "UB bootstrap callback is not registered";
+            }
+        }
+        if (ret != 0 && response_desc.reply_msg.empty()) {
+            response_desc.reply_msg =
+                "UB bootstrap callback failed, ret=" + std::to_string(ret);
+        }
+    } catch (const std::exception& e) {
+        response_desc.reply_msg =
+            std::string("Malformed UB bootstrap request: ") + e.what();
+    }
+    json j = response_desc;
+    response = j.dump();
+}
+
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
     if (request.size() < sizeof(XferDataDesc)) {
@@ -448,12 +519,17 @@ void ControlService::onSendData(const std::string_view& request,
     auto length = le64toh(desc->length);
 
     // Validate request size to prevent buffer over-read
-    if (request.size() < sizeof(XferDataDesc) + length) {
+    if (length > kTcpMaxWriteBytes ||
+        length > request.size() - sizeof(XferDataDesc)) {
         response = "SendData failed: invalid request size";
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadWrite) {
+            response = "SendData failed: remote write permission denied";
+            return;
+        }
         auto status =
             Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
         if (!status.ok()) {
@@ -488,13 +564,17 @@ void ControlService::onRecvData(const std::string_view& request,
     };
 
     // Validate length to prevent DoS via excessive memory allocation
-    constexpr size_t kMaxTransferSize = 1ULL << 30;  // 1GB max per RPC
-    if (length > kMaxTransferSize) {
+    if (length > kTcpMaxReadBytes) {
         fail("RecvData failed: length exceeds maximum allowed");
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadOnly &&
+            buffer->permission != kGlobalReadWrite) {
+            fail("RecvData failed: remote read permission denied");
+            return;
+        }
         auto& loader = Platform::getLoader();
         if (loader.getMemoryType((void*)peer_mem_addr) == MTYPE_CPU) {
             // assign() skips the resize() zero-fill pass.

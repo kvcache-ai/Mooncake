@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
@@ -72,13 +74,21 @@ class RuntimeBindingManifest(ResourceManifest, Protocol):
         ...
 
 
-class StoredResourceManifest(ResourceManifest, Protocol):
-    """Structural contract for persistent reusable-resource metadata."""
+@dataclass(frozen=True)
+class StoredResourceManifest(ABC):
+    """Nominal base for persistent reusable-resource metadata."""
 
     namespace: str
+    resource_id: ResourceId
     group_id: str
     manifest_key: str
     created_at: str
+
+    @property
+    @abstractmethod
+    def resource_kind(self) -> ResourceKind:
+        """Return the concrete persistent resource discriminator."""
+        ...
 
 
 def validate_resource_binding_identity(

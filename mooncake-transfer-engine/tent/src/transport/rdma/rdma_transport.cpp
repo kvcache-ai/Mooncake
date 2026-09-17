@@ -20,13 +20,13 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <future>
 #include <limits>
-#include <set>
 #include <sstream>
 
 #include "tent/common/status.h"
@@ -35,6 +35,7 @@
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/common/utils/random.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -52,6 +53,8 @@ namespace mooncake {
 namespace tent {
 
 namespace {
+
+constexpr uint64_t kDefaultRdmaQuiesceTimeoutNs = 10000000000ull;
 
 uint16_t getRdmaBindDefaultPort(const Config& config) {
     constexpr const char* kKey = "rpc_server_port";
@@ -377,12 +380,37 @@ Status RdmaTransport::install(std::string& local_segment_name,
     return Status::OK();
 }
 
+Status RdmaTransport::quiesce() {
+    uint64_t timeout_ns = kDefaultRdmaQuiesceTimeoutNs;
+    if (conf_) {
+        timeout_ns = conf_->get("transports/rdma/max_timeout_ns", timeout_ns);
+    }
+    Status drain = Status::OK();
+    if (workers_) {
+        drain = workers_->quiesce(timeout_ns);
+        if (!drain.ok()) {
+            LOG(ERROR) << "RDMA workers quiesce failed: " << drain.ToString();
+        }
+    }
+    const Status sync =
+        Platform::getLoader().synchronizeDevices(local_topology_.get());
+    if (!sync.ok()) {
+        LOG(WARNING) << "RDMA dest-GPU sync during quiesce failed: "
+                     << sync.ToString();
+    }
+    return drain;
+}
+
 Status RdmaTransport::uninstall() {
     // ControlService may still receive BootstrapRdma RPCs while uninstall is
     // running. Unregister and drain the callback before destroying workers,
     // contexts, and other state used by onSetupRdmaConnections(). Keep this
     // outside installed_ so partially-installed transports are covered too.
     if (metadata_) metadata_->setBootstrapRdmaCallback(nullptr);
+
+    // Drain CQ and dest-GPU visibility while MRs and QPs are still alive.
+    // Idempotent when deconstruct() already called quiesce().
+    (void)quiesce();
 
     if (installed_) {
         // Stop notification worker thread
@@ -432,10 +460,6 @@ Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
     return Status::OK();
 }
 
-static inline uint64_t roundup(uint64_t a, uint64_t b) {
-    return (a % b == 0) ? a : (a / b + 1) * b;
-}
-
 Status RdmaTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
@@ -475,22 +499,10 @@ Status RdmaTransport::submitTransferTasks(
         task->cancel_requested.store(false, std::memory_order_relaxed);
         task->ref();  // Batch holds a reference to the task
 
-        const double merge_ratio = 0.25;
-        uint64_t base_block = default_block_size;
-        uint64_t num_slices = (request.length + base_block - 1) / base_block;
-        num_slices = std::max<uint64_t>(
-            1, std::min<uint64_t>(num_slices, max_slice_count));
-
-        if (num_slices > 1) {
-            uint64_t tail = request.length % base_block;
-            if (tail > 0 &&
-                tail < static_cast<uint64_t>(base_block * merge_ratio)) {
-                num_slices = std::max<uint64_t>(1, num_slices - 1);
-            }
-        }
-
-        uint64_t block_size = roundup(
-            (request.length + num_slices - 1) / num_slices, default_block_size);
+        const auto plan =
+            planRdmaSlices(request.length, default_block_size, max_slice_count);
+        const uint64_t block_size = plan.block_size;
+        const uint64_t num_slices = plan.count;
 
         std::vector<int> slice_dev_ids;
         // Only if a single request is enough, we perform aggregated allocation
@@ -516,8 +528,12 @@ Status RdmaTransport::submitTransferTasks(
 
         uint64_t offset = 0;
         for (uint64_t slice_idx = 0; slice_idx < num_slices; ++slice_idx) {
-            uint64_t length =
-                std::min<uint64_t>(request.length - offset, block_size);
+            // The last slice takes what is left, which is a block plus a
+            // folded-in tail when the plan folded one; every other slice is
+            // exactly a block. See planRdmaSlices().
+            uint64_t length = (slice_idx + 1 == num_slices)
+                                  ? request.length - offset
+                                  : block_size;
             auto slice = RdmaSliceStorage::Get().allocate();
             slice->source_addr = (char*)request.source + offset;
             slice->target_addr = request.target_offset + offset;
@@ -525,7 +541,9 @@ Status RdmaTransport::submitTransferTasks(
             slice->task = task;
             slice->retry_count = 0;
             slice->last_fallback_idx = -1;
-            slice->quota_charged = false;
+            slice->charged_dev = -1;
+            slice->posted_dev = -1;
+            slice->counted_lane = -1;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
             slice->next = nullptr;
@@ -535,7 +553,7 @@ Status RdmaTransport::submitTransferTasks(
             task->ref();  // Each slice holds a reference to the task
             if (slice_idx < slice_dev_ids.size()) {
                 slice->source_dev_id = slice_dev_ids[slice_idx];
-                slice->quota_charged = true;
+                slice->charged_dev = slice->source_dev_id;
             }
             offset += length;
             int part_id = next_worker_idx % num_workers;
@@ -631,6 +649,67 @@ Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
     return local_buffer_manager_.removeBuffer(desc);
 }
 
+Status RdmaTransport::refreshLocalDeviceDesc(const std::string& device_name,
+                                             uint16_t lid,
+                                             const std::string& gid) {
+    if (!metadata_)
+        return Status::InvalidArgument(
+            "RDMA metadata is not initialized" LOC_MARK);
+
+    auto& manager = metadata_->segmentManager();
+    bool existed = false;
+    uint16_t previous_lid = 0;
+    std::string previous_gid;
+    CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        if (segment.type != SegmentType::Memory)
+            return Status::InvalidArgument(
+                "Local segment is not a memory segment" LOC_MARK);
+        auto* device = segment.findDevice(device_name);
+        if (!device) {
+            auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+            DeviceDesc added;
+            added.name = device_name;
+            added.lid = lid;
+            added.gid = gid;
+            detail.devices.push_back(std::move(added));
+            return Status::OK();
+        }
+        existed = true;
+        previous_lid = device->lid;
+        previous_gid = device->gid;
+        device->lid = lid;
+        device->gid = gid;
+        return Status::OK();
+    }));
+
+    auto status = manager.synchronizeLocal();
+    if (status.ok()) return status;
+
+    auto rollback = manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        if (segment.type != SegmentType::Memory)
+            return Status::InvalidArgument(
+                "Local segment is not a memory segment" LOC_MARK);
+        auto& devices = std::get<MemorySegmentDesc>(segment.detail).devices;
+        auto it = std::find_if(devices.begin(), devices.end(),
+                               [&](const DeviceDesc& device) {
+                                   return device.name == device_name;
+                               });
+        if (it == devices.end()) return Status::OK();
+        if (!existed) {
+            devices.erase(it);
+        } else {
+            it->lid = previous_lid;
+            it->gid = previous_gid;
+        }
+        return Status::OK();
+    });
+    if (!rollback.ok()) {
+        LOG(ERROR) << "Failed to roll back RDMA address metadata for "
+                   << device_name << ": " << rollback.ToString();
+    }
+    return status;
+}
+
 Status RdmaTransport::setupLocalSegment() {
     auto& manager = metadata_->segmentManager();
     CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
@@ -644,8 +723,9 @@ Status RdmaTransport::setupLocalSegment() {
             if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
             DeviceDesc device_desc;
             device_desc.name = context->name();
-            device_desc.lid = context->lid();
-            device_desc.gid = context->gid();
+            const auto address = context->address();
+            device_desc.lid = address.lid;
+            device_desc.gid = address.gid;
             detail.devices.push_back(device_desc);
         }
         return Status::OK();
@@ -666,10 +746,9 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     auto index = context_name_lookup_[local_nic_name];
     auto context = context_set_[index];
     auto ctx_status = context->status();
-    if (ctx_status != RdmaContext::DEVICE_ENABLED &&
-        ctx_status != RdmaContext::DEVICE_PAUSED) {
+    if (ctx_status != RdmaContext::DEVICE_ENABLED) {
         std::stringstream ss;
-        ss << "Device is down: " << peer_desc.local_nic_path;
+        ss << "Device is not ready: " << peer_desc.local_nic_path;
         LOG(ERROR) << ss.str();
         local_desc.reply_msg = ss.str();
         return -1;
@@ -946,7 +1025,11 @@ double RdmaTransport::getEstimatedBandwidth() const {
     if (!workers_) return -1.0;
     auto* sel = workers_->getDeviceSelector();
     if (!sel) return -1.0;
-    return sel->getAggregateEwmaBandwidth();
+    // The transmit estimate, not the selection EWMA: the admission queue
+    // asks "how fast do bytes move once they are sent", and adds the wait
+    // behind earlier work itself (DeadlineMlu's bytes_ahead), so the rate
+    // must not fold that wait in the way the selection sample does.
+    return sel->getAggregateTransmitBandwidth();
 }
 
 }  // namespace tent

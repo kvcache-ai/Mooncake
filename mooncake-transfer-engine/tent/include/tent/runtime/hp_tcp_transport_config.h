@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "tent/common/config.h"
 
@@ -13,6 +14,8 @@ namespace mooncake::tent {
 struct HighPerformanceTcpParams {
     std::string bind_address;
     std::string advertise_address;
+    // Ordered local rail addresses; peers must publish the same rail count.
+    std::vector<std::string> rail_addresses;
     uint16_t port{0};
     size_t worker_count{16};
     size_t connections_per_peer{4};
@@ -21,6 +24,8 @@ struct HighPerformanceTcpParams {
     uint64_t max_transfer_bytes{1ULL << 30};
     uint64_t connect_timeout_ms{2000};
     uint64_t progress_timeout_ms{30000};
+    // Release pooled sockets only when the client has no work on the lane.
+    uint64_t idle_connection_timeout_ms{60000};
 };
 
 struct HpTcpTransportConfig {

@@ -232,6 +232,9 @@ TEST(BatchOpLogSnapshotTypesTest, RejectsInvalidManifestJson) {
 }
 
 TEST(BatchOpLogSnapshotTypesTest, BuildsControlAndArtifactKeys) {
+    EXPECT_EQ(BuildBatchOpLogSnapshotRoot("cluster-a/"),
+              "mooncake_master_snapshot/cluster-a");
+    EXPECT_TRUE(BuildBatchOpLogSnapshotRoot("../cluster").empty());
     EXPECT_EQ(BuildBatchOpLogSnapshotMaintenanceKey("cluster-a/"),
               "/oplog/cluster-a/snapshot/maintenance");
     EXPECT_EQ(BuildBatchOpLogSnapshotLatestKey("cluster-a"),

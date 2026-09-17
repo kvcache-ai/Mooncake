@@ -16,8 +16,15 @@
 
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <functional>
+#include <future>
+#include <queue>
+#include <thread>
 
 #include "config.h"
 #include "memory_location.h"
@@ -52,14 +59,116 @@ struct ActiveEndpointSetupResult {
     bool endpoint_current = false;
 };
 
+class ActiveEndpointSetupExecutor {
+   public:
+    explicit ActiveEndpointSetupExecutor(size_t thread_count) : running_(true) {
+        workers_.reserve(thread_count);
+        for (size_t i = 0; i < thread_count; ++i) {
+            workers_.emplace_back([this] { run(); });
+        }
+    }
+
+    ~ActiveEndpointSetupExecutor() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = false;
+        }
+        cv_.notify_all();
+        for (auto &worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    std::future<int> submit(const std::shared_ptr<RdmaEndPoint> &endpoint) {
+        std::packaged_task<int()> task(
+            [endpoint] { return endpoint->setupConnectionsByActive(); });
+        auto future = task.get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!running_) {
+                task();
+                return future;
+            }
+            tasks_.emplace(std::move(task));
+        }
+        cv_.notify_one();
+        return future;
+    }
+
+   private:
+    void run() {
+        while (true) {
+            std::packaged_task<int()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return !running_ || !tasks_.empty(); });
+                if (!running_ && tasks_.empty()) return;
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+            task();
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::packaged_task<int()>> tasks_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool running_;
+};
+
+static ActiveEndpointSetupExecutor &activeEndpointSetupExecutor() {
+    constexpr size_t kActiveEndpointSetupThreadCount = 8;
+    static ActiveEndpointSetupExecutor executor(
+        kActiveEndpointSetupThreadCount);
+    return executor;
+}
+
 static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
     RdmaContext &context, const std::string &peer_nic_path,
     const std::shared_ptr<RdmaEndPoint> &endpoint,
-    std::unique_lock<std::mutex> &endpoint_lifecycle_lock) {
+    std::unique_lock<std::mutex> &endpoint_lifecycle_lock,
+    const std::function<int()> &drain_cq_while_waiting) {
     const bool had_lifecycle_gate = endpoint_lifecycle_lock.owns_lock();
     if (had_lifecycle_gate) endpoint_lifecycle_lock.unlock();
 
-    int ret = endpoint->setupConnectionsByActive();
+    // The owner worker also polls this peer's CQ. Keep it draining while the
+    // active handshake can block on TCP connect/read timeouts.
+    int ret = ERR_ENDPOINT;
+    try {
+        auto setup_future = activeEndpointSetupExecutor().submit(endpoint);
+        auto wait_period = std::chrono::milliseconds(1);
+        constexpr auto kMaxWaitPeriod = std::chrono::milliseconds(25);
+        while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
+               std::future_status::ready) {
+            bool made_progress = false;
+            while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
+                   std::future_status::ready) {
+                const int drained = drain_cq_while_waiting();
+                if (drained <= 0) break;
+                made_progress = true;
+            }
+            if (setup_future.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
+                break;
+            }
+            if (made_progress) {
+                wait_period = std::chrono::milliseconds(1);
+            } else {
+                if (setup_future.wait_for(wait_period) ==
+                    std::future_status::ready) {
+                    break;
+                }
+                wait_period = std::min(wait_period * 2, kMaxWaitPeriod);
+            }
+        }
+        ret = setup_future.get();
+    } catch (const std::exception &ex) {
+        LOG(ERROR) << "Worker: Active endpoint setup threw: " << ex.what();
+    } catch (...) {
+        LOG(ERROR)
+            << "Worker: Active endpoint setup threw an unknown exception";
+    }
 
     if (had_lifecycle_gate) endpoint_lifecycle_lock.lock();
     auto current_endpoint = context.findEndpoint(peer_nic_path);
@@ -70,20 +179,21 @@ static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
 static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
                             uint64_t offset, size_t length,
                             const std::string &local_hca, int &buffer_id,
-                            int &device_id, int retry_count = 0) {
+                            int &device_id, int retry_count = 0,
+                            int hint_buffer_id = -1) {
     const auto &config = globalConfig();
     int ret = 0;
     if (config.enable_hca_peer_affinity) {
         ret = RdmaTransport::selectDeviceByLocalHca(
             peer_segment_desc, offset, length, local_hca, buffer_id, device_id,
-            retry_count);
+            retry_count, hint_buffer_id);
     } else {
         auto hint = config.enable_dest_device_affinity
                         ? std::string_view(local_hca)
                         : std::string_view();
-        ret =
-            RdmaTransport::selectDevice(peer_segment_desc, offset, length, hint,
-                                        buffer_id, device_id, retry_count);
+        ret = RdmaTransport::selectDevice(peer_segment_desc, offset, length,
+                                          hint, buffer_id, device_id,
+                                          retry_count, hint_buffer_id);
     }
     if (ret) return ret;
 
@@ -205,8 +315,9 @@ int WorkerPool::submitPostSend(
 
     SliceList prepared_slice_list;
     uint64_t submitted_slice_count = 0;
-    int all_rails_failed_count = 0;
     thread_local std::unordered_map<int, uint64_t> failed_target_ids;
+    int last_buffer_id = -1;
+    SegmentID last_target_id = static_cast<SegmentID>(-1);
     for (auto &slice : slice_list) {
         if (failed_target_ids.count(slice->target_id)) {
             auto ts = failed_target_ids[slice->target_id];
@@ -219,9 +330,13 @@ int WorkerPool::submitPostSend(
         }
         auto &peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
+        if (slice->target_id != last_target_id) {
+            last_buffer_id = -1;
+            last_target_id = slice->target_id;
+        }
         if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
                              slice->length, context_.deviceName(), buffer_id,
-                             device_id)) {
+                             device_id, 0, last_buffer_id)) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -231,10 +346,11 @@ int WorkerPool::submitPostSend(
                 failed_target_ids[slice->target_id] = getCurrentTimeInNano();
                 continue;
             }
+            last_buffer_id = -1;
 
             if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
                                  slice->length, context_.deviceName(),
-                                 buffer_id, device_id)) {
+                                 buffer_id, device_id, 0, last_buffer_id)) {
                 slice->markFailed();
                 context_.engine().meta()->dumpMetadataContent(
                     peer_segment_desc->name, slice->rdma.dest_addr,
@@ -242,6 +358,7 @@ int WorkerPool::submitPostSend(
                 continue;
             }
         }
+        last_buffer_id = buffer_id;
         if (!peer_segment_desc) {
             slice->markFailed();
             continue;
@@ -276,7 +393,6 @@ int WorkerPool::submitPostSend(
             }
             if (!found) {
                 slice->markFailed();  // All rails unavailable
-                all_rails_failed_count++;
                 continue;
             }
         }
@@ -301,14 +417,6 @@ int WorkerPool::submitPostSend(
     }
 
     enqueuePreparedSlices(prepared_slice_list, submitted_slice_count);
-
-    // Context-level health tracking: if all slices failed due to no available
-    // rails, increment the context failure counter. This detects catastrophic
-    // local RNIC hardware failure where all paths through the RNIC are down.
-    if (submitted_slice_count == 0 &&
-        all_rails_failed_count == (int)slice_list.size()) {
-        if (markContextFailure()) refreshPublishedLocalTopology();
-    }
 
     return 0;
 }
@@ -347,6 +455,64 @@ int WorkerPool::submitPreparedPostSend(
     return 0;
 }
 
+bool WorkerPool::markLocalContextFailure() {
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    // Fatal events and an already-tripped breaker leave the context inactive.
+    // Ignore late CQEs in either state so they cannot arm a new TTL after a
+    // fatal event took ownership of recovery.
+    if (!context_.active()) return false;
+
+    int failure_count =
+        context_failure_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (failure_count < kLocalCompletionFailureThreshold) return false;
+
+    context_.set_active(false);
+    breaker_reactivate_after_ns_ =
+        static_cast<uint64_t>(getCurrentTimeInNano()) +
+        static_cast<uint64_t>(globalConfig().context_pause_ttl_ms) * 1000000ull;
+    LOG(WARNING) << "Context breaker tripped: context " << context_.deviceName()
+                 << " pausing after " << failure_count
+                 << " consecutive local completion-failure batches, "
+                 << "pause_ttl_ms=" << globalConfig().context_pause_ttl_ms;
+    return true;
+}
+
+void WorkerPool::markContextSuccess() {
+    if (context_failure_count_.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    if (breaker_reactivate_after_ns_ == 0)
+        context_failure_count_.store(0, std::memory_order_relaxed);
+}
+
+bool WorkerPool::tryReactivateContext(uint64_t now_ns) {
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    if (breaker_reactivate_after_ns_ == 0 ||
+        now_ns < breaker_reactivate_after_ns_ ||
+        recovery_activate_after_ns_.load(std::memory_order_relaxed) != 0) {
+        return false;
+    }
+    breaker_reactivate_after_ns_ = 0;
+    context_failure_count_.store(0, std::memory_order_relaxed);
+    context_.set_active(true);
+    return true;
+}
+
+void WorkerPool::maybeReactivateContext() {
+    if (tryReactivateContext(static_cast<uint64_t>(getCurrentTimeInNano()))) {
+        refreshPublishedLocalTopology();
+        LOG(INFO) << "Context breaker pause expired: context "
+                  << context_.deviceName()
+                  << " reactivating (half-open, streak reset)";
+    }
+}
+
+void WorkerPool::resetContextBreaker(bool context_active) {
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    breaker_reactivate_after_ns_ = 0;
+    context_failure_count_.store(0, std::memory_order_relaxed);
+    context_.set_active(context_active);
+}
+
 void WorkerPool::trackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
@@ -383,7 +549,7 @@ void WorkerPool::performPostSend(int thread_id) {
     // If this local RNIC is inactive/unhealthy, the remote rail is not the
     // problem. Move queued work to another local RNIC while preserving the
     // already selected peer rail.
-    if (!context_.active() || !contextHealthy()) {
+    if (!context_.active()) {
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
         for (auto &entry : local_slice_queue_clone)
@@ -399,7 +565,7 @@ void WorkerPool::performPostSend(int thread_id) {
             redispatch_counter_.load(std::memory_order_relaxed);
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
-        bool handoff_to_local_worker = !context_.active() || !contextHealthy();
+        bool handoff_to_local_worker = !context_.active();
         for (auto &entry : local_slice_queue_clone)
             redispatch(entry.second, thread_id, handoff_to_local_worker);
         return;
@@ -455,7 +621,11 @@ void WorkerPool::performPostSend(int thread_id) {
         }
         if (!endpoint->connected()) {
             auto setup_result = setupEndpointByActiveOutsideLifecycleGate(
-                context_, entry.first, endpoint, endpoint_lifecycle_lock);
+                context_, entry.first, endpoint, endpoint_lifecycle_lock,
+                [this, thread_id] {
+                    if (!hasOutstandingCq(thread_id)) return 0;
+                    return performPollCq(thread_id, true);
+                });
             if (!setup_result.endpoint_current) {
                 LOG(WARNING)
                     << "Worker: Endpoint changed while active handshake was "
@@ -559,13 +729,14 @@ void WorkerPool::performPostSend(int thread_id) {
     }
 }
 
-void WorkerPool::performPollCq(int thread_id) {
-    if (context_.cqCount() <= 0) return;
-    if (thread_id < 0 || thread_id >= worker_count_) return;
+int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
+    if (context_.cqCount() <= 0) return 0;
+    if (thread_id < 0 || thread_id >= worker_count_) return 0;
 
     const uint64_t poll_ts = getCurrentTimeInNano();
     const uint64_t previous_poll_ts =
-        last_poll_ts_ns_.exchange(poll_ts, std::memory_order_relaxed);
+        last_poll_ts_ns_.exchange(poll_ts, std::memory_order_release);
+    last_poll_ts_ns_.notify_all();
     if (previous_poll_ts > 0 && poll_ts > previous_poll_ts) {
         const uint64_t interval = poll_ts - previous_poll_ts;
         last_poll_interval_ns_.store(interval, std::memory_order_relaxed);
@@ -581,12 +752,13 @@ void WorkerPool::performPollCq(int thread_id) {
     std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     std::vector<ibv_wc> wc_list;
     const int cq_index = cqIndexForPostingThread(thread_id);
-    if (cq_index < 0) return;
+    if (cq_index < 0) return 0;
+    if (!context_.cq(cq_index)) return 0;
     ibv_wc wc[kPollCount];
     int nr_poll = context_.poll(kPollCount, wc, cq_index);
     if (nr_poll < 0) {
         LOG(ERROR) << "Worker: Failed to poll completion queues";
-        return;
+        return nr_poll;
     }
 
     if (nr_poll > 0 && globalConfig().track_rdma_posted_slices) {
@@ -614,11 +786,14 @@ void WorkerPool::performPollCq(int thread_id) {
     for (auto &entry : qp_depth_set)
         entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
 
-    if (!wc_list.empty()) processCompletions(thread_id, wc_list);
+    if (!wc_list.empty())
+        processCompletions(thread_id, wc_list, defer_local_redispatch);
+    return nr_poll;
 }
 
 void WorkerPool::processCompletions(int thread_id,
-                                    const std::vector<ibv_wc> &wc_list) {
+                                    const std::vector<ibv_wc> &wc_list,
+                                    bool defer_local_redispatch) {
     // Slices this call drove to a terminal state, successes and
     // retry-exhausted failures alike; folded into processed_slice_count_,
     // which gates worker parking. Every terminal outcome below goes through
@@ -756,15 +931,17 @@ void WorkerPool::processCompletions(int thread_id,
     if (succeeded_slice_count) markContextSuccess();
 
     if (!local_failed_slice_list.empty()) {
-        redispatch(local_failed_slice_list, thread_id, true);
+        redispatch(local_failed_slice_list, thread_id, true,
+                   defer_local_redispatch);
     }
     if (!failed_slice_list.empty()) {
-        redispatch(failed_slice_list, thread_id);
+        redispatch(failed_slice_list, thread_id, false, defer_local_redispatch);
     }
 }
 
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
-                            int thread_id, bool handoff_to_local_worker) {
+                            int thread_id, bool handoff_to_local_worker,
+                            bool defer_local_redispatch) {
     std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
         segment_desc_map;
     int shared_redispatch_count = 0;
@@ -878,7 +1055,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             }
             slice->ts = 0;
             const int owner_thread = postingThreadForPeer(peer_nic_path);
-            if (owner_thread == thread_id) {
+            if (owner_thread == thread_id && !defer_local_redispatch) {
                 collective_slice_queue_[thread_id][peer_nic_path].push_back(
                     slice);
             } else {
@@ -1084,7 +1261,10 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
         event_type == IBV_EVENT_PORT_ERR ||
         event_type == IBV_EVENT_LID_CHANGE) {
         recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
-        context_.set_active(false);
+        // The async event now owns this context's inactive state. Clear the
+        // local-WC breaker deadline so its TTL cannot resurrect a context that
+        // a DEVICE_FATAL/PORT_ERR took down.
+        resetContextBreaker(false);
         refreshPublishedLocalTopology();
 
         /**
@@ -1125,8 +1305,7 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
     } else if (event_type == IBV_EVENT_PORT_ACTIVE) {
         // PORT_ACTIVE only means the link started coming back. Real mlx5/RoCE
         // data path can still reject RTR for a while after link-up, so delay
-        // publishing this local RNIC back to metadata. Injected tests follow
-        // the same path.
+        // publishing an inactive local RNIC back to metadata.
         scheduleContextRecovery();
         if (event != nullptr) ibv_ack_async_event(event);
     } else {
@@ -1137,6 +1316,15 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
 }
 
 void WorkerPool::scheduleContextRecovery(uint64_t delay_ns) {
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    // A redundant PORT_ACTIVE on an in-service context is not recovery
+    // evidence: preserve its local-WC streak and do not arm a probe that
+    // could later override a new local-WC trip.
+    if (context_.active()) return;
+
+    // Event recovery owns this inactive period. Cancel only the breaker
+    // deadline; a successful GID probe below resets the failure count.
+    breaker_reactivate_after_ns_ = 0;
     uint64_t activate_after = getCurrentTimeInNano() + delay_ns;
     recovery_activate_after_ns_.store(activate_after,
                                       std::memory_order_relaxed);
@@ -1152,15 +1340,12 @@ void WorkerPool::maybeActivateRecoveredContext() {
         static_cast<uint64_t>(getCurrentTimeInNano()) < activate_after)
         return;
 
-    uint64_t expected = activate_after;
-    if (!recovery_activate_after_ns_.compare_exchange_strong(
-            expected, 0, std::memory_order_relaxed)) {
-        return;
-    }
-
+    // Recovery probes and async events run on the same monitor thread.
+    // Keep the deadline armed throughout GID I/O: event recovery still owns
+    // the inactive context, and late CQEs must not arm breaker recovery.
     auto gid_refresh_result = refreshPublishedLocalGid();
     if (gid_refresh_result == GidRefreshResult::FAILED) {
-        context_.set_active(false);
+        resetContextBreaker(false);
         refreshPublishedLocalTopology();
         scheduleContextRecovery();
         LOG(WARNING) << "Worker: Context " << context_.deviceName()
@@ -1175,9 +1360,9 @@ void WorkerPool::maybeActivateRecoveredContext() {
                   << " GID changed during recovery, disconnected all endpoints";
     }
 
-    context_.set_active(true);
+    resetContextBreaker(true);
+    recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
     refreshPublishedLocalTopology();
-    context_failure_count_.store(0, std::memory_order_relaxed);
     LOG(INFO) << "Worker: Context " << context_.deviceName()
               << " is now active after recovery delay";
 }
@@ -1268,6 +1453,8 @@ void WorkerPool::monitorWorker() {
         const uint64_t current_ts =
             static_cast<uint64_t>(getCurrentTimeInNano());
         maybeActivateRecoveredContext();
+        // Check short breaker TTLs on every loop, like GID recovery.
+        maybeReactivateContext();
         if (current_ts - last_reset_ts > 1000000000ll) {
             // Drain endpoint_store_->waiting_list_ even when no new
             // insertions are happening. Without this, reclaim only runs
@@ -1475,7 +1662,10 @@ void WorkerPool::handleLocalFailure(const std::string &peer_nic_path,
     // Local completion faults can be caused by a poisoned QP/MR as well as a
     // bad RNIC. Retry this slice elsewhere, but only disable the whole context
     // after repeated local failures or an async port/device event.
-    bool context_disabled = markContextFailure();
+    // A local WC status is direct evidence about this RNIC. Submit-side
+    // all-rails-unavailable failures remain peer scoped and never contribute
+    // to this counter.
+    bool context_disabled = markLocalContextFailure();
     if (context_disabled) refreshPublishedLocalTopology();
     redispatch_counter_++;
 

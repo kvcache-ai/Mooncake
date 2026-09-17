@@ -72,6 +72,10 @@ class LocalSsdManager {
     ErrorCode RegisterClient(const UUID& client_id, bool enable_offloading);
     std::optional<int64_t> UnregisterClient(const UUID& client_id);
 
+    // UUIDs of all registered LocalSSD clients. Used to rebuild client
+    // liveness records after an HA snapshot restore.
+    std::vector<UUID> GetClientIds() const;
+
     tl::expected<CapacityChange, ErrorCode> ReportCapacity(
         const UUID& client_id, int64_t bytes);
 

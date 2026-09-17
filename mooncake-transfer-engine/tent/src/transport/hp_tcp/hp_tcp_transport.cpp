@@ -97,11 +97,6 @@ Status RemoteWireStatus(HighPerformanceTcpStatus status) {
 
 }  // namespace
 
-struct HighPerformanceTcpTransport::TaskPlan {
-    std::shared_ptr<HighPerformanceTcpTaskState> task;
-    HighPerformanceTcpWorkers::Command command;
-};
-
 HighPerformanceTcpTransport::HighPerformanceTcpTransport()
     : HighPerformanceTcpTransport(HighPerformanceTcpParams{}) {}
 
@@ -123,9 +118,39 @@ Status HighPerformanceTcpTransport::validateParams() const {
     if (params_.worker_count == 0 || params_.connections_per_peer == 0 ||
         params_.max_outstanding_tasks == 0 ||
         params_.max_outstanding_bytes == 0 || params_.max_transfer_bytes == 0 ||
-        params_.connect_timeout_ms == 0 || params_.progress_timeout_ms == 0) {
+        params_.connect_timeout_ms == 0 || params_.progress_timeout_ms == 0 ||
+        params_.idle_connection_timeout_ms == 0) {
         return Status::InvalidArgument(
             "invalid high-performance TCP limits" LOC_MARK);
+    }
+    if (!params_.rail_addresses.empty()) {
+        if (params_.rail_addresses.size() > params_.connections_per_peer) {
+            return Status::InvalidArgument(
+                "HP TCP rails require at least one lane per address" LOC_MARK);
+        }
+        const bool wildcard_listener =
+            params_.bind_address.empty() || params_.bind_address == "0.0.0.0";
+        if (!wildcard_listener &&
+            (params_.rail_addresses.size() != 1 ||
+             params_.bind_address != params_.rail_addresses.front())) {
+            return Status::InvalidArgument(
+                "HP TCP listener must be wildcard or match the sole rail "
+                "address" LOC_MARK);
+        }
+        for (size_t i = 0; i < params_.rail_addresses.size(); ++i) {
+            std::error_code error;
+            const auto address =
+                asio::ip::make_address(params_.rail_addresses[i], error);
+            if (error || !address.is_v4() ||
+                std::find(params_.rail_addresses.begin() + i + 1,
+                          params_.rail_addresses.end(),
+                          params_.rail_addresses[i]) !=
+                    params_.rail_addresses.end()) {
+                return Status::InvalidArgument(
+                    "HP TCP rail addresses must be unique numeric IPv4 "
+                    "addresses" LOC_MARK);
+            }
+        }
     }
     return Status::OK();
 }
@@ -216,7 +241,7 @@ Status HighPerformanceTcpTransport::install(
             static_cast<size_t>(std::min<uint64_t>(kIoProgressStepBytes,
                                                    params_.max_transfer_bytes)),
             params_.connect_timeout_ms, params_.progress_timeout_ms,
-            params_.connections_per_peer},
+            params_.connections_per_peer, params_.idle_connection_timeout_ms},
         workers_.get());
 
     const uint64_t max_connections_u64 = std::max<uint64_t>(
@@ -246,17 +271,25 @@ Status HighPerformanceTcpTransport::install(
     }
 
     const SegmentDescRef local = metadata_->segmentManager().getLocal();
-    const std::string host = params_.advertise_address.empty()
-                                 ? HostFromRpc(local->rpc_server_addr)
-                                 : params_.advertise_address;
-    if (host.empty()) {
+    std::vector<HighPerformanceTcpEndpoint> endpoints;
+    if (!params_.rail_addresses.empty()) {
+        for (const auto& address : params_.rail_addresses) {
+            endpoints.push_back({address, bound_port});
+        }
+    } else {
+        const std::string host = params_.advertise_address.empty()
+                                     ? HostFromRpc(local->rpc_server_addr)
+                                     : params_.advertise_address;
+        if (!host.empty()) endpoints.push_back({host, bound_port});
+    }
+    if (endpoints.empty()) {
         status = Status::InvalidArgument(
             "unable to derive HP TCP advertise address" LOC_MARK);
     } else {
         const std::string incarnation = makeIncarnation();
         std::string encoded;
         status = EncodeHighPerformanceTcpEndpointAttr(
-            {incarnation, host, bound_port, params_.max_transfer_bytes},
+            {incarnation, std::move(endpoints), params_.max_transfer_bytes},
             &encoded);
         if (status.ok()) {
             status = metadata_->segmentManager().updateLocal(
@@ -390,6 +423,10 @@ Status HighPerformanceTcpTransport::uninstall() {
     workers_.reset();
     admission_.reset();
     metadata_.reset();
+    {
+        std::lock_guard<std::mutex> lock(lane_sequence_mutex_);
+        next_lane_sequence_.clear();
+    }
     installed_.store(false, std::memory_order_release);
     return first;
 }
@@ -437,13 +474,10 @@ Status HighPerformanceTcpTransport::freeSubBatch(SubBatchRef& batch) {
     return Status::OK();
 }
 
-Status HighPerformanceTcpTransport::planTask(const Request& request,
-                                             HighPerformanceTcpSubBatch* batch,
-                                             TaskPlan* plan) {
-    if (batch == nullptr || plan == nullptr) {
-        return Status::InvalidArgument(
-            "invalid HP TCP task plan output" LOC_MARK);
-    }
+Status HighPerformanceTcpTransport::planTask(
+    const Request& request, HighPerformanceTcpSubBatch& batch,
+    std::shared_ptr<HighPerformanceTcpTaskState>& planned_task,
+    std::vector<HighPerformanceTcpWorkers::Command>& commands) {
     if (request.source == nullptr || request.length == 0 ||
         request.length > params_.max_transfer_bytes ||
         (request.opcode != Request::READ && request.opcode != Request::WRITE)) {
@@ -459,6 +493,8 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
     HighPerformanceTcpEndpointAttr endpoint_attr;
     HighPerformanceTcpBufferAttr buffer_attr;
     SegmentDescRef pin;
+    const size_t endpoint_count =
+        params_.rail_addresses.empty() ? 1 : params_.rail_addresses.size();
     Status resolved = metadata_->segmentManager().withCachedSegment(
         request.target_id, pin, [&](SegmentDesc* segment) -> Status {
             if (segment == nullptr || segment->type != SegmentType::Memory) {
@@ -479,6 +515,10 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
                 endpoint_it->second, &endpoint_attr);
             if (!decoded.ok()) {
                 return NeedsRefresh("HP TCP endpoint metadata is incompatible");
+            }
+            if (endpoint_attr.endpoints.size() != endpoint_count) {
+                return NeedsRefresh(
+                    "HP TCP local and remote rail counts differ");
             }
             const auto registration_it =
                 buffer->transport_attrs.find(TransportType::HP_TCP);
@@ -504,57 +544,125 @@ Status HighPerformanceTcpTransport::planTask(const Request& request,
             "operation" LOC_MARK);
     }
 
+    // A partial READ can be overwritten by retry; a partial WRITE cannot.
+    // Split only when every rail receives at least one normal I/O step.
+    const size_t slice_count =
+        request.opcode == Request::READ && endpoint_count > 1 &&
+                request.length / endpoint_count >= kIoProgressStepBytes
+            ? endpoint_count
+            : 1;
     uint64_t request_id =
         next_request_id_.fetch_add(1, std::memory_order_relaxed);
     if (request_id == 0) {
         return Status::InternalError(
             "HP TCP request id space exhausted" LOC_MARK);
     }
-    const uint32_t lane_id = static_cast<uint32_t>(
-        request_id % static_cast<uint64_t>(params_.connections_per_peer));
-    const size_t owner_worker =
-        workers_->affinityOwner(request.target_id, lane_id);
 
     auto task = std::make_shared<HighPerformanceTcpTaskState>(
-        request.length, batch->progress_batch_id, batch->notify_progress,
-        std::move(local_lease));
-    task->setDispatchIdentity(owner_worker, request_id);
+        request.length, batch.progress_batch_id, batch.notify_progress,
+        std::move(local_lease), slice_count);
+    task->setRequestId(request_id);
+    planned_task = task;
 
-    HighPerformanceTcpClient::Operation operation;
-    operation.peer_id = request.target_id;
-    operation.incarnation = endpoint_attr.incarnation;
-    operation.host = endpoint_attr.host;
-    operation.port = endpoint_attr.port;
-    operation.lane_id = lane_id;
-    operation.registration_id = buffer_attr.registration_id;
-    operation.remote_addr = request.target_offset;
-    operation.local_addr = request.source;
-    operation.length = request.length;
-    operation.opcode = request.opcode == Request::READ
-                           ? HighPerformanceTcpOpcode::kRead
-                           : HighPerformanceTcpOpcode::kWrite;
-    operation.request_id = request_id;
-    operation.complete =
-        [task](TransferStatusEnum terminal, size_t bytes,
-               std::optional<HighPerformanceTcpStatus> remote_status) {
-            (void)task->completeOnce(terminal, bytes, remote_status);
-        };
-
-    HighPerformanceTcpWorkers::Command command;
-    command.worker_id = owner_worker;
-    command.run = [this, task,
-                   operation = std::move(operation)](size_t worker_id) mutable {
-        if (task->cancelRequested() ||
-            stopping_.load(std::memory_order_acquire)) {
-            (void)task->completeOnce(CANCELED, 0);
-            return;
+    uint64_t lane_sequence;
+    {
+        std::lock_guard<std::mutex> lock(lane_sequence_mutex_);
+        // Preserve the first lane choice, then advance independently.
+        auto it = next_lane_sequence_.try_emplace(request.target_id, request_id)
+                      .first;
+        lane_sequence = it->second++;
+    }
+    uint64_t slice_offset = 0;
+    for (size_t slice = 0; slice < slice_count; ++slice) {
+        const uint64_t slice_length =
+            request.length / slice_count +
+            (slice < request.length % slice_count ? 1 : 0);
+        uint32_t lane_id = 0;
+        uint32_t endpoint_id = 0;
+        if (slice_count == 1) {
+            lane_id = static_cast<uint32_t>(
+                lane_sequence %
+                static_cast<uint64_t>(params_.connections_per_peer));
+            endpoint_id = static_cast<uint32_t>(lane_id % endpoint_count);
+        } else {
+            endpoint_id = static_cast<uint32_t>(slice);
+            const size_t lanes_for_endpoint =
+                1 + (params_.connections_per_peer - 1 - endpoint_id) /
+                        endpoint_count;
+            lane_id = static_cast<uint32_t>(
+                endpoint_id +
+                (lane_sequence % lanes_for_endpoint) * endpoint_count);
         }
-        client_->enqueueOnOwner(worker_id, std::move(operation));
-    };
-    command.cancel = [task] { (void)task->completeOnce(CANCELED, 0); };
+        const auto& endpoint = endpoint_attr.endpoints[endpoint_id];
+        const size_t owner_worker =
+            workers_->affinityOwner(request.target_id, lane_id);
 
-    plan->task = std::move(task);
-    plan->command = std::move(command);
+        HighPerformanceTcpClient::Operation operation;
+        operation.peer_id = request.target_id;
+        operation.incarnation = endpoint_attr.incarnation;
+        operation.host = endpoint.host;
+        if (!params_.rail_addresses.empty()) {
+            operation.local_host = params_.rail_addresses[endpoint_id];
+        }
+        operation.port = endpoint.port;
+        operation.lane_id = lane_id;
+        operation.registration_id = buffer_attr.registration_id;
+        operation.remote_addr = request.target_offset + slice_offset;
+        operation.local_addr =
+            static_cast<uint8_t*>(request.source) + slice_offset;
+        operation.length = slice_length;
+        operation.opcode = request.opcode == Request::READ
+                               ? HighPerformanceTcpOpcode::kRead
+                               : HighPerformanceTcpOpcode::kWrite;
+        operation.request_id = request_id;
+        if (slice_count == 1) {
+            operation.complete =
+                [task](TransferStatusEnum terminal, size_t bytes,
+                       std::optional<HighPerformanceTcpStatus> remote_status) {
+                    (void)task->completeOnce(terminal, bytes, remote_status);
+                };
+        } else {
+            operation.complete =
+                [this, task](
+                    TransferStatusEnum terminal, size_t,
+                    std::optional<HighPerformanceTcpStatus> remote_status) {
+                    const bool cancel_siblings =
+                        terminal != COMPLETED && task->requestCancel();
+                    const bool finished =
+                        task->completeSlice(terminal, remote_status);
+                    if (cancel_siblings && !finished &&
+                        !stopping_.load(std::memory_order_acquire)) {
+                        (void)client_->cancelRequest(task->requestId());
+                    }
+                };
+        }
+
+        HighPerformanceTcpWorkers::Command command;
+        command.worker_id = owner_worker;
+        command.run = [this, task, slice_count,
+                       operation =
+                           std::move(operation)](size_t worker_id) mutable {
+            if (task->cancelRequested() ||
+                stopping_.load(std::memory_order_acquire)) {
+                if (slice_count == 1) {
+                    (void)task->completeOnce(CANCELED, 0);
+                } else {
+                    (void)task->completeSlice(CANCELED);
+                }
+                return;
+            }
+            client_->enqueueOnOwner(worker_id, std::move(operation));
+        };
+        command.cancel = [task, slice_count] {
+            if (slice_count == 1) {
+                (void)task->completeOnce(CANCELED, 0);
+            } else {
+                (void)task->completeSlice(CANCELED);
+            }
+        };
+        commands.push_back(std::move(command));
+        slice_offset += slice_length;
+    }
     return Status::OK();
 }
 
@@ -588,10 +696,10 @@ Status HighPerformanceTcpTransport::submitTransferTasks(
         total_bytes += request.length;
     }
 
-    std::vector<TaskPlan> plans;
+    std::vector<std::shared_ptr<HighPerformanceTcpTaskState>> planned_tasks;
     std::vector<HighPerformanceTcpWorkers::Command> commands;
     try {
-        plans.resize(requests.size());
+        planned_tasks.resize(requests.size());
         commands.reserve(requests.size());
     } catch (...) {
         return Status::InternalError(
@@ -599,10 +707,8 @@ Status HighPerformanceTcpTransport::submitTransferTasks(
     }
 
     for (size_t i = 0; i < requests.size(); ++i) {
-        CHECK_STATUS(planTask(requests[i], hp_batch, &plans[i]));
-    }
-    for (auto& plan : plans) {
-        commands.push_back(std::move(plan.command));
+        CHECK_STATUS(
+            planTask(requests[i], *hp_batch, planned_tasks[i], commands));
     }
 
     // SubBatch capacity was reserved at allocateSubBatch(). The callback below
@@ -611,9 +717,9 @@ Status HighPerformanceTcpTransport::submitTransferTasks(
     const size_t old_size = hp_batch->tasks.size();
     Status committed = workers_->tryCommitBatch(
         commands, admission_.get(), requests.size(), total_bytes, [&] {
-            for (auto& plan : plans) {
-                plan.task->activateReservation(admission_.get());
-                hp_batch->tasks.push_back(std::move(plan.task));
+            for (auto& task : planned_tasks) {
+                task->activateReservation(admission_.get());
+                hp_batch->tasks.push_back(std::move(task));
             }
         });
     if (!committed.ok()) {
@@ -659,21 +765,16 @@ Status HighPerformanceTcpTransport::retryTransferTask(SubBatchRef batch,
             "HP TCP retry requires a failed attempt" LOC_MARK);
     }
 
-    TaskPlan plan;
-    CHECK_STATUS(planTask(request, hp_batch, &plan));
+    std::shared_ptr<HighPerformanceTcpTaskState> planned_task;
     std::vector<HighPerformanceTcpWorkers::Command> commands;
-    try {
-        commands.push_back(std::move(plan.command));
-    } catch (...) {
-        return Status::InternalError(
-            "unable to allocate HP TCP retry command" LOC_MARK);
-    }
+    commands.reserve(1);
+    CHECK_STATUS(planTask(request, *hp_batch, planned_task, commands));
 
     Status committed = workers_->tryCommitBatch(
         commands, admission_.get(), 1, request.length, [&] {
-            plan.task->activateReservation(admission_.get());
+            planned_task->activateReservation(admission_.get());
             hp_batch->tasks[static_cast<size_t>(task_id)] =
-                std::move(plan.task);
+                std::move(planned_task);
         });
     return committed;
 }
@@ -689,10 +790,9 @@ Status HighPerformanceTcpTransport::cancelTransferTask(SubBatchRef batch,
     const TransferStatusEnum state = task->snapshot().s;
     if (state != INITIAL && state != PENDING) return Status::OK();
 
-    task->requestCancel();
+    if (!task->requestCancel()) return Status::OK();
     if (client_ == nullptr || workers_ == nullptr) return Status::OK();
-    const Status canceled =
-        client_->cancelRequest(task->ownerWorker(), task->requestId());
+    const Status canceled = client_->cancelRequest(task->requestId());
     // A request still in the worker dispatch queue has no client lane yet;
     // its command observes cancelRequested() and settles it. Treat inability
     // to find/post a lane cancellation during shutdown as best effort.

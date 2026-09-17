@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,11 @@ class LocalFileSnapshotObjectStoreTest : public ::testing::Test {
         google::InitGoogleLogging("LocalFileSnapshotObjectStoreTest");
         FLAGS_logtostderr = true;
 
+        if (const char* value = std::getenv("MOONCAKE_SNAPSHOT_LOCAL_PATH")) {
+            original_path_ = value;
+        }
+        ASSERT_EQ(unsetenv("MOONCAKE_SNAPSHOT_LOCAL_PATH"), 0);
+
         // Create a unique temporary directory
         std::string tmpl = (fs::temp_directory_path() /
                             "local_file_snapshot_object_store_test_XXXXXX")
@@ -35,6 +41,13 @@ class LocalFileSnapshotObjectStoreTest : public ::testing::Test {
 
     void TearDown() override {
         backend_.reset();
+        if (original_path_) {
+            EXPECT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH",
+                             original_path_->c_str(), 1),
+                      0);
+        } else {
+            EXPECT_EQ(unsetenv("MOONCAKE_SNAPSHOT_LOCAL_PATH"), 0);
+        }
         if (!tmp_dir().empty() && fs::exists(tmp_dir())) {
             fs::remove_all(tmp_dir());
         }
@@ -43,6 +56,7 @@ class LocalFileSnapshotObjectStoreTest : public ::testing::Test {
 
    private:
     std::string tmp_dir_;
+    std::optional<std::string> original_path_;
 };
 
 // ========== Normal Functionality ==========
@@ -128,7 +142,84 @@ TEST_F(LocalFileSnapshotObjectStoreTest, UploadBuffer_CreatesSubdirectories) {
 // ========== Error Handling ==========
 
 TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_EmptyPath_Throws) {
-    EXPECT_THROW(LocalFileSnapshotObjectStore(""), std::runtime_error);
+    ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", tmp_dir().c_str(), 1), 0);
+    try {
+        LocalFileSnapshotObjectStore store("");
+        FAIL()
+            << "An empty explicit path must not fall back to the environment";
+    } catch (const std::runtime_error& error) {
+        EXPECT_STREQ(
+            error.what(),
+            "LocalFileSnapshotObjectStore base_path is empty. "
+            "Please provide a valid persistent directory path for snapshot "
+            "storage.");
+    }
+}
+
+TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_MissingOrEmptyEnv_Throws) {
+    for (const char* value : {static_cast<const char*>(nullptr), ""}) {
+        if (value) {
+            ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", value, 1), 0);
+        } else {
+            ASSERT_EQ(unsetenv("MOONCAKE_SNAPSHOT_LOCAL_PATH"), 0);
+        }
+        try {
+            LocalFileSnapshotObjectStore store;
+            FAIL() << "A missing or empty environment path must be rejected";
+        } catch (const std::runtime_error& error) {
+            EXPECT_STREQ(
+                error.what(),
+                "MOONCAKE_SNAPSHOT_LOCAL_PATH environment variable is not set. "
+                "Please set it to a persistent directory path for snapshot "
+                "storage. Example: export "
+                "MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots");
+        }
+    }
+}
+
+TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_ReadsEnvForEachStore) {
+    const auto first_path = fs::path(tmp_dir()) / "first" / "snapshots";
+    ASSERT_FALSE(fs::exists(first_path));
+    ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", first_path.c_str(), 1), 0);
+    LocalFileSnapshotObjectStore first;
+    ASSERT_TRUE(fs::is_directory(first_path));
+
+    const auto second_path = fs::path(tmp_dir()) / "second";
+    ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", second_path.c_str(), 1),
+              0);
+    LocalFileSnapshotObjectStore second;
+
+    ASSERT_TRUE(first.UploadString("key", "first snapshot"));
+    ASSERT_TRUE(second.UploadString("key", "second snapshot"));
+    EXPECT_TRUE(fs::is_regular_file(first_path / "key"));
+    EXPECT_TRUE(fs::is_regular_file(second_path / "key"));
+
+    std::string data;
+    ASSERT_TRUE(first.DownloadString("key", data));
+    EXPECT_EQ(data, "first snapshot");
+    ASSERT_TRUE(second.DownloadString("key", data));
+    EXPECT_EQ(data, "second snapshot");
+}
+
+TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_EnvRegularFile_Throws) {
+    ASSERT_TRUE(backend_->UploadString("regular-file", "data"));
+    const auto path = fs::path(tmp_dir()) / "regular-file";
+    ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", path.c_str(), 1), 0);
+    EXPECT_THROW(LocalFileSnapshotObjectStore{}, std::runtime_error);
+}
+
+TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_ExplicitPathIgnoresEnv) {
+    EXPECT_NO_THROW(LocalFileSnapshotObjectStore{tmp_dir()});
+    const std::string env_path = (fs::path(tmp_dir()) / "unused-env").string();
+    const std::string explicit_path =
+        (fs::path(tmp_dir()) / "explicit").string();
+    for (const auto& value : {std::string{}, env_path}) {
+        ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", value.c_str(), 1), 0);
+        LocalFileSnapshotObjectStore store(explicit_path);
+        ASSERT_TRUE(store.UploadString("key", "explicit path"));
+        EXPECT_TRUE(fs::is_regular_file(fs::path(explicit_path) / "key"));
+        EXPECT_FALSE(fs::exists(env_path));
+    }
 }
 
 TEST_F(LocalFileSnapshotObjectStoreTest, DownloadBuffer_NonExistentKey) {

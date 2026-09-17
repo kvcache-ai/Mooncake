@@ -19,9 +19,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -118,6 +120,12 @@ class RdmaContextTestPeer {
     static void clearCompletionQueues(RdmaContext &context) {
         context.cq_list_.clear();
     }
+
+    static void clearNativeCompletionQueue(RdmaContext &context, int cq_index) {
+        ASSERT_GE(cq_index, 0);
+        ASSERT_LT(static_cast<size_t>(cq_index), context.cq_list_.size());
+        context.cq_list_[cq_index].native = nullptr;
+    }
 };
 
 class WorkerPoolTestPeer {
@@ -144,6 +152,43 @@ class WorkerPoolTestPeer {
     static void clearQueuedSlices(WorkerPool &pool) {
         for (auto &queue : pool.collective_slice_queue_) queue.clear();
         for (auto &queue : pool.worker_slice_queue_) queue.clear();
+    }
+
+    static uint64_t lastPollTs(const WorkerPool &pool) {
+        return pool.last_poll_ts_ns_.load(std::memory_order_acquire);
+    }
+
+    static bool waitForPollTs(WorkerPool &pool,
+                              std::chrono::milliseconds timeout) {
+        if (lastPollTs(pool) != 0) return true;
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool observed = false;
+        std::thread waiter([&] {
+            uint64_t poll_ts =
+                pool.last_poll_ts_ns_.load(std::memory_order_acquire);
+            while (poll_ts == 0) {
+                pool.last_poll_ts_ns_.wait(poll_ts, std::memory_order_acquire);
+                poll_ts = pool.last_poll_ts_ns_.load(std::memory_order_acquire);
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                observed = true;
+            }
+            cv.notify_one();
+        });
+
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool ok = cv.wait_for(lock, timeout, [&] { return observed; });
+        if (!ok) {
+            pool.last_poll_ts_ns_.store(std::numeric_limits<uint64_t>::max(),
+                                        std::memory_order_release);
+            pool.last_poll_ts_ns_.notify_all();
+        }
+        lock.unlock();
+        waiter.join();
+        return ok;
     }
 };
 
@@ -193,10 +238,12 @@ class InProcessRdmaTransport : public RdmaTransport {
             ++barrier_->arrivals;
             barrier_->cv.notify_all();
             if (!barrier_->cv.wait_for(lock, std::chrono::seconds(5), [&] {
-                    return barrier_->arrivals >= 2;
+                    return barrier_->arrivals >= barrier_->required_arrivals ||
+                           barrier_->released;
                 })) {
                 return ERR_ENDPOINT;
             }
+            if (fail_after_barrier_) return ERR_ENDPOINT;
         }
 
         return peer_->onSetupRdmaConnections(local_desc, peer_desc);
@@ -210,11 +257,14 @@ class InProcessRdmaTransport : public RdmaTransport {
         std::mutex mutex;
         std::condition_variable cv;
         int arrivals = 0;
+        int required_arrivals = 2;
+        bool released = false;
     };
 
     RdmaContext *local_context_ = nullptr;
     InProcessRdmaTransport *peer_ = nullptr;
     std::shared_ptr<Barrier> barrier_;
+    bool fail_after_barrier_ = false;
 
    private:
     std::atomic<bool> lifecycle_gate_was_free_{true};
@@ -510,6 +560,56 @@ TEST(RdmaEndpointLifecycleGateTest,
 
     WorkerPoolTestPeer::clearQueuedSlices(*peer_a.worker_pool);
     WorkerPoolTestPeer::clearQueuedSlices(*peer_b.worker_pool);
+}
+
+TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
+    auto barrier = std::make_shared<InProcessRdmaTransport::Barrier>();
+    FakeRdmaPeer peer;
+
+    ASSERT_NO_FATAL_FAILURE(
+        initFakePeer(peer, "rdma-drain-a:10000", "mlx5_drain_a", barrier));
+    peer.transport->fail_after_barrier_ = true;
+
+    const std::string peer_nic_path =
+        MakeNicPath("rdma-drain-b:10000", "mlx5_drain_b");
+    ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(peer, peer_nic_path));
+
+    // The fake CQ is not a real verbs object. Clearing the native pointer keeps
+    // the regression hardware-free while still proving the owner worker enters
+    // its CQ poll path during the blocked active handshake.
+    RdmaContextTestPeer::clearNativeCompletionQueue(*peer.context, 0);
+    peer.context->cqOutstandingCount(0)->store(1, std::memory_order_relaxed);
+
+    Transport::Slice slice;
+    Transport::TransferTask task;
+    queueHandshakeSlice(peer, peer_nic_path, slice, task);
+    slice.rdma.max_retry_cnt = 1;
+
+    auto active = std::async(std::launch::async, [&] {
+        WorkerPoolTestPeer::performPostSend(*peer.worker_pool, 0);
+    });
+
+    {
+        std::unique_lock<std::mutex> lock(barrier->mutex);
+        ASSERT_TRUE(barrier->cv.wait_for(lock, std::chrono::seconds(5), [&] {
+            return barrier->arrivals >= 1;
+        }));
+    }
+
+    EXPECT_TRUE(WorkerPoolTestPeer::waitForPollTs(*peer.worker_pool,
+                                                  std::chrono::seconds(5)));
+
+    {
+        std::lock_guard<std::mutex> lock(barrier->mutex);
+        barrier->released = true;
+    }
+    barrier->cv.notify_all();
+
+    ASSERT_EQ(active.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    active.get();
+
+    WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
 }
 
 }  // namespace

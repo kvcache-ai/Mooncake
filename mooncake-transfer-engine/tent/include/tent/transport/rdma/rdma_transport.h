@@ -70,6 +70,8 @@ class RdmaTransport : public Transport {
 
     virtual Status uninstall();
 
+    Status quiesce() override;
+
     virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size);
 
     virtual Status freeSubBatch(SubBatchRef& batch);
@@ -121,6 +123,11 @@ class RdmaTransport : public Transport {
 
    public:
     Status setupLocalSegment();
+
+    // Update one RNIC's published address after a GID/LID change. The local
+    // descriptor is rolled back if registry synchronization fails.
+    Status refreshLocalDeviceDesc(const std::string& device_name, uint16_t lid,
+                                  const std::string& gid);
 
     std::shared_ptr<Config> config() const { return conf_; }
 

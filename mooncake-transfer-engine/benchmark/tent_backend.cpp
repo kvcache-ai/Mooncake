@@ -60,11 +60,16 @@ std::shared_ptr<Config> loadConfig() {
     if (!XferBenchConfig::xport_type.empty()) {
         // Map of transport names to their config keys (handle name mismatches)
         std::unordered_map<std::string, std::string> transport_map = {
-            {"rdma", "rdma"},        {"tcp", "tcp"},
-            {"hp_tcp", "hp_tcp"},    {"shm", "shm"},
+            {"rdma", "rdma"},
+            {"tcp", "tcp"},
+            {"hp_tcp", "hp_tcp"},
+            {"shm", "shm"},
             {"iouring", "io_uring"},  // Note: iouring -> io_uring
-            {"gds", "gds"},          {"mnnvl", "mnnvl"},
-            {"nvlink", "nvlink"},    {"sunrise_link", "sunrise_link"},
+            {"gds", "gds"},
+            {"mnnvl", "mnnvl"},
+            {"nvlink", "nvlink"},
+            {"ub", "ub"},
+            {"sunrise_link", "sunrise_link"},
             {"mpcomm", "mpcomm"}};
 
         // Disable all transports by default
@@ -90,6 +95,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "nvlink") return NVLINK;
     if (xport_type == "tcp") return TCP;
     if (xport_type == "iouring") return IOURING;
+    if (xport_type == "ub") return UB;
     if (xport_type == "sunrise_link") return SUNRISE_LINK;
     if (xport_type == "mpcomm") return MPCOMM;
     if (xport_type == "hp_tcp") return HP_TCP;

@@ -251,7 +251,10 @@ TEST(MasterServiceTest, UpsertConflictReplicationTask) {
         .Given(MemoryNode("node-b"))
         .When(PutStart("upsert_conflict_copy", 1_KB).OnNode("node-a"))
         .When(PutEnd("upsert_conflict_copy"))
-        .When(CopyStart("upsert_conflict_copy").From("node-a").To({"node-b"}))
+        .When(CopyStart("upsert_conflict_copy")
+                  .By("node-a")
+                  .From("node-a")
+                  .To({"node-b"}))
         .When(UpsertStart("upsert_conflict_copy", 1_KB)
                   .ExpectError(ErrorCode::OBJECT_HAS_REPLICATION_TASK));
 }

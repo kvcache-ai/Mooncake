@@ -226,6 +226,39 @@ TEST(TransportHint, RoutesPinnedRequestsToHintedTransport) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
+TEST(TransportHint, ForceTcpOverridesLegacySelection) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("use_legacy_transport_selection", true);
+    cfg->set("transports/force_tcp", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_shm = std::make_shared<FakeTransport>(SHM);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_shm->install(seg_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(SHM, fake_shm);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0x01);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, (BatchID)0);
+    ASSERT_TRUE(engine
+                    .submitTransfer(
+                        batch_id, {makeLocalWriteRequest(buf.data(), kBufLen)})
+                    .ok());
+
+    EXPECT_EQ(fake_shm->submit_calls.load(), 0);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
 // ---------------------------------------------------------------------------
 // 2. Disabled transport rejected before batch state mutates
 // ---------------------------------------------------------------------------
