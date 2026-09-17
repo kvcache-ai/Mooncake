@@ -17,7 +17,6 @@ namespace mooncake {
 class HostTransferProxy;
 class LinkManager;
 class TransferEngine;
-struct HostProxyCommandSlot;
 
 class HostProxyRoute : public RouteProvider {
    public:

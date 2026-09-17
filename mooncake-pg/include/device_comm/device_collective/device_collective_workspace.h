@@ -15,13 +15,13 @@ namespace mooncake {
 
 class DeviceTransferService;
 
-// Context-wide payload storage shared by device collective protocols. The
+// Context-wide payload storage shared by device collective algorithms. The
 // buffer is published once as the rank-level
 // DeviceCollectiveWorkspaceEndpoint during registerAgent, alongside
 // DeviceTransferEndpoint. Staging is local-only and allocated lazily when a
 // route first needs it.
 //
-// StrongStream serializes protocol kernels that borrow these buffers, so one
+// StrongStream serializes algorithm kernels that borrow these buffers, so one
 // published buffer and one optional staging slice can be shared by every
 // communicator in the context.
 class DeviceCollectiveWorkspace {

@@ -234,19 +234,19 @@ struct DeviceTransferService::DeviceState {
                  rank < static_cast<GlobalRank>(max_world_size); ++rank) {
                 if (!endpoints[rank]) {
                     PG_VALIDATE_STATE(
-                        candidates[rank].kind == DeviceRouteKind::Unreachable,
+                        candidates[rank].type == DeviceRouteType::Unreachable,
                         "route provider returned a route for a missing peer");
                     continue;
                 }
                 auto& selected = selected_routes[rank];
-                if (selected.kind == DeviceRouteKind::Unreachable &&
-                    candidates[rank].kind != DeviceRouteKind::Unreachable) {
+                if (selected.type == DeviceRouteType::Unreachable &&
+                    candidates[rank].type != DeviceRouteType::Unreachable) {
                     selected = candidates[rank];
                 }
             }
         }
         PG_VALIDATE_STATE(
-            selected_routes[self_rank].kind != DeviceRouteKind::Unreachable,
+            selected_routes[self_rank].type != DeviceRouteType::Unreachable,
             "no route is available for the local transfer peer");
         std::copy(selected_routes.begin(), selected_routes.end(),
                   host_route_image);
@@ -452,14 +452,14 @@ const DeviceTransferHandle* DeviceTransferService::deviceHandle() {
     return deviceState().device_metadata.handle;
 }
 
-PGResult<DeviceRouteKind> DeviceTransferService::routeKind(GlobalRank rank) {
+PGResult<DeviceRouteType> DeviceTransferService::routeType(GlobalRank rank) {
     std::lock_guard<std::mutex> lock(mutex_);
     PG_VALIDATE_STATE(device_, "DeviceTransferService is not initialized");
     const auto& state = deviceState();
     PG_VALIDATE_ARG(
         rank >= 0 && static_cast<uint32_t>(rank) < state.max_world_size,
         "transfer rank is out of range");
-    return state.host_route_image[rank].kind;
+    return state.host_route_image[rank].type;
 }
 
 const DeviceTransferEndpoint& DeviceTransferService::localEndpoint()

@@ -1,4 +1,4 @@
-#include "device_comm/device_collective/protocols/ring/ring_all_reduce.h"
+#include "device_comm/device_collective/algorithms/ring/ring_all_reduce.h"
 
 #include <algorithm>
 #include <new>
@@ -32,24 +32,24 @@ bool endpointValid(const DeviceCollectiveWorkspaceEndpoint& workspace,
                    uint32_t required_signal_count,
                    uint32_t required_view_epoch_signal_count) noexcept {
     if (!group.ring_all_reduce) return false;
-    const auto& protocol = *group.ring_all_reduce;
+    const auto& ring_endpoint = *group.ring_all_reduce;
     if (workspace.buffer_size < required_buffer_size ||
-        protocol.signal_count < required_signal_count ||
+        ring_endpoint.signal_count < required_signal_count ||
         group.view_epoch_signal_count < required_view_epoch_signal_count) {
         return false;
     }
     const uint64_t signal_bytes =
-        static_cast<uint64_t>(protocol.signal_count) * sizeof(uint64_t);
+        static_cast<uint64_t>(ring_endpoint.signal_count) * sizeof(uint64_t);
     const uint64_t view_epoch_signal_bytes =
         static_cast<uint64_t>(group.view_epoch_signal_count) * sizeof(uint64_t);
     return !rangesOverlap(workspace.buffer_offset, workspace.buffer_size,
-                          protocol.signal_offset, signal_bytes) &&
+                          ring_endpoint.signal_offset, signal_bytes) &&
            !addOverflows(group.view_epoch_signal, view_epoch_signal_bytes);
 }
 
 }  // namespace
 
-RingAllReduceProtocol::RingAllReduceProtocol(
+RingAllReduceAlgorithm::RingAllReduceAlgorithm(
     DeviceTransferService& transfer_service,
     DeviceCollectiveWorkspace& workspace,
     const DeviceTransferHandle* transfer_handle,
@@ -72,12 +72,14 @@ RingAllReduceProtocol::RingAllReduceProtocol(
       endpoint_{.signal_offset = signals_.offset(),
                 .signal_count = signal_layout_.total_signal_count} {}
 
-PGResult<std::unique_ptr<RingAllReduceProtocol>> RingAllReduceProtocol::create(
-    DeviceTransferService& transfer_service,
-    DeviceCollectiveWorkspace& workspace, const uint64_t* view_epoch_signals,
-    InvocationState* invocation_state, ControlMailbox* control_mailbox,
-    uint64_t timeout_ticks, int device_index, InGroupRank self_rank,
-    uint32_t max_group_size) {
+PGResult<std::unique_ptr<RingAllReduceAlgorithm>>
+RingAllReduceAlgorithm::create(DeviceTransferService& transfer_service,
+                               DeviceCollectiveWorkspace& workspace,
+                               const uint64_t* view_epoch_signals,
+                               InvocationState* invocation_state,
+                               ControlMailbox* control_mailbox,
+                               uint64_t timeout_ticks, int device_index,
+                               InGroupRank self_rank, uint32_t max_group_size) {
     PG_VALIDATE_ARG(max_group_size != 0, "Ring group capacity is zero");
     PG_VALIDATE_ARG(
         self_rank >= 0 && static_cast<uint32_t>(self_rank) < max_group_size,
@@ -97,20 +99,20 @@ PGResult<std::unique_ptr<RingAllReduceProtocol>> RingAllReduceProtocol::create(
     PG_TRY(auto signals, transfer_service.allocatePeerAccessible(
                              signal_bytes, alignof(uint64_t)));
 
-    auto protocol =
-        std::unique_ptr<RingAllReduceProtocol>(new RingAllReduceProtocol(
+    auto algorithm =
+        std::unique_ptr<RingAllReduceAlgorithm>(new RingAllReduceAlgorithm(
             transfer_service, workspace, transfer_handle, view_epoch_signals,
             invocation_state, control_mailbox, timeout_ticks, device_index,
             self_rank, max_group_size, std::move(signals), signal_layout));
-    PG_TRY(protocol->initializeDeviceState());
-    return protocol;
+    PG_TRY(algorithm->initializeDeviceState());
+    return algorithm;
 }
 
-RingAllReduceProtocol::~RingAllReduceProtocol() noexcept {
+RingAllReduceAlgorithm::~RingAllReduceAlgorithm() noexcept {
     releaseDeviceState();
 }
 
-PGResult<void> RingAllReduceProtocol::initializeDeviceState() {
+PGResult<void> RingAllReduceAlgorithm::initializeDeviceState() {
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
     PG_TRY_CUDA(cudaMalloc(reinterpret_cast<void**>(&state_),
                            sizeof(RingAllReduceDeviceState)));
@@ -127,7 +129,7 @@ PGResult<void> RingAllReduceProtocol::initializeDeviceState() {
     return {};
 }
 
-void RingAllReduceProtocol::releaseDeviceState() noexcept {
+void RingAllReduceAlgorithm::releaseDeviceState() noexcept {
     if (!state_) return;
     auto device_guard = GpuDeviceGuard::create(device_index_);
     if (!device_guard.has_value()) {
@@ -144,7 +146,7 @@ void RingAllReduceProtocol::releaseDeviceState() noexcept {
     }
 }
 
-RingAllReducePlan RingAllReduceProtocol::makePlan(
+RingAllReducePlan RingAllReduceAlgorithm::makePlan(
     uint64_t view_epoch, int32_t self_active_index, uint32_t participant_count,
     uint64_t buffer_size, RingPeerTarget predecessor, RingPeerTarget successor,
     char* staging_ptr) const {
@@ -169,9 +171,9 @@ RingAllReducePlan RingAllReduceProtocol::makePlan(
     };
 }
 
-PGResult<void> RingAllReduceProtocol::appendPlanUpdate(
+PGResult<void> RingAllReduceAlgorithm::appendPlanUpdate(
     ControlUpdateBuilder& builder) const {
-    // A Plan update also resets all protocol progress state. Keeping the reset
+    // A Plan update also resets all algorithm progress state. Keeping the reset
     // and Plan copy in one ControlUpdate makes replacing Published safe.
     PG_VALIDATE_STATE(signals_.size() % sizeof(uint64_t) == 0,
                       "Ring signal storage is not uint64-aligned");
@@ -185,7 +187,7 @@ PGResult<void> RingAllReduceProtocol::appendPlanUpdate(
     return {};
 }
 
-void RingAllReduceProtocol::useLocalOnly(uint64_t view_epoch) {
+void RingAllReduceAlgorithm::useLocalOnly(uint64_t view_epoch) {
     const RingPeerTarget self{.in_group_rank = self_rank_};
     host_plan_ = RingAllReducePlanSlot{
         .status = DevicePlanStatus::Ready,
@@ -194,7 +196,7 @@ void RingAllReduceProtocol::useLocalOnly(uint64_t view_epoch) {
     };
 }
 
-PGResult<void> RingAllReduceProtocol::applyGroupView(const GroupView& view) {
+PGResult<void> RingAllReduceAlgorithm::applyGroupView(const GroupView& view) {
     PG_ASSERT(view.max_group_size == static_cast<int32_t>(max_group_size_),
               "Ring group capacity changed");
 
@@ -241,7 +243,7 @@ PGResult<void> RingAllReduceProtocol::applyGroupView(const GroupView& view) {
                       member.endpoint->device_collective.ring_all_reduce,
                   "active Ring peer ", in_group_rank, " has no Ring endpoint");
         const auto& group_endpoint = member.endpoint->device_collective;
-        const auto& protocol_endpoint = *group_endpoint.ring_all_reduce;
+        const auto& ring_endpoint = *group_endpoint.ring_all_reduce;
         PG_TRY(auto workspace_endpoint, workspace_.endpoint(global_rank));
         PG_ASSERT(endpointValid(
                       workspace_endpoint, group_endpoint, common_buffer_size,
@@ -252,7 +254,7 @@ PGResult<void> RingAllReduceProtocol::applyGroupView(const GroupView& view) {
             .global_rank = global_rank,
             .in_group_rank = in_group_rank,
             .buffer_offset = workspace_endpoint.buffer_offset,
-            .signal_offset = protocol_endpoint.signal_offset,
+            .signal_offset = ring_endpoint.signal_offset,
             .view_epoch_signal_offset =
                 group_endpoint.view_epoch_signal +
                 static_cast<uint64_t>(self_rank_) * sizeof(uint64_t),
@@ -282,18 +284,18 @@ PGResult<void> RingAllReduceProtocol::applyGroupView(const GroupView& view) {
     return {};
 }
 
-void RingAllReduceProtocol::invalidateHostPlan() noexcept { host_plan_ = {}; }
+void RingAllReduceAlgorithm::invalidateHostPlan() noexcept { host_plan_ = {}; }
 
-bool RingAllReduceProtocol::ready() const noexcept {
+bool RingAllReduceAlgorithm::ready() const noexcept {
     return host_plan_.status == DevicePlanStatus::Ready;
 }
 
-const RingAllReduceEndpoint& RingAllReduceProtocol::localEndpoint()
+const RingAllReduceEndpoint& RingAllReduceAlgorithm::localEndpoint()
     const noexcept {
     return endpoint_;
 }
 
-PGResult<void> RingAllReduceProtocol::enqueue(
+PGResult<void> RingAllReduceAlgorithm::enqueue(
     const void* send_buffer, void* recv_buffer, size_t count, DataType datatype,
     ReduceOp op, cudaStream_t stream, int32_t* failed_ranks_hint) const {
     PG_VALIDATE_STATE(ready(), "Ring AllReduce Plan is not ready");

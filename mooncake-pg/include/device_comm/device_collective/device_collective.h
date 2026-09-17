@@ -20,13 +20,13 @@
 namespace mooncake {
 
 class DeviceCollectiveWorkspace;
-class RingAllReduceProtocol;
+class RingAllReduceAlgorithm;
 class StrongStream;
 
-// Protocol-independent lifecycle facade. It owns communicator view epoch
+// Algorithm-independent lifecycle facade. It owns communicator view epoch
 // synchronization, invocation and recovery state, stream ordering,
-// control-update publication, and graph references. The selected protocol owns
-// topology, protocol resources, and kernel launch policy.
+// control-update publication, and graph references. The selected algorithm owns
+// topology, algorithm resources, and kernel launch policy.
 class DeviceCollectiveRuntime {
    public:
     using FailureRecoveryCallback = std::function<PGResult<void>(InGroupRank)>;
@@ -73,7 +73,7 @@ class DeviceCollectiveRuntime {
     [[nodiscard]] bool hasPendingRecovery() const noexcept;
     PGResult<void> publishControlState(bool pinned,
                                        bool include_active_ranks_mirror);
-    PGResult<void> prepareFailureResume();
+    PGResult<void> prepareFailureResume(const CollectiveFailureReport& failure);
     void releaseState() noexcept;
 
     DeviceTransferService& transfer_service_;
@@ -81,7 +81,7 @@ class DeviceCollectiveRuntime {
     InGroupRank self_rank_ = kInvalidInGroupRank;
     RegionSlice view_epoch_signals_;
     InvocationState* invocation_state_ = nullptr;
-    std::unique_ptr<RingAllReduceProtocol> all_reduce_;
+    std::unique_ptr<RingAllReduceAlgorithm> all_reduce_;
     StrongStream& strong_stream_;
     ControlMailbox* control_mailbox_ = nullptr;
     int32_t* active_ranks_mirror_ = nullptr;

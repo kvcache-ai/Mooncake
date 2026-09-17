@@ -6,12 +6,12 @@
 #include <cooperative_groups.h>
 
 #include "common_types.h"
-#include "device_comm/device_assert.cuh"
+#include "device_comm/device_utils/device_assert.cuh"
 #include "device_comm/device_transfer/transfer_lane.cuh"
 
 namespace mooncake {
 
-// Protocol-supplied subrange of the DTS's local-only staging region.
+// Algorithm-supplied subrange of the DTS's local-only staging region.
 // On a non-direct path, the calling GPU kernel writes the payload directly
 // into this range, and publish() passes that address to TransferLane::put().
 // PayloadWriter never adds another staging copy.
@@ -89,7 +89,7 @@ class PayloadWriteView {
                 // FIXME: Revisit the ordering contract and this assertion when
                 // another route gains direct mappings, since Direct will no
                 // longer necessarily imply P2P.
-                PG_DEVICE_ASSERT(route_kind_ == DeviceRouteKind::P2p);
+                PG_DEVICE_ASSERT(route_type_ == DeviceRouteType::P2p);
                 SignalRequest signal;
                 signal.signal = request.signal;
                 signal.timeout_ticks = request.timeout_ticks;
@@ -115,13 +115,13 @@ class PayloadWriteView {
 
     __device__ __forceinline__ PayloadWriteView(const TransferLane& lane,
                                                 GlobalRank peer,
-                                                DeviceRouteKind route_kind,
+                                                DeviceRouteType route_type,
                                                 PayloadWritePath path,
                                                 void* data, uint64_t capacity,
                                                 uint64_t remote_offset)
         : lane_(lane),
           peer_(peer),
-          route_kind_(route_kind),
+          route_type_(route_type),
           path_(path),
           data_(data),
           capacity_(capacity),
@@ -129,7 +129,7 @@ class PayloadWriteView {
 
     TransferLane lane_;
     GlobalRank peer_ = kInvalidGlobalRank;
-    DeviceRouteKind route_kind_ = DeviceRouteKind::Unreachable;
+    DeviceRouteType route_type_ = DeviceRouteType::Unreachable;
     PayloadWritePath path_ = PayloadWritePath::Staging;
     void* data_ = nullptr;
     uint64_t capacity_ = 0;
@@ -162,7 +162,7 @@ class PayloadWriter {
           staging_(staging),
           remote_region_(remote_region) {
         PG_DEVICE_ASSERT(peer_ != kInvalidGlobalRank);
-        route_kind_ = transfer_handle.routeKind(peer_);
+        route_type_ = transfer_handle.routeType(peer_);
         payload_base_ =
             transfer_handle.remotePtr(peer_, remote_region_.region_offset);
         if (payload_base_) {
@@ -205,7 +205,7 @@ class PayloadWriter {
             destination = static_cast<char*>(payload_base_) + staging_offset;
         }
 
-        return PayloadWriteView(lane_, peer_, route_kind_, selected_path,
+        return PayloadWriteView(lane_, peer_, route_type_, selected_path,
                                 destination, capacity,
                                 remote_region_.region_offset + remote_offset);
     }
@@ -215,7 +215,7 @@ class PayloadWriter {
     GlobalRank peer_ = kInvalidGlobalRank;
     StagingRegion staging_;
     RemotePayloadRegion remote_region_;
-    DeviceRouteKind route_kind_ = DeviceRouteKind::Unreachable;
+    DeviceRouteType route_type_ = DeviceRouteType::Unreachable;
     PayloadWritePath path_ = PayloadWritePath::Staging;
     void* payload_base_ = nullptr;
 };

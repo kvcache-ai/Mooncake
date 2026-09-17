@@ -1,12 +1,12 @@
-#include "device_comm/device_collective/protocols/ring/ring_types.cuh"
+#include "device_comm/device_collective/algorithms/ring/ring_types.cuh"
 
 #include <cstdint>
 
 #include <cooperative_groups.h>
 
-#include "device_comm/device_assert.cuh"
+#include "device_comm/device_utils/device_assert.cuh"
 #include "device_comm/device_collective/device_collective_kernel.cuh"
-#include "device_comm/device_collective/protocols/ring/ring_primitives.cuh"
+#include "device_comm/device_collective/algorithms/ring/ring_primitives.cuh"
 #include "device_comm/device_transfer/transfer_lane.cuh"
 
 namespace mooncake {
@@ -15,7 +15,7 @@ namespace {
 // Keep each participant's Ring shard large enough to amortize step signaling
 // while allowing small collectives to use more of the fixed channel grid.
 inline constexpr uint64_t kMinBytesPerChannelStep = 8ull << 10;
-inline constexpr int kProtocolThreads = 512;
+inline constexpr int kBlockThreads = 512;
 
 template <typename T>
 [[nodiscard]] __device__ __forceinline__ uint32_t
@@ -144,7 +144,7 @@ template <typename T, ReduceOp Op>
 }
 
 template <typename T, ReduceOp Op>
-__global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
+__global__ __launch_bounds__(kBlockThreads, 1) void ringAllReduceKernel(
     RingAllReduceKernelArgs request, RingAllReduceDeviceState* state) {
     const auto block = cooperative_groups::this_thread_block();
     const uint32_t channel = blockIdx.x;
@@ -296,23 +296,23 @@ __global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
 template <typename T>
 cudaError_t launchReduction(const RingAllReduceKernelArgs& request,
                             RingAllReduceDeviceState* state, dim3 grid,
-                            int protocol_threads, cudaStream_t stream) {
+                            int block_threads, cudaStream_t stream) {
     switch (request.op) {
         case ReduceOp::Sum:
             ringAllReduceKernel<T, ReduceOp::Sum>
-                <<<grid, protocol_threads, 0, stream>>>(request, state);
+                <<<grid, block_threads, 0, stream>>>(request, state);
             break;
         case ReduceOp::Product:
             ringAllReduceKernel<T, ReduceOp::Product>
-                <<<grid, protocol_threads, 0, stream>>>(request, state);
+                <<<grid, block_threads, 0, stream>>>(request, state);
             break;
         case ReduceOp::Min:
             ringAllReduceKernel<T, ReduceOp::Min>
-                <<<grid, protocol_threads, 0, stream>>>(request, state);
+                <<<grid, block_threads, 0, stream>>>(request, state);
             break;
         case ReduceOp::Max:
             ringAllReduceKernel<T, ReduceOp::Max>
-                <<<grid, protocol_threads, 0, stream>>>(request, state);
+                <<<grid, block_threads, 0, stream>>>(request, state);
             break;
         default:
             return cudaErrorInvalidValue;
@@ -328,34 +328,34 @@ cudaError_t launchRingAllReduceKernel(const RingAllReduceKernelArgs& request,
     const dim3 grid(kMaxDeviceCollectiveChannels);
     switch (request.datatype) {
         case DataType::Float16:
-            return launchReduction<__half>(request, state, grid,
-                                           kProtocolThreads, stream);
+            return launchReduction<__half>(request, state, grid, kBlockThreads,
+                                           stream);
         case DataType::Uint8:
-            return launchReduction<uint8_t>(request, state, grid,
-                                            kProtocolThreads, stream);
+            return launchReduction<uint8_t>(request, state, grid, kBlockThreads,
+                                            stream);
         case DataType::Int8:
-            return launchReduction<int8_t>(request, state, grid,
-                                           kProtocolThreads, stream);
+            return launchReduction<int8_t>(request, state, grid, kBlockThreads,
+                                           stream);
         case DataType::Int16:
-            return launchReduction<int16_t>(request, state, grid,
-                                            kProtocolThreads, stream);
+            return launchReduction<int16_t>(request, state, grid, kBlockThreads,
+                                            stream);
         case DataType::Int32:
-            return launchReduction<int32_t>(request, state, grid,
-                                            kProtocolThreads, stream);
+            return launchReduction<int32_t>(request, state, grid, kBlockThreads,
+                                            stream);
         case DataType::Int64:
-            return launchReduction<int64_t>(request, state, grid,
-                                            kProtocolThreads, stream);
+            return launchReduction<int64_t>(request, state, grid, kBlockThreads,
+                                            stream);
         case DataType::Bfloat16:
             return launchReduction<__nv_bfloat16>(request, state, grid,
-                                                  kProtocolThreads, stream);
+                                                  kBlockThreads, stream);
         case DataType::Float32:
-            return launchReduction<float>(request, state, grid,
-                                          kProtocolThreads, stream);
+            return launchReduction<float>(request, state, grid, kBlockThreads,
+                                          stream);
         case DataType::Float64:
-            return launchReduction<double>(request, state, grid,
-                                           kProtocolThreads, stream);
+            return launchReduction<double>(request, state, grid, kBlockThreads,
+                                           stream);
         case DataType::Bool:
-            return launchReduction<bool>(request, state, grid, kProtocolThreads,
+            return launchReduction<bool>(request, state, grid, kBlockThreads,
                                          stream);
         default:
             return cudaErrorInvalidValue;

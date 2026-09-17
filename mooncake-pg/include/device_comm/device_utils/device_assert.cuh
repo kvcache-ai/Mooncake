@@ -1,7 +1,9 @@
-#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_ASSERT_CUH
-#define MOONCAKE_PG_DEVICE_COMM_DEVICE_ASSERT_CUH
+#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_UTILS_DEVICE_ASSERT_CUH
+#define MOONCAKE_PG_DEVICE_COMM_DEVICE_UTILS_DEVICE_ASSERT_CUH
 
 #include <cstdio>
+
+#include <cuda_alike.h>
 
 // Fatal checks for device-side programming-contract violations. These remain
 // enabled when NDEBUG is defined and must not be used for recoverable runtime
@@ -48,4 +50,4 @@ namespace mooncake::detail {
     } while (false)
 #endif
 
-#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_ASSERT_CUH
+#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_UTILS_DEVICE_ASSERT_CUH

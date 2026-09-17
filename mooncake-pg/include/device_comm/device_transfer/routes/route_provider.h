@@ -23,7 +23,7 @@ enum class DeviceRegionKind : uint32_t {
 
 // Host-side control path for one way of reaching peers. Implementations manage
 // route-specific resources and metadata, but only borrow DTS backing regions.
-// Device execution remains statically dispatched through DeviceRouteKind.
+// Device execution remains statically dispatched through DeviceRouteType.
 class RouteProvider {
    public:
     virtual ~RouteProvider() = default;

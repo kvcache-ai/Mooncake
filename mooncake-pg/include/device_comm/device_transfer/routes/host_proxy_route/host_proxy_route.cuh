@@ -6,7 +6,8 @@
 #include <cooperative_groups.h>
 #include <transport/device/device_ops.cuh>
 
-#include "device_comm/device_assert.cuh"
+#include "device_comm/device_utils/d2h_request_slot.cuh"
+#include "device_comm/device_utils/device_assert.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_types.cuh"
 
@@ -14,11 +15,6 @@ namespace mooncake {
 
 class HostProxyTransferTicket {
    public:
-    enum class State : uint32_t {
-        Submitted,
-        TimedOut,
-    };
-
     __device__ __forceinline__ HostProxyTransferTicket() = default;
 
     __device__ __forceinline__ explicit HostProxyTransferTicket(
@@ -26,11 +22,9 @@ class HostProxyTransferTicket {
         : wait_result_(wait_result) {}
 
     __device__ __forceinline__ HostProxyTransferTicket(
-        State state, HostProxyCommandSlot* slot, uint64_t expected_sequence,
-        uint64_t start_ticks, uint64_t timeout_ticks, uint64_t* wait_result)
-        : state_(state),
-          slot_(slot),
-          expected_sequence_(expected_sequence),
+        HostProxyCommandSlot::RequestHandle handle, uint64_t start_ticks,
+        uint64_t timeout_ticks, uint64_t* wait_result)
+        : handle_(handle),
           start_ticks_(start_ticks),
           timeout_ticks_(timeout_ticks),
           wait_result_(wait_result) {}
@@ -54,27 +48,11 @@ class HostProxyTransferTicket {
    private:
     __device__ __forceinline__ TransferResult waitLeader() const;
 
-    State state_ = State::TimedOut;
-    HostProxyCommandSlot* slot_ = nullptr;
-    uint64_t expected_sequence_ = 0;
+    HostProxyCommandSlot::RequestHandle handle_;
     uint64_t start_ticks_ = 0;
     uint64_t timeout_ticks_ = 0;
     uint64_t* wait_result_ = nullptr;
 };
-
-__device__ __forceinline__ bool hostProxyTimedOut(uint64_t start,
-                                                  uint64_t timeout_ticks) {
-    return timeout_ticks != 0 && clock64() - start >= timeout_ticks;
-}
-
-__device__ __forceinline__ void publishHostProxyCommand(
-    HostProxyCommandSlot& slot, const HostProxyCommand& command,
-    uint64_t sequence) {
-    slot.command = command;
-    slot.result = HostProxyCommandResult::Pending;
-    __threadfence_system();
-    device::mc_st_release_u64(&slot.submitted_sequence, sequence);
-}
 
 __device__ __forceinline__ HostProxyTransferTicket
 hostProxyPut(HostProxyCommandSlot* command_slots,
@@ -92,18 +70,6 @@ hostProxyPut(HostProxyCommandSlot* command_slots,
     auto* const slot = command_slots + lane;
     const uint64_t start_ticks = clock64();
 
-    const uint64_t submitted =
-        device::mc_ld_acquire_u64(&slot->submitted_sequence);
-    while (true) {
-        const uint64_t completed =
-            device::mc_ld_acquire_u64(&slot->completed_sequence);
-        if (completed == submitted) break;
-        PG_DEVICE_ASSERT(completed < submitted);
-        if (hostProxyTimedOut(start_ticks, timeout_ticks)) return ticket;
-    }
-    PG_DEVICE_ASSERT(submitted != UINT64_MAX);
-
-    const uint64_t sequence = submitted + 1;
     HostProxyCommand command;
     command.local_addr = reinterpret_cast<uint64_t>(source);
     command.remote_region_addr = remote_region_address;
@@ -111,9 +77,8 @@ hostProxyPut(HostProxyCommandSlot* command_slots,
     command.size = size;
     command.signal = signal;
     command.target_rank = target_rank;
-    publishHostProxyCommand(*slot, command, sequence);
-    return HostProxyTransferTicket(HostProxyTransferTicket::State::Submitted,
-                                   slot, sequence, start_ticks, timeout_ticks,
+    const auto handle = slot->submit(command, start_ticks, timeout_ticks);
+    return HostProxyTransferTicket(handle, start_ticks, timeout_ticks,
                                    wait_result);
 }
 
@@ -131,20 +96,14 @@ __device__ __forceinline__ HostProxyTransferTicket hostProxySignal(
 
 __device__ __forceinline__ TransferResult
 HostProxyTransferTicket::waitLeader() const {
-    if (state_ == State::TimedOut) {
+    if (!handle_) {
         return TransferResult::TimedOut;
     }
-    PG_DEVICE_ASSERT(slot_ && expected_sequence_ != 0);
-    while (true) {
-        const uint64_t completed =
-            device::mc_ld_acquire_u64(&slot_->completed_sequence);
-        if (completed == expected_sequence_) break;
-        PG_DEVICE_ASSERT(completed < expected_sequence_);
-        if (hostProxyTimedOut(start_ticks_, timeout_ticks_)) {
-            return TransferResult::TimedOut;
-        }
+    HostProxyCommandResult result;
+    if (!handle_.wait(start_ticks_, timeout_ticks_, &result)) {
+        return TransferResult::TimedOut;
     }
-    switch (slot_->result) {
+    switch (result) {
         case HostProxyCommandResult::Succeeded:
             return TransferResult::Succeeded;
         case HostProxyCommandResult::Failed:

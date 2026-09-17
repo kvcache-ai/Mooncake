@@ -1,7 +1,6 @@
 #include "device_comm/device_transfer/routes/host_proxy_route/host_transfer_proxy.h"
 
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -15,6 +14,7 @@
 #include <transfer_engine.h>
 
 #include "control_plane/link_manager.h"
+#include "device_comm/device_utils/d2h_request_slot.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "gpu_runtime.h"
 #include "memory_location.h"
@@ -49,7 +49,7 @@ struct HostTransferProxy::Lane {
     uint64_t* signal_staging = nullptr;
 
     State state = State::WaitingForCommand;
-    uint64_t sequence = 0;
+    HostProxyCommandSlot::RequestHandle handle;
     HostProxyCommand command;
     TransferMetadata::SegmentID target_segment_id = 0;
     BatchID batch_id = INVALID_BATCH_ID;
@@ -122,18 +122,8 @@ HostTransferProxy::LaneSet::create(TransferEngine& engine) {
     return lane_set;
 }
 
-uint64_t HostTransferProxy::loadSubmitted(const Lane& lane) {
-    return std::atomic_ref(lane.host_slot->submitted_sequence)
-        .load(std::memory_order_acquire);
-}
-
-uint64_t HostTransferProxy::loadCompleted(const Lane& lane) {
-    return std::atomic_ref(lane.host_slot->completed_sequence)
-        .load(std::memory_order_acquire);
-}
-
 bool HostTransferProxy::laneIdle(const Lane& lane) {
-    return loadSubmitted(lane) == loadCompleted(lane);
+    return !lane.host_slot->hasPendingRequest();
 }
 
 bool HostTransferProxy::laneSetIdle(const LaneSet& lane_set) {
@@ -149,17 +139,13 @@ bool HostTransferProxy::lanesIdle() const {
 
 void HostTransferProxy::finishCommand(Lane& lane,
                                       HostProxyCommandResult result) {
-    const uint64_t sequence = lane.sequence;
+    const auto handle = lane.handle;
     lane.state = Lane::State::WaitingForCommand;
-    lane.sequence = 0;
+    lane.handle = {};
     lane.command = {};
     lane.target_segment_id = 0;
 
-    // Publish completion only after the worker-private lane state is idle, so
-    // lifecycle checks need only compare the shared slot sequences.
-    lane.host_slot->result = result;
-    std::atomic_ref(lane.host_slot->completed_sequence)
-        .store(sequence, std::memory_order_release);
+    handle.reply(result);
     state_changed_.notify_all();
 }
 
@@ -211,22 +197,11 @@ HostTransferProxy::BatchPollResult HostTransferProxy::pollBatch(Lane& lane) {
 }
 
 bool HostTransferProxy::tryStartCommand(Lane& lane) {
-    const uint64_t completed = loadCompleted(lane);
-    const uint64_t submitted = loadSubmitted(lane);
-    if (submitted == completed) return false;
+    HostProxyCommandSlot::ReceivedRequest received;
+    if (!lane.host_slot->tryReceive(received)) return false;
 
-    lane.sequence = submitted;
-    // loadSubmitted() acquired the GPU's publication. Snapshot the shared
-    // command before starting asynchronous TE work.
-    lane.command = lane.host_slot->command;
-
-    // A producer may only publish the next sequence after observing the
-    // previous completion. Anything else means the single-slot protocol
-    // was violated; fail the observed command instead of guessing.
-    if (completed == UINT64_MAX || submitted != completed + 1) {
-        finishCommand(lane, HostProxyCommandResult::Failed);
-        return true;
-    }
+    lane.handle = received.handle;
+    lane.command = received.request;
 
     const auto rank = lane.command.target_rank;
     if (rank < 0 || static_cast<uint32_t>(rank) >= max_world_size_) {

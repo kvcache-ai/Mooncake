@@ -61,7 +61,7 @@ PGResult<std::vector<DeviceTransferRoute>> HostProxyRoute::resolveRoutes(
         if (!endpoint) continue;
 
         routes[rank] = DeviceTransferRoute{
-            .kind = DeviceRouteKind::HostProxy,
+            .type = DeviceRouteType::HostProxy,
             .region_size = endpoints[rank]->region_size,
             .host_proxy =
                 {

@@ -9,13 +9,13 @@ namespace mooncake {
 
 PGResult<bool> payloadWriterRequiresStaging(
     DeviceTransferService& transfer_service, GlobalRank peer) {
-    PG_TRY(auto route_kind, transfer_service.routeKind(peer));
-    switch (route_kind) {
-        case DeviceRouteKind::P2p:
+    PG_TRY(auto route_type, transfer_service.routeType(peer));
+    switch (route_type) {
+        case DeviceRouteType::P2p:
             return false;
-        case DeviceRouteKind::HostProxy:
+        case DeviceRouteType::HostProxy:
             return true;
-        case DeviceRouteKind::Unreachable:
+        case DeviceRouteType::Unreachable:
             return makePGError(PGErrorCode::InvalidState,
                                "PayloadWriter peer " + std::to_string(peer) +
                                    " has no device transfer route");
