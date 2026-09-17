@@ -805,9 +805,9 @@ for each axis, or accept an arbitrary strategy dictionary.
   compatible source/target tensor descriptors. The planner is copy-only; it
   does not convert dtype, quantization, packing, or model semantics.
 
-See the [manifest contracts](../../design/reshard-manifest.md),
-[weight reshard planner](../../design/model-weight-reshard-planner.md), and
-[Store upload planning](../../design/model-weight-store-upload-planning.md)
+See the [manifest contracts](../../design/mooncake-reshard/reshard-manifest.md),
+[weight reshard planner](../../design/mooncake-reshard/model-weight-reshard-planner.md), and
+[Store upload planning](../../design/mooncake-reshard/model-weight-store-upload-planning.md)
 for the configuration and execution boundaries.
 
 ## Model Weight Snapshot API

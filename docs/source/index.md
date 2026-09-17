@@ -127,9 +127,7 @@ performance/vllm/index
 
 design/architecture
 design/transfer-engine/index
-design/reshard-manifest
-design/model-weight-reshard-planner
-design/model-weight-store-upload-planning
+design/mooncake-reshard/index
 design/tent/overview
 design/store/mooncake-store
 design/kv-event/publisher-design
