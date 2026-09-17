@@ -413,7 +413,8 @@ class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
                 // polling until we observe the definitive connection_refused
                 // (or hit the deadline) instead of bailing the whole probe.
                 if (error != asio::error::connection_reset) {
-                    LOG(ERROR) << "Unexpected listener probe failure: " << error;
+                    LOG(ERROR)
+                        << "Unexpected listener probe failure: " << error;
                     return false;
                 }
             }
