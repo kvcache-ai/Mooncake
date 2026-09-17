@@ -1,6 +1,6 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-if(MOONCAKE_ENABLE_ADAPTIVE_CC)
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   add_executable(adaptive_congestion_control_test
                  ${WORKSPACE}/adaptive_congestion_control_test.cpp)
   target_link_libraries(

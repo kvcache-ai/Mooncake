@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.20)
 add_subdirectory(base)
 list(APPEND SUB_STATIC_LIBS base)
 
-if(MOONCAKE_ENABLE_ADAPTIVE_CC)
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   add_subdirectory(adaptive_congestion_control)
 endif()
 

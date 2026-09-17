@@ -23,7 +23,7 @@
 
 #include "adaptive_congestion_control.h"
 
-namespace mooncake::adaptive_cc {
+namespace mooncake::adaptive_congestion_control {
 namespace {
 
 Config testConfig(Mode mode = Mode::kEnforce) {
@@ -853,4 +853,4 @@ TEST(AdaptiveCongestionControlTest, ConcurrentPermitsBalanceExactly) {
 }
 
 }  // namespace
-}  // namespace mooncake::adaptive_cc
+}  // namespace mooncake::adaptive_congestion_control

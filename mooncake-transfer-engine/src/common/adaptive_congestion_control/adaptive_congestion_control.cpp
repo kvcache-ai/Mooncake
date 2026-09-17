@@ -18,7 +18,7 @@
 #include <limits>
 #include <thread>
 
-namespace mooncake::adaptive_cc {
+namespace mooncake::adaptive_congestion_control {
 namespace {
 
 Config normalize(Config config) {
@@ -717,4 +717,4 @@ Snapshot snapshot(const DomainState& state) {
     };
 }
 
-}  // namespace mooncake::adaptive_cc
+}  // namespace mooncake::adaptive_congestion_control

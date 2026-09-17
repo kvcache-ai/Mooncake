@@ -19,7 +19,7 @@
 
 #include "adaptive_congestion_control.h"
 
-namespace mooncake::adaptive_cc {
+namespace mooncake::adaptive_congestion_control {
 
 struct ConfigLoadResult {
     Config config;
@@ -29,6 +29,6 @@ struct ConfigLoadResult {
 
 ConfigLoadResult loadConfigFromEnvironment();
 
-}  // namespace mooncake::adaptive_cc
+}  // namespace mooncake::adaptive_congestion_control
 
 #endif  // MOONCAKE_ADAPTIVE_CONGESTION_CONTROL_CONFIG_H

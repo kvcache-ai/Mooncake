@@ -22,7 +22,7 @@
 
 #include "adaptive_congestion_control.h"
 
-namespace mooncake::adaptive_cc {
+namespace mooncake::adaptive_congestion_control {
 
 struct Classification {
     OutcomeClass outcome = OutcomeClass::kFatal;
@@ -35,6 +35,6 @@ Classification classifyCompletion(ibv_wc_status status,
                                   uint32_t vendor_error = 0);
 std::optional<Classification> classifyAsyncEvent(ibv_event_type event);
 
-}  // namespace mooncake::adaptive_cc
+}  // namespace mooncake::adaptive_congestion_control
 
 #endif  // MOONCAKE_RDMA_ERROR_CLASSIFIER_H

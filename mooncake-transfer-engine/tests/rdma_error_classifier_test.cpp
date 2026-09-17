@@ -18,7 +18,7 @@
 
 #include "rdma_error_classifier.h"
 
-namespace mooncake::adaptive_cc {
+namespace mooncake::adaptive_congestion_control {
 namespace {
 
 void expectCompletion(ibv_wc_status status, OutcomeClass outcome,
@@ -81,4 +81,4 @@ TEST(RdmaErrorClassifierTest, IgnoresRecoveryAndTopologyEvents) {
 }
 
 }  // namespace
-}  // namespace mooncake::adaptive_cc
+}  // namespace mooncake::adaptive_congestion_control
