@@ -775,7 +775,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 known_records.insert(record.get());
             }
         }
-        for (const auto& owner : MasterServiceTestPeer::LocalSsdManager(*service).GetClientIds()) {
+        for (const auto& owner :
+             MasterServiceTestPeer::LocalSsdManager(*service).GetClientIds()) {
             ASSERT_TRUE(find_record(owner));
         }
 
