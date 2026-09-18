@@ -73,19 +73,22 @@ class MasterServiceTest : public ::testing::Test {
 
     tl::expected<RegionUnmountTxn, ErrorCode> PrepareUnmountSegmentForTest(
         MasterService& service, const UUID& segment_id, const UUID& client_id) {
-        auto access = MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        auto access =
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
         return access.PrepareUnmount(segment_id, client_id);
     }
 
     ErrorCode CommitUnmountSegmentForTest(MasterService& service,
                                           RegionUnmountTxn&& transaction) {
-        auto access = MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        auto access =
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
         return std::move(transaction).Commit(access);
     }
 
     uint64_t SegmentGenerationForTest(MasterService& service,
                                       const UUID& segment_id) {
-        auto access = MasterServiceTestPeer::SegmentPool(service).AcquireReadAccess();
+        auto access =
+            MasterServiceTestPeer::SegmentPool(service).AcquireReadAccess();
         const auto* region = access.Catalog().Find(segment_id);
         EXPECT_NE(region, nullptr);
         return region ? region->generation : 0;

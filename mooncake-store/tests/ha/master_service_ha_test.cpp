@@ -994,7 +994,8 @@ class MasterServiceHATest : public ::testing::Test {
     static void PrepareUnmountSegmentForTesting(MasterService& service,
                                                 const UUID& segment_id,
                                                 const UUID& client_id) {
-        auto segment_access = MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        auto segment_access =
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
         ASSERT_TRUE(
             segment_access.PrepareUnmount(segment_id, client_id).has_value());
     }
@@ -1036,7 +1037,8 @@ class MasterServiceHATest : public ::testing::Test {
 
     static int64_t GetLocalDiskUsedBytesForTesting(
         MasterService& service, const std::string& segment_name) {
-        auto client_id = MasterServiceTestPeer::SegmentPool(service).AcquireReadAccess()
+        auto client_id = MasterServiceTestPeer::SegmentPool(service)
+                             .AcquireReadAccess()
                              .Catalog()
                              .FindOwnerClientId(segment_name);
         if (!client_id) {

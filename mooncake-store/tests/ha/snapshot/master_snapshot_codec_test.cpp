@@ -39,14 +39,17 @@ class MasterSnapshotCodecTest : public ::testing::Test {
 
     // Assemble the codec state view through the shared test peer.
     static MasterSnapshotStateView MakeStateView(MasterService& service) {
-        return MasterSnapshotStateView(service, MasterServiceTestPeer::SegmentPool(service),
-                                       MasterServiceTestPeer::LocalSsdManager(service),
-                                       MasterServiceTestPeer::TaskManager(service));
+        return MasterSnapshotStateView(
+            service, MasterServiceTestPeer::SegmentPool(service),
+            MasterServiceTestPeer::LocalSsdManager(service),
+            MasterServiceTestPeer::TaskManager(service));
     }
 
     static int EncodeInForkWithPoolLocked(MasterService& service) {
-        std::unique_lock snapshot_lock(MasterServiceTestPeer::SnapshotMutex(service));
-        auto pool_lock = MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        std::unique_lock snapshot_lock(
+            MasterServiceTestPeer::SnapshotMutex(service));
+        auto pool_lock =
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
         const pid_t child = fork();
         if (child == 0) {
             alarm(5);
@@ -65,9 +68,12 @@ class MasterSnapshotCodecTest : public ::testing::Test {
 
     static std::shared_ptr<BufferAllocatorBase> RetireSegmentPool(
         MasterService& service, const UUID& segment_id) {
-        auto allocator =
-            MasterServiceTestPeer::SegmentPool(service).AcquireReadAccess().GetAllocator(segment_id);
-        MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess().Clear();
+        auto allocator = MasterServiceTestPeer::SegmentPool(service)
+                             .AcquireReadAccess()
+                             .GetAllocator(segment_id);
+        MasterServiceTestPeer::SegmentPool(service)
+            .AcquireWriteAccess()
+            .Clear();
         return allocator;
     }
 

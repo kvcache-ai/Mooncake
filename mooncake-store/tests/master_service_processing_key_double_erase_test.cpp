@@ -151,7 +151,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         //    invalidating the replica's memory handle (weak_ptr expires).
         //    No ClearInvalidHandles sweep here (see file header).
         {
-            auto segment_access = MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+            auto segment_access = MasterServiceTestPeer::SegmentPool(service)
+                                      .AcquireWriteAccess();
             if (!segment_access.PrepareUnmount(segment.id, client_id)
                      .has_value()) {
                 ::_exit(kExitUnmountFailed);

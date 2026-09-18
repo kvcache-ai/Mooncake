@@ -170,7 +170,8 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService* service, const UUID& segment_id, size_t size) {
         std::shared_ptr<BufferAllocatorBase> allocator;
         {
-            auto segment_access = MasterServiceTestPeer::SegmentPool(*service).AcquireReadAccess();
+            auto segment_access = MasterServiceTestPeer::SegmentPool(*service)
+                                      .AcquireReadAccess();
             allocator = segment_access.GetAllocator(segment_id);
         }
         if (!allocator) {
