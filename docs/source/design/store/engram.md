@@ -56,9 +56,8 @@ IDs need separate Store deployments or explicit removal before replacement.
 
 Python:
 
-- `EngramStore(layers, store=None)`
+- `EngramStore(layers, store_client=None, local_dir="")`
 - `populate(layer_id, embedding_buffers, config=ReplicateConfig())`
-- `bind_local(layer_id, embedding_buffers)`
 - `lookup_into(layer_id, row_ids, output)`
 - `remove_from_store(layer_id, force=False)`
 - `get_layer_ids()`
@@ -67,41 +66,54 @@ Python:
 - `get_num_heads(layer_id)`
 - `get_row_bytes(layer_id)`
 
-The Python `store` argument accepts the existing `MooncakeDistributedStore`
-wrapper, or `None` for metadata-only construction or local table binding.
+The Python `store_client` argument accepts the existing `MooncakeDistributedStore`
+wrapper. It is mutually exclusive with a nonempty `local_dir`. Omitting both
+keeps metadata accessible but does not provide a lookup backend.
 
 ### Local table mode
 
-Construct without a Store client and bind immutable, contiguous `uint8` tables
-before starting lookup workers:
+EngramStore owns the local tables and their mappings. Prepare the tables once,
+then construct a handle with the same directory in each serving process:
 
 ```python
-table = EngramStore({1: layer1})
-heads = [np.memmap(path, mode="r", dtype=np.uint8, shape=(rows, layer1.row_bytes))
-         for path, rows in zip(paths, layer1.table_vocab_sizes)]
-table.bind_local(1, heads)
+# Preparation process: inputs are per-head contiguous uint8 [N_h, row_bytes].
+table = EngramStore({1: layer1}, local_dir="/dev/shm/model-engram")
+table.populate(1, heads)
+del heads, table  # Published tables survive the preparation process.
+
+# Each serving rank: construction maps and prefaults already published tables.
+table = EngramStore({1: layer1}, local_dir="/dev/shm/model-engram")
 table.lookup_into(1, row_ids, output)
 ```
 
-This mode copies selected rows directly from CPU-addressable memory into output;
-it performs no Store metadata queries, registration, or network transfers. The
-Python binding retains the supplied list and arrays. Do not change that list,
-modify/resize the arrays, or truncate/unmap their backing files while bound.
-Binding a layer twice, binding with a Store client, and lookup of an unbound
-layer are rejected. C++ callers retain ownership of the bound memory.
+There is no explicit attach or external-buffer binding step. `populate` copies
+the inputs into owned shared mappings, so the caller may release or reuse the
+inputs after it returns. The implementation reuses Mooncake's `BufferHandle`
+for mapping lifetime management; it does not start a Store client or Transfer
+Engine. Lookup validates IDs and copies only the selected rows into output,
+without metadata queries, output registration, or network transfers.
 
-Same-host ranks can map the same immutable tmpfs files to share physical pages
-without RDMA. Each rank still owns its staging output. Merely placing data in
-another process on the same host does not make that process's pointers locally
-addressable. Use separate directories for separate model instances.
+Use a tmpfs directory for host-memory storage. Each layer has immutable per-head
+files and a versioned layout descriptor. A per-layer file lock serializes writers;
+a temporary layer directory is renamed into place only after all tables are
+complete. Duplicate population is rejected. A later writer can recover an
+interrupted, unpublished load. Layout and file sizes are checked when opening.
+Construction may precede population: querying an unpublished layer fails, while a
+later lookup automatically opens it after publication. Prepare all layers before
+starting inference; otherwise that first lookup also pays the mapping cost.
 
-For large memory-mapped tables, consider prefaulting the mappings at startup
-(for example, with Linux `MAP_POPULATE`). Resident file pages can still require
-per-process page-table faults on first access, delaying random row lookups.
+Ranks using the same directory share physical pages and each own their staging
+output. Read-only mappings use `MAP_POPULATE` at initialization to avoid sparse
+first-touch page-table faults. Destroying a handle unmaps only its own views;
+it does not delete the shared files. Keep published files immutable and remove
+the dedicated directory only after all serving processes have stopped. Use
+separate directories for separate model deployments. Publication coordinates
+local readers; it is not a crash-durable checkpoint format or a distributed
+replica/eviction protocol.
 
 C++:
 
-- constructor `EngramStore(const std::map<int, EngramStoreConfig>& layers, std::shared_ptr<PyClient>)`
+- constructor `EngramStore(const std::map<int, EngramStoreConfig>& layers, std::shared_ptr<PyClient>, const std::string& local_dir = "")`
 - `populate(...)`
 - `lookup_into(int layer_id, const int64_t* row_ids, int B, int L, void* output, size_t output_size)`
 - `remove_from_store(...)`
@@ -154,7 +166,8 @@ the dtype and layout when interpreting lookup results.
 
 ## Populate Flow
 
-Populate follows the existing Store write path:
+For local tables, populate follows the owned-copy and atomic publication flow
+above. For Store-backed tables, it follows the existing Store write path:
 
 1. validate that exactly one table is provided for each head
 2. validate that every table matches `[N_h, row_bytes]`
@@ -213,8 +226,8 @@ they do not silently mask regressions in the current implementation.
 
 ## Client Instances and Storage
 
-SGLang shares one EngramStore and one Store client across all Engram layers in
-each rank. Each layer still owns its fixed pinned output buffers for CUDA Graph.
+SGLang shares one EngramStore across all Engram layers in each rank, with one
+Store client in Store mode and no client in local mode. Each layer still owns its fixed pinned output buffers for CUDA Graph.
 Different ranks access the same backend keys; creating additional clients or
 EngramStore handles does not replicate table data. Storage replicas are controlled
 by the Store replication configuration used during upload.
