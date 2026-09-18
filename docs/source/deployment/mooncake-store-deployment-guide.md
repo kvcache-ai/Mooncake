@@ -1415,7 +1415,7 @@ participate (segment contributor and readers/writers). Peer processes must
 share a UID (`0600` objects) and a visible `/dev/shm` or hugetlbfs mount.
 After a crash, leftover hugetlbfs files continue to reserve hugepages until
 unlinked — remove only `mooncake_<dead-pid>_*` on the mount (see
-[SHM Transport](../getting_started/supported-protocols.md#shm-transport)).
+{ref}`SHM Transport <shm-transport>`).
 
 #### yalantinglibs Log Level
 
