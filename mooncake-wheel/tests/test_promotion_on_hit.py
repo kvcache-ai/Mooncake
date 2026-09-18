@@ -539,8 +539,7 @@ class BenchPromotionLatency(unittest.TestCase):
             post = _pcts(post_latencies_ms)
 
             print()
-            print(f"=== promotion latency comparison "
-                  f"(cold_key={cold_key}) ===")
+            print(f"=== promotion latency comparison " f"(cold_key={cold_key}) ===")
             print(
                 f"pre-promotion  (LOCAL_DISK via offload-RPC): "
                 f"n={len(pre_latencies_ms)}, "

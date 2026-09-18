@@ -13,7 +13,9 @@ import torch
 import torch.distributed as dist
 
 import mooncake._ep as native_ep
-import mooncake.pg  # Registers the Mooncake process-group backend for bootstrap.
+
+# Registers the Mooncake process-group backend for bootstrap.
+import mooncake.pg  # noqa: F401
 from mooncake.mooncake_ep_buffer import Buffer
 
 
@@ -51,9 +53,7 @@ def main() -> None:
     if buffer._use_fallback:
         raise RuntimeError("native-core benchmark requires the EP fast path")
 
-    x = torch.randn(
-        (args.tokens, args.hidden), dtype=torch.bfloat16, device="cuda"
-    )
+    x = torch.randn((args.tokens, args.hidden), dtype=torch.bfloat16, device="cuda")
     scores = torch.randn(
         (args.tokens, args.experts), dtype=torch.float32, device="cuda"
     )
@@ -69,9 +69,7 @@ def main() -> None:
         device="cuda",
     )
     packed_recv_x = torch.empty_like(expert_x)
-    packed_recv_count = torch.empty(
-        num_local_experts, dtype=torch.int32, device="cuda"
-    )
+    packed_recv_count = torch.empty(num_local_experts, dtype=torch.int32, device="cuda")
     packed_recv_src_info = torch.empty(
         (num_local_experts, recv_tokens), dtype=torch.int32, device="cuda"
     )

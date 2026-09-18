@@ -39,7 +39,9 @@ def _tp_allreduce_many_groups_worker(ctx: MooncakePGWorkerContext) -> None:
         group_ranks = list(tp_spec.ranks)
         values = []
         for iteration in range(3):
-            tensor = torch.tensor([ctx.rank + iteration + 1], dtype=torch.int32, device=device)
+            tensor = torch.tensor(
+                [ctx.rank + iteration + 1], dtype=torch.int32, device=device
+            )
             dist.all_reduce(tensor, group=tp_group, op=dist.ReduceOp.SUM)
             values.append(int(tensor.item()))
         ctx.record_result({"values": values, "group_ranks": group_ranks})
@@ -60,7 +62,9 @@ def _tp_allgather_many_groups_worker(ctx: MooncakePGWorkerContext) -> None:
         group_ranks = list(tp_spec.ranks)
         values = []
         for iteration in range(3):
-            local = torch.tensor([ctx.rank * 10 + iteration], dtype=torch.int32, device=device)
+            local = torch.tensor(
+                [ctx.rank * 10 + iteration], dtype=torch.int32, device=device
+            )
             gathered = torch.empty(len(group_ranks), dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(gathered, local, group=tp_group)
             values.append(gathered.tolist())
@@ -82,7 +86,9 @@ def _pp_send_recv_smoke_worker(ctx: MooncakePGWorkerContext) -> None:
             raise AssertionError(f"rank {ctx.rank} has no PP lane group")
 
         if len(lane_spec.ranks) != 2:
-            raise AssertionError(f"PP lane {lane_spec.name} is not 2-rank: {lane_spec.ranks}")
+            raise AssertionError(
+                f"PP lane {lane_spec.name} is not 2-rank: {lane_spec.ranks}"
+            )
         local_index = lane_spec.ranks.index(ctx.rank)
         peer_group_rank = 1 - local_index
         src, dst = lane_spec.ranks
@@ -93,7 +99,11 @@ def _pp_send_recv_smoke_worker(ctx: MooncakePGWorkerContext) -> None:
             dist.send(direct, group=lane_group, group_dst=peer_group_rank)
             batch = torch.tensor([src * 1000 + dst], dtype=torch.int32, device=device)
             requests = dist.batch_isend_irecv(
-                [dist.P2POp(dist.isend, batch, group=lane_group, group_peer=peer_group_rank)]
+                [
+                    dist.P2POp(
+                        dist.isend, batch, group=lane_group, group_peer=peer_group_rank
+                    )
+                ]
             )
             for request in requests:
                 request.wait()
@@ -104,7 +114,11 @@ def _pp_send_recv_smoke_worker(ctx: MooncakePGWorkerContext) -> None:
             dist.recv(direct, group=lane_group, group_src=peer_group_rank)
             batch = torch.empty(1, dtype=torch.int32, device=device)
             requests = dist.batch_isend_irecv(
-                [dist.P2POp(dist.irecv, batch, group=lane_group, group_peer=peer_group_rank)]
+                [
+                    dist.P2POp(
+                        dist.irecv, batch, group=lane_group, group_peer=peer_group_rank
+                    )
+                ]
             )
             for request in requests:
                 request.wait()
@@ -133,15 +147,25 @@ def _overlapping_group_collective_worker(ctx: MooncakePGWorkerContext) -> None:
 
         dp_root = int(dp_name.removeprefix("dp"))
         dp_tensor = torch.tensor(
-            [dp_root * 100 + 5 if ctx.rank == dp_root else -1], dtype=torch.int32, device=device
+            [dp_root * 100 + 5 if ctx.rank == dp_root else -1],
+            dtype=torch.int32,
+            device=device,
         )
         dist.broadcast(dp_tensor, src=dp_root, group=dp_group)
 
-        ctx.record_result({
-            "tp_value": int(tp_tensor.item()),
-            "dp_value": int(dp_tensor.item()),
-            "ep_group": list(next(spec.ranks for spec in topology.ordered_groups if spec.name == ep_name)),
-        })
+        ctx.record_result(
+            {
+                "tp_value": int(tp_tensor.item()),
+                "dp_value": int(dp_tensor.item()),
+                "ep_group": list(
+                    next(
+                        spec.ranks
+                        for spec in topology.ordered_groups
+                        if spec.name == ep_name
+                    )
+                ),
+            }
+        )
     finally:
         destroy_named_groups(groups)
 
@@ -155,7 +179,9 @@ class _InferenceCollectivesMixin:
 
         for row in rows:
             ranks = row["group_ranks"]
-            expected = [sum(peer + iteration + 1 for peer in ranks) for iteration in range(3)]
+            expected = [
+                sum(peer + iteration + 1 for peer in ranks) for iteration in range(3)
+            ]
             self.assertEqual(row["values"], expected)
 
     def test_tp_allgather_many_groups(self) -> None:
@@ -164,7 +190,9 @@ class _InferenceCollectivesMixin:
 
         for row in rows:
             ranks = row["group_ranks"]
-            expected = [[peer * 10 + iteration for peer in ranks] for iteration in range(3)]
+            expected = [
+                [peer * 10 + iteration for peer in ranks] for iteration in range(3)
+            ]
             self.assertEqual(row["values"], expected)
 
     def test_overlapping_group_collective_traffic(self) -> None:

@@ -8,6 +8,6 @@ from .interface import Storage
 from .disk import DiskHashTable
 
 __all__ = [
-    'Storage',
-    'DiskHashTable',
+    "Storage",
+    "DiskHashTable",
 ]

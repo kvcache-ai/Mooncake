@@ -18,9 +18,7 @@ RankPair = tuple[int, int]
 def _build_preload(output: Path) -> None:
     source = Path(__file__).with_name("transfer_fault_preload.cpp")
     repository_root = Path(__file__).resolve().parents[2]
-    transfer_engine_include = (
-        repository_root / "mooncake-transfer-engine" / "include"
-    )
+    transfer_engine_include = repository_root / "mooncake-transfer-engine" / "include"
     process_group_include = repository_root / "mooncake-pg" / "include"
     command = [
         os.environ.get("CXX", "c++"),
@@ -108,9 +106,7 @@ counter()
         reason = result.stderr.strip() or result.stdout.strip()
         if not reason:
             reason = f"exit code {result.returncode}"
-        raise unittest.SkipTest(
-            f"transfer fault injection is unavailable: {reason}"
-        )
+        raise unittest.SkipTest(f"transfer fault injection is unavailable: {reason}")
 
 
 @contextmanager
@@ -144,12 +140,9 @@ class TransferFault:
         is_available.restype = ctypes.c_int
         if not is_available():
             raise RuntimeError(
-                "preloaded transfer fault shim cannot resolve its "
-                "required symbols"
+                "preloaded transfer fault shim cannot resolve its " "required symbols"
             )
-        self._clear_failed_targets = (
-            self._library.mooncakePgTestClearFailedTargets
-        )
+        self._clear_failed_targets = self._library.mooncakePgTestClearFailedTargets
         self._clear_failed_targets.argtypes = []
         self._clear_failed_targets.restype = None
         self._add_failed_target = self._library.mooncakePgTestAddFailedTarget
@@ -180,20 +173,12 @@ class TransferFault:
         if not normalized:
             raise ValueError("at least one failed link is required")
         for source_rank, target_rank in normalized:
-            if (
-                source_rank < 0
-                or target_rank < 0
-                or source_rank == target_rank
-            ):
-                raise ValueError(
-                    "failed links require distinct, non-negative ranks"
-                )
+            if source_rank < 0 or target_rank < 0 or source_rank == target_rank:
+                raise ValueError("failed links require distinct, non-negative ranks")
         return normalized
 
     @contextmanager
-    def failing_links(
-        self, links: Iterable[RankPair]
-    ) -> Generator[None, None, None]:
+    def failing_links(self, links: Iterable[RankPair]) -> Generator[None, None, None]:
         """Fail directed links whose source is this worker's rank."""
         if self._active:
             raise RuntimeError("fault scopes cannot be nested")

@@ -30,13 +30,11 @@ import json
 import signal
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="KV Cache Prefix Transfer Benchmark"
-    )
+    parser = argparse.ArgumentParser(description="KV Cache Prefix Transfer Benchmark")
     parser.add_argument(
         "--mode",
         choices=["target", "initiator"],
@@ -137,8 +135,9 @@ def allocate_cpu_memory(size_bytes):
     flags = MAP_PRIVATE | MAP_ANONYMOUS
 
     # Try hugepages first (recommended for large EFA registrations)
-    ptr = libc.mmap(None, size_bytes, PROT_READ | PROT_WRITE,
-                    flags | MAP_HUGETLB, -1, 0)
+    ptr = libc.mmap(
+        None, size_bytes, PROT_READ | PROT_WRITE, flags | MAP_HUGETLB, -1, 0
+    )
     if ptr and ptr != MAP_FAILED:
         print(f"  Allocated {size_bytes / 1e9:.1f} GB with 2MB hugepages")
         return ptr, size_bytes, True
@@ -147,8 +146,7 @@ def allocate_cpu_memory(size_bytes):
     ptr = libc.mmap(None, size_bytes, PROT_READ | PROT_WRITE, flags, -1, 0)
     if not ptr or ptr == MAP_FAILED:
         raise RuntimeError(
-            f"mmap failed for {size_bytes} bytes: "
-            f"errno={ctypes.get_errno()}"
+            f"mmap failed for {size_bytes} bytes: " f"errno={ctypes.get_errno()}"
         )
     print(
         f"  Allocated {size_bytes / 1e9:.1f} GB with 4KB pages "
@@ -173,7 +171,7 @@ def run_target(args):
     """Run as target node: allocate KV cache pool and wait."""
     from mooncake.engine import TransferEngine
 
-    print(f"=== Target Node ===")
+    print("=== Target Node ===")
     print(f"Pool size: {args.pool_size_gb} GB")
     print(f"Protocol: {args.protocol}")
 
@@ -198,7 +196,7 @@ def run_target(args):
     else:
         pool_addr, _, _ = allocate_cpu_memory(pool_bytes)
 
-    print(f"Registering memory with transfer engine...")
+    print("Registering memory with transfer engine...")
     t0 = time.time()
     ret = engine.register_memory(pool_addr, pool_bytes)
     reg_time = time.time() - t0
@@ -223,7 +221,7 @@ def run_initiator(args):
     """Run as initiator node: pull prefix KV cache and measure performance."""
     from mooncake.engine import TransferEngine
 
-    print(f"=== Initiator Node ===")
+    print("=== Initiator Node ===")
     print(f"Target: {args.target_server_name}")
     print(f"Pool size: {args.pool_size_gb} GB")
     print(f"Protocol: {args.protocol}")
@@ -234,11 +232,9 @@ def run_initiator(args):
         raise RuntimeError("--target_server_name required in initiator mode")
 
     prefix_tokens_list = [int(x) for x in args.prefix_tokens.split(",")]
-    transfer_sizes = [
-        tokens * args.kv_bytes_per_token for tokens in prefix_tokens_list
-    ]
+    transfer_sizes = [tokens * args.kv_bytes_per_token for tokens in prefix_tokens_list]
 
-    print(f"\nTest matrix:")
+    print("\nTest matrix:")
     for tokens, size in zip(prefix_tokens_list, transfer_sizes):
         print(f"  {tokens:>6} tokens -> {size / 1e6:.1f} MB transfer")
 
@@ -274,8 +270,7 @@ def run_initiator(args):
     remote_addr = engine.get_first_buffer_address(args.target_server_name)
     if remote_addr == 0:
         raise RuntimeError(
-            "Cannot get target buffer address. "
-            "Is the target running and registered?"
+            "Cannot get target buffer address. " "Is the target running and registered?"
         )
     print(f"  Remote buffer at 0x{remote_addr:x}")
 
@@ -295,8 +290,7 @@ def run_initiator(args):
     def do_transfer(local_addr, remote_addr_with_offset, size):
         """Single transfer_sync_read call, suitable for thread pool."""
         return engine.transfer_sync_read(
-            args.target_server_name, local_addr,
-            remote_addr_with_offset, size
+            args.target_server_name, local_addr, remote_addr_with_offset, size
         )
 
     def threaded_transfer(local_base, remote_base, total_size, pool):
@@ -313,8 +307,7 @@ def run_initiator(args):
             off = t * chunk
             sz = chunk if t < num_threads - 1 else (total_size - off)
             futures.append(
-                pool.submit(do_transfer, local_base + off,
-                            remote_base + off, sz)
+                pool.submit(do_transfer, local_base + off, remote_base + off, sz)
             )
         return max(f.result() for f in futures)
 
@@ -412,7 +405,9 @@ def run_initiator(args):
 
     # Summary
     if results:
-        print(f"\n=== Summary (pool_size={args.pool_size_gb}GB, threads={num_threads}) ===")
+        print(
+            f"\n=== Summary (pool_size={args.pool_size_gb}GB, threads={num_threads}) ==="
+        )
         print(json.dumps(results, indent=2))
 
         # Save results

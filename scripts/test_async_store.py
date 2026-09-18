@@ -27,15 +27,17 @@ GLOBAL_CONFIG = None
 
 DEFAULT_MOONCAKE_CONFIG_PATH_ENV = "MOONCAKE_CONFIG_PATH"
 DEFAULT_GLOBAL_SEGMENT_SIZE = 16 * 1024 * 1024 * 1024  # 16 GiB
-DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024    # 8 GB
+DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024  # 8 GB
 DEFAULT_MASTER_METRICS_PORT = 9003
 DEFAULT_CHECK_SERVER = False
+
 
 def verify_tensor_equality(original, received, rtol=0, atol=0, verbose=True):
     """
     Utility to compare two tensors (CPU/GPU/Numpy).
     Identical to the synchronous version.
     """
+
     def to_numpy(x):
         if isinstance(x, torch.Tensor):
             if x.is_cuda:
@@ -56,12 +58,16 @@ def verify_tensor_equality(original, received, rtol=0, atol=0, verbose=True):
 
     if orig_np.shape != recv_np.shape:
         if verbose:
-            print(f"❌ Shape mismatch: original {orig_np.shape} vs received {recv_np.shape}")
+            print(
+                f"❌ Shape mismatch: original {orig_np.shape} vs received {recv_np.shape}"
+            )
         return False
 
     if orig_np.dtype != recv_np.dtype:
         if verbose:
-            print(f"❌ Dtype mismatch: original {orig_np.dtype} vs received {recv_np.dtype}")
+            print(
+                f"❌ Dtype mismatch: original {orig_np.dtype} vs received {recv_np.dtype}"
+            )
         return False
 
     if np.array_equal(orig_np, recv_np):
@@ -80,8 +86,10 @@ def verify_tensor_equality(original, received, rtol=0, atol=0, verbose=True):
                 print(f"   Received: {recv_val}")
         return False
 
+
 def parse_global_segment_size(value) -> int:
-    if isinstance(value, int): return value
+    if isinstance(value, int):
+        return value
     if isinstance(value, str):
         s = value.strip().lower()
         if s.endswith("gb"):
@@ -97,18 +105,23 @@ def generate_tensors(num_tensors, size_mb):
     dim = int(np.sqrt(num_elements))
     dim = (dim // 8) * 8
 
-    tensors = [torch.randn(dim, dim, dtype=torch.float32).contiguous() for _ in range(num_tensors)]
+    tensors = [
+        torch.randn(dim, dim, dtype=torch.float32).contiguous()
+        for _ in range(num_tensors)
+    ]
     keys = [f"test_tensor_{i}_{int(time.time()*1000)}" for i in range(num_tensors)]
     return keys, tensors
+
 
 # ==========================================
 #  Module Level Setup/Teardown
 # ==========================================
 
+
 def setUpModule():
     """
     Initialize the Async wrapper globally.
-    Note: We invoke setup() synchronously via asyncio.run() to ensure C++ client is ready 
+    Note: We invoke setup() synchronously via asyncio.run() to ensure C++ client is ready
     before any tests run. This mimics the sync script's behavior.
     """
     global GLOBAL_STORE, GLOBAL_CONFIG
@@ -121,7 +134,9 @@ def setUpModule():
         # Increase max_workers to simulate high async concurrency
         GLOBAL_STORE = MooncakeDistributedStoreAsync()
 
-        print(f"[{os.getpid()}] (Async) Connecting to Mooncake Master at {GLOBAL_CONFIG.master_server_address}...")
+        print(
+            f"[{os.getpid()}] (Async) Connecting to Mooncake Master at {GLOBAL_CONFIG.master_server_address}..."
+        )
 
         def _do_setup():
             return GLOBAL_STORE.setup(
@@ -146,6 +161,7 @@ def setUpModule():
         print(f"❌ Failed to establish global store connection: {e}")
         sys.exit(1)
 
+
 def tearDownModule():
     global GLOBAL_STORE
     if GLOBAL_STORE:
@@ -157,9 +173,11 @@ def tearDownModule():
         finally:
             GLOBAL_STORE = None
 
+
 # ==========================================
 #  Base Test Class (Async)
 # ==========================================
+
 
 class MooncakeAsyncTestBase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -176,9 +194,11 @@ class MooncakeAsyncTestBase(unittest.IsolatedAsyncioTestCase):
         # For now, we assume remove_all wraps C++ synchronous logic nicely in a thread.
         await self.store.async_remove_all()
 
+
 # ==========================================
 #  Basic Bytes I/O & Auxiliary Tests
 # ==========================================
+
 
 class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
     async def test_01_bytes_put_get(self):
@@ -201,7 +221,7 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
         count = 10
         keys = [f"test_bytes_batch_{i}" for i in range(count)]
         # Generate different length values
-        values = [f"value_{i}_{'x'*i}".encode('utf-8') for i in range(count)]
+        values = [f"value_{i}_{'x'*i}".encode("utf-8") for i in range(count)]
 
         # 1. Batch Put
         rcs = await self.store.async_put_batch(keys, values)
@@ -287,7 +307,7 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
     async def test_07_large_bytes_io(self):
         """Test larger bytes payload (non-tensor path)."""
         key = "test_large_bytes"
-        size = 10 * 1024 * 1024 # 10MB
+        size = 10 * 1024 * 1024  # 10MB
         # Create random bytes
         data = os.urandom(size)
 
@@ -298,9 +318,11 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
         self.assertEqual(len(retrieved), size)
         self.assertEqual(retrieved, data)
 
+
 # ==========================================
 #  Tensor Functional Tests
 # ==========================================
+
 
 class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
     async def test_01_basic_put_get(self):
@@ -329,7 +351,9 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
         target_tensor = tensors[0]
 
         # 1. Put with TP
-        rc = await self.store.async_put_tensor_with_tp(key, target_tensor, tp_size=tp_size, split_dim=split_dim)
+        rc = await self.store.async_put_tensor_with_tp(
+            key, target_tensor, tp_size=tp_size, split_dim=split_dim
+        )
         self.assertEqual(rc, 0, "put_tensor_with_tp failed")
 
         # 2. Verify existence of shards
@@ -344,16 +368,25 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
         # Launch all gets in parallel
         tasks = []
         for rank in range(tp_size):
-            tasks.append(self.store.async_get_tensor_with_tp(key, tp_rank=rank, tp_size=tp_size, split_dim=split_dim))
+            tasks.append(
+                self.store.async_get_tensor_with_tp(
+                    key, tp_rank=rank, tp_size=tp_size, split_dim=split_dim
+                )
+            )
 
         slices = await asyncio.gather(*tasks)
 
         for rank, t_slice in enumerate(slices):
             self.assertIsNotNone(t_slice, f"Slice for rank {rank} is None")
-            self.assertTrue(torch.equal(t_slice, expected_chunks[rank]), f"Data mismatch for rank {rank}")
+            self.assertTrue(
+                torch.equal(t_slice, expected_chunks[rank]),
+                f"Data mismatch for rank {rank}",
+            )
 
         reconstructed = torch.cat(slices, dim=split_dim)
-        self.assertTrue(torch.equal(reconstructed, target_tensor), "Reconstruction mismatch")
+        self.assertTrue(
+            torch.equal(reconstructed, target_tensor), "Reconstruction mismatch"
+        )
 
     async def test_03_tp_batch(self):
         tp_size = 2
@@ -362,15 +395,23 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
         keys, tensors = generate_tensors(num_tensors, 8)
 
         # 1. Batch Put with TP
-        results = await self.store.async_batch_put_tensor_with_tp(keys, tensors, tp_size=tp_size, split_dim=split_dim)
-        self.assertTrue(all(r == 0 for r in results), f"Batch put failed. Results: {results}")
+        results = await self.store.async_batch_put_tensor_with_tp(
+            keys, tensors, tp_size=tp_size, split_dim=split_dim
+        )
+        self.assertTrue(
+            all(r == 0 for r in results), f"Batch put failed. Results: {results}"
+        )
 
         # 2. Batch Get per Rank (Concurrently fetch both ranks)
         tasks = []
         for rank in range(tp_size):
-            tasks.append(self.store.async_batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size))
+            tasks.append(
+                self.store.async_batch_get_tensor_with_tp(
+                    keys, tp_rank=rank, tp_size=tp_size
+                )
+            )
 
-        all_shards = await asyncio.gather(*tasks) # List of lists
+        all_shards = await asyncio.gather(*tasks)  # List of lists
 
         # 3. Verify & Reconstruct
         for i in range(num_tensors):
@@ -380,8 +421,10 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
 
             for rank in range(tp_size):
                 shard = all_shards[rank][i]
-                self.assertTrue(torch.equal(shard, expected_chunks[rank]),
-                                f"Tensor {i} Rank {rank} data mismatch")
+                self.assertTrue(
+                    torch.equal(shard, expected_chunks[rank]),
+                    f"Tensor {i} Rank {rank} data mismatch",
+                )
                 reconstruction_parts.append(shard)
 
             recon = torch.cat(reconstruction_parts, dim=split_dim)
@@ -391,13 +434,19 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
         input_tensor = torch.arange(12).view(3, 4)
         tp_size = 2
 
-        await self.store.async_batch_put_tensor_with_tp(['key'], [input_tensor], tp_size=tp_size, split_dim=1)
+        await self.store.async_batch_put_tensor_with_tp(
+            ["key"], [input_tensor], tp_size=tp_size, split_dim=1
+        )
         chunked_tensors = input_tensor.chunk(chunks=2, dim=1)
 
         # Parallel fetch
         t0, t1 = await asyncio.gather(
-            self.store.async_batch_get_tensor_with_tp(['key'], tp_rank=0, tp_size=tp_size),
-            self.store.async_batch_get_tensor_with_tp(['key'], tp_rank=1, tp_size=tp_size)
+            self.store.async_batch_get_tensor_with_tp(
+                ["key"], tp_rank=0, tp_size=tp_size
+            ),
+            self.store.async_batch_get_tensor_with_tp(
+                ["key"], tp_rank=1, tp_size=tp_size
+            ),
         )
         tmp_tensor_0 = t0[0]
         tmp_tensor_1 = t1[0]
@@ -420,9 +469,11 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
 
         # Parallel get_into
         t2_task = self.store.async_batch_get_tensor_with_tp_into(
-            ['key'], [buffer_ptr_2], [buffer_spacing], tp_rank=0, tp_size=tp_size)
+            ["key"], [buffer_ptr_2], [buffer_spacing], tp_rank=0, tp_size=tp_size
+        )
         t3_task = self.store.async_batch_get_tensor_with_tp_into(
-            ['key'], [buffer_ptr_3], [buffer_spacing], tp_rank=1, tp_size=tp_size)
+            ["key"], [buffer_ptr_3], [buffer_spacing], tp_rank=1, tp_size=tp_size
+        )
 
         t2_res, t3_res = await asyncio.gather(t2_task, t3_task)
         tmp_tensor_2 = t2_res[0]
@@ -447,7 +498,9 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
         rc = await self.store.async_put_tensor(key, tensor)
         self.assertEqual(rc, 0)
 
-        retrieved = await self.store.async_get_tensor_into(key, large_buffer_ptr, total_buffer_size)
+        retrieved = await self.store.async_get_tensor_into(
+            key, large_buffer_ptr, total_buffer_size
+        )
         self.assertIsNotNone(retrieved)
         self.assertTrue(torch.equal(tensor, retrieved))
 
@@ -475,7 +528,9 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
         results = await self.store.async_batch_put_tensor(keys, tensors)
         self.assertTrue(all(r == 0 for r in results))
 
-        res = await self.store.async_batch_get_tensor_into(keys, buffer_ptrs, buffer_sizes)
+        res = await self.store.async_batch_get_tensor_into(
+            keys, buffer_ptrs, buffer_sizes
+        )
 
         self.assertEqual(len(res), len(tensors))
         for j in range(batch_size):
@@ -489,7 +544,9 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
         key = "get_into_with_tp_test"
         tensor = torch.randn(1024, 1024, dtype=torch.float32)
 
-        result = await self.store.async_put_tensor_with_tp(key, tensor, tp_size=tp_size, split_dim=split_dim)
+        result = await self.store.async_put_tensor_with_tp(
+            key, tensor, tp_size=tp_size, split_dim=split_dim
+        )
         self.assertEqual(result, 0)
 
         all_shards = []
@@ -516,7 +573,7 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
 
         for _, shard, buf, ptr in results:
             all_shards.append(shard)
-            registered_buffers.append((buf, ptr)) # Keep buf alive
+            registered_buffers.append((buf, ptr))  # Keep buf alive
 
         # Validate
         original = tensor
@@ -540,7 +597,9 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
         num_tensors = 4
         keys, tensors = generate_tensors(num_tensors, 8)
 
-        results = await self.store.async_batch_put_tensor_with_tp(keys, tensors, tp_size=tp_size, split_dim=split_dim)
+        results = await self.store.async_batch_put_tensor_with_tp(
+            keys, tensors, tp_size=tp_size, split_dim=split_dim
+        )
         self.assertTrue(all(r == 0 for r in results))
 
         async def _fetch_batch_rank(rank):
@@ -551,7 +610,7 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
             l_buf = (ctypes.c_ubyte * total_size)()
             l_ptr = ctypes.addressof(l_buf)
 
-            ptrs = [l_ptr + i*spacing for i in range(batch_size)]
+            ptrs = [l_ptr + i * spacing for i in range(batch_size)]
             sizes = [spacing] * batch_size
 
             await self.store.async_register_buffer(l_ptr, total_size)
@@ -586,8 +645,12 @@ class TestMooncakeTensorFunctional(MooncakeAsyncTestBase):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Async Mooncake Store Tests")
-    parser.add_argument("--mode", type=str, default="all", choices=["all", "Tensorfunc", "Basicfunc"])
-    parser.add_argument("--threads", type=int, default=8, help="Number of concurrent tasks")
+    parser.add_argument(
+        "--mode", type=str, default="all", choices=["all", "Tensorfunc", "Basicfunc"]
+    )
+    parser.add_argument(
+        "--threads", type=int, default=8, help="Number of concurrent tasks"
+    )
     parser.add_argument("--count", type=int, default=800, help="Total items")
     parser.add_argument("--size_mb", type=float, default=0.5, help="Tensor MB")
 
