@@ -191,6 +191,53 @@ mooncake_master \
 
 ---
 
+### Batch OpLog Snapshot Metrics
+
+The master Prometheus endpoint exposes `ha_snapshot_*` metrics for
+`enable_oplog_snapshot`. They are available without the optional OpLog performance
+metrics build flag. Updates use existing scheduler, reader, and maintenance
+observations; scraping does not read etcd or the object store.
+
+All names in the table have the `ha_snapshot_` prefix:
+
+| Metric suffix | Meaning |
+| --- | --- |
+| `enabled` | Whether the runtime is configured for batch snapshots; legacy mode is 0. |
+| `active` | `enabled` and standby state is connecting, syncing, watching, recovering, or reconnecting. Filter snapshot freshness/capacity alerts on this gauge; it is 0 during promotion, after stop, and after fatal failure. Historical observations and in-flight operation counters remain available. |
+| `latest_present`, `fallback_present`, `count` | Decodable pointers observed locally (0–2); not proof that all referenced artifacts remain intact. |
+| `latest_age_seconds`, `fallback_age_seconds` | Time since the observed descriptor's creation, computed at scrape time. Missing pointers and future timestamps report 0; check `*_present` to distinguish absence. |
+| `bytes`, `chunk_bytes`, `chunk_count` | Size/count of the last fully verified upload or successful snapshot restore. Total bytes include segments, chunks, manifest, and descriptor; they do not measure the whole bucket or imply publication success. |
+| `capture_pause_us` | Last completed pause of standby apply for capture, including chunk encoding/upload while capture is held. |
+| `suffix_batches` | Applied batches in the most recent bootstrap suffix replay attempt. |
+| `catch_up_target_batch`, `catch_up_target_sequence` | Durable cursor observed when capture was released; zero after local apply reaches it. |
+| `applied_batch`, `latest_batch`, `fallback_batch` | Local applied cursor and last observed pointer cursors; compare with the catch-up target and durable batch. |
+| `durable_batch`, `compaction_floor`, `candidate_floor` | Last observed durable batch, reader-visible retention floor, and latest pruning candidate. The floor updates immediately after its CAS, before batch deletion. |
+| `uncompacted_batches` | `max(durable_batch - compaction_floor, 0)`: the logical retained suffix, not a physical etcd key count or database size. Failed deletion can retain additional keys below the floor. |
+| `floor_advances_total`, `lease_lost_total` | Successful floor advances and acquired maintenance leases observed lost before release. A failed publish CAS alone does not prove lease loss. |
+| `gc_orphan_prefixes`, `gc_deleted_prefixes` | Unprotected attempt prefixes found by the last completed GC listing, and how many that sweep deleted. A failure before listing leaves the previous observation. |
+| `operations_total{operation}`, `errors_total{operation}`, `duration_us_total{operation}` | Completed calls, failed calls (including exceptions), and total elapsed microseconds. Operations are `schedule`, `upload`, `bootstrap`, `replay`, `publish`, `gc`, `prune`, and `rebootstrap`. Scheduling decisions past the interval/lifecycle gates and no-op pruning calls are included in completed calls; inspect skip reasons and floor advances for its effect. |
+| `skip_reason{reason}`, `skips_total{reason}` | One-hot most recent skip reason and cumulative skipped decisions. Fixed reasons are `none`, `disabled`, `interval`, `in_flight`, `stopped`, `promotion`, `no_new_batch`, `catch_up`, `lease_busy`, `capture_unavailable`, `no_fallback`, `invalid_pair`, and `floor_ahead`. |
+
+Upload time includes encoding, uploads, and verification. Bootstrap time includes
+restore and suffix replay; rebootstrap also includes the floor recheck and state
+replacement. These durations overlap and should not be added together. For
+example, mean upload duration over five minutes in seconds is:
+
+```promql
+rate(ha_snapshot_duration_us_total{operation="upload"}[5m])
+/ rate(ha_snapshot_operations_total{operation="upload"}[5m]) / 1e6
+```
+
+Current gauges reset for a new standby runtime. Event counters remain cumulative
+for the process; in legacy mode they stop increasing and gauges report
+`enabled=0`, `skip_reason{reason="disabled"}=1`, and zero capacity values. Historical
+counters do not indicate activity in the current mode. Publication, GC, and pruning
+have independent error counters: a GC failure does not turn a committed publication
+into a failure. Pointer observations may lag changes made by another standby until
+the next scheduler/bootstrap read.
+
+---
+
 ### Tiered Storage with SSD Offload — Cost-Effective Capacity
 
 Extends the cache pool from DRAM to SSD while keeping normal reads and writes on the distributed memory path. With `--enable_offload=true`, completed memory writes are queued for asynchronous SSD persistence through the master control plane. Set `--offload_on_evict=true` to defer that SSD write until the memory eviction path selects an object for reclamation. When `--promotion_on_hit=true`, SSD-only objects can be promoted back to DRAM after repeated reads; admission is gated by `--promotion_admission_threshold`.

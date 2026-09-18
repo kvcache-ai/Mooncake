@@ -1,5 +1,6 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.h"
 
+#include <algorithm>
 #include <charconv>
 #include <utility>
 
@@ -9,6 +10,8 @@
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
+
+#include "ha_metric_manager.h"
 
 namespace mooncake {
 namespace {
@@ -79,6 +82,8 @@ BatchOpLogPruningCoordinator::BatchOpLogPruningCoordinator(
 ErrorCode BatchOpLogPruningCoordinator::Run(
     const SnapshotMaintenanceLease& lease,
     const std::function<bool()>& cancelled) {
+    HAMetricManager::SnapshotOperationTimer metric_timer(
+        HAMetricManager::SnapshotOperation::Prune);
     const auto latest_key = ha::BuildBatchOpLogSnapshotLatestKey(cluster_id_);
     const auto fallback_key =
         ha::BuildBatchOpLogSnapshotFallbackKey(cluster_id_);
@@ -94,12 +99,18 @@ ErrorCode BatchOpLogPruningCoordinator::Run(
     };
     if (stopped()) return ErrorCode::ETCD_TRANSACTION_FAIL;
 
+    HAMetricManager::instance().update_snapshot_runtime(
+        [](auto& metrics) { metrics.candidate_floor = 0; });
     std::string latest, fallback, old_floor;
     auto error = backend_.Get(latest_key, latest);
     if (error != ErrorCode::OK) return error;
     error = backend_.Get(fallback_key, fallback);
     // The first publication has no redundant recovery baseline yet.
-    if (error == ErrorCode::ETCD_KEY_NOT_EXIST) return ErrorCode::OK;
+    if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        HAMetricManager::instance().record_snapshot_skip(
+            HAMetricManager::SnapshotSkipReason::NoFallback);
+        return metric_timer.Success(ErrorCode::OK);
+    }
     if (error != ErrorCode::OK) return error;
     const auto latest_descriptor =
         ha::DecodeBatchOpLogSnapshotDescriptor(latest);
@@ -109,20 +120,33 @@ ErrorCode BatchOpLogPruningCoordinator::Run(
         return ErrorCode::INTERNAL_ERROR;
     const uint64_t candidate = fallback_descriptor->last_included_batch_id;
     if (latest_descriptor->snapshot_id == fallback_descriptor->snapshot_id ||
-        latest_descriptor->last_included_batch_id <= candidate)
-        return ErrorCode::OK;
+        latest_descriptor->last_included_batch_id <= candidate) {
+        HAMetricManager::instance().record_snapshot_skip(
+            HAMetricManager::SnapshotSkipReason::InvalidPair);
+        return metric_timer.Success(ErrorCode::OK);
+    }
 
+    HAMetricManager::instance().update_snapshot_runtime(
+        [&](auto& metrics) { metrics.candidate_floor = candidate; });
+    uint64_t floor = 0;
     error = backend_.Get(floor_key, old_floor);
     const bool floor_exists = error == ErrorCode::OK;
     if (!floor_exists && error != ErrorCode::ETCD_KEY_NOT_EXIST) return error;
     if (floor_exists) {
-        uint64_t floor = 0;
         const auto parsed = std::from_chars(
             old_floor.data(), old_floor.data() + old_floor.size(), floor);
         if (parsed.ec != std::errc() ||
             parsed.ptr != old_floor.data() + old_floor.size())
             return ErrorCode::INTERNAL_ERROR;
-        if (candidate < floor) return ErrorCode::OK;
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            metrics.compaction_floor =
+                std::max(metrics.compaction_floor, floor);
+        });
+        if (candidate < floor) {
+            HAMetricManager::instance().record_snapshot_skip(
+                HAMetricManager::SnapshotSkipReason::FloorAhead);
+            return metric_timer.Success(ErrorCode::OK);
+        }
     }
 
     if (!ValidateSnapshot(object_store_, snapshot_root_, latest,
@@ -153,12 +177,19 @@ ErrorCode BatchOpLogPruningCoordinator::Run(
     txn.puts.push_back({.key = floor_key, .value = std::to_string(candidate)});
     error = backend_.Txn(txn);
     if (error != ErrorCode::OK) return error;
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.compaction_floor =
+            std::max(metrics.compaction_floor, candidate);
+        metrics.floor_advances_total += candidate > floor;
+    });
     // Even if the lease is lost now, this range has already been advertised to
     // readers. A crash or failed delete leaves the floor in place; a later
     // successful publication can safely repeat this bounded deletion.
-    if (stopped()) return ErrorCode::OK;
-    return OpLogBatchStorage(cluster_id_, backend_)
-        .DeleteBatchesThrough(candidate);
+    if (stopped()) return metric_timer.Success(ErrorCode::OK);
+    const auto delete_error = OpLogBatchStorage(cluster_id_, backend_)
+                                  .DeleteBatchesThrough(candidate);
+    metric_timer.error = static_cast<int64_t>(delete_error);
+    return delete_error;
 }
 
 }  // namespace mooncake
