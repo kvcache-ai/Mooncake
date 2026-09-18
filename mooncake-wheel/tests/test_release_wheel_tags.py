@@ -1,8 +1,8 @@
 """Guard the glibc floor of CI and release wheels.
 
 Distributable wheels must take their manylinux platform tag from a pinned
-container image, never from the GitHub runner. ``scripts/build_wheel.sh`` derives
-``PLATFORM_TAG`` from the *build host's* glibc (``detect_glibc_version``), so a
+container image, never from the GitHub runner. ``scripts/repair_wheel.sh`` derives
+``PLATFORM_TAG`` from the *build host's* glibc (``getconf GNU_LIBC_VERSION``), so a
 job running on a bare runner silently re-tags itself whenever GitHub bumps the
 runner image. That is not hypothetical: the published aarch64 floor moved from
 ``manylinux_2_35`` (0.3.9) to ``manylinux_2_39`` (0.3.10) with no code change,
@@ -36,10 +36,6 @@ ARCH_CONTAINER = {
     "aarch64": re.compile(r"^pytorch/manylinuxaarch64-builder:cuda\d+\.\d+$"),
     "x86_64": re.compile(r"^pytorch/manylinux2_28-builder:cuda\d+\.\d+$"),
 }
-
-
-def _runner_arch(runner: str) -> str:
-    return "aarch64" if runner.endswith("-arm") else "x86_64"
 
 
 def _find_workflows_dir() -> Path | None:
@@ -91,27 +87,28 @@ def test_shared_build_workflow_still_has_callers() -> None:
 
 
 @pytest.mark.parametrize("with_block", BUILD_JOBS)
-def test_wheel_build_pins_glibc_floor_to_a_container(with_block: dict) -> None:
-    runner = str(with_block.get("runner", ""))
-    container = with_block.get("container", "")
-    arch = _runner_arch(runner)
-    expected = ARCH_CONTAINER[arch]
+def test_callers_do_not_override_the_build_environment(with_block: dict) -> None:
+    # Architecture/variant are public inputs now; runner/container/toolkit
+    # selection belongs to the shared workflow rather than its callers.
+    assert not {"runner", "container", "cuda"}.intersection(with_block)
 
-    assert container, (
-        "job builds wheels on a bare runner, so its manylinux tag "
-        "follows the runner's glibc and drifts when GitHub bumps the image; "
-        f"set container to a {expected.pattern} image"
+
+def test_shared_workflow_pins_glibc_floor_to_architecture() -> None:
+    workflow = yaml.safe_load((WORKFLOWS_DIR / SHARED_BUILD_WORKFLOW).read_text())
+    job = workflow["jobs"]["build"]
+    assert job["runs-on"] == (
+        "${{ inputs.architecture == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}"
     )
-    assert expected.match(container), (
-        f"container {container!r} is not the pinned manylinux builder image "
-        f"for {arch} (runner {runner!r}); expected one matching "
-        f"{expected.pattern}"
-    )
-    # sbsa-* makes _build-wheel.yaml install the CUDA toolkit with apt, which
-    # the AlmaLinux-based manylinux image does not have. Any other value
-    # ('container', 'none') keeps the build inside the image.
-    cuda = str(with_block.get("cuda", ""))
-    assert not cuda.startswith("sbsa-"), (
-        f"cuda is {cuda!r}; a job pinned to a manylinux container cannot "
-        "install CUDA via the host package manager"
+    container = " ".join(job.get("container", "").split())
+    # Check both the image floors and their routing. Merely finding four image
+    # names would miss a swapped architecture or a branch that uses the host.
+    images = re.findall(r"'(pytorch/[^']+)'", container)
+    assert len(images) == 4, "all architecture/CUDA branches need a manylinux image"
+    for arch, image in zip(("aarch64", "aarch64", "x86_64", "x86_64"), images):
+        assert ARCH_CONTAINER[arch].fullmatch(image), (arch, image)
+    arm13, arm12, x8613, x8612 = images
+    assert container == (
+        "${{ inputs.architecture == 'arm64' && "
+        f"(inputs.variant == 'cuda13' && '{arm13}' || '{arm12}') || "
+        f"(inputs.variant == 'cuda13' && '{x8613}' || '{x8612}') }}}}"
     )

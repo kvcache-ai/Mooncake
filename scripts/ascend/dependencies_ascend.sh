@@ -148,7 +148,7 @@ cp /usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake/*.so  /
 cp /usr/local/Ascend/ascend-toolkit/latest/python/site-packages/libascend_transport_mem.so ../
 
 # # Generate the whl package, install it, and copy it to a shared path
-sh scripts/build_wheel.sh
+python scripts/build_release_wheel.py
 cp mooncake-wheel/dist/*.whl ../
 pip install mooncake-wheel/dist/*.whl --force
 echo -e "Mooncake wheel pipinstall successfully."

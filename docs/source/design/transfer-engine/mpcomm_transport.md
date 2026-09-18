@@ -110,7 +110,7 @@ Make sure `libmpcomm.so` can be found by the dynamic linker at run time, for exa
 
 ### Wheel Packaging
 
-The `mooncake-transfer-engine` wheel **deliberately does not bundle MPComm**. `scripts/build_wheel.sh`
+The `mooncake-transfer-engine` wheel **deliberately does not bundle MPComm**. `scripts/repair_wheel.sh`
 passes `--exclude libmpcomm.so*` to `auditwheel repair`, so `engine.so` keeps its `DT_NEEDED` entry
 on `libmpcomm.so.<N>` and the library stays an external dependency resolved at run time. This keeps
 MPComm independently upgradable: replacing `libmpcomm.so` does not require rebuilding or repackaging

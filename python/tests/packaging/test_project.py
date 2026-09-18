@@ -50,17 +50,9 @@ def test_dependency_boundaries_are_declared() -> None:
     assert metadata["optional-dependencies"]["administration"] == ["paramiko"]
 
 
-def test_legacy_wheel_administration_extra_matches_root_project() -> None:
-    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
-    legacy = tomllib.loads(
-        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
-    )
-
-    assert (
-        legacy["project"]["optional-dependencies"]["administration"]
-        == project["project"]["optional-dependencies"]["administration"]
-    )
-    assert not any("paramiko" in dep for dep in legacy["project"]["dependencies"])
+def test_legacy_packaging_entrypoints_are_removed() -> None:
+    assert not (REPOSITORY_ROOT / "mooncake-wheel/pyproject.toml").exists()
+    assert not (REPOSITORY_ROOT / "scripts/build_wheel.sh").exists()
 
 
 def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
@@ -103,13 +95,48 @@ def test_ep_modules_have_one_authoritative_source() -> None:
         assert not legacy_test.exists()
 
 
+@pytest.mark.parametrize(
+    "artifact,defines,expected",
+    [
+        ("libetcd_wrapper.so", {"STORE_USE_ETCD": "ON"}, True),
+        ("libetcd_wrapper.so", {"USE_ETCD": "ON"}, True),
+        ("libetcd_wrapper.so", {"USE_ETCD": "ON", "USE_ETCD_LEGACY": "ON"}, False),
+        ("libetcd_wrapper.so", {"STORE_USE_ETCD": "ON", "USE_ETCD_LEGACY": "ON"}, True),
+        ("libetcd_wrapper.so", {}, False),
+        ("allocator.py", {"WITH_TE": "ON"}, True),
+        ("fabric_allocator_utils.py", {"WITH_TE": "ON"}, True),
+    ],
+)
+def test_release_runtime_install_conditions(tmp_path, artifact, defines, expected):
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        pytest.skip("CMake is required to evaluate install conditions")
+    source = (REPOSITORY_ROOT / "mooncake-integration/CMakeLists.txt").read_text()
+    # Execute the actual, self-contained conditional install rule without
+    # configuring native dependencies. Capture install() arguments in script mode.
+    marker = source.index(f'/{artifact}"')
+    start = source.rfind("if(", 0, marker)
+    end = source.index("endif()", marker) + len("endif()")
+    result = tmp_path / "installed.txt"
+    script = tmp_path / "check.cmake"
+    script.write_text(
+        "\n".join(f"set({key} {value})" for key, value in defines.items())
+        + f'\nmacro(install)\nfile(APPEND "{result}" "${{ARGV}}\\n")\nendmacro()\n'
+        + source[start:end]
+    )
+    subprocess.run([cmake, "-P", str(script)], check=True)
+    assert result.exists() is expected
+    if expected:
+        assert artifact in result.read_text()
+        assert "COMPONENT;python" in result.read_text()
+
+
 def test_ssd_administration_modules_have_one_authoritative_source() -> None:
     package_root = REPOSITORY_ROOT / "python" / "mooncake"
     legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
     direct_install = (
         REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
     ).read_text()
-    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
     modules = (
         "_administration.py",
         "mooncake_ssd_register.py",
@@ -122,7 +149,6 @@ def test_ssd_administration_modules_have_one_authoritative_source() -> None:
         assert not (legacy_package_root / module).exists()
         assert f"../python/mooncake/{module}" in direct_install
         assert f"../mooncake-wheel/mooncake/{module}" not in direct_install
-        assert module in legacy_builder
 
     assert (
         REPOSITORY_ROOT / "python" / "tests" / "ssd" / "test_spdk_tgt_create.py"
