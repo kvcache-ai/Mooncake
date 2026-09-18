@@ -191,6 +191,11 @@ struct FilereadWorkerPoolEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_FILEREAD_WORKERS);
 };
 
+struct NoFWorkerPoolEnvironmentVariables {
+    // Preserve the raw value in invalid-value warnings.
+    MC_DEFINE_ENV_VAR(std::string, MC_NOF_WORKERS);
+};
+
 struct NoFRegisterEnvironmentVariables {
     // Keep the raw string to preserve case normalization and warning behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_NOF_TRTYPE);
