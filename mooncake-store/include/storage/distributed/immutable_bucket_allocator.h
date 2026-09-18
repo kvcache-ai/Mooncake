@@ -16,7 +16,7 @@
 
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/fs_adapter.h"
-#include "storage/distributed/global_allocator_interface.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 
 namespace mooncake {
 
@@ -43,7 +43,7 @@ enum class BucketLifecycle : int32_t {
  * already contains a bucket data or metadata file instead of guessing whether
  * it belongs to this process. MarkCommitted records only runtime state.
  */
-class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
+class ImmutableBucketAllocator final : public DfsAllocatorInterface {
    public:
     ImmutableBucketAllocator() = default;
     ~ImmutableBucketAllocator() override;

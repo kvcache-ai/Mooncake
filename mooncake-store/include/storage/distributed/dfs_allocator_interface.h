@@ -42,7 +42,7 @@ struct BatchAllocateResult {
  * DistributedFSDescriptor remains wire-compatible. In bucket mode its
  * shard_idx member carries the bucket id.
  */
-class GlobalAllocatorInterface {
+class DfsAllocatorInterface {
    public:
     struct EvictionCandidate {
         std::string key;
@@ -51,7 +51,7 @@ class GlobalAllocatorInterface {
         DistributedFSDescriptor descriptor;
     };
 
-    virtual ~GlobalAllocatorInterface() = default;
+    virtual ~DfsAllocatorInterface() = default;
 
     virtual DfsAllocatorType Type() const = 0;
     virtual tl::expected<void, ErrorCode> Init(

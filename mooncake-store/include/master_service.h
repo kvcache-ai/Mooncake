@@ -69,7 +69,7 @@ class MasterSnapshotCodecTest;  // test fixture, needs private state access
 
 class EtcdOpLogStore;
 class DfsGlobalAllocator;
-class GlobalAllocatorInterface;
+class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
 
 // Forward declarations
@@ -2904,7 +2904,7 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::unique_ptr<GlobalAllocatorInterface> dfs_allocator_;
+    std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     DfsGlobalAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};
 

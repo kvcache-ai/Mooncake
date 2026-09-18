@@ -9,7 +9,7 @@
 
 #include "environ.h"
 #include "environment_variables.h"
-#include "storage/distributed/global_allocator_interface.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 
 namespace mooncake {
 
