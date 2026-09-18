@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "ascii_string.h"
 #include "bool_parser.h"
 #include "environ.h"
 #include "environment_variables.h"
@@ -69,6 +70,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
 
     config.storage_filepath = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_FILE_STORAGE_PATH, config.storage_filepath);
+
+    config.storage_paths = ResolveOffloadDiskPaths(config.storage_filepath);
 
     config.local_buffer_size =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES,
@@ -205,8 +208,18 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
+    // storage_filepath may be a comma-separated multi-disk list. ValidatePath
+    // stats a single path and would reject the raw list string (stat of
+    // "/d0,/d1" is ENOENT), so validate each root on its own.
+    const auto paths = SplitCommaList(storage_filepath);
+    if (paths.empty()) {
+        LOG(ERROR) << "FileStorageConfig: storage_filepath must not be empty";
         return false;
+    }
+    for (const auto& path : paths) {
+        if (!ValidatePath(path)) {
+            return false;
+        }
     }
     if (total_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mooncake {
 
@@ -19,6 +20,26 @@ inline std::string_view TrimAsciiWhitespace(std::string_view value) {
         value.remove_suffix(1);
     }
     return value;
+}
+
+// Split a comma-separated list, trimming whitespace around each entry and
+// dropping empty ones. Used to expand multi-disk configuration values such as
+// FileStorageConfig::storage_filepath.
+inline std::vector<std::string> SplitCommaList(std::string_view value) {
+    std::vector<std::string> entries;
+    while (true) {
+        const size_t comma = value.find(',');
+        const std::string_view token =
+            TrimAsciiWhitespace(value.substr(0, comma));
+        if (!token.empty()) {
+            entries.emplace_back(token);
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        value.remove_prefix(comma + 1);
+    }
+    return entries;
 }
 
 constexpr char AsciiToLower(char ch) {
