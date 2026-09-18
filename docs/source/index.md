@@ -101,6 +101,7 @@ getting_started/quick-start
 :maxdepth: 1
 
 deployment/mooncake-store-deployment-guide
+deployment/oss
 deployment/kubernetes-deployment-guide/index
 deployment/integrations/sglang/index
 deployment/integrations/vllm/index
@@ -135,6 +136,7 @@ design/store/mooncake-store
 design/kv-event/publisher-design
 design/kv-event/subscriber-guide
 design/nvme-kv-backend
+design/oss-backend
 design/mooncake-backend-pg
 design/mooncake-ep
 design/p2p-store
