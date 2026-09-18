@@ -82,17 +82,32 @@ Per-client `PrefetchThrottle` (sharded, lock-free fast path per shard):
 
 ## get() wait (opt-in)
 
-`ssd_get_wait_ms` (default 0 = off) in the batch-get path: when the selected
-replica is `LOCAL_DISK`-only and there is evidence of an in-flight promotion —
-the local throttle shows the key triggered, or a single read-only re-query
-shows a `PROCESSING` MEMORY replica — wait up to the budget for it to
-complete, then serve from DRAM; otherwise read from SSD immediately. With the
-default (0) there is no extra RPC and no added latency on any get.
+`ssd_get_wait_ms` (default 0 = off) is a **single deadline for the whole
+batch-get**, not a fresh timeout per key. A long prefix spans tens of keys;
+applying a per-key wait serially multiplied the batch budget by the key
+count and produced tens-of-seconds TTFT p99 spikes when prefetch was on.
+
+Wait only when this process has a live local promotion (`kInFlight` /
+`kCompleted`). Do **not** wait on `kTriggered` (pool job still queued),
+`kFailed`, `kAlreadyResident`, or keys delegated to another holder. A process
+with no local SSD object (EngineCore `global_segment_size=0`) must not call
+`RegisterPrefetchTask`: that left a `PROCESSING` MEMORY replica the get path
+then waited on for the full per-key budget.
+
+The get path never initiates promotion — triggers come only from exist
+probes (and from remote holders via `prefetch_offload_object`). In
+particular the get path does not bypass the memory-pressure cooldown: a
+backoff opened by DRAM saturation means prefetch yields to eviction/offload
+even for a key that is being demanded right now. If nothing is in flight,
+fall through to SSD immediately.
 
 The re-query is read-only and grants no lease; between observing a COMPLETE
 MEMORY replica and the actual transfer the replica could in principle be
 evicted. That race is accepted (best-effort): the transfer simply fails and
 the caller retries/falls back per the existing error path.
+
+A/B replay (fill → overflow → settle → measure c=2) and the vLLM bench
+screen logs live in `scripts/ssd-prefetch-ttft-ab/`.
 
 ## Rolling-upgrade compatibility
 
