@@ -7958,7 +7958,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
 
         auto matches_candidate =
             [](const Replica& replica,
-               const GlobalAllocatorInterface::EvictionCandidate& candidate) {
+               const DfsAllocatorInterface::EvictionCandidate& candidate) {
                 if (!replica.is_dfs_replica()) return false;
                 const auto& descriptor = replica.get_dfs_descriptor();
                 return descriptor.shard_idx == candidate.descriptor.shard_idx &&

@@ -17,14 +17,14 @@
 #include "offset_allocator/offset_allocator.h"
 #include "replica.h"
 #include "storage/distributed/fs_adapter.h"
-#include "storage/distributed/global_allocator_interface.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 #include "types.h"
 
 namespace mooncake {
 
 struct DistributedStorageConfig;
 
-class DfsGlobalAllocator final : public GlobalAllocatorInterface {
+class DfsGlobalAllocator final : public DfsAllocatorInterface {
    public:
     struct EvictionCandidate {
         std::string key;
