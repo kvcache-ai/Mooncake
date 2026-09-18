@@ -131,6 +131,16 @@ pip install mooncake-transfer-engine-non-cuda
 pip install mooncake-transfer-engine-npu
 source /usr/local/Ascend/cann/set_env.sh
 ```
+
+See [Ascend Direct Transport](../design/transfer-engine/transport/ascend_direct_transport.md)
+for the recommended path. The legacy backend is documented in
+[Ascend Transport](../design/transfer-engine/transport/ascend_transport.md).
+For mixed GPU/NPU transfers, see
+[Heterogeneous Ascend Transport](../design/transfer-engine/transport/heterogeneous_ascend.md).
+There are also two detailed Chinese guides:
+[Mooncake KVPool guide](https://gitcode.com/cann/hixl/wiki/Mooncake%20KVPool%E6%8C%87%E5%8D%97.md)
+and
+[Mooncake NPU guide](https://gitcode.com/cann/hixl/wiki/Mooncake%EF%BC%88NPU%20%E7%89%88%EF%BC%89%E5%AE%8C%E6%95%B4%E6%8C%87%E5%8D%97.md).
 :::
 
 :::{tab-item} AMD ROCm
@@ -169,9 +179,6 @@ pip install mooncake-transfer-engine-musa
   `/opt/amazon/efa/lib` on `LD_LIBRARY_PATH`.
 - CUDA 12.1–12.9 or CUDA 13 if you use the GPU-aware EFA wheels.
 
-See the [EFA transport guide](../design/transfer-engine/transport/efa_transport.md) for
-details.
-
 **Installation**
 
 ```bash
@@ -184,6 +191,9 @@ pip install mooncake-transfer-engine-efa-cuda13
 # CPU/DRAM-only transfers
 pip install mooncake-transfer-engine-efa-non-cuda
 ```
+
+See the [EFA transport guide](../design/transfer-engine/transport/efa_transport.md)
+for prerequisites and configuration.
 :::
 
 :::{tab-item} Cambricon MLU
