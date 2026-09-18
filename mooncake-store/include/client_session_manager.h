@@ -12,7 +12,6 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -23,7 +22,7 @@ namespace mooncake {
 
 namespace test {
 class ClientSessionManagerTest;
-}
+}  // namespace test
 
 class MasterService;
 class ClientOffboardingWorker;
@@ -91,9 +90,9 @@ class ClientSessionManager {
     void UpdateHostId(const UUID& client_id, const std::string& host_id);
     std::string GetHostId(const UUID& client_id) const;
 
-    // Admission owns the session and its transition lock, not the registry
-    // lock. Both calls block on that lock; an empty result means the client
-    // is missing or its state rejects admission (not lock contention).
+    // Admission retains the slot and owns its operation lock plus the liveness
+    // transition lock, not the registry lock. An empty result means
+    // the client is missing or rejects admission (not lock contention).
     // Serving accepts ACTIVE; retaining accepts ACTIVE and SUSPECTED.
     class SessionGuard;
     [[nodiscard]] std::optional<SessionGuard> TryAcquireServingSession(
@@ -101,11 +100,13 @@ class ClientSessionManager {
     [[nodiscard]] std::optional<SessionGuard> TryAcquireRetainingSession(
         const UUID& client_id) const;
 
+    // Waits for this incarnation's registration/resource scopes to exit.
+    // Never call while holding one of those scopes for the same session.
     bool Remove(const UUID& client_id, const Record& expected);
 
-    // Both scopes hold the WHOLE registry exclusively and the session's
-    // transition lock until destruction, including after Commit(). Do not
-    // reenter registry APIs or reacquire the session's transition lock.
+    // Scopes serialize registration/remount for one incarnation only. Ping
+    // remains independent; monitoring defers transitions for this incarnation
+    // until scope exit. Do not nest registration scopes for the same client.
     // A missing session is provisionally created; OFFLINE rejects admission.
     // The manager must outlive these scopes.
     class Registration;
@@ -117,13 +118,16 @@ class ClientSessionManager {
     [[nodiscard]] std::optional<Registration> BeginRemount(
         const UUID& client_id);
 
-    // Stage restored owners under the exclusive registry lock. Commit adopts
-    // them; destruction without Commit discards them. Resource rollback is
-    // the caller's job. Commit does not release the lock; manager must outlive
-    // the scope. Existing records are reused, not replaced.
+    // Stage restored owners under the exclusive lifecycle lock. Commit adopts
+    // them atomically under the registry lock; destruction without Commit
+    // discards them. Resource rollback is the caller's job. Commit retains the
+    // lifecycle lock; manager must outlive the scope. Existing records are
+    // reused, not replaced. Lookups and heartbeats remain independent.
     class RestoreBatch;
     [[nodiscard]] RestoreBatch BeginRestore();
 
+    // Observes liveness even before remount completes. OK requires an accepted
+    // observation, the current registry identity, and a completed remount.
     ClientStatus Ping(const UUID& client_id);
     // Copies registry membership, not a frozen snapshot of session state.
     Records SnapshotRecords() const;
@@ -134,6 +138,20 @@ class ClientSessionManager {
     friend class MasterService;
     friend class test::ClientSessionManagerTest;
 
+    // A replaceable registry entry, not a permanent per-UUID allocation.
+    // Scopes retain the slot so its mutex and liveness outlive their guards.
+    struct ClientSlot {
+        explicit ClientSlot(Record record) : liveness(std::move(record)) {}
+
+        const Record liveness;
+        std::mutex operation_mutex;
+        // Protected by the manager's registry mutex, not operation_mutex:
+        // Ping must not wait for long registration/resource work.
+        bool remount_completed{false};
+    };
+    using Slot = std::shared_ptr<ClientSlot>;
+    using Slots = std::unordered_map<UUID, Slot, boost::hash<UUID>>;
+
     // Explicit ticks allow deterministic tests through the friend fixture;
     // do not race with Start/Stop or another Poll. Production uses the owned
     // monitor thread.
@@ -141,14 +159,26 @@ class ClientSessionManager {
     // Only the resource-owning listener submits the one pre-reserved job.
     void ScheduleOffboarding(ClientOffboardingJob job);
 
-    // Helpers below require mutex_ to be held by a manager operation.
-    Record FindRecord(const UUID& client_id) const;
-    std::pair<Record, bool> GetOrCreateRecord(const UUID& client_id,
-                                              Clock::time_point now);
-    bool EraseRecord(const UUID& client_id, const Record& expected);
-    void AdoptRecord(const UUID& client_id, Record record);
-    void ClearRecords();
-    void ClearRemountState(const UUID& client_id);
+    // Lock order: slot operation -> registry OR slot operation -> transition.
+    // Never acquire operation under registry, or nest registry and transition.
+    // The caller retains slot until the returned operation is released.
+    // Empty means missing/replaced, or busy when try_lock is requested; this
+    // helper validates slot identity only, not liveness admission.
+    std::optional<std::unique_lock<std::mutex>> AcquireCurrentOperation(
+        const UUID& client_id, const Slot& slot, bool try_lock = false) const;
+    Slot FindSlot(const UUID& client_id) const;
+    Slots SnapshotSlots() const;
+
+    // These helpers require the registry lock on entry.
+    Slot FindSlotLocked(const UUID& client_id) const;
+    void AdoptSlot(const UUID& client_id, const Slot& slot);
+    void ClearRemountState(const Slot& slot);
+    // Requires exclusive lifecycle access; binds before taking registry lock.
+    void AdoptRecords(const Records& records);
+    // Requires a validated current slot operation and lifecycle access.
+    void EraseSlot(const UUID& client_id, const Slot& slot,
+                   const std::unique_lock<std::mutex>& operation);
+    void ClearSlots();
 
     struct Notifications {
         std::mutex mutex;
@@ -163,9 +193,12 @@ class ClientSessionManager {
     void Dispatch();
     void ThreadFunc();
 
+    // Membership-changing operations take this before any other lock.
+    // Registration/removal share it; restore/reset own it exclusively.
+    // Ping/admission never need it; monitoring only tries shared access.
+    mutable std::shared_mutex lifecycle_mutex_;
     mutable std::shared_mutex mutex_;
-    Records records_;
-    std::unordered_set<UUID, boost::hash<UUID>> remount_completed_clients_;
+    Slots slots_;
     // Independent of the registry lock; never acquire the registry lock while
     // holding this mutex. Host lookups do not need a session transaction.
     mutable std::shared_mutex host_mutex_;
@@ -189,15 +222,21 @@ class ClientSessionManager::SessionGuard {
 
     // A read-only identity, not permission to mutate liveness or reacquire its
     // lock. Copying it retains the record, but does not extend admission.
-    ClientSessionSharedPtr Session() const { return record_; }
+    ClientSessionSharedPtr Session() const {
+        return slot_ ? slot_->liveness : nullptr;
+    }
 
    private:
     friend class ClientSessionManager;
-    SessionGuard(Record record, ClientLivenessRecord::RetainingGuard guard)
-        : record_(std::move(record)), guard_(std::move(guard)) {}
+    SessionGuard(Slot slot, std::unique_lock<std::mutex> operation,
+                 ClientLivenessRecord::RetainingGuard guard)
+        : slot_(std::move(slot)),
+          operation_(std::move(operation)),
+          guard_(std::move(guard)) {}
 
-    // Destruction must unlock before releasing the last record reference.
-    Record record_;
+    // Destruction unlocks transition, then operation, before releasing slot.
+    Slot slot_;
+    std::unique_lock<std::mutex> operation_;
     ClientLivenessRecord::RetainingGuard guard_;
 };
 
@@ -209,7 +248,9 @@ class ClientSessionManager::Registration {
     Registration(Registration&& other) noexcept;
     Registration& operator=(Registration&&) = delete;
 
-    ClientSessionSharedPtr Session() const { return record_; }
+    ClientSessionSharedPtr Session() const {
+        return slot_ ? slot_->liveness : nullptr;
+    }
     // Whether this incarnation still owes a successful remount handshake.
     // Independent of ACTIVE/SUSPECTED: a suspected session may need no remount.
     bool NeedsRemount() const;
@@ -219,7 +260,7 @@ class ClientSessionManager::Registration {
     // Exactly one commit, with semantics fixed by the Begin* call.
     // Destruction without Commit removes only a provisional session, not
     // existing state or external resources. This is not a general rollback
-    // transaction. Commit retains both locks until scope exit.
+    // transaction. Commit retains per-incarnation serialization until exit.
     void Commit();
 
    private:
@@ -229,12 +270,13 @@ class ClientSessionManager::Registration {
                  std::optional<Clock::time_point> observed_at = std::nullopt);
 
     ClientSessionManager* manager_;
-    std::unique_lock<std::shared_mutex> registry_lock_;
+    std::shared_lock<std::shared_mutex> lifecycle_lock_;
     UUID client_id_;
     const RegistrationKind kind_;
     Clock::time_point observed_at_;
-    Record record_;
-    std::optional<ClientLivenessRecord::RetainingGuard> guard_;
+    Slot slot_;
+    std::unique_lock<std::mutex> operation_;
+    bool admitted_{false};
     bool provisional_{false};
     bool committed_{false};
 };
@@ -255,7 +297,7 @@ class ClientSessionManager::RestoreBatch {
     explicit RestoreBatch(ClientSessionManager& manager);
 
     ClientSessionManager* manager_;
-    std::unique_lock<std::shared_mutex> registry_lock_;
+    std::unique_lock<std::shared_mutex> lifecycle_lock_;
     Records pending_;
     bool committed_{false};
 };

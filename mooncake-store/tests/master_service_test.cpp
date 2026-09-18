@@ -3016,6 +3016,94 @@ TEST_F(MasterServiceTest, SessionManagerOwnsOffboardingShutdown) {
     }
 }
 
+// Manual fault-injection experiment for #3936; excluded from normal test runs.
+TEST_F(MasterServiceTest, DISABLED_Repro3936RemountKeepsHealthyPings) {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    MasterServiceConfig config;
+    config.client_active_ttl_sec = 1;
+    config.client_suspicion_ttl_sec = 1;
+    MasterService service(config);
+    constexpr size_t count = 4;
+    std::vector<UUID> clients;
+    std::vector<Segment> segments;
+    std::vector<std::shared_ptr<ClientLivenessRecord>> records;
+    for (size_t i = 0; i < count; ++i) {
+        clients.push_back(generate_uuid());
+        segments.push_back(MakeSegment("repro3936_" + std::to_string(i)));
+        ASSERT_TRUE(service.MountSegment(segments.back(), clients.back()));
+        ASSERT_TRUE(service.ReMountSegment({segments.back()}, clients.back()));
+        records.push_back(FindClientLivenessForTest(service, clients.back()));
+        PutObjectOnSegment(service, clients.back(), segments.back().name);
+    }
+    const auto initial_keys = service.GetKeyCount();
+    std::atomic<bool> running{true};
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> need_remount{0};
+    std::atomic<int64_t> max_latency_ms{0};
+    std::vector<std::thread> pingers;
+    for (const auto client : clients) {
+        pingers.emplace_back([&, client] {
+            while (running.load()) {
+                const auto start = Clock::now();
+                const auto result = service.Ping(client);
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now() - start)
+                        .count();
+                auto previous = max_latency_ms.load();
+                while (
+                    elapsed > previous &&
+                    !max_latency_ms.compare_exchange_weak(previous, elapsed)) {
+                }
+                if (!result || result->client_status != ClientStatus::OK) {
+                    ++need_remount;
+                }
+                ++completed;
+                std::this_thread::sleep_for(20ms);
+            }
+        });
+    }
+    std::this_thread::sleep_for(200ms);
+    const auto baseline = completed.load();
+    // A real remount holds only its per-incarnation registration lock here.
+    // Holding snapshot_mutex_ models a slow restore/snapshot critical section.
+    std::unique_lock snapshot_lock(
+        MasterServiceTestPeer::SnapshotMutex(service));
+    bool remount_ok = false;
+    std::thread remounter([&] {
+        remount_ok =
+            service.ReMountSegment({segments[0]}, clients[0]).has_value();
+    });
+    std::this_thread::sleep_for(200ms);
+    const auto before_stall = completed.load();
+    std::this_thread::sleep_for(4s);
+    const auto during_stall = completed.load();
+    snapshot_lock.unlock();
+    remounter.join();
+    std::this_thread::sleep_for(3s);
+    running.store(false);
+    for (auto& pinger : pingers) pinger.join();
+    size_t offline = 0;
+    for (const auto& record : records) {
+        offline += record->state() == ClientLivenessState::OFFLINE;
+    }
+    const auto final_keys = service.GetKeyCount();
+    std::cout << "REPRO3936 baseline_pings=" << baseline
+              << " pings_during_4s_stall=" << during_stall - before_stall
+              << " max_ping_ms=" << max_latency_ms.load()
+              << " need_remount=" << need_remount.load()
+              << " offline=" << offline << "/" << count
+              << " keys=" << initial_keys << "->" << final_keys << std::endl;
+    EXPECT_GT(baseline, 0u);
+    EXPECT_TRUE(remount_ok);
+    EXPECT_GT(during_stall - before_stall, 100u);
+    EXPECT_LT(max_latency_ms.load(), 1000);
+    EXPECT_EQ(offline, 0u);
+    EXPECT_EQ(final_keys, initial_keys);
+    EXPECT_EQ(need_remount.load(), 0u);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

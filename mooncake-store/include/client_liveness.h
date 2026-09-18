@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -127,6 +128,9 @@ class ClientLivenessRecord {
         return RetainingGuard(*this, std::move(lock));
     }
 
+    // Reports only the liveness effect: refresh, recovery, or rejection of
+    // an OFFLINE record. Session readiness and RPC status belong to the
+    // manager.
     [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
         return ObserveAndRun(now, [] { return true; });
     }
@@ -213,10 +217,19 @@ class ClientLivenessRecord {
         observer_enabled_.store(true, std::memory_order_release);
     }
 
-    // Disable future observer calls without acquiring the transition lock, so
-    // registration rollback may call this while holding a RetainingGuard.
-    // The owner must serialize removal against state-changing operations;
-    // already queued notifications are not retracted.
+    // Wait for any in-flight observer, disable future notifications, and
+    // return the state at that point. Does not change liveness. Later
+    // transitions do not invoke the observer unless it is reinstalled.
+    [[nodiscard]] ClientLivenessState StopObserving() {
+        std::lock_guard lock(transition_mutex_);
+        DisableTransitionObserver();
+        return state();
+    }
+
+    // Low-level disable, also usable while holding a RetainingGuard. Prefer
+    // StopObserving when a final state snapshot is needed. The owner must
+    // serialize removal against state-changing operations; already queued
+    // notifications are not retracted.
     void DisableTransitionObserver() {
         observer_enabled_.store(false, std::memory_order_release);
     }
@@ -236,7 +249,7 @@ class ClientLivenessRecord {
 
     [[nodiscard]] ClientLivenessObservation CommitObservation(
         TimePoint now, ClientLivenessState current_state) {
-        last_liveness_at_ = now;
+        last_liveness_at_ = std::max(last_liveness_at_, now);
         if (current_state == ClientLivenessState::SUSPECTED) {
             SetState(ClientLivenessState::ACTIVE);
             return ClientLivenessObservation::RECOVERED_ACTIVE;

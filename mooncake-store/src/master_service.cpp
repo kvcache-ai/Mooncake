@@ -3373,8 +3373,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         (metadata_store && chunk_object_count == 0)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // Keep registry -> snapshot acquisition order. Reverse destruction releases
-    // snapshot before registry on success, early return, and exceptions.
+    // Exclude registration/removal before taking the snapshot lock. Restore
+    // holds the lifecycle barrier, not the registry lock, so Ping can continue.
     auto restore = client_session_manager_.BeginRestore();
     std::unique_lock snapshot_lock(snapshot_mutex_);
     // The ordered writer initializes its sequence from durable_prefix.

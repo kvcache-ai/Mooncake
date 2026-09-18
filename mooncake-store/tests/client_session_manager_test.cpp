@@ -18,6 +18,19 @@ class ClientSessionManagerTest : public ::testing::Test {
                      ClientSessionManager::Clock::time_point now) {
         manager.Poll(now);
     }
+
+    using Slot = ClientSessionManager::Slot;
+
+    static Slot FindSlot(ClientSessionManager& manager, const UUID& client_id) {
+        return manager.FindSlot(client_id);
+    }
+
+    static bool AcquireCurrentOperation(ClientSessionManager& manager,
+                                        const UUID& client_id, const Slot& slot,
+                                        bool try_lock = false) {
+        return manager.AcquireCurrentOperation(client_id, slot, try_lock)
+            .has_value();
+    }
 };
 
 namespace {
@@ -399,23 +412,40 @@ TEST_F(ClientSessionManagerTest,
     });
 }
 
-TEST_F(ClientSessionManagerTest, GuardsKeepSessionAliveAfterRegistryRemoval) {
+TEST_F(ClientSessionManagerTest,
+       RemovalWaitsForAdmissionWithoutHoldingRegistry) {
     const auto check = [](auto acquire) {
         auto manager = std::make_unique<ClientSessionManager>(10s, 20s);
-        std::weak_ptr<ClientLivenessRecord> record = Register(*manager);
-        auto guard = acquire(*manager);
-        ASSERT_TRUE(guard);
-        EXPECT_TRUE(manager->Remove(kClient, record.lock()));
+        auto record = Register(*manager);
+        const UUID other{3, 4};
+        Register(*manager, other);
+        std::future<bool> removed;
+        std::future<ClientStatus> ping;
+        ClientSessionSharedPtr identity;
+        {
+            auto guard = acquire(*manager);
+            ASSERT_TRUE(guard);
+            identity = guard->Session();
+            removed = std::async(std::launch::async, [&] {
+                return manager->Remove(kClient, record);
+            });
+            EXPECT_EQ(removed.wait_for(20ms), std::future_status::timeout);
+            ping = std::async(std::launch::async,
+                              [&] { return manager->Ping(other); });
+            EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+        }
+        EXPECT_TRUE(removed.get());
+        EXPECT_EQ(ping.get(), ClientStatus::NEED_REMOUNT);
+        EXPECT_FALSE(manager->Find(kClient));
+        EXPECT_FALSE(manager->TryAcquireRetainingSession(kClient));
         manager.reset();
-        EXPECT_FALSE(record.expired());
-        guard.reset();
-        EXPECT_TRUE(record.expired());
+        EXPECT_EQ(identity, record);
     };
     check([](auto& manager) {
-        return manager.TryAcquireRetainingSession(kClient);
+        return manager.TryAcquireServingSession(kClient);
     });
     check([](auto& manager) {
-        return manager.TryAcquireServingSession(kClient);
+        return manager.TryAcquireRetainingSession(kClient);
     });
 }
 
@@ -452,8 +482,8 @@ TEST_F(ClientSessionManagerTest, LocalDiskCleanupDistinguishesIncarnations) {
 TEST_F(ClientSessionManagerTest, LocalDiskCleanupNeedsNoRegistryAccess) {
     ClientSessionManager manager(10s, 20s);
     auto record = Register(manager);
-    // Hold the exclusive registry lock while another thread classifies the
-    // newly registered replica. No old client-ID snapshot or registry lookup
+    // Hold a registration scope while another thread classifies the newly
+    // registered replica. No old client-ID snapshot or registry lookup
     // may be involved in the decision.
     std::future<bool> stale;
     std::future_status status;
@@ -461,12 +491,11 @@ TEST_F(ClientSessionManagerTest, LocalDiskCleanupNeedsNoRegistryAccess) {
         auto registration = manager.BeginRegistration(kClient, kInitial);
         ASSERT_TRUE(registration);
         registration->Commit();
-        stale =
-            std::async(std::launch::async, [record] {
-                Replica replica(kClient, 1024, "disk-endpoint",
-                                ReplicaStatus::COMPLETE, record);
-                return replica.has_stale_local_disk_client();
-            });
+        stale = std::async(std::launch::async, [record] {
+            Replica replica(kClient, 1024, "disk-endpoint",
+                            ReplicaStatus::COMPLETE, record);
+            return replica.has_stale_local_disk_client();
+        });
         status = stale.wait_for(1s);
     }
     EXPECT_EQ(status, std::future_status::ready);
@@ -551,6 +580,45 @@ TEST_F(ClientSessionManagerTest,
     EXPECT_EQ(record->state(), State::SUSPECTED);
     EXPECT_EQ(manager.Ping(kClient), ClientStatus::OK);
     EXPECT_EQ(record->state(), State::ACTIVE);
+}
+
+TEST_F(ClientSessionManagerTest, PingCombinesObservationWithRemountReadiness) {
+    for (const bool remounted : {false, true}) {
+        for (const auto state :
+             {State::ACTIVE, State::SUSPECTED, State::OFFLINE}) {
+            SCOPED_TRACE(::testing::Message() << "remounted=" << remounted
+                                              << ", state=" << toString(state));
+            ClientSessionManager manager(10s, 20s);
+            EXPECT_EQ(manager.Ping(kClient), ClientStatus::NEED_REMOUNT);
+            EXPECT_FALSE(manager.Find(kClient));
+            auto record = Register(manager);
+            if (remounted) {
+                auto remount = manager.BeginRemount(kClient);
+                ASSERT_TRUE(remount);
+                remount->Commit();
+            }
+            // Queue transitions without dispatch so OFFLINE rejection cannot
+            // accidentally rely on the remount flag having been cleared.
+            if (state != State::ACTIVE) {
+                (void)record->Evaluate(kInitial + 10s, 10s, 20s);
+            }
+            if (state == State::OFFLINE) {
+                (void)record->Evaluate(kInitial + 30s, 10s, 20s);
+            }
+            ASSERT_EQ(record->state(), state);
+            EXPECT_EQ(manager.Ping(kClient),
+                      remounted && state != State::OFFLINE
+                          ? ClientStatus::OK
+                          : ClientStatus::NEED_REMOUNT);
+            EXPECT_EQ(record->state(),
+                      state == State::OFFLINE ? State::OFFLINE : State::ACTIVE);
+            Poll(manager, ClientSessionManager::Clock::now());
+            // NEED_REMOUNT still refreshes a live session, but OFFLINE is
+            // terminal regardless of whether the handshake was completed.
+            EXPECT_EQ(record->state(),
+                      state == State::OFFLINE ? State::OFFLINE : State::ACTIVE);
+        }
+    }
 }
 
 TEST_F(ClientSessionManagerTest, AbandonedRemountPreservesExistingReadiness) {
@@ -670,7 +738,7 @@ TEST_F(ClientSessionManagerTest, RegistrationCannotCommitTwice) {
     }
 }
 
-TEST_F(ClientSessionManagerTest, RegistrationKeepsAdmissionUntilScopeExit) {
+TEST_F(ClientSessionManagerTest, RegistrationAllowsPingBeforeScopeExit) {
     ClientSessionManager manager(10s, 20s);
     std::promise<void> attempted;
     auto started = attempted.get_future();
@@ -684,10 +752,127 @@ TEST_F(ClientSessionManagerTest, RegistrationKeepsAdmissionUntilScopeExit) {
             return manager.Ping(kClient);
         });
         started.wait();
-        EXPECT_EQ(ping.wait_for(20ms), std::future_status::timeout);
+        EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
     }
     EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
     EXPECT_EQ(ping.get(), ClientStatus::OK);
+}
+
+TEST_F(ClientSessionManagerTest, RemountOnlySerializesItsOwnIncarnation) {
+    ClientSessionManager manager(10s, 20s);
+    auto record = Register(manager);
+    const UUID other{3, 4};
+    auto other_record = Register(manager, other);
+    std::future<bool> same;
+    std::future<bool> different;
+    {
+        auto remount = manager.BeginRemount(kClient);
+        ASSERT_TRUE(remount);
+        same = std::async(std::launch::async, [&] {
+            return manager.BeginRemount(kClient).has_value();
+        });
+        different = std::async(std::launch::async, [&] {
+            return manager.BeginRemount(other).has_value();
+        });
+        EXPECT_EQ(same.wait_for(20ms), std::future_status::timeout);
+        EXPECT_EQ(different.wait_for(1s), std::future_status::ready);
+        // A held remount must neither expire nor stop monitoring other owners.
+        std::async(std::launch::async, [&] {
+            Poll(manager, kInitial + 10s);
+        }).get();
+        EXPECT_EQ(record->state(), State::ACTIVE);
+        EXPECT_EQ(other_record->state(), State::SUSPECTED);
+        std::async(std::launch::async, [&] {
+            Poll(manager, kInitial + 30s);
+        }).get();
+        EXPECT_EQ(record->state(), State::ACTIVE);
+        EXPECT_EQ(other_record->state(), State::OFFLINE);
+    }
+    EXPECT_TRUE(same.get());
+    EXPECT_TRUE(different.get());
+}
+
+TEST_F(ClientSessionManagerTest,
+       WaitingRemountRetriesAfterProvisionalRollback) {
+    ClientSessionManager manager(10s, 20s);
+    ClientSessionSharedPtr old;
+    std::future<ClientSessionSharedPtr> next;
+    {
+        auto registration = manager.BeginRegistration(kClient);
+        old = registration->Session();
+        next = std::async(std::launch::async, [&] {
+            auto remount = manager.BeginRemount(kClient);
+            if (!remount) return ClientSessionSharedPtr{};
+            remount->Commit();
+            return remount->Session();
+        });
+        EXPECT_EQ(next.wait_for(20ms), std::future_status::timeout);
+    }
+    const auto replacement = next.get();
+    ASSERT_TRUE(replacement);
+    EXPECT_NE(old, replacement);
+    EXPECT_EQ(manager.Find(kClient), replacement);
+    EXPECT_EQ(manager.Ping(kClient), ClientStatus::OK);
+}
+
+TEST_F(ClientSessionManagerTest, RegistrationCommitPreservesNewerHeartbeat) {
+    ClientSessionManager manager(10s, 20s);
+    auto record = Register(manager);
+    {
+        auto registration = manager.BeginRegistration(kClient, kInitial);
+        EXPECT_EQ(manager.Ping(kClient), ClientStatus::NEED_REMOUNT);
+        registration->Commit();
+    }
+    Poll(manager, ClientSessionManager::Clock::now());
+    EXPECT_EQ(record->state(), State::ACTIVE);
+}
+
+TEST_F(ClientSessionManagerTest, RemountExcludesResourceAdmissionButNotPing) {
+    ClientSessionManager manager(10s, 20s);
+    Register(manager);
+    std::future<bool> admitted;
+    std::future<ClientStatus> ping;
+    {
+        auto remount = manager.BeginRemount(kClient);
+        admitted = std::async(std::launch::async, [&] {
+            return manager.TryAcquireRetainingSession(kClient).has_value();
+        });
+        ping = std::async(std::launch::async,
+                          [&] { return manager.Ping(kClient); });
+        EXPECT_EQ(admitted.wait_for(20ms), std::future_status::timeout);
+        EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+        remount->Commit();
+    }
+    EXPECT_TRUE(admitted.get());
+    EXPECT_EQ(ping.get(), ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(ClientSessionManagerTest, RestoreWaitsWithoutBlockingRemountCommit) {
+    ClientSessionManager manager(10s, 20s);
+    Register(manager);
+    const UUID other{3, 4};
+    Register(manager, other);
+    std::shared_mutex snapshot_mutex;
+    std::future<void> restore;
+    std::future<ClientStatus> ping;
+    {
+        auto remount = manager.BeginRemount(kClient);
+        std::unique_lock snapshot_lock(snapshot_mutex);
+        restore = std::async(std::launch::async, [&] {
+            auto batch = manager.BeginRestore();
+            std::unique_lock lock(snapshot_mutex);
+            batch.Commit();
+        });
+        EXPECT_EQ(restore.wait_for(20ms), std::future_status::timeout);
+        ping =
+            std::async(std::launch::async, [&] { return manager.Ping(other); });
+        EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+        remount->Commit();
+        EXPECT_FALSE(remount->NeedsRemount());
+    }
+    EXPECT_EQ(restore.wait_for(1s), std::future_status::ready);
+    restore.get();
+    EXPECT_EQ(ping.get(), ClientStatus::NEED_REMOUNT);
 }
 
 TEST_F(ClientSessionManagerTest, RestorePublishesOnlyCommittedStagedRecords) {
@@ -761,6 +946,222 @@ TEST_F(ClientSessionManagerTest,
     EXPECT_EQ(manager.Find(kClient), existing);
     std::unique_lock lock(snapshot_mutex, std::try_to_lock);
     EXPECT_TRUE(lock.owns_lock());
+}
+
+TEST_F(ClientSessionManagerTest, RemovalDoesNotAddALivenessState) {
+    ClientSessionManager manager(10s, 20s);
+    std::vector<ClientSessionEvent> events;
+    ASSERT_TRUE(manager.AddSessionListener(
+        [&](const auto& event) { events.push_back(event); }));
+    auto old = Register(manager);
+    {
+        auto remount = manager.BeginRemount(kClient);
+        remount->Commit();
+    }
+    ASSERT_EQ(old->Observe(kInitial + 1s), Observation::REFRESHED_ACTIVE);
+    ASSERT_TRUE(manager.Remove(kClient, old));
+    EXPECT_EQ(old->state(), State::ACTIVE);
+    EXPECT_EQ(manager.Ping(kClient), ClientStatus::NEED_REMOUNT);
+    EXPECT_FALSE(manager.TryAcquireRetainingSession(kClient));
+    // A retained record remains a normal liveness object, but its observer
+    // no longer belongs to the manager.
+    EXPECT_EQ(old->Observe(kInitial + 2s), Observation::REFRESHED_ACTIVE);
+    EXPECT_EQ(old->Evaluate(kInitial + 12s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_EQ(old->Observe(kInitial + 13s), Observation::RECOVERED_ACTIVE);
+    auto current = Register(manager);
+    EXPECT_NE(old, current);
+    Poll(manager, kInitial + 1s);
+    EXPECT_TRUE(events.empty());
+    EXPECT_EQ(manager.TryAcquireServingSession(kClient)->Session(), current);
+    EXPECT_EQ(manager.Ping(kClient), ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(ClientSessionManagerTest, WaitingAdmissionRejectsRolledBackRecord) {
+    ClientSessionManager manager(10s, 20s);
+    std::promise<void> attempted;
+    auto started = attempted.get_future();
+    std::future<bool> admitted;
+    ClientSessionSharedPtr old;
+    {
+        auto registration = manager.BeginRegistration(kClient);
+        old = registration->Session();
+        admitted = std::async(std::launch::async, [&] {
+            attempted.set_value();
+            return manager.TryAcquireRetainingSession(kClient).has_value();
+        });
+        started.wait();
+        EXPECT_EQ(admitted.wait_for(20ms), std::future_status::timeout);
+    }
+    EXPECT_FALSE(admitted.get());
+    EXPECT_EQ(old->state(), State::ACTIVE);
+    EXPECT_FALSE(manager.Find(kClient));
+    auto current = Register(manager);
+    EXPECT_NE(old, current);
+    EXPECT_EQ(manager.TryAcquireRetainingSession(kClient)->Session(), current);
+}
+
+TEST_F(ClientSessionManagerTest, CurrentOperationValidatesIdentityNotLiveness) {
+    ClientSessionManager manager(10s, 20s);
+    EXPECT_FALSE(AcquireCurrentOperation(manager, kClient, {}));
+    auto old = Register(manager);
+    auto old_slot = FindSlot(manager, kClient);
+    EXPECT_TRUE(AcquireCurrentOperation(manager, kClient, old_slot));
+    ASSERT_TRUE(manager.Remove(kClient, old));
+    EXPECT_FALSE(AcquireCurrentOperation(manager, kClient, old_slot));
+    auto current = Register(manager);
+    auto current_slot = FindSlot(manager, kClient);
+    EXPECT_NE(old_slot, current_slot);
+    EXPECT_FALSE(AcquireCurrentOperation(manager, kClient, old_slot));
+    EXPECT_FALSE(AcquireCurrentOperation(manager, kClient, old_slot,
+                                         /*try_lock=*/true));
+    EXPECT_TRUE(AcquireCurrentOperation(manager, kClient, current_slot));
+    Poll(manager, kInitial + 10s);
+    Poll(manager, kInitial + 30s);
+    // OFFLINE slots still belong to the registry until cleanup completes.
+    // Operation validation must not prevent their removal.
+    EXPECT_EQ(current->state(), State::OFFLINE);
+    EXPECT_TRUE(AcquireCurrentOperation(manager, kClient, current_slot));
+    EXPECT_FALSE(manager.TryAcquireRetainingSession(kClient));
+    EXPECT_TRUE(manager.Remove(kClient, current));
+}
+
+TEST_F(ClientSessionManagerTest, CurrentOperationTryLockDoesNotWait) {
+    ClientSessionManager manager(10s, 20s);
+    Register(manager);
+    auto slot = FindSlot(manager, kClient);
+    std::future<bool> acquired;
+    {
+        auto remount = manager.BeginRemount(kClient);
+        acquired = std::async(std::launch::async, [&] {
+            return AcquireCurrentOperation(manager, kClient, slot,
+                                           /*try_lock=*/true);
+        });
+        EXPECT_EQ(acquired.wait_for(1s), std::future_status::ready);
+    }
+    EXPECT_FALSE(acquired.get());
+    EXPECT_TRUE(AcquireCurrentOperation(manager, kClient, slot,
+                                        /*try_lock=*/true));
+}
+
+TEST_F(ClientSessionManagerTest, ResetRejectsOldSlotEvenWhenRecordIsReused) {
+    ClientSessionManager manager(10s, 20s);
+    auto record = Register(manager);
+    auto old_slot = FindSlot(manager, kClient);
+    std::weak_ptr weak_old_slot = old_slot;
+    {
+        auto remount = manager.BeginRemount(kClient);
+        remount->Commit();
+    }
+    manager.Reset({{kClient, record}});
+    auto current_slot = FindSlot(manager, kClient);
+    EXPECT_NE(old_slot, current_slot);
+    EXPECT_EQ(old_slot->liveness, current_slot->liveness);
+    EXPECT_FALSE(AcquireCurrentOperation(manager, kClient, old_slot));
+    EXPECT_FALSE(AcquireCurrentOperation(manager, kClient, old_slot,
+                                         /*try_lock=*/true));
+    EXPECT_TRUE(AcquireCurrentOperation(manager, kClient, current_slot));
+    EXPECT_EQ(manager.Ping(kClient), ClientStatus::NEED_REMOUNT);
+    old_slot.reset();
+    // Read-only resource identities retain liveness, not obsolete slot locks.
+    EXPECT_TRUE(weak_old_slot.expired());
+    EXPECT_EQ(manager.Find(kClient), record);
+}
+
+TEST_F(ClientSessionManagerTest, RemovedSlotIsReleasedDespiteRetainedRecord) {
+    ClientSessionManager manager(10s, 20s);
+    auto record = Register(manager);
+    std::weak_ptr weak_slot = FindSlot(manager, kClient);
+    EXPECT_FALSE(weak_slot.expired());
+    ASSERT_TRUE(manager.Remove(kClient, record));
+    EXPECT_TRUE(weak_slot.expired());
+    EXPECT_EQ(record->state(), State::ACTIVE);
+    EXPECT_TRUE(manager.SnapshotRecords().empty());
+}
+
+TEST_F(ClientSessionManagerTest, ConcurrentRemovalSucceedsOnlyOnce) {
+    ClientSessionManager manager(10s, 20s);
+    auto record = Register(manager);
+    std::promise<void> start;
+    auto gate = start.get_future().share();
+    const auto remove = [&] {
+        gate.wait();
+        return manager.Remove(kClient, record);
+    };
+    auto first = std::async(std::launch::async, remove);
+    auto second = std::async(std::launch::async, remove);
+    start.set_value();
+    EXPECT_NE(first.get(), second.get());
+    EXPECT_FALSE(manager.Find(kClient));
+}
+
+TEST_F(ClientSessionManagerTest, RestoreDoesNotBlockLookupOrHeartbeat) {
+    ClientSessionManager manager(10s, 20s);
+    auto record = Register(manager);
+    {
+        auto remount = manager.BeginRemount(kClient);
+        remount->Commit();
+    }
+    std::future<bool> lookup;
+    const UUID other{3, 4};
+    {
+        auto restore = manager.BeginRestore();
+        restore.FindOrCreate(other);
+        lookup = std::async(std::launch::async, [&] {
+            return manager.Find(kClient) == record && !manager.Find(other) &&
+                   manager.Ping(kClient) == ClientStatus::OK;
+        });
+        EXPECT_EQ(lookup.wait_for(1s), std::future_status::ready);
+        restore.Commit();
+    }
+    EXPECT_TRUE(lookup.get());
+    EXPECT_TRUE(manager.Find(other));
+}
+
+TEST_F(ClientSessionManagerTest, RestoreDefersExpiryWithoutHoldingRegistry) {
+    ClientSessionManager manager(10s, 20s);
+    auto record = Register(manager);
+    {
+        auto restore = manager.BeginRestore();
+        std::async(std::launch::async, [&] {
+            Poll(manager, kInitial + 10s);
+        }).get();
+        EXPECT_EQ(record->state(), State::ACTIVE);
+        restore.Commit();
+    }
+    Poll(manager, kInitial + 10s);
+    EXPECT_EQ(record->state(), State::SUSPECTED);
+}
+
+TEST_F(ClientSessionManagerTest, ResetPreservesRetainedIncarnationIdentity) {
+    ClientSessionManager manager(10s, 20s);
+    auto record = Register(manager);
+    {
+        auto remount = manager.BeginRemount(kClient);
+        remount->Commit();
+    }
+    EXPECT_EQ(manager.Ping(kClient), ClientStatus::OK);
+    manager.Reset({{kClient, record}});
+    EXPECT_EQ(manager.Find(kClient), record);
+    EXPECT_TRUE(manager.TryAcquireServingSession(kClient));
+    EXPECT_EQ(manager.Ping(kClient), ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(ClientSessionManagerTest, OldOfflineEventDoesNotClearNewIncarnation) {
+    ClientSessionManager manager(10s, 20s);
+    auto old = Register(manager);
+    (void)old->Evaluate(kInitial + 10s, 10s, 20s);
+    (void)old->Evaluate(kInitial + 30s, 10s, 20s);
+    ASSERT_TRUE(manager.Remove(kClient, old));
+    {
+        auto remount = manager.BeginRemount(kClient);
+        remount->UpdateHostId("new-host");
+        remount->Commit();
+    }
+    // Deliver the old record's queued OFFLINE after publishing its replacement.
+    Poll(manager, ClientSessionManager::Clock::now());
+    EXPECT_EQ(manager.GetHostId(kClient), "new-host");
+    EXPECT_EQ(manager.Ping(kClient), ClientStatus::OK);
 }
 
 TEST_F(ClientSessionManagerTest, RecordCanOutliveManager) {
