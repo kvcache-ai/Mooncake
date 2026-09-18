@@ -2,8 +2,13 @@
 
 #include <glog/logging.h>
 
+#include <charconv>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <vector>
 
+#include "ascii_string.h"
 #include "environ.h"
 #include "environment_variables.h"
 
@@ -17,6 +22,17 @@ bool BucketBackendConfig::Validate() const {
     if (bucket_size_limit <= 0) {
         LOG(ERROR) << "BucketBackendConfig: bucket_size_limit must > 0";
         return false;
+    }
+    // Deliberately stricter than the scalar max_total_size, where <= 0 means
+    // "unlimited": the per-disk list is position-aligned, so a 0 in it is far
+    // more likely a typo that silently unlimits one disk than an intent to
+    // limit some disks and not others.
+    for (size_t i = 0; i < max_total_size_per_disk.size(); ++i) {
+        if (max_total_size_per_disk[i] <= 0) {
+            LOG(ERROR) << "BucketBackendConfig: max_total_size_per_disk[" << i
+                       << "] must > 0, got " << max_total_size_per_disk[i];
+            return false;
+        }
     }
     return true;
 }
@@ -45,6 +61,30 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     config.disk_scan_cache_ms =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS,
                         config.disk_scan_cache_ms);
+
+    // Per-disk quota list, positionally aligned with the storage path comma
+    // list. Because the alignment is positional, a single unparsable entry
+    // cannot simply be skipped: that would shift every later disk onto its
+    // neighbour's quota. Drop the whole list instead and fall back to the
+    // scalar quota, loudly.
+    const std::string max_total_size_list = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST, std::string{});
+    for (const std::string_view entry : SplitCommaList(max_total_size_list)) {
+        int64_t parsed = 0;
+        const auto [unconsumed, ec] =
+            std::from_chars(entry.data(), entry.data() + entry.size(), parsed);
+        // Reject trailing garbage too: "100x" is a typo, not a quota.
+        if (ec != std::errc{} || unconsumed != entry.data() + entry.size()) {
+            LOG(ERROR) << "MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST='"
+                       << max_total_size_list << "' has an unparsable entry '"
+                       << entry
+                       << "'; ignoring the whole list and falling back to "
+                          "MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE.";
+            config.max_total_size_per_disk.clear();
+            break;
+        }
+        config.max_total_size_per_disk.push_back(parsed);
+    }
 
     const std::string policy = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY,

@@ -12,9 +12,11 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
+#include "ascii_string.h"
 #include "config/bucket_backend_config.h"
 #include "config/file_per_key_config.h"
 #include "config/offset_allocator_backend_config.h"
@@ -202,12 +204,36 @@ YLT_REFL(OffsetAllocatorPersistedMetadata, version, allocator_state, insert_seq,
 // records cannot be parsed with the current record layout.
 inline constexpr uint32_t kOffsetAllocatorPersistVersion = 3;
 
+// The disk roots a deployment spans, derived from the authoritative
+// storage_filepath rather than the FileStorageConfig::storage_paths cache:
+// callers that overwrite storage_filepath after FromEnvironment() leave that
+// cache stale. Never empty, so its size is safe to use as a divisor.
+inline std::vector<std::string> ResolveOffloadDiskPaths(
+    const std::string& storage_filepath) {
+    const std::vector<std::string_view> tokens =
+        SplitCommaList(storage_filepath);
+    if (tokens.empty()) {
+        // Nothing splittable (including the empty string) still means one
+        // disk, rooted at whatever was configured.
+        return {storage_filepath};
+    }
+    return std::vector<std::string>(tokens.begin(), tokens.end());
+}
+
 struct FileStorageConfig {
     // type of the storage backend
     StorageBackendType storage_backend_type = StorageBackendType::kBucket;
 
-    // Path where data files are stored on disk
+    // Path where data files are stored on disk. May be a comma-separated
+    // list of roots to spread bucket files across several disks.
     std::string storage_filepath = "/data/file_storage";
+
+    // storage_filepath expanded into individual roots, populated by
+    // FromEnvironment(). Always length >= 1; a single path yields length 1.
+    // This is a derived cache: callers that overwrite storage_filepath after
+    // FromEnvironment() leave it stale, so anything that must agree with the
+    // actual storage location re-derives it from storage_filepath instead.
+    std::vector<std::string> storage_paths;
 
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
