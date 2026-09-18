@@ -1,3 +1,4 @@
+#include "ha_metric_manager.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.h"
 
 #include <gtest/gtest.h>
@@ -134,6 +135,7 @@ TEST(BatchOpLogSnapshotGcTest, PointerMismatchSkipsDeletion) {
 }
 
 TEST(BatchOpLogSnapshotGcTest, DeletesOnlyUnprotectedAttempt) {
+    HAMetricManager::instance().reset_snapshot_runtime(true);
     constexpr std::string_view kRoot = "snapshots";
     FakeBackend backend;
     RecordingObjectStore object_store;
@@ -171,6 +173,12 @@ TEST(BatchOpLogSnapshotGcTest, DeletesOnlyUnprotectedAttempt) {
                                                   std::string(kRoot))
                                  .Run(*lease, descriptor_json, std::nullopt));
     ASSERT_EQ(1U, object_store.deleted.size());
+    EXPECT_EQ(
+        1u,
+        HAMetricManager::instance().get_snapshot_runtime().gc_orphan_prefixes);
+    EXPECT_EQ(
+        1u,
+        HAMetricManager::instance().get_snapshot_runtime().gc_deleted_prefixes);
     EXPECT_EQ(stale_prefix, object_store.deleted.front());
 }
 
