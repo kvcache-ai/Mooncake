@@ -129,32 +129,33 @@ classDiagram
         +TriggerPrefetch(keys)
         +RunLocalPrefetch(keys, sizes)
         +WaitIfPromotionInFlight(key, budget_ms)
-        -ThreadPool prefetch_pool_ (4)
+        -ThreadPool prefetch_pool_
     }
     class PrefetchThrottle {
-        +reserve(keys) keys'
-        +enterCooldown() / inCooldown()
-        +waitForCompletion(key, budget)
-        -Shard[16] entries
+        +reserve(keys) keys
+        +enterCooldown()
+        +inCooldown() bool
+        +waitForCompletion(key, budget) bool
+        -Shard shards_
     }
     class FileStorage {
-        +PrefetchKeys(keys, sizes, *dram_pressure, cb)
-        +LookupLocalObjectSize(key)
-        #PromoteOneKeyFromLocalDisk(key, tenant, size)
+        +PrefetchKeys(keys, sizes, dram_pressure, on_key_done)
+        +LookupLocalObjectSize(key) size
+        -PromoteOneKeyFromLocalDisk(key, tenant_id, size, dram_pressure)
     }
     class MasterService {
-        +RegisterPrefetchTask(client_id, key, tenant)
-        +NotifyPromotionSuccess(...)
-        -promotion_tasks : map~key, PromotionTask~
+        +RegisterPrefetchTask(client_id, key, tenant_id)
+        +NotifyPromotionSuccess(client_id, key, tenant_id)
+        -promotion_tasks
     }
     class Client {
         +RegisterPrefetchTask(key)
         +BatchQueryReadOnly(keys)
     }
     SsdPrefetcher --> PrefetchThrottle
-    SsdPrefetcher --> Client : metadata / register
+    SsdPrefetcher --> Client : metadata and register
     SsdPrefetcher --> FileStorage : execute promotion
-    SsdPrefetcher ..> SsdPrefetcher : prefetch_offload_object RPC (remote holder)
+    SsdPrefetcher ..> SsdPrefetcher : prefetch_offload_object RPC to remote holder
     Client --> MasterService : additive RPCs
     FileStorage --> Client : promotion chain calls
 ```
@@ -163,29 +164,29 @@ classDiagram
 
 ```mermaid
 sequenceDiagram
-    participant E as Engine (exist probe)
+    participant E as Engine
     participant P as SsdPrefetcher
     participant T as PrefetchThrottle
     participant M as Master
-    participant H as Holder (local/remote)
+    participant H as Holder
 
-    E->>P: TriggerPrefetch(keys) [sync: no RPC]
-    P->>T: reserve(keys) — TTL dedup, local+remote alike
+    E->>P: TriggerPrefetch(keys), sync, no RPC
+    P->>T: reserve(keys), TTL dedup for local and remote alike
     T-->>P: unseen subset
-    P->>P: enqueue pool job (caller returns here)
+    P->>P: enqueue pool job, caller returns here
     loop per 128-key chunk
-        P->>M: BatchQueryReadOnly (no lease / no promotion / no metrics)
+        P->>M: BatchQueryReadOnly, no lease, no promotion, no metrics
         M-->>P: replica descriptors
-        P->>P: ClassifySsdPrefetchRoute (SSD-only, COMPLETE, size>0)
+        P->>P: ClassifySsdPrefetchRoute, SSD-only, COMPLETE, size above 0
     end
     alt local holder
-        P->>H: LookupLocalObjectSize (authoritative, not the caller's hint)
-        H->>M: RegisterPrefetchTask (holder client_id, tenant)
-        M-->>H: OK / PROMOTION_ALREADY_EXISTS (skip quietly)
-        H->>H: PrefetchKeys → PromoteOneKeyFromLocalDisk
-        H->>M: NotifyPromotionSuccess → grant read lease (from_prefetch)
+        P->>H: LookupLocalObjectSize, authoritative
+        H->>M: RegisterPrefetchTask with holder client_id and tenant
+        M-->>H: OK, or PROMOTION_ALREADY_EXISTS meaning skip quietly
+        H->>H: PrefetchKeys then PromoteOneKeyFromLocalDisk
+        H->>M: NotifyPromotionSuccess, grant read lease from_prefetch
     else remote holder
-        P->>H: prefetch_offload_object RPC (additive; old peers drop)
+        P->>H: prefetch_offload_object RPC, additive, old peers drop
         Note over H: holder runs the same local branch<br/>with its own client_id
     end
 ```
@@ -206,7 +207,7 @@ stateDiagram-v2
     kFailed --> [*] : cooldown-length backoff, then retryable
     kCompleted --> [*] : dedup TTL, then re-prefetchable
     kAlreadyResident --> [*] : dedup TTL
-    kDelegated --> [*] : dedup TTL (holder owns execution state)
+    kDelegated --> [*] : dedup TTL, holder owns execution state
 ```
 
 Dedup windows per state (see `EntryExpired`): healthy states block
@@ -232,11 +233,11 @@ flowchart TD
     E -- yes --> X4[PROMOTION_ALREADY_EXISTS<br/>caller skips quietly]
     E -- no --> F{COMPLETE LOCAL_DISK source?}
     F -- no --> X3
-    F -- yes --> G{holder_id == client_id?}
+    F -- yes --> G{"holder_id == client_id?"}
     G -- no --> X5[INVALID_PARAMS]
-    G -- yes --> H{promotion_in_flight <<br/>queue_limit?}
+    G -- yes --> H{promotion_in_flight<br/>queue limit?}
     H -- full --> X6[KEYS_ULTRA_LIMIT]
-    H -- pass --> I[pin source refcnt;<br/>emplace PromotionTask from_prefetch=true]
+    H -- pass --> I[pin source refcnt<br/>emplace PromotionTask from_prefetch=true]
 ```
 
 The task deliberately skips promotion-on-hit admission (frequency sketch,
@@ -259,13 +260,13 @@ sequenceDiagram
     participant M as Master
     F->>C: PromotionAllocStart(key, tenant, size)
     alt NO_AVAILABLE_HANDLE
-        C-->>F: error → *dram_pressure = true → throttle.enterCooldown()
+        C-->>F: error, set dram_pressure, throttle enters cooldown
     end
-    Note over F: PromotionStateGuard armed (RAII):<br/>any later failure → NotifyPromotionFailure
-    F->>F: AllocateBatch (staging) → BatchLoad (SSD read)
-    F->>C: PromotionWrite (TE write into staged replica)
+    Note over F: PromotionStateGuard armed (RAII) —<br/>any later failure triggers NotifyPromotionFailure
+    F->>F: AllocateBatch staging, then BatchLoad SSD read
+    F->>C: PromotionWrite, TE write into staged replica
     F->>C: NotifyPromotionSuccess
-    C->>M: replica COMPLETE; lease granted (from_prefetch)
+    C->>M: replica COMPLETE, lease granted from_prefetch
     Note over F: guard.Dismiss()
 ```
 
