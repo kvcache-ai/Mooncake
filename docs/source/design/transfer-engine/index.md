@@ -532,49 +532,6 @@ For the complete C++ API reference, see [Transfer Engine C++ API](../../api-refe
 ../../getting_started/supported-protocols
 :::
 
-## EFA Transport (AWS)
-
-:::{toctree}
-:maxdepth: 1
-
-efa_transport
-:::
-
-## Ascend Transport Component
-
-:::{toctree}
-:maxdepth: 1
-
-ascend_direct_transport
-ascend_transport
-heterogeneous_ascend
-:::
-
-## Sunrise Link Transport Component
-
-:::{toctree}
-:maxdepth: 1
-
-kunpeng_ub_transport
-sunrise_link_transport
-:::
-
-## FlagOS FlagCX Transport Component
-
-:::{toctree}
-:maxdepth: 1
-
-flagcx_transport
-:::
-
-## MPComm Transport Component
-
-::::{toctree}
-:maxdepth: 1
-
-mpcomm_transport
-::::
-
 ## Benchmark and Tuning Guide
 
 :::{toctree}
