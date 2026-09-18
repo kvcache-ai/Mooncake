@@ -458,3 +458,5 @@ foreach(
   ordered_oplog_writer_test)
   target_link_libraries(${target} PRIVATE Mooncake::xxhash)
 endforeach()
+
+add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)

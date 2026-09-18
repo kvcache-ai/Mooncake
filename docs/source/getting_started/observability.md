@@ -222,3 +222,46 @@ running.
 Set `MC_STORE_CLIENT_METRIC=0` to disable client metric collection. If the
 client HTTP server remains enabled while metrics are disabled, `/metrics` and
 `/metrics/summary` return HTTP 503 with `metrics not available`.
+
+
+### Master heartbeat observations
+
+Clients running the storage heartbeat expose two gauges through `/metrics`:
+
+| Metric | Meaning |
+|--------|---------|
+| `mooncake_client_master_heartbeat_status_ok` | Last observed Ping status: `1` for `OK`, `0` for `NEED_REMOUNT`. |
+| `mooncake_client_master_heartbeat_observation_timestamp_seconds` | Client-side Unix receive time, in seconds, of the same observation. |
+
+Both samples carry the existing client labels. They are absent before the first
+valid heartbeat, after a failed heartbeat or an unsupported status, and while
+reconnecting. Late responses from an older connection cannot restore the
+observation. A successful remount alone does not set the status to `1`; a later
+Ping must return `OK`.
+
+A client without storage may never start this heartbeat. Memory or LocalDisk
+mounts and DFS backend activation start the storage control plane; creating a
+request-only client does not. Missing samples mean **unknown or inapplicable**,
+not `NEED_REMOUNT`. Disabling client metrics also disables these observations.
+
+The timestamp is an observation value, not a Prometheus sample timestamp. An
+in-flight Ping can leave the previous observation visible until it completes,
+so check its age as well as its status. For example, for targets expected to
+run a storage heartbeat, this query selects a recent `NEED_REMOUNT` observation
+using an illustrative 10-second freshness limit:
+
+```promql
+(mooncake_client_master_heartbeat_status_ok == 0)
+and
+((time() - mooncake_client_master_heartbeat_observation_timestamp_seconds) < 10)
+```
+
+Choose the freshness limit for the heartbeat/RPC timeouts and scrape interval
+in your deployment, and account for clock skew. Do not replace missing status
+samples with zero. Prometheus `up` describes the HTTP scrape, not Master Ping
+success; missing or stale observations need separate handling.
+
+This is a sampled control-plane response. `OK` does not prove that every
+segment is mounted, that transfer metadata or SSD recovery is complete, or
+that data RPCs and RDMA transfers are healthy. The existing `/health` check
+can remain healthy when a successful Ping returns `NEED_REMOUNT`.
