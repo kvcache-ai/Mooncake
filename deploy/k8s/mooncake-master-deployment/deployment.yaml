@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mooncake-master
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9003"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: mooncake-master
+          image: mooncake-master
+          command: ["mooncake_master"]
+          args:
+            - "--config_path=/etc/mooncake/master.yaml"
+          env:
+            - name: MOONCAKE_SNAPSHOT_LOCAL_PATH
+              value: "/data/snapshots"
+          ports:
+            - name: rpc
+              containerPort: 50051
+              protocol: TCP
+            - name: metrics
+              containerPort: 9003
+              protocol: TCP
+            - name: metadata
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mooncake
+              readOnly: true
+            - name: snapshots
+              mountPath: /data/snapshots
+      volumes:
+        - name: config
+          configMap:
+            name: mooncake-master-config
+        - name: snapshots
+          persistentVolumeClaim:
+            claimName: mooncake-master-snapshots
