@@ -15,10 +15,14 @@
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
+/python/mooncake/buffer_pool.py @ykwd @stmatengss
 /python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/mooncake_config.py @ykwd @stmatengss
 /python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
+/python/tests/store/ @ykwd @stmatengss
+/python/tests/unit/test_mooncake_config.py @ykwd @stmatengss
 /python/mooncake/mooncake_ssd_*.py @ykwd @stmatengss
 /python/mooncake/spdk_tgt_create.py @ykwd @stmatengss
 /python/tests/ssd/ @ykwd @stmatengss

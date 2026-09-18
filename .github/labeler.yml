@@ -7,6 +7,10 @@ store:
   - changed-files:
     - any-glob-to-any-file:
       - 'mooncake-store/**/*'
+      - 'python/mooncake/buffer_pool.py'
+      - 'python/mooncake/mooncake_config.py'
+      - 'python/tests/store/**/*'
+      - 'python/tests/unit/test_mooncake_config.py'
       - 'python/mooncake/mooncake_ssd_*.py'
       - 'python/mooncake/spdk_tgt_create.py'
       - 'python/tests/ssd/**/*'

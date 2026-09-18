@@ -56,6 +56,7 @@ from pathlib import Path
 import sys
 import mooncake
 import mooncake.engine
+import mooncake.mooncake_config
 import mooncake.reshard
 import mooncake.store
 
@@ -66,6 +67,7 @@ assert metadata.version("mooncake-transfer-engine") == {_project_version(project
 assert "administration" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+assert mooncake.mooncake_config.MooncakeConfig is not None
 for ep_module in (
     "ep.py",
     "mooncake_ep_buffer.py",
