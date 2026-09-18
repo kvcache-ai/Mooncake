@@ -991,7 +991,7 @@ TEST_F(MasterServiceTest, MasterConfigParsesLocalFirstStrategy) {
     WrappedMasterServiceConfig wrapped_config(config, 0);
     MasterServiceConfig service_config(wrapped_config);
     EXPECT_EQ(service_config.allocation_strategy_type,
-              AllocationStrategyType::LOCAL_FIRST);
+              PlacementPolicyType::LOCAL_FIRST);
 }
 
 TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {

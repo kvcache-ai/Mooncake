@@ -90,13 +90,6 @@ class MasterServiceTestPeer {
 
     size_t SoftPinRegistrationCount() const;
 
-    static auto& AllocationStrategy(MasterService& service) {
-        return service.allocation_strategy_;
-    }
-    static const auto& AllocationStrategy(const MasterService& service) {
-        return service.allocation_strategy_;
-    }
-
     static auto& BatchOplogStorage(MasterService& service) {
         return service.batch_oplog_storage_;
     }

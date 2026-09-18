@@ -1692,7 +1692,7 @@ TEST_F(MasterServiceHATest,
        LocalFirstAllocationDoesNotReacquireClientLockUnderSnapshotBarrier) {
     MasterService service(
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build());
     const UUID client_id = generate_uuid();
     const std::string key = "local_first_lock_order_key";

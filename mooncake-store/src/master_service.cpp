@@ -173,21 +173,21 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
 }
 
 template <typename Allocate>
-auto WithPlacementPolicy(AllocationStrategyType type,
+auto WithPlacementPolicy(PlacementPolicyType type,
                          const LocalSsdManager& local_ssd,
                          Allocate&& allocate) {
     switch (type) {
-        case AllocationStrategyType::RANDOM:
+        case PlacementPolicyType::RANDOM:
             return allocate(RandomPlacementPolicy{});
-        case AllocationStrategyType::FREE_RATIO_FIRST:
+        case PlacementPolicyType::FREE_RATIO_FIRST:
             return allocate(FreeRatioFirstPlacementPolicy{});
-        case AllocationStrategyType::CXL:
+        case PlacementPolicyType::CXL:
             return allocate(
                 PreferredOnlyPlacementPolicy{AllocationCandidateKind::CXL});
-        case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
+        case PlacementPolicyType::SSD_FREE_RATIO_FIRST:
             return allocate(SsdFreeRatioFirstPlacementPolicy{
                 LocalSSDMetricsView(local_ssd)});
-        case AllocationStrategyType::LOCAL_FIRST:
+        case PlacementPolicyType::LOCAL_FIRST:
             return allocate(LocalFirstPlacementPolicy{});
     }
     return allocate(RandomPlacementPolicy{});
@@ -344,10 +344,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       memory_placement_policy_(config.enable_cxl
-                                   ? AllocationStrategyType::CXL
+                                   ? PlacementPolicyType::CXL
                                    : config.allocation_strategy_type),
-      allocation_strategy_(CreateAllocationStrategy(memory_placement_policy_,
-                                                    local_ssd_manager_)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       offloading_queue_limit_(config.offloading_queue_limit),
@@ -376,7 +374,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     } else {
         http_metadata_prefix_ = "mooncake/";
     }
-    if (memory_placement_policy_ == AllocationStrategyType::LOCAL_FIRST) {
+    if (memory_placement_policy_ == PlacementPolicyType::LOCAL_FIRST) {
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
 
@@ -1064,8 +1062,8 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    ScopedNoFSegmentAccess nof_segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
+    ScopedNoFSegmentWriteAccess nof_segment_access =
+        nof_segment_manager_.AcquireWriteAccess();
 
     LOG(INFO) << "NoF segment mount: "
               << "client_id=" << client_id
@@ -1353,8 +1351,8 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    ScopedNoFSegmentAccess nof_segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
+    ScopedNoFSegmentWriteAccess nof_segment_access =
+        nof_segment_manager_.AcquireWriteAccess();
     ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
@@ -1412,7 +1410,7 @@ std::string MasterService::ResolveWriterHostId(const UUID& client_id,
                                                const ReplicateConfig& config) {
     UpdateClientHostId(client_id, config.host_id);
     if (config.replica_num != 1 ||
-        (memory_placement_policy_ != AllocationStrategyType::LOCAL_FIRST &&
+        (memory_placement_policy_ != PlacementPolicyType::LOCAL_FIRST &&
          !config.prefer_alloc_in_same_node)) {
         return {};
     }
@@ -3203,8 +3201,6 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    size_t metrics_dec_capacity = 0;  // to update the metrics
-
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
@@ -3212,10 +3208,10 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 
     // 1. Prepare to unmount the segment by deleting its allocator
     {
-        ScopedNoFSegmentAccess segment_access =
-            nof_segment_manager_.getNoFSegmentAccess();
-        ErrorCode err = segment_access.PrepareUnmountSegment(
-            segment_id, metrics_dec_capacity);
+        ScopedNoFSegmentWriteAccess segment_access =
+            nof_segment_manager_.AcquireWriteAccess();
+        ErrorCode err =
+            segment_access.PrepareUnmountSegment(segment_id, client_id);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             // Return OK because this is an idempotent operation
             return {};
@@ -3230,10 +3226,9 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     ClearInvalidHandles(retaining_clients);
 
     // 3. Commit the unmount operation
-    ScopedNoFSegmentAccess segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
-    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                   metrics_dec_capacity);
+    ScopedNoFSegmentWriteAccess segment_access =
+        nof_segment_manager_.AcquireWriteAccess();
+    auto err = segment_access.CommitUnmountSegment(segment_id, client_id);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -4684,14 +4679,13 @@ tl::expected<Replica, ErrorCode> MasterService::AllocateMemoryReplicaFrom(
 
 tl::expected<std::vector<Replica>, ErrorCode>
 MasterService::AllocateNoFReplicas(const ReplicaAllocationRequest& request) {
-    auto access = nof_segment_manager_.getAllocatorAccess();
-    return allocation_strategy_->Allocate(
-        access.getAllocatorManager(), request.replicas.size,
-        request.replicas.count,
-        std::vector<std::string>(
-            request.placement.preferred_segment_names.begin(),
-            request.placement.preferred_segment_names.end()),
-        std::set<std::string>(), ReplicaType::NOF_SSD);
+    // LocalSSD ownership metrics rank memory placements, not NoF devices.
+    return WithPlacementPolicy(
+        memory_placement_policy_, local_ssd_manager_, [&](auto memory_policy) {
+            auto placement = nof_segment_manager_.AcquirePlacementAccess();
+            return ReplicaAllocator(MakeNoFPlacementPolicy(memory_policy))
+                .Allocate(placement, request);
+        });
 }
 
 auto MasterService::AllocateReplicas(const std::string& key,
@@ -4739,8 +4733,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
     }
 
 #ifdef USE_NOF
-    if (config.nof_replica_num > 0 &&
-        nof_segment_manager_.getMountedSegmentCount() > 0) {
+    if (config.nof_replica_num > 0) {
         const ReplicaAllocationRequest request{
             .replicas = {value_length, config.nof_replica_num,
                          ReplicaType::NOF_SSD},
@@ -5009,8 +5002,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 #ifndef USE_NOF
-    if (config.nof_replica_num > 0 &&
-        nof_segment_manager_.getMountedSegmentCount() > 0) {
+    if (config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
                    << ", nof_replica_num=" << config.nof_replica_num
                    << ", error=nof_pool_disabled";
@@ -5659,8 +5651,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 #ifndef USE_NOF
-    if (config.nof_replica_num > 0 &&
-        nof_segment_manager_.getMountedSegmentCount() > 0) {
+    if (config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
                    << ", nof_replica_num=" << config.nof_replica_num
                    << ", error=nof_pool_disabled";
@@ -12407,26 +12398,25 @@ bool MasterService::ProbeNoFSegment(const std::string& te_endpoint,
 bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     const MountedNoFSegmentSnapshot& snapshot,
     const std::string& error_reason) {
-    size_t metrics_dec_capacity = 0;
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
     {
-        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+        auto nof_segment_access = nof_segment_manager_.AcquireWriteAccess();
         ErrorCode err = nof_segment_access.PrepareUnmountSegment(
-            snapshot.segment_id, metrics_dec_capacity);
+            snapshot.segment.id, snapshot.client_id);
         if (err == ErrorCode::SEGMENT_NOT_FOUND ||
             err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
             std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-            nof_heartbeat_states_.erase(snapshot.segment_id);
-            VLOG(1) << "segment_id=" << snapshot.segment_id
+            nof_heartbeat_states_.erase(snapshot.segment.id);
+            VLOG(1) << "segment_id=" << snapshot.segment.id
                     << ", action=skip_nof_heartbeat_unmount"
                     << ", reason=" << toString(err);
             return false;
         }
         if (err != ErrorCode::OK) {
-            LOG(ERROR) << "segment_id=" << snapshot.segment_id
+            LOG(ERROR) << "segment_id=" << snapshot.segment.id
                        << ", segment_name=" << snapshot.segment.name
                        << ", error=prepare_unmount_nof_segment_by_"
                           "heartbeat_failed"
@@ -12438,11 +12428,11 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     ClearInvalidHandles(retaining_clients);
 
     {
-        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+        auto nof_segment_access = nof_segment_manager_.AcquireWriteAccess();
         ErrorCode err = nof_segment_access.CommitUnmountSegment(
-            snapshot.segment_id, snapshot.client_id, metrics_dec_capacity);
+            snapshot.segment.id, snapshot.client_id);
         if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_NOT_FOUND) {
-            LOG(ERROR) << "segment_id=" << snapshot.segment_id
+            LOG(ERROR) << "segment_id=" << snapshot.segment.id
                        << ", segment_name=" << snapshot.segment.name
                        << ", error=commit_unmount_nof_segment_by_"
                           "heartbeat_failed"
@@ -12453,11 +12443,11 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
 
     {
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-        nof_heartbeat_states_.erase(snapshot.segment_id);
+        nof_heartbeat_states_.erase(snapshot.segment.id);
     }
     MasterMetricManager::instance()
         .inc_nof_segments_unmounted_by_heartbeat_total();
-    LOG(INFO) << "segment_id=" << snapshot.segment_id
+    LOG(INFO) << "segment_id=" << snapshot.segment.id
               << ", client_id=" << snapshot.client_id
               << ", segment_name=" << snapshot.segment.name
               << ", endpoint=" << snapshot.segment.te_endpoint
@@ -12492,9 +12482,9 @@ void MasterService::NofHeartbeatThreadFunc() {
                     nof_heartbeat_interval_sec_);
             for (size_t i = 0; i < ok_segments.size(); ++i) {
                 const auto& snapshot = ok_segments[i];
-                live_segment_ids.insert(snapshot.segment_id);
+                live_segment_ids.insert(snapshot.segment.id);
                 auto [it, inserted] =
-                    nof_heartbeat_states_.try_emplace(snapshot.segment_id);
+                    nof_heartbeat_states_.try_emplace(snapshot.segment.id);
                 auto& state = it->second;
                 state.owner_client_id = snapshot.client_id;
                 state.segment_name = snapshot.segment.name;
@@ -12527,7 +12517,7 @@ void MasterService::NofHeartbeatThreadFunc() {
                         ok_segments[(next_probe_index + offset) %
                                     ok_segments.size()];
                     auto state_it =
-                        nof_heartbeat_states_.find(candidate.segment_id);
+                        nof_heartbeat_states_.find(candidate.segment.id);
                     if (state_it == nof_heartbeat_states_.end()) {
                         continue;
                     }
@@ -12562,7 +12552,7 @@ void MasterService::NofHeartbeatThreadFunc() {
             auto success_time = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-                auto it = nof_heartbeat_states_.find(probe_target->segment_id);
+                auto it = nof_heartbeat_states_.find(probe_target->segment.id);
                 if (it != nof_heartbeat_states_.end()) {
                     it->second.consecutive_failures = 0;
                     it->second.last_success_at = success_time;
@@ -12571,7 +12561,7 @@ void MasterService::NofHeartbeatThreadFunc() {
                         success_time + nof_heartbeat_interval_sec_;
                 }
             }
-            VLOG(1) << "segment_id=" << probe_target->segment_id
+            VLOG(1) << "segment_id=" << probe_target->segment.id
                     << ", segment_name=" << probe_target->segment.name
                     << ", endpoint=" << probe_target->segment.te_endpoint
                     << ", action=nof_heartbeat_success"
@@ -12592,7 +12582,7 @@ void MasterService::NofHeartbeatThreadFunc() {
             static_cast<int64_t>(nof_heartbeat_failures_threshold_);
         {
             std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-            auto it = nof_heartbeat_states_.find(probe_target->segment_id);
+            auto it = nof_heartbeat_states_.find(probe_target->segment.id);
             if (it != nof_heartbeat_states_.end()) {
                 it->second.consecutive_failures++;
                 failure_count = it->second.consecutive_failures;
@@ -12604,7 +12594,7 @@ void MasterService::NofHeartbeatThreadFunc() {
             }
         }
 
-        LOG(WARNING) << "segment_id=" << probe_target->segment_id
+        LOG(WARNING) << "segment_id=" << probe_target->segment.id
                      << ", segment_name=" << probe_target->segment.name
                      << ", endpoint=" << probe_target->segment.te_endpoint
                      << ", action=nof_heartbeat_failure"

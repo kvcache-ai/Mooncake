@@ -31,8 +31,7 @@ MasterServiceConfig OffloadForceEvictConfig() {
 // leases in the way, and the allocator ranking segments by SSD free ratio.
 MasterServiceConfig SsdAwareOffloadConfig() {
     MasterServiceConfig config = OffloadConfig(/*lease_ttl_ms=*/0);
-    config.allocation_strategy_type =
-        AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+    config.allocation_strategy_type = PlacementPolicyType::SSD_FREE_RATIO_FIRST;
     return config;
 }
 

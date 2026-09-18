@@ -14,7 +14,6 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     common/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
-    allocation_strategy.cpp
     allocator.cpp
     config/ha_cluster_namespace_config.cpp
     config/local_file_snapshot_config.cpp
@@ -37,7 +36,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/store_resource_snapshot_codec.cpp
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
-    segment.cpp
+    nof_segment_manager.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp
