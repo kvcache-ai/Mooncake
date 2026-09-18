@@ -282,7 +282,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // === LocalSSD persisted state ===
         {
             for (const auto& name : state.all_segments) {
-                auto client_id = MasterServiceTestPeer::SegmentPool(*service).AcquireReadAccess()
+                auto client_id = MasterServiceTestPeer::SegmentPool(*service)
+                                     .AcquireReadAccess()
                                      .Catalog()
                                      .FindOwnerClientId(name);
                 if (client_id) {
@@ -757,11 +758,15 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     static void AssertRestoredClientAffiliations(MasterService* service) {
         std::unordered_set<const ClientLivenessRecord*> known_records;
         {
-            auto segment_access = MasterServiceTestPeer::SegmentPool(*service).AcquireReadAccess();
+            auto segment_access = MasterServiceTestPeer::SegmentPool(*service)
+                                      .AcquireReadAccess();
             for (const auto& region : segment_access.Catalog().Regions()) {
                 const auto record =
-                    MasterServiceTestPeer::ClientLivenessRecords(*service).find(region.client_id);
-                ASSERT_NE(record, MasterServiceTestPeer::ClientLivenessRecords(*service).end());
+                    MasterServiceTestPeer::ClientLivenessRecords(*service).find(
+                        region.client_id);
+                ASSERT_NE(record,
+                          MasterServiceTestPeer::ClientLivenessRecords(*service)
+                              .end());
                 known_records.insert(record->second.get());
             }
         }

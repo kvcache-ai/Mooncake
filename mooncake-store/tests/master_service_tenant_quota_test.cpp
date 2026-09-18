@@ -375,7 +375,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         segment.te_endpoint = segment.name;
         next_segment_offset_ += size + 4096;
 
-        auto segment_access = MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        auto segment_access =
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
         return segment_access.MountSegment(segment, generate_uuid());
     }
 
