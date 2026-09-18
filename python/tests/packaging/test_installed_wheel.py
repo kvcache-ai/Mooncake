@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
@@ -38,6 +39,8 @@ def test_wheel_imports_outside_the_repository(
 
     wheel = Path(wheel_value).resolve()
     assert wheel.is_file(), f"wheel does not exist: {wheel}"
+    with zipfile.ZipFile(wheel) as archive:
+        assert "mooncake/shared_segment.py" in archive.namelist()
 
     environment = tmp_path / "environment"
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
@@ -57,6 +60,7 @@ import sys
 import mooncake
 import mooncake.engine
 import mooncake.reshard
+import mooncake.shared_segment
 import mooncake.store
 
 package_path = Path(mooncake.__file__).resolve()
@@ -66,6 +70,9 @@ assert metadata.version("mooncake-transfer-engine") == {_project_version(project
 assert "administration" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+assert mooncake.shared_segment.SharedSegment is not None
+assert isinstance(mooncake.shared_segment.shared_segment_supported(), bool)
+assert Path(mooncake.shared_segment.__file__).resolve().parent == package_path.parent
 for ep_module in (
     "ep.py",
     "mooncake_ep_buffer.py",
