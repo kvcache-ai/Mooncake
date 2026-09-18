@@ -858,6 +858,7 @@ When to bump the version:
 
 ssd-offload
 ssd-free-ratio-first-allocation
+nvme-kv-backend
 engram
 
 :::
