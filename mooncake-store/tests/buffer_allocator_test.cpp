@@ -9,6 +9,8 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -503,6 +505,421 @@ TEST_F(BufferAllocatorTest, CachelibImportRejectsNonMemoryReplicaType) {
     EXPECT_FALSE(ImportCachelibBufferAllocator("cachelib-memory-only", kBase,
                                                kCapacity, endpoint, allocations,
                                                ReplicaType::NOF_SSD)
+                     .has_value());
+}
+
+// ============================================================================
+// E01: requested size vs allocator-reserved size
+// ============================================================================
+
+namespace {
+
+// 512 MiB of synthetic address space. Only SlabHeader metadata is really
+// allocated; the region itself is never dereferenced, exactly like the
+// existing import tests.
+constexpr size_t kE01CachelibCapacity = 32 * facebook::cachelib::Slab::kSize;
+
+// Independent oracle for a CacheLib chunk extent: the allocation-class set the
+// allocator was configured with. It is read from the configuration, never from
+// the chunk being checked.
+size_t ExpectedCachelibReserved(size_t requested) {
+    static const std::set<uint32_t> kAllocSizes =
+        facebook::cachelib::MemoryAllocator::generateAllocSizes();
+    const size_t padded =
+        std::max<size_t>(requested, static_cast<size_t>(kMinSliceSize));
+    const auto it = kAllocSizes.lower_bound(static_cast<uint32_t>(padded));
+    return it == kAllocSizes.end() ? 0 : static_cast<size_t>(*it);
+}
+
+}  // namespace
+
+// T01/T13: CacheLib exposes the real allocation-class chunk while the transfer
+// length stays the requested byte count.
+TEST_F(BufferAllocatorTest, E01CachelibReservedMatchesAllocationClass) {
+    const std::string segment = "e01-cachelib-reserved";
+    auto created = CachelibBufferAllocator::Create(
+        segment, 0x200000000ULL, kE01CachelibCapacity, segment);
+    ASSERT_TRUE(created.has_value());
+
+    const std::vector<size_t> requests = {
+        1, 64, 72, 477, 4096, 4097, 24576, 100000, 1024 * 1024 + 1};
+    for (const size_t request : requests) {
+        auto buffer = (*created)->allocate(request);
+        ASSERT_NE(buffer, nullptr) << "request=" << request;
+        EXPECT_EQ(buffer->requested_size(), request);
+        EXPECT_EQ(buffer->size(), request);
+        ASSERT_TRUE(buffer->reserved_size().has_value())
+            << "request=" << request;
+        const size_t reserved = *buffer->reserved_size();
+        EXPECT_GE(reserved, request) << "request=" << request;
+        EXPECT_EQ(reserved, ExpectedCachelibReserved(request))
+            << "request=" << request;
+        // A single chunk is never reported as a whole slab.
+        EXPECT_LT(reserved, facebook::cachelib::Slab::kSize)
+            << "request=" << request;
+        // The transfer descriptor keeps the requested length, not padded bytes.
+        EXPECT_EQ(buffer->get_descriptor().size_, request);
+    }
+}
+
+// T02/T13: Offset reports the real node extent; the free-space drop is an
+// independent oracle for it.
+TEST_F(BufferAllocatorTest, E01OffsetReservedMatchesNodeExtent) {
+    constexpr size_t kCapacity = 16 * 1024 * 1024;
+    const std::string segment = "e01-offset-reserved";
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        segment, 0x240000000ULL, kCapacity, segment);
+    auto internal = allocator->getOffsetAllocator();
+
+    const std::vector<size_t> requests = {1, 64, 477, 4096, 4097, 100000};
+    for (const size_t request : requests) {
+        const uint64_t free_before = internal->storageReport().totalFreeSpace;
+        auto buffer = allocator->allocate(request);
+        ASSERT_NE(buffer, nullptr) << "request=" << request;
+        const uint64_t free_after = internal->storageReport().totalFreeSpace;
+        EXPECT_EQ(buffer->requested_size(), request);
+        EXPECT_EQ(buffer->size(), request);
+        ASSERT_TRUE(buffer->reserved_size().has_value())
+            << "request=" << request;
+        const size_t reserved = *buffer->reserved_size();
+        EXPECT_GE(reserved, request) << "request=" << request;
+        EXPECT_EQ(static_cast<uint64_t>(reserved), free_before - free_after)
+            << "request=" << request;
+        EXPECT_EQ(buffer->get_descriptor().size_, request);
+    }
+}
+
+// T03: the multiplier path of a segment larger than the largest bin. No large
+// payload is ever allocated; only synthetic offsets are used.
+TEST_F(BufferAllocatorTest, E01OffsetMultiplierReservedExtent) {
+    constexpr size_t kCapacity = 8ULL * 1024 * 1024 * 1024;  // 8 GiB synthetic
+    const std::string segment = "e01-offset-multiplier";
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        segment, 0x400000000ULL, kCapacity, segment);
+    auto internal = allocator->getOffsetAllocator();
+    const size_t request = 3ULL * 1024 * 1024 * 1024 + 4096;  // > 2 GiB
+
+    const uint64_t free_before = internal->storageReport().totalFreeSpace;
+    auto buffer = allocator->allocate(request);
+    ASSERT_NE(buffer, nullptr);
+    const uint64_t free_after = internal->storageReport().totalFreeSpace;
+    ASSERT_TRUE(buffer->reserved_size().has_value());
+    EXPECT_GE(*buffer->reserved_size(), request);
+    EXPECT_EQ(static_cast<uint64_t>(*buffer->reserved_size()),
+              free_before - free_after);
+    // The multiplier must actually be engaged for this segment size: the
+    // smallest request already occupies a quantum larger than one byte, and
+    // that quantum divides the reported extent.
+    const uint64_t quantum = internal->normalizedAllocationSize(1);
+    EXPECT_GT(quantum, 1U) << "size multiplier must be engaged for 8 GiB";
+    EXPECT_EQ(quantum & (quantum - 1), 0U) << "quantum must be a power of two";
+    EXPECT_EQ(internal->normalizedAllocationSize(request) % quantum, 0U);
+    EXPECT_EQ(*buffer->reserved_size() % quantum, 0U);
+}
+
+// T06 (continued): self-move assignment must be a no-op, not a release.
+TEST_F(BufferAllocatorTest, E01SelfMoveAssignmentKeepsTheAllocation) {
+    for (const auto& allocator_type : allocator_types_) {
+        const size_t capacity = allocator_type == BufferAllocatorType::CACHELIB
+                                    ? kE01CachelibCapacity
+                                    : 16 * 1024 * 1024;
+        auto allocator =
+            CreateTestAllocator("e01-self-move", 0, capacity, allocator_type);
+
+        auto buffer = allocator->allocate(4096);
+        ASSERT_NE(buffer, nullptr);
+        ASSERT_TRUE(buffer->reserved_size().has_value());
+        const size_t reserved = *buffer->reserved_size();
+
+        // Obscured behind a pointer so the compiler cannot fold this into a
+        // trivially diagnosable self-move.
+        auto self_assign = [](AllocatedBuffer& target) {
+            AllocatedBuffer* alias = &target;
+            target = std::move(*alias);
+        };
+        self_assign(*buffer);
+
+        EXPECT_EQ(buffer->requested_size(), 4096U);
+        ASSERT_TRUE(buffer->reserved_size().has_value());
+        EXPECT_EQ(*buffer->reserved_size(), reserved);
+        EXPECT_EQ(allocator->size(), 4096U)
+            << "a self-move must not release the allocation";
+
+        buffer.reset();
+        EXPECT_EQ(allocator->size(), 0U);
+    }
+}
+
+// T14 (metadata half): a CXL offset is not a normal virtual address, so it must
+// not be attributed to CacheLib allocation metadata. The accounting fields and
+// the transfer length must survive the rewrite unchanged.
+TEST_F(BufferAllocatorTest, E01CxlOffsetIsNotAttributedToAllocatorMetadata) {
+    constexpr uintptr_t kBase = 0x200000000ULL;
+    const std::string endpoint = "e01-cxl-endpoint";
+    auto created = CachelibBufferAllocator::Create(
+        "e01-cxl", kBase, 4 * facebook::cachelib::Slab::kSize, endpoint);
+    ASSERT_TRUE(created.has_value());
+
+    auto buffer = (*created)->allocate(477);
+    ASSERT_NE(buffer, nullptr);
+    ASSERT_TRUE(buffer->reserved_size().has_value());
+    const size_t reserved = *buffer->reserved_size();
+    void* const real_address = buffer->data();
+    // Before the rewrite the address is attributable.
+    ASSERT_TRUE((*created)->lookupReservedSize(real_address).has_value());
+
+    buffer->change_to_cxl("e01-cxl-segment");
+
+    EXPECT_EQ(buffer->requested_size(), 477U);
+    EXPECT_EQ(buffer->size(), 477U);
+    ASSERT_TRUE(buffer->reserved_size().has_value());
+    EXPECT_EQ(*buffer->reserved_size(), reserved);
+    const auto descriptor = buffer->get_descriptor();
+    EXPECT_EQ(descriptor.size_, 477U);
+    EXPECT_EQ(descriptor.protocol_, "cxl");
+    EXPECT_EQ(descriptor.transport_endpoint_, "e01-cxl-segment");
+    EXPECT_NE(buffer->data(), real_address);
+    // The rewritten address is an offset, so it must stay unattributable
+    // rather than be interpreted as a slab address.
+    EXPECT_FALSE((*created)->lookupReservedSize(buffer->data()).has_value());
+    // And the real address is still recoverable for the free path.
+    EXPECT_EQ(buffer->get_vaddr_from_cxl(), real_address);
+}
+
+// T04: zero-length behaviour stays per-backend and matches baseline.
+TEST_F(BufferAllocatorTest, E01ZeroLengthSemanticsAreUnchanged) {
+    // CacheLib pads a zero request to kMinSliceSize and hands out a chunk.
+    {
+        const std::string segment = "e01-zero-cachelib";
+        auto created = CachelibBufferAllocator::Create(
+            segment, 0x280000000ULL, kE01CachelibCapacity, segment);
+        ASSERT_TRUE(created.has_value());
+        auto buffer = (*created)->allocate(0);
+        ASSERT_NE(buffer, nullptr);
+        EXPECT_EQ(buffer->requested_size(), 0U);
+        EXPECT_EQ(buffer->size(), 0U);
+        ASSERT_TRUE(buffer->reserved_size().has_value());
+        EXPECT_EQ(*buffer->reserved_size(), ExpectedCachelibReserved(0));
+        EXPECT_GE(*buffer->reserved_size(), static_cast<size_t>(kMinSliceSize));
+    }
+    // The offset allocator rejects a zero request outright.
+    {
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            "e01-zero-offset", 0x2C0000000ULL, 1024 * 1024, "e01-zero-offset");
+        EXPECT_EQ(allocator->allocate(0), nullptr);
+        EXPECT_EQ(allocator->size(), 0U);
+    }
+}
+
+// T05: a failed allocation leaves no chunk, buffer or accounting behind.
+TEST_F(BufferAllocatorTest, E01FailedAllocationLeavesNoResidue) {
+    for (const auto& allocator_type : allocator_types_) {
+        const size_t capacity = allocator_type == BufferAllocatorType::CACHELIB
+                                    ? kE01CachelibCapacity
+                                    : 16 * 1024 * 1024;
+        auto allocator =
+            CreateTestAllocator("e01-failure", 0, capacity, allocator_type);
+        ASSERT_EQ(allocator->size(), 0U);
+
+        auto too_large = allocator->allocate(capacity * 2);
+        EXPECT_EQ(too_large, nullptr);
+        EXPECT_EQ(allocator->size(), 0U);
+
+        auto live = allocator->allocate(4096);
+        ASSERT_NE(live, nullptr);
+        ASSERT_TRUE(live->reserved_size().has_value());
+        EXPECT_GE(*live->reserved_size(), 4096U);
+        EXPECT_EQ(allocator->size(), 4096U);
+        live.reset();
+        EXPECT_EQ(allocator->size(), 0U);
+    }
+}
+
+// T06: object-level move carries both extents and releases each chunk once.
+TEST_F(BufferAllocatorTest, E01MoveTransfersBothExtentsWithoutDoubleRelease) {
+    for (const auto& allocator_type : allocator_types_) {
+        const size_t capacity = allocator_type == BufferAllocatorType::CACHELIB
+                                    ? kE01CachelibCapacity
+                                    : 16 * 1024 * 1024;
+        auto allocator =
+            CreateTestAllocator("e01-move", 0, capacity, allocator_type);
+
+        {
+            auto source = allocator->allocate(4096);
+            ASSERT_NE(source, nullptr);
+            ASSERT_TRUE(source->reserved_size().has_value());
+            const size_t source_reserved = *source->reserved_size();
+            EXPECT_EQ(allocator->size(), 4096U);
+
+            // Move construction.
+            AllocatedBuffer moved(std::move(*source));
+            source.reset();  // moved-from: owns nothing, must not free
+            EXPECT_EQ(moved.requested_size(), 4096U);
+            EXPECT_EQ(moved.size(), 4096U);
+            ASSERT_TRUE(moved.reserved_size().has_value());
+            EXPECT_EQ(*moved.reserved_size(), source_reserved);
+            EXPECT_EQ(allocator->size(), 4096U);
+
+            // Move assignment over an occupied destination.
+            auto victim = allocator->allocate(8192);
+            ASSERT_NE(victim, nullptr);
+            EXPECT_EQ(allocator->size(), 4096U + 8192U);
+            AllocatedBuffer destination(std::move(*victim));
+            victim.reset();
+
+            destination = std::move(moved);
+            EXPECT_EQ(allocator->size(), 4096U)
+                << "the destination's previous chunk must be released once";
+            EXPECT_EQ(destination.requested_size(), 4096U);
+            ASSERT_TRUE(destination.reserved_size().has_value());
+            EXPECT_EQ(*destination.reserved_size(), source_reserved);
+
+            // The moved-from source owns nothing.
+            EXPECT_EQ(moved.requested_size(), 0U);
+            EXPECT_FALSE(moved.reserved_size().has_value());
+        }
+        EXPECT_EQ(allocator->size(), 0U)
+            << "every chunk must be released exactly once";
+    }
+}
+
+// T07: mixed allocate/free in several orders returns the requested aggregate
+// to the baseline and keeps the allocator usable.
+TEST_F(BufferAllocatorTest, E01MixedAllocateFreeReturnsUsageToBaseline) {
+    for (const auto& allocator_type : allocator_types_) {
+        const size_t capacity = allocator_type == BufferAllocatorType::CACHELIB
+                                    ? kE01CachelibCapacity
+                                    : 16 * 1024 * 1024;
+        auto allocator =
+            CreateTestAllocator("e01-churn", 0, capacity, allocator_type);
+
+        const std::vector<size_t> sizes = {1, 477, 4096, 4097, 100000, 1};
+        for (size_t round = 0; round < 3; ++round) {
+            std::vector<std::unique_ptr<AllocatedBuffer>> live;
+            for (const size_t size : sizes) {
+                auto buffer = allocator->allocate(size);
+                ASSERT_NE(buffer, nullptr)
+                    << "round=" << round << " size=" << size;
+                ASSERT_TRUE(buffer->reserved_size().has_value());
+                EXPECT_GE(*buffer->reserved_size(), size);
+                live.push_back(std::move(buffer));
+            }
+            if (round % 2 == 0) {
+                live.clear();  // reverse destruction order
+            } else {
+                while (!live.empty()) {
+                    live.pop_back();
+                }
+            }
+            EXPECT_EQ(allocator->size(), 0U) << "round=" << round;
+        }
+
+        auto after = allocator->allocate(4096);
+        ASSERT_NE(after, nullptr);
+        after.reset();
+        EXPECT_EQ(allocator->size(), 0U);
+    }
+}
+
+// T08: CacheLib import rebuilds the reserved extent from the imported class
+// metadata, not from the requested size.
+TEST_F(BufferAllocatorTest,
+       E01CachelibImportRebuildsReservedFromClassMetadata) {
+    constexpr uintptr_t kBase = 0x300000000ULL;
+    const std::string segment = "e01-cachelib-import";
+    auto created = CachelibBufferAllocator::Create(
+        segment, kBase, kE01CachelibCapacity, segment);
+    ASSERT_TRUE(created.has_value());
+
+    const std::vector<size_t> requests = {477, 4096, 100000};
+    std::vector<LiveAllocation> allocations;
+    std::vector<size_t> expected_reserved;
+    for (const size_t request : requests) {
+        auto buffer = (*created)->allocate(request);
+        ASSERT_NE(buffer, nullptr);
+        ASSERT_TRUE(buffer->reserved_size().has_value());
+        allocations.push_back(
+            ToLiveAllocation(kBase, buffer->get_descriptor()));
+        expected_reserved.push_back(*buffer->reserved_size());
+    }
+
+    auto restored = ImportCachelibBufferAllocator(
+        segment, kBase, kE01CachelibCapacity, segment, allocations);
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_EQ(restored->buffers.size(), requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        EXPECT_EQ(restored->buffers[i]->requested_size(), requests[i]);
+        ASSERT_TRUE(restored->buffers[i]->reserved_size().has_value()) << i;
+        EXPECT_EQ(*restored->buffers[i]->reserved_size(), expected_reserved[i])
+            << i;
+        EXPECT_EQ(*restored->buffers[i]->reserved_size(),
+                  ExpectedCachelibReserved(requests[i]))
+            << i;
+    }
+}
+
+// T09: Offset import rebuilds the extent from the reconstructed node.
+TEST_F(BufferAllocatorTest, E01OffsetImportRebuildsReservedFromNodeExtent) {
+    constexpr uintptr_t kBase = 0x340000000ULL;
+    constexpr size_t kCapacity = 16 * 1024 * 1024;
+    const std::string segment = "e01-offset-import";
+    auto created = CreateBufferAllocator(BufferAllocatorType::OFFSET, segment,
+                                         kBase, kCapacity, segment);
+    ASSERT_TRUE(created.has_value());
+    auto original = std::move(*created);
+
+    auto first = original->allocate(477);
+    auto hole = original->allocate(4096);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(hole, nullptr);
+    ASSERT_TRUE(first->reserved_size().has_value());
+    ASSERT_TRUE(hole->reserved_size().has_value());
+    const size_t first_reserved = *first->reserved_size();
+    EXPECT_GT(first_reserved, 477U);
+    std::vector<LiveAllocation> live = {
+        ToLiveAllocation(kBase, first->get_descriptor())};
+    hole.reset();
+
+    auto restored =
+        ImportOffsetBufferAllocator(segment, kBase, kCapacity, segment, live);
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_EQ(restored->buffers.size(), 1U);
+    EXPECT_EQ(restored->buffers[0]->requested_size(), 477U);
+    ASSERT_TRUE(restored->buffers[0]->reserved_size().has_value());
+    EXPECT_EQ(*restored->buffers[0]->reserved_size(), first_reserved);
+}
+
+// T11: a descriptor-only buffer keeps the reserved extent unknown instead of
+// pretending it equals the requested length.
+TEST_F(BufferAllocatorTest, E01DescriptorOnlyBufferKeepsReservedUnknown) {
+    constexpr uintptr_t kBase = 0x380000000ULL;
+    const std::string endpoint = "e01-descriptor-endpoint";
+    auto created = CachelibBufferAllocator::Create(
+        "e01-descriptor", kBase, 4 * facebook::cachelib::Slab::kSize, endpoint);
+    ASSERT_TRUE(created.has_value());
+
+    auto live = (*created)->allocate(477);
+    ASSERT_NE(live, nullptr);
+    ASSERT_TRUE(live->reserved_size().has_value());
+    const auto descriptor = live->get_descriptor();
+
+    // Standby NoF restore builds metadata-only buffers on a Dummy allocator.
+    auto dummy =
+        std::make_shared<DummyBufferAllocator>("e01-descriptor", endpoint);
+    AllocatedBuffer metadata_only(dummy, descriptor);
+    EXPECT_EQ(metadata_only.requested_size(), 477U);
+    EXPECT_EQ(metadata_only.size(), 477U);
+    EXPECT_FALSE(metadata_only.reserved_size().has_value());
+    EXPECT_EQ(metadata_only.get_descriptor().size_, 477U);
+    EXPECT_EQ(metadata_only.get_descriptor().transport_endpoint_, endpoint);
+}
+
+// T14: the base allocator's default lookup reports "unknown" instead of
+// inventing an extent for allocators without allocation metadata.
+TEST_F(BufferAllocatorTest, E01DefaultReservedLookupIsUnknown) {
+    DummyBufferAllocator dummy("e01-dummy", "e01-dummy-endpoint");
+    EXPECT_FALSE(dummy.lookupReservedSize(nullptr).has_value());
+    EXPECT_FALSE(dummy.lookupReservedSize(reinterpret_cast<const void*>(0x1234))
                      .has_value());
 }
 

@@ -486,22 +486,25 @@ OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
 // OffsetAllocationHandle implementation
 OffsetAllocationHandle::OffsetAllocationHandle(
     std::shared_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,
-    uint64_t base, uint64_t size)
+    uint64_t base, uint64_t size, std::optional<uint64_t> reserved_size)
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
       real_base(base),
-      requested_size(size) {}
+      requested_size(size),
+      reserved_size_(reserved_size) {}
 
 OffsetAllocationHandle::OffsetAllocationHandle(
     OffsetAllocationHandle&& other) noexcept
     : m_allocator(std::move(other.m_allocator)),
       m_allocation(other.m_allocation),
       real_base(other.real_base),
-      requested_size(other.requested_size) {
+      requested_size(other.requested_size),
+      reserved_size_(other.reserved_size_) {
     other.m_allocation = {OffsetAllocation::NO_SPACE,
                           OffsetAllocation::NO_SPACE};
     other.real_base = 0;
     other.requested_size = 0;
+    other.reserved_size_ = std::nullopt;
 }
 
 OffsetAllocationHandle& OffsetAllocationHandle::operator=(
@@ -518,12 +521,14 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
         m_allocation = other.m_allocation;
         real_base = other.real_base;
         requested_size = other.requested_size;
+        reserved_size_ = other.reserved_size_;
 
         // Reset other
         other.m_allocation = {OffsetAllocation::NO_SPACE,
                               OffsetAllocation::NO_SPACE};
         other.real_base = 0;
         other.requested_size = 0;
+        other.reserved_size_ = std::nullopt;
     }
     return *this;
 }
@@ -926,12 +931,21 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
 
     const uint64_t real_base =
         m_base + (allocation.getOffset() << m_multiplier_bits);
+
+    // Read the extent of the node that was actually handed out while the
+    // allocator lock is still held. This is the historical node size, not a
+    // re-derivation from the current rounding rules.
+    std::optional<uint64_t> reserved_size = std::nullopt;
+    const uint32 node_size = m_allocator->allocationSize(allocation);
+    if (node_size != 0) {
+        reserved_size = static_cast<uint64_t>(node_size) << m_multiplier_bits;
+    }
     guard.unlock();
 
     // Handle construction and shared_ptr reference-counting do not access
     // allocator state and should not extend the serialized critical section.
     return OffsetAllocationHandle(shared_from_this(), allocation, real_base,
-                                  size);
+                                  size, reserved_size);
 }
 
 uint64_t OffsetAllocator::normalizedAllocationSize(size_t size) const {
@@ -1093,8 +1107,27 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::createHandleAtNode(
     }
 
     OffsetAllocation allocation(node.dataOffset, node_index);
+    const auto reserved_size = static_cast<uint64_t>(node.dataSize)
+                               << m_multiplier_bits;
     return OffsetAllocationHandle(shared_from_this(), allocation, real_offset,
-                                  requested_size);
+                                  requested_size, reserved_size);
+}
+
+std::optional<uint64_t> OffsetAllocator::allocationReservedSize(
+    const OffsetAllocation& allocation) const {
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator || allocation.metadata == OffsetAllocation::NO_SPACE ||
+        allocation.metadata >= m_allocator->m_current_capacity) {
+        // Never index the node array with an unvalidated index.
+        return std::nullopt;
+    }
+    const auto& node = m_allocator->m_nodes[allocation.metadata];
+    if (!node.used || node.dataSize == 0) {
+        return std::nullopt;
+    }
+    // The persisted node is the authority for the extent this allocation
+    // occupies; current rounding rules must not be used to recompute it.
+    return static_cast<uint64_t>(node.dataSize) << m_multiplier_bits;
 }
 
 }  // namespace mooncake::offset_allocator
