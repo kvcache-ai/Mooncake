@@ -767,3 +767,14 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT)
   add_test(NAME tent_ascend_direct_transport_test
            COMMAND tent_ascend_direct_transport_test)
 endif()
+
+add_executable(tent_segment_desc_retry_test segment_desc_retry_test.cpp)
+target_link_libraries(tent_segment_desc_retry_test PRIVATE gtest gtest_main
+                                                           tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_segment_desc_retry_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_segment_desc_retry_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
+set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)

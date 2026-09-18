@@ -45,6 +45,16 @@ class EndpointTestAccess {
         endpoint.notify_connected_.store(true, std::memory_order_relaxed);
     }
 
+    static void beginDestroy(RdmaEndPoint& endpoint) {
+        endpoint.beginDestroy();
+    }
+
+    // Stands in for notification WRs posted on the notify QP whose
+    // completions the worker has not polled yet.
+    static void setNotifyInflight(RdmaEndPoint& endpoint, uint32_t count) {
+        endpoint.notify_inflight_.store(count, std::memory_order_release);
+    }
+
     static bool notifyConnected(const RdmaEndPoint& endpoint) {
         return endpoint.notify_connected_.load(std::memory_order_relaxed);
     }
@@ -379,6 +389,60 @@ TEST(EndpointLifecycleTest, ExternalOwnerCanReleaseAfterExplicitDeconstruct) {
 
     endpoint.reset();
     EXPECT_TRUE(weak.expired());
+}
+
+// Destroying the notify QP takes its completions with it, so an endpoint
+// whose notify CQ has not caught up is not finished yet. The data QPs have
+// their own counters; this is the notify side of the same gate.
+TEST(EndpointLifecycleTest, FinishDestroyWaitsForNotifyCompletions) {
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+    EndpointTestAccess::setNotifyInflight(endpoint, 3);
+    EndpointTestAccess::beginDestroy(endpoint);
+
+    EXPECT_FALSE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
+    endpoint.noteNotifyCompletion();
+    endpoint.noteNotifyCompletion();
+    EXPECT_FALSE(endpoint.finishDestroy());
+
+    endpoint.noteNotifyCompletion();
+    EXPECT_EQ(endpoint.notifyInflight(), 0u);
+    // Never below zero, whatever order the completions arrive in.
+    endpoint.noteNotifyCompletion();
+    EXPECT_EQ(endpoint.notifyInflight(), 0u);
+
+    EXPECT_TRUE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+}
+
+// A consumed notify RECV slot is posted again only while the endpoint is
+// ready and its notify QP connected. Retirement moves the QP to ERR, and so
+// does the local fault that disables notifications, so neither may re-arm.
+TEST(EndpointLifecycleTest, NotifyRecvIsRearmedOnlyWhileReady) {
+    using S = RdmaEndPoint;
+    EXPECT_TRUE(S::shouldRearmNotifyRecv(S::EP_READY, true));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_READY, false));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_DESTROYING, true));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_DESTROYED, false));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_HANDSHAKING, true));
+
+    // The states the endpoint actually passes through.
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+    EXPECT_TRUE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                         endpoint.notifyConnected()));
+    endpoint.disableNotification("test");
+    EXPECT_EQ(endpoint.status(), S::EP_READY);
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                          endpoint.notifyConnected()));
+    EndpointTestAccess::beginDestroy(endpoint);
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                          endpoint.notifyConnected()));
 }
 
 }  // namespace

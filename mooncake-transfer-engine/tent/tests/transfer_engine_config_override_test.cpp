@@ -286,7 +286,7 @@ TEST(TransferEngineConfigOverrideTest,
 TEST(TransferEngineConfigOverrideTest, LegacyForceTcpEnvOverridesTentConfig) {
     EnvVarGuard conf_guard(
         "MC_TENT_CONF",
-        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":true}}})");
+        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":true},"hp_tcp":{"enable":true}}})");
     EnvVarGuard force_tcp_guard("MC_FORCE_TCP", "1");
 
     Config config;
@@ -295,13 +295,14 @@ TEST(TransferEngineConfigOverrideTest, LegacyForceTcpEnvOverridesTentConfig) {
     EXPECT_TRUE(config.get("transports/force_tcp", false));
     EXPECT_TRUE(config.get("transports/tcp/enable", false));
     EXPECT_FALSE(config.get("transports/rdma/enable", true));
+    EXPECT_FALSE(config.get("transports/hp_tcp/enable", true));
 }
 
 TEST(TransferEngineConfigOverrideTest,
      ExplicitForceTcpSurvivesMcTentConfThroughConstructor) {
     EnvVarGuard conf_guard(
         "MC_TENT_CONF",
-        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":false},"mpcomm":{"enable":false},"io_uring":{"enable":false}},"metrics":{"enabled":false}})");
+        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":false},"hp_tcp":{"enable":true},"mpcomm":{"enable":false},"io_uring":{"enable":false}},"metrics":{"enabled":false}})");
 
     auto config = std::make_shared<Config>();
     config->set("metadata_type", "p2p");
@@ -316,6 +317,7 @@ TEST(TransferEngineConfigOverrideTest,
         EXPECT_TRUE(config->get("transports/force_tcp", false));
         EXPECT_TRUE(config->get("transports/tcp/enable", false));
         EXPECT_FALSE(config->get("transports/rdma/enable", true));
+        EXPECT_FALSE(config->get("transports/hp_tcp/enable", true));
     }
 }
 

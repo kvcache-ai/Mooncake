@@ -590,6 +590,9 @@ jobs:
               - '.github/workflows/**'
             tent:
               - 'mooncake-transfer-engine/**'
+              - 'mooncake-store/src/transfer_task.cpp'
+              - 'mooncake-store/tests/transfer_task_test.cpp'
+              - 'mooncake-store/tests/CMakeLists.txt'
               - 'mooncake-common/**'
               - 'extern/**'
               - 'cmake/**'
@@ -637,7 +640,7 @@ jobs:
             need_cuda: true
             metrics_flags: ''
           - name: cuda-off
-            cmake_flags: '-DUSE_CUDA=OFF'
+            cmake_flags: '-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON'
             need_cuda: false
             metrics_flags: ''
           - name: cuda-off-metrics-on
@@ -732,6 +735,13 @@ jobs:
         cargo test --lib
         cargo test --examples --tests --no-run
         cargo clean
+      shell: bash
+
+    - name: Test Store completion with TENT
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^transfer_task_tent_completion_test$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;

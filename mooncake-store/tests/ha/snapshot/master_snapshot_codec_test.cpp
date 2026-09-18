@@ -15,11 +15,14 @@
 #include "master_service.h"
 #include "segment/pool_read_access.h"
 #include "segment/pool_write_access.h"
+#include "master_service/master_service_test_peer.h"
 #include "task_manager.h"
 #include "tenant_id.h"
 #include "common/zstd_util.h"
 
 namespace mooncake::ha {
+
+using mooncake::test::MasterServiceTestPeer;
 
 class MasterSnapshotCodecTest : public ::testing::Test {
    protected:
@@ -34,18 +37,16 @@ class MasterSnapshotCodecTest : public ::testing::Test {
         return std::make_unique<MasterService>(config);
     }
 
-    // The fixture is befriended by MasterService, so private state access is
-    // funneled through this helper (friendship is not inherited by the
-    // TEST_F-generated subclasses).
+    // Assemble the codec state view through the shared test peer.
     static MasterSnapshotStateView MakeStateView(MasterService& service) {
-        return MasterSnapshotStateView(service, service.segment_pool_,
-                                       service.local_ssd_manager_,
-                                       service.task_manager_);
+        return MasterSnapshotStateView(service, MasterServiceTestPeer::SegmentPool(service),
+                                       MasterServiceTestPeer::LocalSsdManager(service),
+                                       MasterServiceTestPeer::TaskManager(service));
     }
 
     static int EncodeInForkWithPoolLocked(MasterService& service) {
-        std::unique_lock snapshot_lock(service.snapshot_mutex_);
-        auto pool_lock = service.segment_pool_.AcquireWriteAccess();
+        std::unique_lock snapshot_lock(MasterServiceTestPeer::SnapshotMutex(service));
+        auto pool_lock = MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
         const pid_t child = fork();
         if (child == 0) {
             alarm(5);
@@ -65,8 +66,8 @@ class MasterSnapshotCodecTest : public ::testing::Test {
     static std::shared_ptr<BufferAllocatorBase> RetireSegmentPool(
         MasterService& service, const UUID& segment_id) {
         auto allocator =
-            service.segment_pool_.AcquireReadAccess().GetAllocator(segment_id);
-        service.segment_pool_.AcquireWriteAccess().Clear();
+            MasterServiceTestPeer::SegmentPool(service).AcquireReadAccess().GetAllocator(segment_id);
+        MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess().Clear();
         return allocator;
     }
 
