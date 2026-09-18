@@ -44,6 +44,18 @@ std::string ValidateConfig(const ZMQClientConfig& config) {
     if (config.endpoint.empty()) {
         return "endpoint is required";
     }
+    if (config.replay_timeout <= std::chrono::milliseconds::zero()) {
+        return "replay_timeout must be positive";
+    }
+    if (config.replay_recovery_timeout <= std::chrono::milliseconds::zero()) {
+        return "replay_recovery_timeout must be positive";
+    }
+    if (config.max_recovery_buffered_messages == 0) {
+        return "max_recovery_buffered_messages must be positive";
+    }
+    if (config.max_recovery_buffered_bytes == 0) {
+        return "max_recovery_buffered_bytes must be positive";
+    }
     return "";
 }
 
@@ -131,43 +143,20 @@ void ZMQClient::HandleReconnect() {
     }
 
     int64_t last_seq;
-    std::deque<ReplayRange> pending_ranges;
+    bool stale;
     {
         std::shared_lock lock(mu_);
         last_seq = last_seq_;
-        pending_ranges = pending_replay_ranges_;
+        stale = stale_;
     }
-    if (ReplayEnabled(config_) && (last_seq >= 0 || !pending_ranges.empty())) {
-        bool replay_succeeded = true;
-        for (const auto& range : pending_ranges) {
-            LOG(INFO) << "Reconnected service=" << config_.cache_pool_key
-                      << " resuming_from=" << range.from
-                      << " resuming_until=" << range.until;
-            if (auto err = RequestReplay(range.from, range.until);
-                !err.empty()) {
-                LOG(WARNING) << "Failed to request replay after reconnect "
-                                "service="
-                             << config_.cache_pool_key << " from=" << range.from
-                             << " until=" << range.until << " error=" << err;
-                replay_succeeded = false;
-                break;
-            }
-            std::unique_lock lock(mu_);
-            if (!pending_replay_ranges_.empty() &&
-                pending_replay_ranges_.front().from == range.from &&
-                pending_replay_ranges_.front().until == range.until) {
-                pending_replay_ranges_.pop_front();
-            }
-        }
-        if (replay_succeeded && last_seq >= 0) {
-            const int64_t replay_from = last_seq + 1;
-            LOG(INFO) << "Reconnected service=" << config_.cache_pool_key
-                      << " resuming_from=" << replay_from;
-            if (auto err = RequestReplay(replay_from); !err.empty()) {
-                LOG(WARNING) << "Failed to request replay after reconnect "
-                                "service="
-                             << config_.cache_pool_key << " error=" << err;
-            }
+    if (ReplayEnabled(config_) && last_seq >= 0 &&
+        last_seq != std::numeric_limits<int64_t>::max() && !stale) {
+        LOG(INFO) << "Reconnected service=" << config_.cache_pool_key
+                  << " resuming_from=" << last_seq + 1;
+        StartRecovery("connection was interrupted");
+        if (auto err = AttemptRecovery(); !err.empty()) {
+            LOG(ERROR) << "Failed to process replay after reconnect service="
+                       << config_.cache_pool_key << " error=" << err;
         }
     }
 }
@@ -244,7 +233,7 @@ std::string ZMQClient::Consume() {
         ::zmq::pollitem_t items[] = {{socket->handle(), 0, ZMQ_POLLIN, 0}};
         const int rc = ::zmq::poll(items, 1, config_.poll_timeout);
         if (rc == 0) {
-            return "";  // No data, continue loop
+            return AttemptRecovery();
         }
         if (!(items[0].revents & ZMQ_POLLIN)) {
             return "";
@@ -296,24 +285,38 @@ std::string ZMQClient::ProcessMessage() {
     if (seq_msg.size() != 8) {
         return "invalid sequence length";
     }
-    const int64_t seq = static_cast<int64_t>(
-        BigEndianToU64(static_cast<const unsigned char*>(seq_msg.data())));
+    const uint64_t raw_seq =
+        BigEndianToU64(static_cast<const unsigned char*>(seq_msg.data()));
+    if (raw_seq > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return "sequence exceeds int64 range";
+    }
+    const int64_t seq = static_cast<int64_t>(raw_seq);
 
     const std::string topic(static_cast<const char*>(topic_msg.data()),
                             topic_msg.size());
-    int64_t last_seq;
+    int64_t last_live_seq;
+    bool stale;
     {
         std::shared_lock lock(mu_);
-        last_seq = last_seq_;
+        last_live_seq = last_live_seq_;
+        stale = stale_;
     }
 
-    const bool new_gap = last_seq != -1 && seq > last_seq + 1;
+    if (stale) {
+        VLOG(1) << "Dropping event from stale source service="
+                << config_.cache_pool_key << " seq=" << seq;
+        return "";
+    }
+
+    const bool new_gap = last_live_seq != -1 &&
+                         last_live_seq != std::numeric_limits<int64_t>::max() &&
+                         seq > last_live_seq + 1;
     if (new_gap) {
-        const int64_t missed = seq - last_seq - 1;
+        const int64_t missed = seq - last_live_seq - 1;
         const int64_t total = dropped_events_.fetch_add(missed) + missed;
         const int64_t gaps = gap_count_.fetch_add(1) + 1;
         LOG(WARNING) << "Event gap detected service=" << config_.cache_pool_key
-                     << " missed=" << missed << " last=" << last_seq
+                     << " missed=" << missed << " last=" << last_live_seq
                      << " current=" << seq << " cumulative_dropped=" << total
                      << " gaps=" << gaps;
         if (!ReplayEnabled(config_)) {
@@ -321,40 +324,59 @@ std::string ZMQClient::ProcessMessage() {
                          << " events are permanently lost from the index "
                             "service="
                          << config_.cache_pool_key;
-        } else {
-            std::unique_lock lock(mu_);
-            pending_replay_ranges_.push_back({last_seq + 1, seq});
+            MarkStale(
+                "sequence gap cannot be recovered without a replay "
+                "endpoint");
+            return "";
         }
     }
-
-    if (ReplayEnabled(config_)) {
-        while (true) {
-            ReplayRange range;
-            {
-                std::shared_lock lock(mu_);
-                if (pending_replay_ranges_.empty()) break;
-                range = pending_replay_ranges_.front();
-            }
-            if (auto err = RequestReplay(range.from, range.until);
-                !err.empty()) {
-                LOG(WARNING) << "Gap replay request failed service="
-                             << config_.cache_pool_key << " from=" << range.from
-                             << " until=" << range.until << " error=" << err;
-                break;
-            }
-            std::unique_lock lock(mu_);
-            if (!pending_replay_ranges_.empty() &&
-                pending_replay_ranges_.front().from == range.from &&
-                pending_replay_ranges_.front().until == range.until) {
-                pending_replay_ranges_.pop_front();
-            }
-        }
+    {
+        std::unique_lock lock(mu_);
+        last_live_seq_ = std::max(last_live_seq_, seq);
     }
 
-    UpdateLastSequence(seq);
-    return DispatchMessage(topic, seq,
-                           static_cast<const char*>(payload_msg.data()),
-                           payload_msg.size());
+    if (!ReplayEnabled(config_)) {
+        UpdateLastSequence(seq);
+        return DispatchMessage(topic, seq,
+                               static_cast<const char*>(payload_msg.data()),
+                               payload_msg.size());
+    }
+
+    std::string buffer_error;
+    if (!BufferMessage({.topic = topic,
+                        .sequence = seq,
+                        .payload = std::string(
+                            static_cast<const char*>(payload_msg.data()),
+                            payload_msg.size())},
+                       &buffer_error)) {
+        if (!buffer_error.empty()) {
+            MarkStale(buffer_error);
+            return "";
+        }
+        return AttemptRecovery();
+    }
+
+    bool allow_initial_baseline = false;
+    {
+        std::shared_lock lock(mu_);
+        allow_initial_baseline = last_seq_ == -1 && !recovery_in_progress_;
+    }
+    if (auto err = DrainBufferedMessages(allow_initial_baseline);
+        !err.empty()) {
+        return err;
+    }
+
+    bool gap_remains = false;
+    {
+        std::shared_lock lock(mu_);
+        gap_remains = !buffered_messages_.empty() && last_seq_ >= 0 &&
+                      last_seq_ != std::numeric_limits<int64_t>::max() &&
+                      buffered_messages_.begin()->first > last_seq_ + 1;
+    }
+    if (gap_remains) {
+        StartRecovery("live sequence gap detected");
+    }
+    return AttemptRecovery();
 }
 
 std::string ZMQClient::DispatchMessage(const std::string& topic,
@@ -428,31 +450,229 @@ void ZMQClient::UpdateLastSequence(int64_t sequence) {
     last_seq_ = std::max(last_seq_, sequence);
 }
 
-std::string ZMQClient::RequestReplay(int64_t from_seq,
-                                     std::optional<int64_t> until_seq) {
+bool ZMQClient::BufferMessage(BufferedMessage message, std::string* error) {
+    const size_t message_bytes = message.topic.size() + message.payload.size();
+    std::unique_lock lock(mu_);
+    if (stale_ || message.sequence <= last_seq_) {
+        return false;
+    }
+    if (const auto existing = buffered_messages_.find(message.sequence);
+        existing != buffered_messages_.end()) {
+        if (existing->second.payload != message.payload) {
+            *error = "conflicting payloads for sequence " +
+                     std::to_string(message.sequence);
+        }
+        return false;
+    }
+    if (buffered_messages_.size() + 1 >
+        config_.max_recovery_buffered_messages) {
+        *error = "recovery message buffer limit exceeded";
+        return false;
+    }
+    if (message_bytes > config_.max_recovery_buffered_bytes ||
+        buffered_message_bytes_ >
+            config_.max_recovery_buffered_bytes - message_bytes) {
+        *error = "recovery byte buffer limit exceeded";
+        return false;
+    }
+    buffered_message_bytes_ += message_bytes;
+    buffered_messages_.emplace(message.sequence, std::move(message));
+    return true;
+}
+
+std::string ZMQClient::DrainBufferedMessages(bool allow_initial_baseline) {
+    while (true) {
+        BufferedMessage message;
+        {
+            std::unique_lock lock(mu_);
+            if (stale_ || buffered_messages_.empty()) return "";
+
+            auto next = buffered_messages_.end();
+            if (last_seq_ == -1) {
+                if (!allow_initial_baseline) return "";
+                next = buffered_messages_.begin();
+            } else {
+                if (last_seq_ == std::numeric_limits<int64_t>::max()) {
+                    return "";
+                }
+                next = buffered_messages_.find(last_seq_ + 1);
+                if (next == buffered_messages_.end()) return "";
+            }
+
+            message = std::move(next->second);
+            buffered_message_bytes_ -=
+                message.topic.size() + message.payload.size();
+            buffered_messages_.erase(next);
+        }
+
+        if (auto err =
+                DispatchMessage(message.topic, message.sequence,
+                                message.payload.data(), message.payload.size());
+            !err.empty()) {
+            MarkStale("failed to dispatch buffered sequence " +
+                      std::to_string(message.sequence) + ": " + err);
+            return err;
+        }
+        UpdateLastSequence(message.sequence);
+        allow_initial_baseline = false;
+    }
+}
+
+void ZMQClient::StartRecovery(const std::string& reason) {
+    bool started = false;
+    {
+        std::unique_lock lock(mu_);
+        if (!stale_ && !recovery_in_progress_) {
+            recovery_in_progress_ = true;
+            recovery_deadline_ = std::chrono::steady_clock::now() +
+                                 config_.replay_recovery_timeout;
+            started = true;
+        }
+    }
+    if (started) {
+        LOG(WARNING) << "Starting bounded replay recovery service="
+                     << config_.cache_pool_key << " reason=" << reason
+                     << " timeout_ms="
+                     << config_.replay_recovery_timeout.count();
+    }
+}
+
+std::string ZMQClient::AttemptRecovery() {
+    if (!ReplayEnabled(config_)) return "";
+
+    while (true) {
+        int64_t from_seq;
+        std::optional<int64_t> until_seq;
+        std::chrono::steady_clock::time_point deadline;
+        {
+            std::shared_lock lock(mu_);
+            if (stale_ || !recovery_in_progress_) return "";
+            deadline = recovery_deadline_;
+            if (last_seq_ == std::numeric_limits<int64_t>::max()) {
+                lock.unlock();
+                MarkStale("sequence space exhausted during replay recovery");
+                return "";
+            }
+            from_seq = last_seq_ + 1;
+            if (!buffered_messages_.empty()) {
+                until_seq = buffered_messages_.begin()->first;
+            }
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            MarkStale("replay recovery deadline exceeded");
+            return "";
+        }
+
+        // A message may have become contiguous after replay records from the
+        // previous iteration were inserted.
+        if (until_seq.has_value() && *until_seq == from_seq) {
+            if (auto err = DrainBufferedMessages(); !err.empty()) return err;
+            continue;
+        }
+
+        auto result = RequestReplay(from_seq, until_seq, deadline);
+        if (!result.ok()) {
+            LOG(WARNING) << "Replay recovery request failed service="
+                         << config_.cache_pool_key << " from=" << from_seq
+                         << (until_seq.has_value()
+                                 ? " until=" + std::to_string(*until_seq)
+                                 : "")
+                         << " error=" << result.error;
+            if (result.failure == ReplayFailure::kUnrecoverable ||
+                std::chrono::steady_clock::now() >= deadline) {
+                MarkStale("unable to recover sequence range starting at " +
+                          std::to_string(from_seq) + ": " + result.error);
+            }
+            return "";
+        }
+
+        const int64_t before = GetLastSequence();
+        for (auto& message : result.messages) {
+            std::string buffer_error;
+            if (!BufferMessage(std::move(message), &buffer_error) &&
+                !buffer_error.empty()) {
+                MarkStale(buffer_error);
+                return "";
+            }
+        }
+        if (auto err = DrainBufferedMessages(); !err.empty()) return err;
+
+        bool gap_remains;
+        {
+            std::unique_lock lock(mu_);
+            if (stale_) return "";
+            gap_remains = !buffered_messages_.empty() && last_seq_ >= 0 &&
+                          last_seq_ != std::numeric_limits<int64_t>::max() &&
+                          buffered_messages_.begin()->first > last_seq_ + 1;
+            if (!gap_remains) {
+                recovery_in_progress_ = false;
+            }
+        }
+        if (!gap_remains) {
+            LOG(INFO) << "Replay recovery completed service="
+                      << config_.cache_pool_key
+                      << " last_sequence=" << GetLastSequence();
+            return "";
+        }
+        if (GetLastSequence() == before) {
+            MarkStale("replay completed without closing the sequence gap");
+            return "";
+        }
+    }
+}
+
+void ZMQClient::MarkStale(const std::string& reason) {
+    MessageMetadata metadata;
+    {
+        std::unique_lock lock(mu_);
+        if (stale_) return;
+        stale_ = true;
+        stale_reason_ = reason;
+        recovery_in_progress_ = false;
+        buffered_messages_.clear();
+        buffered_message_bytes_ = 0;
+        metadata = {
+            .publisher_kind = config_.publisher_kind,
+            .endpoint = config_.endpoint,
+            .topic = "",
+            .sequence = last_seq_,
+        };
+    }
+
+    LOG(ERROR) << "ZMQ event source marked stale service="
+               << config_.cache_pool_key << " endpoint=" << config_.endpoint
+               << " last_sequence=" << metadata.sequence
+               << " reason=" << reason;
+    if (event_handler_ != nullptr) {
+        event_handler_->OnSourceStale(config_.cache_pool_key, metadata, reason);
+    }
+}
+
+ZMQClient::ReplayResult ZMQClient::RequestReplay(
+    int64_t from_seq, std::optional<int64_t> until_seq,
+    std::chrono::steady_clock::time_point recovery_deadline) {
     ::zmq::socket_t* socket;
     {
         std::shared_lock lock(mu_);
         socket = replay_socket_.get();
     }
     if (socket == nullptr) {
-        return "replay socket is nil";
+        return {.error = "replay socket is nil",
+                .failure = ReplayFailure::kRetryable};
     }
 
-    auto fail = [this](std::string error) {
+    auto fail = [this](std::string error, ReplayFailure failure) {
         if (auto reset_error = ResetReplaySocket(); !reset_error.empty()) {
             error += "; failed to reset replay socket: " + reset_error;
         }
-        return error;
+        return ReplayResult{.error = std::move(error), .failure = failure};
     };
 
     unsigned char req[8];
     U64ToBigEndian(static_cast<uint64_t>(from_seq), req);
 
     try {
-        socket->set(::zmq::sockopt::rcvtimeo,
-                    static_cast<int>(config_.replay_timeout.count()));
-
         // A DEALER must add the empty delimiter that a REQ socket would add
         // automatically. vLLM's ROUTER expects [identity, empty, from_seq].
         const std::string empty;
@@ -461,60 +681,79 @@ std::string ZMQClient::RequestReplay(int64_t from_seq,
             ::zmq::buffer(req, sizeof(req)),
         };
         if (!::zmq::send_multipart(*socket, request)) {
-            return fail("failed to send replay request");
+            return fail("failed to send replay request",
+                        ReplayFailure::kRetryable);
         }
 
-        struct ReplayMessage {
-            int64_t sequence;
-            std::string payload;
-        };
-        std::vector<ReplayMessage> messages;
+        size_t existing_messages;
+        size_t existing_bytes;
+        {
+            std::shared_lock lock(mu_);
+            existing_messages = buffered_messages_.size();
+            existing_bytes = buffered_message_bytes_;
+        }
+
+        std::vector<BufferedMessage> messages;
+        size_t replay_bytes = 0;
         int64_t next_expected = from_seq;
         while (true) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= recovery_deadline) {
+                return fail("replay recovery deadline exceeded",
+                            ReplayFailure::kRetryable);
+            }
+            auto receive_timeout =
+                std::min(config_.replay_timeout,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                             recovery_deadline - now));
+            receive_timeout =
+                std::max(receive_timeout, std::chrono::milliseconds(1));
+            socket->set(
+                ::zmq::sockopt::rcvtimeo,
+                static_cast<int>(std::min<int64_t>(
+                    receive_timeout.count(), std::numeric_limits<int>::max())));
+
             std::vector<::zmq::message_t> frames;
             const auto frame_count = ::zmq::recv_multipart(
                 *socket, std::back_inserter(frames), ::zmq::recv_flags::none);
             if (!frame_count) {
-                return fail("failed to receive replay response: timed out");
+                return fail("failed to receive replay response: timed out",
+                            ReplayFailure::kRetryable);
             }
             // The ROUTER sends [identity, empty, sequence, payload]. The
             // DEALER strips only the routing identity.
             if (frames.size() != 3 || !frames[0].empty()) {
-                return fail("invalid replay response frame count or delimiter");
+                return fail("invalid replay response frame count or delimiter",
+                            ReplayFailure::kRetryable);
             }
 
             auto& seq_msg = frames[1];
             auto& payload_msg = frames[2];
             if (seq_msg.size() != 8) {
-                return fail("invalid replay sequence length");
+                return fail("invalid replay sequence length",
+                            ReplayFailure::kRetryable);
             }
             const uint64_t raw_seq = BigEndianToU64(
                 static_cast<const unsigned char*>(seq_msg.data()));
             if (raw_seq == std::numeric_limits<uint64_t>::max()) {
                 if (!payload_msg.empty()) {
-                    return fail("invalid replay end marker");
+                    return fail("invalid replay end marker",
+                                ReplayFailure::kRetryable);
                 }
                 if (until_seq.has_value() && next_expected < *until_seq) {
                     return fail(
-                        "replay buffer did not contain every missing sequence");
-                }
-                for (const auto& message : messages) {
-                    if (auto err = DispatchMessage("", message.sequence,
-                                                   message.payload.data(),
-                                                   message.payload.size());
-                        !err.empty()) {
-                        return fail("failed to process replay message: " + err);
-                    }
-                    UpdateLastSequence(message.sequence);
+                        "replay buffer did not contain every missing sequence",
+                        ReplayFailure::kUnrecoverable);
                 }
                 LOG(INFO) << "Replay completed service="
                           << config_.cache_pool_key << " from=" << from_seq
                           << " replayed=" << messages.size();
-                return "";
+                return {.messages = std::move(messages)};
             }
             if (raw_seq >
                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-                return fail("replay sequence exceeds int64 range");
+                return fail("replay sequence exceeds int64 range",
+                            ReplayFailure::kRetryable);
             }
 
             const int64_t replay_seq = static_cast<int64_t>(raw_seq);
@@ -526,20 +765,40 @@ std::string ZMQClient::RequestReplay(int64_t from_seq,
                 continue;
             }
             if (replay_seq > next_expected) {
-                return fail("replay response skipped a sequence");
+                return fail("replay response skipped a sequence",
+                            ReplayFailure::kUnrecoverable);
             }
             if (replay_seq == std::numeric_limits<int64_t>::max()) {
-                return fail("replay sequence cannot be incremented");
+                return fail("replay sequence cannot be incremented",
+                            ReplayFailure::kUnrecoverable);
             }
             next_expected = replay_seq + 1;
 
-            messages.push_back({.sequence = replay_seq,
+            const size_t payload_size = payload_msg.size();
+            const bool message_limit_exceeded =
+                existing_messages >= config_.max_recovery_buffered_messages ||
+                messages.size() >=
+                    config_.max_recovery_buffered_messages - existing_messages;
+            const bool byte_limit_exceeded =
+                existing_bytes > config_.max_recovery_buffered_bytes ||
+                replay_bytes >
+                    config_.max_recovery_buffered_bytes - existing_bytes ||
+                payload_size > config_.max_recovery_buffered_bytes -
+                                   existing_bytes - replay_bytes;
+            if (message_limit_exceeded || byte_limit_exceeded) {
+                return fail("replay response exceeds recovery buffer limits",
+                            ReplayFailure::kUnrecoverable);
+            }
+            replay_bytes += payload_size;
+            messages.push_back({.topic = "",
+                                .sequence = replay_seq,
                                 .payload = std::string(static_cast<const char*>(
                                                            payload_msg.data()),
-                                                       payload_msg.size())});
+                                                       payload_size)});
         }
     } catch (const ::zmq::error_t& e) {
-        return fail(std::string("replay request failed: ") + e.what());
+        return fail(std::string("replay request failed: ") + e.what(),
+                    ReplayFailure::kRetryable);
     }
 }
 
@@ -595,6 +854,16 @@ bool ZMQClient::IsConnected() const {
 int64_t ZMQClient::GetLastSequence() const {
     std::shared_lock lock(mu_);
     return last_seq_;
+}
+
+bool ZMQClient::IsStale() const {
+    std::shared_lock lock(mu_);
+    return stale_;
+}
+
+std::string ZMQClient::GetStaleReason() const {
+    std::shared_lock lock(mu_);
+    return stale_reason_;
 }
 
 }  // namespace mooncake::conductor::zmq
