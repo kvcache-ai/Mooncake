@@ -11,6 +11,7 @@ from ._compat import _strict_zip
 
 
 _MAX_HIGH_DIMENSIONAL_PAIRWISE_COMPARISONS = 1_000_000
+Box = tuple[tuple[int, ...], tuple[int, ...]]
 
 
 class LogicalBox(Protocol):
@@ -31,6 +32,42 @@ class OverlapRegion(Protocol):
 
     @property
     def overlap_shape(self) -> tuple[int, ...]: ...
+
+
+def box_intersection(
+    left_offset: tuple[int, ...],
+    left_shape: tuple[int, ...],
+    right_offset: tuple[int, ...],
+    right_shape: tuple[int, ...],
+) -> Box | None:
+    """Return the half-open intersection of two logical boxes.
+
+    This is shared by dense and sparse planners.  The helper deliberately
+    operates on the resource-neutral ``LogicalBox`` representation instead of
+    importing a weight-specific fragment type.
+    """
+
+    if not (
+        left_offset
+        and len(left_offset) == len(left_shape) == len(right_offset) == len(right_shape)
+    ):
+        raise ValueError("logical boxes must have the same non-zero rank")
+    if any(item < 0 for item in left_offset + right_offset):
+        raise ValueError("logical box offsets must be non-negative")
+    if any(item <= 0 for item in left_shape + right_shape):
+        raise ValueError("logical box shapes must be positive")
+    begin = tuple(
+        max(left, right) for left, right in _strict_zip(left_offset, right_offset)
+    )
+    end = tuple(
+        min(left_begin + left_extent, right_begin + right_extent)
+        for left_begin, left_extent, right_begin, right_extent in _strict_zip(
+            left_offset, left_shape, right_offset, right_shape
+        )
+    )
+    if any(begin_dim >= end_dim for begin_dim, end_dim in _strict_zip(begin, end)):
+        return None
+    return begin, end
 
 
 def box_contains(
@@ -256,8 +293,10 @@ def regions_exactly_cover(
 
 
 __all__ = [
+    "Box",
     "LogicalBox",
     "OverlapRegion",
+    "box_intersection",
     "box_contains",
     "boxes_exactly_cover",
     "boxes_overlap",
