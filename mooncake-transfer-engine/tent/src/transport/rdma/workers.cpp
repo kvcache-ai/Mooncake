@@ -773,6 +773,12 @@ void Workers::asyncPostSend() {
                     updateSliceStatus(slice, FAILED);
                 } else {
                     // The re-submit moves the count to the lane it lands on.
+                    // No endpoint was obtained, so this slice never reached the
+                    // wire on the rail admit() selected: clear any probe/trial
+                    // it armed so the rail is not stranded.
+                    if (auto* rail = slice->rail_monitor)
+                        rail->cancelProbe(slice->source_dev_id,
+                                          slice->target_dev_id);
                     submitFromTick(worker, slice);
                 }
             }
@@ -821,6 +827,11 @@ void Workers::asyncPostSend() {
                 discountFromOwner(worker, slice);
                 updateSliceStatus(slice, FAILED);
             } else {
+                // Rejected by hardware before reaching the wire: clear any
+                // probe/trial admit() armed on the selected rail.
+                if (auto* rail = slice->rail_monitor)
+                    rail->cancelProbe(slice->source_dev_id,
+                                      slice->target_dev_id);
                 submitFromTick(worker, slice);
             }
         }
@@ -1582,7 +1593,7 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     }
 
     if (gdr_excluded ||
-        !rail.available(slice->source_dev_id, slice->target_dev_id)) {
+        !rail.admit(slice->source_dev_id, slice->target_dev_id)) {
         VLOG(1) << "Optimal device pair not available: source_dev_id "
                 << slice->source_dev_id << ", target_dev_id "
                 << slice->target_dev_id;
@@ -1690,13 +1701,15 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         if (strictLocalNuma() &&
             source.topo->isCrossNuma(*source.topo_entry, sdev))
             continue;
-        bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
-                                      : rail_mon->available(sdev, tdev);
-
         // Skip NICs that cannot GPUDirect-DMA to the source/target GPU.
-        if (reachable && gdr_learned &&
+        // Checked BEFORE admit() so a probe/trial is never armed on a rail
+        // that GDR will reject -- arming then discarding would orphan the
+        // in-flight flag and strand the rail.
+        if (!same_machine && gdr_learned &&
             gdrPairExcluded(source, target, sdev, tdev, src_gpu, dst_gpu))
-            reachable = false;
+            continue;
+        bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
+                                      : rail_mon->admit(sdev, tdev);
 
         if (reachable) {
             // A retry gets here after the failure path returned the slice's
