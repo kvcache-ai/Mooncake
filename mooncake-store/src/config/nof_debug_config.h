@@ -1,16 +1,20 @@
 #pragma once
 
+#include <chrono>
+
 namespace mooncake {
 
 struct NoFDebugConfig {
     bool enabled = false;
-    int interval_ms = 1000;
+    std::chrono::milliseconds interval_ms{1000};
 
-    static bool ReadEnabledFromEnvironment();
-    static int ReadIntervalMsFromEnvironment();
     static bool IsEnabledAtFirstUse();
-    static int IntervalMsAtFirstUse();
+    static std::chrono::milliseconds IntervalMsAtFirstUse();
     static NoFDebugConfig FromEnvironment();
+
+   private:
+    static bool ReadEnabledFromEnvironment();
+    static std::chrono::milliseconds ReadIntervalMsFromEnvironment();
 };
 
 }  // namespace mooncake

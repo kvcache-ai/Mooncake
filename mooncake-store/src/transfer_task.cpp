@@ -47,7 +47,7 @@ static bool IsSpdkNofDebugEnabled() {
     return mooncake::NoFDebugConfig::IsEnabledAtFirstUse();
 }
 
-static int GetSpdkNofDebugIntervalMs() {
+static std::chrono::milliseconds GetSpdkNofDebugIntervalMs() {
     return mooncake::NoFDebugConfig::IntervalMsAtFirstUse();
 }
 
@@ -521,7 +521,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_debug_snapshot);
-            if (elapsed.count() >= GetSpdkNofDebugIntervalMs()) {
+            if (elapsed >= GetSpdkNofDebugIntervalMs()) {
                 for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx

@@ -22,18 +22,18 @@ bool NoFDebugConfig::ReadEnabledFromEnvironment() {
            normalized == "on";
 }
 
-int NoFDebugConfig::ReadIntervalMsFromEnvironment() {
+std::chrono::milliseconds NoFDebugConfig::ReadIntervalMsFromEnvironment() {
     const auto raw =
         Environ::Read(NoFDebugEnvironmentVariables::MC_NOF_DEBUG_INTERVAL_MS);
-    if (!raw) return 1000;
+    if (!raw) return std::chrono::milliseconds{1000};
 
     char* end = nullptr;
     const long parsed = std::strtol(raw->c_str(), &end, 10);
     if (end == raw->c_str() || (end != nullptr && *end != '\0') ||
         parsed <= 0) {
-        return 1000;
+        return std::chrono::milliseconds{1000};
     }
-    return static_cast<int>(parsed);
+    return std::chrono::milliseconds{static_cast<int>(parsed)};
 }
 
 bool NoFDebugConfig::IsEnabledAtFirstUse() {
@@ -41,8 +41,8 @@ bool NoFDebugConfig::IsEnabledAtFirstUse() {
     return enabled;
 }
 
-int NoFDebugConfig::IntervalMsAtFirstUse() {
-    static const int interval_ms = ReadIntervalMsFromEnvironment();
+std::chrono::milliseconds NoFDebugConfig::IntervalMsAtFirstUse() {
+    static const auto interval_ms = ReadIntervalMsFromEnvironment();
     return interval_ms;
 }
 
