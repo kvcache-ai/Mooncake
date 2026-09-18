@@ -34,10 +34,12 @@ echo "Verifying that import succeeds after installation..."
 python -c "import mooncake.engine" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
 python -c "import mooncake.mooncake_store_service" && echo "Success: Store REST service import succeeded after installation" || { echo "ERROR: Store REST service import failed after installation!"; exit 1; }
 python -c "import mooncake.reshard.weight" && echo "Success: Reshard import succeeded after installation" || { echo "ERROR: Reshard import failed after installation!"; exit 1; }
+python -c "import mooncake.cli, mooncake.cli_bench, mooncake.cli_client, mooncake.transfer_engine_topology_dump" && echo "Success: CLI imports succeeded after installation" || { echo "ERROR: CLI imports failed after installation!"; exit 1; }
 
 echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
+cp -r python/tests/unit test_env/unit_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cp -r python/tests/ssd test_env/ssd_tests
 cd test_env
@@ -47,7 +49,7 @@ python tests/test_fast_copy.py
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."
-python tests/test_mooncake_config.py
+python unit_tests/test_mooncake_config.py
 
 echo "Running reshard contract tests..."
 python -m pip install pytest hypothesis==6.141.0 paramiko
@@ -72,6 +74,10 @@ echo "Verifying mc_store_rest_server entry point..."
 which mc_store_rest_server || { echo "ERROR: mc_store_rest_server entry point not found!"; exit 1; }
 mc_store_rest_server --help >/dev/null
 echo "Success: mc_store_rest_server entry point found"
+echo "Verifying transfer_engine_topology_dump entry point..."
+transfer_engine_topology_dump --help >/dev/null
+python -m mooncake.transfer_engine_topology_dump --help >/dev/null
+echo "Success: transfer_engine_topology_dump entry point and module execution work"
 
 cd ..
 

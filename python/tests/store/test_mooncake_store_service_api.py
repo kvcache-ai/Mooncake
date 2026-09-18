@@ -19,7 +19,7 @@ for module_name in tuple(sys.modules):
     if module_name == "mooncake" or module_name.startswith("mooncake."):
         del sys.modules[module_name]
 mooncake_package = types.ModuleType("mooncake")
-mooncake_package.__path__ = [str(REPOSITORY_ROOT / "mooncake-wheel" / "mooncake")]
+mooncake_package.__path__ = [str(REPOSITORY_ROOT / "python" / "mooncake")]
 sys.modules["mooncake"] = mooncake_package
 
 try:

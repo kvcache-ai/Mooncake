@@ -183,7 +183,7 @@ Loading the transport and selecting it for a transfer are two separate steps.
 
 **2. Select it.** Any of the standard TENT mechanisms work:
 
-- A transport policy (see [Transport Selector](../tent/transport-selector.md)):
+- A transport policy (see [Transport Selector](../../tent/transport-selector.md)):
 
   ```json
   {

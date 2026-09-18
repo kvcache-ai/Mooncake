@@ -13,9 +13,7 @@ def test_entry_point_installed():
     try:
         # Check if mooncake_master is in PATH
         result = subprocess.run(
-            ["which", "mooncake_master"],
-            capture_output=True,
-            text=True
+            ["which", "mooncake_master"], capture_output=True, text=True
         )
 
         if result.returncode != 0:
@@ -24,9 +22,7 @@ def test_entry_point_installed():
 
         print(f"✅ mooncake_master entry point found at: {result.stdout.strip()}")
         result = subprocess.run(
-            ["which", "mooncake_client"],
-            capture_output=True,
-            text=True
+            ["which", "mooncake_client"], capture_output=True, text=True
         )
 
         if result.returncode != 0:
@@ -35,9 +31,7 @@ def test_entry_point_installed():
 
         print(f"✅ mooncake_client entry point found at: {result.stdout.strip()}")
         result = subprocess.run(
-            ["which", "transfer_engine_bench"],
-            capture_output=True,
-            text=True
+            ["which", "transfer_engine_bench"], capture_output=True, text=True
         )
 
         if result.returncode != 0:
@@ -67,10 +61,14 @@ def test_run_master_and_client():
         #    and the default 9003 is still held by a lingering master from the
         #    prior CXL test step when this smoke test runs.
         process = subprocess.Popen(
-            ["mooncake_master", "--port=61351", "--max_threads=2",
-             "--metrics_port=19003"],
+            [
+                "mooncake_master",
+                "--port=61351",
+                "--max_threads=2",
+                "--metrics_port=19003",
+            ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
         )
 
         # Give it a moment to start
@@ -80,9 +78,13 @@ def test_run_master_and_client():
         if process.poll() is None:
             print("✅ mooncake_master process started successfully")
             client_process = subprocess.Popen(
-                ["mooncake_client", "--master_server_address=127.0.0.1:61351", "--port=61352"],
+                [
+                    "mooncake_client",
+                    "--master_server_address=127.0.0.1:61351",
+                    "--port=61352",
+                ],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stderr=subprocess.PIPE,
             )
 
             # Give the client some time to connect
@@ -95,7 +97,7 @@ def test_run_master_and_client():
                 print("✅ mooncake_client process terminated successfully")
             else:
                 stdout, stderr = client_process.communicate()
-                print(f"❌ mooncake_client failed to start")
+                print("❌ mooncake_client failed to start")
                 print(f"stdout: {stdout.decode()}")
                 print(f"stderr: {stderr.decode()}")
             # Terminate the process
@@ -105,7 +107,7 @@ def test_run_master_and_client():
             return True
         else:
             stdout, stderr = process.communicate()
-            print(f"❌ mooncake_master process failed to start")
+            print("❌ mooncake_master process failed to start")
             print(f"stdout: {stdout.decode()}")
             print(f"stderr: {stderr.decode()}")
             return False
