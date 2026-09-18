@@ -1,4 +1,5 @@
 #include "master_service/dsl/scenario.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <gtest/gtest.h>
 
@@ -1074,7 +1075,8 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
 
     const TenantId tenant(action.tenant);
     auto update = [&](size_t shard_idx) {
-        MasterService::MetadataShardAccessorRW shard(service_.get(), shard_idx);
+        MasterServiceTestPeer::MetadataShardAccessorRW shard(service_.get(),
+                                                             shard_idx);
         auto tenant_it = shard->tenants.find(tenant);
         if (tenant_it == shard->tenants.end()) {
             return false;
@@ -1089,11 +1091,12 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         return true;
     };
 
-    const size_t routed = service_->getShardIndex(tenant, action.key);
+    const size_t routed =
+        MasterServiceTestPeer(*service_).getShardIndex(tenant, action.key);
     if (update(routed)) {
         return *this;
     }
-    for (size_t shard_idx = 0; shard_idx < MasterService::kNumShards;
+    for (size_t shard_idx = 0; shard_idx < MasterServiceTestPeer::kNumShards;
          ++shard_idx) {
         if (shard_idx != routed && update(shard_idx)) {
             return *this;
@@ -1107,8 +1110,8 @@ MasterScenario& MasterScenario::When(MemoryEvictAction action) {
     if (!EnsureService()) {
         return *this;
     }
-    service_->RunBatchEvictForTesting(action.target_ratio,
-                                      action.lower_bound_ratio);
+    MasterServiceTestPeer(*service_).RunBatchEvictForTesting(
+        action.target_ratio, action.lower_bound_ratio);
     return *this;
 }
 
@@ -1116,7 +1119,7 @@ MasterScenario& MasterScenario::When(DfsEvictAction) {
     if (!EnsureService()) {
         return *this;
     }
-    service_->RunDfsEvictionForTesting();
+    MasterServiceTestPeer(*service_).RunDfsEvictionForTesting();
     return *this;
 }
 
@@ -1124,7 +1127,7 @@ MasterScenario& MasterScenario::When(TenantEvictAction) {
     if (!EnsureService()) {
         return *this;
     }
-    service_->RunTenantEvictForTesting();
+    MasterServiceTestPeer(*service_).RunTenantEvictForTesting();
     return *this;
 }
 
@@ -1141,16 +1144,17 @@ MasterScenario& MasterScenario::When(WaitForOpLogFailureAction action) {
     if (!EnsureService()) {
         return *this;
     }
-    if (!service_->ordered_oplog_writer_) {
+    if (!MasterServiceTestPeer::OrderedOplogWriter(*service_)) {
         Fail("OpLog writer is not configured");
         return *this;
     }
     const auto deadline = std::chrono::steady_clock::now() + action.timeout;
-    while (service_->ordered_oplog_writer_->IsAccepting() &&
-           std::chrono::steady_clock::now() < deadline) {
+    while (
+        MasterServiceTestPeer::OrderedOplogWriter(*service_)->IsAccepting() &&
+        std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    if (service_->ordered_oplog_writer_->IsAccepting()) {
+    if (MasterServiceTestPeer::OrderedOplogWriter(*service_)->IsAccepting()) {
         Fail("OpLog writer was expected to be unavailable");
     }
     return *this;
@@ -2126,7 +2130,8 @@ bool MasterScenario::EnsureService() {
     service_ = std::make_unique<MasterService>(config_);
     if (batch_oplog_backend_) {
         const auto result =
-            service_->SetBatchOpLogBackendForTesting(batch_oplog_backend_);
+            MasterServiceTestPeer(*service_).SetBatchOpLogBackendForTesting(
+                batch_oplog_backend_);
         if (result != ErrorCode::OK) {
             Fail("failed to install batch OpLog backend: " + toString(result));
             service_.reset();
