@@ -943,6 +943,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
+#ifdef USE_NOF
+    if (local_buffer_size > 0 &&
+        !(use_hugepage_ && !globalConfig().ascend_use_fabric_mem) &&
+        (protocol == "tcp" || protocol == "rdma")) {
+        client_->SetNofStagingAllocator(client_buffer_allocator_);
+    }
+#endif
+
     // If global_segment_size is 0, skip mount segment. Transports with a
     // registration limit split it into balanced chunks; other transports use
     // one segment.
