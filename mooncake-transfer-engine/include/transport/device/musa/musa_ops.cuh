@@ -66,19 +66,17 @@ __device__ __forceinline__ int mc_atomic_add_release(const int* ptr, int val) {
     return ret;
 }
 
-// ---------------------------------------------------------------------------
-// Non-coherent loads — MUSA has no nc/no_allocate cache hints; use volatile.
-// int4 volatile copy not supported by MUSA compiler; copy field-by-field.
-// ---------------------------------------------------------------------------
-__device__ __forceinline__ int4 mc_ld_nc(const int4* ptr) {
-    const volatile int* vp = reinterpret_cast<const volatile int*>(ptr);
-    int4 ret;
-    ret.x = vp[0];
-    ret.y = vp[1];
-    ret.z = vp[2];
-    ret.w = vp[3];
-    return ret;
+// Finish counters are consumed by local CTA/count workers. Cross-GPU
+// publication is fenced once before the final per-expert signal.
+__device__ __forceinline__ int mc_atomic_add_relaxed(const int* ptr, int val) {
+    return atomicAdd(const_cast<int*>(ptr), val);
 }
+
+// ---------------------------------------------------------------------------
+// Non-coherent loads — use MUSA's vector cache-hinted intrinsic for int4.
+// Scalar metadata loads remain volatile so reused signal slots are observed.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ int4 mc_ld_nc(const int4* ptr) { return __ldg(ptr); }
 
 __device__ __forceinline__ int mc_ld_nc_s32(const int* ptr) {
     return *const_cast<volatile const int*>(ptr);
