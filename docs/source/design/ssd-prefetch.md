@@ -94,12 +94,18 @@ with no local SSD object (EngineCore `global_segment_size=0`) must not call
 `RegisterPrefetchTask`: that left a `PROCESSING` MEMORY replica the get path
 then waited on for the full per-key budget.
 
-The get path never initiates promotion — triggers come only from exist
-probes (and from remote holders via `prefetch_offload_object`). In
-particular the get path does not bypass the memory-pressure cooldown: a
-backoff opened by DRAM saturation means prefetch yields to eviction/offload
-even for a key that is being demanded right now. If nothing is in flight,
-fall through to SSD immediately.
+**Demand-side kick.** A batch whose best replica is `LOCAL_DISK` gets one
+`TriggerPrefetch(disk_keys, ignore_cooldown=true)` before the wait. The
+bypass covers only the client-side throttle backoff — never a master-side
+gate (the shared in-flight cap, holder check, and dedup TTL all still
+apply). Rationale: an in-flight get is the strongest hotness signal there
+is, and a request whose exist-triggered promotion was dropped by a
+saturated backoff window should not pay an SSD read with no retry.
+Measured on a saturated store this kick is what turns a no-gain regime
+positive; without it, p99 TTFT regresses slightly as gets wait on
+promotions that then fail under pressure.
+
+If nothing is in flight, fall through to SSD immediately.
 
 The re-query is read-only and grants no lease; between observing a COMPLETE
 MEMORY replica and the actual transfer the replica could in principle be
@@ -108,6 +114,176 @@ the caller retries/falls back per the existing error path.
 
 A/B replay (fill → overflow → settle → measure c=2) and the vLLM bench
 screen logs live in `scripts/ssd-prefetch-ttft-ab/`.
+
+
+## Detailed design
+
+The four pieces below are the load-bearing components. Everything here maps
+one-to-one onto the code named in [Code map](#code-map).
+
+### Component architecture
+
+```mermaid
+classDiagram
+    class SsdPrefetcher {
+        +TriggerPrefetch(keys)
+        +RunLocalPrefetch(keys, sizes)
+        +WaitIfPromotionInFlight(key, budget_ms)
+        -ThreadPool prefetch_pool_ (4)
+    }
+    class PrefetchThrottle {
+        +reserve(keys) keys'
+        +enterCooldown() / inCooldown()
+        +waitForCompletion(key, budget)
+        -Shard[16] entries
+    }
+    class FileStorage {
+        +PrefetchKeys(keys, sizes, *dram_pressure, cb)
+        +LookupLocalObjectSize(key)
+        #PromoteOneKeyFromLocalDisk(key, tenant, size)
+    }
+    class MasterService {
+        +RegisterPrefetchTask(client_id, key, tenant)
+        +NotifyPromotionSuccess(...)
+        -promotion_tasks : map~key, PromotionTask~
+    }
+    class Client {
+        +RegisterPrefetchTask(key)
+        +BatchQueryReadOnly(keys)
+    }
+    SsdPrefetcher --> PrefetchThrottle
+    SsdPrefetcher --> Client : metadata / register
+    SsdPrefetcher --> FileStorage : execute promotion
+    SsdPrefetcher ..> SsdPrefetcher : prefetch_offload_object RPC (remote holder)
+    Client --> MasterService : additive RPCs
+    FileStorage --> Client : promotion chain calls
+```
+
+### End-to-end trigger flow (exist probe)
+
+```mermaid
+sequenceDiagram
+    participant E as Engine (exist probe)
+    participant P as SsdPrefetcher
+    participant T as PrefetchThrottle
+    participant M as Master
+    participant H as Holder (local/remote)
+
+    E->>P: TriggerPrefetch(keys) [sync: no RPC]
+    P->>T: reserve(keys) — TTL dedup, local+remote alike
+    T-->>P: unseen subset
+    P->>P: enqueue pool job (caller returns here)
+    loop per 128-key chunk
+        P->>M: BatchQueryReadOnly (no lease / no promotion / no metrics)
+        M-->>P: replica descriptors
+        P->>P: ClassifySsdPrefetchRoute (SSD-only, COMPLETE, size>0)
+    end
+    alt local holder
+        P->>H: LookupLocalObjectSize (authoritative, not the caller's hint)
+        H->>M: RegisterPrefetchTask (holder client_id, tenant)
+        M-->>H: OK / PROMOTION_ALREADY_EXISTS (skip quietly)
+        H->>H: PrefetchKeys → PromoteOneKeyFromLocalDisk
+        H->>M: NotifyPromotionSuccess → grant read lease (from_prefetch)
+    else remote holder
+        P->>H: prefetch_offload_object RPC (additive; old peers drop)
+        Note over H: holder runs the same local branch<br/>with its own client_id
+    end
+```
+
+### PrefetchThrottle
+
+Sharded (16) per-key state machine; lazy expiry (per-entry deadline plus an
+amortized per-shard sweep), so a probe is O(batch) not O(table).
+
+```mermaid
+stateDiagram-v2
+    [*] --> kTriggered : reserve()
+    kTriggered --> kInFlight : RegisterPrefetchTask OK
+    kTriggered --> kAlreadyResident : query shows MEMORY
+    kTriggered --> kDelegated : remote holder RPC sent
+    kInFlight --> kCompleted : NotifyPromotionSuccess
+    kInFlight --> kFailed : any step failed
+    kFailed --> [*] : cooldown-length backoff, then retryable
+    kCompleted --> [*] : dedup TTL, then re-prefetchable
+    kAlreadyResident --> [*] : dedup TTL
+    kDelegated --> [*] : dedup TTL (holder owns execution state)
+```
+
+Dedup windows per state (see `EntryExpired`): healthy states block
+re-triggering for `ssd_prefetch_dedup_ttl_sec` (default 30 s); `kFailed`
+only for `ssd_prefetch_cooldown_sec` (default 5 s) so transient failures
+retry quickly. The memory-pressure cooldown is opened when
+`PromotionAllocStart` returns `NO_AVAILABLE_HANDLE`: while active,
+TriggerPrefetch is a no-op — prefetch (which adds DRAM) yields to
+eviction/offload (which frees DRAM). `waitForCompletion` exits immediately
+on the three terminal non-success states instead of burning budget.
+
+### Master: RegisterPrefetchTask
+
+```mermaid
+flowchart TD
+    A[client_id, key, tenant] --> B{serving guard?}
+    B -- no --> X1[UNAVAILABLE_IN_CURRENT_STATUS]
+    B -- yes --> C{object exists?}
+    C -- no --> X2[OBJECT_NOT_FOUND]
+    C -- yes --> D{Put in flight?<br/>InProcessing}
+    D -- yes --> X3[REPLICA_IS_NOT_READY]
+    D -- no --> E{MEMORY replica or<br/>promotion task exists?}
+    E -- yes --> X4[PROMOTION_ALREADY_EXISTS<br/>caller skips quietly]
+    E -- no --> F{COMPLETE LOCAL_DISK source?}
+    F -- no --> X3
+    F -- yes --> G{holder_id == client_id?}
+    G -- no --> X5[INVALID_PARAMS]
+    G -- yes --> H{promotion_in_flight <<br/>queue_limit?}
+    H -- full --> X6[KEYS_ULTRA_LIMIT]
+    H -- pass --> I[pin source refcnt;<br/>emplace PromotionTask from_prefetch=true]
+```
+
+The task deliberately skips promotion-on-hit admission (frequency sketch,
+watermark) and the holder's heartbeat mailbox — an explicit probe is the
+hotness signal — but **shares** the `promotion_in_flight_` cap and the
+per-key `promotion_tasks` entry with promotion-on-hit, so the two paths
+cannot double-promote a key. `NotifyPromotionSuccess` on a
+`from_prefetch` task grants the normal `default_kv_lease_ttl` read lease:
+the DRAM replica survives until the follow-up get.
+
+### FileStorage execution chain
+
+`PromoteOneKeyFromLocalDisk` is shared verbatim by promotion-on-hit
+(`ProcessPromotionTasks`) and prefetch (`PrefetchKeys`):
+
+```mermaid
+sequenceDiagram
+    participant F as FileStorage
+    participant C as Client
+    participant M as Master
+    F->>C: PromotionAllocStart(key, tenant, size)
+    alt NO_AVAILABLE_HANDLE
+        C-->>F: error → *dram_pressure = true → throttle.enterCooldown()
+    end
+    Note over F: PromotionStateGuard armed (RAII):<br/>any later failure → NotifyPromotionFailure
+    F->>F: AllocateBatch (staging) → BatchLoad (SSD read)
+    F->>C: PromotionWrite (TE write into staged replica)
+    F->>C: NotifyPromotionSuccess
+    C->>M: replica COMPLETE; lease granted (from_prefetch)
+    Note over F: guard.Dismiss()
+```
+
+Per-key failures never propagate (best-effort): they are logged, counted on
+`SsdMetric.prefetch_complete/fail_total`, and reported through the
+completion callback that drives the throttle states above.
+
+### exist/get wiring
+
+- **exist**: `ExistOptions.prefetch_to_memory` + `enable_ssd_prefetch` →
+  TriggerPrefetch. Synchronous cost: one dedup lookup + one pool enqueue.
+- **get** (`ssd_get_wait_ms > 0`, default 0 = off): one deadline shared by
+  the whole batch; a key is waited on only while a local promotion is
+  `kInFlight`/`kCompleted`; re-queries are read-only. A batch headed for
+  SSD also gets one demand-side kick (see "get() wait" above) that bypasses
+  only the client-side throttle backoff. On a COMPLETE MEMORY replica the
+  transfer plan is rebuilt from the refreshed replica list
+  (`FilterQueryResult`); otherwise the SSD read proceeds immediately.
 
 ## Rolling-upgrade compatibility
 
