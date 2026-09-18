@@ -2,6 +2,7 @@ add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
+    allocator_metric.cpp
     types.cpp
     common/network.cpp
     thread_pool.cpp
@@ -402,13 +403,27 @@ set(MOONCAKE_STORE_INCLUDE_DIRS
     ${MOONCAKE_STORE_INCLUDE_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/../include
     ${ETCD_WRAPPER_INCLUDE})
 
-set(MASTER_EXTRA_INCS)
-set(MASTER_EXTRA_LIBS)
+# jemalloc replaces the process allocator, so it is linked into the executables
+# rather than into libmooncake_store, which is also consumed by the Python
+# extension and must not force an allocator on its host process.
+#
+# The results are copied into ALLOCATOR_* rather than used through the
+# JEMALLOC_* names directly: pkg_check_modules writes those into the CMake
+# cache, so a build directory reconfigured back to STORE_USE_JEMALLOC=OFF would
+# keep linking the allocator while the compile definition is gone, leaving the
+# binary running on jemalloc but reporting mooncake_jemalloc_enabled 0. These
+# four are plain variables, so clearing them here takes effect every configure.
+set(ALLOCATOR_DEFS)
+set(ALLOCATOR_INCS)
+set(ALLOCATOR_LIB_DIRS)
+set(ALLOCATOR_LIBS)
 if(STORE_USE_JEMALLOC)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(JEMALLOC REQUIRED jemalloc)
-  list(APPEND MASTER_EXTRA_INCS ${JEMALLOC_INCLUDE_DIRS})
-  list(APPEND MASTER_EXTRA_LIBS ${JEMALLOC_STATIC_LIBRARIES})
+  set(ALLOCATOR_DEFS STORE_USE_JEMALLOC)
+  set(ALLOCATOR_INCS ${JEMALLOC_INCLUDE_DIRS})
+  set(ALLOCATOR_LIB_DIRS ${JEMALLOC_LIBRARY_DIRS})
+  set(ALLOCATOR_LIBS ${JEMALLOC_STATIC_LIBRARIES})
 endif()
 
 include(CheckPIESupported)
@@ -640,7 +655,9 @@ endif()
 # Store Master executable.
 add_executable(mooncake_master master.cpp)
 set_target_properties(mooncake_master PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(mooncake_master PRIVATE ${MASTER_EXTRA_INCS})
+target_include_directories(mooncake_master PRIVATE ${ALLOCATOR_INCS})
+target_compile_definitions(mooncake_master PRIVATE ${ALLOCATOR_DEFS})
+target_link_directories(mooncake_master PRIVATE ${ALLOCATOR_LIB_DIRS})
 target_link_libraries(
   mooncake_master
   PRIVATE mooncake_store_master
@@ -653,7 +670,7 @@ target_link_libraries(
           JsonCpp::JsonCpp
           yalantinglibs::yalantinglibs
           ${ETCD_WRAPPER_LIB}
-          ${MASTER_EXTRA_LIBS}
+          ${ALLOCATOR_LIBS}
           asio_shared)
 if(USE_SUNRISE)
   target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
@@ -671,9 +688,13 @@ install(TARGETS mooncake_master DESTINATION bin)
 # Store Client executable.
 add_executable(mooncake_client real_client_main.cpp)
 set_target_properties(mooncake_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mooncake_client PRIVATE ${ALLOCATOR_INCS})
+target_compile_definitions(mooncake_client PRIVATE ${ALLOCATOR_DEFS})
+target_link_directories(mooncake_client PRIVATE ${ALLOCATOR_LIB_DIRS})
 target_link_libraries(
-  mooncake_client PRIVATE mooncake_store transfer_engine asio_shared
-                          gflags::gflags yalantinglibs::yalantinglibs)
+  mooncake_client
+  PRIVATE mooncake_store transfer_engine asio_shared gflags::gflags
+          yalantinglibs::yalantinglibs ${ALLOCATOR_LIBS})
 if(USE_CUDA)
   target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
   target_include_directories(mooncake_client

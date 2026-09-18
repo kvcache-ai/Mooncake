@@ -233,6 +233,7 @@ add_store_test(client_host_identity_config_test
                client_host_identity_config_test.cpp)
 add_store_test(client_metric_config_test client_metric_config_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
+add_store_test(allocator_metric_test allocator_metric_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
 add_store_test(dfs_posix_test dfs_posix_test.cpp)
 add_store_test(distributed_storage_config_test
