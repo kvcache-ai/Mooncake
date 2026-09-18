@@ -188,7 +188,7 @@ TYPED_TEST(ReplicaAllocatorLivenessTest,
     this->state.Add("suspected", "suspected");
     this->state.candidates.back()->BindClientLiveness(suspected);
     this->state.Add("unavailable", "unavailable");
-    this->state.candidates.back()->SetAvailability(false, true);
+    this->state.candidates.back()->SetStatus(SegmentStatus::DRAINING);
     this->state.Add("cxl", "cxl", 0, true);
 
     PlacementDiagnostics diagnostics;
@@ -326,7 +326,7 @@ TEST(ReplicaAllocatorTest, PreferredOnlyCountsServingEntriesOfRequiredKind) {
         EXPECT_EQ(state.candidates.front()->allocation_attempts(), 0U);
 
         request.replicas.count = 1;
-        state.candidates[1]->SetAvailability(false, true);
+        state.candidates[1]->SetStatus(SegmentStatus::DRAINING);
         result = allocator.Allocate(access, request, &diagnostics);
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);

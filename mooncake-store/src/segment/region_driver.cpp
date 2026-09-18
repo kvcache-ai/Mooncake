@@ -203,7 +203,7 @@ bool RegionDriver::Reactivate(const UUID& id) {
 bool RegionDriver::Erase(const UUID& id) {
     auto* resource = GetResource(id);
     if (!resource) return false;
-    resource->candidate->SetAvailability(false, false);
+    resource->candidate->Invalidate();
     return resources_.erase(id) != 0;
 }
 

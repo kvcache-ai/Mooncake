@@ -5409,7 +5409,9 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    replica.bindClientLiveness(client_liveness);
+    // Memory replicas take their owner from the region they were allocated
+    // from, so this only stores the record for local disk replicas.
+    replica.bindLocalDiskClientLiveness(client_liveness);
     return AddReplicaForRetainedClient(client_id, key, tenant_id, replica);
 }
 
@@ -10834,15 +10836,17 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
                                 auto& buffer =
                                     *std::get<MemoryReplicaData>(replica.data_)
                                          .buffer;
-                                if (!segment_access.RebindBufferToOwningSegment(
-                                        buffer)) {
+                                // Restore bound the buffer to its region, and
+                                // binding owners above updated every buffer of
+                                // that region. Validate the binding only.
+                                if (!segment_access.HasBufferBinding(buffer)) {
                                     missing_memory_registration = true;
                                 }
                             } else if (replica.is_local_disk_replica()) {
                                 const auto owner =
                                     replica.get_local_disk_client_id();
                                 if (owner) {
-                                    replica.bindClientLiveness(
+                                    replica.bindLocalDiskClientLiveness(
                                         records.at(*owner));
                                 }
                             }

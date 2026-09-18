@@ -214,12 +214,11 @@ bool SegmentPool::WriteAccess::BindBufferToSegment(const UUID& segment_id,
     return true;
 }
 
-bool SegmentPool::WriteAccess::RebindBufferToOwningSegment(
-    AllocatedBuffer& buffer) {
+bool SegmentPool::WriteAccess::HasBufferBinding(
+    const AllocatedBuffer& buffer) const {
     for (const auto& mounted : catalog_.Regions()) {
         auto* resource = segment_pool_.GetResource(mounted);
         if (resource && resource->candidate->OwnsBuffer(buffer)) {
-            resource->candidate->BindBuffer(buffer);
             return true;
         }
     }
@@ -276,8 +275,7 @@ ErrorCode SegmentPool::WriteAccess::TransitionRegion(
             DCHECK(deactivated);
         }
     }
-    resource.candidate->SetAvailability(status == SegmentStatus::OK,
-                                        status != SegmentStatus::UNMOUNTING);
+    resource.candidate->SetStatus(status);
     const bool updated = catalog_.SetStatus(mounted.segment.id, status);
     DCHECK(updated);
     return ErrorCode::OK;
