@@ -1,3 +1,4 @@
+#include "ha_metric_manager.h"
 #include "hot_standby_service.h"
 
 #include <gtest/gtest.h>
@@ -24,6 +25,10 @@ namespace {
 
 class MemoryBackend final : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = values_.find(std::string(key));
@@ -221,10 +226,26 @@ class RebootstrapTest : public ::testing::Test {
 };
 
 TEST_F(RebootstrapTest, CorruptLatestUsesFallbackAndReplaysSuffix) {
+    auto& metrics = HAMetricManager::instance();
+    const auto before = metrics.get_snapshot_operation(
+        HAMetricManager::SnapshotOperation::Rebootstrap);
     Publish(3, "new", true);
     backend_->Put(ha::BuildBatchOpLogSnapshotLatestKey("n09"), "{}");
     Compact();
     ExpectRecovered();
+    ASSERT_TRUE(WaitUntil([&] {
+        return metrics
+                   .get_snapshot_operation(
+                       HAMetricManager::SnapshotOperation::Rebootstrap)
+                   .total > before.total;
+    }));
+    EXPECT_EQ(before.errors,
+              metrics
+                  .get_snapshot_operation(
+                      HAMetricManager::SnapshotOperation::Rebootstrap)
+                  .errors);
+    EXPECT_EQ(1u, metrics.get_snapshot_runtime().suffix_batches);
+    EXPECT_EQ(3u, metrics.get_snapshot_runtime().compaction_floor);
 }
 
 TEST_F(RebootstrapTest, NoEligibleSnapshotPreservesStateAndRetriesOnline) {
@@ -259,6 +280,11 @@ TEST_F(RebootstrapTest, PromotionDuringSwapFailsClosedThenSucceeds) {
                                        "/standby_rebootstrap_before_swap.hit");
     }));
     ExpectOldState();
+    EXPECT_EQ(1u,
+              HAMetricManager::instance().get_snapshot_runtime().applied_batch);
+    EXPECT_EQ(
+        3u,
+        HAMetricManager::instance().get_snapshot_runtime().compaction_floor);
     ReleaseSwap();
     ExpectRecovered();
 }
@@ -279,6 +305,8 @@ TEST_F(RebootstrapTest, StopDuringSwapDoesNotDeadlockOrInstallCandidate) {
               stopped.wait_for(std::chrono::seconds(5)));
     EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
     EXPECT_EQ(2u, service_->GetMetadataCount());
+    EXPECT_EQ(1u,
+              HAMetricManager::instance().get_snapshot_runtime().applied_batch);
 }
 
 TEST_F(RebootstrapTest, FloorAdvancingBeforeSwapRejectsCandidate) {

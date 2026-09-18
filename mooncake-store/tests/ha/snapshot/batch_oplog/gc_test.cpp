@@ -1,3 +1,4 @@
+#include "ha_metric_manager.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.h"
 
 #include <gtest/gtest.h>
@@ -20,6 +21,10 @@ namespace {
 
 class FakeBackend final : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         auto it = values.find(std::string(key));
         if (it == values.end()) return ErrorCode::ETCD_KEY_NOT_EXIST;
@@ -130,6 +135,7 @@ TEST(BatchOpLogSnapshotGcTest, PointerMismatchSkipsDeletion) {
 }
 
 TEST(BatchOpLogSnapshotGcTest, DeletesOnlyUnprotectedAttempt) {
+    HAMetricManager::instance().reset_snapshot_runtime(true);
     constexpr std::string_view kRoot = "snapshots";
     FakeBackend backend;
     RecordingObjectStore object_store;
@@ -167,6 +173,12 @@ TEST(BatchOpLogSnapshotGcTest, DeletesOnlyUnprotectedAttempt) {
                                                   std::string(kRoot))
                                  .Run(*lease, descriptor_json, std::nullopt));
     ASSERT_EQ(1U, object_store.deleted.size());
+    EXPECT_EQ(
+        1u,
+        HAMetricManager::instance().get_snapshot_runtime().gc_orphan_prefixes);
+    EXPECT_EQ(
+        1u,
+        HAMetricManager::instance().get_snapshot_runtime().gc_deleted_prefixes);
     EXPECT_EQ(stale_prefix, object_store.deleted.front());
 }
 

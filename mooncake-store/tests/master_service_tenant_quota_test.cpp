@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <atomic>
 #include <chrono>
@@ -174,7 +175,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     // class and friendship does not inherit -- so private access has to go
     // through a fixture method, as it does for the helpers around this one.
     void RunTenantEvictionPass(MasterService& service) {
-        service.EvictTenantsOverWatermark();
+        MasterServiceTestPeer(service).RunTenantEvictForTesting();
     }
 
     TenantQuotaSnapshot Snapshot(MasterService& service,
@@ -185,17 +186,20 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     }
 
     void ReloadTenantQuotaPolicyFromStore(MasterService& service) {
-        service.LoadTenantQuotaPoliciesFromStoreOrThrow();
-        service.RebuildTenantQuotaUsageFromMetadata();
+        MasterServiceTestPeer(service)
+            .LoadTenantQuotaPoliciesFromStoreOrThrow();
+        MasterServiceTestPeer(service).RebuildTenantQuotaUsageFromMetadata();
     }
 
     void ReplaceTenantQuotaPolicyStore(
         MasterService& service, std::unique_ptr<TenantQuotaPolicyStore> store) {
-        service.tenant_quota_policy_store_ = std::move(store);
+        MasterServiceTestPeer::TenantQuotaPolicyStore(service) =
+            std::move(store);
     }
 
     int64_t LocalDiskUsedBytes(MasterService& service, const UUID& client_id) {
-        auto usage = service.local_ssd_manager_.GetUsage(client_id);
+        auto usage =
+            MasterServiceTestPeer::LocalSsdManager(service).GetUsage(client_id);
         EXPECT_TRUE(usage.has_value());
         if (!usage) {
             return -1;
@@ -225,7 +229,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         };
         auto candidate = std::make_unique<NoFCandidate>(allocator);
 
-        auto& manager = service.nof_segment_manager_;
+        auto& manager = MasterServiceTestPeer::NofSegmentManager(service);
         std::unique_lock lock(manager.manager_mutex_);
         auto mounted = std::find_if(
             manager.mounted_segments_.begin(), manager.mounted_segments_.end(),
@@ -246,36 +250,42 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     tl::expected<void, ErrorCode> ChargeTenantQuotaForTest(
         MasterService& service, const TenantId& tenant_id, uint64_t bytes) {
-        return service.ChargeTenantQuota(
-            service.tenant_quota_table_.GetOrCreateTenantHandle(tenant_id),
+        return MasterServiceTestPeer(service).ChargeTenantQuota(
+            MasterServiceTestPeer::TenantQuotaTable(service)
+                .GetOrCreateTenantHandle(tenant_id),
             bytes);
     }
 
     TenantQuotaHandle GetOrCreateTenantStateHandleForTest(
         MasterService& service, size_t shard_idx, const TenantId& tenant_id) {
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
+                                                             shard_idx);
         auto& tenant_state =
-            service.GetOrCreateTenantState(shard.get(), tenant_id);
-        return service.GetBoundTenantQuotaHandle(tenant_state);
+            MasterServiceTestPeer(service).GetOrCreateTenantState(shard.get(),
+                                                                  tenant_id);
+        return MasterServiceTestPeer(service).GetBoundTenantQuotaHandle(
+            tenant_state);
     }
 
     tl::expected<void, ErrorCode> ChargeBoundTenantQuotaForTest(
         MasterService& service, TenantQuotaHandle account, uint64_t bytes) {
-        return service.ChargeTenantQuota(account, bytes);
+        return MasterServiceTestPeer(service).ChargeTenantQuota(account, bytes);
     }
 
     void ReleaseBoundTenantQuotaForTest(MasterService& service,
                                         TenantQuotaHandle account,
                                         uint64_t bytes) {
-        service.ReleaseTenantQuota(account, bytes);
+        MasterServiceTestPeer(service).ReleaseTenantQuota(account, bytes);
     }
 
     void DiscardExpiredProcessingForTest(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        const size_t shard_idx = service.getShardIndex(tenant_id, key);
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
-        service.DiscardExpiredProcessingReplicas(
+        const size_t shard_idx =
+            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
+        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
+                                                             shard_idx);
+        MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::time_point::max());
     }
 
@@ -285,8 +295,9 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         OpLogEntry entry;
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
-        service.FinalizeExpiredProcessingReplicasAfterDurable(
-            entry, std::chrono::system_clock::now());
+        MasterServiceTestPeer(service)
+            .FinalizeExpiredProcessingReplicasAfterDurable(
+                entry, std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,
@@ -294,8 +305,9 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
                                               const std::string& key) {
         std::vector<ReplicaID> removed_ids;
         {
-            MasterService::MetadataAccessorRW accessor(
-                &service, MasterService::ObjectIdentity{tenant_id, key});
+            MasterServiceTestPeer::MetadataAccessorRW accessor(
+                &service,
+                MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
             ASSERT_TRUE(accessor.Exists());
             accessor.Get().VisitReplicas(
                 &Replica::fn_is_memory_replica,
@@ -309,8 +321,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         OpLogEntry entry;
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
-        service.FinalizeRemovedReplicasAfterDurable(
-            entry, removed_ids, MasterService::QuotaEraseMode::kFull);
+        MasterServiceTestPeer(service).FinalizeRemovedReplicasAfterDurable(
+            entry, removed_ids, MasterServiceTestPeer::QuotaEraseMode::kFull);
     }
 
     void AddCompletedDiskReplica(MasterService& service, const UUID& client_id,
@@ -336,18 +348,20 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     std::unique_lock<std::shared_mutex> LockSnapshotForTest(
         MasterService& service) {
-        return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
+        return std::unique_lock<std::shared_mutex>(
+            MasterServiceTestPeer::SnapshotMutex(service));
     }
 
     std::unique_lock<std::mutex> LockTenantQuotaRecomputeForTest(
         MasterService& service) {
         return std::unique_lock<std::mutex>(
-            service.tenant_quota_recompute_mutex_);
+            MasterServiceTestPeer::TenantQuotaRecomputeMutex(service));
     }
 
     std::unique_lock<std::mutex> LockTenantQuotaPolicyForTest(
         MasterService& service) {
-        return std::unique_lock<std::mutex>(service.tenant_quota_policy_mutex_);
+        return std::unique_lock<std::mutex>(
+            MasterServiceTestPeer::TenantQuotaPolicyMutex(service));
     }
 
     ErrorCode MountSegmentWithoutQuotaRecomputeForTest(MasterService& service,
@@ -361,20 +375,21 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         segment.te_endpoint = segment.name;
         next_segment_offset_ += size + 4096;
 
-        auto segment_access = service.segment_pool_.AcquireWriteAccess();
+        auto segment_access = MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
         return segment_access.MountSegment(segment, generate_uuid());
     }
 
     void RecomputeTenantEffectiveQuotasForTest(MasterService& service) {
-        service.RecomputeTenantEffectiveQuotas();
+        MasterServiceTestPeer(service).RecomputeTenantEffectiveQuotas();
     }
 
     bool WaitForTenantQuotaPolicyMutexContention(MasterService& service) {
         for (int i = 0; i < 500; ++i) {
-            if (!service.tenant_quota_policy_mutex_.try_lock()) {
+            if (!MasterServiceTestPeer::TenantQuotaPolicyMutex(service)
+                     .try_lock()) {
                 return true;
             }
-            service.tenant_quota_policy_mutex_.unlock();
+            MasterServiceTestPeer::TenantQuotaPolicyMutex(service).unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         return false;

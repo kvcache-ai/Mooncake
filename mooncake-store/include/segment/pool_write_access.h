@@ -52,7 +52,7 @@ class SegmentPool::WriteAccess final {
         const UUID& client_id,
         const std::shared_ptr<ClientLivenessRecord>& client_liveness);
     bool BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
-    bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
+    bool HasBufferBinding(const AllocatedBuffer& buffer) const;
 
     const RegionCatalog& Catalog() const;
     ErrorCode SetSegmentStatusByName(std::string_view segment_name,

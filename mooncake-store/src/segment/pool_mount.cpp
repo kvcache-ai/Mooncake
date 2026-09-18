@@ -164,7 +164,7 @@ ErrorCode SegmentPool::WriteAccess::PublishMount(
     }
     auto& new_resource = prepared.resource();
     if (existed) {
-        new_resource.candidate->InheritBinding(
+        new_resource.candidate->InheritLifetime(
             *segment_pool_.GetResource(*current)->candidate);
     }
     for (const auto& buffer : prepared.imported_buffers()) {

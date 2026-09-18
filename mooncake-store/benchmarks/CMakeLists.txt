@@ -49,7 +49,7 @@ endif()
 # Add BatchEvict benchmark executable
 add_executable(batch_evict_bench batch_evict_bench.cpp)
 target_link_libraries(
-  batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
+  batch_evict_bench PRIVATE master_service_test_peer cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
 
 add_executable(batch_oplog_promotion_bench batch_oplog_promotion_bench.cpp)

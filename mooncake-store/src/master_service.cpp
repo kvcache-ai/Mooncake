@@ -858,20 +858,6 @@ MasterService::~MasterService() {
     client_liveness_records_.clear();
 }
 
-ErrorCode MasterService::SetBatchOpLogBackendForTesting(
-    std::shared_ptr<HaKvBackend> backend) {
-    // Explicit test injection keeps the zero-view fixture API. A configured
-    // view still exercises the production fenced path.
-    return InitializeBatchOpLogWriter(std::move(backend), view_version_ > 0);
-}
-
-void MasterService::SetBatchOpLogWriterFactoryForTesting(
-    BatchOpLogWriterFactory factory) {
-    assert(factory);
-    assert(!ordered_oplog_writer_);
-    batch_oplog_writer_factory_ = std::move(factory);
-}
-
 void MasterService::SetBatchOpLogTerminalCallback(
     OrderedOpLogWriter::TerminalCallback callback) {
     if (ordered_oplog_writer_) {
@@ -881,81 +867,6 @@ void MasterService::SetBatchOpLogTerminalCallback(
 
 void MasterService::StopBatchOpLogWriter() {
     if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
-}
-
-void MasterService::RunBatchEvictForTesting(double evict_ratio_target,
-                                            double evict_ratio_lowerbound) {
-    BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
-}
-
-void MasterService::RunNoFBatchEvictForTesting(double evict_ratio_target,
-                                               double evict_ratio_lowerbound) {
-    NoFBatchEvict(evict_ratio_target, evict_ratio_lowerbound);
-}
-
-void MasterService::RunDfsEvictionForTesting() { RunDfsEviction(); }
-
-void MasterService::RunTenantEvictForTesting() { EvictTenantsOverWatermark(); }
-
-void MasterService::SetKvTenantEpochTrackingForTesting(bool enabled) {
-    kv_track_tenant_epochs_ = enabled;
-}
-
-void MasterService::SetRemoveAllShardHookForTesting(
-    std::function<void(size_t)> hook) {
-    kv_remove_all_shard_hook_ = std::move(hook);
-}
-
-uint64_t MasterService::GetKvClearedPublishedForTesting() const {
-    return kv_cleared_published_.load(std::memory_order_relaxed);
-}
-
-uint64_t MasterService::GetKvClearedSuppressedForTesting() const {
-    return kv_cleared_suppressed_by_epoch_.load(std::memory_order_relaxed);
-}
-
-void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
-#ifdef USE_NOF
-    std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
-    if (fn) {
-        nof_probe_fn_ = std::move(fn);
-        return;
-    }
-    nof_probe_fn_ = [](const std::string& te_endpoint, uint32_t timeout_ms,
-                       std::string* error_reason) {
-        return SpdkWrapper::GetInstance().ProbeNofSegment(
-            te_endpoint, timeout_ms, error_reason);
-    };
-#else
-    (void)fn;
-#endif
-}
-
-size_t MasterService::GetMountedNoFSegmentCountForTesting() {
-    std::vector<MountedNoFSegmentSnapshot> mounted_segments;
-    nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
-    return mounted_segments.size();
-}
-
-bool MasterService::IsNoFSegmentMountedForTesting(const UUID& segment_id) {
-    std::vector<MountedNoFSegmentSnapshot> mounted_segments;
-    nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
-    return std::any_of(
-        mounted_segments.begin(), mounted_segments.end(),
-        [&segment_id](const MountedNoFSegmentSnapshot& snapshot) {
-            return snapshot.segment.id == segment_id &&
-                   snapshot.status == SegmentStatus::OK;
-        });
-}
-
-std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
-    const UUID& segment_id) {
-    std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
-    auto it = nof_heartbeat_states_.find(segment_id);
-    if (it == nof_heartbeat_states_.end()) {
-        return std::nullopt;
-    }
-    return it->second.consecutive_failures;
 }
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
@@ -2355,7 +2266,7 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     return {};
 }
 
-std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
+std::unordered_map<std::string, ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -2363,7 +2274,7 @@ MasterService::EraseMetadata(
     return EraseMetadata(tenant_state, it, tenant_id, QuotaEraseMode::kFull);
 }
 
-std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
+std::unordered_map<std::string, ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -2375,7 +2286,7 @@ MasterService::EraseMetadata(
 // associated per-key state: offloading_tasks (with dec_refcnt),
 // processing_keys, replication_tasks, and promotion tasks.
 // Callers no longer need to clean these up manually before calling.
-std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
+std::unordered_map<std::string, ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -2703,16 +2614,6 @@ void MasterService::SoftPinDeadlineIndex::Clear() {
     heap_.swap(empty);
 }
 
-size_t MasterService::SoftPinDeadlineIndex::HeapSizeForTest() const {
-    std::lock_guard lock(mutex_);
-    return heap_.size();
-}
-
-size_t MasterService::SoftPinDeadlineIndex::RegistrationCountForTest() const {
-    std::lock_guard lock(mutex_);
-    return registrations_.size();
-}
-
 auto MasterService::ResolveSoftPinRequest(const ReplicateConfig& config) const
     -> tl::expected<ResolvedSoftPinRequest, ErrorCode> {
     switch (config.soft_pin_action) {
@@ -2724,7 +2625,8 @@ auto MasterService::ResolveSoftPinRequest(const ReplicateConfig& config) const
                            << ", error=ttl_requires_enable";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            return ResolvedSoftPinRequest{config.soft_pin_action, 0};
+            return ResolvedSoftPinRequest{config.soft_pin_action,
+                                          std::chrono::milliseconds::zero()};
         case SoftPinAction::ENABLE: {
             const uint64_t ttl_ms =
                 config.soft_pin_ttl_ms.value_or(default_kv_soft_pin_ttl_);
@@ -2734,7 +2636,8 @@ auto MasterService::ResolveSoftPinRequest(const ReplicateConfig& config) const
                            << ", error=soft_pin_ttl_exceeds_limit";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            return ResolvedSoftPinRequest{config.soft_pin_action, ttl_ms};
+            return ResolvedSoftPinRequest{config.soft_pin_action,
+                                          std::chrono::milliseconds(ttl_ms)};
         }
     }
     LOG(ERROR) << "soft_pin_action="
@@ -4943,7 +4846,7 @@ auto MasterService::InsertMetadata(
     }
 
     std::vector<Replica::Descriptor> replica_list;
-    std::vector<ReplicaID> eligible_replica_ids;
+    std::unordered_set<ReplicaID> eligible_replica_ids;
     replica_list.reserve(replicas.size());
     eligible_replica_ids.reserve(replicas.size());
     int i = 0;
@@ -4952,7 +4855,7 @@ auto MasterService::InsertMetadata(
     for (const auto& replica : replicas) {
         const auto desc = replica.get_descriptor();
         replica_list.emplace_back(desc);
-        eligible_replica_ids.push_back(replica.id());
+        eligible_replica_ids.insert(replica.id());
 
         if (replica.is_memory_replica()) {
             const auto& mem_desc = desc.get_memory_descriptor();
@@ -5401,7 +5304,9 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    replica.bindClientLiveness(client_liveness);
+    // Memory replicas take their owner from the region they were allocated
+    // from, so this only stores the record for local disk replicas.
+    replica.bindLocalDiskClientLiveness(client_liveness);
     return AddReplicaForRetainedClient(client_id, key, tenant_id, replica);
 }
 
@@ -6007,11 +5912,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // Mark COMPLETE → PROCESSING so readers won't see stale
                     // data mid-transfer.  The key becomes unreadable until
                     // UpsertEnd.
-                    std::vector<ReplicaID> eligible_replica_ids;
+                    std::unordered_set<ReplicaID> eligible_replica_ids;
                     metadata.VisitReplicas(
                         &Replica::fn_is_completed,
                         [&eligible_replica_ids](Replica& replica) {
-                            eligible_replica_ids.push_back(replica.id());
+                            eligible_replica_ids.insert(replica.id());
                             replica.mark_processing();
                         });
                     metadata.BeginSoftPinAction(
@@ -8397,6 +8302,8 @@ auto MasterService::NotifyOffloadSuccess(
                         source->dec_refcnt();
                     }
                     tenant_state.offloading_tasks.erase(task_it);
+                    MasterMetricManager::instance().inc_offload_failed(
+                        UuidToString(client_id));
                 }
             }
             continue;
@@ -8463,6 +8370,8 @@ auto MasterService::NotifyOffloadSuccess(
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
                         SyncCacheTotalAccounting(obj_metadata);
+                        MasterMetricManager::instance().inc_offload_completed(
+                            UuidToString(client_id));
                         added_new_local_disk_replica = true;
                     } else {
                         obj_metadata.VisitReplicas(
@@ -8560,6 +8469,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     bool any_enqueued = false;
+    std::string client_id_str;
     const auto liveness = replica.getClientLiveness();
     if (!liveness) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -8604,11 +8514,16 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
         }
         if (err != ErrorCode::OK) {
+            if (err == ErrorCode::KEYS_ULTRA_LIMIT) {
+                MasterMetricManager::instance().inc_offload_enqueue_rejected(
+                    UuidToString(*client_id));
+            }
             return tl::make_unexpected(err);
         }
         if (mirror_clients != nullptr) {
             mirror_clients->push_back(*client_id);
         }
+        client_id_str = UuidToString(*client_id);
         any_enqueued = true;
     }
     // Every segment name was nullopt (or EnqueueOffload found no usable
@@ -8617,6 +8532,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     if (!any_enqueued) {
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
+    MasterMetricManager::instance().inc_offload_enqueued(client_id_str);
     return {};
 }
 
@@ -8641,6 +8557,8 @@ bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
     if (source != nullptr) {
         source->dec_refcnt();
     }
+    MasterMetricManager::instance().inc_offload_cancelled(
+        UuidToString(mirror_clients[0]));
     tenant_state.offloading_tasks.erase(task_it);
     return true;
 }
@@ -8844,37 +8762,6 @@ void MasterService::ClearCandidatesForReload() {
 
 size_t MasterService::RunPromotionCandidateRetry() {
     return RunPromotionCandidateRetry(kPromotionRetryShardBatch);
-}
-
-size_t MasterService::RunPromotionCandidateRetryForTesting() {
-    return RunPromotionCandidateRetry(kNumShards);
-}
-
-size_t MasterService::CountCandidatesForTesting(const TenantId& tenant_id) {
-    size_t count = 0;
-    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
-    for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRO shard(this, i);
-        auto it = shard->tenants.find(tenant_id);
-        if (it != shard->tenants.end()) {
-            count += it->second.promotion_candidates.size();
-        }
-    }
-    return count;
-}
-
-void MasterService::ResetCandidateBackoffsForTesting() {
-    const auto epoch = std::chrono::steady_clock::time_point{};
-    for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRW shard(this, i);
-        for (auto& [tenant_id, tenant_state] : shard->tenants) {
-            (void)tenant_id;
-            for (auto& [key, candidate] : tenant_state.promotion_candidates) {
-                (void)key;
-                candidate.retry_after = epoch;
-            }
-        }
-    }
 }
 
 size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
@@ -9627,7 +9514,7 @@ tl::expected<UUID, ErrorCode> MasterService::SubmitDynamicReplicaCopyTask(
              .dynamic_replication_version_epoch = version_epoch});
 }
 
-MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
+PromotionQueueResult MasterService::TryPushPromotionQueue(
     const ObjectIdentity& object_id, bool record_candidate) {
     if (!promotion_on_hit_ || !promotion_sketch_) {
         return PromotionQueueResult::kDisabled;
@@ -10825,15 +10712,17 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
                                 auto& buffer =
                                     *std::get<MemoryReplicaData>(replica.data_)
                                          .buffer;
-                                if (!segment_access.RebindBufferToOwningSegment(
-                                        buffer)) {
+                                // Restore bound the buffer to its region, and
+                                // binding owners above updated every buffer of
+                                // that region. Validate the binding only.
+                                if (!segment_access.HasBufferBinding(buffer)) {
                                     missing_memory_registration = true;
                                 }
                             } else if (replica.is_local_disk_replica()) {
                                 const auto owner =
                                     replica.get_local_disk_client_id();
                                 if (owner) {
-                                    replica.bindClientLiveness(
+                                    replica.bindLocalDiskClientLiveness(
                                         records.at(*owner));
                                 }
                             }
@@ -13109,8 +12998,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::SerializeMetadata(
-    const MasterService::ObjectMetadata& metadata,
-    MsgpackPacker& packer) const {
+    const ObjectMetadata& metadata, MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
@@ -13174,7 +13062,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     return {};
 }
 
-tl::expected<std::unique_ptr<MasterService::ObjectMetadata>, SerializationError>
+tl::expected<std::unique_ptr<ObjectMetadata>, SerializationError>
 MasterService::MetadataSerializer::DeserializeMetadata(
     const msgpack::object& obj) const {
     // Check if input is a valid array

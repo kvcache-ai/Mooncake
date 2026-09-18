@@ -22,7 +22,7 @@ SegmentPool::SegmentPool(RegionDriverRegistry region_drivers)
 SegmentPool::~SegmentPool() {
     for (const auto& mounted : catalog_.Regions()) {
         if (auto* resource = GetResource(mounted)) {
-            resource->candidate->SetAvailability(false, false);
+            resource->candidate->Invalidate();
         }
     }
     ReleaseCapacityMetrics();

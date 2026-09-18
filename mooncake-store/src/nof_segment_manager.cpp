@@ -28,7 +28,7 @@ NoFSegmentManager::~NoFSegmentManager() {
     auto& metrics = MasterMetricManager::instance();
     std::unordered_set<std::string> names;
     for (const auto& [_, mounted] : mounted_segments_) {
-        if (mounted.candidate) mounted.candidate->SetAvailability(false, false);
+        if (mounted.candidate) mounted.candidate->Invalidate();
         metrics.dec_total_nof_capacity(mounted.segment.name,
                                        mounted.segment.size);
         names.insert(mounted.segment.name);
@@ -126,7 +126,7 @@ ErrorCode ScopedNoFSegmentWriteAccess::PrepareUnmountSegment(
     if (mounted->second.candidate) {
         nof_segment_manager_->placement_index_.RemoveCandidate(
             mounted->second.segment.name, *mounted->second.candidate, {});
-        mounted->second.candidate->SetAvailability(false, false);
+        mounted->second.candidate->Invalidate();
     }
     mounted->second.candidate.reset();
     mounted->second.allocator.reset();

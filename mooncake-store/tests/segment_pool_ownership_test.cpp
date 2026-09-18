@@ -25,6 +25,7 @@ namespace mooncake::test {
 namespace {
 
 constexpr size_t kRegionSize = 16U * 1024 * 1024;
+constexpr size_t kBufferSize = 4096;
 
 RegionDriverRegistry Drivers(bool cxl = false) {
     RegionDriverConfig config;
@@ -46,6 +47,60 @@ MountedRegion Region(uint64_t index, SegmentStatus status = SegmentStatus::OK) {
     segment.te_endpoint = "endpoint-" + std::to_string(index);
     segment.host_id = "shared-host";
     return {std::move(segment), UUID{1, index}, status};
+}
+
+// A region served by the driver kind selected by `cxl`.
+MountedRegion RegionOnDriver(uint64_t index, bool cxl) {
+    auto region = Region(index);
+    region.segment.protocol = cxl ? "cxl" : "tcp";
+    return region;
+}
+
+AllocationCandidateKind KindForDriver(bool cxl) {
+    return cxl ? AllocationCandidateKind::CXL : AllocationCandidateKind::NATIVE;
+}
+
+// Whether the pool places a new allocation on `segment_name`.
+bool AllocatesIn(SegmentPool& pool, std::string_view segment_name,
+                 AllocationCandidateKind kind) {
+    return pool.AllocateInSegment(segment_name, kind, kBufferSize).has_value();
+}
+
+// A mounted region's allocator plus one buffer bound to it. Holding the
+// allocator keeps the buffer's memory alive independently of the pool, so a
+// test can tell a stale region apart from a dropped allocator.
+struct MountedAllocation {
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    std::unique_ptr<AllocatedBuffer> buffer;
+};
+
+MountedAllocation MountRegionAndAllocate(SegmentPool& pool,
+                                         const MountedRegion& region) {
+    {
+        auto access = pool.AcquireWriteAccess();
+        EXPECT_EQ(access.MountSegment(region.segment, region.client_id),
+                  ErrorCode::OK);
+    }
+    auto view = pool.AcquireReadAccess();
+    MountedAllocation allocation;
+    allocation.allocator = view.GetAllocator(region.segment.id);
+    allocation.buffer = allocation.allocator->allocate(kBufferSize);
+    EXPECT_NE(allocation.buffer, nullptr);
+    if (allocation.buffer != nullptr) {
+        EXPECT_TRUE(
+            view.BindBufferToSegment(region.segment.id, *allocation.buffer));
+    }
+    return allocation;
+}
+
+// A record that already missed a heartbeat, as after a client stopped serving.
+std::shared_ptr<ClientLivenessRecord> SuspectedOwner(
+    ClientLivenessRecord::TimePoint now = ClientLivenessRecord::TimePoint{}) {
+    auto owner = std::make_shared<ClientLivenessRecord>(now);
+    EXPECT_EQ(owner->Evaluate(now + std::chrono::seconds(1),
+                              std::chrono::seconds(1), std::chrono::seconds(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    return owner;
 }
 
 void ExpectOwners(const RegionCatalog& catalog,
@@ -228,43 +283,30 @@ TEST(SegmentPoolOwnershipTest,
     for (bool cxl : {false, true}) {
         SCOPED_TRACE(cxl);
         SegmentPool pool(Drivers(cxl));
-        auto first = Region(1);
-        auto second = Region(2);
-        first.segment.protocol = second.segment.protocol = cxl ? "cxl" : "tcp";
+        const auto first = RegionOnDriver(1, cxl);
+        const auto second = RegionOnDriver(2, cxl);
+        auto first_allocation = MountRegionAndAllocate(pool, first);
+        auto second_allocation = MountRegionAndAllocate(pool, second);
+        auto& first_buffer = first_allocation.buffer;
+        auto& second_buffer = second_allocation.buffer;
+        ASSERT_NE(first_buffer, nullptr);
+        ASSERT_NE(second_buffer, nullptr);
         const auto now = ClientLivenessRecord::TimePoint{};
         auto first_liveness = std::make_shared<ClientLivenessRecord>(now);
         auto second_liveness = std::make_shared<ClientLivenessRecord>(now);
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_EQ(access.MountSegment(first.segment, first.client_id),
-                      ErrorCode::OK);
-            ASSERT_EQ(access.MountSegment(second.segment, second.client_id),
-                      ErrorCode::OK);
             access.BindClientLiveness(first.client_id, first_liveness);
             access.BindClientLiveness(second.client_id, second_liveness);
         }
-        std::unique_ptr<AllocatedBuffer> first_buffer;
-        std::unique_ptr<AllocatedBuffer> second_buffer;
-        {
-            auto view = pool.AcquireReadAccess();
-            first_buffer = view.GetAllocator(first.segment.id)->allocate(4096);
-            second_buffer =
-                view.GetAllocator(second.segment.id)->allocate(4096);
-            ASSERT_NE(first_buffer, nullptr);
-            ASSERT_NE(second_buffer, nullptr);
-            ASSERT_TRUE(
-                view.BindBufferToSegment(first.segment.id, *first_buffer));
-            ASSERT_TRUE(
-                view.BindBufferToSegment(second.segment.id, *second_buffer));
-        }
-        // Recovery must rebind by region identity, even with one shared CXL
-        // allocator and the same name, rather than choosing an arbitrary owner.
+        // Each buffer keeps its own region's identity, even though both
+        // regions share one CXL allocator and one name.
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_TRUE(access.RebindBufferToOwningSegment(*second_buffer));
+            ASSERT_TRUE(access.HasBufferBinding(*second_buffer));
         }
-        EXPECT_EQ(first_buffer->getClientLiveness(), first_liveness);
-        EXPECT_EQ(second_buffer->getClientLiveness(), second_liveness);
+        EXPECT_TRUE(first_buffer->isAvailable());
+        EXPECT_TRUE(second_buffer->isAvailable());
         EXPECT_EQ(first_liveness->Evaluate(now + std::chrono::seconds(1),
                                            std::chrono::seconds(1),
                                            std::chrono::seconds(1)),
@@ -276,8 +318,7 @@ TEST(SegmentPoolOwnershipTest,
         EXPECT_FALSE(first_buffer->isAvailable());
         EXPECT_TRUE(second_buffer->isAvailable());
         EXPECT_TRUE(second_liveness->IsServing());
-        const auto kind = cxl ? AllocationCandidateKind::CXL
-                              : AllocationCandidateKind::NATIVE;
+        const auto kind = KindForDriver(cxl);
         auto allocated = pool.AllocateInSegment(first.segment.name, kind, 4096);
         ASSERT_TRUE(allocated.has_value());
         EXPECT_EQ(allocated->getClientLiveness(), second_liveness);
@@ -296,6 +337,103 @@ TEST(SegmentPoolOwnershipTest,
             pool.AllocateInSegment(second.segment.name, kind, 4096);
         ASSERT_TRUE(remaining.has_value());
         EXPECT_EQ(remaining->getClientLiveness(), second_liveness);
+    }
+}
+
+TEST(SegmentPoolOwnershipTest, RebindingSegmentOwnerUpdatesExistingBuffers) {
+    for (bool cxl : {false, true}) {
+        SCOPED_TRACE(cxl);
+        SegmentPool pool(Drivers(cxl));
+        const auto region = RegionOnDriver(1, cxl);
+        auto allocation = MountRegionAndAllocate(pool, region);
+        auto& buffer = allocation.buffer;
+        ASSERT_NE(buffer, nullptr);
+        const auto kind = KindForDriver(cxl);
+
+        // Snapshot restore rebuilds client records after the buffers already
+        // reference their region, so the buffers follow the new binding.
+        const auto now = ClientLivenessRecord::TimePoint{};
+        auto owner = SuspectedOwner(now);
+        pool.AcquireWriteAccess().BindClientLiveness(region.client_id, owner);
+        EXPECT_TRUE(buffer->isHandleUsable());
+        EXPECT_FALSE(buffer->isAvailable());
+        EXPECT_FALSE(AllocatesIn(pool, region.segment.name, kind));
+
+        ASSERT_EQ(owner->Observe(now + std::chrono::seconds(2)),
+                  ClientLivenessObservation::RECOVERED_ACTIVE);
+        EXPECT_TRUE(buffer->isAvailable());
+        EXPECT_TRUE(AllocatesIn(pool, region.segment.name, kind));
+
+        // Replacing the allocator keeps the region identity, so the buffer
+        // still belongs to the region whose allocator has just been replaced.
+        {
+            auto access = pool.AcquireWriteAccess();
+            auto remount =
+                access.PrepareMount(region.segment, region.client_id);
+            ASSERT_TRUE(remount.has_value());
+            ASSERT_EQ(remount->Commit(access), ErrorCode::OK);
+            EXPECT_TRUE(access.HasBufferBinding(*buffer));
+        }
+
+        // A replacement record from recovery takes the buffers over, and the
+        // record it replaced no longer gates them.
+        auto restored_owner = SuspectedOwner(now);
+        pool.AcquireWriteAccess().BindClientLiveness(region.client_id,
+                                                     restored_owner);
+        EXPECT_FALSE(buffer->isAvailable());
+        EXPECT_TRUE(buffer->isHandleUsable());
+        EXPECT_TRUE(owner->IsServing());
+    }
+}
+
+TEST(SegmentPoolOwnershipTest, DrainRollbackAndNewMountKeepDistinctLifetimes) {
+    for (bool cxl : {false, true}) {
+        SCOPED_TRACE(cxl);
+        SegmentPool pool(Drivers(cxl));
+        const auto region = RegionOnDriver(1, cxl);
+        auto allocation = MountRegionAndAllocate(pool, region);
+        auto& buffer = allocation.buffer;
+        ASSERT_NE(buffer, nullptr);
+        const auto kind = KindForDriver(cxl);
+
+        // Draining stops new allocations but keeps existing buffers readable.
+        {
+            auto access = pool.AcquireWriteAccess();
+            ASSERT_EQ(access.SetSegmentStatusByName(region.segment.name,
+                                                    SegmentStatus::DRAINING),
+                      ErrorCode::OK);
+        }
+        EXPECT_TRUE(buffer->isAvailable());
+        EXPECT_FALSE(AllocatesIn(pool, region.segment.name, kind));
+
+        // A rolled back unmount leaves the region usable for its buffers.
+        {
+            auto access = pool.AcquireWriteAccess();
+            auto unmount =
+                access.PrepareUnmount(region.segment.id, region.client_id);
+            ASSERT_TRUE(unmount.has_value());
+            EXPECT_FALSE(buffer->isHandleUsable());
+            ASSERT_EQ(std::move(*unmount).Rollback(access), ErrorCode::OK);
+        }
+        EXPECT_TRUE(buffer->isAvailable());
+
+        // Reuse the same ID and name while the old allocator is still alive:
+        // the fresh mount must not revive the buffers of the old region.
+        {
+            auto access = pool.AcquireWriteAccess();
+            auto unmount =
+                access.PrepareUnmount(region.segment.id, region.client_id);
+            ASSERT_TRUE(unmount.has_value());
+            ASSERT_EQ(std::move(*unmount).Commit(access), ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(region.segment, region.client_id),
+                      ErrorCode::OK);
+            access.BindClientLiveness(region.client_id,
+                                      std::make_shared<ClientLivenessRecord>(
+                                          ClientLivenessRecord::Clock::now()));
+        }
+        EXPECT_FALSE(buffer->isHandleUsable());
+        EXPECT_FALSE(buffer->isAvailable());
+        EXPECT_TRUE(AllocatesIn(pool, region.segment.name, kind));
     }
 }
 

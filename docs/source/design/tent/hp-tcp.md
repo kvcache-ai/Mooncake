@@ -214,6 +214,26 @@ host/fabric limits. Compare one rail/one lane, one rail/multiple lanes, and two
 rails/the same total lanes: the last two differ in single-READ slicing as well
 as rail placement.
 
+### Tuning concurrent READs
+
+For one peer with `C` outstanding large READs and `R` rails, at most
+`min(connections_per_peer, C * R)` payload streams can be active. This assumes
+the READs are large enough to slice across all rails. Four outstanding READs
+with four total lanes therefore have the same four-stream upper bound with
+one or two rails; adding a rail alone does not increase that bound.
+
+With four rails and four total lanes, each rail has one connection. Eight
+lanes provide two per rail. Each lane processes one operation at a time;
+once those four lanes already have distinct owners, adding workers alone
+cannot increase the number of active lane owners. Compare lane and worker counts separately, recording the counts
+at both endpoints, throughput, tail latency and CPU use. Additional lanes
+sharing the same workers need not increase throughput.
+
+Keep CPU and memory placement fixed during these comparisons; record the
+NICs' NUMA nodes. Use per-thread CPU measurements because Store and tebench
+callers also consume CPU polling for completion. A stream-count upper bound
+does not predict throughput or establish a universal rail/worker default.
+
 ### Measured scope
 
 On two Xeon 8457C virtual machines, with four workers and four total lanes,
@@ -227,7 +247,41 @@ following medians:
 | 4 KiB, one concurrent task | Mean latency (microseconds) | 72 | 78 |
 
 Both interfaces carried payload-direction traffic, but their underlying
-resource independence is not guaranteed. Four concurrent READs showed no
-additional gain. A same-pool 4 KiB/64 MiB closed-loop mix still delayed small
+resource independence is not guaranteed. In that four-lane/four-worker setup,
+four concurrent READs showed no additional gain. A same-pool 4 KiB/64 MiB
+closed-loop mix still delayed small
 tasks behind large ones: static slicing offers neither latency isolation nor
 universal bandwidth scaling.
+
+A Store `get_into` comparison on two H20 hosts used the unchanged `202ad9c89`
+Release build, 8 MiB host-memory objects and four closed-loop callers (one
+outstanding READ each). Both endpoints used the worker/lane counts below,
+CPU 0-89 and new allocations bound to NUMA node 0. Two rails used eth1/2
+on node 0; four rails also used eth3/4 on node 1. There were three 30-second
+runs per configuration after a 2-second warmup. Each pair of configurations
+was interleaved; the three pairs ran sequentially.
+
+| Rails | Workers / total lanes | Median GB/s [min, max] | Client CPU (core equivalents) |
+| ---: | ---: | ---: | ---: |
+| 2 | 4 / 4 | 10.371 [9.664, 10.747] | 6.84 |
+| 2 | 8 / 8 | 8.022 [7.904, 8.159] | 5.40 |
+| 4 | 4 / 4 | 7.599 [7.440, 7.877] | 6.86 |
+| 4 | 4 / 8 | 8.537 [8.139, 8.624] | 6.93 |
+| 4 | 8 / 4 | 7.339 [7.260, 7.790] | 6.83 |
+| 4 | 8 / 8 | 11.487 [11.343, 11.551] | 7.76 |
+
+For four rails, increasing both counts improved throughput by 51.2% over
+four/four, with client CPU rising from 6.86 to 7.76 cores. Increasing workers
+alone did not help; increasing lanes alone helped less. The four-rail 8/8
+configuration was 10.8% faster than the best measured two-rail configuration
+(4/4), with 13.5% more client CPU. Server-process CPU samples also rose
+from about 2.24 to 3.35 core equivalents. Two rails regressed with 8/8, so
+these results do not justify raising defaults.
+
+Before each of the 18 timing runs, all 32 objects passed bytewise checks.
+Every run used the configured 4 or 8 connections, and per-rail payload byte
+totals matched the static split. Separate stack samples confirmed
+four active receive workers in the four-lane case and were excluded from
+timing results. The experiment changes both endpoints' worker counts; it
+does not isolate client versus server costs or remove NUMA effects. It covers
+Store host-memory READs, not GPU transfers or model-level performance.
