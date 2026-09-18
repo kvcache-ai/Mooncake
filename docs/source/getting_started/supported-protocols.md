@@ -168,7 +168,7 @@ cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON
 - Software-emulated RDMA writes (higher CPU overhead than true RDMA)
 - ~88% of RoCE RDMA throughput
 
-**Documentation:** See [EFA Transport](../design/transfer-engine/efa_transport.md) for build instructions, benchmarks, and tuning.
+**Documentation:** See [EFA Transport](../design/transfer-engine/transport/efa_transport.md) for build instructions, benchmarks, and tuning.
 
 ## Advanced Protocols (C++ Transfer Engine)
 
@@ -365,8 +365,8 @@ export MC_INTRANODE_NVLINK=true
 - HCCL runtime
 
 **Documentation:**
-- [Heterogeneous Ascend](../design/transfer-engine/heterogeneous_ascend.md)
-- [Ascend Transport](../design/transfer-engine/ascend_transport.md)
+- [Heterogeneous Ascend](../design/transfer-engine/transport/heterogeneous_ascend.md)
+- [Ascend Transport](../design/transfer-engine/transport/ascend_transport.md)
 
 ### TPU Transport (tpu) — Experimental
 
@@ -427,7 +427,7 @@ so it cannot be selected through `MOONCAKE_PROTOCOL` or `transfer_engine_bench -
 { "transports": { "mpcomm": { "enable": true } } }
 ```
 
-See [MPComm Transport](../design/transfer-engine/mpcomm_transport.md) for the full guide,
+See [MPComm Transport](../design/transfer-engine/transport/mpcomm_transport.md) for the full guide,
 including selection via transport policy, tuning environment variables, and troubleshooting.
 
 ### FlagOS FlagCX Transport (flagcx)
@@ -476,7 +476,7 @@ export FLAGCX_SOCKET_IFNAME="eth0"
 - Buffers should be registered before the first transfer to a peer and remain registered while
   that peer connection is active
 
-See [FlagOS FlagCX Transport](../design/transfer-engine/flagcx_transport.md) for dependency,
+See [FlagOS FlagCX Transport](../design/transfer-engine/transport/flagcx_transport.md) for dependency,
 build, benchmark, runtime configuration, and troubleshooting details.
 
 ## Configuration Examples
@@ -582,3 +582,17 @@ If a protocol fails to initialize:
 - [Transfer Engine Benchmark](../design/transfer-engine/transfer-engine-bench-tuning.md) - Performance tuning
 - [Python API Reference](../api-reference/python/transfer-engine.md) - API documentation
 - [Deployment Guide](../deployment/mooncake-store-deployment-guide.md) - Production deployment
+
+:::{toctree}
+:maxdepth: 1
+:hidden:
+
+../design/transfer-engine/transport/efa_transport
+../design/transfer-engine/transport/ascend_direct_transport
+../design/transfer-engine/transport/ascend_transport
+../design/transfer-engine/transport/heterogeneous_ascend
+../design/transfer-engine/transport/kunpeng_ub_transport
+../design/transfer-engine/transport/sunrise_link_transport
+../design/transfer-engine/transport/flagcx_transport
+../design/transfer-engine/transport/mpcomm_transport
+:::

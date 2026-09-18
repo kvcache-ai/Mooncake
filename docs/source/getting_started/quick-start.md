@@ -40,7 +40,7 @@ variant in an environment.
 >   ```bash
 >   sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
 >   ```
-> - The EFA variants require the AWS EFA driver and libfabric at runtime. See the [EFA transport guide](../design/transfer-engine/efa_transport.md) for prerequisites and configuration.
+> - The EFA variants require the AWS EFA driver and libfabric at runtime. See the [EFA transport guide](../design/transfer-engine/transport/efa_transport.md) for prerequisites and configuration.
 > - MLU support is currently available through source builds with `-DUSE_MLU=ON`; there is no dedicated prebuilt MLU wheel yet.
 > - If users encounter problems such as missing `lib*.so`, first install the corresponding system runtime libraries. If the issue persists, uninstall the package and build the binaries manually.
 

@@ -624,7 +624,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         }
         return ErrorCode::OK;
     } else {
-        auto err = master_client_.Connect(master_server_entry);
+        auto err = ConnectMasterEndpoint(master_server_entry);
         if (err != ErrorCode::OK) {
             return err;
         }
@@ -649,6 +649,13 @@ void Client::EnterHaRuntimeMode() {
     master_client_.EnableHaConnectionPolicy();
 }
 
+ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
+    if (!metrics_) return master_client_.Connect(address);
+
+    return metrics_->master_heartbeat_metric.ObserveConnect(
+        [this, &address] { return master_client_.Connect(address); });
+}
+
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
     std::lock_guard<std::mutex> lock(leader_switch_mutex_);
 
@@ -665,7 +672,7 @@ ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
         }
     }
 
-    auto err = master_client_.Connect(target_view.leader_address);
+    auto err = ConnectMasterEndpoint(target_view.leader_address);
     if (err != ErrorCode::OK) {
         last_ping_success_.store(false);
         return err;
@@ -5142,8 +5149,10 @@ void Client::StorageHeartbeatThreadMain() {
             remount_segment_future = std::future<void>();
         }
 
-        // Ping master
-        auto ping_result = master_client_.Ping();
+        auto ping_result = metrics_
+                               ? metrics_->master_heartbeat_metric.ObservePing(
+                                     [this] { return master_client_.Ping(); })
+                               : master_client_.Ping();
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
@@ -5242,7 +5251,7 @@ void Client::StorageHeartbeatThreadMain() {
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
                        << " times (non-HA); reconnecting to "
                        << current_master_address;
-            auto err = master_client_.Connect(current_master_address);
+            auto err = ConnectMasterEndpoint(current_master_address);
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Reconnect failed to " << current_master_address
                            << ": " << toString(err);
