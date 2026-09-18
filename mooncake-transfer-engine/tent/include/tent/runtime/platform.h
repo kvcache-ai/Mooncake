@@ -23,9 +23,10 @@ namespace tent {
 // New device memory types are appended last so the numeric values of the
 // existing entries are preserved. TPU HBM and Intel XPU VRAM are not
 // NIC-addressable in the MVP, so transfers touching them are staged through
-// host DRAM. TPU staging is routed by ProxyManager (see findStagingPolicy);
-// XPU currently only exposes the device-local alloc/copy primitives and is
-// classified by getTypeEnum, but its transport-layer staging is not yet wired.
+// host DRAM by ProxyManager (see findStagingPolicy). Any device memory type
+// added here must also be reported by isGpuMemoryType() below, so the
+// selector's routing predicate and the staging capability checks stay in
+// agreement.
 enum MemoryType {
     MTYPE_UNKNOWN,
     MTYPE_CPU,
@@ -34,6 +35,17 @@ enum MemoryType {
     MTYPE_TPU,
     MTYPE_XPU
 };
+
+// Single source of truth for "is this a device (GPU/NPU/TPU/XPU) memory type?".
+// Both the selector's routing predicate and the staging capability checks
+// consult this, so a device memory type can never be classified as a device on
+// one path and as host on the other. Device types stage their device<->host hop
+// through the matching transport (gpu_to_dram / dram_to_gpu) and never satisfy
+// gpu_to_gpu in the MVP.
+inline bool isGpuMemoryType(MemoryType t) {
+    return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU ||
+           t == MTYPE_XPU;
+}
 
 class Platform {
    public:
