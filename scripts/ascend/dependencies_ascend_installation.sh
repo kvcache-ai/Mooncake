@@ -60,7 +60,6 @@ if command -v apt-get &> /dev/null; then
     echo "Detected apt-get. Using Debian-based package manager."
     apt-get update
     apt-get install -y build-essential \
-            cmake \
             git \
             wget \
             libibverbs-dev \
@@ -108,22 +107,20 @@ elif command -v yum &> /dev/null; then
     clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
     cd yaml-cpp || exit
     rm -rf build
-    mkdir -p build && cd build
-    cmake ..
-    make -j$(nproc)
-    make install
-    cd ../..
+    cmake -B build
+    cmake --build build -j$(nproc)
+    cmake --install build
+    cd -
 
     # Install msgpack-c
     clone_repo_if_not_exists "msgpack-c" "https://github.com/msgpack/msgpack-c.git"
     cd msgpack-c || exit
     git checkout cpp-7.0.0
     rm -rf build
-    mkdir -p build && cd build
-    cmake ..
-    make -j
-    make install
-    cd ../..
+    cmake -B build
+    cmake --build build -j$(nproc)
+    cmake --install build
+    cd -
 else
     echo "Unsupported package manager. Please install the dependencies manually."
     exit 1
