@@ -101,18 +101,12 @@ bool RailMonitor::available(int local_nic, int remote_nic) {
     if (!st.paused()) return true;
     auto now = std::chrono::steady_clock::now();
     if (now < st.resume_time) return false;
-    // Cooldown expired. Clear the pause so traffic resumes. Half-Open
-    // (admit one trial on expiry, escalate only on trial failure) is a
-    // follow-up: it needs available() split into a non-mutating predicate
-    // plus an admit() with in-flight tracking, so probes don't race the
-    // fallback/updateBestMapping callers that also call available().
     st.resume_time = {};
     st.error_count = 0;
+    st.cooldown = std::chrono::seconds(0);
     updateBestMapping();
     LOG(INFO) << "Rail recovered: local_nic=" << local_nic
-              << " remote_nic=" << remote_nic
-              << " (cooldown expired, cooldown_retained=" << st.cooldown.count()
-              << "s)";
+              << " remote_nic=" << remote_nic << " (cooldown expired)";
     return true;
 }
 
