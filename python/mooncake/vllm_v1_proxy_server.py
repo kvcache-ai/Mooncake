@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # This is a copy from vLLM repo at tests/v1/kv_connector/nixl_integration/toy_proxy_server.py
 
+"""Disaggregated prefill/decode proxy for the Mooncake vLLM integration."""
+
 import argparse
 import itertools
 import logging

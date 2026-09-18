@@ -15,6 +15,9 @@
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
+/python/mooncake/mooncake_connector_v1.py @stmatengss @ShangmingCai
+/python/mooncake/vllm_v1_proxy_server.py @stmatengss @ShangmingCai
+/python/tests/vllm/ @stmatengss @ShangmingCai
 /python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys

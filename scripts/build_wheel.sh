@@ -185,6 +185,8 @@ echo "Building wheel package..."
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 MIGRATED_PYTHON_MODULES=(
+    mooncake_connector_v1.py
+    vllm_v1_proxy_server.py
     ep.py
     mooncake_ep_buffer.py
     mooncake_elastic_buffer.py

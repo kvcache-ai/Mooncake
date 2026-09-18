@@ -66,6 +66,18 @@ assert metadata.version("mooncake-transfer-engine") == {_project_version(project
 assert "administration" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+optional_roots = {{
+    "fastapi", "httpx", "msgspec", "numpy", "torch", "uvicorn", "vllm", "zmq"
+}}
+for module_name in (
+    "mooncake.mooncake_connector_v1",
+    "mooncake.vllm_v1_proxy_server",
+):
+    spec = util.find_spec(module_name)
+    assert spec is not None and spec.origin is not None, module_name
+    module_path = Path(spec.origin).resolve()
+    assert module_path.parent == package_path.parent, (module_name, module_path)
+assert not (optional_roots & {{name.partition(".")[0] for name in sys.modules}})
 for ep_module in (
     "ep.py",
     "mooncake_ep_buffer.py",
