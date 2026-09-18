@@ -866,7 +866,8 @@ TEST_P(HighPerformanceTcpLaneDistributionTest,
         ASSERT_TRUE(
             client_metadata->segmentManager().openRemote(target, name).ok());
         // Process-wide RPC pool can keep a dead connection to a recycled port;
-        // one retry after RpcServiceError matches production reconnect behavior.
+        // one retry after RpcServiceError matches production reconnect
+        // behavior.
         SegmentDescRef remote_desc;
         Status resolved = client_metadata->segmentManager().getRemoteCached(
             remote_desc, target);
