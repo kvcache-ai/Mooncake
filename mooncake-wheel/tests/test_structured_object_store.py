@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import gc
+import io
 import json
 import os
 import threading
@@ -3049,6 +3051,276 @@ def test_unified_dict_put_accepts_field_schemas() -> None:
     assert result["global_batch_sizes"] == [2]
     assert result["num_microbatches"] == 1
     assert result["step"] == 7
+
+
+def _pil_fixture(image_format: str):
+    Image = pytest.importorskip("PIL.Image")
+    image = Image.new("RGB", (12, 9), (1, 2, 3))
+    output = io.BytesIO()
+    options = {"icc_profile": b"test-icc-profile"}
+    if image_format == "PNG":
+        PngImagePlugin = pytest.importorskip("PIL.PngImagePlugin")
+        png_info = PngImagePlugin.PngInfo()
+        png_info.add_text("source", "mooncake-test")
+        options.update(pnginfo=png_info, dpi=(96, 96))
+    else:
+        exif = Image.Exif()
+        exif[0x010E] = "mooncake-test"
+        options.update(quality=95, dpi=(144, 144), exif=exif)
+    image.save(output, format=image_format, **options)
+    encoded = output.getvalue()
+    decoded = Image.open(io.BytesIO(encoded))
+    return decoded, encoded
+
+
+def _assert_pil_roundtrip(actual, expected) -> None:
+    assert actual.mode == expected.mode
+    assert actual.size == expected.size
+    assert actual.format == expected.format
+    assert actual.tobytes() == expected.tobytes()
+    assert actual.info == expected.info
+    expected_palette = expected.palette.getdata() if expected.palette else None
+    actual_palette = actual.palette.getdata() if actual.palette else None
+    assert actual_palette == expected_palette
+
+
+def _palette_image():
+    Image = pytest.importorskip("PIL.Image")
+    image = Image.fromarray(np.arange(20, dtype=np.uint8).reshape(4, 5), mode="P")
+    image.putpalette(bytes([0, 255, 0, 255, 0, 127]))
+    image.info = {
+        "transparency": 0,
+        "dpi": (72, 72),
+        "nested": (("source", 1), 2),
+    }
+    image.format = "PNG"
+    return image
+
+
+@pytest.mark.parametrize("image_format", ["PNG", "JPEG"])
+def test_unified_dict_pil_codec_preserves_common_image_state(image_format) -> None:
+    _store, transfer = make_transfer()
+    image, _encoded = _pil_fixture(image_format)
+
+    ref = transfer.put(
+        {"image": [image]},
+        type="dict",
+        field_schemas={
+            "image": FieldSchema(
+                codec="media_bytes", metadata={"section": "non_tensor_batch"}
+            )
+        },
+    )
+    actual = transfer.get(ref, type="dict")["image"][0]
+
+    _assert_pil_roundtrip(actual, image)
+
+
+def test_unified_dict_pil_codec_preserves_palette_and_partial_reads() -> None:
+    png, png_bytes = _pil_fixture("PNG")
+    jpeg, jpeg_bytes = _pil_fixture("JPEG")
+    palette = _palette_image()
+    rows = [[png, png_bytes], None, [], [jpeg, jpeg_bytes, palette]]
+    _store, transfer = make_transfer()
+    ref = transfer.put(
+        {"media": rows},
+        type="dict",
+        field_schemas={
+            "media": FieldSchema(
+                codec="media_list_ragged",
+                metadata={"section": "non_tensor_batch"},
+            )
+        },
+    )
+
+    sliced = transfer.get(ref, type="dict", rows=slice(2, 4))["media"]
+    gathered = transfer.get(ref, type="dict", rows=[3, 0])["media"]
+
+    assert sliced[0] == []
+    _assert_pil_roundtrip(sliced[1][0], jpeg)
+    assert sliced[1][1] == jpeg_bytes
+    _assert_pil_roundtrip(sliced[1][2], palette)
+    assert [
+        item.tobytes() if hasattr(item, "tobytes") else item for item in gathered[0]
+    ] == [
+        jpeg.tobytes(),
+        jpeg_bytes,
+        palette.tobytes(),
+    ]
+    _assert_pil_roundtrip(gathered[1][0], png)
+    assert gathered[1][1] == png_bytes
+
+
+@pytest.mark.parametrize("mode", ["1", "L", "LA", "RGB", "RGBA", "CMYK", "I", "I;16"])
+def test_pil_codec_roundtrips_supported_raw_modes(mode) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    image = Image.new(mode, (5, 3))
+
+    pixels, state = sos._encode_pil_image(image)
+    actual = sos._decode_pil_image(memoryview(pixels), memoryview(state))
+
+    _assert_pil_roundtrip(actual, image)
+
+
+def test_unified_dict_pil_codec_releases_buffer_pool_once() -> None:
+    image = _palette_image()
+    pool = FakeBufferPool()
+    _store, transfer = make_transfer(buffer_pool=pool)
+    ref = transfer.put(
+        {"image": [image]},
+        type="dict",
+        field_schemas={
+            "image": FieldSchema(
+                codec="media_bytes", metadata={"section": "non_tensor_batch"}
+            )
+        },
+    )
+    result = transfer.get(ref, type="dict")
+    actual = result["image"][0]
+    _assert_pil_roundtrip(actual, image)
+    assert hasattr(actual, "_mooncake_pool_owner")
+    del result
+    gc.collect()
+    assert pool.release_count < pool.acquire_count
+    MooncakeBundleTransfer.release_result(actual)
+    assert pool.release_count == pool.acquire_count
+    after_release = pool.release_count
+    MooncakeBundleTransfer.release_result(actual)
+    assert pool.release_count == after_release
+
+
+def test_pil_codec_rejects_multiframe_images() -> None:
+    Image = pytest.importorskip("PIL.Image")
+    encoded = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(
+        encoded,
+        format="PNG",
+        save_all=True,
+        append_images=[Image.new("RGB", (2, 2), "blue")],
+    )
+    image = Image.open(io.BytesIO(encoded.getvalue()))
+
+    with pytest.raises(ValueError, match="multi-frame PIL images"):
+        sos._encode_pil_image(image)
+
+
+@pytest.mark.parametrize(
+    "payload", [b"\x07pixels", b"\x01\x0b\x00\x00\x00not-msgpackpixels"]
+)
+def test_pil_codec_rejects_invalid_encodings(payload) -> None:
+    with pytest.raises(ValueError, match="media encoding|PIL image state"):
+        sos._decode_media_bytes(memoryview(payload), framed=True)
+
+
+def test_pil_codec_rejects_unsupported_state_and_framing() -> None:
+    image = _palette_image()
+    image.info = {1: "non-string key"}
+    with pytest.raises(ValueError, match="keys must be strings"):
+        sos._encode_pil_image(image)
+
+    with pytest.raises(ValueError, match="unsupported media framing"):
+        sos._media_framed({"media_framing": "pil_v3"})
+
+
+def test_pil_rgb_arrow_path_avoids_tobytes(monkeypatch) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    if sos._pillow_arrow_view is None:
+        pytest.skip("Pillow Arrow fast path is unavailable")
+    image = Image.new("RGB", (5, 3), (1, 2, 3))
+    monkeypatch.setattr(image, "tobytes", lambda: pytest.fail("tobytes called"))
+
+    pixels, state = sos._encode_pil_image(image)
+    actual = sos._decode_pil_image(pixels, state)
+
+    assert actual.getpixel((0, 0)) == (1, 2, 3)
+
+
+def test_pil_rgb_arrow_path_falls_back_to_packed_rgb(monkeypatch) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    image = Image.new("RGB", (5, 3), (1, 2, 3))
+    monkeypatch.setattr(
+        sos, "_pillow_arrow_view", lambda _image: (_ for _ in ()).throw(ValueError())
+    )
+
+    pixels, state = sos._encode_pil_image(image)
+    actual = sos._decode_pil_image(pixels, state)
+
+    assert len(pixels) == 5 * 3 * 3
+    assert actual.getpixel((0, 0)) == (1, 2, 3)
+
+
+def test_pil_rgb_arrow_path_falls_back_without_arrow_decoder(monkeypatch) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    if sos._pillow_arrow_view is None:
+        pytest.skip("Pillow Arrow fast path is unavailable")
+    image = Image.new("RGB", (5, 3), (1, 2, 3))
+    pixels, state = sos._encode_pil_image(image)
+    monkeypatch.setattr(
+        Image,
+        "fromarrow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError()),
+    )
+
+    actual = sos._decode_pil_image(pixels, state)
+
+    assert actual.mode == "RGB"
+    assert actual.getpixel((0, 0)) == (1, 2, 3)
+
+
+def test_pil_rgb_arrow_path_returns_packed_bytes_without_pillow(monkeypatch) -> None:
+    import builtins
+
+    Image = pytest.importorskip("PIL.Image")
+    if sos._pillow_arrow_view is None:
+        pytest.skip("Pillow Arrow fast path is unavailable")
+    pixels, state = sos._encode_pil_image(Image.new("RGB", (5, 3), (1, 2, 3)))
+    real_import = builtins.__import__
+
+    def no_pillow(name, *args, **kwargs):
+        if name == "PIL":
+            raise ImportError("Pillow unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_pillow)
+    actual = sos._decode_pil_image(pixels, state, raw_fallback=True)
+
+    assert len(actual) == 5 * 3 * 3
+    assert actual == bytes((1, 2, 3)) * 15
+
+
+def test_pil_rgb_arrow_path_releases_shared_buffer_pool_once(monkeypatch) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    if sos._pillow_arrow_view is None:
+        pytest.skip("Pillow Arrow fast path is unavailable")
+    images = [Image.new("RGB", (5, 3), color) for color in ((1, 2, 3), (4, 5, 6))]
+    for image in images:
+        monkeypatch.setattr(image, "tobytes", lambda: pytest.fail("tobytes called"))
+    pool = FakeBufferPool()
+    _store, transfer = make_transfer(buffer_pool=pool)
+    ref = transfer.put(
+        {"image": images},
+        type="dict",
+        field_schemas={
+            "image": FieldSchema(
+                codec="media_bytes", metadata={"section": "non_tensor_batch"}
+            )
+        },
+    )
+
+    result = transfer.get(ref, type="dict")
+    first, second = result["image"]
+    del result
+    gc.collect()
+    assert pool.release_count < pool.acquire_count
+    MooncakeBundleTransfer.release_result(first)
+    assert second.getpixel((0, 0)) == (4, 5, 6)
+    assert pool.release_count < pool.acquire_count
+    MooncakeBundleTransfer.release_result(second)
+    assert pool.release_count == pool.acquire_count
+
+    result = transfer.get(ref, type="dict")
+    MooncakeBundleTransfer.release_result(result)
+    assert pool.release_count == pool.acquire_count
 
 
 def test_release_result_recurses_into_ragged_row_views() -> None:
