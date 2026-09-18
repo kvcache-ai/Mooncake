@@ -35,6 +35,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::REPLICA_ALREADY_EXISTS, "REPLICA_ALREADY_EXISTS"},
         {ErrorCode::REPLICA_IS_GONE, "REPLICA_IS_GONE"},
         {ErrorCode::OBJECT_REPLICA_BUSY, "OBJECT_REPLICA_BUSY"},
+        {ErrorCode::PROMOTION_ALREADY_EXISTS, "PROMOTION_ALREADY_EXISTS"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
         {ErrorCode::CHECKSUM_MISMATCH, "CHECKSUM_MISMATCH"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},

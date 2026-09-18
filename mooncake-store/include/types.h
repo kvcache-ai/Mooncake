@@ -216,6 +216,23 @@ constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
     "enable_client_http_server";
 constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+// Master switch for best-effort SSD prefetch (SSD->DRAM promotion triggered
+// by exist probes). Off by default; when off, the exist/get paths behave
+// exactly as before.
+constexpr const char* CONFIG_KEY_ENABLE_SSD_PREFETCH = "enable_ssd_prefetch";
+// Backoff window (seconds) for best-effort SSD prefetch after DRAM is
+// saturated: while active, prefetch is skipped so eviction/offload can
+// reclaim memory instead of competing with promotion. 0 disables the backoff.
+constexpr const char* CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC =
+    "ssd_prefetch_cooldown_sec";
+// De-duplication / rate-limit TTL (seconds): the same key is prefetched at
+// most once per this period, suppressing duplicate triggers from concurrent
+// probes. 0 disables dedup.
+constexpr const char* CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC =
+    "ssd_prefetch_dedup_ttl_sec";
+// Max wait budget (milliseconds) on get when an SSD-only key has a prefetch
+// in flight. 0 (the default) disables the wait entirely.
+constexpr const char* CONFIG_KEY_SSD_GET_WAIT_MS = "ssd_get_wait_ms";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
@@ -223,6 +240,10 @@ static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
+static constexpr size_t DEFAULT_SSD_PREFETCH_COOLDOWN_SEC = 5;
+static constexpr size_t DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC = 30;
+// Disabled by default: no get-path latency change unless explicitly opted in.
+static constexpr size_t DEFAULT_SSD_GET_WAIT_MS = 0;
 
 struct OffloadTaskItem {
     std::string tenant_id;
@@ -328,6 +349,9 @@ enum class ErrorCode : int32_t {
     REPLICA_NOT_IN_LOCAL_MEMORY =
         -713,  ///< Replica does not reside in current node memory.
     OBJECT_REPLICA_BUSY = -714,  ///< Object replicas have non-zero refcnt.
+    PROMOTION_ALREADY_EXISTS =
+        -715,  ///< A MEMORY replica or an in-flight promotion already exists
+               ///< for the key; not an error for best-effort prefetch.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
