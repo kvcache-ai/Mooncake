@@ -318,17 +318,12 @@ tl::expected<void, ErrorCode> OssObjectStorageAdapter::Init() {
     security_token_ = std::move(config->security_token);
     path_style_ = config->path_style;
     anonymous_ = config->anonymous;
+    max_connections_ = config->max_connections;
+    receive_buffer_size_ = config->receive_buffer_size;
+    upload_buffer_size_ = config->upload_buffer_size;
 
     std::call_once(curl_init_once,
                    [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
-    max_connections_ =
-        std::max<long>(1, Environ::GetInt("MOONCAKE_OSS_MAX_CONNECTIONS", 64));
-    receive_buffer_size_ = std::clamp<long>(
-        Environ::GetInt("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", 1024 * 1024),
-        16 * 1024, 10 * 1024 * 1024);
-    upload_buffer_size_ = std::clamp<long>(
-        Environ::GetInt("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", 1024 * 1024),
-        16 * 1024, 2 * 1024 * 1024);
     initialized_ = true;
     LOG(INFO) << "OSS adapter initialized: endpoint=" << endpoint_
               << ", bucket=" << bucket_ << ", region=" << region_
