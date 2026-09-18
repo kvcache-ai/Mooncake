@@ -11,19 +11,25 @@ namespace {
 
 int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap,
                                int num_local_experts) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA's verified protocol uses one active QP until each QP owns an
+    // independent source row.
+    return 1;
+#else
     if (!is_roce) return qps_per_rank;
     // CUDA RoCE shares HCAs across local GPUs; spreading small EP messages
-    // over all expert QPs adds doorbell/progress overhead. MUSA keeps the
+    // over all expert QPs adds doorbell/progress overhead. MACA keeps the
     // existing expert-scaled policy until its high-QP path is fully tuned.
     int target = cap;
     if (target <= 0) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_USE_MACA
         target = std::max(8, num_local_experts);
 #else
         target = 8;
 #endif
     }
     return std::min(qps_per_rank, target);
+#endif
 }
 
 cudaStream_t create_comm_stream() {
@@ -103,9 +109,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
-    // Optional runtime override for the RoCE active-QP count. Without an
-    // override, CUDA uses eight QPs and MUSA scales up to local experts.
+    // Optional runtime override for the CUDA/MACA RoCE active-QP count.
     active_qps_cap_ = 0;
+#ifndef MOONCAKE_EP_USE_MUSA
     if (const char* env = std::getenv("MOONCAKE_EP_ACTIVE_QPS_PER_RANK")) {
         char* end = nullptr;
         long v = std::strtol(env, &end, 10);
@@ -120,6 +126,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     LOG(INFO) << "[EP] RoCE active QPs/rank override = "
               << (active_qps_cap_ > 0 ? std::to_string(active_qps_cap_)
                                       : "auto");
+#else
+    LOG(INFO) << "[EP] MUSA active QPs/rank = 1";
+#endif
 
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -241,7 +250,6 @@ MooncakeEpBuffer::dispatch(
     int current_buffer_idx = buffer_idx;
     auto buffer = layout.buffers[current_buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
-    int phase_epoch = ++phase_epochs[current_buffer_idx];
     int shadow_slot;
     {
         std::lock_guard<std::mutex> lock(buffer_mutex);
@@ -305,30 +313,6 @@ MooncakeEpBuffer::dispatch(
     int active_qps_per_rank = active_qps_per_rank_for_ep(
         USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
         active_qps_cap_, num_experts / num_ranks);
-    auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
-                                 buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream);
-#endif
-    };
-
-    auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
-#endif
-    };
-
-    auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
-#endif
-    };
-
     auto launcher = [=](int phases) {
         mooncake::dispatch(
             packed_recv_x, packed_recv_x_scales, packed_recv_src_info,
@@ -345,13 +329,11 @@ MooncakeEpBuffer::dispatch(
     if (return_recv_hook &&
         (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
         launcher(LOW_LATENCY_SEND_PHASE);
-        mark_send_done();
     } else if (graph_capture) {
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
     } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
-        mark_and_wait_peer_send_done();
         launcher(LOW_LATENCY_RECV_PHASE);
 #else
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
@@ -376,7 +358,6 @@ MooncakeEpBuffer::dispatch(
     if (return_recv_hook)
         recv_hook = [=]() {
             if (graph_capture && macaHostPhaseFenceCoversPeers()) return;
-            if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
 
@@ -432,7 +413,6 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     int current_buffer_idx = buffer_idx;
     auto buffer = layout.buffers[current_buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
-    int phase_epoch = ++phase_epochs[current_buffer_idx];
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream, whose native
@@ -457,30 +437,6 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
         USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
         active_qps_cap_, num_experts / num_ranks);
 
-    auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
-                                 buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream);
-#endif
-    };
-
-    auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
-#endif
-    };
-
-    auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_PHASE_ACK
-        mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
-#endif
-    };
-
     // Kernel launch
     auto launcher = [=](int phases) {
         auto* kernel_topk_idx =
@@ -499,13 +455,11 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     if (return_recv_hook &&
         (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
         launcher(LOW_LATENCY_SEND_PHASE);
-        mark_send_done();
     } else if (graph_capture) {
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
     } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
-        mark_and_wait_peer_send_done();
         launcher(LOW_LATENCY_RECV_PHASE);
 #else
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
@@ -530,7 +484,6 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     if (return_recv_hook)
         recv_hook = [=]() {
             if (graph_capture && macaHostPhaseFenceCoversPeers()) return;
-            if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
             launcher(LOW_LATENCY_RECV_PHASE);
         };
 
