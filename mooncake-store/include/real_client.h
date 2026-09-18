@@ -26,6 +26,7 @@
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
 #endif
+#include "thread_pool.h"
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/coro_io.hpp>
@@ -694,6 +695,34 @@ class RealClient : public PyClient {
         std::unordered_map<std::string, std::vector<Slice>>;
     using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
         const std::string &, LocalDiskOffloadObjects &)>;
+    using LocalDiskOffloadObjectsByEndpoint =
+        std::unordered_map<std::string, LocalDiskOffloadObjects>;
+
+    // One endpoint's batch paired with the outcome of reading it.
+    struct LocalDiskEndpointRead {
+        const std::string *endpoint;
+        LocalDiskOffloadObjects *objects;
+        tl::expected<void, ErrorCode> status;
+    };
+
+    /**
+     * @brief Reads each endpoint's LOCAL_DISK batch, the endpoints in
+     *        parallel.
+     *
+     * The batches are independent, so reading them one at a time would add up
+     * their latencies. Endpoints with nothing to read are skipped. Only the
+     * reads happen here: checksum verification and result bookkeeping stay
+     * with the caller, on the caller's thread.
+     *
+     * @param objects_by_endpoint Per-endpoint batches; the reader fills the
+     *        destination slices in place.
+     * @param reader Performs one endpoint's read; called concurrently.
+     * @return One entry per non-empty endpoint, each pointing into
+     *         objects_by_endpoint and carrying that read's status.
+     */
+    std::vector<LocalDiskEndpointRead> read_local_disk_endpoints(
+        LocalDiskOffloadObjectsByEndpoint &objects_by_endpoint,
+        const LocalDiskOffloadReader &reader);
 
     // Dependency-injected overload used to verify routing decisions without
     // requiring multiple live SSD offload servers.
@@ -1112,6 +1141,12 @@ class RealClient : public PyClient {
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
+
+    // Workers for the per-endpoint LOCAL_DISK reads of one batch. Sized from
+    // MC_OFFLOAD_PARALLEL_WORKERS and kept for the client's lifetime: these
+    // reads are on the per-request path, where spawning threads per batch
+    // would cost more than the overlap saves.
+    std::unique_ptr<ThreadPool> offload_parallel_pool_;
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();
