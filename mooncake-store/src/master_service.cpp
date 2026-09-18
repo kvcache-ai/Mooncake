@@ -8115,6 +8115,8 @@ auto MasterService::NotifyOffloadSuccess(
                         source->dec_refcnt();
                     }
                     tenant_state.offloading_tasks.erase(task_it);
+                    MasterMetricManager::instance().inc_offload_failed(
+                        UuidToString(client_id));
                 }
             }
             continue;
@@ -8181,6 +8183,8 @@ auto MasterService::NotifyOffloadSuccess(
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
                         SyncCacheTotalAccounting(obj_metadata);
+                        MasterMetricManager::instance().inc_offload_completed(
+                            UuidToString(client_id));
                         added_new_local_disk_replica = true;
                     } else {
                         obj_metadata.VisitReplicas(
@@ -8278,6 +8282,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     bool any_enqueued = false;
+    std::string client_id_str;
     const auto source_session = replica.getClientSession();
     if (!source_session) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -8322,11 +8327,16 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
         }
         if (err != ErrorCode::OK) {
+            if (err == ErrorCode::KEYS_ULTRA_LIMIT) {
+                MasterMetricManager::instance().inc_offload_enqueue_rejected(
+                    UuidToString(*client_id));
+            }
             return tl::make_unexpected(err);
         }
         if (mirror_clients != nullptr) {
             mirror_clients->push_back(*client_id);
         }
+        client_id_str = UuidToString(*client_id);
         any_enqueued = true;
     }
     // Every segment name was nullopt (or EnqueueOffload found no usable
@@ -8335,6 +8345,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     if (!any_enqueued) {
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
+    MasterMetricManager::instance().inc_offload_enqueued(client_id_str);
     return {};
 }
 
@@ -8359,6 +8370,8 @@ bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
     if (source != nullptr) {
         source->dec_refcnt();
     }
+    MasterMetricManager::instance().inc_offload_cancelled(
+        UuidToString(mirror_clients[0]));
     tenant_state.offloading_tasks.erase(task_it);
     return true;
 }

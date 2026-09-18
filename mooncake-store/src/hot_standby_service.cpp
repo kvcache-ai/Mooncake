@@ -107,6 +107,9 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         return ErrorCode::INTERNAL_ERROR;  // State machine rejected START
     }
 
+    HAMetricManager::instance().reset_snapshot_runtime(
+        config_.enable_snapshot_bootstrap &&
+        batch_oplog_snapshot_provider_ != nullptr);
     config_.primary_address = primary_address;
     oplog_endpoints_ = oplog_endpoints;
     cluster_id_ = cluster_id;
@@ -294,6 +297,9 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
         DurablePrefix{.batch_id = restored->last_applied_batch_id,
                       .last_seq = restored->last_applied_seq};
     batch_snapshot_producer_view_version_ = restored->producer_view_version;
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.applied_batch = batch_snapshot_baseline_->batch_id;
+    });
     applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
     primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
     return ErrorCode::OK;
@@ -956,6 +962,7 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
         return;
     }
 
+    const auto pause_start = std::chrono::steady_clock::now();
     state->requested = false;
     auto applied_prefix = batch_standby_reader_->GetLastAppliedDurablePrefix();
     ViewVersionId producer_view_version = 0;
@@ -984,6 +991,14 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
         return !state->active ||
                !replication_loop_running_.load(std::memory_order_acquire);
     });
+    if (consistent) {
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            metrics.capture_pause_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - pause_start)
+                    .count();
+        });
+    }
 }
 
 void HotStandbyService::CancelSnapshotCapture() {
@@ -1017,6 +1032,8 @@ void HotStandbyService::SetBatchOpLogSnapshotProvider(
 }
 
 ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
+    HAMetricManager::SnapshotOperationTimer metric_timer(
+        HAMetricManager::SnapshotOperation::Rebootstrap);
     recovering_.store(true, std::memory_order_release);
     CancelSnapshotCapture();
     {
@@ -1085,6 +1102,12 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     err = storage.ReadCompactionFloor(current_floor);
     if (err != ErrorCode::OK && err != ErrorCode::ETCD_KEY_NOT_EXIST)
         return err;
+    if (err == ErrorCode::OK) {
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            metrics.compaction_floor =
+                std::max(metrics.compaction_floor, current_floor);
+        });
+    }
     if (err == ErrorCode::OK &&
         restored->last_included_batch_id < current_floor) {
         return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
@@ -1100,6 +1123,9 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     batch_standby_reader_.swap(reader);
     batch_snapshot_baseline_ = *cursor;
     batch_snapshot_producer_view_version_ = restored->producer_view_version;
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.applied_batch = batch_snapshot_baseline_->batch_id;
+    });
     {
         std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
         last_applied_batch_snapshot_prefix_ = *cursor;
@@ -1108,7 +1134,7 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     primary_seq_id_.store(cursor->last_seq);
     last_error_.store(ErrorCode::OK);
     recovering_.store(false, std::memory_order_release);
-    return ErrorCode::OK;
+    return metric_timer.Success(ErrorCode::OK);
 }
 
 void HotStandbyService::ReplicationLoop() {
@@ -1158,6 +1184,31 @@ void HotStandbyService::ReplicationLoop() {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
             auto result = batch_standby_reader_->PollOnce();
+            if (result.durable_prefix_present ||
+                result.disposition ==
+                    OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
+                const auto applied =
+                    batch_standby_reader_->GetLastAppliedDurablePrefix();
+                HAMetricManager::instance().update_snapshot_runtime(
+                    [&](auto& metrics) {
+                        metrics.applied_batch = applied ? applied->batch_id : 0;
+                        if (result.durable_prefix_present)
+                            metrics.durable_batch =
+                                std::max(metrics.durable_batch,
+                                         result.durable_prefix.batch_id);
+                        metrics.compaction_floor = std::max(
+                            metrics.compaction_floor, result.compaction_floor);
+                        if (applied &&
+                            applied->batch_id >=
+                                metrics.catch_up_target_batch &&
+                            !IsSequenceOlder(
+                                applied->last_seq,
+                                metrics.catch_up_target_sequence)) {
+                            metrics.catch_up_target_batch = 0;
+                            metrics.catch_up_target_sequence = 0;
+                        }
+                    });
+            }
             {
                 std::lock_guard<std::mutex> cursor_lock(
                     batch_snapshot_cursor_mutex_);

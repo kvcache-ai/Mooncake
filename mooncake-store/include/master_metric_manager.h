@@ -351,6 +351,14 @@ class MasterMetricManager {
     void inc_promotion_candidate_expired_unevaluated(int64_t val = 1);
     void inc_promotion_candidate_dropped_limit(int64_t val = 1);
 
+    // SSD Offload Task Metrics (per store worker via client_id label)
+    void inc_offload_enqueued(const std::string& client_id, int64_t val = 1);
+    void inc_offload_completed(const std::string& client_id, int64_t val = 1);
+    void inc_offload_failed(const std::string& client_id, int64_t val = 1);
+    void inc_offload_cancelled(const std::string& client_id, int64_t val = 1);
+    void inc_offload_enqueue_rejected(const std::string& client_id,
+                                      int64_t val = 1);
+
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
     int64_t get_promotion_admitted();
@@ -747,6 +755,13 @@ class MasterMetricManager {
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
+
+    // SSD Offload Task Metrics
+    ylt::metric::dynamic_counter_1t offload_enqueued_total_;
+    ylt::metric::dynamic_counter_1t offload_completed_total_;
+    ylt::metric::dynamic_counter_1t offload_failed_total_;
+    ylt::metric::dynamic_counter_1t offload_cancelled_total_;
+    ylt::metric::dynamic_counter_1t offload_enqueue_rejected_total_;
 
     // Snapshot Metrics
     ylt::metric::histogram_t snapshot_duration_ms_;

@@ -226,7 +226,9 @@ void TcpTransport::startTransfer(TcpTask *task) {
         auto status = doTransferWithRetry(task);
         completed = status.ok();
         if (!completed) {
-            LOG(WARNING) << "TCP transfer failed: " << status.ToString();
+            VLOG(1) << "TCP transfer failed: " << status.ToString();
+            LOG_EVERY_N(WARNING, 100)
+                << "TCP transfer failed: " << status.ToString();
         }
     } catch (const std::exception &error) {
         // enqueue() stores exceptions in a future which the submit path does
@@ -267,9 +269,12 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
             return Status::InternalError("Transport shutting down");
 
         if (attempt > 0) {
-            LOG(INFO) << "TCP transfer retry attempt " << attempt << "/"
-                      << params_.max_retry_count << ", backoff " << delay_ms
-                      << "ms";
+            VLOG(1) << "TCP transfer retry attempt " << attempt << "/"
+                    << params_.max_retry_count << ", backoff " << delay_ms
+                    << "ms";
+            LOG_EVERY_N(INFO, 100)
+                << "TCP transfer retry attempt " << attempt << "/"
+                << params_.max_retry_count << ", backoff " << delay_ms << "ms";
             // Sleep in small increments so shutdown is not delayed
             for (uint64_t i = 0; i < delay_ms; i += 100) {
                 if (shutting_down_.load(std::memory_order_acquire))
@@ -293,8 +298,10 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         if (status.ok()) return Status::OK();
 
         last_error = status;
-        LOG(WARNING) << "TCP transfer attempt " << attempt
-                     << " failed: " << status.ToString();
+        VLOG(1) << "TCP transfer attempt " << attempt
+                << " failed: " << status.ToString();
+        LOG_EVERY_N(WARNING, 1000) << "TCP transfer attempt " << attempt
+                                   << " failed: " << status.ToString();
 
         if (task->request.opcode == Request::WRITE &&
             status.IsRpcServiceError() && !status.IsRpcConnectionError()) {
