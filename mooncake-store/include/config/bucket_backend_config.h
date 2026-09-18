@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <ostream>
+#include <vector>
 
 namespace mooncake {
 
@@ -65,6 +66,12 @@ struct BucketBackendConfig {
     // Write the final partial bucket in the current offload cycle instead of
     // carrying keys into a later cycle without their current offload tasks.
     bool flush_partial_buckets = false;
+
+    // Per-disk quotas, positionally aligned with the disks parsed out of
+    // FileStorageConfig::storage_filepath. Empty => broadcast the scalar
+    // max_total_size to every disk. A list shorter than the disk count
+    // reuses its last entry for the remaining disks.
+    std::vector<int64_t> max_total_size_per_disk;
 
     bool Validate() const;
 
