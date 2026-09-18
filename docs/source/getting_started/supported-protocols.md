@@ -327,6 +327,7 @@ export MC_INTRANODE_NVLINK=true
 **Requirements:**
 - CXL-capable hardware
 
+(shm-transport)=
 ### SHM Transport (shm)
 
 **Description:** Same-host DRAM copies over POSIX shared memory. Classic Transfer Engine maps the peer's named shm object, relocates the peer virtual address into the local mapping, and `memcpy`s. This is a first-class transport like HIP, not a replacement for `CxlTransport` (DAX offset addressing).
@@ -350,7 +351,7 @@ export MC_INTRANODE_NVLINK=true
 - After `freeSharedMemory` + `allocateSharedMemory`, a peer that still has a cached mapping probes the object name before memcpy. An unlinked object is dropped and the segment descriptor is refetched once; a changed virtual address still requires the initiator to read the new `BufferDesc.addr` (relocate cannot guess a new offset). Background refresh remains optional via `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`.
 - Relocate caches at most 32 mmap'd peer objects per target. An in-flight copy pins its mapping so prune/cap cannot `munmap` it until memcpy returns; the cache may briefly exceed 32 while pins are held.
 - Default off because the path is not NUMA-aware
-- Mooncake Store host DRAM global segments can opt into this path with `MC_STORE_USE_SHM_SEGMENT=1` (or `MC_FORCE_SHM=1`); hugepage SHM follows `MC_STORE_USE_HUGEPAGE` / `MC_STORE_HUGEPAGE_SIZE` / optional `MC_HUGETLBFS_PATH`, and POSIX fallback after hugetlbfs failure is gated by `MC_STORE_SHM_ALLOW_TMPFS`. Classic TE only; prefer `-DENABLE_MULTI_PROTOCOL=ON`. See [Same-host Store SHM Segment](../deployment/mooncake-store-deployment-guide.md#same-host-store-shm-segment-shmtransport).
+- Mooncake Store host DRAM global segments can opt into this path with `MC_STORE_USE_SHM_SEGMENT=1` (or `MC_FORCE_SHM=1`); hugepage SHM follows `MC_STORE_USE_HUGEPAGE` / `MC_STORE_HUGEPAGE_SIZE` / optional `MC_HUGETLBFS_PATH`, and POSIX fallback after hugetlbfs failure is gated by `MC_STORE_SHM_ALLOW_TMPFS`. Classic TE only; prefer `-DENABLE_MULTI_PROTOCOL=ON`. See [Same-host Store SHM Segment](../deployment/mooncake-store-deployment-guide.md#same-host-store-shm-segment).
 
 ### Ascend Transport (ascend)
 

@@ -1366,6 +1366,7 @@ pool plus any hugepage-backed segments; when the pool is exhausted the first
 allocation aborts with a clear error naming the hugepage size and count needed
 rather than silently degrading.
 
+(same-host-store-shm-segment)=
 #### Same-host Store SHM Segment (`ShmTransport`)
 
 By default, same-host Put/Get between Store clients still uses the segment
@@ -1414,7 +1415,7 @@ participate (segment contributor and readers/writers). Peer processes must
 share a UID (`0600` objects) and a visible `/dev/shm` or hugetlbfs mount.
 After a crash, leftover hugetlbfs files continue to reserve hugepages until
 unlinked — remove only `mooncake_<dead-pid>_*` on the mount (see
-[SHM Transport](../getting_started/supported-protocols.md#shm-transport-shm)).
+[SHM Transport](../getting_started/supported-protocols.md#shm-transport)).
 
 #### yalantinglibs Log Level
 
