@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Optional
 
 from ..contracts import ParticipantId, TopologyId
 from .types import (
     ParallelRank,
+    _parallel_rank_identity,
     _require_integer,
     _require_nonempty_string,
     require_manifest_items,
@@ -33,10 +34,10 @@ class TopologyParticipant:
 
 @dataclass(frozen=True, init=False)
 class ParallelTopology:
-    """Complete TP/PP/EP/DP dimensions and selected participant mapping.
+    """Complete TP/PP/EP/DP/CP dimensions and selected participant mapping.
 
     ``world_size`` is the number of explicit participants. It is deliberately
-    not inferred from the product of the four axis sizes because frameworks may
+    not inferred from the product of the axis sizes because frameworks may
     map TP and EP onto the same workers, and a placement may select one DP
     replica while retaining the source runtime's declared ``dp_size``.
     """
@@ -45,6 +46,7 @@ class ParallelTopology:
     pp_size: int
     ep_size: int
     dp_size: int
+    cp_size: int
     participants: tuple[TopologyParticipant, ...]
     topology_id: TopologyId
 
@@ -56,6 +58,7 @@ class ParallelTopology:
         ep_size: int,
         dp_size: int,
         participants: tuple[TopologyParticipant, ...],
+        cp_size: int = 1,
         topology_id: Optional[TopologyId] = None,
     ) -> None:
         for value, name in (
@@ -63,6 +66,7 @@ class ParallelTopology:
             (pp_size, "pp_size"),
             (ep_size, "ep_size"),
             (dp_size, "dp_size"),
+            (cp_size, "cp_size"),
         ):
             _require_integer(value, name, minimum=1)
         normalized_participants = require_manifest_items(
@@ -88,6 +92,7 @@ class ParallelTopology:
             "pp": pp_size,
             "ep": ep_size,
             "dp": dp_size,
+            "cp": cp_size,
         }
         for participant in normalized_participants:
             for axis, size in axis_sizes.items():
@@ -103,6 +108,7 @@ class ParallelTopology:
             pp_size=pp_size,
             ep_size=ep_size,
             dp_size=dp_size,
+            cp_size=cp_size,
             participants=normalized_participants,
         )
         if topology_id is not None and topology_id != canonical_id:
@@ -111,6 +117,7 @@ class ParallelTopology:
         object.__setattr__(self, "pp_size", pp_size)
         object.__setattr__(self, "ep_size", ep_size)
         object.__setattr__(self, "dp_size", dp_size)
+        object.__setattr__(self, "cp_size", cp_size)
         object.__setattr__(self, "participants", normalized_participants)
         object.__setattr__(self, "topology_id", canonical_id)
 
@@ -135,6 +142,7 @@ def _topology_id(
     pp_size: int,
     ep_size: int,
     dp_size: int,
+    cp_size: int,
     participants: tuple[TopologyParticipant, ...],
 ) -> TopologyId:
     content = {
@@ -143,8 +151,16 @@ def _topology_id(
         "pp_size": pp_size,
         "ep_size": ep_size,
         "dp_size": dp_size,
-        "participants": [asdict(item) for item in participants],
+        "participants": [
+            {
+                "participant_id": item.participant_id,
+                "rank": _parallel_rank_identity(item.rank),
+            }
+            for item in participants
+        ],
     }
+    if cp_size != 1:
+        content["cp_size"] = cp_size
     encoded = json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
     return TopologyId(f"sha256:{hashlib.sha256(encoded).hexdigest()}")
 

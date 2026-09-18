@@ -149,6 +149,14 @@ def complete_parallel_source_replicas(
     source_tensors: dict[TensorId, TensorDescriptor],
     source_fragments: Sequence[PlacementFragment],
 ) -> dict[int, dict[TensorId, RuntimeTensorOwner]]:
+    """Select a complete non-DP owner per tensor within each DP replica.
+
+    Every declared owner must independently cover the tensor. Multiple complete
+    PP/EP/TP/CP owners are permitted; the smallest canonical owner-coordinate
+    tuple is selected deterministically. Tensors with DP ownership follow the
+    separate, single-owner contract in ``complete_dp_owned_source_owners``.
+    """
+
     replicas: dict[int, dict[TensorId, RuntimeTensorOwner]] = {}
     fragments_by_dp_and_tensor: dict[int, dict[TensorId, list[PlacementFragment]]] = {}
     for fragment in source_fragments:

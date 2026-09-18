@@ -401,7 +401,13 @@ def _build_executor_plans(
                     )
                 )
     result.sort(
-        key=lambda item: (item.rank.dp, item.rank.pp, item.rank.ep, item.rank.tp)
+        key=lambda item: (
+            item.rank.dp,
+            item.rank.pp,
+            item.rank.ep,
+            item.rank.tp,
+            item.rank.cp,
+        )
     )
     if selected_fragment_ids is not None and observed_selected_fragment_ids != set(
         selected_fragment_ids

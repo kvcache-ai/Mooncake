@@ -143,6 +143,7 @@ def with_empty_participant(
         pp_size=max(inputs.placement.topology.pp_size, rank.pp + 1),
         ep_size=max(inputs.placement.topology.ep_size, rank.ep + 1),
         dp_size=max(inputs.placement.topology.dp_size, rank.dp + 1),
+        cp_size=max(inputs.placement.topology.cp_size, rank.cp + 1),
         participants=(
             *inputs.placement.topology.participants,
             TopologyParticipant(participant_id=participant_id, rank=rank),
@@ -207,6 +208,7 @@ def make_runtime_inputs(
         pp_size=max(participant.rank.pp for participant in participants) + 1,
         ep_size=max(participant.rank.ep for participant in participants) + 1,
         dp_size=max(participant.rank.dp for participant in participants) + 1,
+        cp_size=max(participant.rank.cp for participant in participants) + 1,
         participants=tuple(
             TopologyParticipant(
                 participant_id=participant.participant_id,
