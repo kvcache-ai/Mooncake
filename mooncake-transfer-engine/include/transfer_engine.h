@@ -58,6 +58,12 @@ const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
 using NicLoadStats = Transport::NicLoadStats;
 
+struct SegmentBufferInfo {
+    uint64_t addr;
+    uint64_t length;
+    std::string location;
+};
+
 enum class PeerLiveness : uint8_t {
     Alive = 0,
     Unreachable = 1,
@@ -123,6 +129,12 @@ class TransferEngine {
     bool isUsingTent() const { return use_tent_; }
 
     SegmentHandle openSegment(const std::string& segment_name);
+
+    // Replace buffers with a snapshot of the segment's memory buffers.
+    // Return 0 on success (including an empty segment), or a negative ERR_*.
+    // On error, buffers is empty. Does not close the segment handle.
+    int getSegmentBuffers(SegmentHandle handle,
+                          std::vector<SegmentBufferInfo>& buffers);
 
     Status CheckSegmentStatus(SegmentID sid);
 

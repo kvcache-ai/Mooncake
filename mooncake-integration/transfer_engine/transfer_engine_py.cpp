@@ -1153,13 +1153,16 @@ int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string& segment_name) {
+    pybind11::gil_scoped_release release;
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
-    auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
-    if (!segment_desc || segment_desc->buffers.empty()) {
+    if (segment_id ==
+        static_cast<Transport::SegmentHandle>(ERR_INVALID_ARGUMENT))
         return 0;
-    }
-    return segment_desc->buffers[0].addr;
+    std::vector<SegmentBufferInfo> buffers;
+    if (engine_->getSegmentBuffers(segment_id, buffers) != 0 || buffers.empty())
+        return 0;
+    return buffers.front().addr;
 }
 
 std::string TransferEnginePy::getLocalTopology(const char* device_name) {
@@ -1226,7 +1229,6 @@ int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
         if (handle == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
             return -1;
         auto liveness = engine_->probePeerAliveByID(handle);
-        engine_->closeSegment(handle);
         return static_cast<int>(liveness);
     }
 

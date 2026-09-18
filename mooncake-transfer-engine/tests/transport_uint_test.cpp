@@ -531,6 +531,94 @@ class TransportTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+TEST_F(TransportTest, SegmentBuffersClassicSnapshotAndErrors) {
+#ifdef USE_TENT
+    ScopedUnsetEnvVar use_tent("MC_USE_TENT");
+    ScopedUnsetEnvVar use_tev1("MC_USE_TEV1");
+#endif
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto metadata = engine.getMetadata();
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "buffers";
+    desc->protocol = "rdma";
+    desc->buffers.resize(2);
+    desc->buffers[0].name = "cpu:0";
+    desc->buffers[0].addr = 8192;
+    desc->buffers[0].length = 128;
+    desc->buffers[1].name = "cpu:1";
+    desc->buffers[1].addr = 4096;
+    desc->buffers[1].length = 256;
+    metadata->addLocalSegment(LOCAL_SEGMENT_ID, "buffers", std::move(desc));
+
+    std::vector<SegmentBufferInfo> buffers{{1, 1, "old"}};
+    ASSERT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    ASSERT_EQ(buffers.size(), 2);
+    EXPECT_EQ(buffers[0].addr, 8192);
+    EXPECT_EQ(buffers[0].length, 128);
+    EXPECT_EQ(buffers[0].location, "cpu:0");
+    EXPECT_EQ(buffers[1].addr, 4096);
+    EXPECT_EQ(buffers[1].length, 256);
+    EXPECT_EQ(buffers[1].location, "cpu:1");
+
+    // Replacing the descriptor leaves an already returned snapshot intact.
+    desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "buffers";
+    desc->protocol = "rdma";
+    metadata->addLocalSegment(LOCAL_SEGMENT_ID, "buffers", std::move(desc));
+    EXPECT_EQ(buffers[0].length, 128);
+    EXPECT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    EXPECT_TRUE(buffers.empty());
+
+    buffers.push_back({1, 1, "old"});
+    EXPECT_EQ(engine.getSegmentBuffers(
+                  static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT), buffers),
+              ERR_METADATA);
+    EXPECT_TRUE(buffers.empty());
+
+    desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "buffers";
+    desc->protocol = "nvmeof";
+    metadata->addLocalSegment(LOCAL_SEGMENT_ID, "buffers", std::move(desc));
+    buffers.push_back({1, 1, "old"});
+    EXPECT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers),
+              ERR_NOT_IMPLEMENTED);
+    EXPECT_TRUE(buffers.empty());
+}
+
+#ifdef USE_TENT
+TEST_F(TransportTest, SegmentBuffersTentMemoryAndInvalidHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar config(
+        "MC_TENT_CONF",
+        R"({"transports":{"rdma":{"enable":false},"tcp":{"enable":true},"gds":{"enable":false},"shm":{"enable":false}}})");
+    std::array<char, 128> memory{};
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, ""), 0);
+    std::vector<SegmentBufferInfo> buffers{{1, 1, "old"}};
+    ASSERT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    EXPECT_TRUE(buffers.empty());
+
+    ASSERT_EQ(engine.registerLocalMemory(memory.data(), memory.size()), 0);
+    ASSERT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    ASSERT_EQ(buffers.size(), 1);
+    EXPECT_EQ(buffers[0].addr, reinterpret_cast<uint64_t>(memory.data()));
+    EXPECT_EQ(buffers[0].length, memory.size());
+    EXPECT_FALSE(buffers[0].location.empty());
+    EXPECT_EQ(engine.unregisterLocalMemory(memory.data()), 0);
+    EXPECT_EQ(buffers[0].length, memory.size());
+    EXPECT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    EXPECT_TRUE(buffers.empty());
+
+    buffers.push_back({1, 1, "old"});
+    EXPECT_EQ(engine.getSegmentBuffers(
+                  static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT), buffers),
+              ERR_METADATA);
+    EXPECT_TRUE(buffers.empty());
+}
+#endif
+
 static int CreateTempFile() {
     char temp_filename[] = "/tmp/testfileXXXXXX";
     int fd = mkstemp(temp_filename);
