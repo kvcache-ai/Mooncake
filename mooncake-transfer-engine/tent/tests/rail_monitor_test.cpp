@@ -358,9 +358,9 @@ TEST(RailMonitorRecoverTest, CooldownDoesNotCarryOverAfterRecovery) {
     auto remote = makeSingleNicTopology("mlx5_1");
 
     Config cfg;
-    cfg.set(RailMonitor::kCfgErrorThreshold, 1);    // pause on first failure
-    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);  // wide: no window resets
-    cfg.set(RailMonitor::kCfgCooldownSecs, 1);      // small initial cooldown
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);      // pause on first failure
+    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);    // wide: no window resets
+    cfg.set(RailMonitor::kCfgCooldownSecs, 1);        // small initial cooldown
     cfg.set(RailMonitor::kCfgProbeIntervalSecs, 60);  // disable probing
 
     RailMonitor rail;
@@ -577,13 +577,13 @@ TEST(RailMonitorProbeTest, InFlightProbeBlocksSecondAdmit) {
     rail.markRecovered(0, 0);
     EXPECT_TRUE(rail.isAvailable(0, 0));
 
-    // Re-pause and arm another probe: the flag was cleared, so a new probe arms.
+    // Re-pause and arm another probe: the flag was cleared, so a new probe
+    // arms.
     rail.markFailed(0, 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     EXPECT_TRUE(rail.admit(0, 0))
         << "After completion clears the flag, a new probe must arm";
-    EXPECT_FALSE(rail.admit(0, 0))
-        << "Again blocked while in flight";
+    EXPECT_FALSE(rail.admit(0, 0)) << "Again blocked while in flight";
 }
 
 // ---------------------------------------------------------------------------

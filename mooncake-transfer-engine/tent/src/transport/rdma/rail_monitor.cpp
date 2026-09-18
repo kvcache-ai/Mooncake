@@ -265,8 +265,7 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic) {
         st.cooldown = std::chrono::seconds(0);
         st.last_probe_time = {};
         LOG(INFO) << "Rail recovered: local_nic=" << local_nic
-                  << " remote_nic=" << remote_nic
-                  << " (probe/trial succeeded)";
+                  << " remote_nic=" << remote_nic << " (probe/trial succeeded)";
         updateBestMapping();
         return;
     }
