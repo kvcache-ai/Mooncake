@@ -11,8 +11,7 @@ runs:
           /usr/share/dotnet \
           /opt/ghc \
           /opt/hostedtoolcache/CodeQL \
-          /usr/local/lib/android \
-          /opt/hostedtoolcache/go \
-          /opt/hostedtoolcache/node
+          /usr/local/lib/android
+        # Build-flags TE scratch lives on /mnt (larger than /) when jobs opt in.
         sudo mkdir -p /mnt/mooncake-build-flags-te
         df -h
