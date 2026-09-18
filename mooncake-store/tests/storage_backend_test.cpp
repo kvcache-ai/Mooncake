@@ -5240,4 +5240,555 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     EXPECT_FALSE(exists.value());
 }
 
+//----------------------------- multi-disk ------------------------------------
+
+namespace {
+
+// Writes one bucket holding a single key of `size` bytes. bucket_keys_limit=1
+// in these tests makes every call produce exactly one bucket, so the number of
+// .meta files per directory equals the number of buckets routed to that disk.
+tl::expected<int64_t, ErrorCode> OffloadOneKey(BucketStorageBackend& backend,
+                                               const std::string& key,
+                                               size_t size, char fill = 'a') {
+    std::vector<char> value(size, fill);
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{value.data(), value.size()}});
+    return backend.BatchOffload(batch, [](const std::vector<std::string>&,
+                                          std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    });
+}
+
+int CountMetaFiles(const std::string& dir) {
+    int count = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (entry.path().extension() == ".meta") {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int64_t DirectoryBytes(const std::string& dir) {
+    int64_t bytes = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (entry.is_regular_file()) {
+            bytes += static_cast<int64_t>(fs::file_size(entry.path()));
+        }
+    }
+    return bytes;
+}
+
+}  // namespace
+
+TEST_F(StorageBackendTest, MultiDiskSplitCommaList) {
+    EXPECT_TRUE(SplitCommaList("").empty());
+    EXPECT_EQ(SplitCommaList("/d0").size(), 1u);
+    EXPECT_EQ(SplitCommaList("/d0,/d1,/d2").size(), 3u);
+    // Whitespace around entries is trimmed and empty segments are dropped, so
+    // a stray trailing comma cannot create a phantom disk rooted at "".
+    EXPECT_EQ(SplitCommaList(" /d0 , /d1 ").at(1), "/d1");
+    EXPECT_EQ(SplitCommaList("/d0,,/d1").size(), 2u);
+    EXPECT_EQ(SplitCommaList("/d0,").size(), 1u);
+}
+
+TEST_F(StorageBackendTest, MultiDiskWriteAndReadBackAcrossDisks) {
+    fs::create_directories(data_path + "/disk0");
+    fs::create_directories(data_path + "/disk1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0," + data_path + "/disk1";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;  // broadcast to both disks
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::unordered_map<std::string, std::string> test_data;
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> buckets;
+    ASSERT_TRUE(BatchOffloadUtil(backend, keys, sizes, test_data, buckets));
+
+    std::unordered_map<std::string, StorageObjectMetadata> metadata;
+    ASSERT_TRUE(backend.BatchQuery(keys, metadata));
+    EXPECT_EQ(metadata.size(), test_data.size());
+}
+
+TEST_F(StorageBackendTest, MultiDiskInitRecoversKeysFromEveryDisk) {
+    fs::create_directories(data_path + "/disk0");
+    fs::create_directories(data_path + "/disk1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0," + data_path + "/disk1";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    std::vector<std::string> written_keys;
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        for (int i = 0; i < 6; ++i) {
+            const std::string key = "k" + std::to_string(i);
+            ASSERT_TRUE(
+                OffloadOneKey(backend, key, 4096, static_cast<char>('a' + i)));
+            written_keys.push_back(key);
+        }
+    }
+    // Round-robin means the buckets are spread over both roots, so recovery
+    // only works if Init scans every disk.
+    EXPECT_GT(CountMetaFiles(data_path + "/disk0"), 0);
+    EXPECT_GT(CountMetaFiles(data_path + "/disk1"), 0);
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        for (const auto& key : written_keys) {
+            auto exists = backend.IsExist(key);
+            ASSERT_TRUE(exists.has_value());
+            EXPECT_TRUE(exists.value()) << "key lost after restart: " << key;
+        }
+    }
+}
+
+TEST_F(StorageBackendTest, MultiDiskRoundRobinSpreadsWritesEvenly) {
+    constexpr int kDisks = 3;
+    std::string paths;
+    for (int d = 0; d < kDisks; ++d) {
+        fs::create_directories(data_path + "/disk" + std::to_string(d));
+        if (d) {
+            paths += ",";
+        }
+        paths += data_path + "/disk" + std::to_string(d);
+    }
+
+    FileStorageConfig config;
+    config.storage_filepath = paths;
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;  // large: never evicts
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    constexpr int kWrites = 9;  // multiple of kDisks
+    for (int i = 0; i < kWrites; ++i) {
+        ASSERT_TRUE(OffloadOneKey(backend, "k" + std::to_string(i), 4096));
+    }
+    for (int d = 0; d < kDisks; ++d) {
+        EXPECT_EQ(CountMetaFiles(data_path + "/disk" + std::to_string(d)),
+                  kWrites / kDisks)
+            << "disk" << d << " did not get its round-robin share";
+    }
+}
+
+// Regression for disk starvation. A "most free space wins" policy pins every
+// write to the disk that was just evicted from — it regains the most headroom
+// and therefore always looks freest — leaving the other disks frozen at full.
+// Bucket ids increase with write order, so if a disk stopped receiving writes
+// its newest surviving id falls far behind the global newest.
+TEST_F(StorageBackendTest, MultiDiskRoundRobinDoesNotStarveDisksUnderEviction) {
+    constexpr int kDisks = 3;
+    std::string paths;
+    for (int d = 0; d < kDisks; ++d) {
+        fs::create_directories(data_path + "/disk" + std::to_string(d));
+        if (d) {
+            paths += ",";
+        }
+        paths += data_path + "/disk" + std::to_string(d);
+    }
+
+    FileStorageConfig config;
+    config.storage_filepath = paths;
+    BucketBackendConfig bucket_config;
+    // Small equal quotas so every disk starts evicting quickly.
+    bucket_config.max_total_size_per_disk = {32 * 1024, 32 * 1024, 32 * 1024};
+    bucket_config.bucket_size_limit = 16 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    for (int i = 0; i < 30; ++i) {
+        ASSERT_TRUE(OffloadOneKey(backend, "k" + std::to_string(i), 8 * 1024));
+    }
+
+    auto newest_bucket_id = [](const std::string& dir) -> int64_t {
+        int64_t newest = -1;
+        for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+            if (entry.path().extension() != ".meta") {
+                continue;
+            }
+            newest = std::max<int64_t>(
+                newest, std::stoll(entry.path().stem().string()));
+        }
+        return newest;
+    };
+    std::vector<int64_t> newest(kDisks);
+    int64_t global_newest = -1;
+    for (int d = 0; d < kDisks; ++d) {
+        newest[d] = newest_bucket_id(data_path + "/disk" + std::to_string(d));
+        global_newest = std::max(global_newest, newest[d]);
+    }
+    ASSERT_GE(global_newest, 0);
+    for (int d = 0; d < kDisks; ++d) {
+        EXPECT_GE(newest[d], 0) << "disk" << d << " holds nothing (starved)";
+        EXPECT_LE(global_newest - newest[d], static_cast<int64_t>(kDisks))
+            << "disk" << d << " stopped receiving recent writes (starvation)";
+    }
+}
+
+// Each disk enforces its own quota. A backend that evicted against a single
+// global total would let the small disk grow past its own cap.
+TEST_F(StorageBackendTest, MultiDiskEvictionRespectsPerDiskQuota) {
+    fs::create_directories(data_path + "/disk0");
+    fs::create_directories(data_path + "/disk1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0," + data_path + "/disk1";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size_per_disk = {40 * 1024, 80 * 1024};
+    bucket_config.bucket_size_limit = 16 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    for (int i = 0; i < 40; ++i) {
+        // Writes may legitimately fail once a disk is at its cap; the point of
+        // this test is the resulting on-disk footprint.
+        (void)OffloadOneKey(backend, "k" + std::to_string(i), 8 * 1024);
+    }
+
+    const int64_t disk0_bytes = DirectoryBytes(data_path + "/disk0");
+    const int64_t disk1_bytes = DirectoryBytes(data_path + "/disk1");
+    // Allow one bucket of slack for the write that is being admitted.
+    EXPECT_LE(disk0_bytes, 40 * 1024 + 16 * 1024);
+    EXPECT_LE(disk1_bytes, 80 * 1024 + 16 * 1024);
+    EXPECT_GT(disk0_bytes, 0);
+    EXPECT_GT(disk1_bytes, 0);
+}
+
+TEST_F(StorageBackendTest, MultiDiskRejectsBucketLargerThanEveryDisk) {
+    fs::create_directories(data_path + "/disk0");
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0";
+    BucketBackendConfig bucket_config;
+    // The bucket fits under bucket_size_limit but exceeds the disk's whole
+    // quota, so no amount of eviction could make room for it.
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.max_total_size_per_disk = {4 * 1024 * 1024};
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    auto result = OffloadOneKey(backend, "big", 8 * 1024 * 1024);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_DISK);
+}
+
+// With eviction enabled, a disk whose whole quota is smaller than the incoming
+// bucket must be skipped rather than selected. Selecting it would evict every
+// bucket it holds and still fail the write: the cache is destroyed for nothing.
+TEST_F(StorageBackendTest,
+       MultiDiskSkipsDiskTooSmallForBucketInsteadOfEvicting) {
+    fs::create_directories(data_path + "/small");
+    fs::create_directories(data_path + "/big");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/small," + data_path + "/big";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size_per_disk = {2 * 1024 * 1024, 64 * 1024 * 1024};
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;  // <= the small quota
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    // Seed the small disk. rr_cursor_ starts at 0, so this lands there.
+    ASSERT_TRUE(OffloadOneKey(backend, "resident", 64 * 1024, 'r'));
+    ASSERT_EQ(CountMetaFiles(data_path + "/small"), 1);
+
+    // Buckets larger than the small disk's entire quota. Whenever round-robin
+    // offers the small disk, it must be skipped in favour of the big one.
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(OffloadOneKey(backend, "big" + std::to_string(i),
+                                  4 * 1024 * 1024, 'b'))
+            << "write " << i << " should have gone to the big disk";
+    }
+
+    EXPECT_EQ(CountMetaFiles(data_path + "/big"), 4);
+    // The seeded bucket survived: the small disk was never evicted to make
+    // room for a bucket it could never hold.
+    auto resident = backend.IsExist("resident");
+    ASSERT_TRUE(resident.has_value());
+    EXPECT_TRUE(resident.value())
+        << "small disk was evicted for a bucket that cannot fit on it";
+    EXPECT_EQ(CountMetaFiles(data_path + "/small"), 1);
+}
+
+// The per-disk quota list is positionally aligned with the disks, so a single
+// unparsable entry must invalidate the whole list. Skipping just that entry
+// would shift every later disk onto its neighbour's quota — a silent
+// misconfiguration that only shows up as unexplained eviction behaviour.
+TEST_F(StorageBackendTest, MultiDiskQuotaListDroppedWhenAnyEntryIsUnparsable) {
+    const char* kEnv = "MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST";
+
+    setenv(kEnv, "100,200,300", 1);
+    auto good = BucketBackendConfig::FromEnvironment();
+    EXPECT_EQ(good.max_total_size_per_disk,
+              (std::vector<int64_t>{100, 200, 300}));
+
+    setenv(kEnv, "100,abc,300", 1);
+    auto bad = BucketBackendConfig::FromEnvironment();
+    EXPECT_TRUE(bad.max_total_size_per_disk.empty())
+        << "a partially parsed list would misalign every disk after the bad "
+           "entry";
+
+    unsetenv(kEnv);
+    auto absent = BucketBackendConfig::FromEnvironment();
+    EXPECT_TRUE(absent.max_total_size_per_disk.empty());
+}
+
+// A quota list shorter than the disk list reuses its last entry, so one value
+// configures every disk identically.
+TEST_F(StorageBackendTest, MultiDiskShortQuotaListReusesLastEntry) {
+    fs::create_directories(data_path + "/q0");
+    fs::create_directories(data_path + "/q1");
+    fs::create_directories(data_path + "/q2");
+
+    FileStorageConfig config;
+    config.storage_filepath =
+        data_path + "/q0," + data_path + "/q1," + data_path + "/q2";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size_per_disk = {16 * 1024 * 1024,
+                                             32 * 1024 * 1024};
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    EXPECT_EQ(backend.DiskQuotasForTest(),
+              (std::vector<int64_t>{16 * 1024 * 1024, 32 * 1024 * 1024,
+                                    32 * 1024 * 1024}));
+}
+
+// Two roots that resolve to the same directory (or nest) would let both disks
+// claim the same files: accounting double-counts them, and the orphan pass
+// deletes a live bucket's data while its metadata stays in the index. Init
+// must refuse such a configuration rather than silently corrupt the cache.
+TEST_F(StorageBackendTest, MultiDiskInitRejectsOverlappingStorageRoots) {
+    fs::create_directories(data_path + "/root");
+    fs::create_directories(data_path + "/root/nested");
+
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    // Same directory twice, spelled differently.
+    {
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/root," + data_path + "/root/";
+        BucketStorageBackend backend(config, bucket_config);
+        auto result = backend.Init();
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    // One root nested inside the other.
+    {
+        FileStorageConfig config;
+        config.storage_filepath =
+            data_path + "/root," + data_path + "/root/nested";
+        BucketStorageBackend backend(config, bucket_config);
+        auto result = backend.Init();
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    // Sibling directories sharing a prefix are NOT nested and must be accepted.
+    {
+        fs::create_directories(data_path + "/d");
+        fs::create_directories(data_path + "/d1");
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/d," + data_path + "/d1";
+        BucketStorageBackend backend(config, bucket_config);
+        EXPECT_TRUE(backend.Init());
+    }
+}
+
+// Without eviction the quota is a hard admission limit, so Init must not
+// synthesise a 90%-of-device quota: doing so would start rejecting writes with
+// NO_AVAILABLE_DISK on deployments that never configured a quota, which
+// previously ran up to total_size_limit.
+TEST_F(StorageBackendTest, MultiDiskNoEvictionDoesNotSynthesiseDiskQuota) {
+    fs::create_directories(data_path + "/disk0");
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 0;  // unconfigured
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::NONE;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    // The quota stays unset, so disk selection never enforces a limit.
+    ASSERT_EQ(backend.DiskQuotasForTest().size(), 1u);
+    EXPECT_EQ(backend.DiskQuotasForTest().front(), 0)
+        << "no quota may be synthesised when eviction is disabled";
+    EXPECT_TRUE(OffloadOneKey(backend, "unbounded", 1024 * 1024, 'u'));
+
+    // With eviction enabled the 90% default still applies, so the gate above
+    // is about the NONE policy specifically and not a blanket removal.
+    FileStorageConfig evicting_config;
+    evicting_config.storage_filepath = data_path + "/disk1";
+    fs::create_directories(evicting_config.storage_filepath);
+    BucketBackendConfig evicting_bucket_config = bucket_config;
+    evicting_bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend evicting_backend(evicting_config,
+                                          evicting_bucket_config);
+    ASSERT_TRUE(evicting_backend.Init());
+    ASSERT_EQ(evicting_backend.DiskQuotasForTest().size(), 1u);
+    EXPECT_GT(evicting_backend.DiskQuotasForTest().front(), 0)
+        << "eviction-enabled disks must still get the 90% capacity default";
+}
+
+// The reported total must track the bytes actually on disk, and must return to
+// exactly zero once everything is deleted. A commit/evict accounting asymmetry
+// would leave a permanent drift that silently shrinks the usable quota.
+TEST_F(StorageBackendTest, MultiDiskTotalSizeMatchesOnDiskBytes) {
+    fs::create_directories(data_path + "/disk0");
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 256 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    auto offload_result = OffloadOneKey(backend, "acct", 4096, 'z');
+    ASSERT_TRUE(offload_result.has_value());
+    const int64_t bucket_id = offload_result.value();
+
+    auto after_write = backend.GetStoreMetadata();
+    ASSERT_TRUE(after_write.has_value());
+    EXPECT_EQ(after_write.value().total_size,
+              DirectoryBytes(data_path + "/disk0"));
+
+    ASSERT_TRUE(backend.DeleteBucket(bucket_id));
+    auto after_delete = backend.GetStoreMetadata();
+    ASSERT_TRUE(after_delete.has_value());
+    EXPECT_EQ(after_delete.value().total_size, 0);
+}
+
+// A caller that overrides storage_filepath after FromEnvironment() has cached
+// storage_paths must still have its override honored: the backend derives the
+// disks from storage_filepath, never from the stale cache.
+TEST_F(StorageBackendTest, MultiDiskStorageFilepathOverrideWinsOverCache) {
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    const std::string owned_dir = data_path + "/owned_override";
+    fs::create_directories(owned_dir);
+    config.storage_filepath = owned_dir;
+    // storage_paths deliberately left pointing at the environment default.
+
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;
+    bucket_config.bucket_size_limit = 4 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    ASSERT_TRUE(OffloadOneKey(backend, "override_key", 64, 'q'));
+
+    int bucket_files = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(owned_dir)) {
+        if (entry.path().extension() == ".bucket") {
+            ++bucket_files;
+        }
+    }
+    EXPECT_EQ(bucket_files, 1)
+        << "bucket must land in the overridden storage_filepath";
+}
+
+// FileStorage's constructor throws when Validate() fails, so a Validate() that
+// stat()s the raw comma list would make every multi-disk deployment die at
+// startup.
+TEST_F(StorageBackendTest, MultiDiskValidateAcceptsCommaListStorageFilepath) {
+    fs::create_directories(data_path + "/v0");
+    fs::create_directories(data_path + "/v1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/v0," + data_path + "/v1";
+    config.total_keys_limit = 1000000;
+    config.total_size_limit = 1024 * 1024 * 1024;
+    config.heartbeat_interval_seconds = 5;
+    EXPECT_TRUE(config.Validate());
+
+    FileStorageConfig missing_dir = config;
+    missing_dir.storage_filepath =
+        data_path + "/v0," + data_path + "/does_not_exist";
+    EXPECT_FALSE(missing_dir.Validate());
+
+    FileStorageConfig single = config;
+    single.storage_filepath = data_path + "/v0";
+    EXPECT_TRUE(single.Validate());
+}
+
+// total_size_limit is a separate knob from the per-disk quotas, and it is what
+// the client reports to the master as this node's SSD capacity. Nothing forces
+// them to agree, so adding disks without scaling total_size_limit silently
+// leaves the master either under-using the node or over-committing it. Init
+// must say so rather than let the mismatch pass unnoticed.
+TEST_F(StorageBackendTest, MultiDiskWarnsWhenTotalSizeLimitDisagrees) {
+    fs::create_directories(data_path + "/cap0");
+    fs::create_directories(data_path + "/cap1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/cap0," + data_path + "/cap1";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size_per_disk = {64 * 1024 * 1024,
+                                             64 * 1024 * 1024};
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    // A mismatch is a warning, never a startup failure: it is recoverable by
+    // editing the configuration, and the node still serves reads and writes.
+    config.total_size_limit = 8 * 1024 * 1024;  // far below the 128MB of quota
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        EXPECT_TRUE(OffloadOneKey(backend, "under", 4096, 'u'));
+    }
+
+    config.total_size_limit = 128 * 1024 * 1024;  // matches the quota sum
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+    }
+}
+
+// A zero or negative entry in the position-aligned quota list is a typo that
+// would silently unlimit exactly one disk, so Validate() rejects it even
+// though the scalar max_total_size treats <= 0 as "unlimited".
+TEST_F(StorageBackendTest, MultiDiskValidateRejectsNonPositiveQuotaEntry) {
+    BucketBackendConfig config;
+    config.max_total_size_per_disk = {16 * 1024 * 1024, 32 * 1024 * 1024};
+    EXPECT_TRUE(config.Validate());
+
+    config.max_total_size_per_disk = {16 * 1024 * 1024, 0};
+    EXPECT_FALSE(config.Validate());
+
+    config.max_total_size_per_disk = {-1};
+    EXPECT_FALSE(config.Validate());
+}
+
+//-----------------------------------------------------------------------------
+
 }  // namespace mooncake::test
