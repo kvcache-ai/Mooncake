@@ -43,6 +43,7 @@
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "config/client_auto_discovery_config.h"
+#include "common/store_shm_alloc.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_INTRA_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
@@ -817,7 +818,8 @@ ErrorCode Client::InitTransferEngine(
     }
 
     // TENT mode: Skip manual transport installation - TENT handles this
-    // internally
+    // internally. Classic allocateSharedMemory is unavailable, so Store SHM
+    // segments cannot be created.
     if (use_tent) {
         LOG(INFO)
             << "Using TENT mode - transport configuration handled internally";
@@ -826,6 +828,11 @@ ErrorCode Client::InitTransferEngine(
                 << "Note: device_names parameter is ignored in TENT mode. "
                 << "Configure devices via TENT config file or environment "
                    "variables.";
+        }
+        if (store_use_shm_segment_flag()) {
+            LOG(ERROR) << "MC_STORE_USE_SHM_SEGMENT is incompatible with TENT "
+                          "(allocateSharedMemory is classic-only)";
+            return ErrorCode::INVALID_PARAMS;
         }
         return ErrorCode::OK;
     }
@@ -964,6 +971,25 @@ ErrorCode Client::InitTransferEngine(
         }
     }
 
+    return MaybeInstallStoreShmTransport();
+}
+
+ErrorCode Client::MaybeInstallStoreShmTransport() {
+    if (!store_use_shm_segment() || !is_store_host_dram_protocol(protocol_)) {
+        return ErrorCode::OK;
+    }
+
+#ifndef ENABLE_MULTI_PROTOCOL
+    LOG(WARNING) << "Store SHM without ENABLE_MULTI_PROTOCOL may become "
+                    "shm-only; rebuild with ENABLE_MULTI_PROTOCOL=ON to keep "
+                    "rdma/tcp alongside shm";
+#endif
+    Transport* shm = transfer_engine_->installTransport("shm", nullptr);
+    if (!shm) {
+        LOG(ERROR) << "Failed to install ShmTransport for Store SHM segment";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    LOG(INFO) << "Installed ShmTransport for Store same-host copy";
     return ErrorCode::OK;
 }
 

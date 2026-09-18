@@ -60,4 +60,11 @@ void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);
 
+// Bind an already-mapped contiguous VMA into equal NUMA regions. `total_size`
+// must be divisible by `numa_nodes.size()` and each region must be a multiple
+// of `page_size`. Does not munmap on failure; the caller owns the mapping.
+int bind_buffer_numa_segments(void* ptr, size_t total_size,
+                              const std::vector<int>& numa_nodes,
+                              size_t page_size = 0);
+
 }  // namespace mooncake

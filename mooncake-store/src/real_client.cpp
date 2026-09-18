@@ -32,6 +32,7 @@
 #include "client_auto_port_config.h"
 #include "config/cxl_segment_config.h"
 #include "config/hugepage_config.h"
+#include "common/store_shm_alloc.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
@@ -1019,8 +1020,32 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::string seg_location = kWildcardLocation;
+            bool used_shm_segment = false;
+            bool used_shm_numa = false;
+            std::vector<int> shm_numa_nodes;
 
-            if (!seg_numa_nodes.empty()) {
+            if (is_store_host_dram_protocol(this->protocol) &&
+                store_use_shm_segment()) {
+                auto te = client_->getTransferEngine();
+                if (!te) {
+                    LOG(ERROR) << "TransferEngine is not available for SHM "
+                                  "segment allocation";
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                auto alloc = allocate_store_host_segment(
+                    *te, segment_size, this->protocol, seg_numa_nodes,
+                    parallel_hugetlb_population);
+                if (!alloc.ptr) {
+                    LOG(ERROR) << "Failed to allocate SHM segment memory";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                ptr = alloc.ptr;
+                mapped_size = alloc.mapped_size;
+                seg_location = alloc.location;
+                used_shm_segment = true;
+                used_shm_numa = alloc.used_numa;
+                shm_numa_nodes = std::move(alloc.numa_nodes);
+            } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
@@ -1077,6 +1102,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
+            } else if (used_shm_segment) {
+                shm_segment_ptrs_.emplace_back(
+                    ptr, ShmSegmentDeleter{client_->getTransferEngine()});
             } else if (!seg_numa_nodes.empty() || use_hugepage_) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
@@ -1094,7 +1122,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             // engine registration. NUMA mappings use node-local workers for
             // each mbind region; direct mappings use the generic worker pool.
             if (parallel_hugetlb_population) {
-                if (!seg_numa_nodes.empty()) {
+                if (used_shm_numa) {
+                    populate_hugetlb_numa_mapping(ptr, mapped_size,
+                                                  shm_numa_nodes);
+                } else if (!seg_numa_nodes.empty()) {
                     populate_hugetlb_numa_mapping(ptr, mapped_size,
                                                   seg_numa_nodes);
                 } else if (!is_mmap_arena_allocation(ptr)) {
@@ -1437,10 +1468,12 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         setup_segment_pinned_regions_, "Store setup segment");
     if (!setup_segments_safe_to_free || setup_segment_memory_must_leak_) {
         for (auto &ptr : hugepage_segment_ptrs_) ptr.release();
+        for (auto &ptr : shm_segment_ptrs_) ptr.release();
         for (auto &ptr : segment_ptrs_) ptr.release();
         setup_segment_memory_must_leak_ = false;
     }
     hugepage_segment_ptrs_.clear();
+    shm_segment_ptrs_.clear();
     segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
 #ifdef USE_VRAM_SEGMENT

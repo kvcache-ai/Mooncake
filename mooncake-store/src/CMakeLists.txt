@@ -92,6 +92,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/hugepage_config.cpp
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
+    common/store_shm_alloc.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp
