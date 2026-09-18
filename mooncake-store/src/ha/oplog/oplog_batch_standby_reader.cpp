@@ -78,7 +78,9 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
             result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         } else if (err == ErrorCode::OK && current_floor > floor &&
                    current_floor == last_applied_batch_id_) {
+            const auto applied_batches = result.applied_batches;
             result = PollBatches(max_batches, current_floor);
+            result.applied_batches += applied_batches;
         } else if (err != ErrorCode::OK &&
                    err != ErrorCode::ETCD_KEY_NOT_EXIST) {
             SetPollError(result, err, IsRetryableBackendError(err));
@@ -90,6 +92,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
 OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
     size_t max_batches, uint64_t floor) {
     OpLogBatchStandbyPollResult result;
+    result.compaction_floor = floor;
     DurablePrefix prefix;
     auto err = storage_.ReadDurablePrefix(prefix);
     if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
@@ -209,6 +212,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
             }
             ++result.applied_entries;
         }
+        ++result.applied_batches;
         last_applied_batch_id_ = batch.batch_id;
         last_scanned_batch_last_seq_ = batch.last_seq;
         if (last_applied_batch_id_ >= prefix.batch_id) {

@@ -190,6 +190,8 @@ MIGRATED_PYTHON_MODULES=(
     cli_bench.py
     cli_client.py
     transfer_engine_topology_dump.py
+    buffer_pool.py
+    mooncake_config.py
     ep.py
     mooncake_ep_buffer.py
     mooncake_elastic_buffer.py

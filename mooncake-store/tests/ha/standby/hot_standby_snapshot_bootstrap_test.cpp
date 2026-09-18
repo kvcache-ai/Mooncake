@@ -1,4 +1,5 @@
 #include "hot_standby_service.h"
+#include "ha_metric_manager.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -106,7 +107,15 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     HotStandbyService service(MakeSnapshotOnlyConfig());
     service.SetSnapshotProvider(std::move(provider.value()));
 
+    HAMetricManager::instance().reset_snapshot_runtime(true);
+    HAMetricManager::instance().update_snapshot_runtime(
+        [](auto& metrics) { metrics.snapshot_bytes = 100; });
     ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
+    const auto metrics = HAMetricManager::instance().get_snapshot_runtime();
+    EXPECT_FALSE(metrics.enabled);
+    EXPECT_EQ(0u, metrics.snapshot_bytes);
+    EXPECT_EQ(HAMetricManager::SnapshotSkipReason::Disabled,
+              metrics.skip_reason);
     EXPECT_EQ(StandbyState::WATCHING, service.GetState());
     EXPECT_EQ(1u, service.GetMetadataCount());
     EXPECT_EQ(descriptor_.last_included_seq,

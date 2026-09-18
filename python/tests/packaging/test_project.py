@@ -155,9 +155,7 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
     # Modules still supplied from the legacy tree at build time. Phase 2 should
     # migrate these into python/mooncake and drop the DIRECTORY rule above.
     for module in (
-        "buffer_pool.py",
         "http_metadata_server.py",
-        "mooncake_config.py",
         "mooncake_store_service.py",
         "mooncake_connector_v1.py",
         "vllm_v1_proxy_server.py",
@@ -220,6 +218,28 @@ def test_cli_build_inputs_use_the_canonical_sources() -> None:
     ):
         assert f"../python/mooncake/{module}" in integration_cmake
         assert f"../mooncake-wheel/mooncake/{module}" not in integration_cmake
+
+
+def test_lightweight_modules_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+
+    for module in ("buffer_pool.py", "mooncake_config.py"):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "unit" / "test_mooncake_config.py"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "test_buffer_pool_native.py"
+    ).is_file()
+    assert not (
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_mooncake_config.py"
+    ).exists()
+    assert not (
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_buffer_pool_native.py"
+    ).exists()
 
 
 def test_ssd_administration_modules_have_one_authoritative_source() -> None:

@@ -115,7 +115,7 @@ export LD_LIBRARY_PATH="$FLAGCX_HOME/lib:${LD_LIBRARY_PATH:-}"
 
 If Mooncake also needs to allocate or identify device memory, enable its matching hardware option,
 such as `USE_CUDA`, `USE_MACA`, `USE_MUSA`, `USE_HIP`, `USE_COREX`, `USE_HYGON`, or `USE_MLU`.
-See the [build guide](../../getting_started/build.md) for the options and SDK requirements.
+See the [build guide](../../../getting_started/build.md) for the options and SDK requirements.
 
 ---
 

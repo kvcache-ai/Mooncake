@@ -444,6 +444,23 @@ MasterMetricManager::MasterMetricManager()
       tenant_evict_bytes_total_(
           "mooncake_tenant_evict_bytes_total",
           "Total bytes evicted by tenant-scoped quota eviction", {"tenant_id"}),
+      offload_enqueued_total_(
+          "master_offload_enqueued_total",
+          "SSD offload tasks successfully enqueued (per store worker)",
+          {"client_id"}),
+      offload_completed_total_(
+          "master_offload_completed_total",
+          "SSD offload tasks completed (worker reported OK)", {"client_id"}),
+      offload_failed_total_("master_offload_failed_total",
+                            "SSD offload tasks failed (worker reported NACK)",
+                            {"client_id"}),
+      offload_cancelled_total_(
+          "master_offload_cancelled_total",
+          "SSD offload tasks cancelled (preempted before write)",
+          {"client_id"}),
+      offload_enqueue_rejected_total_(
+          "master_offload_enqueue_rejected_total",
+          "SSD offload tasks rejected at enqueue (queue full)", {"client_id"}),
 
       // Snapshot Metrics
       snapshot_duration_ms_(
@@ -1365,6 +1382,31 @@ void MasterMetricManager::inc_tenant_evict_bytes(const std::string& tenant_id,
     tenant_evict_bytes_total_.inc({tenant_id}, bytes);
 }
 
+void MasterMetricManager::inc_offload_enqueued(const std::string& client_id,
+                                               int64_t val) {
+    offload_enqueued_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_completed(const std::string& client_id,
+                                                int64_t val) {
+    offload_completed_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_failed(const std::string& client_id,
+                                             int64_t val) {
+    offload_failed_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_cancelled(const std::string& client_id,
+                                                int64_t val) {
+    offload_cancelled_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_enqueue_rejected(
+    const std::string& client_id, int64_t val) {
+    offload_enqueue_rejected_total_.inc({client_id}, val);
+}
+
 void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
     snapshot_duration_ms_.observe(size);
 }
@@ -2126,6 +2168,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
+    serialize_metric(offload_enqueued_total_);
+    serialize_metric(offload_completed_total_);
+    serialize_metric(offload_failed_total_);
+    serialize_metric(offload_cancelled_total_);
+    serialize_metric(offload_enqueue_rejected_total_);
     serialize_metric(build_info_);
 
     // Serialize Snapshot Metrics

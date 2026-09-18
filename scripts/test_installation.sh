@@ -38,6 +38,7 @@ python -c "import mooncake.cli, mooncake.cli_bench, mooncake.cli_client, mooncak
 echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
+cp -r python/tests/unit test_env/unit_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cp -r python/tests/ssd test_env/ssd_tests
 cd test_env
@@ -47,7 +48,7 @@ python tests/test_fast_copy.py
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."
-python tests/test_mooncake_config.py
+python unit_tests/test_mooncake_config.py
 
 echo "Running reshard contract tests..."
 python -m pip install pytest hypothesis==6.141.0 paramiko
