@@ -602,6 +602,78 @@ TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
     EXPECT_GE(last_id, 101000);  // Should have increased by at least 100,000
 }
 
+TEST_F(StorageBackendTest,
+       SharedDirectoryBucketIdCollisionDoesNotTruncateExistingBucket) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+
+    auto offload = [](BucketStorageBackend& backend, const std::string& key,
+                      const std::string& value) {
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key, std::vector<Slice>{Slice{
+                               const_cast<char*>(value.data()), value.size()}});
+        return backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    };
+
+    {
+        BucketStorageBackend seed_backend(config, bucket_config);
+        ASSERT_TRUE(seed_backend.Init());
+        auto seed_result = offload(seed_backend, "seed", "seed-value");
+        ASSERT_TRUE(seed_result.has_value());
+    }
+
+    BucketStorageBackend first(config, bucket_config);
+    BucketStorageBackend second(config, bucket_config);
+    ASSERT_TRUE(first.Init());
+    ASSERT_TRUE(second.Init());
+
+    const std::string first_value = "first-backend-value";
+    const std::string second_value = "second-backend-value";
+    auto first_result = offload(first, "first-key", first_value);
+    ASSERT_TRUE(first_result.has_value());
+
+    auto second_result = offload(second, "second-key", second_value);
+    ASSERT_TRUE(second_result.has_value());
+    EXPECT_NE(first_result.value(), second_result.value());
+
+    std::vector<char> first_buffer(first_value.size());
+    std::unordered_map<std::string, Slice> first_load;
+    first_load.emplace(
+        "first-key", Slice{first_buffer.data(), first_buffer.size()});
+    ASSERT_TRUE(first.BatchLoad(first_load));
+    EXPECT_EQ(std::string(first_buffer.data(), first_buffer.size()),
+              first_value);
+
+    std::vector<char> second_buffer(second_value.size());
+    std::unordered_map<std::string, Slice> second_load;
+    second_load.emplace(
+        "second-key", Slice{second_buffer.data(), second_buffer.size()});
+    ASSERT_TRUE(second.BatchLoad(second_load));
+    EXPECT_EQ(std::string(second_buffer.data(), second_buffer.size()),
+              second_value);
+
+    const auto first_data_path =
+        fs::path(data_path) /
+        (std::to_string(first_result.value()) + ".bucket");
+    const auto first_meta_path =
+        fs::path(data_path) /
+        (std::to_string(first_result.value()) + ".meta");
+    const auto second_data_path =
+        fs::path(data_path) /
+        (std::to_string(second_result.value()) + ".bucket");
+    const auto second_meta_path =
+        fs::path(data_path) /
+        (std::to_string(second_result.value()) + ".meta");
+    EXPECT_TRUE(fs::exists(first_data_path));
+    EXPECT_TRUE(fs::exists(first_meta_path));
+    EXPECT_TRUE(fs::exists(second_data_path));
+    EXPECT_TRUE(fs::exists(second_meta_path));
+}
+
 TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     FileStorageConfig config;
     config.storage_filepath = data_path;

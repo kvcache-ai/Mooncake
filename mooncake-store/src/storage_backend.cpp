@@ -1579,6 +1579,14 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     }
 
     auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
+    while (!write_bucket_result &&
+           write_bucket_result.error() == ErrorCode::BUCKET_ALREADY_EXISTS) {
+        bucket_id = bucket_id_generator_->NextId();
+        for (auto& metadata : metadatas) {
+            metadata.bucket_id = bucket_id;
+        }
+        write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
+    }
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
         ReleasePreparedWrite(pending);
@@ -2398,11 +2406,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto bucket_data_path = bucket_data_path_res.value();
-    auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
+    auto open_file_result = OpenFile(bucket_data_path, FileMode::WriteExclusive);
     if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: "
-                   << bucket_data_path;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        return tl::make_unexpected(open_file_result.error());
     }
     auto file = std::move(open_file_result.value());
 
@@ -2500,7 +2506,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     }
     if (!sync_result) {
         LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-        CleanupOrphanedBucket(bucket_id);
+        file.reset();
+        std::error_code ec;
+        fs::remove(bucket_data_path, ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(WARNING) << "Failed to cleanup bucket data file: "
+                         << bucket_data_path << ", error: " << ec.message();
+        }
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
@@ -2516,6 +2528,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
 
+        file.reset();
         // Clean up the bucket file to prevent orphans
         std::error_code ec;
         if (fs::remove(bucket_data_path, ec)) {
@@ -2528,7 +2541,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << bucket_data_path << ", error: " << ec.message();
         }
 
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return tl::make_unexpected(store_bucket_metadata_result.error());
     }
     return {};
 }
@@ -3312,10 +3325,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto meta_path = meta_path_res.value();
-    auto open_file_result = OpenFile(meta_path, FileMode::Write);
+    auto open_file_result = OpenFile(meta_path, FileMode::WriteExclusive);
     if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        return tl::make_unexpected(open_file_result.error());
     }
     auto file = std::move(open_file_result.value());
     std::string str;
@@ -3324,12 +3336,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     if (!write_result) {
         LOG(ERROR) << "Write failed for: " << meta_path
                    << ", error: " << write_result.error();
+        file.reset();
+        std::error_code ec;
+        std::filesystem::remove(meta_path, ec);
         return tl::make_unexpected(write_result.error());
     }
     if (write_result.value() != str.size()) {
         LOG(ERROR) << "Write size mismatch for: " << meta_path
                    << ", expected: " << str.size()
                    << ", got: " << write_result.value();
+        file.reset();
+        std::error_code ec;
+        std::filesystem::remove(meta_path, ec);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     metadata->meta_size = str.size();
@@ -3404,6 +3422,9 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         case FileMode::Write:
             access_mode = O_WRONLY | O_CREAT | O_TRUNC;
             break;
+        case FileMode::WriteExclusive:
+            access_mode = O_WRONLY | O_CREAT | O_EXCL;
+            break;
     }
 
 #ifdef USE_URING
@@ -3417,8 +3438,13 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
 
     int fd = open(path.c_str(), flags | access_mode, 0644);
     if (fd < 0) {
-        LOG(ERROR) << "Failed to open file: " << path << ", errno=" << errno
-                   << " (" << strerror(errno) << ")";
+        const int open_errno = errno;
+        if (mode == FileMode::WriteExclusive && open_errno == EEXIST) {
+            VLOG(1) << "Bucket file already exists: " << path;
+            return tl::make_unexpected(ErrorCode::BUCKET_ALREADY_EXISTS);
+        }
+        LOG(ERROR) << "Failed to open file: " << path << ", errno="
+                   << open_errno << " (" << strerror(open_errno) << ")";
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 #ifdef USE_URING
