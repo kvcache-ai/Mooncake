@@ -20,6 +20,7 @@
 
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/transport/shm/shm_transport.h"
 #include "tent/transport/tcp/tcp_transport.h"
 
 namespace mooncake {
@@ -92,6 +93,47 @@ TEST(TcpSubBatchTest, PointerStabilityAfterReserve) {
 
     EXPECT_EQ(first->target_addr, 42u);
     EXPECT_EQ(&batch.task_list[0], first);
+}
+
+// ---------------------------------------------------------------------------
+// Sub-batch type mismatch regression test (#3129)
+// ---------------------------------------------------------------------------
+// getTransferStatus is a public Transport API. Handing it a sub-batch that
+// was allocated by a different transport used to dereference the result of a
+// failed dynamic_cast (UB). Neither allocateSubBatch nor getTransferStatus's
+// type check requires install(), so default-constructed transports suffice.
+
+TEST(TcpTransportSubBatchTest, RejectsForeignSubBatchInGetTransferStatus) {
+    TcpTransport tcp;
+    ShmTransport shm;
+
+    Transport::SubBatchRef shm_batch = nullptr;
+    ASSERT_TRUE(shm.allocateSubBatch(shm_batch, 8).ok());
+    ASSERT_NE(shm_batch, nullptr);
+
+    // An ShmSubBatch handed to TcpTransport must be rejected, not cast
+    // blindly. Without the null check this dereferences nullptr.
+    TransferStatus status;
+    EXPECT_TRUE(
+        tcp.getTransferStatus(shm_batch, 0, status).IsInvalidArgument());
+
+    // Same guard in the opposite direction.
+    Transport::SubBatchRef tcp_batch = nullptr;
+    ASSERT_TRUE(tcp.allocateSubBatch(tcp_batch, 8).ok());
+    ASSERT_NE(tcp_batch, nullptr);
+    EXPECT_TRUE(
+        shm.getTransferStatus(tcp_batch, 0, status).IsInvalidArgument());
+
+    // A matching sub-batch must still pass: the guard discriminates by
+    // type rather than rejecting everything.
+    auto* typed_tcp_batch = dynamic_cast<TcpSubBatch*>(tcp_batch);
+    ASSERT_NE(typed_tcp_batch, nullptr);
+    typed_tcp_batch->task_list.emplace_back();
+    ASSERT_TRUE(tcp.getTransferStatus(tcp_batch, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
+
+    EXPECT_TRUE(shm.freeSubBatch(shm_batch).ok());
+    EXPECT_TRUE(tcp.freeSubBatch(tcp_batch).ok());
 }
 
 TEST(TcpRetryBackoffTest, ExponentialGrowthWithCap) {
