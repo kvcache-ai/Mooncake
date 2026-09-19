@@ -744,9 +744,18 @@ void TcpTransport::runGroupPump(
         for (const auto& lane : group->lanes) {
             if (group->queue.empty()) break;
             if (lane->state != LaneState::IDLE) continue;
-            if (!lane->socket || !lane->socket->is_open()) {
+            // is_open() only describes the local descriptor. A peer may have
+            // closed an otherwise idle pooled connection since its last ACK.
+            char pending_byte;
+            const auto received =
+                lane->socket && lane->socket->is_open()
+                    ? recv(lane->socket->native_handle(), &pending_byte, 1,
+                           MSG_PEEK | MSG_DONTWAIT)
+                    : 0;
+            if (received >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
                 lane->socket.reset();
                 lane->state = LaneState::DISCONNECTED;
+                lane->last_connect_round = 0;
                 continue;
             }
 
