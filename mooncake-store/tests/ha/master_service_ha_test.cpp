@@ -32,6 +32,8 @@
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
+#include "segment/pool_read_access.h"
+#include "segment/pool_write_access.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -913,8 +915,8 @@ class MasterServiceHATest : public ::testing::Test {
             return false;
         }
 
-        auto segment_lock = std::make_unique<ScopedSegmentAccess>(
-            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess());
+        auto segment_lock = std::make_unique<SegmentPool::WriteAccess>(
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess());
         auto task = std::async(std::launch::async, std::move(create_task));
         auto& metadata_mutex =
             MasterServiceTestPeer::MetadataShards(
@@ -975,16 +977,9 @@ class MasterServiceHATest : public ::testing::Test {
 
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
                                                  const std::string& name) {
-        auto access =
-            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
-        const auto* allocators =
-            access.getAllocatorManager().getAllocators(name);
-        EXPECT_NE(allocators, nullptr);
-        EXPECT_EQ(allocators == nullptr ? 0 : allocators->size(), 1);
-        const auto allocator = allocators == nullptr || allocators->empty()
-                                   ? nullptr
-                                   : allocators->front()->GetAllocator();
-        return allocator ? allocator->size() : 0;
+        auto result = service.QuerySegments(name);
+        EXPECT_TRUE(result.has_value());
+        return result ? result->first : 0;
     }
 
     static void EraseObjectForTesting(MasterService& service,
@@ -997,12 +992,12 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static void PrepareUnmountSegmentForTesting(MasterService& service,
-                                                const UUID& segment_id) {
+                                                const UUID& segment_id,
+                                                const UUID& client_id) {
         auto segment_access =
-            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
-        size_t metrics_dec_capacity = 0;
-        ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
-                                     segment_id, metrics_dec_capacity));
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        ASSERT_TRUE(
+            segment_access.PrepareUnmount(segment_id, client_id).has_value());
     }
 
     static std::vector<ReplicaID> MarkCompletedReplicasRemovedForTesting(
@@ -1042,9 +1037,10 @@ class MasterServiceHATest : public ::testing::Test {
 
     static int64_t GetLocalDiskUsedBytesForTesting(
         MasterService& service, const std::string& segment_name) {
-        auto access =
-            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
-        auto client_id = access.GetOwnerClientId(segment_name);
+        auto client_id = MasterServiceTestPeer::SegmentPool(service)
+                             .AcquireReadAccess()
+                             .Catalog()
+                             .FindOwnerClientId(segment_name);
         if (!client_id) {
             return 0;
         }
@@ -3327,7 +3323,8 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                        "batch_upsert_stale_seg");
     ReadBatchEventually(storage, 3, batch);
 
-    PrepareUnmountSegmentForTesting(service, mounted.segment_id);
+    PrepareUnmountSegmentForTesting(service, mounted.segment_id,
+                                    mounted.client_id);
     backend->BlockTxn();
 
     ReplicateConfig config;
@@ -3396,7 +3393,8 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                        "batch_remove_stale_finalize_seg");
     ReadBatchEventually(storage, 3, batch);
 
-    PrepareUnmountSegmentForTesting(service, mounted.segment_id);
+    PrepareUnmountSegmentForTesting(service, mounted.segment_id,
+                                    mounted.client_id);
     backend->BlockTxn();
 
     auto remove_result = service.BatchRemove({key}, kDefaultTenant,

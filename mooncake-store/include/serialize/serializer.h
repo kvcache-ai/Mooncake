@@ -7,6 +7,8 @@
 #include <ylt/util/tl/expected.hpp>
 #include <msgpack.hpp>
 
+#include "segment/pool.h"
+
 namespace mooncake::offset_allocator {
 class __Allocator;
 class OffsetAllocator;
@@ -14,15 +16,15 @@ class OffsetAllocationHandle;
 }  // namespace mooncake::offset_allocator
 
 namespace mooncake {
+class SegmentView;
+class MountedSegment;
+class OffsetBufferAllocator;
 class AllocatedBuffer;
 class Replica;
 class MasterService;
 class BufferAllocatorBase;
-class SegmentView;
 enum class ErrorCode;
 struct SerializationError;
-class MountedSegment;
-class OffsetBufferAllocator;
 
 using MsgpackPacker = msgpack::packer<msgpack::sbuffer>;
 
@@ -76,7 +78,8 @@ class Serializer<offset_allocator::OffsetAllocationHandle> {
         const std::shared_ptr<offset_allocator::OffsetAllocator> &allocator);
 };
 
-// Serializer specialization for AllocatedBuffer
+// Encoding with SegmentPool requires a forked child or external quiescence;
+// the ReadAccess overload is for callers already holding a runtime read lock.
 template <>
 class Serializer<AllocatedBuffer> {
    public:
@@ -88,9 +91,23 @@ class Serializer<AllocatedBuffer> {
 
     static tl::expected<PointerType, SerializationError> deserialize(
         const msgpack::object &obj, const SegmentView &segment_view);
+
+    static tl::expected<void, SerializationError> serialize(
+        const AllocatedBuffer& buffer, const SegmentPool& segment_pool,
+        MsgpackPacker& packer);
+    static tl::expected<void, SerializationError> serialize(
+        const AllocatedBuffer& buffer,
+        const SegmentPool::ReadAccess& segment_view, MsgpackPacker& packer);
+    static tl::expected<PointerType, SerializationError> deserialize(
+        const msgpack::object& obj,
+        const SegmentPool::ReadAccess& segment_view);
+
+   private:
+    static tl::expected<void, SerializationError> SerializeWithRegionId(
+        const AllocatedBuffer& buffer, const UUID& region_id,
+        MsgpackPacker& packer);
 };
 
-// Serializer specialization for Replica (interface declaration)
 template <>
 class Serializer<Replica> {
    public:
@@ -102,6 +119,22 @@ class Serializer<Replica> {
 
     static tl::expected<PointerType, SerializationError> deserialize(
         const msgpack::object &obj, const SegmentView &segment_view);
+
+    static tl::expected<void, SerializationError> serialize(
+        const Replica& replica, const SegmentPool& segment_pool,
+        MsgpackPacker& packer);
+    static tl::expected<void, SerializationError> serialize(
+        const Replica& replica, const SegmentPool::ReadAccess& segment_view,
+        MsgpackPacker& packer);
+    static tl::expected<PointerType, SerializationError> deserialize(
+        const msgpack::object& obj,
+        const SegmentPool::ReadAccess& segment_view);
+
+   private:
+    template <typename SegmentAccess>
+    static tl::expected<void, SerializationError> SerializeImpl(
+        const Replica& replica, const SegmentAccess& segment_access,
+        MsgpackPacker& packer);
 };
 
 template <>

@@ -45,6 +45,11 @@ class RegionDriver {
         const RegionResourceSpec& spec,
         std::shared_ptr<BufferAllocatorBase> allocator) = 0;
 
+    // Driver-owned capacity can exist without any mounted region (CXL).
+    virtual std::shared_ptr<BufferAllocatorBase> GetSharedAllocator() const {
+        return nullptr;
+    }
+
     RegionResource* GetResource(const UUID& id);
     const RegionResource* GetResource(const UUID& id) const;
     bool Deactivate(const UUID& id);

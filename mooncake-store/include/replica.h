@@ -462,7 +462,7 @@ class Replica {
     [[nodiscard]] bool has_invalid_mem_handle() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
-            return !mem_data.buffer->isAllocatorValid();
+            return !mem_data.buffer->isHandleUsable();
         }
         return false;  // DiskReplicaData does not have handles
     }
@@ -485,7 +485,7 @@ class Replica {
     [[nodiscard]] bool has_invalid_nof_handle() const {
         if (is_nof_replica()) {
             const auto& nof_data = std::get<NoFReplicaData>(data_);
-            return !nof_data.buffer->isAllocatorValid();
+            return !nof_data.buffer->isHandleUsable();
         }
         return false;
     }
@@ -521,14 +521,11 @@ class Replica {
         return std::nullopt;
     }
 
-    void bindClientLiveness(
+    // Memory replicas inherit their owner from the region they were allocated
+    // from, so only local disk replicas keep their own record here.
+    void bindLocalDiskClientLiveness(
         std::shared_ptr<ClientLivenessRecord> client_liveness) {
-        if (is_memory_replica()) {
-            auto& data = std::get<MemoryReplicaData>(data_);
-            if (data.buffer) {
-                data.buffer->bindClientLiveness(std::move(client_liveness));
-            }
-        } else if (is_local_disk_replica()) {
+        if (is_local_disk_replica()) {
             auto& record =
                 std::get<LocalDiskReplicaData>(data_).client_liveness;
             std::atomic_store_explicit(&record, std::move(client_liveness),
@@ -888,7 +885,7 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
         std::vector<std::optional<std::string>> segment_names;
-        if (mem_data.buffer && mem_data.buffer->isAllocatorValid()) {
+        if (mem_data.buffer && mem_data.buffer->isHandleUsable()) {
             segment_names.push_back(mem_data.buffer->getSegmentName());
         } else {
             segment_names.push_back(std::nullopt);
@@ -897,7 +894,7 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
     } else if (is_nof_replica()) {
         const auto& nof_data = std::get<NoFReplicaData>(data_);
         std::vector<std::optional<std::string>> segment_names;
-        if (nof_data.buffer && nof_data.buffer->isAllocatorValid()) {
+        if (nof_data.buffer && nof_data.buffer->isHandleUsable()) {
             segment_names.push_back(nof_data.buffer->getSegmentName());
         } else {
             segment_names.push_back(std::nullopt);

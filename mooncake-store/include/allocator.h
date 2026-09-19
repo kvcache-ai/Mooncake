@@ -11,8 +11,8 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
-#include "client_liveness.h"
 #include "offset_allocator/offset_allocator.h"
+#include "segment/lifetime.h"
 #include "storage_usage.h"
 #include "types.h"
 
@@ -47,26 +47,6 @@ class BufferAllocatorBase;
 class Replica;
 class SegmentAllocatorRegistration;
 
-class SegmentLifetime {
-   public:
-    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
-
-    [[nodiscard]] bool isAvailable() const {
-        return available_->load(std::memory_order_acquire);
-    }
-
-    void setAvailable(bool available) const {
-        available_->store(available, std::memory_order_release);
-    }
-
-    [[nodiscard]] bool operator==(const SegmentLifetime& other) const {
-        return available_ == other.available_;
-    }
-
-   private:
-    std::shared_ptr<std::atomic<bool>> available_;
-};
-
 class AllocatedBuffer {
    public:
     friend class CachelibBufferAllocator;
@@ -97,38 +77,36 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
-    [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired() && segment_lifetime_.isAvailable();
+    // The handle can still be used to move or release the memory: its region is
+    // attached and the allocator owning the address is alive. Unmounting the
+    // region, or replacing its allocator on remount, makes stale handles report
+    // false here, which is how the object layer drops their replicas.
+    [[nodiscard]] bool isHandleUsable() const {
+        return !allocator_.expired() && segment_lifetime_.HasReadableRegion();
     }
 
     [[nodiscard]] std::shared_ptr<BufferAllocatorBase> getAllocator() const {
         return allocator_.lock();
     }
 
+    // Whether the buffer can be read right now, which also requires a serving
+    // owner.
     [[nodiscard]] bool isAvailable() const {
-        if (!isAllocatorValid()) {
-            return false;
-        }
-        const auto record = std::atomic_load_explicit(
-            &client_liveness_, std::memory_order_acquire);
-        return !record || record->IsServing();
-    }
-
-    void bindClientLiveness(
-        std::shared_ptr<ClientLivenessRecord> client_liveness) {
-        std::atomic_store_explicit(&client_liveness_,
-                                   std::move(client_liveness),
-                                   std::memory_order_release);
+        return !allocator_.expired() && segment_lifetime_.CanRead();
     }
 
     void bindSegmentLifetime(SegmentLifetime lifetime) {
         segment_lifetime_ = std::move(lifetime);
     }
 
+    [[nodiscard]] bool isBoundTo(const SegmentLifetime& lifetime) const {
+        return segment_lifetime_ == lifetime;
+    }
+
+    // The buffer's owner is the owner of the region it was allocated from.
     [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
         const {
-        return std::atomic_load_explicit(&client_liveness_,
-                                         std::memory_order_acquire);
+        return segment_lifetime_.GetClientLiveness();
     }
 
     // Serialize the buffer into a descriptor for transfer
@@ -158,7 +136,6 @@ class AllocatedBuffer {
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
     SegmentLifetime segment_lifetime_;
-    std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
@@ -170,7 +147,20 @@ class AllocatedBuffer {
     friend class Serializer<AllocatedBuffer>;
     friend class Replica;
     friend class SegmentAllocatorRegistration;
+    friend class AllocationCandidate;
 };
+
+/**
+ * @brief Allocates `size` bytes and binds the result to `lifetime`.
+ *
+ * A region can be unmounted, or rebound to a new owner, while an allocation is
+ * in flight. The buffer is published only if the region still serves its owner
+ * afterwards, so callers either get a buffer that is valid for the lifetime
+ * they asked for, or no buffer at all.
+ */
+std::unique_ptr<AllocatedBuffer> AllocateBoundTo(
+    BufferAllocatorBase& allocator, const SegmentLifetime& lifetime,
+    size_t size);
 
 /**
  * Virtual base class for buffer allocators.

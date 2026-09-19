@@ -8,6 +8,8 @@
 #pragma once
 
 #include "master_service.h"
+#include "segment/pool_read_access.h"
+#include "segment/pool_write_access.h"
 #include "master_service/master_service_test_peer.h"
 #include "types.h"
 
@@ -69,22 +71,27 @@ class MasterServiceTest : public ::testing::Test {
         return MasterServiceTestPeer(service).ProcessClientOffboardingJob(job);
     }
 
-    ErrorCode PrepareUnmountSegmentForTest(MasterService& service,
-                                           const UUID& segment_id,
-                                           size_t& metrics_dec_capacity) {
+    tl::expected<RegionUnmountTxn, ErrorCode> PrepareUnmountSegmentForTest(
+        MasterService& service, const UUID& segment_id, const UUID& client_id) {
         auto access =
-            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
-        return access.PrepareUnmountSegment(segment_id, metrics_dec_capacity);
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        return access.PrepareUnmount(segment_id, client_id);
     }
 
     ErrorCode CommitUnmountSegmentForTest(MasterService& service,
-                                          const UUID& segment_id,
-                                          const UUID& client_id,
-                                          size_t metrics_dec_capacity) {
+                                          RegionUnmountTxn&& transaction) {
         auto access =
-            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
-        return access.CommitUnmountSegment(segment_id, client_id,
-                                           metrics_dec_capacity);
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        return std::move(transaction).Commit(access);
+    }
+
+    uint64_t SegmentGenerationForTest(MasterService& service,
+                                      const UUID& segment_id) {
+        auto access =
+            MasterServiceTestPeer::SegmentPool(service).AcquireReadAccess();
+        const auto* region = access.Catalog().Find(segment_id);
+        EXPECT_NE(region, nullptr);
+        return region ? region->generation : 0;
     }
 
     std::chrono::seconds ClientOffboardingRetryDelayForTest(

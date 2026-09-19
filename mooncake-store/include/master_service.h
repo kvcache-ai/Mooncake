@@ -26,7 +26,6 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "allocation_strategy.h"
 #include "background_worker.h"
 #include "client_liveness.h"
 #include "client_offboarding.h"
@@ -36,6 +35,10 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
+#include "placement/replica_allocator.h"
+#include "segment/pool.h"
+#include "segment/pool_write_access.h"
+#include "serialize/serializer.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
 #include "tenant_quota_sharded.h"
@@ -72,7 +75,6 @@ class EtcdOpLogStore;
 class DfsGlobalAllocator;
 
 // Forward declarations
-class AllocationStrategy;
 class EvictionStrategy;
 class HaKvBackend;
 class HttpMetadataServer;
@@ -111,7 +113,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * 3. snapshot_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
  * 5. tenant_quota_recompute_mutex_
- * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
+ * 6. ShardedTenantQuotaTable internal mutex or pool_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
  * Strict tenant admission and policy mutation paths that need both
@@ -758,7 +760,7 @@ class MasterService {
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
-     * DRAM via the existing AllocationStrategy, optionally biased toward the
+     * DRAM via SegmentPool placement, optionally biased toward the
      * caller's local memory segment via preferred_segments. The new replica is
      * invisible to readers until NotifyPromotionSuccess flips it to COMPLETE.
      *
@@ -978,6 +980,8 @@ class MasterService {
         const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
+    std::string ResolveWriterHostId(const UUID& client_id,
+                                    const ReplicateConfig& config);
 
     void ClearInvalidHandles();
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
@@ -2181,12 +2185,32 @@ class MasterService {
     std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
 
     // Segment management
-    SegmentManager segment_manager_;
+    SegmentPool segment_pool_;
+    // Process-local offboarding tokens, protected by the Pool write lock.
+    // The worker's pending-job barrier keeps them out of snapshots.
+    std::unordered_map<UUID, RegionUnmountTxn, boost::hash<UUID>>
+        client_offboarding_unmounts_;
+    // Names outlive resource removal until the terminal OpLog is accepted.
+    std::unordered_map<std::string, std::unordered_set<UUID, boost::hash<UUID>>>
+        client_offboarding_reserved_names_;
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
-    const AllocationStrategyType allocation_strategy_type_;
+    const AllocationStrategyType memory_placement_policy_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+
+    AllocationCandidateKind MemoryAllocationKind() const {
+        return memory_placement_policy_ == AllocationStrategyType::CXL
+                   ? AllocationCandidateKind::CXL
+                   : AllocationCandidateKind::NATIVE;
+    }
+    tl::expected<std::vector<Replica>, ErrorCode> AllocateMemoryReplicas(
+        const ReplicaAllocationRequest& request,
+        PlacementDiagnostics* diagnostics = nullptr);
+    tl::expected<Replica, ErrorCode> AllocateMemoryReplicaFrom(
+        size_t size, std::string_view segment_name);
+    tl::expected<std::vector<Replica>, ErrorCode> AllocateNoFReplicas(
+        const ReplicaAllocationRequest& request);
 
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
@@ -2271,10 +2295,12 @@ class MasterService {
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
 
+    tl::expected<void, ErrorCode> ValidateDrainTargets(
+        const CreateDrainJobRequest& request);
     tl::expected<void, ErrorCode> ValidateDrainRequest(
         const CreateDrainJobRequest& request);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
-        ScopedSegmentAccess& segment_access,
+        SegmentPool::WriteAccess& segment_access,
         const CreateDrainJobRequest& request);
     void ProcessDrainJobs();
     void RefreshDrainJobTasks(DrainJob& job);
