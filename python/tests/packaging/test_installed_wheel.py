@@ -55,6 +55,12 @@ def test_wheel_imports_outside_the_repository(
 from importlib import import_module, metadata, util
 from pathlib import Path
 import sys
+import types
+
+aiohttp = types.ModuleType("aiohttp")
+aiohttp.web = types.SimpleNamespace()
+sys.modules["aiohttp"] = aiohttp
+
 import mooncake
 
 cli_modules = (
@@ -73,6 +79,7 @@ import mooncake.transfer_engine_topology_dump
 assert "mooncake.engine" not in sys.modules
 
 import mooncake.engine
+import mooncake.mooncake_store_service
 import mooncake.mooncake_config
 import mooncake.reshard
 import mooncake.store
@@ -84,6 +91,14 @@ assert metadata.version("mooncake-transfer-engine") == {_project_version(project
 assert "administration" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+assert mooncake.mooncake_store_service.MooncakeStoreService is not None
+store_entry_points = metadata.entry_points(
+    group="console_scripts", name="mc_store_rest_server"
+)
+assert len(store_entry_points) == 1
+store_entry_point = store_entry_points[0]
+assert store_entry_point.value == "mooncake.mooncake_store_service:sync_main"
+assert store_entry_point.load() is mooncake.mooncake_store_service.sync_main
 assert mooncake.mooncake_config.MooncakeConfig is not None
 for ep_module in (
     "ep.py",

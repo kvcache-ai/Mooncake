@@ -910,7 +910,7 @@ retcode = store.setup(
 
 ### 将 Client 作为独立进程启动并通过 HTTP 访问
 
-使用 `mooncake-wheel/mooncake/mooncake_store_service.py` 可以以独立进程的形式启动 **真实**`Client` 并通过 HTTP 访问。
+使用 `python/mooncake/mooncake_store_service.py` 可以以独立进程的形式启动 **真实**`Client` 并通过 HTTP 访问。
 
 首先，创建并保存一个 JSON 格式的配置文件。例如：
 

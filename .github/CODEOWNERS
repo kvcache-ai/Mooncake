@@ -15,6 +15,8 @@
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
+/python/mooncake/mooncake_store_service.py @ykwd @stmatengss
+/python/tests/store/test_mooncake_store_service_api.py @ykwd @stmatengss
 /python/mooncake/buffer_pool.py @ykwd @stmatengss
 /python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_config.py @ykwd @stmatengss

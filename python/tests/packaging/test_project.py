@@ -83,6 +83,32 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
 
 
+def test_store_rest_service_has_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    tests_root = REPOSITORY_ROOT / "python" / "tests"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    legacy_tests_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
+
+    assert (package_root / "mooncake_store_service.py").is_file()
+    assert (tests_root / "store" / "test_mooncake_store_service_api.py").is_file()
+    assert not (legacy_package_root / "mooncake_store_service.py").exists()
+    assert not (legacy_tests_root / "test_mooncake_store_service_api.py").exists()
+
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    assert (
+        project["project"]["scripts"]["mc_store_rest_server"]
+        == "mooncake.mooncake_store_service:sync_main"
+    )
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    assert "../python/mooncake/mooncake_store_service.py" in integration_cmake
+    assert (
+        "../mooncake-wheel/mooncake/mooncake_store_service.py" not in integration_cmake
+    )
+
+
 def test_ep_modules_have_one_authoritative_source() -> None:
     package_root = REPOSITORY_ROOT / "python" / "mooncake"
     legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
@@ -156,7 +182,6 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
     # migrate these into python/mooncake and drop the DIRECTORY rule above.
     for module in (
         "http_metadata_server.py",
-        "mooncake_store_service.py",
         "mooncake_connector_v1.py",
         "vllm_v1_proxy_server.py",
         "pg.py",
