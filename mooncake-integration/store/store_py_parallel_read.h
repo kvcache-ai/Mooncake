@@ -44,17 +44,18 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_prefix(
 
 std::vector<CachedQueryResultResponse> batch_query_for_reuse(
     const std::vector<std::string> &keys) {
-    if (auto real_client = get_real_client()) {
-        return real_client->batch_get_query_results(keys);
-    }
-
-    auto query_results = store_->batch_query(keys);
+    auto snapshot = store_->prepare_get_into_ranges_snapshot(keys);
     std::vector<CachedQueryResultResponse> cached_results;
-    cached_results.reserve(query_results.size());
+    cached_results.reserve(keys.size());
     auto now = std::chrono::steady_clock::now();
-    for (const auto &query_result : query_results) {
+    for (const auto &key : keys) {
+        auto it = snapshot.query_result_cache.find(key);
+        if (it == snapshot.query_result_cache.end()) {
+            cached_results.emplace_back(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
         cached_results.push_back(
-            to_cached_query_result_response(query_result, now));
+            to_cached_query_result_response(it->second, now));
     }
     return cached_results;
 }
@@ -80,6 +81,7 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
         return std::nullopt;
     }
 
+    mooncake::PyClient::RangedReadSnapshot snapshot;
     mooncake::PyClient::QueryResultCache query_result_cache;
     auto now = std::chrono::steady_clock::now();
     std::vector<size_t> metadata_key_indices;
@@ -98,6 +100,7 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
         reusable_query_results[i] = cached_query_results[i];
         metadata_key_indices.push_back(i);
     }
+    snapshot.reset(std::move(query_result_cache), now);
 
     std::vector<std::optional<ParsedTensorMetadata>> prefix_metadata(
         keys.size());
@@ -111,6 +114,11 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
                        << ": failed to register metadata scratch buffer";
             return std::nullopt;
         }
+        struct RegisteredScratchBuffer {
+            decltype(store_) store;
+            char *ptr;
+            ~RegisteredScratchBuffer() { store->unregister_buffer(ptr); }
+        } registered_scratch{store_, scratch_buffer.get()};
 
         char *scratch_base = scratch_buffer.get();
         std::vector<void *> metadata_buffers;
@@ -135,10 +143,9 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
         std::vector<std::vector<std::vector<int64_t>>> metadata_results;
         {
             py::gil_scoped_release release_gil;
-            metadata_results = store_->get_into_ranges(
+            metadata_results = store_->get_into_ranges_from_snapshot(
                 metadata_buffers, metadata_all_keys, metadata_all_dst_offsets,
-                metadata_all_src_offsets, metadata_all_sizes,
-                &query_result_cache);
+                metadata_all_src_offsets, metadata_all_sizes, snapshot);
         }
         for (size_t i = 0;
              i < metadata_results.size() && i < metadata_key_indices.size();
@@ -153,7 +160,6 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
                     keys[key_index]);
             }
         }
-        store_->unregister_buffer(scratch_buffer.get());
     }
 
     std::vector<ReconstructedShardSource> sources;
@@ -859,9 +865,16 @@ std::vector<bool> execute_tensor_into_plan_transfers(
                 }
             }
         }
-        range_results = store_->get_into_ranges(
-            buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
-            query_result_cache.empty() ? nullptr : &query_result_cache);
+        if (query_result_cache.empty()) {
+            range_results = store_->get_into_ranges(
+                buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes);
+        } else {
+            mooncake::PyClient::RangedReadSnapshot snapshot;
+            snapshot.reset(std::move(query_result_cache), now);
+            range_results = store_->get_into_ranges_from_snapshot(
+                buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+                snapshot);
+        }
     }
 
     for (size_t i = 0; i < transfer_plan_indices.size(); ++i) {
