@@ -922,6 +922,17 @@ class RealClient : public PyClient {
         }
     };
 
+    // Keep a TransferEngine shared_ptr so freeSharedMemory still works after
+    // Client is reset (Unmount happens in ~Client; unlink needs TE alive).
+    struct ShmSegmentDeleter {
+        std::shared_ptr<TransferEngine> te;
+        void operator()(void *ptr) const {
+            if (ptr && te) {
+                te->freeSharedMemory(ptr);
+            }
+        }
+    };
+
     struct AscendSegmentDeleter {
         std::string protocol = "ascend";
         void operator()(void *ptr) {
@@ -963,6 +974,7 @@ class RealClient : public PyClient {
 
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
+    std::vector<std::unique_ptr<void, ShmSegmentDeleter>> shm_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
