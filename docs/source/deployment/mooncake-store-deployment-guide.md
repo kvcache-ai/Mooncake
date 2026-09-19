@@ -1209,6 +1209,22 @@ mooncake_client \
 `mooncake_client --version` prints the release version plus the short git hash,
 and the same value is logged at startup.
 
+#### Dummy Client Liveness
+
+The real client tracks every attached dummy client by its periodic ping and
+unmaps that client's shared-memory segments once the ping has been silent for
+longer than the live TTL.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MC_DUMMY_CLIENT_TTL_SEC` | `10` | Seconds a dummy client may go without a ping before the real client unmaps its segments. Unset, empty, and invalid values (non-integer, zero, negative) fall back to the default and log an error. The effective value is logged once when the monitor starts |
+
+Raise this when a single operation can occupy the dummy↔real client UDS channel
+for longer than the default: registering a large pool segment or a slow SSD
+`batch_get` blocks the pings of every other dummy client sharing that channel,
+and the monitor then unmaps segments that are still in use. Lower values detect
+genuinely dead clients sooner.
+
 ### Client HTTP Health and Metrics Endpoint
 
 Each real client can expose its own lightweight HTTP endpoint independently of the master admin HTTP server and the Python store REST API. This endpoint is disabled by default for programmatic clients and `mooncake_store_service`; enable it explicitly when you want to scrape client-local metrics:

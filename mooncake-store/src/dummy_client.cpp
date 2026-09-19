@@ -139,6 +139,23 @@ std::vector<Result> expected_results_to_py(
     return results;
 }
 
+// True if any element of the batch result carries `code`.
+// Used to detect DUMMY_BUFFER_NOT_MAPPED returned by RealClient when the
+// client's segments were evicted server-side (monitor TTL) or never mapped:
+// the dummy client's local ShmSegment::registered flag is stale in that case
+// and would silently skip re-registration on the next register_buffer.
+template <typename T>
+bool any_error_is(
+    const std::vector<tl::expected<T, mooncake::ErrorCode>>& results,
+    mooncake::ErrorCode code) {
+    for (const auto& result : results) {
+        if (!result.has_value() && result.error() == code) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<uint64_t> void_ptrs_to_u64(const std::vector<void*>& ptrs) {
     std::vector<uint64_t> out;
     out.reserve(ptrs.size());
@@ -997,6 +1014,37 @@ int DummyClient::reregister_device_buffers() {
 #endif
 
 // Dummy only register buffer within the shared memory region
+// Clear the local registered flag of the SHM segments
+// covering `buffers`. Called after a batch op failed with
+// DUMMY_BUFFER_NOT_MAPPED: RealClient no longer has these segments mapped
+// (monitor TTL eviction is invisible to this client), but our local flags
+// still say "registered", which makes the next register_buffer() a silent
+// no-op. Clearing the flag turns the next register_buffer() into a real
+// re-registration (fd is re-sent over UDS, store re-mmaps + re-registers MR).
+//
+// Note on thread safety: ShmSegment::registered is atomic because batch-op
+// threads and register_buffer() callers touch it concurrently. The
+// check-then-act sequence here is still not atomic as a whole, but the
+// remaining interleavings are benign: worst cases are a redundant real
+// re-registration (idempotent server-side) or one extra failed op before the
+// flag is cleared and healed.
+void DummyClient::mark_shms_unregistered(const std::vector<void*>& buffers) {
+    for (void* ptr : buffers) {
+        if (ptr == nullptr) {
+            continue;
+        }
+        auto shm = shm_helper_->get_shm(ptr);
+        if (shm && shm->registered) {
+            LOG(WARNING) << "batch op got DUMMY_BUFFER_NOT_MAPPED; clearing "
+                            "stale local registered flag for shm '"
+                         << shm->name << "' (base=" << shm->base_addr
+                         << ", size=" << shm->size
+                         << ") so the next register_buffer re-registers";
+            shm->registered = false;
+        }
+    }
+}
+
 int DummyClient::register_buffer(void* buffer, size_t size) {
     if (buffer == nullptr || size == 0) {
         LOG(ERROR) << "Invalid buffer pointer";
@@ -1710,6 +1758,11 @@ std::vector<int> DummyClient::batch_put_from(
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_put_from_dummy_helper, void>(
             keys.size(), keys, buffers, sizes, config, device_id_, client_id_);
+    // Server says our buffers are not mapped -> local 'registered'
+    // flags are stale; clear them so the next register_buffer re-registers.
+    if (any_error_is(internal_results, ErrorCode::DUMMY_BUFFER_NOT_MAPPED)) {
+        mark_shms_unregistered(buffer_ptrs);
+    }
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -1783,6 +1836,10 @@ std::vector<int64_t> DummyClient::batch_get_into(
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper, int64_t>(
             keys.size(), keys, buffers, sizes, device_id_, client_id_);
+    // See batch_put_from
+    if (any_error_is(internal_results, ErrorCode::DUMMY_BUFFER_NOT_MAPPED)) {
+        mark_shms_unregistered(buffer_ptrs);
+    }
     auto results = expected_results_to_py(internal_results);
 
     for (size_t i = 0; i < results.size() && i < prepared.size(); ++i) {
@@ -1851,6 +1908,14 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
         invoke_batch_rpc<&RealClient::batch_put_from_multi_buffers_dummy_helper,
                          void>(keys.size(), keys, prepared->dummy_buffers,
                                all_sizes, config, device_id_, client_id_);
+    // See batch_put_from (flatten nested rows before marking)
+    if (any_error_is(internal_results, ErrorCode::DUMMY_BUFFER_NOT_MAPPED)) {
+        std::vector<void*> flat;
+        for (const auto& row : all_buffer_ptrs) {
+            flat.insert(flat.end(), row.begin(), row.end());
+        }
+        mark_shms_unregistered(flat);
+    }
     auto results = expected_results_to_py<int>(internal_results);
     const size_t successful_bytes =
         sum_successful_nested_sizes(results, all_sizes);
@@ -1951,6 +2016,14 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
                          int64_t>(keys.size(), keys, prepared->dummy_buffers,
                                   all_sizes, prefer_alloc_in_same_node,
                                   device_id_, client_id_);
+    // See batch_put_from (flatten nested rows before marking)
+    if (any_error_is(internal_results, ErrorCode::DUMMY_BUFFER_NOT_MAPPED)) {
+        std::vector<void*> flat;
+        for (const auto& row : all_buffer_ptrs) {
+            flat.insert(flat.end(), row.begin(), row.end());
+        }
+        mark_shms_unregistered(flat);
+    }
     std::vector<int> results;
     results.reserve(internal_results.size());
     for (const auto& result : internal_results) {
