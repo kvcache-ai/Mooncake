@@ -93,7 +93,7 @@ The script first verifies steady-state `put/get` success with `memory + nof` rep
   - `mooncake-store/src/mooncake_master`
   - `mooncake-integration/store*.so`
 - SPDK has already been built under `extern/spdk`
-- Python environment contains `aiohttp` because the script launches a standalone metadata process with `mooncake-wheel/mooncake/http_metadata_server.py`
+- Python environment contains `aiohttp` because the script launches a standalone metadata process with `python/mooncake/http_metadata_server.py`
 - The script uses `sudo -n` to set hugepages and mount `/dev/hugepages`, so the current user must have passwordless sudo
 
 **Usage**:
@@ -118,7 +118,7 @@ PRE_FAULT_SUCCESS_TARGET=10 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e
 **Notes**:
 
 - The client payload size defaults to `4096` bytes because the current NoF path requires 4K-aligned I/O.
-- The script uses a standalone metadata server process (`mooncake-wheel/mooncake/http_metadata_server.py`) instead of the embedded master metadata server so all four components remain explicit during the test.
+- The script uses a standalone metadata server process (`python/mooncake/http_metadata_server.py`) instead of the embedded master metadata server so all four components remain explicit during the test.
 - In default mode, the script verifies **service continuity** after NoF unmount by checking that post-fault I/O still succeeds.
 - In `CLIENT_GLOBAL_SEGMENT_SIZE=0` mode, the script verifies **NoF-only failure behavior** by checking that post-fault I/O starts failing after the NoF segment is removed.
 - Logs are written under `LOG_DIR` (default `/tmp/mooncake_nof_heartbeat_e2e`) and the final pass/fail summary is printed from `summary.log`.

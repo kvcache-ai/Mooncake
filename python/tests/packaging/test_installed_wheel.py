@@ -44,6 +44,10 @@ def test_wheel_imports_outside_the_repository(
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
     python = environment / "bin" / "python"
     subprocess.run(
+        [str(python), "-m", "pip", "install", "aiohttp"],
+        check=True,
+    )
+    subprocess.run(
         [str(python), "-m", "pip", "install", "--no-deps", str(wheel)],
         check=True,
     )
@@ -73,6 +77,7 @@ import mooncake.transfer_engine_topology_dump
 assert "mooncake.engine" not in sys.modules
 
 import mooncake.engine
+import mooncake.http_metadata_server
 import mooncake.mooncake_config
 import mooncake.reshard
 import mooncake.store
@@ -84,6 +89,7 @@ assert metadata.version("mooncake-transfer-engine") == {_project_version(project
 assert "administration" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+assert mooncake.http_metadata_server.KVBootstrapServer is not None
 assert mooncake.mooncake_config.MooncakeConfig is not None
 for ep_module in (
     "ep.py",
@@ -122,6 +128,12 @@ assert {{
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],
+        cwd=tmp_path,
+        env=clean_environment,
+        check=True,
+    )
+    subprocess.run(
+        [str(environment / "bin" / "mooncake_http_metadata_server"), "--help"],
         cwd=tmp_path,
         env=clean_environment,
         check=True,
