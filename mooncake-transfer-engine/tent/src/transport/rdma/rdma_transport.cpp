@@ -604,10 +604,9 @@ Status RdmaTransport::submitTransferTasks(
     for (int i = 0; i < num_workers; ++i) {
         if (slice_lists[i].first) {
             rdma_batch->slice_chain.push_back(slice_lists[i].first);
-            workers_->submit(slice_lists[i], i);
         }
     }
-    return Status::OK();
+    return workers_->admitBatch(slice_lists);
 }
 
 void RdmaTransport::reapOrphanSlices(bool on_tick) {

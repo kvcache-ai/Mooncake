@@ -340,24 +340,97 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
     }
     auto& worker = worker_context_[worker_id];
 
-    // This lane's set and counter now account for the slices, wherever they
-    // are later swept from. First entry only: a slice arriving here has
-    // never been counted, so there is nothing to move.
-    auto* owned = slice_list.first;
-    for (int i = 0; i < slice_list.num_slices && owned; ++i) {
-        owned->owner_worker.store(worker_id, std::memory_order_relaxed);
-        owned->counted_lane.store(worker_id, std::memory_order_relaxed);
-        owned = owned->next;
-    }
-
     // Get priority from first slice (all slices in list have same priority)
     int priority = PRIO_HIGH;
     if (slice_list.first && slice_list.first->task) {
         priority = slice_list.first->priority;
     }
 
-    worker.queues[priority].push(slice_list);
-    if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
+    BoundedSliceQueue::Reservation reservation;
+    if (!worker.queues[priority].try_reserve(reservation)) {
+        return Status::TooManyRequests("Worker submit queue is full" LOC_MARK);
+    }
+
+    // Account for the list before publishing it to the consumer.
+    auto* owned = slice_list.first;
+    for (int i = 0; i < slice_list.num_slices && owned; ++i) {
+        owned->owner_worker.store(worker_id, std::memory_order_relaxed);
+        owned->counted_lane.store(worker_id, std::memory_order_relaxed);
+        owned = owned->next;
+    }
+    bool wake = !worker.inflight_slices.fetch_add(slice_list.num_slices);
+    worker.queues[priority].commit(reservation, slice_list);
+    if (wake) {
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        if (worker.in_suspend) worker.cv.notify_all();
+    }
+    return Status::OK();
+}
+
+Status Workers::admitBatch(std::vector<RdmaSliceList>& slice_lists) {
+    if (!accepting_submits_.load(std::memory_order_acquire)) {
+        return Status::InternalError("RDMA transport is quiescing" LOC_MARK);
+    }
+    if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
+        num_workers_ == 0) {
+        return Status::InternalError("RDMA workers are not running" LOC_MARK);
+    }
+    if (slice_lists.size() > num_workers_) {
+        return Status::InvalidArgument("Too many worker slice lists" LOC_MARK);
+    }
+
+    struct PendingAdmission {
+        int worker_id;
+        int priority;
+        RdmaSliceList* slice_list;
+        BoundedSliceQueue::Reservation reservation;
+        bool wake = false;
+    };
+    std::vector<PendingAdmission> pending;
+    pending.reserve(slice_lists.size());
+
+    for (size_t i = 0; i < slice_lists.size(); ++i) {
+        auto& slice_list = slice_lists[i];
+        if (!slice_list.first || slice_list.num_slices == 0) continue;
+        int priority = slice_list.first->priority;
+        PendingAdmission admission{
+            static_cast<int>(i), priority, &slice_list, {}};
+        auto& queue = worker_context_[i].queues[priority];
+        if (!queue.try_reserve(admission.reservation)) {
+            for (auto& reserved : pending) {
+                worker_context_[reserved.worker_id]
+                    .queues[reserved.priority]
+                    .cancel_reservation(reserved.reservation);
+            }
+            return Status::TooManyRequests(
+                "Worker submit queue is full; batch was not "
+                "published" LOC_MARK);
+        }
+        pending.push_back(admission);
+    }
+
+    // All queues have room. Establish ownership and accounting before any
+    // consumer can observe a real list.
+    for (auto& admission : pending) {
+        auto& worker = worker_context_[admission.worker_id];
+        auto* owned = admission.slice_list->first;
+        for (int i = 0; i < admission.slice_list->num_slices && owned; ++i) {
+            owned->owner_worker.store(admission.worker_id,
+                                      std::memory_order_relaxed);
+            owned->counted_lane.store(admission.worker_id,
+                                      std::memory_order_relaxed);
+            owned = owned->next;
+        }
+        admission.wake =
+            !worker.inflight_slices.fetch_add(admission.slice_list->num_slices);
+    }
+    for (auto& admission : pending) {
+        worker_context_[admission.worker_id].queues[admission.priority].commit(
+            admission.reservation, *admission.slice_list);
+    }
+    for (auto& admission : pending) {
+        if (!admission.wake) continue;
+        auto& worker = worker_context_[admission.worker_id];
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
     }
