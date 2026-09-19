@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -88,6 +89,32 @@ TEST(LocalMemoryLifecycle, RetainsOwnershipWhenTransportFreeFails) {
     auto third = engine.freeLocalMemory(addr);
     EXPECT_TRUE(third.IsInvalidArgument());
     EXPECT_EQ(transport->free_calls, 2);
+}
+
+TEST(LocalMemoryLifecycle, SegmentInfoReplacesPreviouslyReportedBuffers) {
+    auto config = makeConfig();
+    config->set("transports/tcp/enable", true);
+    std::vector<char> buffer(4096);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    SegmentInfo info;
+    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    ASSERT_EQ(info.buffers.size(), 1u);
+    EXPECT_EQ(info.buffers.front().base,
+              reinterpret_cast<uint64_t>(buffer.data()));
+    EXPECT_EQ(info.buffers.front().length, buffer.size());
+
+    // Reusing the output must not duplicate buffers from the previous call.
+    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    EXPECT_EQ(info.buffers.size(), 1u);
+
+    ASSERT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    EXPECT_TRUE(info.buffers.empty())
+        << "An unregistered buffer must not survive a segment-info refresh";
 }
 
 }  // namespace
