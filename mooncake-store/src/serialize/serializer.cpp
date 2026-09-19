@@ -528,9 +528,17 @@ auto Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
     auto metadata = allocation_array.via.array.ptr[1].as<uint32_t>();
     offset_allocator::OffsetAllocation allocation(offset, metadata);
 
+    // The wire format does not carry the reserved extent, so rebuild it from
+    // the restored allocator's node. Requested size must never be substituted
+    // for a missing extent.
+    std::optional<uint64_t> reserved_size = std::nullopt;
+    if (allocator) {
+        reserved_size = allocator->allocationReservedSize(allocation);
+    }
+
     // Create a new OffsetAllocationHandle object
     auto handle = std::make_shared<offset_allocator::OffsetAllocationHandle>(
-        allocator, allocation, real_base, requested_size);
+        allocator, allocation, real_base, requested_size, reserved_size);
 
     return handle;
 }
@@ -689,9 +697,21 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
         }
     }
 
+    // Rebuild the allocator-reserved extent. A restored offset handle carries
+    // the node extent of the persisted layout; other real backends report it
+    // from their own allocation metadata. A descriptor-only buffer stays
+    // unknown rather than pretending requested_size is the reserved size.
+    std::optional<std::size_t> reserved_size = std::nullopt;
+    if (offsetHandle.has_value() && offsetHandle->reserved_size().has_value()) {
+        reserved_size =
+            static_cast<std::size_t>(*offsetHandle->reserved_size());
+    } else {
+        reserved_size = allocator->lookupReservedSize(buffer_ptr);
+    }
+
     // Create AllocatedBuffer object
-    auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
-                                                    std::move(offsetHandle));
+    auto buffer = std::make_unique<AllocatedBuffer>(
+        allocator, buffer_ptr, size, reserved_size, std::move(offsetHandle));
     if (mountedSegment.allocator_registration) {
         mountedSegment.allocator_registration->BindBuffer(*buffer);
     }
