@@ -16,6 +16,9 @@
 #define RDMA_ENDPOINT_H
 
 #include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <queue>
 
 #include "rdma_context.h"
@@ -41,7 +44,7 @@ class RdmaEndPointTestPeer;
 // If the user initiates a disconnect() call or an error is detected internally,
 // the connection is closed and the RdmaEndPoint state is set to UNCONNECTED.
 // The handshake can be restarted at this point.
-class RdmaEndPoint {
+class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
    public:
     enum Status {
         INITIALIZING,
@@ -54,6 +57,9 @@ class RdmaEndPoint {
     };
 
     friend class RdmaEndPointTestPeer;
+    friend class RdmaNotificationTestPeer;
+    friend class RdmaContext;
+    friend class RdmaTransport;
 
    public:
     RdmaEndPoint(RdmaContext &context);
@@ -83,6 +89,9 @@ class RdmaEndPoint {
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
     int setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                   HandShakeDesc &local_desc);
+
+    int sendNotification(const TransferMetadata::NotifyDesc &notify);
+    bool notificationNeedsReconnect() const;
 
     bool active() const { return active_.load(std::memory_order_acquire); }
 
@@ -134,6 +143,28 @@ class RdmaEndPoint {
     bool finishDestroy();
 
    private:
+    // Match TENT: fixed capacity and native-endian length-prefixed strings.
+    // Layout: uint32 name_length, name, uint32 message_length, message.
+    static constexpr size_t kNotifySlots = 256;
+    static constexpr size_t kNotifySlotBytes = 65536;
+    static constexpr size_t kNotifyHeaderBytes = 8;
+    static bool notificationFits(const TransferMetadata::NotifyDesc &notify);
+    static size_t encodeNotification(
+        char *slot, const TransferMetadata::NotifyDesc &notify);
+    static bool decodeNotification(const char *slot, size_t bytes,
+                                   TransferMetadata::NotifyDesc &notify);
+    int constructNotification();
+    int connectNotification(const std::string &gid, uint16_t lid,
+                            uint32_t peer_qp, uint16_t recv_depth,
+                            int local_gid_index);
+    uint32_t notificationQpNum() const;
+    int postNotificationReceive(size_t slot);
+    void handleNotificationCompletion(
+        const ibv_wc &wc, std::vector<TransferMetadata::NotifyDesc> &received);
+    void failNotification(uint64_t generation);
+    void stopNotification();
+    int closeNotification();
+    void describeNotification(HandShakeDesc &desc) const;
     int disconnectUnlocked();
 
     // Resets only pre-connected handshake attempts. Once an endpoint has ever
@@ -182,7 +213,9 @@ class RdmaEndPoint {
                           std::vector<uint32_t> peer_qp_num_list,
                           Status connected_status = CONNECTED,
                           std::string *reply_msg = nullptr,
-                          SetupConnectionFailureInfo *failure_info = nullptr);
+                          SetupConnectionFailureInfo *failure_info = nullptr,
+                          uint32_t notify_qp_num = 0,
+                          uint16_t notify_rq_depth = 0);
 
     int doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                           uint16_t peer_lid, uint32_t peer_qp_num,
@@ -215,6 +248,28 @@ class RdmaEndPoint {
     mutable RWSpinlock lock_;
     std::vector<ibv_qp *> qp_list_;
     uint64_t qp_generation_;
+    // Protected by its own mutex so send-slot waits never hold lock_.
+    // Each QP incarnation gets a context-unique generation encoded in wr_id.
+    struct NotifyState {
+        int fail(int code, bool reconnect = false) {
+            if (!error) error = code;
+            reconnect_needed = reconnect_needed || reconnect;
+            connected = false;
+            cv.notify_all();
+            return error;
+        }
+        mutable std::mutex mutex;
+        std::condition_variable cv;
+        ibv_qp *qp = nullptr;
+        ibv_mr *send_mr = nullptr, *recv_mr = nullptr;
+        std::unique_ptr<char[]> send_buffer, recv_buffer;
+        uint64_t generation = 0, next_send = 0;
+        size_t pending = 0;
+        uint32_t peer_qp = 0, inline_bytes = 0;
+        int error = 0;
+        bool enabled = false, connected = false, reconnect_needed = false;
+    } notify_;
+    uint32_t peer_notify_qp_num_ = 0;
 
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;

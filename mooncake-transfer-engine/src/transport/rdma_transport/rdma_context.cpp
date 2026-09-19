@@ -46,6 +46,7 @@
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
+#include <limits>
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
 #include "transport/transport.h"
@@ -292,6 +293,8 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
         cq_list_[i].native = cq;
     }
 
+    native_notify_enabled_ = globalConfig().rdma_notify_enabled &&
+                             std::string(engine_.getName()) == "rdma";
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
 
 #ifdef USE_MLX5DV
@@ -312,6 +315,107 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     return 0;
 }
 
+int RdmaContext::registerNotification(
+    const std::weak_ptr<RdmaEndPoint> &endpoint, uint64_t &generation,
+    ibv_cq *&cq) {
+    std::lock_guard<std::mutex> guard(notify_mutex_);
+    if (endpoint.expired() || notify_cq_failed_ ||
+        notify_next_generation_ >
+            std::numeric_limits<uint64_t>::max() / RdmaEndPoint::kNotifySlots)
+        return ERR_ENDPOINT;
+    if (!notify_cq_) {
+        ibv_device_attr attr{};
+        if (ibv_query_device(context_, &attr)) return ERR_CONTEXT;
+        notify_max_cqe_ = attr.max_cqe;
+        const size_t entries = std::min<size_t>(
+            notify_max_cqe_,
+            std::max(globalConfig().max_cqe, 2 * RdmaEndPoint::kNotifySlots));
+        if (entries < 2 * RdmaEndPoint::kNotifySlots) return ERR_CONTEXT;
+        notify_cq_ = ibv_create_cq(context_, entries, nullptr, nullptr, 0);
+        if (!notify_cq_) return ERR_CONTEXT;
+    }
+    // Include retired QPs until an empty poll proves any queued completions
+    // have drained. This bounds CQ occupancy even during rapid reconnects.
+    const size_t required =
+        (notify_endpoints_.size() + 1) * 2 * RdmaEndPoint::kNotifySlots;
+    if (required > static_cast<size_t>(notify_max_cqe_)) return ERR_ENDPOINT;
+    if (required > static_cast<size_t>(notify_cq_->cqe)) {
+        const size_t entries = std::min<size_t>(
+            notify_max_cqe_, std::max(required, size_t(notify_cq_->cqe) * 2));
+        if (ibv_resize_cq(notify_cq_, entries)) {
+            PLOG(ERROR) << "Failed to grow shared notification CQ";
+            return ERR_ENDPOINT;
+        }
+    }
+    generation = notify_next_generation_++;
+    notify_endpoints_.emplace(generation, endpoint);
+    cq = notify_cq_;
+    if (!notify_worker_.joinable()) {
+        notify_running_.store(true, std::memory_order_release);
+        notify_worker_ = std::thread([this] { pollNotifications(); });
+    }
+    return 0;
+}
+
+void RdmaContext::unregisterNotification(uint64_t generation) {
+    std::lock_guard<std::mutex> guard(notify_mutex_);
+    auto it = notify_endpoints_.find(generation);
+    if (it != notify_endpoints_.end()) {
+        // Called only after successful QP destruction: no future WRs/CQEs.
+        it->second.reset();
+        notify_retired_.push_back(generation);
+    }
+}
+
+void RdmaContext::dispatchNotificationCompletion(
+    const ibv_wc &wc, std::vector<TransferMetadata::NotifyDesc> &received) {
+    std::shared_ptr<RdmaEndPoint> endpoint;
+    {
+        std::lock_guard<std::mutex> guard(notify_mutex_);
+        auto it = notify_endpoints_.find(wc.wr_id / RdmaEndPoint::kNotifySlots);
+        if (it != notify_endpoints_.end()) endpoint = it->second.lock();
+    }
+    // Never acquire endpoint locks under notify_mutex_. Teardown takes them
+    // in the opposite direction. The strong reference protects this callback.
+    if (endpoint) endpoint->handleNotificationCompletion(wc, received);
+}
+
+int RdmaContext::pollNotificationCq() {
+    ibv_wc completions[32];
+    int count;
+    std::vector<std::pair<uint64_t, std::shared_ptr<RdmaEndPoint>>> failed;
+    {
+        std::lock_guard<std::mutex> guard(notify_mutex_);
+        if (!notify_cq_ || notify_cq_failed_) return 0;
+        count = ibv_poll_cq(notify_cq_, 32, completions);
+        if (count < 0) {
+            notify_cq_failed_ = true;
+            for (auto &[generation, weak_endpoint] : notify_endpoints_)
+                if (auto endpoint = weak_endpoint.lock())
+                    failed.emplace_back(generation, std::move(endpoint));
+        } else if (!count) {
+            for (auto generation : notify_retired_)
+                notify_endpoints_.erase(generation);
+            notify_retired_.clear();
+        }
+    }
+    for (auto &[generation, endpoint] : failed)
+        endpoint->failNotification(generation);
+    std::vector<TransferMetadata::NotifyDesc> received;
+    for (int i = 0; i < count; ++i)
+        dispatchNotificationCompletion(completions[i], received);
+    for (const auto &message : received) engine_.meta()->pushNotify(message);
+    return count;
+}
+
+void RdmaContext::pollNotifications() {
+    while (notify_running_.load(std::memory_order_acquire)) {
+        const int count = pollNotificationCq();
+        if (count < 0) break;
+        if (!count) std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+}
+
 int RdmaContext::socketId() {
     std::string path =
         "/sys/class/infiniband/" + device_name_ + "/device/numa_node";
@@ -328,6 +432,8 @@ int RdmaContext::socketId() {
 
 int RdmaContext::deconstruct() {
     worker_pool_.reset();
+    notify_running_.store(false, std::memory_order_release);
+    if (notify_worker_.joinable()) notify_worker_.join();
 
     // Graceful teardown order: QPs -> MRs.
     if (endpoint_store_) {
@@ -351,6 +457,17 @@ int RdmaContext::deconstruct() {
             LOG(ERROR) << "Failed to destroy all QPs before MR deregistration";
         }
     }
+
+    // All endpoint QPs must be destroyed before the shared notification CQ.
+    if (notify_cq_) {
+        if (ibv_destroy_cq(notify_cq_)) {
+            LOG(ERROR) << "Failed to destroy shared notification CQ";
+        } else {
+            notify_cq_ = nullptr;
+        }
+    }
+    notify_endpoints_.clear();
+    notify_retired_.clear();
 
     for (auto &[_, entry] : memory_region_map_) {
         int ret = ibv_dereg_mr(entry.mr);
