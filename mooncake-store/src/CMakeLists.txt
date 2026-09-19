@@ -152,6 +152,10 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     ssd_register_client.cpp
     engram/engram_store.cpp)
 
+if(USE_CUDA)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES cuda_transfer_barrier.cpp)
+endif()
+
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
 endif()
@@ -640,7 +644,7 @@ if(TARGET Mooncake::liburing)
   target_link_libraries(mooncake_store PUBLIC Mooncake::liburing)
 endif()
 if(USE_CUDA)
-  target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
+  target_link_libraries(mooncake_store PRIVATE CUDA::cudart CUDA::cuda_driver)
 elseif(USE_HIP)
   target_link_libraries(mooncake_store PRIVATE hip::host)
 endif()
