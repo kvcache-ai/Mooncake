@@ -67,19 +67,111 @@ static int getCudaDeviceId(void* addr) {
 
 class TcpStagingBuffer {
    public:
-    char* ensure(size_t size) {
+    ~TcpStagingBuffer() {
+#ifdef USE_CUDA
+        for (char* ptr : buffers_)
+            if (ptr) cudaFreeHost(ptr);
+#endif
+    }
+
+    char* ensure(size_t size, size_t slot = 0) {
+#ifdef USE_CUDA
+        if (capacities_[slot] < size) {
+            char* replacement = nullptr;
+            if (cudaMallocHost(reinterpret_cast<void**>(&replacement), size) !=
+                cudaSuccess)
+                return nullptr;
+            if (buffers_[slot]) cudaFreeHost(buffers_[slot]);
+            buffers_[slot] = replacement;
+            capacities_[slot] = size;
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+            recordStagingBufferAllocationForTest();
+            recordStagingBufferPointerForTest(replacement);
+#endif
+        }
+        return buffers_[slot];
+#else
+        (void)slot;
         if (buffer_.size() < size) {
             buffer_.resize(size);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
             recordStagingBufferAllocationForTest();
+            recordStagingBufferPointerForTest(buffer_.data());
 #endif
         }
         return buffer_.data();
+#endif
     }
 
    private:
+#ifdef USE_CUDA
+    char* buffers_[2] = {nullptr, nullptr};
+    size_t capacities_[2] = {0, 0};
+#else
     std::vector<char> buffer_;
+#endif
 };
+
+#ifdef USE_CUDA
+// Stage the next device chunk while the socket sends the current one.
+class TcpGpuSendPipeline {
+   public:
+    ~TcpGpuSendPipeline() {
+        if (stream_) {
+            cudaSetDevice(device_);
+            cudaStreamSynchronize(stream_);
+            cudaStreamDestroy(stream_);
+        }
+    }
+
+    cudaError_t prepare(int device, const char* source, size_t offset,
+                        size_t size, size_t total, char*& ready) {
+        if (!stream_) {
+            device_ = device;
+            // Match the original synchronous cudaMemcpy's legacy default
+            // stream ordering with producer work.
+            auto status =
+                cudaStreamCreateWithFlags(&stream_, cudaStreamDefault);
+            if (status != cudaSuccess) return status;
+        }
+        if (prefetched_offset_ != offset) {
+            slot_ = 0;
+            ready = buffers_.ensure(size, slot_);
+            if (!ready) return cudaErrorMemoryAllocation;
+            auto status = cudaMemcpyAsync(ready, source + offset, size,
+                                          cudaMemcpyDeviceToHost, stream_);
+            if (status != cudaSuccess) return status;
+        } else {
+            ready = buffers_.ensure(size, slot_);
+        }
+        auto status = cudaStreamSynchronize(stream_);
+        if (status != cudaSuccess) return status;
+
+        const size_t next_offset = offset + size;
+        prefetched_offset_ = total;
+        if (next_offset < total) {
+            const size_t next_size =
+                std::min(getChunkSize(), total - next_offset);
+            const size_t next_slot = 1 - slot_;
+            char* next = buffers_.ensure(next_size, next_slot);
+            if (!next) return cudaErrorMemoryAllocation;
+            status = cudaMemcpyAsync(next, source + next_offset, next_size,
+                                     cudaMemcpyDeviceToHost, stream_);
+            if (status != cudaSuccess) return status;
+            prefetched_offset_ = next_offset;
+            slot_ = next_slot;
+        }
+        return cudaSuccess;
+    }
+
+   private:
+    TcpStagingBuffer buffers_;
+    cudaStream_t stream_ = nullptr;
+    int device_ = -1;
+    size_t prefetched_offset_ = std::numeric_limits<size_t>::max();
+    size_t slot_ = 0;
+};
+#endif
 
 #ifdef USE_MACA
 static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
@@ -161,6 +253,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_COREX)
     int cuda_device_ = -1;
     TcpStagingBuffer staging_buffer_;
+#ifdef USE_CUDA
+    TcpGpuSendPipeline send_pipeline_;
+#endif
 #endif
 
     void start() {
@@ -251,12 +346,17 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
         if (cuda_device_ >= 0) {
-            dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
+#ifdef USE_CUDA
+            cudaError_t cuda_status = send_pipeline_.prepare(
+                cuda_device_, addr, total_transferred_bytes_, buffer_size, size,
+                dram_buffer);
+#elif defined(USE_MACA)
+            dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
 #else
+            dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaError_t cuda_status =
                 cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
                            buffer_size, cudaMemcpyDefault);
@@ -314,7 +414,13 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
         if (cuda_device_ >= 0) {
+            cudaSetDevice(cuda_device_);
             dram_buffer = staging_buffer_.ensure(buffer_size);
+            if (!dram_buffer) {
+                LOG(ERROR) << "ServerSession::readBody failed to allocate CUDA "
+                              "staging";
+                return;
+            }
         }
 #endif
 
@@ -388,6 +494,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_COREX)
     int cuda_device_ = -1;
     TcpStagingBuffer staging_buffer_;
+#ifdef USE_CUDA
+    TcpGpuSendPipeline send_pipeline_;
+#endif
 #endif
     // v2 WRITE runs the body stream and the ack read concurrently (one
     // async op per direction; handlers serialize on the io thread). The
@@ -765,7 +874,12 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
         if (cuda_device_ >= 0) {
+            cudaSetDevice(cuda_device_);
             dram_buffer = staging_buffer_.ensure(buffer_size);
+            if (!dram_buffer) {
+                finalize(TransferStatusEnum::FAILED, false);
+                return;
+            }
         }
 #endif
 
@@ -866,12 +980,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
         if (cuda_device_ >= 0) {
-            dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
+#ifdef USE_CUDA
+            cudaError_t cuda_status = send_pipeline_.prepare(
+                cuda_device_, addr, total_transferred_bytes_, buffer_size, size,
+                dram_buffer);
+#elif defined(USE_MACA)
+            dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
 #else
+            dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaError_t cuda_status =
                 cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
                            buffer_size, cudaMemcpyDefault);

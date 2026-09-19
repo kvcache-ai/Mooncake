@@ -30,6 +30,7 @@
 namespace mooncake {
 void tcpTransportResetStagingStatsForTest() noexcept;
 size_t tcpTransportStagingBufferAllocationCountForTest() noexcept;
+size_t tcpTransportStagingPinnedAllocationCountForTest() noexcept;
 size_t tcpTransportStagingDeviceQueryCountForTest() noexcept;
 }  // namespace mooncake
 #endif
@@ -153,7 +154,8 @@ TEST(TcpCudaStagingTest, ReusesStagingAcrossChunksAndRequests) {
     write.target_offset = remote_base + kTransferSize;
     ASSERT_EQ(runOne(engine.get(), write), TransferStatusEnum::COMPLETED);
     EXPECT_EQ(tcpTransportStagingDeviceQueryCountForTest(), 2u);
-    EXPECT_EQ(tcpTransportStagingBufferAllocationCountForTest(), 2u);
+    EXPECT_EQ(tcpTransportStagingBufferAllocationCountForTest(), 3u);
+    EXPECT_EQ(tcpTransportStagingPinnedAllocationCountForTest(), 3u);
 
     std::vector<unsigned char> actual(kTransferSize);
     ASSERT_EQ(cudaMemcpy(actual.data(), device_bytes + kTransferSize,
@@ -170,10 +172,24 @@ TEST(TcpCudaStagingTest, ReusesStagingAcrossChunksAndRequests) {
     read.target_offset = remote_base + kTransferSize;
     ASSERT_EQ(runOne(engine.get(), read), TransferStatusEnum::COMPLETED);
     EXPECT_EQ(tcpTransportStagingDeviceQueryCountForTest(), 2u);
-    // The client session is new; the persistent server session retains the
-    // staging allocation used by the preceding WRITE.
-    EXPECT_EQ(tcpTransportStagingBufferAllocationCountForTest(), 1u);
+    // The client uses one receive buffer; the persistent server allocates
+    // two send buffers when it first serves a READ.
+    EXPECT_EQ(tcpTransportStagingBufferAllocationCountForTest(), 3u);
+    EXPECT_EQ(tcpTransportStagingPinnedAllocationCountForTest(), 3u);
 
+    ASSERT_EQ(cudaMemcpy(actual.data(), device_bytes + 2 * kTransferSize,
+                         actual.size(), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, pattern);
+
+    for (auto& byte : pattern) byte ^= 0xA5;
+    ASSERT_EQ(cudaMemcpy(device_bytes + kTransferSize, pattern.data(),
+                         pattern.size(), cudaMemcpyHostToDevice),
+              cudaSuccess);
+    tcpTransportResetStagingStatsForTest();
+    ASSERT_EQ(runOne(engine.get(), read), TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(tcpTransportStagingBufferAllocationCountForTest(), 1u);
+    EXPECT_EQ(tcpTransportStagingPinnedAllocationCountForTest(), 1u);
     ASSERT_EQ(cudaMemcpy(actual.data(), device_bytes + 2 * kTransferSize,
                          actual.size(), cudaMemcpyDeviceToHost),
               cudaSuccess);
