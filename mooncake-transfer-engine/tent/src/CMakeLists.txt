@@ -61,6 +61,7 @@ if(IBVERBS_LIB AND IBVERBS_INCLUDE)
   target_compile_definitions(tent_interface INTERFACE USE_RDMA)
   target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
   target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
+  set(TENT_FEATURE_RDMA ON)
   # ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
   # newer rdma-core adds active_speed_ex to carry it.
   include(CheckStructHasMember)
@@ -95,9 +96,15 @@ if(TARGET Mooncake::liburing)
   message(STATUS "Uring: Enabled")
   target_compile_definitions(tent_interface INTERFACE USE_URING)
   target_link_libraries(tent_interface INTERFACE Mooncake::liburing)
+  set(TENT_FEATURE_URING ON)
 else()
   message(STATUS "Uring: Disabled")
 endif()
+
+# Configure diagnostics only after optional local capabilities have been
+# detected. The resulting library is deliberately independent of tent_interface
+# so the CLI cannot initialize transports or device runtimes.
+add_subdirectory(diagnostics)
 
 if(USE_SUNRISE)
   target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
