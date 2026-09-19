@@ -27,6 +27,11 @@
 #include "default_config.h"
 #include "crc_checksum.h"
 #include "environ.h"
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+
+#include "cuda_transfer_barrier.h"
+#endif
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -396,6 +401,83 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
         << "Remove operation failed: " << toString(remove_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
+
+#ifdef USE_CUDA
+TEST_F(ClientIntegrationTest, BatchGetSignalsCudaGraphAfterGpuRead) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0)
+        GTEST_SKIP() << "CUDA device unavailable";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr size_t kSize = 64 * 1024;
+    const std::string key = "batch_get_cuda_graph_read";
+    std::vector<char> expected(kSize);
+    for (size_t i = 0; i < kSize; ++i) expected[i] = static_cast<char>(i);
+    void* source = client_buffer_allocator_->allocate(kSize);
+    memcpy(source, expected.data(), kSize);
+    std::vector<Slice> source_slices{{source, kSize}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(test_client_->Put(key, source_slices, config).has_value());
+    client_buffer_allocator_->deallocate(source, kSize);
+
+    void* destination = nullptr;
+    void* graph_output = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, kSize), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&graph_output, kSize), cudaSuccess);
+    ASSERT_TRUE(
+        test_client_
+            ->RegisterLocalMemory(destination, kSize, "cuda:0", false, false)
+            .has_value());
+    auto barrier = CudaTransferBarrier::Create();
+    ASSERT_NE(barrier, nullptr);
+    cudaStream_t stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+              cudaSuccess);
+    cudaGraph_t graph;
+    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+              cudaSuccess);
+    ASSERT_TRUE(barrier->enqueueWait(stream));
+    ASSERT_EQ(cudaMemcpyAsync(graph_output, destination, kSize,
+                              cudaMemcpyDeviceToDevice, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    cudaGraphExec_t executable;
+    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, 0), cudaSuccess);
+
+    std::unordered_map<std::string, std::vector<Slice>> slices{
+        {key, {{destination, kSize}}}};
+    std::vector<char> actual(kSize);
+    for (int replay = 0; replay < 2; ++replay) {
+        ASSERT_EQ(cudaMemset(destination, 0, kSize), cudaSuccess);
+        ASSERT_EQ(cudaMemset(graph_output, 0, kSize), cudaSuccess);
+        ASSERT_TRUE(StartBatchGetWithCudaBarrier(test_client_, {key}, slices,
+                                                 *barrier));
+        ASSERT_EQ(cudaGraphLaunch(executable, stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(barrier->wait(), ErrorCode::OK);
+        ASSERT_EQ(cudaMemcpy(actual.data(), graph_output, kSize,
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_EQ(actual, expected);
+    }
+
+    ASSERT_TRUE(StartBatchGetWithCudaBarrier(
+        test_client_, {"missing_cuda_graph_key"},
+        {{"missing_cuda_graph_key", {{destination, kSize}}}}, *barrier));
+    ASSERT_EQ(cudaGraphLaunch(executable, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    EXPECT_NE(barrier->wait(), ErrorCode::OK);
+
+    EXPECT_TRUE(
+        test_client_->unregisterLocalMemory(destination, false).has_value());
+    EXPECT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
+    EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    EXPECT_EQ(cudaFree(graph_output), cudaSuccess);
+    EXPECT_EQ(cudaFree(destination), cudaSuccess);
+}
+#endif
 
 TEST_F(ClientIntegrationTest, ObjectChecksumRejectsCorruptedObject) {
     if (!Environ::Get().GetStoreChecksumEnabled()) {
