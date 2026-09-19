@@ -48,7 +48,7 @@ size_t ProcessThreadCount() {
 
 bool WaitForProcessThreadCount(size_t expected) {
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     do {
         if (ProcessThreadCount() == expected) {
             return true;
@@ -58,20 +58,35 @@ bool WaitForProcessThreadCount(size_t expected) {
     return false;
 }
 
+size_t StableProcessThreadCount() {
+    size_t baseline = ProcessThreadCount();
+    for (int i = 0; i < 50; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const size_t now = ProcessThreadCount();
+        if (now == baseline) {
+            return baseline;
+        }
+        baseline = now;
+    }
+    return baseline;
+}
+
 TEST(FilereadWorkerPoolTest, AcceptsTypedTrailingWhitespaceAndCaches) {
     google::InitGoogleLogging("FilereadWorkerPoolTest");
     ScopedFilereadWorkersEnv env("2 ");
     std::shared_ptr<StorageBackend> backend;
-    const size_t baseline = ProcessThreadCount();
+    // glog can spawn helper threads after InitGoogleLogging; settle first.
+    const size_t baseline = StableProcessThreadCount();
     {
         FilereadWorkerPool pool(backend);
-        EXPECT_EQ(ProcessThreadCount(), baseline + 2);
+        ASSERT_TRUE(WaitForProcessThreadCount(baseline + 2));
     }
     ASSERT_TRUE(WaitForProcessThreadCount(baseline));
     ASSERT_EQ(setenv("MC_FILEREAD_WORKERS", "3", 1), 0);
     {
         FilereadWorkerPool pool(backend);
-        EXPECT_EQ(ProcessThreadCount(), baseline + 2);
+        // worker_count is cached on first construction; still 2, not 3.
+        ASSERT_TRUE(WaitForProcessThreadCount(baseline + 2));
     }
     EXPECT_TRUE(WaitForProcessThreadCount(baseline));
     google::ShutdownGoogleLogging();
