@@ -1959,6 +1959,34 @@ class MasterService {
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
+
+    // Ping reads this instead of taking client_mutex_, so a heartbeat is never
+    // queued behind whatever a client_mutex_ holder is doing.
+    struct ClientView {
+        std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                           boost::hash<UUID>>
+            liveness_records;
+        std::unordered_set<UUID, boost::hash<UUID>> ok_clients;
+    };
+    // Read and written only through std::atomic_{load,store}_explicit.
+    std::shared_ptr<const ClientView> client_view_ =
+        std::make_shared<const ClientView>();
+    // Caller must hold client_mutex_ exclusively.
+    void PublishClientViewLocked();
+    // Publishes on scope exit. Declare it after the client_mutex_ lock so the
+    // view is published before that lock is released, on every return path.
+    class ScopedClientViewPublish {
+       public:
+        explicit ScopedClientViewPublish(MasterService& service)
+            : service_(service) {}
+        ~ScopedClientViewPublish() { service_.PublishClientViewLocked(); }
+        ScopedClientViewPublish(const ScopedClientViewPublish&) = delete;
+        ScopedClientViewPublish& operator=(const ScopedClientViewPublish&) =
+            delete;
+
+       private:
+        MasterService& service_;
+    };
     ClientOffboardingWorker client_offboarding_worker_{this};
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;

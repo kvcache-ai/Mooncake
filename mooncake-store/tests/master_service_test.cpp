@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <limits>
@@ -2930,6 +2931,105 @@ TEST_F(MasterServiceTest,
     EXPECT_TRUE(job.prepared_segments.empty());
     EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+}
+
+// ===================== Heartbeat Path Tests =====================
+
+TEST_F(MasterServiceTest,
+       PingRecordsLivenessWhileClientMutexIsHeldExclusively) {
+    MasterService service;
+    auto segment = MakeSegment("ping_exclusive_hold_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
+    const auto liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(liveness);
+    ASSERT_EQ(
+        liveness->Evaluate(ClientLivenessRecord::Clock::now(),
+                           std::chrono::seconds::zero(), std::chrono::hours(1)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
+
+    std::unique_lock<std::shared_mutex> segment_operation_hold(
+        MasterServiceTestPeer::ClientMutex(service));
+    auto ping =
+        std::async(std::launch::async, [&] { return service.Ping(client_id); });
+    const bool ping_returned_during_hold =
+        ping.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const auto state_during_hold = liveness->state();
+    segment_operation_hold.unlock();
+
+    ASSERT_TRUE(ping_returned_during_hold);
+    EXPECT_EQ(state_during_hold, ClientLivenessState::ACTIVE);
+    auto response = ping.get();
+    ASSERT_TRUE(response.has_value());
+    EXPECT_EQ(response->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceTest, PingReturnsWhileTheClientsOwnRecordIsGuarded) {
+    MasterService service;
+    auto segment = MakeSegment("ping_guarded_record_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
+    const auto liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(liveness);
+
+    auto remount_in_progress = liveness->TryAcquireRetainingGuard();
+    ASSERT_TRUE(remount_in_progress.has_value());
+    auto ping =
+        std::async(std::launch::async, [&] { return service.Ping(client_id); });
+    const bool ping_returned_during_guard =
+        ping.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    remount_in_progress.reset();
+
+    ASSERT_TRUE(ping_returned_during_guard);
+    auto response = ping.get();
+    ASSERT_TRUE(response.has_value());
+    EXPECT_EQ(response->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceTest, PingSeesReMountedClientAsSoonAsReMountReturns) {
+    MasterService service;
+    auto segment = MakeSegment("ping_after_remount_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    EXPECT_EQ(service.Ping(client_id)->client_status,
+              ClientStatus::NEED_REMOUNT);
+
+    ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
+    EXPECT_EQ(service.Ping(client_id)->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceTest, PingSeesUnknownClientAsNeedRemount) {
+    MasterService service;
+    EXPECT_EQ(service.Ping(generate_uuid())->client_status,
+              ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(MasterServiceTest, PingReportsNeedRemountOnceClientGoesOffline) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_client_active_ttl_sec(1)
+                              .set_client_suspicion_ttl_sec(1)
+                              .build();
+    MasterService service(service_config);
+    auto segment = MakeSegment("ping_after_offline_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
+    ASSERT_EQ(service.Ping(client_id)->client_status, ClientStatus::OK);
+    const auto liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(liveness);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (liveness->state() != ClientLivenessState::OFFLINE &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_EQ(liveness->state(), ClientLivenessState::OFFLINE);
+
+    EXPECT_EQ(service.Ping(client_id)->client_status,
+              ClientStatus::NEED_REMOUNT);
 }
 
 }  // namespace mooncake::test

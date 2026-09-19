@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -101,6 +103,29 @@ class ClientLivenessRecord {
         return ObserveAndRun(now, [] { return true; });
     }
 
+    // A guard can be held across long work, so a heartbeat never waits for
+    // transition_mutex_. When it is busy the heartbeat is still counted by
+    // Evaluate, and the next heartbeat that gets the mutex recovers the state.
+    [[nodiscard]] ClientLivenessObservation ObserveHeartbeat(TimePoint now) {
+        auto latest = latest_heartbeat_rep_.load(std::memory_order_relaxed);
+        while (latest < now.time_since_epoch().count() &&
+               !latest_heartbeat_rep_.compare_exchange_weak(
+                   latest, now.time_since_epoch().count(),
+                   std::memory_order_release, std::memory_order_relaxed)) {
+        }
+        std::unique_lock<std::mutex> lock(transition_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return state() == ClientLivenessState::OFFLINE
+                       ? ClientLivenessObservation::REJECTED_OFFLINE
+                       : ClientLivenessObservation::OBSERVATION_WITHHELD;
+        }
+        const auto current_state = state_.load(std::memory_order_relaxed);
+        if (current_state == ClientLivenessState::OFFLINE) {
+            return ClientLivenessObservation::REJECTED_OFFLINE;
+        }
+        return CommitObservationLocked(now, current_state);
+    }
+
     template <typename Operation>
     [[nodiscard]] ClientLivenessObservation ObserveAndRun(
         TimePoint now, Operation&& operation) {
@@ -141,9 +166,13 @@ class ClientLivenessRecord {
         ClientLivenessTransition transition = ClientLivenessTransition::NONE;
         {
             std::lock_guard<std::mutex> lock(transition_mutex_);
+            const TimePoint latest_heartbeat_at{Clock::duration(
+                latest_heartbeat_rep_.load(std::memory_order_acquire))};
             switch (state_.load(std::memory_order_relaxed)) {
                 case ClientLivenessState::ACTIVE:
-                    if (now - last_liveness_at_ >= active_ttl) {
+                    if (now -
+                            std::max(last_liveness_at_, latest_heartbeat_at) >=
+                        active_ttl) {
                         suspected_since_ = now;
                         state_.store(ClientLivenessState::SUSPECTED,
                                      std::memory_order_release);
@@ -151,7 +180,8 @@ class ClientLivenessRecord {
                     }
                     break;
                 case ClientLivenessState::SUSPECTED:
-                    if (now - suspected_since_ >= suspicion_ttl) {
+                    if (latest_heartbeat_at <= suspected_since_ &&
+                        now - suspected_since_ >= suspicion_ttl) {
                         // Publish the external barrier before OFFLINE so a
                         // concurrent snapshot cannot miss terminal work.
                         std::forward<ReserveRetirement>(reserve_retirement)();
@@ -188,6 +218,8 @@ class ClientLivenessRecord {
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
     std::mutex transition_mutex_;
     TimePoint last_liveness_at_;
+    std::atomic<Clock::rep> latest_heartbeat_rep_{
+        std::numeric_limits<Clock::rep>::min()};
     TimePoint suspected_since_{};
 };
 

@@ -57,6 +57,52 @@ TEST(ClientLivenessRecordTest, FailedOperationDoesNotRecoverOrRefresh) {
               ClientLivenessTransition::BECAME_OFFLINE);
 }
 
+TEST(ClientLivenessRecordTest, HeartbeatDoesNotWaitForAGuardHolder) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+
+    auto guard = record.TryAcquireRetainingGuard();
+    ASSERT_TRUE(guard.has_value());
+    EXPECT_EQ(record.ObserveHeartbeat(initial + 9s),
+              ClientLivenessObservation::OBSERVATION_WITHHELD);
+    guard.reset();
+
+    EXPECT_EQ(record.Evaluate(initial + 15s, 10s, 20s),
+              ClientLivenessTransition::NONE);
+    EXPECT_EQ(record.Evaluate(initial + 19s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+}
+
+TEST(ClientLivenessRecordTest, HeartbeatDuringSuspicionPreventsOffline) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+
+    auto guard = record.TryAcquireRetainingGuard();
+    ASSERT_TRUE(guard.has_value());
+    EXPECT_EQ(record.ObserveHeartbeat(initial + 25s),
+              ClientLivenessObservation::OBSERVATION_WITHHELD);
+    guard.reset();
+
+    EXPECT_EQ(record.Evaluate(initial + 31s, 10s, 20s),
+              ClientLivenessTransition::NONE);
+    EXPECT_EQ(record.ObserveHeartbeat(initial + 32s),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+}
+
+TEST(ClientLivenessRecordTest, HeartbeatIsRejectedOnceOffline) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(record.Evaluate(initial + 30s, 10s, 20s),
+              ClientLivenessTransition::BECAME_OFFLINE);
+
+    EXPECT_EQ(record.ObserveHeartbeat(initial + 31s),
+              ClientLivenessObservation::REJECTED_OFFLINE);
+}
+
 TEST(ClientLivenessRecordTest, RetireCallbackRunsAfterTransitionGuardRelease) {
     const auto initial = ClientLivenessRecord::TimePoint{};
     ClientLivenessRecord record(initial);
