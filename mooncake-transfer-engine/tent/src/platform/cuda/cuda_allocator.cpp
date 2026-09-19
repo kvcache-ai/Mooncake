@@ -126,21 +126,22 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     return Status::OK();
 }
 
-Status CudaPlatform::synchronizeDevices(const Topology* topology) {
+void CudaPlatform::forEachActiveDevice(
+    const Topology* topology, const char* log_tag,
+    const std::function<void(int device)>& on_device) {
     const std::vector<int> devices =
         topologyDeviceIndices(topology, Topology::MEM_CUDA);
-    if (devices.empty()) return Status::OK();
+    if (devices.empty()) return;
 
     int device_count = 0;
     cudaError_t err = cudaGetDeviceCount(&device_count);
     if (err != cudaSuccess || device_count <= 0) {
         if (err != cudaSuccess) {
-            LOG(WARNING) << "CudaPlatform::synchronizeDevices "
-                            "cudaGetDeviceCount failed: "
+            LOG(WARNING) << log_tag << " cudaGetDeviceCount failed: "
                          << cudaGetErrorString(err);
             (void)cudaGetLastError();
         }
-        return Status::OK();
+        return;
     }
 
     int saved = 0;
@@ -153,29 +154,43 @@ Status CudaPlatform::synchronizeDevices(const Topology* topology) {
         if (!cudaPrimaryContextIsActive(device)) continue;
         err = cudaSetDevice(device);
         if (err != cudaSuccess) {
-            LOG(WARNING) << "CudaPlatform::synchronizeDevices cudaSetDevice("
-                         << device << ") failed: " << cudaGetErrorString(err);
+            LOG(WARNING) << log_tag << " cudaSetDevice(" << device
+                         << ") failed: " << cudaGetErrorString(err);
             (void)cudaGetLastError();
             continue;
         }
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            LOG(WARNING)
-                << "CudaPlatform::synchronizeDevices cudaDeviceSynchronize "
-                   "device "
-                << device << " failed: " << cudaGetErrorString(err);
-            (void)cudaGetLastError();
-        }
+        on_device(device);
     }
     if (have_saved) {
         err = cudaSetDevice(saved);
         if (err != cudaSuccess) {
-            LOG(WARNING)
-                << "CudaPlatform::synchronizeDevices restore cudaSetDevice("
-                << saved << ") failed: " << cudaGetErrorString(err);
+            LOG(WARNING) << log_tag << " restore cudaSetDevice(" << saved
+                         << ") failed: " << cudaGetErrorString(err);
             (void)cudaGetLastError();
         }
+    } else if (ensureCudaDriverInit()) {
+        // cudaSetDevice binds a current context on this thread. Drop it so a
+        // notify poller that entered with none is not stuck on the last GPU.
+        const CUresult ctx_err = cuCtxSetCurrent(nullptr);
+        if (ctx_err != CUDA_SUCCESS) {
+            LOG(WARNING) << log_tag << " cuCtxSetCurrent(nullptr) failed: "
+                         << static_cast<int>(ctx_err);
+        }
     }
+}
+
+Status CudaPlatform::synchronizeDevices(const Topology* topology) {
+    forEachActiveDevice(
+        topology, "CudaPlatform::synchronizeDevices", [](int device) {
+            cudaError_t err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                LOG(WARNING)
+                    << "CudaPlatform::synchronizeDevices "
+                       "cudaDeviceSynchronize device "
+                    << device << " failed: " << cudaGetErrorString(err);
+                (void)cudaGetLastError();
+            }
+        });
     return Status::OK();
 }
 }  // namespace tent
