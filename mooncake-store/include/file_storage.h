@@ -8,6 +8,7 @@
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
+#include "thread_pool.h"
 
 namespace mooncake {
 
@@ -201,6 +202,57 @@ class FileStorage {
     tl::expected<void, ErrorCode> OffloadObjects(
         const std::vector<OffloadTaskItem>& offloading_objects);
 
+    // One bucket's share of an offload round. Produced on a write-pool
+    // worker and merged by OffloadObjects on the caller thread, so it carries
+    // everything the merge needs and touches no shared state itself.
+    struct BucketOffloadOutcome {
+        ErrorCode status = ErrorCode::OK;
+        // Keys this bucket drained from the master queue but did not persist.
+        // Reported back with the data_size=-1 sentinel so the master releases
+        // their offloading tasks and source-replica refcounts.
+        std::vector<OffloadTaskItem> failed_tasks;
+    };
+
+    /**
+     * @brief Persists one bucket of an offload round: stages its values into
+     *        host memory and hands them to the backend.
+     *
+     * Thread-safe: runs concurrently on the offload write pool, one call per
+     * bucket. It reads `task_by_storage_key` without mutating it and reaches
+     * shared state only through members that serialize their own access --
+     * the backend's BatchOffload, the pinned buffer pool, the ylt metric
+     * counters, and enable_offloading_ under offloading_mutex_.
+     *
+     * Latches offloading off on KEYS_ULTRA_LIMIT, as the serial loop did.
+     *
+     * @param keys Storage keys grouped into this bucket.
+     * @param task_by_storage_key Every drained task of the round, by storage
+     *        key; shared read-only across the concurrent calls.
+     * @return This bucket's status plus the tasks it could not persist. The
+     *         status is OK, a per-bucket soft error
+     *         (see IsPerBucketSoftOffloadError), or a hard error that
+     *         AggregateBucketOutcomes may turn into the round's verdict.
+     */
+    BucketOffloadOutcome OffloadOneBucket(
+        const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            task_by_storage_key);
+
+    /**
+     * @brief Reduces the buckets' statuses to the round's terminal error.
+     *
+     * Every bucket of a round runs, so unlike the serial loop's early break
+     * there can be several errors to choose between.
+     *
+     * @param outcomes One entry per bucket, in bucket order.
+     * @return OK when no bucket hit a whole-cycle error, including when some
+     *         hit only soft ones; KEYS_ULTRA_LIMIT if any bucket did, since
+     *         that is the one error that also disables offloading; otherwise
+     *         the first hard error in bucket order.
+     */
+    static ErrorCode AggregateBucketOutcomes(
+        const std::vector<BucketOffloadOutcome>& outcomes);
+
     /**
      * @brief Classifies a BatchOffload error as affecting only the current
      * bucket rather than the whole offload cycle.
@@ -316,6 +368,12 @@ class FileStorage {
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.
     bool uring_buffer_registered_ = false;
+    // Workers for the per-bucket writes of one offload round, sized by
+    // ResolveOffloadWriteConcurrency so the default is one write stream per
+    // disk. Long-lived rather than per-round: a round can hold thousands of
+    // buckets, and rebuilding the pool each round would churn threads for no
+    // gain.
+    std::unique_ptr<ThreadPool> offload_write_pool_;
     mutable Mutex client_buffer_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;

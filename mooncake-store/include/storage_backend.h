@@ -268,6 +268,12 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Buckets written to disk concurrently within one offload round.
+    // 0 = auto, meaning one write stream per disk; a negative value is
+    // rejected at parse time and stored as auto. Resolve it through
+    // ResolveOffloadWriteConcurrency rather than reading it directly.
+    int32_t offload_write_concurrency = 0;
+
     // DFS control-plane mode. Enabled for filesystem-mode distributed storage
     // and KVCS; other object stores use the regular offload control plane.
     bool enable_dfs = false;
@@ -303,6 +309,17 @@ struct StorageValueSpan {
     uint64_t object_size = 0;
     Slice slice;
 };
+
+// How many buckets of one offload round may be written concurrently: the
+// configured value when set, otherwise one write stream per disk. Never 0, so
+// the result is safe to use as a thread count. Derives the disk count from
+// storage_filepath for the reason ResolveOffloadDiskPaths documents.
+inline size_t ResolveOffloadWriteConcurrency(const FileStorageConfig& config) {
+    if (config.offload_write_concurrency > 0) {
+        return static_cast<size_t>(config.offload_write_concurrency);
+    }
+    return ResolveOffloadDiskPaths(config.storage_filepath).size();
+}
 
 class StorageBackendInterface {
    public:

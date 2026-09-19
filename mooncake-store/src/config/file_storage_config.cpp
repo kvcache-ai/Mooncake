@@ -90,6 +90,16 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
 
     config.storage_paths = ResolveOffloadDiskPaths(config.storage_filepath);
 
+    config.offload_write_concurrency =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_WRITE_CONCURRENCY,
+                        config.offload_write_concurrency);
+    if (config.offload_write_concurrency < 0) {
+        LOG(WARNING) << "MOONCAKE_OFFLOAD_WRITE_CONCURRENCY="
+                     << config.offload_write_concurrency
+                     << " is negative, using one write stream per disk";
+        config.offload_write_concurrency = 0;
+    }
+
     config.local_buffer_size =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES,
                         config.local_buffer_size);

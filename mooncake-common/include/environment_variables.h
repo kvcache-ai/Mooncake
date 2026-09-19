@@ -36,6 +36,7 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_USE_URING);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_USE_URING);
+    MC_DEFINE_ENV_VAR(int32_t, MOONCAKE_OFFLOAD_WRITE_CONCURRENCY);
 };
 
 struct FilePerKeyEnvironmentVariables {
