@@ -9,6 +9,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -90,6 +92,14 @@ class HipTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+    // Registered sub-range address → its hipMalloc base; base → live alias
+    // count. One IPC registration per base, removed by the last unregister.
+    std::unordered_map<uint64_t, uint64_t> registered_addr_to_base_;
+    std::unordered_map<uint64_t, size_t> registered_base_refs_;
+    // Addresses registerLocalMemory deliberately skipped (e.g. host memory
+    // left to other transports), distinguishing them from never-registered
+    // ones at unregister time.
+    std::unordered_set<uint64_t> skipped_addrs_;
 
     // Stream and event pools for async operations
     StreamPool stream_pool_;
