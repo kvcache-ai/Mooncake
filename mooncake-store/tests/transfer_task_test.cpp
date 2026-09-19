@@ -10,7 +10,10 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "types.h"
@@ -67,6 +70,34 @@ class TransferTaskTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 };
+
+TEST(TransferIntentTest, UsesStableNamedValues) {
+    EXPECT_EQ(static_cast<int>(TransferIntent::kUnspecified),
+              transfer_intent_values::kUnspecified);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kForegroundGet),
+              transfer_intent_values::kForegroundGet);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kBackgroundPrefetch),
+              transfer_intent_values::kBackgroundPrefetch);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kMigration),
+              transfer_intent_values::kMigration);
+}
+
+TEST(TransferIntentTest, ParsesLegacyIntegerValues) {
+    EXPECT_EQ(TransferIntentFromInt(0), TransferIntent::kUnspecified);
+    EXPECT_EQ(TransferIntentFromInt(1), TransferIntent::kForegroundGet);
+    EXPECT_EQ(TransferIntentFromInt(2), TransferIntent::kBackgroundPrefetch);
+    EXPECT_EQ(TransferIntentFromInt(3), TransferIntent::kMigration);
+    EXPECT_FALSE(TransferIntentFromInt(-1).has_value());
+    EXPECT_FALSE(TransferIntentFromInt(4).has_value());
+}
+
+TEST(TransferScatterApiTest, SubmitterOwnsScatterOperation) {
+    using ScatterRanges = std::vector<TransferEngine::ScatterTransferRange>;
+    static_assert(std::is_same_v<
+                  decltype(std::declval<TransferSubmitter&>().submitScatter(
+                      std::declval<const ScatterRanges&>())),
+                  StoreScatterTransferOperation>);
+}
 
 // Test MemcpyOperationState functionality
 TEST_F(TransferTaskTest, MemcpyOperationState) {
@@ -207,6 +238,74 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
     }
 }
 
+#ifdef USE_TENT
+TEST_F(TransferTaskTest, TransferSubmitterScatterUsesTentDataPath) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17934"), 0);
+    if (!engine.isUsingTent()) GTEST_SKIP() << "TENT is unavailable";
+
+    constexpr size_t kSize = 128;
+    std::vector<char> source(kSize, 'T'), destination(kSize, 0);
+    std::vector<size_t> offsets{0};
+    std::vector<size_t> lengths{kSize};
+    ASSERT_EQ(engine.registerLocalMemory(source.data(), kSize, "cpu:0"), 0);
+    ASSERT_EQ(engine.registerLocalMemory(destination.data(), kSize, "cpu:0"),
+              0);
+
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
+    auto operation = submitter.submitScatter(
+        {{.opcode = TransferRequest::READ,
+          .remote_segment = engine.getLocalIpAndPort(),
+          .remote_base_offset = reinterpret_cast<uintptr_t>(source.data()),
+          .remote_size = kSize,
+          .local_buffer = destination.data(),
+          .local_capacity = kSize,
+          .local_offsets = offsets,
+          .remote_offsets = offsets,
+          .lengths = lengths}},
+        TransferIntent::kForegroundGet);
+    ASSERT_TRUE(operation.wait().ok());
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(engine.freeEngine(), 0);
+}
+
+TEST_F(TransferTaskTest, TransferSubmitterScatterContainsCallbackFailure) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17935"), 0);
+    if (!engine.isUsingTent()) GTEST_SKIP() << "TENT is unavailable";
+
+    std::vector<char> source(8, 'T'), destination(8, 0);
+    std::vector<size_t> offsets{0};
+    std::vector<size_t> lengths{8};
+    ASSERT_EQ(engine.registerLocalMemory(source.data(), source.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(engine.registerLocalMemory(destination.data(), destination.size(),
+                                         "cpu:0"),
+              0);
+
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
+    auto operation = submitter.submitScatter(
+        {{.opcode = TransferRequest::READ,
+          .remote_segment = engine.getLocalIpAndPort(),
+          .remote_base_offset = reinterpret_cast<uintptr_t>(source.data()),
+          .remote_size = source.size(),
+          .local_buffer = destination.data(),
+          .local_capacity = destination.size(),
+          .local_offsets = offsets,
+          .remote_offsets = {},
+          .lengths = lengths,
+          .on_fragment_complete =
+              [](size_t, const Status&) {
+                  throw std::runtime_error("callback failure");
+              }}},
+        TransferIntent::kForegroundGet);
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_EQ(engine.freeEngine(), 0);
+}
+#endif
+
 #ifdef USE_CUDA
 TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedGpuBuffers) {
     int device_count = 0;
@@ -342,14 +441,16 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
         TransferSubmitter submitter(engine, backend, endpoint);
         auto future = submitter.submit_batch_get_offload_object(
             endpoint, keys, pointers, slices,
-            OffloadBufferAccess::kLocalAddress);
+            OffloadBufferAccess::kLocalAddress,
+            TransferIntent::kBackgroundPrefetch);
         ASSERT_TRUE(future);
         EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);
         EXPECT_EQ(future->get(), ErrorCode::OK);
         EXPECT_FALSE(submitter.submit_batch_get_offload_object(
             endpoint, keys, {std::numeric_limits<uint64_t>::max() - 7},
             {{"key", {{destination.data(), 16}}}},
-            OffloadBufferAccess::kLocalAddress));
+            OffloadBufferAccess::kLocalAddress,
+            TransferIntent::kBackgroundPrefetch));
     }
     EXPECT_EQ(destination, source);
 
@@ -357,7 +458,8 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
     std::shared_ptr<StorageBackend> backend;
     TransferSubmitter submitter(engine, backend, endpoint);
     EXPECT_FALSE(submitter.submit_batch_get_offload_object(
-        endpoint, keys, pointers, slices, OffloadBufferAccess::kLocalAddress));
+        endpoint, keys, pointers, slices, OffloadBufferAccess::kLocalAddress,
+        TransferIntent::kBackgroundPrefetch));
     EXPECT_EQ(engine.freeEngine(), 0);
 }
 
@@ -390,7 +492,8 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectCopiesPinnedHostToGpu) {
             {reinterpret_cast<uintptr_t>(static_cast<char*>(pinned_source) +
                                          kSourceOffset)},
             {{"gpu", {{gpu_destination, kSize}}}},
-            OffloadBufferAccess::kLocalAddress);
+            OffloadBufferAccess::kLocalAddress,
+            TransferIntent::kBackgroundPrefetch);
         ASSERT_TRUE(future);
         EXPECT_EQ(future->get(), ErrorCode::OK);
     }
@@ -463,7 +566,8 @@ TEST_F(TransferTaskTest, BatchWriteHonorsLocalMemcpySetting) {
         std::vector<std::vector<Slice>> slices{
             {{source.data(), source.size()}}};
         auto future =
-            submitter.submit_batch({replica}, slices, TransferRequest::WRITE);
+            submitter.submit_batch({replica}, slices, TransferRequest::WRITE,
+                                   TransferIntent::kUnspecified);
 
         ASSERT_TRUE(future);
         EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);

@@ -42,6 +42,28 @@ enum class OffloadBufferAccess {
     kLocalAddress,
 };
 
+enum class TransferIntent : int {
+    kUnspecified = transfer_intent_values::kUnspecified,
+    kForegroundGet = transfer_intent_values::kForegroundGet,
+    kBackgroundPrefetch = transfer_intent_values::kBackgroundPrefetch,
+    kMigration = transfer_intent_values::kMigration,
+};
+
+inline std::optional<TransferIntent> TransferIntentFromInt(int intent) {
+    switch (intent) {
+        case transfer_intent_values::kUnspecified:
+            return TransferIntent::kUnspecified;
+        case transfer_intent_values::kForegroundGet:
+            return TransferIntent::kForegroundGet;
+        case transfer_intent_values::kBackgroundPrefetch:
+            return TransferIntent::kBackgroundPrefetch;
+        case transfer_intent_values::kMigration:
+            return TransferIntent::kMigration;
+        default:
+            return std::nullopt;
+    }
+}
+
 /**
  * @brief Stream operator for TransferStrategy
  */
@@ -219,11 +241,12 @@ class TransferEngineOperationState : public OperationState {
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
         : engine_(engine),
+          tent_engine_(engine.getTentEngine().get()),
           batch_id_(batch_id),
           batch_size_(batch_size),
           start_ts_(getCurrentTimeInMilli()) {}
 
-    ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
+    ~TransferEngineOperationState();
 
     bool is_completed() override;
 
@@ -244,6 +267,7 @@ class TransferEngineOperationState : public OperationState {
     void set_result_internal(ErrorCode error_code);
 
     TransferEngine& engine_;
+    mooncake::tent::TransferEngine* tent_engine_;
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
@@ -292,6 +316,33 @@ class TransferFuture {
 
    private:
     std::shared_ptr<OperationState> state_;
+};
+
+/// Scatter transfer operation returned by TransferSubmitter::submitScatter().
+///
+/// Thread safety: NOT thread-safe. Only one thread may call wait(),
+/// waitFor(), or destroy this object at a time. The caller that received
+/// the operation from submitScatter() owns it for its entire lifetime.
+class StoreScatterTransferOperation {
+   public:
+    StoreScatterTransferOperation(StoreScatterTransferOperation&&) noexcept;
+    StoreScatterTransferOperation& operator=(
+        StoreScatterTransferOperation&&) noexcept;
+    ~StoreScatterTransferOperation();
+
+    StoreScatterTransferOperation(const StoreScatterTransferOperation&) =
+        delete;
+    StoreScatterTransferOperation& operator=(
+        const StoreScatterTransferOperation&) = delete;
+
+    Status wait();
+    Status waitFor(std::chrono::nanoseconds timeout);
+
+   private:
+    class Impl;
+    explicit StoreScatterTransferOperation(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+    friend class TransferSubmitter;
 };
 
 /**
@@ -552,10 +603,18 @@ class TransferSubmitter {
      * @return TransferFuture representing the async operation, or nullopt on
      * failure
      */
+    std::optional<TransferFuture> submit(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        TransferRequest::OpCode op_code, void* ptr = nullptr, size_t size = 0,
+        TransferIntent intent = TransferIntent::kUnspecified);
     std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
                                          std::vector<Slice>& slices,
                                          TransferRequest::OpCode op_code,
-                                         void* ptr = nullptr, size_t size = 0);
+                                         void* ptr, size_t size, int intent) {
+        auto parsed_intent = TransferIntentFromInt(intent);
+        if (!parsed_intent) return std::nullopt;
+        return submit(replica, slices, op_code, ptr, size, *parsed_intent);
+    }
 
     /**
      * @brief Submit a range read: read [src_offset, src_offset+size) from
@@ -563,19 +622,48 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitRangeRead(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        uint64_t src_offset);
+        uint64_t src_offset,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    std::optional<TransferFuture> submitRangeRead(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        uint64_t src_offset, int intent) {
+        auto parsed_intent = TransferIntentFromInt(intent);
+        if (!parsed_intent) return std::nullopt;
+        return submitRangeRead(replica, slices, src_offset, *parsed_intent);
+    }
 
     std::optional<TransferFuture> submitRangeWrite(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        uint64_t dst_offset);
+        uint64_t dst_offset,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    std::optional<TransferFuture> submitRangeWrite(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        uint64_t dst_offset, int intent) {
+        auto parsed_intent = TransferIntentFromInt(intent);
+        if (!parsed_intent) return std::nullopt;
+        return submitRangeWrite(replica, slices, dst_offset, *parsed_intent);
+    }
 
-    TransferEngine::ScatterTransferOperation submitScatter(
-        const std::vector<TransferEngine::ScatterTransferRange>& transfers);
+    StoreScatterTransferOperation submitScatter(
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    StoreScatterTransferOperation submitScatter(
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+        int intent);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    std::optional<TransferFuture> submit_batch(
+        const std::vector<Replica::Descriptor>& replicas,
+        std::vector<std::vector<Slice>>& all_slices,
+        TransferRequest::OpCode op_code, int intent) {
+        auto parsed_intent = TransferIntentFromInt(intent);
+        if (!parsed_intent) return std::nullopt;
+        return submit_batch(replicas, all_slices, op_code, *parsed_intent);
+    }
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
@@ -583,7 +671,21 @@ class TransferSubmitter {
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batched_slices,
-        OffloadBufferAccess buffer_access);
+        OffloadBufferAccess buffer_access,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    std::optional<TransferFuture> submit_batch_get_offload_object(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& pointers,
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batched_slices,
+        OffloadBufferAccess buffer_access, int intent) {
+        auto parsed_intent = TransferIntentFromInt(intent);
+        if (!parsed_intent) return std::nullopt;
+        return submit_batch_get_offload_object(transfer_engine_addr, keys,
+                                               pointers, batched_slices,
+                                               buffer_access, *parsed_intent);
+    }
 
     [[nodiscard]] bool canUseLocalMemcpy(const std::string& endpoint) const;
 
@@ -601,6 +703,7 @@ class TransferSubmitter {
 
    private:
     TransferEngine& engine_;
+    mooncake::tent::TransferEngine* tent_engine_ = nullptr;
     // Cached at construction: the local transport endpoint never changes for
     // the lifetime of the TransferSubmitter, so we avoid calling
     // engine_.getLocalIpAndPort() (which allocates a string) on every transfer.
@@ -659,15 +762,18 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
-        uint64_t src_offset = 0);
+        uint64_t src_offset = 0,
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     std::optional<TransferFuture> submitMemoryReadOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, uint64_t src_offset);
+        const std::vector<Slice>& slices, uint64_t src_offset,
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     std::optional<TransferFuture> submitMemoryWriteOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, uint64_t dst_offset);
+        const std::vector<Slice>& slices, uint64_t dst_offset,
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
@@ -680,7 +786,8 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests,
+        TransferIntent intent = TransferIntent::kUnspecified);
 };
 
 }  // namespace mooncake

@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <chrono>
 #include <cerrno>
@@ -17,6 +18,9 @@
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#ifdef USE_TENT
+#include "tent/transfer_engine.h"
+#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -153,6 +157,78 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 }
 #endif
 namespace mooncake {
+namespace {
+
+#ifdef USE_TENT
+int GetTentPositiveEnvOrDefault(const char* name, int default_value) {
+    const char* raw_value = std::getenv(name);
+    if (!raw_value || raw_value[0] == '\0') return default_value;
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    long parsed = std::strtol(raw_value, &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value || *end_ptr != '\0' || parsed <= 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+        LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
+                     << ", using default " << default_value;
+        return default_value;
+    }
+    return static_cast<int>(parsed);
+}
+
+std::optional<tent::Request::OpCode> ToTentOpCode(
+    TransferRequest::OpCode op_code) {
+    switch (op_code) {
+        case TransferRequest::READ:
+            return tent::Request::READ;
+        case TransferRequest::WRITE:
+            return tent::Request::WRITE;
+        default:
+            return std::nullopt;
+    }
+}
+
+// NOTE: This only handles TransferIntent values (0-3). The compat-layer
+// toTentIntent in transfer_engine.cpp also handles raw int values 4-6
+// (CHECKPOINT, WEIGHT_LOADING, STAGING_INTERNAL) for forward compatibility.
+std::optional<tent::IntentType> ToTentIntent(TransferIntent intent) {
+    switch (intent) {
+        case TransferIntent::kUnspecified:
+            return tent::IntentType::INTENT_UNSPEC;
+        case TransferIntent::kForegroundGet:
+            return tent::IntentType::FOREGROUND_GET;
+        case TransferIntent::kBackgroundPrefetch:
+            return tent::IntentType::BACKGROUND_PREFETCH;
+        case TransferIntent::kMigration:
+            return tent::IntentType::MIGRATION;
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<TransferStatusEnum> ToClassicTransferStatus(
+    tent::TransferStatusEnum status) {
+    switch (status) {
+        case tent::INITIAL:
+        case tent::PENDING:
+            return TransferStatusEnum::WAITING;
+        case tent::INVALID:
+            return TransferStatusEnum::INVALID;
+        case tent::CANCELED:
+            return TransferStatusEnum::CANCELED;
+        case tent::COMPLETED:
+            return TransferStatusEnum::COMPLETED;
+        case tent::TIMEOUT:
+            return TransferStatusEnum::TIMEOUT;
+        case tent::FAILED:
+            return TransferStatusEnum::FAILED;
+        default:
+            return std::nullopt;
+    }
+}
+#endif
+
+}  // namespace
 
 #ifdef USE_NOF
 SpdkNofQos::SpdkNofQos(uint32_t block_size) {
@@ -723,6 +799,15 @@ void MemcpyWorkerPool::workerThread() {
 // TransferEngineOperationState Implementation
 // ============================================================================
 
+TransferEngineOperationState::~TransferEngineOperationState() {
+#ifdef USE_TENT
+    if (tent_engine_)
+        tent_engine_->freeBatch(batch_id_);
+    else
+#endif
+        engine_.freeBatchID(batch_id_);
+}
+
 bool TransferEngineOperationState::is_completed() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (result_.has_value()) {
@@ -744,13 +829,41 @@ void TransferEngineOperationState::check_task_status() {
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
-        Status s = engine_.getTransferStatus(batch_id_, i, status);
-        if (!s.ok()) {
-            LOG(ERROR) << "Failed to get transfer status for batch "
-                       << batch_id_ << " task " << i << " with error "
-                       << s.message();
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+        Status s;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::TransferStatus tent_status;
+            auto tent_s =
+                tent_engine_->getTransferStatus(batch_id_, i, tent_status);
+            if (!tent_s.ok()) {
+                LOG(ERROR) << "Failed to get transfer status for batch "
+                           << batch_id_ << " task " << i << " with error "
+                           << tent_s.message();
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            auto classic_status = ToClassicTransferStatus(tent_status.s);
+            if (!classic_status) {
+                LOG(ERROR) << "Unknown TENT transfer status for batch "
+                           << batch_id_ << " task " << i << " with status "
+                           << static_cast<int>(tent_status.s);
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            status.s = *classic_status;
+            status.transferred_bytes = tent_status.transferred_bytes;
+            s = Status::OK();
+        } else
+#endif
+        {
+            s = engine_.getTransferStatus(batch_id_, i, status);
+            if (!s.ok()) {
+                LOG(ERROR) << "Failed to get transfer status for batch "
+                           << batch_id_ << " task " << i << " with error "
+                           << s.message();
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
         }
 
         switch (status.s) {
@@ -824,7 +937,6 @@ void TransferEngineOperationState::wait_for_completion() {
     if (!engine_.isUsingTent()) {
         VLOG(1) << "Waiting for transfer engine completion for batch "
                 << batch_id_;
-
         // Wait directly on BatchDesc's condition variable.
         auto& batch_desc = Transport::toBatchDesc(batch_id_);
         bool completed;
@@ -859,16 +971,13 @@ void TransferEngineOperationState::wait_for_completion() {
         if (completed) {
             failed = batch_desc.has_failure.load(std::memory_order_relaxed);
         }
-
         ErrorCode error_code =
             completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
                       : ErrorCode::TRANSFER_FAIL;
-
         {
             std::lock_guard<std::mutex> lock(mutex_);
             set_result_internal(error_code);
         }
-
         if (completed) {
             VLOG(1) << "Transfer engine operation completed for batch "
                     << batch_id_
@@ -943,6 +1052,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      TransferMetric* transfer_metric,
                                      int numa_socket_id)
     : engine_(engine),
+      tent_engine_(engine.getTentEngine().get()),
       local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
 #ifdef USE_NOF
@@ -972,7 +1082,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code, void* ptr, size_t size) {
+    TransferRequest::OpCode op_code, void* ptr, size_t size,
+    TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -984,7 +1095,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         if (op_code == TransferRequest::READ) {
-            future = submitMemoryReadOperation(handle, slices, 0);
+            future = submitMemoryReadOperation(handle, slices, 0, intent);
         } else {
             TransferStrategy strategy = selectStrategy(handle, slices);
 
@@ -993,8 +1104,8 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE:
-                    future =
-                        submitTransferEngineOperation(handle, slices, op_code);
+                    future = submitTransferEngineOperation(handle, slices,
+                                                           op_code, 0, intent);
                     break;
                 default:
                     LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -1030,7 +1141,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code, TransferIntent intent) {
     if (replicas.size() != all_slices.size()) {
         LOG(ERROR) << "Mismatched replicas and slice lists";
         return std::nullopt;
@@ -1070,11 +1181,27 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             continue;
         }
         uint64_t offset = 0;
-        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment "
-                       << handle.transport_endpoint_;
-            return std::nullopt;
+        SegmentHandle seg = 0;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::SegmentID seg_id;
+            auto status =
+                tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
+            if (!status.ok()) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
+            seg = seg_id;
+        } else
+#endif
+        {
+            seg = engine_.openSegment(handle.transport_endpoint_);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
         }
         for (const auto& slice : slices) {
             TransferRequest request;
@@ -1089,7 +1216,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     }
     auto future = use_local_memcpy
                       ? submitMemcpyOperations(std::move(memcpy_operations))
-                      : submitTransfer(requests);
+                      : submitTransfer(requests, intent);
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1099,9 +1226,394 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     return future;
 }
 
-TransferEngine::ScatterTransferOperation TransferSubmitter::submitScatter(
-    const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
-    return engine_.submitScatter(transfers);
+class StoreScatterTransferOperation::Impl {
+   public:
+    explicit Impl(TransferEngine::ScatterTransferOperation operation)
+        : classic_operation_(std::move(operation)) {}
+
+    explicit Impl(Status status)
+        : aggregate_status_(std::move(status)), completed_(true) {}
+
+#ifdef USE_TENT
+    Impl(std::shared_ptr<tent::TransferEngine> engine,
+         const std::vector<TransferEngine::ScatterTransferRange>& ranges,
+         TransferIntent intent)
+        : tent_engine_(std::move(engine)) {
+        build(ranges, intent);
+    }
+#endif
+    ~Impl() {
+        if (classic_operation_) {
+            classic_operation_->wait();
+            return;
+        }
+#ifdef USE_TENT
+        if (completed_) {
+            retryCloseSegments();
+            return;
+        }
+        // Destructor path: use a shorter timeout than wait() to avoid
+        // blocking too long when the caller didn't explicitly wait.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                                  "MC_TENT_DESTRUCTOR_TIMEOUT_S", 5));
+        while (!completed_ && std::chrono::steady_clock::now() < deadline) {
+            poll();
+            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+        }
+        if (!completed_) forceCleanup();
+#endif
+    }
+
+    Status wait() {
+        if (classic_operation_) return classic_operation_->wait();
+#ifdef USE_TENT
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                                  "MC_TENT_TRANSFER_TIMEOUT_S", 60));
+        while (!completed_) {
+            poll();
+            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+            if (!completed_ && std::chrono::steady_clock::now() >= deadline) {
+                requestAbort(Status::Socket("TENT scatter transfer timed out"));
+                const auto cleanup_deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                        "MC_TENT_CANCEL_GRACE_S", 1));
+                while (!completed_ &&
+                       std::chrono::steady_clock::now() < cleanup_deadline) {
+                    poll();
+                    if (!completed_) std::this_thread::sleep_for(kPollInterval);
+                }
+                if (!completed_) forceCleanup();
+            }
+        }
+#endif
+        return aggregate_status_;
+    }
+
+    Status waitFor(std::chrono::nanoseconds timeout) {
+        if (classic_operation_) return classic_operation_->waitFor(timeout);
+#ifdef USE_TENT
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!completed_) {
+            poll();
+            if (completed_) break;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                requestAbort(Status::Clock("scatter transfer wait timed out"));
+                return aggregate_status_;
+            }
+            std::this_thread::sleep_for(kPollInterval);
+        }
+#else
+        (void)timeout;
+#endif
+        return aggregate_status_;
+    }
+
+   private:
+    static constexpr auto kPollInterval = std::chrono::microseconds(10);
+
+#ifdef USE_TENT
+    void remember(const Status& status) {
+        if (aggregate_status_.ok() && !status.ok()) aggregate_status_ = status;
+    }
+
+    void complete(size_t index, const Status& status) {
+        if (done_[index]) return;
+        done_[index] = true;
+        remember(status);
+        const auto [range_index, fragment_index] = request_fragments_[index];
+        if (callbacks_[range_index]) {
+            try {
+                callbacks_[range_index](fragment_index, status);
+            } catch (...) {
+                remember(Status::Context("scatter transfer callback failed"));
+            }
+        }
+    }
+
+    void retryCloseSegments() {
+        for (int attempt = 0; attempt < 3 && !segments_.empty(); ++attempt) {
+            for (auto it = segments_.begin(); it != segments_.end();) {
+                auto status = tent_engine_->closeSegment(it->second);
+                if (status.ok()) {
+                    it = segments_.erase(it);
+                } else {
+                    remember(Status::Context(status.ToString()));
+                    ++it;
+                }
+            }
+            if (!segments_.empty())
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    void finish() {
+        retryCloseSegments();
+        completed_ = true;
+    }
+
+    void failPending(const Status& status) {
+        for (size_t i = 0; i < done_.size(); ++i) complete(i, status);
+    }
+
+    void requestAbort(const Status& status) {
+        remember(status);
+        if (abort_requested_ || batch_id_ == 0) return;
+        abort_requested_ = true;
+        abort_deadline_ = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                              "MC_TENT_CANCEL_GRACE_S", 1));
+        for (size_t task = 0; task < tent_requests_.size(); ++task) {
+            const size_t index = native_indexes_[task];
+            if (done_[index]) continue;
+            auto cancel_status = tent_engine_->cancelTransfer(batch_id_, task);
+            if (!cancel_status.ok() && !cancel_status.IsNotImplemented())
+                remember(Status::Context(cancel_status.ToString()));
+        }
+    }
+
+    void forceCleanup() {
+        failPending(Status::Socket("TENT scatter transfer cleanup timed out"));
+        if (batch_id_ != 0) tent_engine_->freeBatch(batch_id_);
+        batch_id_ = 0;
+        finish();
+    }
+
+    void build(const std::vector<TransferEngine::ScatterTransferRange>& ranges,
+               TransferIntent intent) {
+        auto default_intent = ToTentIntent(intent);
+        if (!default_intent) {
+            aggregate_status_ =
+                Status::InvalidArgument("invalid TENT scatter transfer intent");
+            completed_ = true;
+            return;
+        }
+        std::map<std::string, tent::SegmentID> segment_ids;
+        for (size_t range_index = 0; range_index < ranges.size();
+             ++range_index) {
+            const auto& range = ranges[range_index];
+            callbacks_.push_back(range.on_fragment_complete);
+            const size_t count = range.local_offsets.size();
+            if (range.remote_offsets.size() != count ||
+                range.lengths.size() != count ||
+                range.local_buffer == nullptr || range.remote_segment.empty()) {
+                const auto error =
+                    Status::InvalidArgument("invalid scatter transfer range");
+                for (size_t i = 0; i < count; ++i) {
+                    request_fragments_.emplace_back(range_index, i);
+                    done_.push_back(false);
+                    complete(done_.size() - 1, error);
+                }
+                continue;
+            }
+            auto segment_it = segment_ids.find(range.remote_segment);
+            if (segment_it == segment_ids.end()) {
+                tent::SegmentID segment_id;
+                auto status =
+                    tent_engine_->openSegment(segment_id, range.remote_segment);
+                if (!status.ok()) {
+                    const auto error = Status::Context(status.ToString());
+                    for (size_t i = 0; i < count; ++i) {
+                        request_fragments_.emplace_back(range_index, i);
+                        done_.push_back(false);
+                        complete(done_.size() - 1, error);
+                    }
+                    continue;
+                }
+                segment_it =
+                    segment_ids.emplace(range.remote_segment, segment_id).first;
+                segments_.emplace_back(range.remote_segment, segment_id);
+            }
+            for (size_t fragment = 0; fragment < count; ++fragment) {
+                const size_t length = range.lengths[fragment];
+                const size_t local_offset = range.local_offsets[fragment];
+                const size_t remote_offset = range.remote_offsets[fragment];
+                const bool valid =
+                    local_offset <= range.local_capacity &&
+                    length <= range.local_capacity - local_offset &&
+                    remote_offset <= range.remote_size &&
+                    length <= range.remote_size - remote_offset &&
+                    range.remote_base_offset <=
+                        std::numeric_limits<uint64_t>::max() - remote_offset &&
+                    length <= std::numeric_limits<uint64_t>::max() -
+                                  (range.remote_base_offset + remote_offset);
+                request_fragments_.emplace_back(range_index, fragment);
+                done_.push_back(false);
+                if (!valid) {
+                    complete(done_.size() - 1,
+                             Status::InvalidArgument(
+                                 "invalid scatter transfer fragment"));
+                    continue;
+                }
+                if (length == 0) {
+                    complete(done_.size() - 1, Status::OK());
+                    continue;
+                }
+                auto opcode = ToTentOpCode(range.opcode);
+                auto request_intent =
+                    ToTentIntent(range.intent_type == 0
+                                     ? intent
+                                     : TransferIntentFromInt(range.intent_type)
+                                           .value_or(intent));
+                if (!opcode || !request_intent) {
+                    complete(done_.size() - 1,
+                             Status::InvalidArgument(
+                                 "invalid TENT scatter transfer request"));
+                    continue;
+                }
+                tent::Request request;
+                request.opcode = *opcode;
+                request.source =
+                    static_cast<char*>(range.local_buffer) + local_offset;
+                request.target_id = segment_it->second;
+                request.target_offset =
+                    range.remote_base_offset + remote_offset;
+                request.length = length;
+                request.intent_type = *request_intent;
+                // transport_hint left at default (0 = auto-select);
+                // ScatterTransferRange does not carry per-fragment hints.
+                tent_requests_.push_back(request);
+                native_indexes_.push_back(done_.size() - 1);
+            }
+        }
+        if (tent_requests_.empty()) {
+            finish();
+            return;
+        }
+        batch_id_ = tent_engine_->allocateBatch(tent_requests_.size());
+        if (batch_id_ == 0) {
+            failPending(Status::InvalidArgument(
+                "failed to allocate TENT scatter transfer batch"));
+            finish();
+            return;
+        }
+        auto status = tent_engine_->submitTransfer(batch_id_, tent_requests_);
+        if (!status.ok()) {
+            failPending(Status::Context(status.ToString()));
+            tent_engine_->freeBatch(batch_id_);
+            batch_id_ = 0;
+            finish();
+            return;
+        }
+        remaining_ = tent_requests_.size();
+    }
+
+    void poll() {
+        for (size_t task = 0; task < tent_requests_.size(); ++task) {
+            const size_t index = native_indexes_[task];
+            if (done_[index]) continue;
+            tent::TransferStatus transfer_status;
+            auto status = tent_engine_->getTransferStatus(batch_id_, task,
+                                                          transfer_status);
+            if (!status.ok()) {
+                requestAbort(Status::Context(status.ToString()));
+                if (!abort_requested_ ||
+                    std::chrono::steady_clock::now() >= abort_deadline_) {
+                    complete(index, Status::Context(status.ToString()));
+                    assert(remaining_ > 0);
+                    --remaining_;
+                }
+                continue;
+            } else {
+                auto state = ToClassicTransferStatus(transfer_status.s);
+                if (!state) {
+                    complete(
+                        index,
+                        Status::Socket("unknown TENT scatter transfer status"));
+                    --remaining_;
+                    continue;
+                }
+                if (*state == TransferStatusEnum::WAITING) continue;
+                complete(index, *state == TransferStatusEnum::COMPLETED
+                                    ? Status::OK()
+                                    : Status::Socket(
+                                          "scatter transfer fragment failed"));
+            }
+            assert(remaining_ > 0);
+            --remaining_;
+        }
+        if (remaining_ != 0) return;
+        auto status = tent_engine_->freeBatch(batch_id_);
+        remember(status.ok() ? Status::OK()
+                             : Status::Context(status.ToString()));
+        batch_id_ = 0;
+        finish();
+    }
+#endif
+
+    std::optional<TransferEngine::ScatterTransferOperation> classic_operation_;
+    Status aggregate_status_;
+    bool completed_ = false;
+#ifdef USE_TENT
+    std::shared_ptr<tent::TransferEngine> tent_engine_;
+    std::vector<tent::Request> tent_requests_;
+    std::vector<size_t> native_indexes_;
+    std::vector<std::pair<size_t, size_t>> request_fragments_;
+    std::vector<std::function<void(size_t, const Status&)>> callbacks_;
+    std::vector<uint8_t> done_;
+    std::vector<std::pair<std::string, tent::SegmentID>> segments_;
+    BatchID batch_id_ = 0;
+    size_t remaining_ = 0;
+    bool abort_requested_ = false;
+    std::chrono::steady_clock::time_point abort_deadline_ =
+        std::chrono::steady_clock::time_point::max();
+#endif
+};
+
+StoreScatterTransferOperation::StoreScatterTransferOperation(
+    std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+StoreScatterTransferOperation::StoreScatterTransferOperation(
+    StoreScatterTransferOperation&&) noexcept = default;
+
+StoreScatterTransferOperation& StoreScatterTransferOperation::operator=(
+    StoreScatterTransferOperation&&) noexcept = default;
+
+StoreScatterTransferOperation::~StoreScatterTransferOperation() = default;
+
+Status StoreScatterTransferOperation::wait() {
+    return impl_
+               ? impl_->wait()
+               : Status::InvalidArgument("invalid scatter transfer operation");
+}
+
+Status StoreScatterTransferOperation::waitFor(
+    std::chrono::nanoseconds timeout) {
+    return impl_
+               ? impl_->waitFor(timeout)
+               : Status::InvalidArgument("invalid scatter transfer operation");
+}
+
+StoreScatterTransferOperation TransferSubmitter::submitScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    TransferIntent intent) {
+#ifdef USE_TENT
+    if (tent_engine_) {
+        return StoreScatterTransferOperation(
+            std::make_unique<StoreScatterTransferOperation::Impl>(
+                engine_.getTentEngine(), transfers, intent));
+    }
+#else
+    (void)intent;
+#endif
+    return StoreScatterTransferOperation(
+        std::make_unique<StoreScatterTransferOperation::Impl>(
+            engine_.submitScatter(transfers)));
+}
+
+StoreScatterTransferOperation TransferSubmitter::submitScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    int intent) {
+    auto parsed_intent = TransferIntentFromInt(intent);
+    if (!parsed_intent) {
+        return StoreScatterTransferOperation(
+            std::make_unique<StoreScatterTransferOperation::Impl>(
+                Status::InvalidArgument("invalid transfer intent")));
+    }
+    return submitScatter(transfers, *parsed_intent);
 }
 
 std::optional<TransferFuture>
@@ -1109,7 +1621,7 @@ TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
-    OffloadBufferAccess buffer_access) {
+    OffloadBufferAccess buffer_access, TransferIntent intent) {
     if (keys.size() != pointers.size()) {
         LOG(ERROR) << "Mismatched offload transfer argument counts";
         return std::nullopt;
@@ -1129,10 +1641,24 @@ TransferSubmitter::submit_batch_get_offload_object(
     SegmentHandle seg = 0;
     if (!use_local_memcpy) {
         // Open once: all keys share the same transfer endpoint.
-        seg = engine_.openSegment(transfer_engine_addr);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
-            return std::nullopt;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::SegmentID seg_id;
+            auto status =
+                tent_engine_->openSegment(seg_id, transfer_engine_addr);
+            if (!status.ok()) {
+                LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+                return std::nullopt;
+            }
+            seg = seg_id;
+        } else
+#endif
+        {
+            seg = engine_.openSegment(transfer_engine_addr);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+                return std::nullopt;
+            }
         }
     }
 
@@ -1169,7 +1695,7 @@ TransferSubmitter::submit_batch_get_offload_object(
         }
     }
     return use_local_memcpy ? submitMemcpyOperations(std::move(operations))
-                            : submitTransfer(requests);
+                            : submitTransfer(requests, intent);
 }
 
 void TransferSubmitter::appendMemcpyOperations(
@@ -1219,34 +1745,71 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
-    // Allocate batch ID
+    std::vector<TransferRequest>& requests, TransferIntent intent) {
     const size_t batch_size = requests.size();
-    BatchID batch_id = engine_.allocateBatchID(batch_size);
-    if (batch_id == INVALID_BATCH_ID) {
-        LOG(ERROR) << "Failed to allocate batch ID";
-        return std::nullopt;
+
+    BatchID batch_id = INVALID_BATCH_ID;
+    Status s;
+
+#ifdef USE_TENT
+    if (tent_engine_) {
+        batch_id = tent_engine_->allocateBatch(batch_size);
+        if (batch_id == 0) {
+            LOG(ERROR) << "Failed to allocate batch ID";
+            return std::nullopt;
+        }
+        std::vector<tent::Request> tent_reqs;
+        tent_reqs.reserve(requests.size());
+        auto tent_intent = ToTentIntent(intent);
+        if (!tent_intent) {
+            LOG(ERROR) << "Invalid TENT transfer intent: "
+                       << static_cast<int>(intent);
+            tent_engine_->freeBatch(batch_id);
+            return std::nullopt;
+        }
+        for (auto& r : requests) {
+            auto tent_opcode = ToTentOpCode(r.opcode);
+            if (!tent_opcode) {
+                LOG(ERROR) << "Invalid TENT transfer opcode: "
+                           << static_cast<int>(r.opcode);
+                tent_engine_->freeBatch(batch_id);
+                return std::nullopt;
+            }
+            tent::Request tr;
+            tr.opcode = *tent_opcode;
+            tr.source = r.source;
+            tr.target_id = r.target_id;
+            tr.target_offset = r.target_offset;
+            tr.length = r.length;
+            tr.transport_hint =
+                mooncake::tent::c_to_transport_hint(r.transport_hint);
+            tr.intent_type = *tent_intent;
+            tent_reqs.push_back(tr);
+        }
+        auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
+        if (!tent_status.ok()) {
+            LOG(ERROR) << "Failed to submit all transfers, error: "
+                       << tent_status.ToString();
+            tent_engine_->freeBatch(batch_id);
+            return std::nullopt;
+        }
+    } else
+#endif
+    {
+        batch_id = engine_.allocateBatchID(batch_size);
+        if (batch_id == INVALID_BATCH_ID) {
+            LOG(ERROR) << "Failed to allocate batch ID";
+            return std::nullopt;
+        }
+        s = engine_.submitTransfer(batch_id, requests);
+        if (!s.ok()) {
+            LOG(ERROR) << "Failed to submit all transfers, error code is "
+                       << s.code();
+            engine_.freeBatchID(batch_id);
+            return std::nullopt;
+        }
     }
 
-    // Submit transfer
-    Status s = engine_.submitTransfer(batch_id, requests);
-    if (!s.ok()) {
-        LOG(ERROR) << "Failed to submit all transfers, error code is "
-                   << s.code();
-        // Note: batch_id will be freed by TransferEngineOperationState
-        // destructor if we create the state object, otherwise we need to free
-        // it here
-        engine_.freeBatchID(batch_id);
-        return std::nullopt;
-    }
-
-    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
-        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
-        return std::nullopt;
-    }
-
-    // Create state with transfer engine context - no polling thread
-    // needed
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, batch_id, batch_size);
 
@@ -1255,18 +1818,34 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code, uint64_t src_offset) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset,
+    TransferIntent intent) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
         return std::nullopt;
     }
-    SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-
-    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-        LOG(ERROR) << "Failed to open segment for endpoint='"
-                   << handle.transport_endpoint_ << "'";
-        return std::nullopt;
+    SegmentHandle seg = 0;
+#ifdef USE_TENT
+    if (tent_engine_) {
+        tent::SegmentID seg_id;
+        auto status =
+            tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
+        seg = seg_id;
+    } else
+#endif
+    {
+        seg = engine_.openSegment(handle.transport_endpoint_);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
     }
 
     // Create transfer requests
@@ -1289,12 +1868,12 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    return submitTransfer(requests, intent);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, TransferIntent intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1302,8 +1881,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
                                      src_offset);
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
-        return submitTransferEngineOperation(handle, slices,
-                                             TransferRequest::READ, src_offset);
+        return submitTransferEngineOperation(
+            handle, slices, TransferRequest::READ, src_offset, intent);
     }
 
     LOG(ERROR) << "Read only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
@@ -1313,7 +1892,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t dst_offset) {
+    uint64_t dst_offset, TransferIntent intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1322,7 +1901,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
         return submitTransferEngineOperation(
-            handle, slices, TransferRequest::WRITE, dst_offset);
+            handle, slices, TransferRequest::WRITE, dst_offset, intent);
     }
 
     LOG(ERROR) << "Write only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
@@ -1332,7 +1911,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1349,7 +1928,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
             return std::nullopt;
         }
 
-        future = submitMemoryReadOperation(handle, slices, src_offset);
+        future = submitMemoryReadOperation(handle, slices, src_offset, intent);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range read not supported for NoF replicas";
         return std::nullopt;
@@ -1368,7 +1947,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
 std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t dst_offset) {
+    uint64_t dst_offset, TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1385,7 +1964,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
             return std::nullopt;
         }
 
-        future = submitMemoryWriteOperation(handle, slices, dst_offset);
+        future = submitMemoryWriteOperation(handle, slices, dst_offset, intent);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range write not supported for NoF replicas";
         return std::nullopt;

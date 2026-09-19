@@ -164,6 +164,8 @@ add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 if(USE_TENT)
+  target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
+  target_link_libraries(transfer_task_test PRIVATE tent)
   add_test(
     NAME transfer_task_tent_completion_test
     COMMAND transfer_task_test
@@ -182,16 +184,24 @@ endif()
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(transfer_task_test PRIVATE USE_CUDA)
-  if(USE_TENT)
-    add_test(
-      NAME transfer_scatter_tent_test
-      COMMAND
-        transfer_task_test
-        --gtest_filter=TransferTaskTest.TransferScatterWritesGpuDestinationDirectly
-    )
-    set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                               "MC_USE_TENT=1")
-  endif()
+endif()
+if(USE_TENT)
+  add_test(
+    NAME transfer_scatter_tent_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
+  )
+  set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
+                                                           "MC_USE_TENT=1")
+  add_test(
+    NAME transfer_submitter_scatter_tent_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
+  )
+  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
+                       ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
