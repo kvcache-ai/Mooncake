@@ -252,6 +252,78 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
               "rdma");
 }
 
+TEST(TransferEngineAscendTransportTest, AscendHintsSelectAscendTransport) {
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    EXPECT_TRUE(shouldInstallAscendTransport(""));
+    EXPECT_TRUE(shouldInstallAscendTransport("ascend"));
+    EXPECT_TRUE(shouldInstallAscendTransport("ascend_direct"));
+#else
+    EXPECT_FALSE(shouldInstallAscendTransport(""));
+    EXPECT_FALSE(shouldInstallAscendTransport("ascend"));
+#endif
+}
+
+TEST(TransferEngineAscendTransportTest, HostHintsKeepHostTransportPath) {
+#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
+    // HCCL builds always install Ascend, whatever the hint names.
+    EXPECT_TRUE(shouldInstallAscendTransport("rdma"));
+    EXPECT_TRUE(shouldInstallAscendTransport("tcp"));
+#else
+    EXPECT_FALSE(shouldInstallAscendTransport("rdma"));
+    EXPECT_FALSE(shouldInstallAscendTransport("tcp"));
+#endif
+}
+
+TEST(TransferEngineAscendTransportTest, ProtocolHintMergeKeepsStoredProtocol) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "rdma"});
+
+    // Store configures the protocol before init(); an omitted one must not
+    // wipe it, while an explicit one wins.
+    engine.applyProtocolHint("");
+    auto config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_EQ(config.protocol, "rdma");
+
+    engine.applyProtocolHint("ascend");
+    config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_EQ(config.protocol, "ascend");
+
+#if !defined(USE_EFA)
+    // "efa" is dropped instead of being handed to auto-discovery, which could
+    // only fail on a build without the EFA transport.
+    engine.applyProtocolHint("efa");
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverConfig(engine).protocol,
+              "ascend");
+#endif
+}
+
+TEST(TransferEngineAscendTransportTest, InitProtocolHintReachesEngine) {
+    TransferEngine engine(/*auto_discover=*/false);
+
+    // The hint is recorded before init() picks a transport, so the assertion
+    // holds whatever init() returns on this host.
+    (void)engine.init(P2PHANDSHAKE, "127.0.0.1:18465", "", 0, "rdma");
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    const auto config = TransferEngineImplTestPeer::autoDiscoverConfig(impl);
+    EXPECT_FALSE(config.enabled);
+    EXPECT_EQ(config.protocol, "rdma");
+}
+
+#if defined(USE_ASCEND_DIRECT)
+TEST(TransferEngineAscendTransportTest, RdmaHintNeverInstallsAscendDirect) {
+    TransferEngine engine(/*auto_discover=*/false);
+
+    // End to end over the public API: with discovery off, the hint alone
+    // decides and no host transport is installed here; that is the caller's
+    // job, the way Store does it. An "rdma" hint never selects Ascend Direct,
+    // which the pre-fix code did and which fails the install without an NPU.
+    EXPECT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:18463", "", 0, "rdma"), 0);
+    EXPECT_EQ(engine.getTransport("ascend"), nullptr);
+}
+#endif
+
 #ifdef USE_TENT
 // RDMA is left enabled and TCP disabled so a regression that drops forceTcp()
 // still comes up with RDMA selected. forceTcp() must flip both flags.
