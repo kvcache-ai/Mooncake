@@ -101,6 +101,7 @@ struct MasterConfig {
     std::string rpc_interface;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
+    uint32_t heartbeat_rpc_port = 0;
 
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
