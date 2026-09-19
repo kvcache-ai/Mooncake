@@ -70,6 +70,8 @@ struct MasterSnapshotPayloads;
 
 class EtcdOpLogStore;
 class DfsGlobalAllocator;
+class DfsAllocatorInterface;
+class ImmutableBucketAllocator;
 
 // Forward declarations
 class AllocationStrategy;
@@ -1454,7 +1456,8 @@ class MasterService {
     // before the old metadata is removed.
     auto AllocateReplicas(const std::string& key, uint64_t value_length,
                           const ReplicateConfig& config,
-                          const std::string& writer_host_id)
+                          const std::string& writer_host_id,
+                          bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
@@ -1479,7 +1482,8 @@ class MasterService {
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
-            committed_soft_pin_timeout = std::nullopt)
+            committed_soft_pin_timeout = std::nullopt,
+        bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -1491,6 +1495,10 @@ class MasterService {
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
+    void RunShardDfsEviction();
+    void RunBucketDfsEviction();
+    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -2178,7 +2186,9 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
+    std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
+    DfsGlobalAllocator* shard_allocator_{nullptr};
+    ImmutableBucketAllocator* bucket_allocator_{nullptr};
 
     // Segment management
     SegmentManager segment_manager_;
