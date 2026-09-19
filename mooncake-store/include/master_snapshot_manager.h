@@ -45,9 +45,9 @@ struct MasterSnapshotManagerOptions {
  * timeout handling, payload upload, catalog publish, retention cleanup, and
  * snapshot metrics updates.
  *
- * This is a behavior-preserving refactor that moves snapshot orchestration
- * logic out of MasterService without changing snapshot format, restore
- * behavior, storage layout, flags, or locking semantics.
+ * Snapshot format, restore behavior, storage layout, flags, and locking
+ * semantics are unchanged; shutdown additionally interrupts an in-flight
+ * snapshot child so the manager can terminate promptly.
  */
 class MasterSnapshotManager {
     friend class test::MasterServiceSnapshotTestBase;  // Allow test access to
@@ -72,6 +72,8 @@ class MasterSnapshotManager {
     void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
                               int log_pipe_fd);
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
+    void TerminateSnapshotChild(pid_t pid, const std::string& snapshot_id,
+                                const char* reason);
     void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
 
     tl::expected<void, SerializationError> PersistState(
