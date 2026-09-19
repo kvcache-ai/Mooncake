@@ -213,6 +213,8 @@ add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
 add_store_test(hugepage_config_test hugepage_config_test.cpp)
+add_store_test(shm_spdk_registration_config_test
+               shm_spdk_registration_config_test.cpp)
 add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
 add_store_test(random_test random_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)

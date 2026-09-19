@@ -93,6 +93,11 @@ struct HugepageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_HUGEPAGE_SIZE);
 };
 
+struct ShmSpdkRegistrationEnvironmentVariables {
+    // The registration opt-in is enabled only by the exact string "1".
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_REGISTER_SPDK);
+};
+
 struct LocalHotCacheEnvironmentVariables {
     // Keep these values as strings to preserve their existing per-setting
     // parsing, fallback, and logging behavior.
