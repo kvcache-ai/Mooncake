@@ -22,14 +22,17 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <future>
 #include <iomanip>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 
 #include "multi_transport.h"
@@ -1084,6 +1087,95 @@ TEST_F(TransportTest, BatchCleanupRunsAfterBeforeDeleteCallback) {
     ASSERT_TRUE(status.ok());
     EXPECT_TRUE(cleanup_observed_callback);
 }
+
+#ifdef USE_TCP
+TEST_F(TransportTest, TcpScatterCombinesRequestsIntoOneTask) {
+    constexpr size_t kRequestCount = 256;
+    constexpr size_t kRequestBytes = 128;
+    constexpr size_t kBytes = kRequestCount * kRequestBytes;
+    // Keep request metadata and buffers alive until after engine shutdown,
+    // including when an unexpected transport failure aborts the test.
+    std::array<char, 2 * kBytes> buffer{};
+    std::vector<TransferRequest> requests;
+    requests.reserve(kRequestCount);
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
+              0);
+    auto segment = engine.openSegment(engine.getLocalIpAndPort());
+    ASSERT_NE(engine.getMetadata()->getSegmentDescByID(segment), nullptr);
+
+    for (auto opcode : {TransferRequest::READ, TransferRequest::WRITE}) {
+        SCOPED_TRACE(opcode == TransferRequest::READ ? "READ" : "WRITE");
+        auto* source = opcode == TransferRequest::READ ? buffer.data() + kBytes
+                                                       : buffer.data();
+        auto* destination = opcode == TransferRequest::READ
+                                ? buffer.data()
+                                : buffer.data() + kBytes;
+        std::fill(buffer.begin(), buffer.end(), 0);
+        std::fill_n(source, kBytes, 37);
+        requests.clear();
+        for (size_t i = 0; i < kRequestCount; ++i) {
+            requests.push_back(TransferRequest{
+                .opcode = opcode,
+                .source = buffer.data() + i * kRequestBytes,
+                .target_id = segment,
+                .target_offset =
+                    reinterpret_cast<uint64_t>(buffer.data() + kBytes) +
+                    i * kRequestBytes,
+                .length = kRequestBytes,
+                .task_group_id = 1,
+            });
+        }
+
+        MultiTransport::ScatterSubmission submission;
+        const auto submitted = engine.submitScatter(requests, submission);
+        ASSERT_NE(submission.batch_id, INVALID_BATCH_ID);
+        const auto& tasks =
+            Transport::toBatchDesc(submission.batch_id).task_list;
+        const size_t task_count = tasks.size();
+        std::vector<size_t> request_counts;
+        for (const auto& task : tasks)
+            request_counts.push_back(task.request_count);
+
+        // Drain every actual task before asserting grouping, so the regression
+        // case (one task per request) also releases its batch normally.
+        std::vector<bool> done(task_count, false);
+        bool successful = true;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        size_t remaining = task_count;
+        while (remaining != 0 && std::chrono::steady_clock::now() < deadline) {
+            for (size_t i = 0; i < task_count; ++i) {
+                if (done[i]) continue;
+                TransferStatus status;
+                auto result =
+                    engine.getTransferStatus(submission.batch_id, i, status);
+                if (!result.ok()) continue;
+                if (status.s == TransferStatusEnum::COMPLETED ||
+                    status.s == TransferStatusEnum::FAILED) {
+                    successful &= status.s == TransferStatusEnum::COMPLETED;
+                    done[i] = true;
+                    --remaining;
+                }
+            }
+            if (remaining != 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_EQ(remaining, 0u)
+            << "TCP scatter did not reach physical completion";
+        EXPECT_TRUE(engine.freeBatchID(submission.batch_id).ok());
+        EXPECT_TRUE(submitted.ok());
+        EXPECT_TRUE(successful);
+        EXPECT_EQ(memcmp(source, destination, kBytes), 0);
+        EXPECT_EQ(task_count, 1u);
+        EXPECT_EQ(request_counts, (std::vector<size_t>{kRequestCount}));
+        EXPECT_EQ(submission.task_sizes, (std::vector<size_t>{kRequestCount}));
+    }
+    EXPECT_EQ(engine.closeSegment(segment), 0);
+}
+#endif
 
 TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     TransferEngine engine(false);
