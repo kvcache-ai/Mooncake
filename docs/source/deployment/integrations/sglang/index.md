@@ -51,4 +51,5 @@ HiCache extends SGLang's RadixAttention with three memory tiers, using Mooncake 
 pd-disaggregation
 hicache-quick-start
 hicache-integration-v1
+weight-file-cache-control-plane
 ::::
