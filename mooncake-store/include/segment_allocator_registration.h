@@ -18,20 +18,17 @@ class SegmentAllocatorRegistration {
     [[nodiscard]] std::shared_ptr<BufferAllocatorBase> GetAllocator() const;
 
    private:
-    SegmentAllocatorRegistration(
-        std::shared_ptr<BufferAllocatorBase> allocator,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+    SegmentAllocatorRegistration(std::shared_ptr<BufferAllocatorBase> allocator,
+                                 ClientSessionSharedPtr owner_session);
 
     void BindAllocator(std::shared_ptr<BufferAllocatorBase> replacement);
-    void BindClientLiveness(std::shared_ptr<ClientLivenessRecord> record);
+    void BindClientSession(ClientSessionSharedPtr record);
     void BindBuffer(AllocatedBuffer& buffer) const;
     [[nodiscard]] bool OwnsBuffer(const AllocatedBuffer& buffer) const;
     void SetAllocatable(bool allocatable);
     void Invalidate();
     std::shared_ptr<BufferAllocatorBase> allocator_;
-    SegmentLifetime allocation_lifetime_;
-    SegmentLifetime buffer_lifetime_;
-    std::shared_ptr<ClientLivenessRecord> client_liveness_;
+    SegmentLifetime lifetime_;
     friend class AllocatorManager;
     friend class ScopedNoFSegmentAccess;
     friend class ScopedSegmentAccess;

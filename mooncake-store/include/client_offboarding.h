@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "client_liveness.h"
@@ -17,6 +18,7 @@
 namespace mooncake {
 
 class MasterService;
+class ClientSessionManager;
 namespace test {
 class MasterServiceTest;
 }
@@ -28,6 +30,13 @@ struct PendingSegmentOffboarding {
 };
 
 struct PreparedSegmentOffboarding {
+    PreparedSegmentOffboarding(PendingSegmentOffboarding pending,
+                               size_t capacity)
+        : segment_id(pending.segment_id),
+          segment_name(std::move(pending.segment_name)),
+          transport_endpoint(std::move(pending.transport_endpoint)),
+          metrics_dec_capacity(capacity) {}
+
     UUID segment_id;
     std::string segment_name;
     std::string transport_endpoint;
@@ -39,7 +48,7 @@ struct PreparedSegmentOffboarding {
 // barrier until the residual work converges.
 struct ClientOffboardingJob {
     UUID client_id;
-    std::shared_ptr<ClientLivenessRecord> liveness;
+    std::shared_ptr<ClientLivenessRecord> retired_session;
     std::vector<PendingSegmentOffboarding> pending_prepare_segments;
     std::vector<PreparedSegmentOffboarding> prepared_segments;
     bool metadata_cleanup_accepted{false};
@@ -53,22 +62,24 @@ struct ClientOffboardingJob {
 
 class ClientOffboardingWorker {
    public:
-    explicit ClientOffboardingWorker(MasterService* service)
-        : service_(service) {}
     ~ClientOffboardingWorker();
 
     ClientOffboardingWorker(const ClientOffboardingWorker&) = delete;
     ClientOffboardingWorker& operator=(const ClientOffboardingWorker&) = delete;
 
+   private:
+    // Only the manager may construct/start/stop the worker and reserve or
+    // submit jobs, keeping OFFLINE publication and the cleanup barrier ordered.
+    friend class ClientSessionManager;
+    friend class test::MasterServiceTest;
+
+    explicit ClientOffboardingWorker(MasterService* service)
+        : service_(service) {}
     void Start();
     void Stop();
     [[nodiscard]] bool HasPending() const {
         return pending_jobs_.load(std::memory_order_acquire) != 0;
     }
-
-   private:
-    friend class MasterService;
-    friend class test::MasterServiceTest;
 
     void ReserveJob();
     void ScheduleReserved(ClientOffboardingJob job);

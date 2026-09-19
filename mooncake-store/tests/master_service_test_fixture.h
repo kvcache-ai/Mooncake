@@ -61,7 +61,20 @@ class MasterServiceTest : public ::testing::Test {
 
     std::shared_ptr<ClientLivenessRecord> FindClientLivenessForTest(
         MasterService& service, const UUID& client_id) {
-        return MasterServiceTestPeer(service).FindClientRecord(client_id);
+        return MasterServiceTestPeer::ClientSessions(service).Find(client_id);
+    }
+
+    void QuiesceClientSessionsForTest(MasterService& service) {
+        MasterServiceTestPeer::ClientSessions(service).Quiesce();
+    }
+
+    void StopClientSessionsForTest(MasterService& service) {
+        MasterServiceTestPeer::ClientSessions(service).Stop();
+    }
+
+    bool HasPendingOffboardingForTest(MasterService& service) {
+        return MasterServiceTestPeer::ClientSessions(service)
+            .HasPendingOffboarding();
     }
 
     bool ProcessClientOffboardingForTest(MasterService& service,

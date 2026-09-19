@@ -769,6 +769,176 @@ TEST_F(SegmentTest,
     EXPECT_FALSE(existing_buffer->isAvailable());
 }
 
+TEST_F(SegmentTest, BufferLifetimeRetainsClientSessionWithoutRegistration) {
+    std::unique_ptr<AllocatedBuffer> buffer;
+    std::weak_ptr<ClientLivenessRecord> owner;
+    {
+        auto record = std::make_shared<ClientLivenessRecord>(
+            ClientLivenessRecord::Clock::now());
+        owner = record;
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            "retained_session", DEFAULT_CXL_BASE, 64 * 1024 * 1024,
+            "retained_session_endpoint");
+        AllocatorManager manager;
+        auto registration =
+            manager.addAllocator("retained_session", allocator, record);
+        buffer = registration->Allocate(1024);
+        ASSERT_TRUE(buffer);
+        EXPECT_EQ(buffer->getClientSession(), record);
+    }
+    EXPECT_FALSE(owner.expired());
+    EXPECT_TRUE(buffer->getClientSession()->IsServing());
+    EXPECT_FALSE(buffer->isAllocatorValid());
+    buffer.reset();
+    EXPECT_TRUE(owner.expired());
+}
+
+TEST_F(SegmentTest, RestoredLifetimeAdoptsSessionWithoutLosingBufferIdentity) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "restored_session_lifetime";
+    segment.base = DEFAULT_CXL_BASE;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = "restored_session_endpoint";
+    const UUID owner = generate_uuid();
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, owner, nullptr), ErrorCode::OK);
+    }
+    AllocatorManager snapshot;
+    {
+        auto access = manager.getAllocatorAccess();
+        snapshot = access.SnapshotAllocatorManager();
+    }
+    auto registration = snapshot.getAllocators(segment.name)->front();
+    auto buffer = registration->Allocate(1024);
+    ASSERT_TRUE(buffer);
+    EXPECT_FALSE(buffer->getClientSession());
+    {
+        auto access = manager.getSegmentAccess();
+        access.BindClientSession(owner, client_liveness_);
+        EXPECT_EQ(buffer->getClientSession(), client_liveness_);
+        EXPECT_TRUE(access.RebindBufferToOwningSegment(*buffer));
+        // Rebinding the same session must not invalidate existing buffers.
+        access.BindClientSession(owner, client_liveness_);
+    }
+    EXPECT_TRUE(buffer->isAvailable());
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(client_liveness_->Evaluate(now, std::chrono::seconds::zero(),
+                                         std::chrono::hours(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_TRUE(buffer->isAllocatorValid());
+    EXPECT_FALSE(buffer->isAvailable());
+    EXPECT_FALSE(registration->Allocate(1024));
+    ASSERT_EQ(client_liveness_->Observe(now),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    EXPECT_TRUE(buffer->isAvailable());
+    EXPECT_TRUE(registration->Allocate(1024));
+}
+
+TEST_F(SegmentTest, ReplacingSessionDoesNotReparentOldBuffersOrUndoDraining) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "session_incarnation_lifetime";
+    segment.base = DEFAULT_CXL_BASE;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = "session_incarnation_endpoint";
+    const UUID owner = generate_uuid();
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, owner, client_liveness_),
+                  ErrorCode::OK);
+    }
+    AllocatorManager snapshot;
+    {
+        auto access = manager.getAllocatorAccess();
+        snapshot = access.SnapshotAllocatorManager();
+    }
+    auto registration = snapshot.getAllocators(segment.name)->front();
+    auto old_buffer = registration->Allocate(1024);
+    ASSERT_TRUE(old_buffer);
+    auto replacement = std::make_shared<ClientLivenessRecord>(
+        ClientLivenessRecord::Clock::now());
+    {
+        auto access = manager.getSegmentAccess();
+        access.BindClientSession(owner, replacement);
+        EXPECT_FALSE(access.RebindBufferToOwningSegment(*old_buffer));
+    }
+    EXPECT_EQ(old_buffer->getClientSession(), client_liveness_);
+    EXPECT_FALSE(old_buffer->isAllocatorValid());
+    auto new_buffer = registration->Allocate(1024);
+    ASSERT_TRUE(new_buffer);
+    EXPECT_EQ(new_buffer->getClientSession(), replacement);
+    EXPECT_TRUE(new_buffer->isAvailable());
+
+    auto third = std::make_shared<ClientLivenessRecord>(
+        ClientLivenessRecord::Clock::now());
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.SetSegmentStatusByName(segment.name,
+                                                SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+        EXPECT_TRUE(new_buffer->isAvailable());
+        access.BindClientSession(owner, third);
+    }
+    EXPECT_FALSE(registration->Allocate(1024));
+    EXPECT_FALSE(new_buffer->isAvailable());
+    EXPECT_EQ(new_buffer->getClientSession(), replacement);
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(
+            access.SetSegmentStatusByName(segment.name, SegmentStatus::OK),
+            ErrorCode::OK);
+    }
+    auto third_buffer = registration->Allocate(1024);
+    ASSERT_TRUE(third_buffer);
+    EXPECT_EQ(third_buffer->getClientSession(), third);
+    EXPECT_FALSE(old_buffer->isAvailable());
+    EXPECT_FALSE(new_buffer->isAvailable());
+}
+
+TEST_F(SegmentTest, DetachedAllocationRejectsReplacedSessionLifetime) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "allocation_session_replacement";
+    segment.base = DEFAULT_CXL_BASE;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = "allocation_session_endpoint";
+    const UUID owner = generate_uuid();
+    auto blocking = std::make_shared<BlockingAllocateOffsetBufferAllocator>(
+        segment.name, segment.base, segment.size, segment.te_endpoint);
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, owner, client_liveness_),
+                  ErrorCode::OK);
+        ASSERT_TRUE(access.ReplaceAllocators(
+            {{segment.id, access.GetAllocator(segment.id), blocking}}));
+    }
+    AllocatorManager snapshot;
+    {
+        auto access = manager.getAllocatorAccess();
+        snapshot = access.SnapshotAllocatorManager();
+    }
+    auto registration = snapshot.getAllocators(segment.name)->front();
+    auto allocation = std::async(std::launch::async,
+                                 [&] { return registration->Allocate(1024); });
+    const bool entered =
+        blocking->entered_.try_acquire_for(std::chrono::seconds(5));
+    if (entered) {
+        auto access = manager.getSegmentAccess();
+        access.BindClientSession(owner,
+                                 std::make_shared<ClientLivenessRecord>(
+                                     ClientLivenessRecord::Clock::now()));
+    }
+    blocking->resume_.release();
+    ASSERT_TRUE(entered);
+    EXPECT_EQ(allocation.get(), nullptr);
+    EXPECT_TRUE(registration->IsServing());
+}
+
 TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
     SegmentManager segment_manager;
 

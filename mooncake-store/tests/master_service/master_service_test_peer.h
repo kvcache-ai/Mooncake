@@ -104,18 +104,11 @@ class MasterServiceTestPeer {
         return service.batch_oplog_storage_;
     }
 
-    static auto& ClientLivenessRecords(MasterService& service) {
-        return service.client_liveness_records_;
+    static auto& ClientSessions(MasterService& service) {
+        return service.client_session_manager_;
     }
-    static const auto& ClientLivenessRecords(const MasterService& service) {
-        return service.client_liveness_records_;
-    }
-
-    static auto& ClientMutex(MasterService& service) {
-        return service.client_mutex_;
-    }
-    static const auto& ClientMutex(const MasterService& service) {
-        return service.client_mutex_;
+    static const auto& ClientSessions(const MasterService& service) {
+        return service.client_session_manager_;
     }
 
     static auto& DynamicReplicationWindows(MasterService& service) {
@@ -355,11 +348,6 @@ class MasterServiceTestPeer {
 
     void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
 
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-        service_.ClearInvalidHandles(retaining_clients);
-    }
-
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
 
@@ -412,7 +400,7 @@ class MasterServiceTestPeer {
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
-        return service_.FindClientRecord(client_id);
+        return service_.client_session_manager_.Find(client_id);
     }
 
     TenantQuotaHandle GetBoundTenantQuotaHandle(

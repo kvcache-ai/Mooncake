@@ -47,24 +47,31 @@ class BufferAllocatorBase;
 class Replica;
 class SegmentAllocatorRegistration;
 
+// Shared ownership of a segment incarnation, including its client session.
+// Copies retain the current generation, not future session replacements.
 class SegmentLifetime {
    public:
-    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
+    explicit SegmentLifetime(ClientSessionSharedPtr session = nullptr);
+    SegmentLifetime(const SegmentLifetime& other) noexcept;
+    SegmentLifetime& operator=(const SegmentLifetime& other) noexcept;
 
-    [[nodiscard]] bool isAvailable() const {
-        return available_->load(std::memory_order_acquire);
-    }
-
-    void setAvailable(bool available) const {
-        available_->store(available, std::memory_order_release);
-    }
-
-    [[nodiscard]] bool operator==(const SegmentLifetime& other) const {
-        return available_ == other.available_;
-    }
+    [[nodiscard]] bool isAvailable() const;
+    [[nodiscard]] bool isServing() const;
+    [[nodiscard]] bool isAllocatable() const;
+    [[nodiscard]] bool operator==(const SegmentLifetime& other) const;
 
    private:
-    std::shared_ptr<std::atomic<bool>> available_;
+    friend class AllocatedBuffer;
+    friend class SegmentAllocatorRegistration;
+    [[nodiscard]] ClientSessionSharedPtr getClientSession() const;
+    // Mutations are serialized by the segment lock. Readers, including copies
+    // held by detached allocator snapshots, may run concurrently.
+    void BindSession(ClientSessionSharedPtr session);
+    void SetAllocatable(bool allocatable);
+    void Invalidate();
+    struct State;
+    std::shared_ptr<State> Snapshot() const;
+    std::shared_ptr<State> state_;
 };
 
 class AllocatedBuffer {
@@ -106,29 +113,18 @@ class AllocatedBuffer {
     }
 
     [[nodiscard]] bool isAvailable() const {
-        if (!isAllocatorValid()) {
-            return false;
-        }
-        const auto record = std::atomic_load_explicit(
-            &client_liveness_, std::memory_order_acquire);
-        return !record || record->IsServing();
-    }
-
-    void bindClientLiveness(
-        std::shared_ptr<ClientLivenessRecord> client_liveness) {
-        std::atomic_store_explicit(&client_liveness_,
-                                   std::move(client_liveness),
-                                   std::memory_order_release);
+        return !allocator_.expired() && segment_lifetime_.isServing();
     }
 
     void bindSegmentLifetime(SegmentLifetime lifetime) {
         segment_lifetime_ = std::move(lifetime);
     }
 
-    [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
-        const {
-        return std::atomic_load_explicit(&client_liveness_,
-                                         std::memory_order_acquire);
+    // Preserve the owning session's identity for replica affiliation checks
+    // and source admission; a client UUID alone cannot distinguish
+    // re-registers.
+    [[nodiscard]] ClientSessionSharedPtr getClientSession() const {
+        return segment_lifetime_.getClientSession();
     }
 
     // Serialize the buffer into a descriptor for transfer
@@ -158,7 +154,6 @@ class AllocatedBuffer {
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
     SegmentLifetime segment_lifetime_;
-    std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};

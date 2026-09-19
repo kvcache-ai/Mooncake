@@ -57,10 +57,10 @@ class AllocatorManager {
     std::shared_ptr<SegmentAllocatorRegistration> addAllocator(
         const std::string& name,
         const std::shared_ptr<BufferAllocatorBase>& allocator,
-        std::shared_ptr<ClientLivenessRecord> client_liveness) {
+        ClientSessionSharedPtr owner_session) {
         auto registration = std::shared_ptr<SegmentAllocatorRegistration>(
             new SegmentAllocatorRegistration(allocator,
-                                             std::move(client_liveness)));
+                                             std::move(owner_session)));
         addRegistration(name, registration);
         return registration;
     }
