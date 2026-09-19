@@ -34,6 +34,21 @@ from .engine import (
     validate_mooncake_protocol_pair,
 )
 from .transport_evidence import collect_mooncake_worker_transport_evidence
+from .rdma import (
+    RdmaCapabilities,
+    RdmaDeviceInfo,
+    default_rdma_bind_address,
+    detect_rdma_capabilities,
+    resolve_rdma_protocol,
+)
+from .rdmacm import (
+    RdmaStagedClient,
+    RdmaStagedServer,
+    RdmaTransportError,
+    RegisteredRegion,
+    rdmacm_cuda_staging_smoke,
+    rdmacm_listener_smoke,
+)
 
 __all__ = [
     "Channel",
@@ -52,12 +67,23 @@ __all__ = [
     "PeerTransferResult",
     "Precision",
     "Prefetch",
+    "RdmaCapabilities",
+    "RdmaDeviceInfo",
+    "RdmaStagedClient",
+    "RdmaStagedServer",
+    "RdmaTransportError",
+    "RegisteredRegion",
     "TransferEngine",
     "TransferHandle",
     "TransferPolicy",
     "TransferStats",
     "default_policy_for",
+    "default_rdma_bind_address",
+    "detect_rdma_capabilities",
+    "rdmacm_cuda_staging_smoke",
+    "rdmacm_listener_smoke",
     "require_mooncake_protocol_support",
+    "resolve_rdma_protocol",
     "validate_mooncake_protocol_pair",
     "collect_mooncake_worker_transport_evidence",
 ]

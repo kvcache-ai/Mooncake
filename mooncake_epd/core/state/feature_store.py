@@ -7,7 +7,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -274,11 +274,8 @@ def _tensor_checksum(tensor: torch.Tensor) -> str:
     t = tensor.detach().contiguous().cpu()
     header = f"{tuple(t.shape)}|{t.dtype}|{tuple(t.stride())}".encode()
     h.update(header)
-    # Avoid ``ndarray.tobytes()`` here: for 30-100MiB multimodal hidden states
-    # it adds another full memory copy on the strict FeatureHandle validation
-    # path.  hashlib accepts buffer-protocol objects directly, so the contiguous
-    # uint8 NumPy view can be streamed without allocating a duplicate bytes
-    # object.
+    # Keep checksum generation zero-copy after the required contiguous CPU
+    # materialization; ndarray.tobytes() duplicates large hidden states.
     h.update(memoryview(t.view(torch.uint8).numpy()))
     return h.hexdigest()
 
@@ -338,7 +335,7 @@ def hash_pixel_values(pixel_values: torch.Tensor, sample_budget: int = 4096) -> 
 
 
 class FeatureStore:
-    """LRU feature cache with hard refcount + lease semantics."""
+    """Feature cache with hard refcount/lease and optional value admission."""
 
     def __init__(
         self,
@@ -347,11 +344,20 @@ class FeatureStore:
         ttl_seconds: Optional[float] = None,
         *,
         node_id: str = "local",
+        admission_policy: str = "lru",
+        frequency_sample_size: Optional[int] = None,
     ):
         self._max_bytes = max_bytes
         self._max_entries = max_entries
         self._ttl_seconds = ttl_seconds
         self._node_id = str(node_id)
+        policy = str(admission_policy or "lru").strip().lower()
+        if policy not in {"lru", "reuse_density"}:
+            raise ValueError(
+                "FeatureStore admission_policy must be lru or reuse_density: "
+                f"{admission_policy}"
+            )
+        self._admission_policy = policy
         self._cache: "OrderedDict[str, FeatureBundle]" = OrderedDict()
         self._records: Dict[str, FeatureRecord] = {}
         self._current_bytes = 0
@@ -359,12 +365,36 @@ class FeatureStore:
         self._hits = 0
         self._misses = 0
         self._evictions = 0
+        # ``reuse_density`` is an exact, bounded TinyLFU-style history rather
+        # than a probabilistic sketch. FeatureBundle caches are intentionally
+        # small (normally tens of GPU-resident entries), so exact counters
+        # avoid hash collisions while retaining O(1) access and bounded state.
+        self._frequency_history: "OrderedDict[str, int]" = OrderedDict()
+        self._frequency_history_limit = max(64, int(max_entries) * 8)
+        self._frequency_sample_size = max(
+            1,
+            int(
+                frequency_sample_size
+                if frequency_sample_size is not None
+                else max(100, int(max_entries) * 10)
+            ),
+        )
+        self._frequency_samples = 0
+        self._frequency_resets = 0
+        self._recompute_costs: Dict[str, float] = {}
+        self._admissions = 0
+        self._admission_rejections = 0
+        self._capacity_rejections = 0
+        self._oversize_rejections = 0
+        self._value_evictions = 0
 
     # ------------------------------------------------------------------
     # CRUD / lookup
     # ------------------------------------------------------------------
     def get(self, image_hash: str) -> Optional[FeatureBundle]:
         with self._lock:
+            if self._admission_policy == "reuse_density":
+                self._record_frequency(image_hash)
             bundle = self._cache.get(image_hash)
             record = self._records.get(image_hash)
             if bundle is None or record is None:
@@ -387,15 +417,52 @@ class FeatureStore:
         physical_node_id: Optional[str] = None,
         ttl_seconds: Optional[float] = None,
         metadata: Optional[Dict] = None,
-    ) -> None:
+        recompute_cost: Optional[float] = None,
+    ) -> bool:
         with self._lock:
+            if self._admission_policy == "reuse_density":
+                return self._put_reuse_density(
+                    image_hash,
+                    bundle,
+                    owner_shard=owner_shard,
+                    physical_node_id=physical_node_id,
+                    ttl_seconds=ttl_seconds,
+                    metadata=metadata,
+                    recompute_cost=recompute_cost,
+                )
             existing_record = self._records.get(image_hash)
-            existing_bundle = self._cache.pop(image_hash, None)
+            existing_bundle = self._cache.get(image_hash)
+            existing_bytes = (
+                int(existing_bundle.nbytes()) if existing_bundle is not None else 0
+            )
+            bundle_bytes = int(bundle.nbytes())
+            if bundle_bytes > int(self._max_bytes):
+                self._oversize_rejections += 1
+                return False
+            base_bytes = max(0, int(self._current_bytes) - existing_bytes)
+            base_entries = len(self._cache) - (1 if existing_bundle is not None else 0)
+            required_bytes = max(0, base_bytes + bundle_bytes - int(self._max_bytes))
+            required_entries = max(0, base_entries + 1 - int(self._max_entries))
+            victims: List[str] = []
+            freed_bytes = 0
+            for key, resident in self._cache.items():
+                if key == image_hash:
+                    continue
+                record = self._records.get(key)
+                if record is None or record.refcount > 0 or record.lease_count > 0:
+                    continue
+                if freed_bytes >= required_bytes and len(victims) >= required_entries:
+                    break
+                victims.append(key)
+                freed_bytes += int(resident.nbytes())
+            if freed_bytes < required_bytes or len(victims) < required_entries:
+                self._capacity_rejections += 1
+                return False
+            for key in victims:
+                self._remove(key)
             if existing_bundle is not None:
-                self._current_bytes -= existing_bundle.nbytes()
-
-            bundle_bytes = bundle.nbytes()
-            self._ensure_capacity(bundle_bytes)
+                self._cache.pop(image_hash, None)
+                self._current_bytes = max(0, self._current_bytes - existing_bytes)
             self._cache[image_hash] = bundle
             ttl = self._ttl_seconds if ttl_seconds is None else ttl_seconds
             ttl_deadline = (
@@ -422,6 +489,8 @@ class FeatureStore:
                 record.metadata = merged
             self._records[image_hash] = record
             self._current_bytes += bundle_bytes
+            self._admissions += 1
+            return True
 
     def has(self, image_hash: str) -> bool:
         with self._lock:
@@ -537,27 +606,164 @@ class FeatureStore:
     def _is_expired(self, record: FeatureRecord) -> bool:
         return record.ttl_deadline != float("inf") and time.monotonic() > record.ttl_deadline
 
-    def _ensure_capacity(self, incoming_bytes: int) -> None:
-        while (
-            (self._current_bytes + incoming_bytes > self._max_bytes)
-            or (len(self._cache) >= self._max_entries)
-        ) and self._cache:
-            oldest_key = next(iter(self._cache))
-            oldest = self._records.get(oldest_key)
-            if oldest is not None and (oldest.refcount > 0 or oldest.lease_count > 0):
-                movable = [
+    def _record_frequency(self, image_hash: str) -> None:
+        if self._frequency_samples >= self._frequency_sample_size:
+            decayed: "OrderedDict[str, int]" = OrderedDict()
+            for key, count in self._frequency_history.items():
+                next_count = int(count) // 2
+                if next_count > 0 or key in self._cache:
+                    decayed[key] = max(1, next_count) if key in self._cache else next_count
+            self._frequency_history = decayed
+            self._frequency_samples = 0
+            self._frequency_resets += 1
+        count = min(255, int(self._frequency_history.pop(image_hash, 0)) + 1)
+        self._frequency_history[image_hash] = count
+        self._frequency_samples += 1
+        self._trim_frequency_history()
+
+    def _trim_frequency_history(self) -> None:
+        while len(self._frequency_history) > self._frequency_history_limit:
+            removable = next(
+                (
                     key
-                    for key in self._cache.keys()
-                    if (
-                        (rec := self._records.get(key)) is not None
-                        and rec.refcount <= 0
-                        and rec.lease_count <= 0
-                    )
-                ]
-                if not movable:
-                    break
-                oldest_key = movable[0]
-            self._remove(oldest_key)
+                    for key in self._frequency_history
+                    if key not in self._cache
+                ),
+                None,
+            )
+            if removable is None:
+                break
+            self._frequency_history.pop(removable, None)
+
+    def _reuse_density(
+        self,
+        image_hash: str,
+        *,
+        bundle_bytes: int,
+        recompute_cost: Optional[float] = None,
+    ) -> float:
+        frequency = max(1, int(self._frequency_history.get(image_hash, 0)))
+        cost = (
+            self._recompute_costs.get(image_hash, 1.0)
+            if recompute_cost is None
+            else max(1e-9, float(recompute_cost))
+        )
+        return float(frequency) * float(cost) / float(max(1, bundle_bytes))
+
+    def _put_reuse_density(
+        self,
+        image_hash: str,
+        bundle: FeatureBundle,
+        *,
+        owner_shard: Optional[str],
+        physical_node_id: Optional[str],
+        ttl_seconds: Optional[float],
+        metadata: Optional[Dict],
+        recompute_cost: Optional[float],
+    ) -> bool:
+        """Admit work with greater expected saved-compute per cache byte.
+
+        Every lookup updates a bounded, periodically decayed frequency history.
+        When capacity is available the first exact result is cached immediately.
+        Under pressure, the candidate competes with the lowest-density unpinned
+        residents needed to make room. This preserves hot visual features under
+        one-pass scans without adding synchronization to the CUDA hot path.
+        """
+
+        bundle_bytes = int(bundle.nbytes())
+        if bundle_bytes > int(self._max_bytes):
+            self._oversize_rejections += 1
+            return False
+
+        existing_bundle = self._cache.get(image_hash)
+        existing_record = self._records.get(image_hash)
+        existing_bytes = existing_bundle.nbytes() if existing_bundle is not None else 0
+        base_bytes = max(0, int(self._current_bytes) - int(existing_bytes))
+        base_entries = len(self._cache) - (1 if existing_bundle is not None else 0)
+        required_bytes = max(0, base_bytes + bundle_bytes - int(self._max_bytes))
+        required_entries = max(0, base_entries + 1 - int(self._max_entries))
+
+        victims: List[str] = []
+        freed_bytes = 0
+        eligible = []
+        for lru_ordinal, (key, resident) in enumerate(self._cache.items()):
+            if key == image_hash:
+                continue
+            record = self._records.get(key)
+            if record is None or record.refcount > 0 or record.lease_count > 0:
+                continue
+            resident_bytes = int(resident.nbytes())
+            eligible.append(
+                (
+                    self._reuse_density(key, bundle_bytes=resident_bytes),
+                    int(lru_ordinal),
+                    key,
+                    resident_bytes,
+                )
+            )
+        eligible.sort(key=lambda item: (item[0], item[1]))
+        victim_densities: List[float] = []
+        for density, _ordinal, key, resident_bytes in eligible:
+            if freed_bytes >= required_bytes and len(victims) >= required_entries:
+                break
+            victims.append(key)
+            victim_densities.append(float(density))
+            freed_bytes += int(resident_bytes)
+
+        if freed_bytes < required_bytes or len(victims) < required_entries:
+            self._capacity_rejections += 1
+            return False
+
+        candidate_density = self._reuse_density(
+            image_hash,
+            bundle_bytes=bundle_bytes,
+            recompute_cost=recompute_cost,
+        )
+        if victim_densities and candidate_density < max(victim_densities):
+            self._admission_rejections += 1
+            return False
+
+        for key in victims:
+            self._remove(key)
+            self._value_evictions += 1
+
+        if existing_bundle is not None:
+            self._cache.pop(image_hash, None)
+            self._current_bytes = max(0, self._current_bytes - int(existing_bytes))
+
+        ttl = self._ttl_seconds if ttl_seconds is None else ttl_seconds
+        ttl_deadline = (
+            float("inf")
+            if ttl is None
+            else time.monotonic() + max(0.0, float(ttl))
+        )
+        record = existing_record or FeatureRecord(
+            image_hash=image_hash,
+            owner_shard=str(owner_shard or self._node_id),
+            physical_node_id=str(physical_node_id or self._node_id),
+        )
+        record.owner_shard = str(owner_shard or record.owner_shard or self._node_id)
+        record.physical_node_id = str(
+            physical_node_id or record.physical_node_id or self._node_id
+        )
+        record.size_bytes = bundle_bytes
+        record.status = "ACTIVE"
+        record.last_updated_at = time.monotonic()
+        record.ttl_deadline = ttl_deadline
+        if metadata:
+            merged = dict(record.metadata)
+            merged.update(metadata)
+            record.metadata = merged
+        self._cache[image_hash] = bundle
+        self._records[image_hash] = record
+        self._recompute_costs[image_hash] = max(
+            1e-9,
+            float(recompute_cost if recompute_cost is not None else 1.0),
+        )
+        self._current_bytes += bundle_bytes
+        self._admissions += 1
+        self._trim_frequency_history()
+        return True
 
     def _remove(self, key: str) -> None:
         record = self._records.get(key)
@@ -565,6 +771,7 @@ class FeatureStore:
             return
         bundle = self._cache.pop(key, None)
         self._records.pop(key, None)
+        self._recompute_costs.pop(key, None)
         if bundle is not None:
             self._current_bytes = max(0, self._current_bytes - bundle.nbytes())
             self._evictions += 1
@@ -588,14 +795,40 @@ class FeatureStore:
             self._cache = survivors
             self._records = survivor_records
             self._current_bytes = current_bytes
+            self._recompute_costs = {
+                key: self._recompute_costs[key]
+                for key in survivors
+                if key in self._recompute_costs
+            }
+            self._frequency_history.clear()
+            self._frequency_samples = 0
+            self._frequency_resets = 0
             self._hits = 0
             self._misses = 0
             self._evictions = 0
+            self._admissions = 0
+            self._admission_rejections = 0
+            self._capacity_rejections = 0
+            self._oversize_rejections = 0
+            self._value_evictions = 0
 
-    def stats(self) -> Dict[str, float]:
+    def stats(self) -> Dict[str, Any]:
         with self._lock:
             total = self._hits + self._misses
             expired = sum(1 for record in self._records.values() if self._is_expired(record))
+            bundle_sizes = [int(bundle.nbytes()) for bundle in self._cache.values()]
+            pinned_bytes = sum(
+                int(self._cache[key].nbytes())
+                for key, record in self._records.items()
+                if key in self._cache and record.refcount > 0
+            )
+            leased_bytes = sum(
+                int(self._cache[key].nbytes())
+                for key, record in self._records.items()
+                if key in self._cache and record.lease_count > 0
+            )
+            admission_attempts = self._admissions + self._admission_rejections
+            admission_attempts += self._capacity_rejections + self._oversize_rejections
             return {
                 "entries": len(self._cache),
                 "bytes": self._current_bytes,
@@ -606,6 +839,28 @@ class FeatureStore:
                 "leased_entries": sum(1 for v in self._records.values() if v.lease_count > 0),
                 "total_refcount": sum(v.refcount for v in self._records.values()),
                 "total_leases": sum(v.lease_count for v in self._records.values()),
+                "pinned_bytes": pinned_bytes,
+                "leased_bytes": leased_bytes,
+                "largest_entry_bytes": max(bundle_sizes, default=0),
                 "expired_entries": expired,
                 "evictions": self._evictions,
+                "admission_policy": self._admission_policy,
+                "admissions": self._admissions,
+                "admission_rejections": self._admission_rejections,
+                "capacity_rejections": self._capacity_rejections,
+                "oversize_rejections": self._oversize_rejections,
+                "value_evictions": self._value_evictions,
+                "admission_attempts": admission_attempts,
+                "admission_rejection_rate": (
+                    (
+                        self._admission_rejections
+                        + self._capacity_rejections
+                        + self._oversize_rejections
+                    )
+                    / admission_attempts
+                    if admission_attempts
+                    else 0.0
+                ),
+                "frequency_history_entries": len(self._frequency_history),
+                "frequency_resets": self._frequency_resets,
             }

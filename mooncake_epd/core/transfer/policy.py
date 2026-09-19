@@ -59,6 +59,9 @@ class HwCaps:
 
     has_rdma: bool = False
     has_gpudirect: bool = False
+    rdma_backend: str = ""
+    rdma_device: str = ""
+    rdma_transport: str = ""
     has_nvlink: bool = False
     has_cuda_ipc: bool = True
     num_gpus: int = 1
@@ -69,18 +72,24 @@ class HwCaps:
     def detect(cls) -> "HwCaps":
         """Best-effort detection; never raises."""
         import torch
+
+        from .rdma import detect_rdma_capabilities, resolve_rdma_protocol
+
         caps = cls()
         caps.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         try:
-            import subprocess
-            out = subprocess.check_output(
-                ["ibv_devices"], stderr=subprocess.STDOUT, timeout=2,
-            ).decode()
-            caps.has_rdma = "node GUID" in out or "mlx" in out.lower()
+            rdma = detect_rdma_capabilities()
+            caps.has_rdma = rdma.has_rdma
+            caps.has_gpudirect = rdma.has_gpudirect
+            caps.rdma_backend = resolve_rdma_protocol("auto", rdma)
+            preferred = rdma.preferred_device
+            if preferred is not None:
+                caps.rdma_device = preferred.name
+                caps.rdma_transport = preferred.transport
         except Exception:
             caps.has_rdma = False
-        # GPUDirect typically requires both RDMA and a compatible driver
-        caps.has_gpudirect = caps.has_rdma and caps.num_gpus > 0
+            caps.has_gpudirect = False
+            caps.rdma_backend = ""
         return caps
 
 
