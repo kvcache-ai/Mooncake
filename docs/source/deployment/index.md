@@ -13,6 +13,7 @@ Kubernetes environments.
 | [KV Cache Sharing and Isolation](kv-cache-sharing-and-isolation) | Define cache-sharing boundaries across models, releases, request groups, and Mooncake tenants. |
 | [Kubernetes Deployment](kubernetes-deployment-guide/index) | Deploy Mooncake Store and Transfer Engine integrations on Kubernetes. |
 | [SSD Storage](ssd/index) | Configure local SSD offload or a shared NVMe-over-Fabrics storage pool. |
+| [OSS Local-Disk Backend](oss) | Configure OSS object storage behind the client-owned offload path. |
 
 ## Framework Integrations
 
