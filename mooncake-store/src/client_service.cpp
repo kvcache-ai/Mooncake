@@ -1445,6 +1445,12 @@ std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
     return transfer_submitter_->submitScatter(transfers);
 }
 
+void Client::SetScatterStagingAllocator(
+    TransferEngine::ScatterStagingAllocator allocator) {
+    if (transfer_engine_)
+        transfer_engine_->setScatterStagingAllocator(std::move(allocator));
+}
+
 struct BatchGetOperation {
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> batched_slices;
