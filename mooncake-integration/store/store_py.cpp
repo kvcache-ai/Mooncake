@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <unordered_map>
@@ -493,6 +494,41 @@ inline int to_py_ret(ErrorCode error_code) {
 #include "store_py_internal.h"
 
 }  // namespace
+
+class RangedReadSnapshotPy {
+   public:
+    RangedReadSnapshotPy(std::shared_ptr<PyClient> store,
+                         std::vector<std::string> keys)
+        : store_(std::move(store)), keys_(std::move(keys)) {
+        snapshot_ = store_->prepare_get_into_ranges_snapshot(keys_);
+    }
+
+    bool belongs_to(const std::shared_ptr<PyClient> &store) const {
+        return store_.get() == store.get();
+    }
+
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (snapshot_.should_refresh()) {
+            store_->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        }
+        return store_->get_into_ranges_from_snapshot(
+            buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+            snapshot_);
+    }
+
+   private:
+    std::shared_ptr<PyClient> store_;
+    std::vector<std::string> keys_;
+    PyClient::RangedReadSnapshot snapshot_;
+    std::mutex mutex_;
+};
+
 // Python-specific wrapper functions that handle GIL and return pybind11 types
 class MooncakeStorePyWrapper {
    public:
@@ -2078,6 +2114,10 @@ PYBIND11_MODULE(store, m) {
     m.def("_deserialize_tensor", &deserialize_tensor_from_bytes,
           "Deserialize Mooncake tensor metadata plus payload bytes.");
 
+    py::class_<RangedReadSnapshotPy, std::shared_ptr<RangedReadSnapshotPy>>(
+        m, "RangedReadSnapshot",
+        "Reusable metadata snapshot for repeated ranged reads");
+
     // Object data type classification
     py::enum_<ObjectDataType>(m, "ObjectDataType")
         .value("UNKNOWN", ObjectDataType::UNKNOWN)
@@ -2922,6 +2962,60 @@ PYBIND11_MODULE(store, m) {
             py::arg("all_sizes"),
             "Get multiple byte ranges from multiple objects into multiple "
             "pre-allocated buffers")
+        .def(
+            "prepare_get_into_ranges_snapshot",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    throw std::runtime_error("Client is not initialized");
+                }
+                std::vector<std::string> unique_keys;
+                unique_keys.reserve(keys.size());
+                std::unordered_set<std::string> seen;
+                seen.reserve(keys.size());
+                for (const auto &key : keys) {
+                    if (seen.insert(key).second) unique_keys.push_back(key);
+                }
+                py::gil_scoped_release release;
+                return std::make_shared<RangedReadSnapshotPy>(
+                    self.store_, std::move(unique_keys));
+            },
+            py::arg("keys"),
+            "Prepare a reusable metadata snapshot for ranged reads")
+        .def(
+            "get_into_ranges_from_snapshot",
+            [](MooncakeStorePyWrapper &self,
+               const std::shared_ptr<RangedReadSnapshotPy> &snapshot,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<std::vector<std::string>> &all_keys,
+               const std::vector<std::vector<std::vector<size_t>>>
+                   &all_dst_offsets,
+               const std::vector<std::vector<std::vector<size_t>>>
+                   &all_src_offsets,
+               const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+                if (!self.is_client_initialized()) {
+                    throw std::runtime_error("Client is not initialized");
+                }
+                if (!snapshot || !snapshot->belongs_to(self.store_)) {
+                    throw std::invalid_argument(
+                        "Ranged-read snapshot belongs to another Store");
+                }
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return snapshot->get_into_ranges(buffers, all_keys,
+                                                 all_dst_offsets,
+                                                 all_src_offsets, all_sizes);
+            },
+            py::arg("snapshot"), py::arg("buffer_ptrs"), py::arg("all_keys"),
+            py::arg("all_dst_offsets"), py::arg("all_src_offsets"),
+            py::arg("all_sizes"),
+            "Get byte ranges using a reusable metadata snapshot. The "
+            "snapshot is refreshed at the read-lease midpoint before a new "
+            "transfer is submitted.")
         .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,
