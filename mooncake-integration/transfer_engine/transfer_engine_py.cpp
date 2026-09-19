@@ -773,16 +773,17 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 
     for (int retry = 0; retry < max_retry; ++retry) {
         batch_id = engine_->allocateBatchID(batch_size);
-        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
-
         auto start_ts = getCurrentTimeInNano();
-        batch_desc->start_timestamp = start_ts;
 
         Status s = engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
             return 0;
         } else {
+            std::lock_guard<std::mutex> guard(mutex_);
+            async_batch_deadlines_[batch_id] =
+                start_ts + transfer_timeout_nsec_ +
+                std::accumulate(lengths.begin(), lengths.end(), 0ull);
             break;
         }
     }
@@ -795,27 +796,26 @@ int TransferEnginePy::getBatchTransferStatus(
     pybind11::gil_scoped_release release;
     TransferStatus status;
     std::unordered_map<batch_id_t, int64_t> timeout_table{};
-    for (auto& batch_id : batch_ids) {
-        int64_t total_length = 0;
-        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
-        const size_t task_count = batch_desc->task_list.size();
-
-        for (size_t task_id = 0; task_id < task_count; task_id++) {
-            auto& task = batch_desc->task_list[task_id];
-            for (auto& slice : task.slice_list) {
-                total_length += slice->length;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (auto batch_id : batch_ids) {
+            auto it = async_batch_deadlines_.find(batch_id);
+            if (it == async_batch_deadlines_.end()) {
+                LOG(ERROR) << "Unknown async batch: " << batch_id;
+                return -1;
             }
+            timeout_table.emplace(*it);
         }
-
-        timeout_table[batch_id] = total_length + transfer_timeout_nsec_;
+        // This call consumes all supplied batches, including on failure.
+        for (const auto& entry : timeout_table) {
+            async_batch_deadlines_.erase(entry.first);
+        }
     }
 
     bool failed_or_timeout = false;
     std::unordered_set<batch_id_t> remove_ids{};
     while (!timeout_table.empty() && !failed_or_timeout) {
         for (auto& entry : timeout_table) {
-            auto batch_desc = reinterpret_cast<BatchDesc*>(entry.first);
-            auto start_timestamp = batch_desc->start_timestamp;
             Status s = engine_->getBatchTransferStatus(entry.first, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -828,9 +828,8 @@ int TransferEnginePy::getBatchTransferStatus(
                 LOG(INFO) << "Sync data transfer timeout";
             }
             auto current_ts = getCurrentTimeInNano();
-            if (current_ts - start_timestamp > entry.second) {
-                LOG(INFO) << "Sync batch data transfer timeout after "
-                          << current_ts - start_timestamp << "ns";
+            if (current_ts > entry.second) {
+                LOG(INFO) << "Sync batch data transfer timeout";
                 failed_or_timeout = true;
             }
         }
@@ -879,12 +878,18 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     entry.target_offset = peer_buffer_address;
     entry.transport_hint = parseTransportHint(transport_hint);
 
+    auto start_ts = getCurrentTimeInNano();
     Status s = engine_->submitTransfer(batch_id, {entry});
     if (!s.ok()) {
         engine_->freeBatchID(batch_id);
         return 0;
     }
 
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        async_batch_deadlines_[batch_id] =
+            start_ts + transfer_timeout_nsec_ + length;
+    }
     return batch_id;
 }
 
@@ -893,12 +898,14 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     TransferStatus status;
     Status s = engine_->getTransferStatus(batch_id, 0, status);
     LOG_ASSERT(s.ok());
-    if (status.s == TransferStatusEnum::COMPLETED) {
+    if (status.s == TransferStatusEnum::COMPLETED ||
+        status.s == TransferStatusEnum::FAILED) {
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            async_batch_deadlines_.erase(batch_id);
+        }
         engine_->freeBatchID(batch_id);
-        return 1;
-    } else if (status.s == TransferStatusEnum::FAILED) {
-        engine_->freeBatchID(batch_id);
-        return -1;
+        return status.s == TransferStatusEnum::COMPLETED ? 1 : -1;
     } else if (status.s == TransferStatusEnum::TIMEOUT) {
         return -2;
     } else {

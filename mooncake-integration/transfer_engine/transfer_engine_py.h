@@ -49,9 +49,6 @@ class TransferEnginePy {
     };
 
    public:
-    using BatchDesc = Transport::BatchDesc;
-
-   public:
     TransferEnginePy();
 
     ~TransferEnginePy();
@@ -220,6 +217,9 @@ class TransferEnginePy {
     std::vector<char *> buffer_list_;
     std::unordered_set<char *> large_buffer_list_;
     std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
+    // Batch IDs are opaque: classic TE and TENT use different batch layouts.
+    // Protected by mutex_; a batch waiter takes ownership of its deadlines.
+    std::unordered_map<batch_id_t, int64_t> async_batch_deadlines_;
     bool auto_discovery_;
 
     uint64_t transfer_timeout_nsec_;
