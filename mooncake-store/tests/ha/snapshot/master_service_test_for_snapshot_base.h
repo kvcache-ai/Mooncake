@@ -160,6 +160,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         return {.segment_id = segment.id, .client_id = client_id};
     }
 
+    tl::expected<void, SerializationError> ApplySnapshotStateForTest(
+        MasterService& service) const {
+        return service.ApplySnapshotState(std::chrono::system_clock::now());
+    }
+
     // ==================== Snapshot Helper Methods ====================
 
     // Persist the master's snapshot using state exposed by the test peer.
