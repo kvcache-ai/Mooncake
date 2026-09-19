@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <ostream>
+#include <vector>
 
 namespace mooncake {
 
@@ -61,6 +62,12 @@ struct BucketBackendConfig {
     // more often. <=0 disables caching (scan every check). Only relevant when
     // max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
+
+    // Per-disk quotas, positionally aligned with the disks parsed out of
+    // FileStorageConfig::storage_filepath. Empty => broadcast the scalar
+    // max_total_size to every disk. A list shorter than the disk count
+    // reuses its last entry for the remaining disks.
+    std::vector<int64_t> max_total_size_per_disk;
 
     bool Validate() const;
 
