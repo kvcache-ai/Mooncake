@@ -2901,6 +2901,185 @@ TEST_F(RealClientTest, BatchGetBufferWipedSiblingPreservesHealthyReplica) {
     EXPECT_EQ(py_client_->get_replica_desc(key_b).size(), 1u);
 }
 
+// fcczzz's second counterexample on #3889: request {A, B, B} with A's bucket
+// file wiped and B healthy on the same owner. The batch dies wholesale, B's
+// standalone retry succeeds, but the healed status used to stay an error, so
+// the duplicate fan-out skipped the copy and the second B came back null.
+TEST_F(RealClientTest, BatchGetBufferHealedKeyFeedsDuplicateFanOut) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_dup_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key_a = "dup_heal_missing";
+    const std::string key_b = "dup_heal_healthy";
+    ASSERT_EQ(py_client_->put(key_a, source), 0);
+
+    auto wait_disk_replica = [&](const std::string& k) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(k)) {
+                if (replica.is_local_disk_replica()) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    auto clear_memory_replica = [&](const std::string& k) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (py_client_->batch_replica_clear({k}, "localhost:17813")
+                    .size() == 1) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    };
+    ASSERT_TRUE(wait_disk_replica(key_a));
+    ASSERT_TRUE(clear_memory_replica(key_a));
+
+    // Everything in the offload dir right now belongs to A's bucket.
+    std::vector<std::filesystem::path> files_a;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        files_a.push_back(entry.path());
+    }
+    ASSERT_FALSE(files_a.empty());
+
+    ASSERT_EQ(py_client_->put(key_b, source), 0);
+    ASSERT_TRUE(wait_disk_replica(key_b));
+    ASSERT_TRUE(clear_memory_replica(key_b));
+
+    std::error_code ec;
+    for (const auto& file : files_a) {
+        std::filesystem::remove_all(file, ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    auto after = py_client_->batch_get_buffer({key_a, key_b, key_b});
+    ASSERT_EQ(after.size(), 3u);
+    EXPECT_EQ(after[0], nullptr);
+    EXPECT_TRUE(py_client_->get_replica_desc(key_a).empty());
+    // Both B entries must carry the healed data: the primary is repopulated
+    // by the bounded retry, the duplicate is served by the fan-out copy.
+    ASSERT_NE(after[1], nullptr);
+    ASSERT_NE(after[2], nullptr);
+    EXPECT_EQ(std::memcmp(after[1]->ptr(), source.data(), kSize), 0);
+    EXPECT_EQ(std::memcmp(after[2]->ptr(), source.data(), kSize), 0);
+    EXPECT_EQ(py_client_->get_replica_desc(key_b).size(), 1u);
+}
+
+// fcczzz's first counterexample on #3889: a truncated bucket file keeps the
+// existence probe at kPresent while every read fails. The retry used to
+// recurse with healing enabled, burning one arena buffer per level until
+// allocation or the stack gave out; now it runs exactly once with healing
+// off and surfaces the error. The file exists, so the replica must stay.
+TEST_F(RealClientTest, BatchGetBufferTruncatedBucketFileSurfacesMiss) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_trunc_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "trunc_heal_missing";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    auto wait_disk_replica = [&]() {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    ASSERT_TRUE(wait_disk_replica());
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    auto before = py_client_->batch_get_buffer({key});
+    ASSERT_EQ(before.size(), 1u);
+    ASSERT_NE(before[0], nullptr);
+
+    // Truncate every bucket file: the physical file still exists, so the
+    // heal probe keeps answering kPresent, but no read can succeed.
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        if (std::filesystem::is_regular_file(entry.path(), ec)) {
+            std::filesystem::resize_file(entry.path(), 1024, ec);
+            ASSERT_FALSE(ec) << ec.message();
+        }
+    }
+
+    auto after = py_client_->batch_get_buffer({key});
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0], nullptr);
+    // kPresent means no eviction: the key stays advertised even though this
+    // read could not be served.
+    EXPECT_EQ(py_client_->get_replica_desc(key).size(), 1u);
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

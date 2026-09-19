@@ -3170,7 +3170,8 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
 std::vector<std::shared_ptr<BufferHandle>>
 RealClient::batch_get_buffer_internal(
     const std::vector<std::string> &keys,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    bool heal_dangling_disk_replica) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -3436,19 +3437,30 @@ RealClient::batch_get_buffer_internal(
                     // A batch read also dies wholesale, so a key whose file
                     // provably exists is retried as-is: its failure came from
                     // a sibling's wiped bucket file, not from its own data.
-                    // The retry allocates through the allocator and lands in
-                    // final_results directly; op_status stays an error so the
-                    // duplicate fan-out and handle assembly below ignore it.
-                    if (client_) {
+                    // The retry runs with healing off so a replica whose file
+                    // exists but keeps failing (e.g. a truncated bucket)
+                    // surfaces its error instead of recursing until the stack
+                    // or the allocator gives out. On success the bytes land in
+                    // this op's own buffer and op_status flips to success, so
+                    // the duplicate fan-out and handle assembly below treat
+                    // the healed key like any other successful read.
+                    if (client_ && heal_dangling_disk_replica) {
                         const auto heal =
                             client_->healDanglingLocalDiskReplica(key);
                         if (heal == Client::DiskReplicaHealResult::kEvicted ||
                             heal == Client::DiskReplicaHealResult::kPresent) {
                             auto healed = batch_get_buffer_internal(
-                                {key}, client_buffer_allocator);
-                            if (!healed.empty() && healed[0]) {
-                                final_results[op.original_index] =
-                                    std::move(healed[0]);
+                                {key}, client_buffer_allocator,
+                                /*heal_dangling_disk_replica=*/false);
+                            if (!healed.empty() && healed[0] &&
+                                healed[0]->size() == op.total_size) {
+                                if (CopyMaybeDevice(
+                                        op.buffer_handle->ptr(),
+                                        healed[0]->ptr(), op.total_size,
+                                        "healed SSD read retry, key: " + key)) {
+                                    op_status[idx_it->second] =
+                                        static_cast<int64_t>(op.total_size);
+                                }
                             }
                         }
                     }

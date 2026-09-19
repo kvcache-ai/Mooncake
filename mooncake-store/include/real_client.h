@@ -774,7 +774,11 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        // The dangling-replica heal retry calls back into this function;
+        // it passes false here so a replica whose file exists but keeps
+        // failing to read surfaces its error instead of recursing forever.
+        bool heal_dangling_disk_replica = true);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
