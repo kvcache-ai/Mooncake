@@ -206,86 +206,95 @@ class Transport {
         };
 
        public:
+        // Packed handshake word: bit 63 = sealed, bits 0..62 = completed
+        // slices. One location so last-slice CQ and seal share a modification
+        // order (no Dekker pair on two atomics).
+        static constexpr uint64_t kCompletionSealBit = 1ull << 63;
+        static constexpr uint64_t kCompletionDoneMask = kCompletionSealBit - 1;
+
         void markSuccess() {
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
             __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
-
-            check_batch_completion(task, false);
+            // Second CQ RMW: handshake word. success_slice_count stays for
+            // getTransferStatus; packing both into one word is a follow-up.
+            const uint64_t state = __atomic_add_fetch(&task->completion_state,
+                                                      1, __ATOMIC_ACQ_REL);
+            finishIfComplete(task, state, false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
-
-            check_batch_completion(task, true);
+            const uint64_t state = __atomic_add_fetch(&task->completion_state,
+                                                      1, __ATOMIC_ACQ_REL);
+            finishIfComplete(task, state, true);
         }
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
+        static void unsealTaskSubmission(TransferTask *task) {
+            __atomic_store_n(&task->completion_state, 0, __ATOMIC_RELEASE);
+        }
+
         static void sealTaskSubmission(TransferTask *task) {
-            __atomic_store_n(&task->submission_sealed, true, __ATOMIC_RELEASE);
-            check_batch_completion(task, false, false);
+            const uint64_t state = __atomic_or_fetch(
+                &task->completion_state, kCompletionSealBit, __ATOMIC_ACQ_REL);
+            finishIfComplete(task, state, false);
         }
-#endif
 
         volatile int64_t ts;
 
        private:
-        static inline void check_batch_completion(TransferTask *task,
-                                                  bool is_failed,
-                                                  bool count_slice = true) {
-#ifdef USE_EVENT_DRIVEN_COMPLETION
+        static inline void finishIfComplete(TransferTask *task, uint64_t state,
+                                            bool is_failed) {
+            // Handshake / dummy slices are not attached to a BatchDesc.
+            if (!task->batch_id) return;
             auto &batch_desc = toBatchDesc(task->batch_id);
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
             }
 
-            uint64_t completed =
-                count_slice ? __atomic_add_fetch(&task->completed_slice_count,
-                                                 1, __ATOMIC_ACQ_REL)
-                            : __atomic_load_n(&task->completed_slice_count,
-                                              __ATOMIC_ACQUIRE);
-            if (__atomic_load_n(&task->submission_sealed, __ATOMIC_ACQUIRE) &&
-                completed ==
-                    __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE) &&
-                !__atomic_exchange_n(&task->completion_published, true,
-                                     __ATOMIC_ACQ_REL)) {
-                __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
-
-                // Increment the number of finished tasks in the batch
-                // (relaxed). This counter does not itself publish data; only
-                // the thread that observes the last task completion performs
-                // the release-store on batch_desc.is_finished below. The waiter
-                // pairs this with an acquire load, which makes all prior writes
-                // (including relaxed increments) visible.
-                //
-                // check if this is the last task in the batch
-                auto prev = batch_desc.finished_task_count.fetch_add(
-                    1, std::memory_order_relaxed);
-
-                // Last task in the batch: wake up waiting thread directly
-                if (prev + 1 == batch_desc.batch_size) {
-                    // Publish completion of the entire batch under the same
-                    // mutex used by the waiter to avoid lost notifications.
-                    //
-                    // Keep a release-store because the reader has a fast path
-                    // that may observe completion without taking the mutex. The
-                    // acquire load in that fast path pairs with this release to
-                    // make all prior updates visible. For the predicate checked
-                    // under the mutex, relaxed would suffice since the mutex
-                    // acquire provides the necessary visibility.
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            batch_desc.completion_mutex);
-                        batch_desc.is_finished.store(true,
-                                                     std::memory_order_release);
-                    }
-                    // Notify after releasing the lock to avoid waking threads
-                    // only to block again on the mutex.
-                    batch_desc.completion_cv.notify_all();
-                }
+            const uint64_t done = state & kCompletionDoneMask;
+            const uint64_t slice_count =
+                __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE);
+            if ((state & kCompletionSealBit) == 0 || done != slice_count)
+                return;
+            if (__atomic_exchange_n(&task->completion_published, true,
+                                    __ATOMIC_ACQ_REL)) {
+                return;
             }
+
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+            // Non-EDC: is_finished stays with getTransferStatus on the
+            // completion walk. The WAITING fast path never frees the batch;
+            // COMPLETED always walks first, so CQ must not write is_finished.
+            batch_desc.finished_task_count.fetch_add(1,
+                                                     std::memory_order_acq_rel);
+#else
+            // EDC waiters can freeBatchID after the CV without a walk.
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
+
+            auto prev = batch_desc.finished_task_count.fetch_add(
+                1, std::memory_order_acq_rel);
+            if (prev + 1 != batch_desc.batch_size) return;
+
+            // Last task in the batch: wake up waiting thread directly.
+            // Publish completion under the same mutex used by the waiter
+            // to avoid lost notifications.
+            //
+            // Keep a release-store because the reader has a fast path
+            // that may observe completion without taking the mutex. The
+            // acquire load in that fast path pairs with this release to
+            // make all prior updates visible. For the predicate checked
+            // under the mutex, relaxed would suffice since the mutex
+            // acquire provides the necessary visibility.
+            {
+                std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+                batch_desc.is_finished.store(true, std::memory_order_release);
+            }
+            // Notify after releasing the lock to avoid waking threads
+            // only to block again on the mutex.
+            batch_desc.completion_cv.notify_all();
 #endif
         }
     };
@@ -341,6 +350,15 @@ class Transport {
         volatile uint64_t slice_count = 0;
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
+        // Keep handshake state on the same cacheline as the CQ counters.
+        // markSuccess RMWs success_slice_count and completion_state; if
+        // completion_state sat past offset 64 those would bounce two lines
+        // across CQ workers.
+        volatile bool completion_published = false;
+        // Default sealed so tests/legacy markSuccess paths publish without an
+        // explicit seal. Counter submit unseals, then sealTaskSubmission
+        // republishes.
+        volatile uint64_t completion_state = Slice::kCompletionSealBit;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
@@ -354,12 +372,6 @@ class Transport {
 
 #ifdef WITH_METRICS
         std::chrono::steady_clock::time_point start_time;
-#endif
-
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-        volatile uint64_t completed_slice_count = 0;
-        volatile bool submission_sealed = true;
-        volatile bool completion_published = false;
 #endif
 
         // record the origin request
@@ -393,12 +405,15 @@ class Transport {
         // Completion events do not populate the status-query byte cache.
         std::atomic<bool> status_cached{false};
         std::atomic<uint64_t> finished_transfer_bytes{0};
+        std::atomic<uint64_t> finished_task_count{0};
+
+        // Set before dispatch; true only if every submitted task uses a
+        // transport that publishes completion without foreground polling.
+        // As with task_list, submission and polling must be serialized.
+        bool counter_eligible = false;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Event-driven completion: tracks batch progress and notifies waiters
-        std::atomic<uint64_t> finished_task_count{0};
-
-        // Synchronization primitives for direct notification
         std::mutex completion_mutex;
         std::condition_variable completion_cv;
 #endif
@@ -433,6 +448,12 @@ class Transport {
     // Grouped transports must append slices in request order so scatter can
     // recover per-request status after a grouped task fails.
     virtual bool supportsGroupedScatter() const { return false; }
+
+    // Opt in only if all tasks publish Slice completion without requiring
+    // getTransferStatus() to drive progress. MultiTransport unseals those
+    // tasks, submits, then seals each task after submitTransferTask() has
+    // finished constructing its slices.
+    virtual bool supportsBatchCompletionCounter() const { return false; }
 
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.
