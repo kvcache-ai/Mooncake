@@ -55,6 +55,8 @@ struct HandShakePlugin {
     // second param represents local attributes.
     using OnReceiveCallBack =
         std::function<int(const Json::Value &, Json::Value &)>;
+    using OnReceiveCommand = std::function<void(
+        const std::string &, const std::string &, std::string &)>;
 
     virtual int startDaemon(uint16_t listen_port, int sockfd) = 0;
 
@@ -66,6 +68,10 @@ struct HandShakePlugin {
                            const Json::Value &local, Json::Value &peer) = 0;
     virtual int sendProbe(std::string ip_or_host_name, uint16_t rpc_port,
                           const Json::Value &local, Json::Value &peer) = 0;
+    virtual int sendCommand(std::string ip_or_host_name, uint16_t rpc_port,
+                            const std::string &source_ip,
+                            const std::string &request,
+                            std::string &response) = 0;
 
     // Exchange metadata with remote peer.
     virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
@@ -83,6 +89,7 @@ struct HandShakePlugin {
 
     // Register callback function for receiving liveness probe request.
     virtual void registerOnProbeCallBack(OnReceiveCallBack callback) = 0;
+    virtual void registerOnCommandCallBack(OnReceiveCommand callback) = 0;
 };
 
 std::vector<std::string> findLocalIpAddresses();

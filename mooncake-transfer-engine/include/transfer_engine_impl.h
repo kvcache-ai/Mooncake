@@ -21,10 +21,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -158,6 +160,40 @@ class TransferEngineImpl {
 #endif
         return s;
     }
+
+    struct ScatterSpan {
+        uint64_t source_address;
+        uint32_t length;
+    };
+
+    struct ScatterTransportProfile {
+        double link_bytes_per_second;
+        size_t queue_depth;
+        size_t pipeline_width;
+    };
+
+    struct ScatterPlan {
+        bool gather = false;
+        uint8_t pipeline_depth = 1;
+        size_t chunk_bytes = 1ULL << 20;
+    };
+
+    void setScatterStagingAllocator(
+        TransferEngine::ScatterStagingAllocator allocator);
+    size_t scatterCommandSpanBudget(const std::string& peer_server_name) const;
+    Status requestScatterGather(const std::string& peer_server_name,
+                                uint64_t destination_address,
+                                const std::vector<ScatterSpan>& spans,
+                                uint64_t source_base, uint64_t source_size,
+                                uint64_t total_bytes, size_t chunk_bytes,
+                                uint8_t pipeline_depth);
+    Status transferDirect(const std::vector<TransferRequest>& requests);
+    ScatterTransportProfile scatterTransportProfile() const;
+    static size_t scatterSmallFragmentLimit(
+        const ScatterTransportProfile& profile);
+    static ScatterPlan planScatter(size_t fragments, size_t spans,
+                                   uint64_t bytes,
+                                   const ScatterTransportProfile& profile);
 
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
@@ -470,6 +506,12 @@ class TransferEngineImpl {
 
     void eraseMemoryRegionLocked(void* addr);
 
+    void handleTransferCommand(const std::string& peer_address,
+                               const std::string& request,
+                               std::string& response);
+    Status executeScatterGather(const std::string& peer_address,
+                                std::string_view request);
+
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;
@@ -477,6 +519,11 @@ class TransferEngineImpl {
     MemoryRegionMap local_memory_regions_;
     MemoryRegionMap registering_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
+
+    mutable std::mutex scatter_staging_mutex_;
+    std::condition_variable scatter_staging_cv_;
+    TransferEngine::ScatterStagingAllocator scatter_staging_allocator_;
+    size_t active_scatter_commands_ = 0;
 
     RWSpinlock send_notifies_lock_;
     std::unordered_map<BatchID,

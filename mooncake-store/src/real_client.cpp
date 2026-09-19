@@ -982,6 +982,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 .offset = 0,
             };
         }
+        std::weak_ptr<ClientBufferAllocator> staging_pool =
+            client_buffer_allocator_;
+        client_->SetScatterStagingAllocator([staging_pool](size_t size) {
+            auto pool = staging_pool.lock();
+            if (!pool) return TransferEngine::ScatterStagingBuffer{};
+            auto allocation = pool->allocate(size);
+            if (!allocation) return TransferEngine::ScatterStagingBuffer{};
+            auto owner = std::make_shared<BufferHandle>(std::move(*allocation));
+            return TransferEngine::ScatterStagingBuffer{
+                .data = owner->ptr(),
+                .capacity = owner->size(),
+                .owner = std::move(owner),
+            };
+        });
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
@@ -1459,6 +1473,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
+        client_->SetScatterStagingAllocator({});
         auto unregister_result = client_->unregisterLocalMemory(
             client_buffer_allocator_->getBase(), true);
         if (!unregister_result) {
@@ -4563,6 +4578,24 @@ RealClient::get_into_ranges_internal(
                                 status.ok() ? ErrorCode::LEASE_EXPIRED
                                             : scatter_transfer_error(status));
                             (*results)[k] = tl::unexpected(error);
+                        },
+                    .on_fragment_batch_complete =
+                        [results = &range_results, sizes = &sizes,
+                         lease = &lease_it->second](size_t begin, size_t end,
+                                                    const Status &status) {
+                            if (status.ok() && !lease->error.has_value() &&
+                                std::chrono::steady_clock::now() <
+                                    lease->expires_at) {
+                                for (size_t k = begin; k < end; ++k)
+                                    (*results)[k] =
+                                        static_cast<int64_t>((*sizes)[k]);
+                                return;
+                            }
+                            const auto error = lease->error.value_or(
+                                status.ok() ? ErrorCode::LEASE_EXPIRED
+                                            : scatter_transfer_error(status));
+                            for (size_t k = begin; k < end; ++k)
+                                (*results)[k] = tl::unexpected(error);
                         },
                 });
                 continue;
