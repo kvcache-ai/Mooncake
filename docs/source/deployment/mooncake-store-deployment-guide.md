@@ -238,6 +238,69 @@ the next scheduler/bootstrap read.
 
 ---
 
+### Batch OpLog Capacity Operations
+
+Batch pruning removes keys, but etcd MVCC history and backend files require
+separate compaction and defragmentation. Mooncake does not run these operations.
+The snapshot `compaction_floor` is a **batch ID**, not an etcd revision.
+
+Before enabling pruning through `enable_oplog_snapshot`, deploy compaction-floor
+rebootstrap support to every electable standby; older binaries cannot follow a
+pruned log. Verify shared durable snapshot storage and two distinct, readable
+latest/fallback snapshots, with matching descriptor/manifest cursors and
+`latest.last_included_batch_id > fallback.last_included_batch_id`. Pointer presence
+alone is insufficient. The runtime revalidates both snapshots before pruning;
+rehearse cold restore and promotion before rollout.
+
+Configure `--quota-backend-bytes` for measured history growth and disk headroom.
+For auto-compaction, `--auto-compaction-mode=periodic --auto-compaction-retention=1h`
+is an example; choose retention for all watch/revision consumers and keep member
+configuration consistent. Monitor each member's `dbSize`, `dbSizeInUse`, quota
+utilization and free disk space. Increasing quota does not replace cleanup.
+
+For Mooncake alerts, use `ha_snapshot_active=1` and the metrics described above.
+Snapshot storage outages stall new baselines and pruning; GC failures retain
+orphan artifacts. These failures retain recovery data safely but grow storage
+until availability is at risk. The logical retained suffix does not include
+undeleted keys below the floor. Never lower the floor or manually delete batch
+keys/pointers to clear a capacity alarm.
+
+Use your deployment's TLS/authentication options. Before and after maintenance,
+save these checks; `$ENDPOINTS` lists all members:
+
+```bash
+etcdctl --endpoints="$ENDPOINTS" member list -w json
+etcdctl --endpoints="$ENDPOINTS" endpoint health
+etcdctl --endpoints="$ENDPOINTS" endpoint status -w json
+etcdctl --endpoints="$ENDPOINTS" alarm list
+```
+
+Confirm healthy quorum and identify the leader. Select `$REVISION` from a successful
+linearizable read, respecting required history; with mutations quiesced, the current
+revision can be used for emergency reclamation. Compact once, then defragment one
+member at a time, healthy followers first and leader last. `$MEMBER` must name one
+endpoint. Defrag blocks that member; recheck health/quorum between members and stop
+if degraded. Compare sizes before/after rather than relying only on exit status.
+
+```bash
+etcdctl --endpoints="$MEMBER" compact "$REVISION" --physical
+etcdctl --endpoints="$MEMBER" defrag  # Repeat separately for each member.
+```
+
+For `NOSPACE`: stop/limit mutations → compact → defrag each member → confirm space
+below quota on every member → `etcdctl --endpoints="$ENDPOINTS" alarm disarm` →
+repeat checks and verify a controlled write/read → gradually restore traffic.
+Health probes requiring a commit may fail under the alarm; inspect member status
+as well. After writer fail-stop, Mooncake may need master restart/re-election;
+verify acknowledged data and promotion readiness before resuming load.
+
+See the etcd [maintenance](https://etcd.io/docs/v3.5/op-guide/maintenance/) and
+[configuration](https://etcd.io/docs/v3.5/op-guide/configuration/) guides for details.
+Capacity test commands and evidence are documented in
+`mooncake-store/tests/e2e/readme.md` under “Batch OpLog capacity tests”.
+
+---
+
 ### Tiered Storage with SSD Offload — Cost-Effective Capacity
 
 Extends the cache pool from DRAM to SSD while keeping normal reads and writes on the distributed memory path. With `--enable_offload=true`, completed memory writes are queued for asynchronous SSD persistence through the master control plane. Set `--offload_on_evict=true` to defer that SSD write until the memory eviction path selects an object for reclamation. When `--promotion_on_hit=true`, SSD-only objects can be promoted back to DRAM after repeated reads; admission is gated by `--promotion_admission_threshold`.
