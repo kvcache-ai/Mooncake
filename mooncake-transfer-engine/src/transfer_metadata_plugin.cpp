@@ -45,6 +45,8 @@
 #endif  // USE_ETCD
 
 #include <cassert>
+#include <condition_variable>
+#include <deque>
 #include <set>
 
 #include "common.h"
@@ -793,11 +795,67 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
     }
 
+    struct CommandJob {
+        int fd;
+        std::string peer_address;
+        std::string request;
+    };
+
+    void commandWorker() {
+        while (true) {
+            CommandJob job;
+            OnReceiveCommand callback;
+            {
+                std::unique_lock<std::mutex> lock(command_mutex_);
+                command_cv_.wait(lock, [this] {
+                    return command_stopping_ || !command_queue_.empty();
+                });
+                if (command_stopping_ && command_queue_.empty()) return;
+                job = std::move(command_queue_.front());
+                command_queue_.pop_front();
+                callback = on_command_callback_;
+            }
+
+            std::string response;
+            try {
+                if (callback) callback(job.peer_address, job.request, response);
+            } catch (const std::exception &exception) {
+                LOG(ERROR) << "SocketHandShakePlugin: command failed: "
+                           << exception.what();
+                response.clear();
+            } catch (...) {
+                LOG(ERROR) << "SocketHandShakePlugin: command failed";
+                response.clear();
+            }
+            if (writeString(job.fd, HandShakeRequestType::TransferCommand,
+                            response)) {
+                LOG(ERROR) << "SocketHandShakePlugin: failed to send command "
+                              "response";
+            }
+            close(job.fd);
+        }
+    }
+
+    void stopCommandWorkers() {
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            command_stopping_ = true;
+        }
+        command_cv_.notify_all();
+        for (auto &worker : command_workers_) worker.join();
+        command_workers_.clear();
+        while (!command_queue_.empty()) {
+            close(command_queue_.front().fd);
+            command_queue_.pop_front();
+        }
+    }
+
     virtual ~SocketHandShakePlugin() {
         if (listener_running_) {
             listener_running_ = false;
             listener_.join();
         }
+        stopCommandWorkers();
         closeListen();
     }
 
@@ -815,6 +873,16 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     virtual void registerOnProbeCallBack(OnReceiveCallBack callback) {
         on_probe_callback_ = callback;
+    }
+
+    virtual void registerOnCommandCallBack(OnReceiveCommand callback) {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        on_command_callback_ = std::move(callback);
+        if (on_command_callback_ && command_workers_.empty()) {
+            command_stopping_ = false;
+            for (size_t i = 0; i < kCommandWorkerCount; ++i)
+                command_workers_.emplace_back([this] { commandWorker(); });
+        }
     }
 
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
@@ -893,8 +961,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         listener_running_ = true;
         listener_ = std::thread([this]() {
             while (listener_running_) {
-                sockaddr_in addr;
-                socklen_t addr_len = sizeof(sockaddr_in);
+                sockaddr_storage addr{};
+                socklen_t addr_len = sizeof(addr);
                 int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
                     if (errno != EWOULDBLOCK && errno != EINTR)
@@ -902,7 +970,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                if (addr.sin_family != AF_INET && addr.sin_family != AF_INET6) {
+                if (addr.ss_family != AF_INET && addr.ss_family != AF_INET6) {
                     LOG(ERROR) << "SocketHandShakePlugin: unsupported socket "
                                   "type, should be AF_INET or AF_INET6";
                     close(conn_fd);
@@ -928,6 +996,32 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 auto [type, json_str] = readString(conn_fd);
                 if (type == HandShakeRequestType::Invalid) {
                     close(conn_fd);
+                    continue;
+                }
+
+                if (type == HandShakeRequestType::TransferCommand) {
+                    timeout.tv_sec = 60;
+                    if (setsockopt(conn_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                                   sizeof(timeout))) {
+                        close(conn_fd);
+                        continue;
+                    }
+                    bool queued = false;
+                    {
+                        std::lock_guard<std::mutex> lock(command_mutex_);
+                        if (on_command_callback_ &&
+                            command_queue_.size() < kCommandQueueDepth) {
+                            command_queue_.push_back(CommandJob{
+                                conn_fd, peer_hostname, std::move(json_str)});
+                            queued = true;
+                        }
+                    }
+                    if (queued) {
+                        command_cv_.notify_one();
+                    } else {
+                        writeString(conn_fd, type, {});
+                        close(conn_fd);
+                    }
                     continue;
                 }
 
@@ -1072,6 +1166,28 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
+    virtual int sendCommand(std::string ip_or_host_name, uint16_t rpc_port,
+                            const std::string &source_ip,
+                            const std::string &request, std::string &response) {
+        struct addrinfo hints {};
+        struct addrinfo *result = nullptr;
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        char service[16];
+        sprintf(service, "%u", rpc_port);
+        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result))
+            return ERR_DNS;
+
+        int ret = ERR_SOCKET;
+        for (auto *address = result; address; address = address->ai_next) {
+            ret = doSendCommand(address, source_ip, request, response);
+            if (ret == 0) break;
+        }
+        freeaddrinfo(result);
+        return ret;
+    }
+
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
                      const Json::Value &local, Json::Value &peer) {
         struct addrinfo hints;
@@ -1108,7 +1224,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    int doConnect(struct addrinfo *addr, int &conn_fd) {
+    int doConnect(struct addrinfo *addr, int &conn_fd,
+                  const std::string &source_ip = {}) {
         int on = 1;
         conn_fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
         if (conn_fd == -1) {
@@ -1119,6 +1236,29 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
             close(conn_fd);
             return ERR_SOCKET;
+        }
+
+        if (!source_ip.empty()) {
+            struct addrinfo hints {};
+            struct addrinfo *sources = nullptr;
+            hints.ai_family = addr->ai_family;
+            hints.ai_socktype = addr->ai_socktype;
+            if (getaddrinfo(source_ip.c_str(), "0", &hints, &sources)) {
+                close(conn_fd);
+                return ERR_DNS;
+            }
+            bool bound = false;
+            for (auto *source = sources; source; source = source->ai_next) {
+                if (bind(conn_fd, source->ai_addr, source->ai_addrlen) == 0) {
+                    bound = true;
+                    break;
+                }
+            }
+            freeaddrinfo(sources);
+            if (!bound) {
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
         }
 
         struct timeval timeout;
@@ -1366,6 +1506,28 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
+    int doSendCommand(struct addrinfo *addr, const std::string &source_ip,
+                      const std::string &request, std::string &response) {
+        int conn_fd = -1;
+        int ret = doConnect(addr, conn_fd, source_ip);
+        if (ret) return ret;
+
+        ret = writeString(conn_fd, HandShakeRequestType::TransferCommand,
+                          request);
+        if (ret) {
+            close(conn_fd);
+            return ret;
+        }
+        auto [type, wire_response] = readString(conn_fd);
+        if (type != HandShakeRequestType::TransferCommand) {
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+        response = std::move(wire_response);
+        close(conn_fd);
+        return 0;
+    }
+
     int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
                        Json::Value &peer_metadata) {
         int conn_fd = -1;
@@ -1412,6 +1574,15 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::thread listener_;
     int listen_fd_;
     int listen_backlog_;
+
+    static constexpr size_t kCommandWorkerCount = 4;
+    static constexpr size_t kCommandQueueDepth = 16;
+    std::mutex command_mutex_;
+    std::condition_variable command_cv_;
+    std::deque<CommandJob> command_queue_;
+    std::vector<std::thread> command_workers_;
+    OnReceiveCommand on_command_callback_;
+    bool command_stopping_ = false;
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;

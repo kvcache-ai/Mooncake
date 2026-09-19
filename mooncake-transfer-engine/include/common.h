@@ -64,6 +64,7 @@ enum class HandShakeRequestType {
     Metadata = 1,
     Notify = 2,
     Probe = 3,
+    TransferCommand = 4,
     Invalid = 0xfe,
     // placeholder for old protocol without RequestType
     OldProtocol = 0xff,
@@ -501,6 +502,7 @@ static inline int writeString(int fd, const HandShakeRequestType type,
 // Constants for handshake max length configuration
 constexpr size_t kDefaultHandshakeMaxLength = 1ULL << 20;  // 1MB (also minimum)
 constexpr size_t kMaxHandshakeMaxLength = 128ULL << 20;    // 128MB
+constexpr size_t kMaxTransferCommandLength = 1ULL << 20;
 
 // Load handshake max length from environment variable.
 static inline size_t loadHandshakeMaxLength() {
@@ -553,22 +555,39 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
         return {type, ""};
     }
 
-    std::string str;
-    std::vector<char> buffer(length);
-    n = readFully(fd, buffer.data(), length);
-    if (n != (ssize_t)length) {
+    char first = 0;
+    n = readFully(fd, &first, sizeof(first));
+    if (n != static_cast<ssize_t>(sizeof(first))) {
         LOG(ERROR) << "readString: unexpected length, got: " << n
-                   << ", expected: " << length;
+                   << ", expected at least one byte";
         return {type, ""};
     }
 
-    if (buffer[0] <= static_cast<char>(HandShakeRequestType::Probe)) {
-        type = static_cast<HandShakeRequestType>(buffer[0]);
-        str.assign(buffer.data() + sizeof(char), length - sizeof(char));
+    const bool typed =
+        static_cast<unsigned char>(first) <=
+        static_cast<unsigned char>(HandShakeRequestType::TransferCommand);
+    if (typed) {
+        type = static_cast<HandShakeRequestType>(first);
+        if (type == HandShakeRequestType::TransferCommand &&
+            length > kMaxTransferCommandLength) {
+            LOG(ERROR) << "readString: transfer command exceeds "
+                       << kMaxTransferCommandLength << " bytes";
+            return {HandShakeRequestType::Invalid, ""};
+        }
     } else {
         type = HandShakeRequestType::OldProtocol;
-        // Old protocol, no type
-        str.assign(buffer.data(), length);
+    }
+
+    const size_t remaining = length - sizeof(first);
+    std::string str;
+    str.resize(typed ? remaining : length);
+    if (!typed) str[0] = first;
+    char *destination = str.data() + (typed ? 0 : 1);
+    n = readFully(fd, destination, remaining);
+    if (n != static_cast<ssize_t>(remaining)) {
+        LOG(ERROR) << "readString: unexpected length, got: " << n
+                   << ", expected: " << remaining;
+        return {HandShakeRequestType::Invalid, ""};
     }
 
     return {type, str};

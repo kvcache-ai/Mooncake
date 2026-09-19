@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <chrono>
 #include <cassert>
+#include <cmath>
+#include <future>
 #include <limits>
 #include <thread>
 #include <unordered_map>
@@ -1153,9 +1156,11 @@ class TransferEngine::ScatterTransferOperation::Impl {
          const std::vector<ScatterTransferRange>& ranges)
         : backend_(std::move(backend)) {
         callbacks_.reserve(ranges.size());
+        batch_callbacks_.reserve(ranges.size());
         size_t fragment_count = 0;
         for (const auto& range : ranges) {
             callbacks_.push_back(range.on_fragment_complete);
+            batch_callbacks_.push_back(range.on_fragment_batch_complete);
             fragment_count += range.lengths.size();
         }
         requests_.reserve(fragment_count);
@@ -1262,8 +1267,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
         aggregate_status_ = closeSegments(aggregate_status_);
         completed_ = true;
         callbacks_.clear();
+        batch_callbacks_.clear();
         requests_.clear();
         request_fragments_.clear();
+        gather_fragment_runs_.clear();
         done_.clear();
         task_sizes_.clear();
         backend_ = {};
@@ -1287,6 +1294,45 @@ class TransferEngine::ScatterTransferOperation::Impl {
             request_fragments_[request_index];
         done_[request_index] = true;
         complete(range_index, fragment_index, status);
+    }
+
+    void completeBatch(size_t range_index, size_t begin, size_t end,
+                       const Status& status) {
+        const auto& callback = batch_callbacks_[range_index];
+        if (!callback) {
+            for (size_t fragment = begin; fragment < end; ++fragment)
+                complete(range_index, fragment, status);
+            return;
+        }
+        remember(status);
+        try {
+            callback(begin, end, status);
+        } catch (...) {
+            LOG(ERROR) << "scatter transfer batch callback failed";
+            remember(Status::Context("scatter transfer batch callback failed"));
+        }
+    }
+
+    void completeRequests(size_t begin, size_t end, const Status& status) {
+        size_t request = begin;
+        while (request < end) {
+            const auto [range_index, fragment_begin] =
+                request_fragments_[request];
+            size_t run_end = request + 1;
+            done_[request] = true;
+            while (run_end < end) {
+                const auto [next_range, next_fragment] =
+                    request_fragments_[run_end];
+                if (next_range != range_index ||
+                    next_fragment != fragment_begin + run_end - request) {
+                    break;
+                }
+                done_[run_end++] = true;
+            }
+            completeBatch(range_index, fragment_begin,
+                          fragment_begin + run_end - request, status);
+            request = run_end;
+        }
     }
 
     void failPending(const Status& status) {
@@ -1313,8 +1359,471 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #endif
     }
 
+    struct FragmentRun {
+        size_t range;
+        size_t begin;
+        size_t end;
+    };
+
+    struct GatherTask {
+        std::string peer;
+        uint64_t destination = 0;
+        uint64_t source_region_base = 0;
+        uint64_t source_region_size = 0;
+        uint64_t source_base = 0;
+        uint64_t source_size = 0;
+        uint64_t total_bytes = 0;
+        size_t encoded_span_bytes = 0;
+        size_t command_span_budget = 0;
+        size_t chunk_bytes = 0;
+        uint8_t pipeline_depth = 1;
+        uint32_t fixed_span_length = 0;
+        size_t fragment_count = 0;
+        std::vector<TransferEngineImpl::ScatterSpan> spans;
+        std::vector<uint32_t> span_fragment_counts;
+        std::vector<FragmentRun> fragment_runs;
+    };
+
+    struct GatherResult {
+        std::vector<FragmentRun> fragment_runs;
+        Status status;
+    };
+
+    size_t tryBuildGather(const std::vector<ScatterTransferRange>& ranges,
+                          size_t total_fragments,
+                          std::vector<std::vector<bool>>& gather_fragments) {
+        if (useTent() || !backend_.legacy || ranges.empty()) return 0;
+        const auto profile = backend_.legacy->scatterTransportProfile();
+        const size_t small_limit =
+            TransferEngineImpl::scatterSmallFragmentLimit(profile);
+        if (small_limit == 0) return 0;
+        constexpr size_t kMaxTaskFragments = 131072;
+
+        bool has_gather_work = false;
+        bool all_gather_work = true;
+        for (const auto& range : ranges) {
+            const size_t count = range.local_offsets.size();
+            if (range.opcode != TransferRequest::READ || !range.local_buffer ||
+                range.remote_segment.empty() ||
+                range.remote_offsets.size() != count ||
+                range.lengths.size() != count) {
+                all_gather_work = false;
+                continue;
+            }
+            for (const size_t length : range.lengths) {
+                if (length != 0 && length < small_limit) {
+                    has_gather_work = true;
+                } else {
+                    all_gather_work = false;
+                }
+            }
+        }
+        if (!has_gather_work) return 0;
+
+        std::vector<GatherTask> tasks;
+        tasks.reserve(profile.pipeline_width);
+        GatherTask candidate;
+        uint64_t expected_destination = 0;
+        const auto startCandidate =
+            [&](const std::string& peer, uint64_t destination,
+                uint64_t source_region_base, uint64_t source_region_size,
+                uint64_t source, size_t length, size_t fragment_capacity) {
+                candidate.peer = peer;
+                candidate.destination = destination;
+                candidate.source_region_base = source_region_base;
+                candidate.source_region_size = source_region_size;
+                candidate.source_base = source;
+                candidate.source_size = length;
+                candidate.command_span_budget =
+                    backend_.legacy->scatterCommandSpanBudget(peer);
+                fragment_capacity =
+                    std::min(fragment_capacity, kMaxTaskFragments);
+                candidate.spans.reserve(fragment_capacity);
+                candidate.span_fragment_counts.reserve(fragment_capacity);
+                candidate.fragment_runs.reserve(ranges.size());
+            };
+        auto flush = [&] {
+            if (candidate.fragment_count == 0) return;
+            const auto decision = TransferEngineImpl::planScatter(
+                candidate.fragment_count, candidate.spans.size(),
+                candidate.total_bytes, profile);
+            if (decision.gather) {
+                candidate.chunk_bytes = decision.chunk_bytes;
+                candidate.pipeline_depth = decision.pipeline_depth;
+                const size_t shard_count =
+                    all_gather_work ? std::min<size_t>(decision.pipeline_depth,
+                                                       candidate.spans.size())
+                                    : 1;
+                if (shard_count == 1) {
+                    tasks.push_back(std::move(candidate));
+                } else {
+                    size_t span_begin = 0;
+                    size_t run_index = 0;
+                    size_t run_offset = 0;
+                    uint64_t destination_offset = 0;
+                    uint64_t assigned_bytes = 0;
+                    size_t assigned_fragments = 0;
+                    for (size_t shard_index = 0; shard_index < shard_count;
+                         ++shard_index) {
+                        const size_t shards_left = shard_count - shard_index;
+                        const uint64_t target_bytes = candidate.total_bytes *
+                                                      (shard_index + 1) /
+                                                      shard_count;
+                        size_t span_end = span_begin;
+                        uint64_t shard_bytes = 0;
+                        size_t shard_fragments = 0;
+                        while (span_end < candidate.spans.size()) {
+                            if (span_end > span_begin &&
+                                assigned_bytes + shard_bytes >= target_bytes &&
+                                candidate.spans.size() - span_end >=
+                                    shards_left - 1) {
+                                break;
+                            }
+                            shard_bytes += candidate.spans[span_end].length;
+                            shard_fragments +=
+                                candidate.span_fragment_counts[span_end];
+                            ++span_end;
+                            if (candidate.spans.size() - span_end <
+                                shards_left - 1) {
+                                break;
+                            }
+                        }
+
+                        GatherTask shard;
+                        shard.peer = candidate.peer;
+                        shard.destination =
+                            candidate.destination + destination_offset;
+                        shard.source_region_base = candidate.source_region_base;
+                        shard.source_region_size = candidate.source_region_size;
+                        shard.total_bytes = shard_bytes;
+                        shard.command_span_budget =
+                            candidate.command_span_budget;
+                        shard.chunk_bytes = decision.chunk_bytes;
+                        shard.pipeline_depth = 1;
+                        shard.fragment_count = shard_fragments;
+                        shard.spans.assign(candidate.spans.begin() + span_begin,
+                                           candidate.spans.begin() + span_end);
+                        uint64_t source_begin = UINT64_MAX;
+                        uint64_t source_end = 0;
+                        for (const auto& span : shard.spans) {
+                            source_begin =
+                                std::min(source_begin, span.source_address);
+                            source_end = std::max(
+                                source_end, span.source_address + span.length);
+                        }
+                        shard.source_base = source_begin;
+                        shard.source_size = source_end - source_begin;
+                        DCHECK_LE(shard.source_size, UINT32_MAX);
+
+                        size_t remaining = shard_fragments;
+                        while (remaining != 0) {
+                            const auto& run =
+                                candidate.fragment_runs[run_index];
+                            const size_t begin = run.begin + run_offset;
+                            const size_t available = run.end - begin;
+                            const size_t take = std::min(remaining, available);
+                            shard.fragment_runs.push_back(
+                                {run.range, begin, begin + take});
+                            remaining -= take;
+                            run_offset += take;
+                            if (run_offset == run.end - run.begin) {
+                                ++run_index;
+                                run_offset = 0;
+                            }
+                        }
+                        tasks.push_back(std::move(shard));
+                        span_begin = span_end;
+                        destination_offset += shard_bytes;
+                        assigned_bytes += shard_bytes;
+                        assigned_fragments += shard_fragments;
+                    }
+                    DCHECK_EQ(assigned_bytes, candidate.total_bytes);
+                    DCHECK_EQ(assigned_fragments, candidate.fragment_count);
+                }
+            }
+            candidate = {};
+            expected_destination = 0;
+        };
+
+        for (size_t range_index = 0; range_index < ranges.size();
+             ++range_index) {
+            const auto& range = ranges[range_index];
+            const size_t count = range.local_offsets.size();
+            if (range.opcode != TransferRequest::READ || !range.local_buffer ||
+                range.remote_segment.empty() ||
+                range.remote_offsets.size() != count ||
+                range.lengths.size() != count) {
+                flush();
+                continue;
+            }
+            for (size_t fragment_index = 0; fragment_index < count;
+                 ++fragment_index) {
+                const size_t length = range.lengths[fragment_index];
+                const size_t local_offset = range.local_offsets[fragment_index];
+                const size_t remote_offset =
+                    range.remote_offsets[fragment_index];
+                if (length == 0 || length >= small_limit ||
+                    local_offset > range.local_capacity ||
+                    length > range.local_capacity - local_offset ||
+                    remote_offset > range.remote_size ||
+                    length > range.remote_size - remote_offset ||
+                    range.remote_base_offset > UINT64_MAX - remote_offset) {
+                    flush();
+                    continue;
+                }
+                const uint64_t destination = reinterpret_cast<uint64_t>(
+                    static_cast<char*>(range.local_buffer) + local_offset);
+                const uint64_t source =
+                    range.remote_base_offset + remote_offset;
+                if (destination > UINT64_MAX - length ||
+                    source > UINT64_MAX - length) {
+                    flush();
+                    continue;
+                }
+                if (candidate.fragment_count != 0 &&
+                    (candidate.peer != range.remote_segment ||
+                     candidate.source_region_base != range.remote_base_offset ||
+                     candidate.source_region_size != range.remote_size ||
+                     destination != expected_destination)) {
+                    flush();
+                }
+                if (candidate.fragment_count == 0) {
+                    startCandidate(range.remote_segment, destination,
+                                   range.remote_base_offset, range.remote_size,
+                                   source, length, count - fragment_index);
+                    if (candidate.command_span_budget == 0) {
+                        candidate = {};
+                        continue;
+                    }
+                }
+                if (candidate.fragment_count >= kMaxTaskFragments ||
+                    candidate.total_bytes > (512ULL << 20) - length) {
+                    flush();
+                    startCandidate(range.remote_segment, destination,
+                                   range.remote_base_offset, range.remote_size,
+                                   source, length, count - fragment_index);
+                }
+
+                const uint64_t source_begin =
+                    std::min(candidate.source_base, source);
+                const uint64_t source_end =
+                    std::max(candidate.source_base + candidate.source_size,
+                             source + length);
+                if (source_end - source_begin > UINT32_MAX) {
+                    flush();
+                    startCandidate(range.remote_segment, destination,
+                                   range.remote_base_offset, range.remote_size,
+                                   source, length, count - fragment_index);
+                } else {
+                    candidate.source_base = source_begin;
+                    candidate.source_size = source_end - source_begin;
+                }
+
+                bool coalesces =
+                    !candidate.spans.empty() &&
+                    candidate.spans.back().source_address <=
+                        UINT64_MAX - candidate.spans.back().length &&
+                    candidate.spans.back().source_address +
+                            candidate.spans.back().length ==
+                        source &&
+                    candidate.spans.back().length <= (1ULL << 20) - length;
+                size_t encoded_span_bytes = candidate.encoded_span_bytes;
+                uint32_t fixed_span_length = candidate.fixed_span_length;
+                if (coalesces) {
+                    if (candidate.spans.size() == 1) {
+                        fixed_span_length = static_cast<uint32_t>(
+                            candidate.spans.back().length + length);
+                    } else {
+                        fixed_span_length = 0;
+                    }
+                } else if (candidate.spans.empty()) {
+                    fixed_span_length = static_cast<uint32_t>(length);
+                } else if (fixed_span_length != length) {
+                    fixed_span_length = 0;
+                }
+                encoded_span_bytes =
+                    (candidate.spans.size() + (coalesces ? 0 : 1)) *
+                    (fixed_span_length ? sizeof(uint32_t)
+                                       : 2 * sizeof(uint32_t));
+                if (encoded_span_bytes > candidate.command_span_budget &&
+                    candidate.fragment_count != 0) {
+                    flush();
+                    startCandidate(range.remote_segment, destination,
+                                   range.remote_base_offset, range.remote_size,
+                                   source, length, count - fragment_index);
+                    coalesces = false;
+                    encoded_span_bytes = sizeof(uint32_t);
+                }
+                if (coalesces) {
+                    candidate.spans.back().length +=
+                        static_cast<uint32_t>(length);
+                    ++candidate.span_fragment_counts.back();
+                } else {
+                    candidate.spans.push_back(
+                        {source, static_cast<uint32_t>(length)});
+                    candidate.span_fragment_counts.push_back(1);
+                }
+                if (candidate.spans.size() == 1) {
+                    candidate.fixed_span_length =
+                        candidate.spans.front().length;
+                } else if (coalesces || candidate.fixed_span_length != length) {
+                    candidate.fixed_span_length = 0;
+                }
+                candidate.encoded_span_bytes = encoded_span_bytes;
+                if (!candidate.fragment_runs.empty() &&
+                    candidate.fragment_runs.back().range == range_index &&
+                    candidate.fragment_runs.back().end == fragment_index) {
+                    ++candidate.fragment_runs.back().end;
+                } else {
+                    candidate.fragment_runs.push_back(
+                        {range_index, fragment_index, fragment_index + 1});
+                }
+                ++candidate.fragment_count;
+                candidate.total_bytes += length;
+                expected_destination = destination + length;
+            }
+        }
+        flush();
+        if (tasks.empty()) return 0;
+
+        size_t planned_fragments = 0;
+        for (const auto& task : tasks) planned_fragments += task.fragment_count;
+
+        if (planned_fragments != total_fragments) {
+            gather_fragments.reserve(ranges.size());
+            for (const auto& range : ranges)
+                gather_fragments.emplace_back(range.lengths.size(), false);
+        }
+        gather_fragment_runs_.reserve(tasks.size());
+        for (const auto& task : tasks) {
+            for (const auto& run : task.fragment_runs) {
+                if (!gather_fragments.empty()) {
+                    for (size_t fragment = run.begin; fragment < run.end;
+                         ++fragment)
+                        gather_fragments[run.range][fragment] = true;
+                }
+                if (!gather_fragment_runs_.empty() &&
+                    gather_fragment_runs_.back().range == run.range &&
+                    gather_fragment_runs_.back().end == run.begin) {
+                    gather_fragment_runs_.back().end = run.end;
+                } else {
+                    gather_fragment_runs_.push_back(run);
+                }
+            }
+        }
+
+        try {
+            auto impl = backend_.legacy;
+            const size_t max_parallel =
+                std::max<size_t>(1, profile.pipeline_width);
+            gather_future_ = std::async(
+                std::launch::async,
+                [impl, max_parallel, tasks = std::move(tasks)]() mutable {
+                    const auto run_task = [impl](GatherTask task) {
+                        GatherResult result;
+                        result.fragment_runs = std::move(task.fragment_runs);
+                        Status status = impl->requestScatterGather(
+                            task.peer, task.destination, task.spans,
+                            task.source_base, task.source_size,
+                            task.total_bytes, task.chunk_bytes,
+                            task.pipeline_depth);
+                        if (!status.ok()) {
+                            const auto segment = impl->openSegment(task.peer);
+                            if (segment == static_cast<SegmentHandle>(
+                                               ERR_INVALID_ARGUMENT)) {
+                                status = Status::Endpoint(
+                                    "failed to open direct fallback segment");
+                            } else {
+                                std::vector<TransferRequest> requests;
+                                requests.reserve(task.spans.size());
+                                uint64_t destination = task.destination;
+                                for (const auto& span : task.spans) {
+                                    requests.push_back(TransferRequest{
+                                        .opcode = TransferRequest::READ,
+                                        .source = reinterpret_cast<void*>(
+                                            destination),
+                                        .target_id = segment,
+                                        .target_offset = span.source_address,
+                                        .length = span.length,
+                                        .task_group_id = 1,
+                                    });
+                                    destination += span.length;
+                                }
+                                status = impl->transferDirect(requests);
+                                if (impl->closeSegment(segment) != 0 &&
+                                    status.ok())
+                                    status = Status::Endpoint(
+                                        "failed to close direct fallback "
+                                        "segment");
+                            }
+                        }
+                        result.status = std::move(status);
+                        return result;
+                    };
+                    std::vector<GatherResult> results(tasks.size());
+                    for (size_t wave = 0; wave < tasks.size();
+                         wave += max_parallel) {
+                        const size_t wave_end =
+                            std::min(tasks.size(), wave + max_parallel);
+                        std::vector<std::future<GatherResult>> futures;
+                        futures.reserve(wave_end - wave);
+                        for (size_t i = wave; i < wave_end; ++i) {
+                            futures.push_back(std::async(std::launch::async,
+                                                         run_task,
+                                                         std::move(tasks[i])));
+                        }
+                        for (size_t i = wave; i < wave_end; ++i)
+                            results[i] = futures[i - wave].get();
+                    }
+                    return results;
+                });
+        } catch (...) {
+            gather_future_ = {};
+            if (!gather_fragments.empty()) {
+                for (const auto& run : gather_fragment_runs_)
+                    for (size_t fragment = run.begin; fragment < run.end;
+                         ++fragment)
+                        gather_fragments[run.range][fragment] = false;
+            }
+            gather_fragment_runs_.clear();
+            return 0;
+        }
+        return planned_fragments;
+    }
+
+    bool pollGather() {
+        if (!gather_future_.valid()) return false;
+        if (gather_future_.wait_for(std::chrono::nanoseconds::zero()) !=
+            std::future_status::ready)
+            return true;
+        const auto complete_fragments = [&](const auto& runs,
+                                            const Status& status) {
+            for (const auto& run : runs)
+                completeBatch(run.range, run.begin, run.end, status);
+        };
+        try {
+            auto results = gather_future_.get();
+            for (const auto& result : results)
+                complete_fragments(result.fragment_runs, result.status);
+        } catch (...) {
+            const auto status = Status::Context("scatter gather worker failed");
+            for (const auto& run : gather_fragment_runs_)
+                completeBatch(run.range, run.begin, run.end, status);
+        }
+        gather_fragment_runs_.clear();
+        return false;
+    }
+
     void build(TransferEngine& engine,
                const std::vector<ScatterTransferRange>& ranges) {
+        size_t total_fragments = 0;
+        for (const auto& range : ranges)
+            total_fragments += range.local_offsets.size();
+        std::vector<std::vector<bool>> gather_fragments;
+        const size_t gathered_fragments =
+            tryBuildGather(ranges, total_fragments, gather_fragments);
+        if (gathered_fragments == total_fragments && gather_future_.valid())
+            return;
         for (size_t range_index = 0; range_index < ranges.size();
              ++range_index) {
             const auto& range = ranges[range_index];
@@ -1333,6 +1842,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
 
             for (size_t fragment_index = 0; fragment_index < fragment_count;
                  ++fragment_index) {
+                if (!gather_fragments.empty() &&
+                    fragment_index < gather_fragments[range_index].size() &&
+                    gather_fragments[range_index][fragment_index])
+                    continue;
                 const size_t length = range.lengths[fragment_index];
                 const size_t local_offset = range.local_offsets[fragment_index];
                 const size_t remote_offset =
@@ -1385,9 +1898,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 request_fragments_.emplace_back(range_index, fragment_index);
             }
         }
-
         if (requests_.empty()) {
-            finish();
+            if (!gather_future_.valid()) finish();
             return;
         }
 
@@ -1411,7 +1923,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                             ? Status::InvalidArgument(
                                   "failed to allocate scatter transfer batch")
                             : submit_status);
-            finish();
+            if (!gather_future_.valid()) finish();
             return;
         }
 
@@ -1445,10 +1957,15 @@ class TransferEngine::ScatterTransferOperation::Impl {
         remember(freeBatch(batch_id_));
         batch_id_ = INVALID_BATCH_ID;
         failPending(submit_status);
-        finish();
+        if (!gather_future_.valid()) finish();
     }
 
     void poll() {
+        const bool gather_pending = pollGather();
+        if (batch_id_ == INVALID_BATCH_ID) {
+            if (!gather_pending) finish();
+            return;
+        }
         size_t request_index = 0;
         for (size_t task_id = 0; task_id < task_sizes_.size(); ++task_id) {
             const size_t request_start = request_index;
@@ -1504,8 +2021,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     Status::Socket("scatter transfer fragment failed");
             }
             if (!fragment_status.ok()) requestAbort(fragment_status);
-            for (size_t i = request_start; i < request_index; ++i)
-                completeRequest(i, fragment_status);
+            completeRequests(request_start, request_index, fragment_status);
             --remaining_;
         }
         assert(request_index == requests_.size());
@@ -1515,16 +2031,20 @@ class TransferEngine::ScatterTransferOperation::Impl {
         if (free_status.IsBatchBusy()) return;
         remember(free_status);
         batch_id_ = INVALID_BATCH_ID;
-        finish();
+        if (!gather_pending) finish();
     }
 
     Backend backend_;
     std::vector<TransferRequest> requests_;
     std::vector<std::pair<size_t, size_t>> request_fragments_;
     std::vector<std::function<void(size_t, const Status&)>> callbacks_;
+    std::vector<std::function<void(size_t, size_t, const Status&)>>
+        batch_callbacks_;
     std::unordered_map<std::string, SegmentHandle> segment_handles_;
     std::vector<uint8_t> done_;
     std::vector<size_t> task_sizes_;
+    std::future<std::vector<GatherResult>> gather_future_;
+    std::vector<FragmentRun> gather_fragment_runs_;
     BatchID batch_id_ = INVALID_BATCH_ID;
     size_t remaining_ = 0;
     Status aggregate_status_;
@@ -1556,6 +2076,12 @@ Status TransferEngine::ScatterTransferOperation::waitFor(
     return impl_
                ? impl_->waitFor(timeout)
                : Status::InvalidArgument("invalid scatter transfer operation");
+}
+
+void TransferEngine::setScatterStagingAllocator(
+    ScatterStagingAllocator allocator) {
+    if (!use_tent_ && impl_)
+        impl_->setScatterStagingAllocator(std::move(allocator));
 }
 
 TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(

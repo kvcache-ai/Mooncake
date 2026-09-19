@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <shared_mutex>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -176,6 +177,7 @@ class TransferMetadata {
         std::string ip_or_host_name;
         uint16_t rpc_port;
         uint64_t metadata_version{0};
+        std::string command_capability;
 #ifdef USE_BAREX
         uint16_t barex_port;
 #endif
@@ -205,6 +207,8 @@ class TransferMetadata {
         uint32_t notify_qp_num = 0;
         uint16_t notify_rq_depth = 0;
         bool ctrl_channel = false;
+        // Opaque token advertising support for authenticated binary commands.
+        std::string command_capability;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
@@ -294,6 +298,12 @@ class TransferMetadata {
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);
     int sendProbe(const std::string &peer_server_name);
 
+    using OnReceiveCommand =
+        std::function<void(const std::string &peer_address,
+                           const std::string &request, std::string &response)>;
+    void registerOnCommandCallBack(OnReceiveCommand callback);
+    int sendCommand(const std::string &peer_server_name,
+                    const std::string &request, std::string &response);
     void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);
 
@@ -339,6 +349,10 @@ class TransferMetadata {
     RWSpinlock rpc_meta_lock_;
     std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
     RpcMetaDesc local_rpc_meta_;
+
+    std::shared_mutex command_mutex_;
+    OnReceiveCommand on_command_callback_;
+    std::string command_capability_;
 
     std::atomic<SegmentID> next_segment_id_;
 
