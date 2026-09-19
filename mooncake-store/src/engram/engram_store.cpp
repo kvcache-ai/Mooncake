@@ -1,24 +1,160 @@
 #include "engram/engram_store.h"
 
-#include <cstring>
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstring>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <system_error>
+#include <unistd.h>
 #include <vector>
 
+#include "client_buffer.h"
 #include "pyclient.h"
 
 namespace mooncake {
 namespace engram {
 
 struct EngramStore::QueryCacheEntry {
+    std::vector<int> layer_ids;
     mooncake::PyClient::RangedReadSnapshot snapshot;
 };
 
+// Local table mappings use the same RAII buffer handle as Store client buffers.
+// A layer directory is published atomically, after all heads have been copied.
+// Published files are immutable; removing them is an explicit deployment
+// action.
+struct EngramStore::LocalTables {
+    std::vector<BufferHandle> heads;
+
+    struct File {
+        int fd;
+        File(const std::filesystem::path& path, int flags)
+            : fd(::open(path.c_str(), flags | O_CLOEXEC, 0600)) {
+            if (fd < 0)
+                throw std::system_error(errno, std::generic_category(),
+                                        path.string());
+        }
+        ~File() { ::close(fd); }
+        File(const File&) = delete;
+        File& operator=(const File&) = delete;
+    };
+
+    static std::filesystem::path path(const std::string& root, int layer_id) {
+        return std::filesystem::path(root) /
+               ("layer-" + std::to_string(layer_id));
+    }
+
+    static std::string layout(const EngramStoreConfig& cfg) {
+        std::ostringstream out;
+        out << "mooncake-engram-v1\n" << cfg.row_bytes << '\n';
+        for (auto rows : cfg.table_vocab_sizes) out << rows << '\n';
+        return out.str();
+    }
+
+    static BufferHandle map(int fd, size_t size, bool writable) {
+        void* ptr =
+            ::mmap(nullptr, size, PROT_READ | (writable ? PROT_WRITE : 0),
+                   MAP_SHARED | (writable ? 0 : MAP_POPULATE), fd, 0);
+        if (ptr == MAP_FAILED)
+            throw std::system_error(errno, std::generic_category(),
+                                    "Engram mmap");
+        return BufferHandle(ptr, size, [ptr, size] { ::munmap(ptr, size); });
+    }
+
+    static std::shared_ptr<LocalTables> open(const std::filesystem::path& dir,
+                                             const EngramStoreConfig& cfg) {
+        if (!std::filesystem::exists(dir)) return nullptr;
+        std::ifstream manifest(dir / "layout");
+        std::string actual((std::istreambuf_iterator<char>(manifest)), {});
+        if (!manifest || actual != layout(cfg))
+            throw std::runtime_error("Local Engram layout mismatch: " +
+                                     dir.string());
+        auto tables = std::make_shared<LocalTables>();
+        tables->heads.reserve(cfg.table_vocab_sizes.size());
+        for (size_t h = 0; h < cfg.table_vocab_sizes.size(); ++h) {
+            const size_t size =
+                static_cast<size_t>(cfg.table_vocab_sizes[h]) * cfg.row_bytes;
+            File file(dir / ("head-" + std::to_string(h) + ".bin"), O_RDONLY);
+            struct stat statbuf {};
+            if (::fstat(file.fd, &statbuf) != 0 || statbuf.st_size < 0 ||
+                static_cast<uint64_t>(statbuf.st_size) != size)
+                throw std::runtime_error("Local Engram table size mismatch: " +
+                                         dir.string());
+            tables->heads.push_back(map(file.fd, size, false));
+        }
+        return tables;
+    }
+
+    static std::shared_ptr<LocalTables> populate(
+        const std::filesystem::path& dir, const EngramStoreConfig& cfg,
+        const std::vector<void*>& buffers, const std::vector<size_t>& sizes) {
+        File lock(dir.string() + ".lock", O_CREAT | O_RDWR);
+        if (::flock(lock.fd, LOCK_EX) != 0)
+            throw std::system_error(errno, std::generic_category(),
+                                    "Engram populate lock");
+        if (std::filesystem::exists(dir))
+            throw std::runtime_error(
+                "Local Engram populate requires an absent layer: " +
+                dir.string());
+        const std::filesystem::path temporary = dir.string() + ".tmp";
+        // Only a writer holding this layer's lock may recover an interrupted
+        // load.
+        std::filesystem::remove_all(temporary);
+        std::filesystem::create_directory(temporary);
+        try {
+            for (size_t h = 0; h < buffers.size(); ++h) {
+                File file(temporary / ("head-" + std::to_string(h) + ".bin"),
+                          O_CREAT | O_EXCL | O_RDWR);
+                if (sizes[h] >
+                    static_cast<uint64_t>(std::numeric_limits<off_t>::max()))
+                    throw std::runtime_error(
+                        "Local Engram table exceeds file offset range");
+                // Reserve space before memcpy so an exhausted tmpfs reports an
+                // error here instead of delivering SIGBUS during a mapped
+                // write.
+                int rc =
+                    ::posix_fallocate(file.fd, 0, static_cast<off_t>(sizes[h]));
+                if (rc != 0)
+                    throw std::system_error(rc, std::generic_category(),
+                                            "Engram allocation");
+                auto mapping = map(file.fd, sizes[h], true);
+                std::memcpy(mapping.ptr(), buffers[h], sizes[h]);
+                if (::fchmod(file.fd, 0400) != 0)
+                    throw std::system_error(errno, std::generic_category(),
+                                            "Engram read-only table");
+            }
+            std::ofstream manifest(temporary / "layout");
+            manifest << layout(cfg);
+            manifest.close();
+            if (!manifest)
+                throw std::runtime_error("Failed to write local Engram layout");
+            auto tables = open(temporary, cfg);
+            std::filesystem::rename(temporary, dir);
+            return tables;
+        } catch (...) {
+            std::filesystem::remove_all(temporary);
+            throw;
+        }
+    }
+};
+
 EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
-                         std::shared_ptr<PyClient> store)
-    : store_(std::move(store)) {
+                         std::shared_ptr<PyClient> store,
+                         const std::string& local_dir)
+    : store_(std::move(store)), local_dir_(local_dir) {
+    if (store_ && !local_dir_.empty()) {
+        throw std::invalid_argument(
+            "store_client and local_dir are mutually exclusive");
+    }
     if (layers.empty()) {
         throw std::invalid_argument("EngramStore requires at least one layer");
     }
@@ -43,6 +179,14 @@ EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
         }
         layers_.emplace(layer_id, std::move(layer));
     }
+    if (!local_dir_.empty()) {
+        local_dir_ = std::filesystem::absolute(local_dir_).string();
+        std::filesystem::create_directories(local_dir_);
+        for (auto& [id, layer] : layers_) {
+            layer.local_tables = LocalTables::open(
+                LocalTables::path(local_dir_, id), layer.config);
+        }
+    }
 }
 
 const EngramStore::Layer& EngramStore::get_layer(int layer_id) const {
@@ -55,168 +199,247 @@ const EngramStore::Layer& EngramStore::get_layer(int layer_id) const {
 }
 
 std::shared_ptr<const EngramStore::QueryCacheEntry>
-EngramStore::get_query_cache(int layer_id,
+EngramStore::get_query_cache(const std::vector<int>& layer_ids,
                              const std::vector<std::string>& keys) const {
+    if (layer_ids.empty()) return nullptr;
+
     const auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(query_cache_mutex_);
-        auto it = query_cache_.find(layer_id);
-        if (it != query_cache_.end() && it->second &&
-            it->second->snapshot.reusable(now)) {
-            return it->second;
+        std::shared_ptr<QueryCacheEntry> cached;
+        if (layer_ids.size() == 1) {
+            const auto found = query_cache_.find(layer_ids.front());
+            if (found != query_cache_.end()) cached = found->second;
+        } else {
+            cached = multi_layer_query_cache_;
+        }
+        if (cached && cached->layer_ids == layer_ids &&
+            cached->snapshot.reusable(now)) {
+            return cached;
         }
     }
 
     auto entry = std::make_shared<QueryCacheEntry>();
+    entry->layer_ids = layer_ids;
     entry->snapshot = store_->prepare_get_into_ranges_snapshot(keys);
-    if (!entry->snapshot.reusable(now)) return nullptr;
+    if (!entry->snapshot.reusable(std::chrono::steady_clock::now()))
+        return nullptr;
 
     std::lock_guard<std::mutex> lock(query_cache_mutex_);
-    query_cache_[layer_id] = entry;
+    if (layer_ids.size() == 1)
+        query_cache_[layer_ids.front()] = entry;
+    else
+        multi_layer_query_cache_ = entry;
     return entry;
 }
 
 void EngramStore::invalidate_query_cache(int layer_id) const {
     std::lock_guard<std::mutex> lock(query_cache_mutex_);
     query_cache_.erase(layer_id);
-}
-
-int EngramStore::bind_local(int layer_id,
-                            const std::vector<const void*>& buffers,
-                            const std::vector<size_t>& sizes) {
-    const auto& layer = get_layer(layer_id);
-    if (store_ || !layer.local_tables.empty() ||
-        buffers.size() != layer.keys.size() || sizes.size() != buffers.size()) {
-        return -1;
+    if (multi_layer_query_cache_ &&
+        std::find(multi_layer_query_cache_->layer_ids.begin(),
+                  multi_layer_query_cache_->layer_ids.end(),
+                  layer_id) != multi_layer_query_cache_->layer_ids.end()) {
+        multi_layer_query_cache_.reset();
     }
-    for (size_t h = 0; h < buffers.size(); ++h) {
-        if (!buffers[h] ||
-            sizes[h] != static_cast<size_t>(layer.config.table_vocab_sizes[h]) *
-                            layer.config.row_bytes)
-            return -1;
-    }
-    layers_.at(layer_id).local_tables = buffers;
-    return 0;
 }
 
 int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
                              void* output_buffer, size_t output_size) const {
-    const auto& layer = get_layer(layer_id);
-    const auto& table_vocab_sizes = layer.config.table_vocab_sizes;
-    const auto& embed_keys = layer.keys;
-    if ((!store_ && layer.local_tables.empty()) || row_ids == nullptr ||
-        output_buffer == nullptr || B <= 0 || L <= 0) {
-        return -1;
-    }
+    return lookup_many_into(
+        {LookupRequest{layer_id, row_ids, B, L, output_buffer, output_size}});
+}
 
-    const int num_heads = static_cast<int>(table_vocab_sizes.size());
-    const size_t row_bytes = layer.config.row_bytes;
+int EngramStore::lookup_many_into(
+    const std::vector<LookupRequest>& requests) const {
+    return lookup_many_into_impl(requests, true);
+}
+
+int EngramStore::lookup_many_into_registered(
+    const std::vector<LookupRequest>& requests) const {
+    if (!store_) return -1;
+    return lookup_many_into_impl(requests, false);
+}
+
+int EngramStore::lookup_many_into_impl(
+    const std::vector<LookupRequest>& requests,
+    bool clear_outputs_on_failure) const {
+    if (requests.empty()) return 0;
+
+    struct LookupPlan {
+        const LookupRequest* request;
+        const Layer* layer;
+        size_t token_count;
+        size_t expected_size;
+        uintptr_t output_begin;
+        uintptr_t output_end;
+    };
+
+    std::vector<LookupPlan> plans;
+    plans.reserve(requests.size());
+    size_t key_count = 0;
     const size_t max_size = std::numeric_limits<size_t>::max();
-    if (static_cast<size_t>(B) > max_size / static_cast<size_t>(L)) {
-        return -1;
-    }
-    const size_t token_count = static_cast<size_t>(B) * static_cast<size_t>(L);
-    if (token_count > max_size / static_cast<size_t>(num_heads) ||
-        token_count * static_cast<size_t>(num_heads) > max_size / row_bytes) {
-        return -1;
-    }
-    const size_t expected_size =
-        token_count * static_cast<size_t>(num_heads) * row_bytes;
-    if (output_size < expected_size) {
-        return -1;
+    for (const auto& request : requests) {
+        const auto& layer = get_layer(request.layer_id);
+        if ((!store_ && local_dir_.empty()) || request.row_ids == nullptr ||
+            request.output == nullptr || request.batch_size <= 0 ||
+            request.sequence_length <= 0) {
+            return -1;
+        }
+
+        const size_t batch_size = static_cast<size_t>(request.batch_size);
+        const size_t sequence_length =
+            static_cast<size_t>(request.sequence_length);
+        const size_t num_heads = layer.config.table_vocab_sizes.size();
+        const size_t row_bytes = layer.config.row_bytes;
+        if (batch_size > max_size / sequence_length) return -1;
+        const size_t token_count = batch_size * sequence_length;
+        if (token_count > max_size / num_heads ||
+            token_count * num_heads > max_size / row_bytes) {
+            return -1;
+        }
+        const size_t expected_size = token_count * num_heads * row_bytes;
+        if (request.output_size < expected_size) return -1;
+
+        const uintptr_t output_begin =
+            reinterpret_cast<uintptr_t>(request.output);
+        if (expected_size >
+            std::numeric_limits<uintptr_t>::max() - output_begin) {
+            return -1;
+        }
+        const uintptr_t output_end = output_begin + expected_size;
+        for (const auto& plan : plans) {
+            if (output_begin < plan.output_end &&
+                plan.output_begin < output_end) {
+                return -1;
+            }
+        }
+
+        plans.push_back(LookupPlan{&request, &layer, token_count, expected_size,
+                                   output_begin, output_end});
+        key_count += layer.keys.size();
     }
 
-    auto fail_lookup = [&]() {
-        std::memset(output_buffer, 0, expected_size);
+    auto fail_lookups = [&]() {
+        if (clear_outputs_on_failure) {
+            for (const auto& plan : plans)
+                std::memset(plan.request->output, 0, plan.expected_size);
+        }
         return -1;
     };
 
-    if (!layer.local_tables.empty()) {
-        // Validate all IDs before touching output. No metadata or transfer
-        // work.
-        for (size_t t = 0; t < token_count; ++t) {
-            for (int h = 0; h < num_heads; ++h) {
-                const auto id = row_ids[t * num_heads + h];
-                if (id < 0 || id >= table_vocab_sizes[h]) return fail_lookup();
+    // Validate every layer before touching any output or starting a transfer.
+    for (const auto& plan : plans) {
+        const auto& vocab_sizes = plan.layer->config.table_vocab_sizes;
+        const size_t num_heads = vocab_sizes.size();
+        for (size_t token = 0; token < plan.token_count; ++token) {
+            for (size_t head = 0; head < num_heads; ++head) {
+                const int64_t id =
+                    plan.request->row_ids[token * num_heads + head];
+                if (id < 0 || id >= vocab_sizes[head]) return fail_lookups();
             }
         }
-        auto* dst = static_cast<char*>(output_buffer);
-        for (size_t t = 0; t < token_count; ++t) {
-            for (int h = 0; h < num_heads; ++h) {
-                const size_t index = t * num_heads + h;
-                const auto* src =
-                    static_cast<const char*>(layer.local_tables[h]);
-                std::memcpy(
-                    dst + index * row_bytes,
-                    src + static_cast<size_t>(row_ids[index]) * row_bytes,
-                    row_bytes);
+    }
+
+    if (!local_dir_.empty()) {
+        for (const auto& plan : plans) {
+            auto tables = std::atomic_load(&plan.layer->local_tables);
+            if (!tables) {
+                tables = LocalTables::open(
+                    LocalTables::path(local_dir_, plan.request->layer_id),
+                    plan.layer->config);
+                if (!tables) return fail_lookups();
+                std::atomic_store(&plan.layer->local_tables, tables);
+            }
+            const size_t num_heads =
+                plan.layer->config.table_vocab_sizes.size();
+            const size_t row_bytes = plan.layer->config.row_bytes;
+            auto* output = static_cast<char*>(plan.request->output);
+            for (size_t token = 0; token < plan.token_count; ++token) {
+                for (size_t head = 0; head < num_heads; ++head) {
+                    const size_t index = token * num_heads + head;
+                    const auto* table =
+                        static_cast<const char*>(tables->heads[head].ptr());
+                    std::memcpy(output + index * row_bytes,
+                                table + static_cast<size_t>(
+                                            plan.request->row_ids[index]) *
+                                            row_bytes,
+                                row_bytes);
+                }
             }
         }
         return 0;
     }
 
-    std::vector<void*> buffers{output_buffer};
-    std::vector<std::vector<std::string>> all_keys(1);
-    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets(1);
-    std::vector<std::vector<std::vector<size_t>>> all_src_offsets(1);
-    std::vector<std::vector<std::vector<size_t>>> all_sizes(1);
+    std::vector<void*> buffers;
+    std::vector<std::vector<std::string>> all_keys;
+    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_sizes;
+    std::vector<std::string> query_keys;
+    std::vector<int> query_layer_ids;
+    buffers.reserve(plans.size());
+    all_keys.reserve(plans.size());
+    all_dst_offsets.reserve(plans.size());
+    all_src_offsets.reserve(plans.size());
+    all_sizes.reserve(plans.size());
+    query_keys.reserve(key_count);
+    query_layer_ids.reserve(plans.size());
 
-    all_keys[0].reserve(static_cast<size_t>(num_heads));
-    all_dst_offsets[0].reserve(static_cast<size_t>(num_heads));
-    all_src_offsets[0].reserve(static_cast<size_t>(num_heads));
-    all_sizes[0].reserve(static_cast<size_t>(num_heads));
+    for (const auto& plan : plans) {
+        const auto& layer = *plan.layer;
+        const size_t num_heads = layer.config.table_vocab_sizes.size();
+        const size_t row_bytes = layer.config.row_bytes;
+        buffers.push_back(plan.request->output);
+        query_layer_ids.push_back(plan.request->layer_id);
+        all_keys.push_back(layer.keys);
+        query_keys.insert(query_keys.end(), layer.keys.begin(),
+                          layer.keys.end());
+        all_dst_offsets.emplace_back(num_heads);
+        all_src_offsets.emplace_back(num_heads);
+        all_sizes.emplace_back(num_heads);
 
-    for (int h = 0; h < num_heads; ++h) {
-        all_keys[0].push_back(embed_keys[h]);
-        all_dst_offsets[0].emplace_back();
-        all_src_offsets[0].emplace_back();
-        all_sizes[0].emplace_back();
-        all_dst_offsets[0].back().reserve(static_cast<size_t>(B) * L);
-        all_src_offsets[0].back().reserve(static_cast<size_t>(B) * L);
-        all_sizes[0].back().reserve(static_cast<size_t>(B) * L);
-    }
-
-    for (int b = 0; b < B; ++b) {
-        for (int l = 0; l < L; ++l) {
-            const size_t token_index = static_cast<size_t>(b) * L + l;
-            const size_t row_offset =
-                token_index * static_cast<size_t>(num_heads);
-            for (int h = 0; h < num_heads; ++h) {
-                const int64_t idx =
-                    row_ids[row_offset + static_cast<size_t>(h)];
-                if (idx < 0 || idx >= table_vocab_sizes[h]) {
-                    return fail_lookup();
-                }
-                all_dst_offsets[0][h].push_back(
-                    (row_offset + static_cast<size_t>(h)) * row_bytes);
-                all_src_offsets[0][h].push_back(static_cast<size_t>(idx) *
-                                                row_bytes);
-                all_sizes[0][h].push_back(row_bytes);
+        auto& dst_offsets = all_dst_offsets.back();
+        auto& src_offsets = all_src_offsets.back();
+        auto& sizes = all_sizes.back();
+        for (size_t head = 0; head < num_heads; ++head) {
+            dst_offsets[head].reserve(plan.token_count);
+            src_offsets[head].reserve(plan.token_count);
+            sizes[head].reserve(plan.token_count);
+        }
+        for (size_t token = 0; token < plan.token_count; ++token) {
+            const size_t row_offset = token * num_heads;
+            for (size_t head = 0; head < num_heads; ++head) {
+                const size_t index = row_offset + head;
+                dst_offsets[head].push_back(index * row_bytes);
+                src_offsets[head].push_back(
+                    static_cast<size_t>(plan.request->row_ids[index]) *
+                    row_bytes);
+                sizes[head].push_back(row_bytes);
             }
         }
     }
 
-    auto query_cache = get_query_cache(layer_id, embed_keys);
-    if (!query_cache) return fail_lookup();
+    auto query_cache = get_query_cache(query_layer_ids, query_keys);
+    if (!query_cache) return fail_lookups();
 
     auto results = store_->get_into_ranges_from_snapshot(
         buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
         query_cache->snapshot);
-    if (results.size() != 1 ||
-        results[0].size() != static_cast<size_t>(num_heads)) {
-        return fail_lookup();
-    }
-    for (int h = 0; h < num_heads; ++h) {
-        if (results[0][h].size() != all_sizes[0][h].size()) {
-            return fail_lookup();
-        }
-        for (int64_t bytes_read : results[0][h]) {
-            if (bytes_read != static_cast<int64_t>(row_bytes)) {
-                return fail_lookup();
+    if (results.size() != plans.size()) return fail_lookups();
+    for (size_t i = 0; i < plans.size(); ++i) {
+        const size_t num_heads = plans[i].layer->keys.size();
+        const size_t row_bytes = plans[i].layer->config.row_bytes;
+        if (results[i].size() != num_heads) return fail_lookups();
+        for (size_t head = 0; head < num_heads; ++head) {
+            if (results[i][head].size() != all_sizes[i][head].size())
+                return fail_lookups();
+            for (int64_t bytes_read : results[i][head]) {
+                if (bytes_read != static_cast<int64_t>(row_bytes))
+                    return fail_lookups();
             }
         }
     }
-
     return 0;
 }
 
@@ -278,7 +501,7 @@ int EngramStore::populate(int layer_id,
     const auto& layer = get_layer(layer_id);
     const auto& table_vocab_sizes = layer.config.table_vocab_sizes;
     const auto& embed_keys = layer.keys;
-    if (store_ == nullptr) {
+    if (store_ == nullptr && local_dir_.empty()) {
         return -1;
     }
     if (embedding_buffers.size() != embed_keys.size() ||
@@ -292,6 +515,14 @@ int EngramStore::populate(int layer_id,
         if (embedding_buffers[i] == nullptr || buffer_sizes[i] != expected) {
             return -1;
         }
+    }
+
+    if (!local_dir_.empty()) {
+        auto tables = LocalTables::populate(
+            LocalTables::path(local_dir_, layer_id), layer.config,
+            embedding_buffers, buffer_sizes);
+        std::atomic_store(&layer.local_tables, tables);
+        return 0;
     }
 
     std::vector<int> exists_results = store_->batchIsExist(embed_keys);

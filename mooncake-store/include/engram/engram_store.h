@@ -29,16 +29,20 @@ namespace engram {
  */
 class EngramStore {
    public:
+    struct LookupRequest {
+        int layer_id;
+        const int64_t* row_ids;
+        int batch_size;
+        int sequence_length;
+        void* output;
+        size_t output_size;
+    };
+
     EngramStore(const std::map<int, EngramStoreConfig>& layers,
-                std::shared_ptr<PyClient> store = nullptr);
+                std::shared_ptr<PyClient> store = nullptr,
+                const std::string& local_dir = "");
 
     ~EngramStore() = default;
-
-    // Bind immutable caller-owned tables before lookup, without a Store client.
-    // The caller must keep these buffers alive until this EngramStore is
-    // destroyed.
-    int bind_local(int layer_id, const std::vector<const void*>& buffers,
-                   const std::vector<size_t>& sizes);
 
     /**
      * Lookup embedding rows for a batch of precomputed row IDs.
@@ -50,6 +54,19 @@ class EngramStore {
      */
     int lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
                     void* output, size_t output_size) const;
+
+    /**
+     * Lookup several layers through one Store ranged-read submission.
+     * Each output must be registered for Store-backed lookup.
+     */
+    int lookup_many_into(const std::vector<LookupRequest>& requests) const;
+
+    /**
+     * Lookup several layers into raw Store-registered addresses. This variant
+     * is Store-backed only and leaves output contents undefined on failure.
+     */
+    int lookup_many_into_registered(
+        const std::vector<LookupRequest>& requests) const;
 
     std::vector<int> get_layer_ids() const;
     std::vector<int64_t> get_table_vocab_sizes(int layer_id) const;
@@ -65,7 +82,9 @@ class EngramStore {
     int remove_from_store(int layer_id, bool force = false);
 
     /**
-     * Populate Store with per-head embedding tensors.
+     * Create per-head tables in Store or owned local shared mappings.
+     * Local tables persist after this handle is destroyed. The caller may
+     * release the input buffers when this method returns successfully.
      * @param embedding_buffers Byte buffers for each head [N_h, row_bytes]
      * @param buffer_sizes Size in bytes for each buffer
      * @return 0 on success, negative on error
@@ -75,20 +94,26 @@ class EngramStore {
                  const ReplicateConfig& config = ReplicateConfig{});
 
    private:
-    std::shared_ptr<PyClient> store_;
+    struct LocalTables;
     struct QueryCacheEntry;
+    std::shared_ptr<PyClient> store_;
+    std::string local_dir_;
     struct Layer {
         EngramStoreConfig config;
         std::vector<std::string> keys;
-        std::vector<const void*> local_tables;
+        mutable std::shared_ptr<LocalTables> local_tables;
     };
     const Layer& get_layer(int layer_id) const;
     std::shared_ptr<const QueryCacheEntry> get_query_cache(
-        int layer_id, const std::vector<std::string>& keys) const;
+        const std::vector<int>& layer_ids,
+        const std::vector<std::string>& keys) const;
     void invalidate_query_cache(int layer_id) const;
+    int lookup_many_into_impl(const std::vector<LookupRequest>& requests,
+                              bool clear_outputs_on_failure) const;
     std::map<int, Layer> layers_;
     mutable std::mutex query_cache_mutex_;
     mutable std::map<int, std::shared_ptr<QueryCacheEntry>> query_cache_;
+    mutable std::shared_ptr<QueryCacheEntry> multi_layer_query_cache_;
 };
 
 }  // namespace engram

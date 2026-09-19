@@ -102,31 +102,6 @@ void bind_engram_store(py::module& m) {
         .def_readwrite("row_bytes", &EngramStoreConfig::row_bytes);
 
     py::class_<EngramStore>(m, "EngramStore")
-        .def(
-            "bind_local",
-            [](EngramStore& self, int layer_id, py::list buffers) {
-                const auto rows = self.get_table_vocab_sizes(layer_id);
-                if (py::len(buffers) != rows.size())
-                    throw std::runtime_error(
-                        "Local table count must match heads");
-                std::vector<const void*> pointers;
-                std::vector<size_t> sizes;
-                for (size_t h = 0; h < rows.size(); ++h) {
-                    auto arr = require_embedding_buffer(
-                        buffers[h], rows[h], self.get_row_bytes(layer_id));
-                    pointers.push_back(arr.data());
-                    sizes.push_back(arr.nbytes());
-                }
-                if (self.bind_local(layer_id, pointers, sizes) != 0)
-                    throw std::runtime_error(
-                        "bind_local requires an unbound layer and no Store "
-                        "client");
-            },
-            py::arg("layer_id"), py::arg("embedding_buffers"),
-            py::keep_alive<1, 3>(),
-            "Bind immutable uint8 tables before lookup. Retains the arrays "
-            "without "
-            "copying; do not modify, resize or unmap them while bound.")
         .def("get_layer_ids", &EngramStore::get_layer_ids)
         .def("get_table_vocab_sizes", &EngramStore::get_table_vocab_sizes)
         .def("get_store_keys", &EngramStore::get_store_keys)
@@ -147,11 +122,13 @@ void bind_engram_store(py::module& m) {
             "Returns the number of removed head tables; missing keys are "
             "ignored.")
         .def(py::init([](const std::map<int, EngramStoreConfig>& layers,
-                         py::object store_obj) {
+                         py::object store_obj, const std::string& local_dir) {
                  std::shared_ptr<PyClient> store = unwrap_store(store_obj);
-                 return new EngramStore(layers, store);
+                 py::gil_scoped_release release;
+                 return new EngramStore(layers, store, local_dir);
              }),
-             py::arg("layers"), py::arg("store") = py::none())
+             py::arg("layers"), py::arg("store_client") = py::none(),
+             py::arg("local_dir") = "")
         .def(
             "lookup_into",
             [](EngramStore& self, int layer_id,
@@ -190,8 +167,156 @@ void bind_engram_store(py::module& m) {
             py::arg("output").noconvert(),
             "Read into caller-owned uint8 memory. The caller must keep the "
             "output registered with this Store for Store-backed reads. "
-            "Local bound tables do not require output registration. "
+            "Local tables do not require output registration. "
             "This method does not allocate, register, or unregister output.")
+        .def(
+            "lookup_many_into",
+            [](EngramStore& self, py::sequence layer_ids, py::sequence row_ids,
+               py::sequence outputs) {
+                const size_t count = py::len(layer_ids);
+                if (py::len(row_ids) != count || py::len(outputs) != count) {
+                    throw std::runtime_error(
+                        "layer_ids, row_ids, and outputs must have equal "
+                        "lengths");
+                }
+
+                std::vector<py::array> id_arrays;
+                std::vector<py::array> output_arrays;
+                std::vector<EngramStore::LookupRequest> requests;
+                id_arrays.reserve(static_cast<size_t>(count));
+                output_arrays.reserve(static_cast<size_t>(count));
+                requests.reserve(static_cast<size_t>(count));
+                for (size_t i = 0; i < count; ++i) {
+                    const int layer_id = py::cast<int>(layer_ids[i]);
+                    py::handle ids_object = row_ids[i];
+                    py::handle output_object = outputs[i];
+                    if (!py::isinstance<py::array>(ids_object) ||
+                        !py::isinstance<py::array>(output_object)) {
+                        throw std::runtime_error(
+                            "row_ids and outputs must contain NumPy arrays");
+                    }
+                    auto ids = py::reinterpret_borrow<py::array>(ids_object);
+                    auto output =
+                        py::reinterpret_borrow<py::array>(output_object);
+                    const int width = self.get_row_bytes(layer_id);
+                    if (ids.ndim() != 3 ||
+                        !ids.dtype().is(py::dtype::of<int64_t>()) ||
+                        !(ids.flags() & py::array::c_style) ||
+                        ids.shape(2) != self.get_num_heads(layer_id) ||
+                        ids.shape(0) > std::numeric_limits<int>::max() ||
+                        ids.shape(1) > std::numeric_limits<int>::max() ||
+                        output.ndim() != 4 || output.shape(0) != ids.shape(0) ||
+                        output.shape(1) != ids.shape(1) ||
+                        output.shape(2) != ids.shape(2) ||
+                        output.shape(3) != width || !output.writeable() ||
+                        !(output.flags() & py::array::c_style) ||
+                        !output.dtype().is(py::dtype::of<uint8_t>())) {
+                        throw std::runtime_error(
+                            "lookup_many_into requires contiguous IDs "
+                            "[B,L,H] and matching writable uint8 outputs "
+                            "[B,L,H,row_bytes]");
+                    }
+
+                    id_arrays.push_back(ids);
+                    output_arrays.push_back(output);
+                    if (ids.size() == 0) continue;
+                    auto ids_buffer = ids.request();
+                    auto output_buffer = output.request();
+                    requests.push_back(EngramStore::LookupRequest{
+                        .layer_id = layer_id,
+                        .row_ids = static_cast<const int64_t*>(ids_buffer.ptr),
+                        .batch_size = static_cast<int>(ids_buffer.shape[0]),
+                        .sequence_length =
+                            static_cast<int>(ids_buffer.shape[1]),
+                        .output = output_buffer.ptr,
+                        .output_size = static_cast<size_t>(output_buffer.size) *
+                                       output_buffer.itemsize,
+                    });
+                }
+
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    ret = self.lookup_many_into(requests);
+                }
+                if (ret != 0)
+                    throw std::runtime_error(
+                        "EngramStore lookup_many_into failed");
+            },
+            py::arg("layer_ids"), py::arg("row_ids"), py::arg("outputs"),
+            "Read several layers into registered outputs through one Store "
+            "ranged-read submission.")
+        .def(
+            "lookup_many_into_registered",
+            [](EngramStore& self, py::sequence layer_ids, py::sequence row_ids,
+               py::sequence output_addresses, py::sequence output_sizes) {
+                const size_t count = py::len(layer_ids);
+                if (py::len(row_ids) != count ||
+                    py::len(output_addresses) != count ||
+                    py::len(output_sizes) != count) {
+                    throw std::runtime_error(
+                        "layer_ids, row_ids, output_addresses, and "
+                        "output_sizes must have equal lengths");
+                }
+
+                std::vector<py::array> id_arrays;
+                std::vector<EngramStore::LookupRequest> requests;
+                id_arrays.reserve(count);
+                requests.reserve(count);
+                for (size_t i = 0; i < count; ++i) {
+                    const int layer_id = py::cast<int>(layer_ids[i]);
+                    py::handle ids_object = row_ids[i];
+                    if (!py::isinstance<py::array>(ids_object)) {
+                        throw std::runtime_error(
+                            "row_ids must contain NumPy arrays");
+                    }
+                    auto ids = py::reinterpret_borrow<py::array>(ids_object);
+                    if (ids.ndim() != 3 ||
+                        !ids.dtype().is(py::dtype::of<int64_t>()) ||
+                        !(ids.flags() & py::array::c_style) ||
+                        ids.shape(2) != self.get_num_heads(layer_id) ||
+                        ids.shape(0) > std::numeric_limits<int>::max() ||
+                        ids.shape(1) > std::numeric_limits<int>::max()) {
+                        throw std::runtime_error(
+                            "lookup_many_into_registered requires contiguous "
+                            "int64 IDs [B,L,H]");
+                    }
+
+                    id_arrays.push_back(ids);
+                    if (ids.size() == 0) continue;
+                    const auto output_address =
+                        py::cast<uintptr_t>(output_addresses[i]);
+                    const auto output_size = py::cast<size_t>(output_sizes[i]);
+                    if (output_address == 0) {
+                        throw std::runtime_error(
+                            "registered output address must be nonzero");
+                    }
+                    auto ids_buffer = ids.request();
+                    requests.push_back(EngramStore::LookupRequest{
+                        .layer_id = layer_id,
+                        .row_ids = static_cast<const int64_t*>(ids_buffer.ptr),
+                        .batch_size = static_cast<int>(ids_buffer.shape[0]),
+                        .sequence_length =
+                            static_cast<int>(ids_buffer.shape[1]),
+                        .output = reinterpret_cast<void*>(output_address),
+                        .output_size = output_size,
+                    });
+                }
+
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    ret = self.lookup_many_into_registered(requests);
+                }
+                if (ret != 0)
+                    throw std::runtime_error(
+                        "EngramStore lookup_many_into_registered failed");
+            },
+            py::arg("layer_ids"), py::arg("row_ids"),
+            py::arg("output_addresses"), py::arg("output_sizes"),
+            "Read several layers directly into Store-registered memory. The "
+            "caller owns pointer validation and lifetime; output contents are "
+            "undefined on failure.")
         .def(
             "populate",
             [](EngramStore& self, int layer_id, py::list embedding_buffers,
@@ -226,7 +351,12 @@ void bind_engram_store(py::module& m) {
                 }
             },
             py::arg("layer_id"), py::arg("embedding_buffers"),
-            py::arg("config") = ReplicateConfig{});
+            py::arg("config") = ReplicateConfig{},
+            "Create a layer from per-head uint8 arrays. Copies into owned "
+            "local "
+            "tables or uploads to Store; inputs may be released after return. "
+            "Local layers are published atomically and must not already "
+            "exist.");
 }
 
 }  // namespace engram
