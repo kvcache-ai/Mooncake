@@ -735,7 +735,7 @@ Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
 }
 
 Status RdmaTransport::refreshLocalDeviceDesc(const std::string& device_name,
-                                             uint16_t lid,
+                                             uint32_t lid,
                                              const std::string& gid) {
     if (!metadata_)
         return Status::InvalidArgument(
@@ -743,7 +743,7 @@ Status RdmaTransport::refreshLocalDeviceDesc(const std::string& device_name,
 
     auto& manager = metadata_->segmentManager();
     bool existed = false;
-    uint16_t previous_lid = 0;
+    uint32_t previous_lid = 0;
     std::string previous_gid;
     CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
         if (segment.type != SegmentType::Memory)
