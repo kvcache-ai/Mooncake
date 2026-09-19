@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import pytest
-
-import json
-import time
-
 import torch
 
 from mooncake_epd.agent.coordination import Workflow, WorkflowStep
 from mooncake_epd.core.control import ServingControlPlane, ServingControlPlaneConfig
-from mooncake_epd.core.control.connector_metrics import ConnectorMetricsReader, ConnectorMetricsSink
+from mooncake_epd.core.control.connector_metrics import ConnectorMetricsSink
 from mooncake_epd.core.control.vllm_transfer_primitives import LayeredTransferWorkerMeta
 from mooncake_epd.core.state import (
     FeatureStore,
@@ -35,6 +31,78 @@ def _mm_request():
         ],
         "metadata": {"workflow_id": "wf-mm-1"},
     }
+
+
+def test_multimodal_uuid_identity_survives_payload_omission():
+    full = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,ZmFrZQ=="},
+        "uuid": "asset-123",
+    }
+    compact = {
+        "type": "image_url",
+        "image_url": None,
+        "uuid": "asset-123",
+    }
+
+    assert ServingControlPlane._stable_mm_hash(full) == (
+        ServingControlPlane._stable_mm_hash(compact)
+    )
+    assert ServingControlPlane._stable_mm_hash(compact) != (
+        ServingControlPlane._stable_mm_hash(compact | {"uuid": "asset-456"})
+    )
+    assert ServingControlPlane._stable_mm_hash(compact) != (
+        ServingControlPlane._stable_mm_hash(compact | {"type": "audio_url"})
+    )
+
+
+def test_decode_worker_hint_targets_registered_worker():
+    cp = ServingControlPlane(ServingControlPlaneConfig(node_id="proxy-targeted"))
+    cp.register_stage_workers("decode", ["decode-0", "decode-1"])
+    request = _mm_request()
+    request["metadata"]["mooncake_epd_decode_worker_id"] = "decode-1"
+
+    ctx = cp.start_request(request, "req-targeted")
+    decision = cp.admit_stage("decode", ctx)
+
+    assert ctx.decode_worker_hint == "decode-1"
+    assert decision.worker_id == "decode-1"
+
+
+def test_decode_worker_hint_rejects_unknown_worker():
+    cp = ServingControlPlane(ServingControlPlaneConfig(node_id="proxy-targeted"))
+    cp.register_stage_workers("decode", ["decode-0"])
+    request = _mm_request()
+    request["metadata"]["mooncake_epd_decode_worker_id"] = "decode-missing"
+    ctx = cp.start_request(request, "req-targeted-missing")
+
+    with pytest.raises(RuntimeError, match="not registered"):
+        cp.admit_stage("decode", ctx)
+
+
+def test_unavailable_decode_worker_is_hard_excluded_and_recovers():
+    cp = ServingControlPlane(ServingControlPlaneConfig(node_id="proxy-health"))
+    cp.register_stage_workers("decode", ["decode-0", "decode-1"])
+    cp.set_stage_worker_available("decode", "decode-1", available=False)
+
+    automatic = cp.start_request(_mm_request(), "req-health-auto")
+    automatic_decision = cp.admit_stage("decode", automatic)
+    assert automatic_decision.worker_id == "decode-0"
+    cp.mark_stage_complete("decode", "decode-0", latency_ms=1.0)
+    assert cp.snapshot()["worker_health"]["decode"] == {
+        "decode-0": True,
+        "decode-1": False,
+    }
+
+    targeted_request = _mm_request()
+    targeted_request["metadata"]["mooncake_epd_decode_worker_id"] = "decode-1"
+    targeted = cp.start_request(targeted_request, "req-health-targeted")
+    with pytest.raises(RuntimeError, match="worker is unavailable"):
+        cp.admit_stage("decode", targeted)
+
+    cp.set_stage_worker_available("decode", "decode-1", available=True)
+    recovered = cp.start_request(targeted_request, "req-health-recovered")
+    assert cp.admit_stage("decode", recovered).worker_id == "decode-1"
 
 
 def _make_state_layer(registry: WorkflowStateRegistry) -> StateLayer:
@@ -143,48 +211,55 @@ def test_serving_control_plane_classifies_multimodal_and_builds_handoff():
     assert snapshot["metrics"]["path_stats"]["PD"]["requests_total"] == 0
 
 
-def test_prefill_decode_transport_affinity_preserves_pair_and_bypasses_saturation():
-    cp = ServingControlPlane(
-        ServingControlPlaneConfig(
-            node_id="proxy-affinity",
-            prefill_decode_affinity=(
-                ("prefill-0", "decode-0"),
-                ("prefill-1", "decode-1"),
-            ),
-        )
-    )
-    cp.register_stage_workers("prefill", ["prefill-0", "prefill-1"])
-    cp.register_stage_workers("decode", ["decode-0", "decode-1"])
-
+def test_serving_control_plane_records_stage_conservation_with_overlap():
+    cp = ServingControlPlane(ServingControlPlaneConfig(node_id="proxy-timing"))
     ctx = cp.start_request(
-        {"messages": [{"role": "user", "content": "summarize this request"}]},
-        "req-affinity-0",
+        {"messages": [{"role": "user", "content": "hello"}]},
+        "req-timing",
+        created_at=100.0,
     )
-    prefill = cp.admit_stage("prefill", ctx)
-    assert prefill.worker_id == "prefill-0"
-    prefill_kv = cp.build_prefill_kv_params(ctx, prefill, decode_worker_id="decode-1")
-    assert prefill_kv["a2a_target_node"] == "decode-0"
-    decode = cp.admit_stage("decode", ctx)
-    assert decode.worker_id == "decode-0"
+    cp.record_stage_span(ctx, "proxy_parse", started_at=100.0, ended_at=102.0)
+    cp.record_stage_span(ctx, "prefill_dispatch", started_at=101.0, ended_at=104.0)
+    cp.record_stage_span(ctx, "handoff_commit", started_at=104.0, ended_at=105.0)
 
-    # The preference is not a hard pin: once the paired Decode is full, a
-    # healthy peer is selected so locality cannot create an admission outage.
-    cp.update_worker_load("decode", "decode-0", current_load=64, queue_size=0)
-    cp.update_worker_load("prefill", "prefill-1", current_load=32, queue_size=0)
-    ctx_overloaded = cp.start_request(
-        {"messages": [{"role": "user", "content": "summarize this request"}]},
-        "req-affinity-1",
-    )
-    prefill_overloaded = cp.admit_stage("prefill", ctx_overloaded)
-    assert prefill_overloaded.worker_id == "prefill-0"
-    cp.build_prefill_kv_params(ctx_overloaded, prefill_overloaded)
-    fallback_decode = cp.admit_stage("decode", ctx_overloaded)
-    assert fallback_decode.worker_id == "decode-1"
+    summary = cp.mark_first_token(ctx, emitted_at=105.0)
+    duplicate = cp.mark_first_token(ctx, emitted_at=106.0)
+    cp.finish_request(ctx.request_id)
+
+    assert summary == duplicate
+    assert summary["critical_path_ms"] == 5000.0
+    assert summary["raw_sum_ms"] == 6000.0
+    assert summary["accounted_union_ms"] == 5000.0
+    assert summary["overlap_ms"] == 1000.0
+    assert summary["unattributed_ms"] == 0.0
+    assert summary["stage_conservation_ok"] is True
 
     metrics = cp.snapshot()["metrics"]
-    assert metrics["pd_transport_affinity_candidates"] == 2
-    assert metrics["pd_transport_affinity_hits"] == 1
-    assert metrics["pd_transport_affinity_fallbacks"] == 1
+    assert metrics["first_token_ms"]["count"] == 1
+    assert metrics["first_token_ms"]["p95"] == 5000.0
+    assert metrics["request_stage_timing_ms"]["proxy_parse"]["count"] == 1
+    assert metrics["request_stage_timing_ms"]["prefill_dispatch"]["avg"] == 3000.0
+    assert metrics["stage_conservation"]["count"] == 1
+    assert metrics["stage_conservation"]["ok_count"] == 1
+    assert metrics["stage_conservation"]["ok_rate"] == 1.0
+
+
+def test_serving_control_plane_exposes_unavailable_timing_stats_without_zero_samples():
+    metrics = ServingControlPlane(
+        ServingControlPlaneConfig(node_id="proxy-no-timing")
+    ).snapshot()["metrics"]
+
+    assert metrics["first_token_ms"] == {
+        "count": 0,
+        "avg": None,
+        "p50": None,
+        "p95": None,
+        "p99": None,
+        "max": None,
+    }
+    assert metrics["request_stage_timing_ms"] == {}
+    assert metrics["stage_conservation"]["count"] == 0
+    assert metrics["stage_conservation"]["ok_rate"] is None
 
 
 def test_serving_control_plane_syncs_workflow_registry(tmp_path):
@@ -314,6 +389,7 @@ def test_serving_control_plane_snapshot_reports_registry_reuse_summary(tmp_path)
         state_layer=sl,
         prefill_fn=prefill_fn,
         enable_relay=True,
+        force_relay=True,
         relay_min_match_run=4,
     )
 
@@ -537,23 +613,22 @@ def test_serving_control_plane_snapshot_merges_real_connector_metrics(tmp_path):
             layer_wait_calls=7,
             layer_wait_ms=12.5,
             receive_failures=1,
-            receive_kv_requests=2,
-            receive_kv_worker_roundtrips=2,
-            receive_kv_worker_ms=30.0,
-            receive_kv_response_messages=5,
-            receive_kv_first_response_count=2,
-            receive_kv_first_response_ms=10.0,
-            receive_kv_last_response_count=2,
-            receive_kv_last_response_ms=28.0,
-            receive_kv_response_process_count=5,
-            receive_kv_response_process_ms=1.25,
-            receive_kv_first_group_count=2,
-            receive_kv_first_group_ms=12.0,
-            receive_kv_finished_count=2,
-            receive_kv_finished_ms=26.0,
+            transfer_attempts=3,
+            transfer_successes=3,
+            transfer_bytes=192,
+            transfer_elapsed_ms=3.0,
+            transfer_attempt_elapsed_ms=3.0,
             backend_counts={
                 "peer_buffer_direct": 2,
                 "batch_transfer_fallback": 1,
+            },
+            backend_bytes={
+                "peer_buffer_direct": 128,
+                "batch_transfer_fallback": 64,
+            },
+            backend_elapsed_ms={
+                "peer_buffer_direct": 2.0,
+                "batch_transfer_fallback": 1.0,
             },
         ),
         path_totals={
@@ -587,21 +662,17 @@ def test_serving_control_plane_snapshot_merges_real_connector_metrics(tmp_path):
     assert metrics["layer_load_wait_calls"] == 7
     assert metrics["layer_load_wait_ms"] == 12.5
     assert metrics["layered_receive_failures"] == 1
-    assert metrics["layered_receive_kv_requests"] == 2
-    assert metrics["layered_receive_kv_worker_roundtrips"] == 2
-    assert metrics["layered_receive_kv_worker_ms_avg"] == 15.0
-    assert metrics["layered_receive_kv_response_messages"] == 5
-    assert metrics["layered_receive_kv_first_response_count"] == 2
-    assert metrics["layered_receive_kv_first_response_ms_avg"] == 5.0
-    assert metrics["layered_receive_kv_last_response_count"] == 2
-    assert metrics["layered_receive_kv_last_response_ms_avg"] == 14.0
-    assert metrics["layered_receive_kv_response_process_count"] == 5
-    assert metrics["layered_receive_kv_response_process_ms_avg"] == 0.25
-    assert metrics["layered_receive_kv_first_group_count"] == 2
-    assert metrics["layered_receive_kv_first_group_ms_avg"] == 6.0
-    assert metrics["layered_receive_kv_finished_count"] == 2
-    assert metrics["layered_receive_kv_finished_ms_avg"] == 13.0
     assert metrics["fallback_batches"] == 1
+    assert metrics["kv_transfer_attempts"] == 3
+    assert metrics["kv_transfer_successes"] == 3
+    assert metrics["kv_transfer_bytes"] == 192
+    assert metrics["kv_transfer_elapsed_ms"] == 3.0
+    assert metrics["kv_transfer_elapsed_ms_avg"] == 1.0
+    assert metrics["kv_transfer_gbps"] == 0.000512
+    assert metrics["remote_transfer_backend_gbps"] == {
+        "batch_transfer_fallback": 0.000512,
+        "peer_buffer_direct": 0.000512,
+    }
     assert metrics["path_stats"]["PD"]["requests_total"] == 0
     assert metrics["path_stats"]["EPD"]["requests_total"] == 0
     assert metrics["connector_path_stats"]["PD"]["grouped_bytes"] == 64
@@ -634,29 +705,6 @@ def test_connector_metrics_sink_cleans_stale_same_worker_files(tmp_path):
     files = sorted(tmp_path.glob("*.json"))
     assert len(files) == 1
     assert "pid222" in files[0].name
-
-
-def test_connector_metrics_sink_defers_hot_path_flush_until_forced(tmp_path):
-    sink = ConnectorMetricsSink(
-        tmp_path,
-        engine_id="engine-deferred",
-        role="producer",
-        hostname="host-0",
-        rpc_port=8999,
-        tp_rank=0,
-        flush_interval_s=3600.0,
-    )
-
-    sink.record(LayeredTransferWorkerMeta(grouped_batches=1))
-    assert ConnectorMetricsReader(tmp_path).aggregate().totals.grouped_batches == 1
-
-    sink.record(LayeredTransferWorkerMeta(grouped_batches=2))
-    # The second delta stays in process memory until an interval tick or a
-    # request-terminal forced flush. This is the sender hot-path contract.
-    assert ConnectorMetricsReader(tmp_path).aggregate().totals.grouped_batches == 1
-
-    assert sink.flush(force=True) is True
-    assert ConnectorMetricsReader(tmp_path).aggregate().totals.grouped_batches == 3
 
 
 def test_serving_control_plane_records_cross_step_reuse_in_hot_path_registry(tmp_path):
@@ -770,166 +818,3 @@ def test_serving_control_plane_forks_workflow_state_zero_copy(tmp_path):
     assert snapshot["metrics"]["agent_state_clone_branches"] == 3
     assert snapshot["metrics"]["agent_state_clone_zero_copy_branches"] == 3
     assert snapshot["metrics"]["agent_state_clone_copied_bytes"] == 0
-
-
-def test_serving_control_plane_rolls_back_partial_agent_fork(tmp_path, monkeypatch):
-    registry = WorkflowStateRegistry(str(tmp_path / "serving-agent-fork-rollback.jsonl"))
-    cp = ServingControlPlane(
-        ServingControlPlaneConfig(
-            node_id="proxy-agent-fork-rollback",
-            enable_agent_state_clone=True,
-        ),
-        workflow_registry=registry,
-    )
-    cp.register_stage_workers("prefill", ["prefill-0"])
-    cp.register_stage_workers("decode", ["decode-0"])
-
-    ctx = cp.start_request(_mm_request(), "req-fork-rollback-parent")
-    prefill = cp.admit_stage("prefill", ctx)
-    cp.build_prefill_kv_params(ctx, prefill, decode_worker_id="decode-0")
-    kv = cp.note_prefill_response(
-        ctx,
-        {
-            "transfer_id": "xfer-fork-rollback",
-            "remote_engine_id": "prefill-engine",
-            "remote_bootstrap_addr": "http://prefill-bootstrap",
-            "remote_block_ids": [[801, 802]],
-        },
-        decode_worker_id="decode-0",
-    )
-    decode = cp.admit_stage("decode", ctx)
-    cp.build_decode_kv_params(ctx, decode, kv)
-    cp.commit_handoff(ctx)
-    cp.finish_request(ctx.request_id)
-
-    original_upsert = registry.upsert_record
-    calls = 0
-
-    def fail_second_upsert(record, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("simulated workflow registry failure")
-        return original_upsert(record, **kwargs)
-
-    monkeypatch.setattr(registry, "upsert_record", fail_second_upsert)
-    with pytest.raises(RuntimeError, match="simulated workflow registry failure"):
-        cp.fork_workflow_state(
-            workflow_id="wf-mm-1",
-            parent_request_id="req-fork-rollback-parent",
-            branch_count=2,
-            target_node_id="decode-0",
-            for_write=True,
-        )
-
-    for gid in ("prefill-engine:801", "prefill-engine:802"):
-        record = cp.kv_directory.get_record(gid)
-        assert record is not None
-        assert record.refcount == 1
-        assert record.lease_count == 0
-    records = [
-        row
-        for row in registry.workflow_records("wf-mm-1")
-        if row.state_id != "req-fork-rollback-parent"
-    ]
-    assert records
-    assert all(row.status == "RELEASED" for row in records)
-
-
-
-def test_connector_reader_aggregates_decode_engine_timing(tmp_path):
-    metrics_dir = tmp_path / "metrics"
-    metrics_dir.mkdir()
-    payloads = [
-        {
-            "version": 1,
-            "kind": "decode_engine_timing",
-            "updated_at": 10.0,
-            "identity": {"pid": 1, "role": "decode"},
-            "metrics": {
-                "first_token_requests": 2,
-                "first_token_latency_ms_total": 120.0,
-                "kv_first_token_requests": 2,
-                "kv_first_token_latency_ms_total": 120.0,
-                "kv_first_token_output_tokens": 2,
-                "scheduler_update_calls": 7,
-            },
-        },
-        {
-            "version": 1,
-            "kind": "decode_engine_timing",
-            "updated_at": 11.0,
-            "identity": {"pid": 2, "role": "decode"},
-            "metrics": {
-                "first_token_requests": 1,
-                "first_token_latency_ms_total": 30.0,
-                "kv_first_token_requests": 0,
-                "kv_first_token_latency_ms_total": 0.0,
-                "kv_first_token_output_tokens": 0,
-                "scheduler_update_calls": 3,
-            },
-        },
-        {
-            "version": 1,
-            "identity": {"pid": 3, "role": "decode"},
-            "updated_at": 12.0,
-            "totals": LayeredTransferWorkerMeta(receive_kv_requests=99).to_dict(),
-        },
-    ]
-    for idx, payload in enumerate(payloads):
-        (metrics_dir / f"worker-{idx}.json").write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-        )
-
-    from mooncake_epd.core.control.connector_metrics import ConnectorMetricsReader
-
-    agg = ConnectorMetricsReader(str(metrics_dir)).aggregate_decode_engine_timing()
-    assert agg["workers"] == 2
-    assert agg["updated_at_max"] == 11.0
-    assert agg["first_token_requests"] == 3
-    assert agg["first_token_latency_ms_total"] == 150.0
-    assert agg["first_token_latency_ms_avg"] == 50.0
-    assert agg["kv_first_token_requests"] == 2
-    assert agg["kv_first_token_latency_ms_avg"] == 60.0
-    assert agg["kv_first_token_output_tokens"] == 2
-    assert agg["scheduler_update_calls"] == 10
-
-
-def test_serving_snapshot_exposes_decode_engine_timing(tmp_path):
-    metrics_dir = tmp_path / "metrics"
-    metrics_dir.mkdir()
-    (metrics_dir / "decode.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "kind": "decode_engine_timing",
-                "updated_at": time.time(),
-                "metrics": {
-                    "first_token_requests": 4,
-                    "first_token_latency_ms_total": 200.0,
-                    "kv_first_token_requests": 3,
-                    "kv_first_token_latency_ms_total": 180.0,
-                    "kv_first_token_output_tokens": 3,
-                    "scheduler_update_calls": 12,
-                },
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    cp = ServingControlPlane(
-        ServingControlPlaneConfig(
-            node_id="proxy-decode-timing",
-            connector_metrics_dir=str(metrics_dir),
-        )
-    )
-    metrics = cp.snapshot()["metrics"]
-    assert metrics["decode_engine_timing_workers"] == 1
-    assert metrics["decode_engine_first_token_requests"] == 4
-    assert metrics["decode_engine_first_token_latency_ms_total"] == 200.0
-    assert metrics["decode_engine_first_token_latency_ms_avg"] == 50.0
-    assert metrics["decode_engine_kv_first_token_requests"] == 3
-    assert metrics["decode_engine_kv_first_token_latency_ms_total"] == 180.0
-    assert metrics["decode_engine_kv_first_token_latency_ms_avg"] == 60.0
-    assert metrics["decode_engine_kv_first_token_output_tokens"] == 3
-    assert metrics["decode_engine_scheduler_update_calls"] == 12

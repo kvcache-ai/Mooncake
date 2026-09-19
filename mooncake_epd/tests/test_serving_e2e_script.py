@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import pytest
 
+import mooncake_epd.scripts.run_vllm_serving_e2e as serving_e2e
 from mooncake_epd.scripts.run_vllm_serving_e2e import (
     _agent_pd_metadata_for_dataset,
     _connector_metrics_settled,
     _data_url_for_demo_image,
     _ensure_process_running,
+    _execute_dataset_request,
     _load_dataset_requests,
+    _stats,
     _wait_for_metrics_settle,
     _validate_summary,
 )
@@ -18,6 +21,71 @@ def test_data_url_for_demo_image_uses_inline_png_payload():
     payload = _data_url_for_demo_image("room")
     assert payload.startswith("data:image/png;base64,")
     assert len(payload.split(",", 1)[1]) > 128
+
+
+def test_stats_marks_empty_samples_unavailable_instead_of_zero_latency():
+    assert _stats([]) == {
+        "count": 0,
+        "avg": None,
+        "p50": None,
+        "p95": None,
+        "p99": None,
+        "max": None,
+    }
+
+
+def test_stream_ttft_ignores_role_only_sse_chunk(monkeypatch):
+    class _Response:
+        status_code = 200
+        headers = {"x-epd-routing-path": "EPD"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, chunk_size=1, decode_unicode=True):
+            assert chunk_size == 1
+            assert decode_unicode is True
+            return iter(
+                [
+                    'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}',
+                    'data: {"choices":[{"delta":{"content":"Hello"}}]}',
+                    'data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}',
+                    'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}',
+                    "data: [DONE]",
+                ]
+            )
+
+    class _Session:
+        trust_env = False
+
+        def post(self, *args, **kwargs):
+            del args, kwargs
+            return _Response()
+
+        def close(self):
+            return None
+
+    ticks = iter([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    monkeypatch.setattr(serving_e2e.requests, "Session", _Session)
+    monkeypatch.setattr(serving_e2e.time, "perf_counter", lambda: next(ticks))
+
+    result = _execute_dataset_request(
+        proxy_url="http://127.0.0.1:1/v1/chat/completions",
+        entry={
+            "request": {"messages": []},
+            "sample": {"sample_id": "sample", "workflow_id": "workflow"},
+            "family": "W0",
+        },
+        index=0,
+        request_timeout=1.0,
+        stream_metrics=True,
+    )
+
+    assert result["first_stream_chunk_ms"] == pytest.approx(100.0)
+    assert result["ttft_ms"] == pytest.approx(200.0)
+    assert result["tpot_ms"] == pytest.approx(400.0)
+    assert result["response_text"] == "Hello world"
+    assert result["completion_tokens"] == 2
 
 
 def test_generate_configs_supports_real_multi_worker_pools(tmp_path):
@@ -128,6 +196,51 @@ def _sample_summary(tmp_path):
 
 def test_validate_summary_accepts_real_success_shape(tmp_path):
     _validate_summary(_sample_summary(tmp_path))
+
+
+def test_validate_summary_requires_observed_hash_only_decode(tmp_path):
+    summary = _sample_summary(tmp_path)
+    summary["performance_config"] = {"decode_mm_hash_cache": True}
+    summary["mm_hash_probe_stdout"] = (
+        "headers: {'x-epd-decode-mm-features': 'full'}"
+    )
+    summary["metrics"]["decode_mm_hash_cache"] = {
+        "enabled": True,
+        "epoch_monitor_enabled": True,
+        "lookups": 1,
+        "promotions": 1,
+        "hash_only_requests": 0,
+        "invalidations": 0,
+        "rejected_cold_metadata_only": 0,
+        "epoch_probe_failures": 0,
+        "worker_unavailable_events": 0,
+    }
+
+    with pytest.raises(AssertionError) as exc:
+        _validate_summary(summary)
+
+    assert "no hash-only request observed" in str(exc.value)
+
+
+def test_validate_summary_accepts_dedicated_hash_only_decode_probe(tmp_path):
+    summary = _sample_summary(tmp_path)
+    summary["performance_config"] = {"decode_mm_hash_cache": True}
+    summary["mm_hash_probe_stdout"] = (
+        "headers: {'x-epd-decode-mm-features': 'hash-only'}"
+    )
+    summary["metrics"]["decode_mm_hash_cache"] = {
+        "enabled": True,
+        "epoch_monitor_enabled": True,
+        "lookups": 2,
+        "promotions": 1,
+        "hash_only_requests": 1,
+        "invalidations": 0,
+        "rejected_cold_metadata_only": 0,
+        "epoch_probe_failures": 0,
+        "worker_unavailable_events": 0,
+    }
+
+    _validate_summary(summary)
 
 
 def test_validate_summary_rejects_missing_connector_metrics(tmp_path):

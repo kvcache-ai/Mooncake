@@ -18,7 +18,7 @@ from .feature_store import FeatureBundle, FeatureStore
 
 
 class MMStoreBackpressureError(RuntimeError):
-    """Raised when MMStore prefetch admission is rejected by bounded capacity."""
+    """Raised when MMStore publication or prefetch exceeds bounded capacity."""
 
 
 @dataclass
@@ -96,6 +96,7 @@ class MMStore:
         self._wal = JsonLineWAL(journal_path) if journal_path else None
         self._stats = {
             "published": 0,
+            "publish_rejections": 0,
             "queued": 0,
             "completed": 0,
             "failed": 0,
@@ -143,7 +144,19 @@ class MMStore:
             self._recompute_hooks[worker_id] = hook
 
     def publish(self, bundle: FeatureBundle, *, incref: bool = False) -> str:
-        self.shared_store.put(bundle.image_hash, bundle)
+        admitted = self.shared_store.put(bundle.image_hash, bundle)
+        if not admitted:
+            with self._lock:
+                self._stats["publish_rejections"] += 1
+            self._log(
+                "PUBLISH_REJECTED",
+                image_hash=bundle.image_hash,
+                bundle_bytes=int(bundle.nbytes()),
+            )
+            raise MMStoreBackpressureError(
+                "MMStore shared-store admission rejected "
+                f"image_hash={bundle.image_hash} bytes={bundle.nbytes()}"
+            )
         if incref:
             self.shared_store.incref(bundle.image_hash)
         with self._lock:
@@ -317,6 +330,7 @@ class MMStore:
                 "queue_size": self._events.qsize(),
                 "dispatcher_workers": self.dispatcher_workers,
                 "published": self._stats["published"],
+                "publish_rejections": self._stats["publish_rejections"],
                 "queued": self._stats["queued"],
                 "completed": self._stats["completed"],
                 "failed": self._stats["failed"],

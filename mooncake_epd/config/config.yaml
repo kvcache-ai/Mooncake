@@ -1,0 +1,59 @@
+# EPD 三阶段分离配置文件
+
+# 模型配置
+model:
+  name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  max_model_len: 4096
+  gpu_memory_utilization: 0.8
+
+# EPD 阶段分配
+epd:
+  encoder:
+    device: "cuda:0"
+    description: "Vision Encoder (ViT)"
+  prefill:
+    device: "cuda:1"
+    description: "LLM Prefill (generate KV Cache)"
+  decode:
+    device: "cuda:2"
+    description: "LLM Decode (autoregressive generation)"
+
+# Transfer Engine 配置
+transfer:
+  # local/tcp/rdma/rdmacm/auto。auto 在同机 EPD 上选 CUDA P2P/SHM；
+  # 配置 remote_address 后可在 Intel iWARP 上选 rdmacm_staged。
+  protocol: "auto"
+  backend: "auto"        # auto/mooncake_engine_direct/rdmacm_staged
+  device_name: ""
+  rdmacm:
+    bind_address: "192.168.100.1"
+    remote_address: ""   # 跨机 Decode 节点的 RDMA IPv4；同机必须留空
+    port_offset: 2711
+  buffer_size_mb: 512    # Transfer Engine buffer 大小
+
+# Mooncake Store 配置
+store:
+  master_port: 50051
+  metadata_port: 8080
+  global_segment_size: "16gb"
+  local_buffer_size: "4gb"
+
+# Agent 配置
+agent:
+  max_branches: 16
+  clone_strategy: "zero_copy"    # "zero_copy" 或 "deep_copy"
+  prune_keep_top_k: 4
+
+# 前缀缓存
+prefix_cache:
+  enabled: true
+  max_size_gb: 4
+  ttl_seconds: 3600
+
+# vLLM 集成
+vllm:
+  prefill_port: 8100
+  decode_port: 8200
+  proxy_port: 8000
+  tensor_parallel_size: 1
+  kv_buffer_size: 2000000000

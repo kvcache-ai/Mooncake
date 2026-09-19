@@ -10,14 +10,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import statistics
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlparse
+from typing import Any, Dict, List
 
 import requests
 
@@ -25,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT.parent))
 
-from mooncake_epd.demo.vllm_integration import VLLMDisaggConfig, generate_configs  # noqa: E402
+from mooncake_epd.demo.vllm_integration import MODEL_PATH, VLLMDisaggConfig, generate_configs  # noqa: E402
 from mooncake_epd.scripts.run_vllm_feature_handle_e2e import summarize_feature_handle_metrics  # noqa: E402
 from mooncake_epd.scripts.run_vllm_serving_e2e import (  # noqa: E402
     _cleanup_previous_run_artifacts,
@@ -51,94 +49,6 @@ def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def _iter_feature_handles(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    handles: List[Dict[str, Any]] = []
-    for row in rows:
-        request = row.get("request") if isinstance(row, dict) else None
-        metadata = request.get("metadata") if isinstance(request, dict) else None
-        if not isinstance(metadata, dict):
-            continue
-        raw = (
-            metadata.get("mooncake_epd_feature_handles")
-            or metadata.get("mm_feature_handles")
-            or metadata.get("feature_handles")
-            or []
-        )
-        if isinstance(raw, list):
-            handles.extend([dict(item) for item in raw if isinstance(item, dict)])
-    return handles
-
-
-def _store_id_and_key_from_uri(uri: str) -> Tuple[Optional[str], Optional[str]]:
-    parsed = urlparse(str(uri or ""))
-    if parsed.scheme != "mooncake":
-        return None, None
-    return parsed.netloc or None, parsed.path.lstrip("/") or None
-
-
-def _http_store_has_key(store_url: str, key: str, *, timeout_s: float = 5.0) -> bool:
-    sess = requests.Session()
-    sess.trust_env = False
-    try:
-        resp = sess.get(
-            f"{store_url.rstrip('/')}/api/get/{quote(str(key), safe='')}",
-            timeout=timeout_s,
-        )
-        return resp.status_code == 200 and bool(resp.content)
-    except Exception:
-        return False
-    finally:
-        sess.close()
-
-
-def _infer_feature_handle_store(rows: List[Dict[str, Any]], args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
-    """Infer the real Mooncake FeatureBundle store endpoint for vLLM workers.
-
-    Dataset JSONL carries stable ``mooncake://<store_id>/<object_key>`` handles,
-    but the EngineCore worker also needs the concrete HTTP store endpoint or a
-    Python SDK config.  Without this, vLLM falls into MooncakeDistributedStore
-    client retries and eventually re-runs the vision encoder in non-strict
-    mode.  This helper is intentionally conservative: it only auto-selects the
-    local default service when the first handle can be fetched successfully.
-    """
-
-    handles = _iter_feature_handles(rows)
-    mooncake_handles = [h for h in handles if str(h.get("uri") or "").startswith("mooncake://")]
-    if not mooncake_handles:
-        return None, None
-
-    store_ids = set()
-    first_key: Optional[str] = None
-    for handle in mooncake_handles:
-        store_id, key = _store_id_and_key_from_uri(str(handle.get("uri") or ""))
-        if store_id:
-            store_ids.add(store_id)
-        if first_key is None and key:
-            first_key = key
-    if len(store_ids) > 1:
-        raise RuntimeError(f"dataset carries multiple Mooncake feature store ids: {sorted(store_ids)}")
-    store_id = next(iter(store_ids), None)
-
-    explicit_url = (
-        args.mooncake_store_url
-        or os.getenv("MOONCAKE_EPD_FEATURE_HANDLE_STORE_URL")
-        or os.getenv("MOONCAKE_STORE_URL")
-    )
-    if explicit_url:
-        return str(explicit_url), store_id
-    if args.mooncake_config or os.getenv("MOONCAKE_EPD_FEATURE_HANDLE_STORE_CONFIG") or os.getenv("MOONCAKE_CONFIG_PATH"):
-        return None, store_id
-
-    default_url = "http://127.0.0.1:8089"
-    if first_key and _http_store_has_key(default_url, first_key):
-        return default_url, store_id
-    raise RuntimeError(
-        "dataset contains mooncake:// FeatureHandles but no FeatureBundle store endpoint was configured. "
-        "Pass --mooncake-store-url (for example http://127.0.0.1:8089) or --mooncake-config; "
-        "strict feature-handle mode will not silently re-run the vision encoder."
-    )
-
-
 def _validate(summary: Dict[str, Any]) -> None:
     failures: List[str] = []
     rows = list(summary.get("results") or [])
@@ -153,8 +63,8 @@ def _validate(summary: Dict[str, Any]) -> None:
             failures.append(f"request {row.get('index')} did not route EPD: {row.get('routing_path')}")
         if int(row.get("response_content_len", 0) or 0) <= 0:
             failures.append(f"request {row.get('index')} empty response")
-    if int(metric_summary.get("vision_skip_hits", 0) or 0) <= 0:
-        failures.append("no precomputed/hidden-cache vision-skip hit observed")
+    if int(metric_summary.get("precomputed_hits", 0) or 0) < requested:
+        failures.append(f"precomputed_hits {metric_summary.get('precomputed_hits')} < {requested}")
     if float(metric_summary.get("hidden_cache_vision_compute_ms_avg", 0.0) or 0.0) != 0.0:
         failures.append("vision_compute_ms_avg != 0")
     if int(metric_summary.get("hidden_cache_full_miss_batches", 0) or 0) != 0:
@@ -207,14 +117,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         decode_gpu=int(args.decode_gpu),
         gpu_memory_utilization=float(args.gpu_memory_utilization),
         max_model_len=int(args.max_model_len),
-        strict_no_fallback=bool(args.strict_no_fallback),
+        strict_no_fallback=True,
     )
-    store_url, store_id = _infer_feature_handle_store(rows, args)
-    cfg.feature_handle_store_url = store_url
-    cfg.feature_handle_store_id = args.mooncake_store_id or store_id
-    cfg.feature_handle_store_config = args.mooncake_config
-    cfg.feature_handle_store_timeout_s = float(args.mooncake_timeout_s)
-    cfg.feature_handle_require_checksum = bool(args.require_checksum)
     files = generate_configs(str(workdir), cfg)
     prefill_port = _extract_port(Path(files["prefill"]))
     decode_port = _extract_port(Path(files["decode"]))
@@ -227,14 +131,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "request_count": len(rows),
         "ports": {"prefill": prefill_port, "decode": decode_port, "proxy": proxy_port},
         "logs": {k: str(v) for k, v in logs.items()},
-        "feature_handle_store": {
-            "url": cfg.feature_handle_store_url,
-            "store_id": cfg.feature_handle_store_id,
-            "config": cfg.feature_handle_store_config,
-            "timeout_s": cfg.feature_handle_store_timeout_s,
-            "require_checksum": cfg.feature_handle_require_checksum,
-            "strict_no_fallback": cfg.strict_no_fallback,
-        },
     }
     try:
         named: Dict[str, subprocess.Popen] = {}
@@ -298,10 +194,7 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--requests-jsonl", required=True)
     ap.add_argument("--workdir", default="/tmp/mooncake_epd_dataset_feature_handle")
-    ap.add_argument(
-        "--model",
-        default=os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct"),
-    )
+    ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--max-requests", type=int, default=0)
     ap.add_argument("--warmup-requests", type=int, default=1)
     ap.add_argument("--prefill-gpu", type=int, default=3)
@@ -312,15 +205,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--request-timeout", type=float, default=300.0)
     ap.add_argument("--max-group-bytes", type=int, default=16 * 1024 * 1024)
-    ap.add_argument("--max-transfer-descriptors", type=int, default=128)
+    ap.add_argument("--max-transfer-descriptors", type=int, default=64)
     ap.add_argument("--max-transfer-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--owner-shards", type=int, default=4)
-    ap.add_argument("--mooncake-store-url", default=None)
-    ap.add_argument("--mooncake-store-id", default=None)
-    ap.add_argument("--mooncake-config", default=None)
-    ap.add_argument("--mooncake-timeout-s", type=float, default=30.0)
-    ap.add_argument("--require-checksum", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--strict-no-fallback", action=argparse.BooleanOptionalAction, default=True)
     return ap.parse_args()
 
 

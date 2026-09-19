@@ -22,11 +22,10 @@ import json
 import os
 import threading
 import time
-import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -35,7 +34,6 @@ from .feature_store import FeatureBundle, FeatureBundleDescriptor, TensorSpec
 from .mooncake_feature_store import (
     MooncakeFeatureBundleStore,
     MooncakeFeatureBundleStoreConfig,
-    MooncakeFeatureStoreError,
     parse_mooncake_feature_uri,
 )
 from .direct_feature_buffer import (
@@ -60,9 +58,6 @@ _DIRECT_READ_ENGINE: Optional[TransferEngine] = None
 _DIRECT_READ_ENGINE_LOCK = threading.RLock()
 _DEFAULT_PROVIDER: Optional["FeatureHandleProvider"] = None
 _DEFAULT_PROVIDER_LOCK = threading.RLock()
-_BUNDLE_CACHE: "OrderedDict[str, Tuple[int, FeatureBundle]]" = OrderedDict()
-_BUNDLE_CACHE_LOCK = threading.RLock()
-_BUNDLE_CACHE_BYTES = 0
 _RESOLVED_CACHE: "OrderedDict[str, Tuple[int, ResolvedFeatureHandles]]" = OrderedDict()
 _RESOLVED_CACHE_LOCK = threading.RLock()
 _RESOLVED_CACHE_BYTES = 0
@@ -113,10 +108,14 @@ class FeatureHandleProviderConfig:
     bundle_cache_max_bytes: int = 2 * 1024 * 1024 * 1024
     resolved_cache_entries: int = 8
     resolved_cache_max_bytes: int = 512 * 1024 * 1024
-    # A direct handle is an explicit E->P data-plane contract.  Falling back
-    # to raw pixels when that contract fails hides transfer failures and makes
-    # serving measurements indistinguishable from ordinary vision encoding.
-    allow_direct_feature_fallback: bool = False
+    direct_read_mode: str = "registered_tensor"
+    direct_read_slow_ms: float = 750.0
+    direct_read_managed_cooldown_reads: int = 8
+    direct_read_adaptive_min_samples: int = 4
+    direct_read_adaptive_ewma_alpha: float = 0.25
+    direct_read_adaptive_slow_ratio: float = 3.0
+    direct_read_adaptive_min_observation_ms: float = 20.0
+    direct_read_adaptive_max_buckets: int = 32
 
     @classmethod
     def from_env(cls) -> "FeatureHandleProviderConfig":
@@ -151,24 +150,17 @@ class FeatureHandleProviderConfig:
                 _empty_to_none(os.getenv("MOONCAKE_EPD_FEATURE_HANDLE_STORE_CONFIG"))
                 or _empty_to_none(os.getenv("MOONCAKE_CONFIG_PATH"))
             ),
-            mooncake_http_binary_payload=_env_bool("MOONCAKE_EPD_FEATURE_HANDLE_HTTP_BINARY", False),
             allow_file_fallback_for_mooncake_uri=(
                 False
                 if strict_no_fallback_enabled()
                 else _env_bool("MOONCAKE_EPD_FEATURE_HANDLE_ALLOW_FILE_FALLBACK", False)
             ),
-            bundle_cache_entries=int(
-                _env_float("MOONCAKE_EPD_FEATURE_HANDLE_BUNDLE_CACHE_ENTRIES", 64, minimum=0.0)
-            ),
-            bundle_cache_max_bytes=int(
+            resolved_cache_entries=int(
                 _env_float(
-                    "MOONCAKE_EPD_FEATURE_HANDLE_BUNDLE_CACHE_MAX_BYTES",
-                    float(2 * 1024 * 1024 * 1024),
+                    "MOONCAKE_EPD_FEATURE_HANDLE_RESOLVED_CACHE_ENTRIES",
+                    8,
                     minimum=0.0,
                 )
-            ),
-            resolved_cache_entries=int(
-                _env_float("MOONCAKE_EPD_FEATURE_HANDLE_RESOLVED_CACHE_ENTRIES", 8, minimum=0.0)
             ),
             resolved_cache_max_bytes=int(
                 _env_float(
@@ -177,12 +169,64 @@ class FeatureHandleProviderConfig:
                     minimum=0.0,
                 )
             ),
-            allow_direct_feature_fallback=(
-                False
-                if strict_no_fallback_enabled()
-                else _env_bool("MOONCAKE_EPD_ALLOW_DIRECT_FEATURE_FALLBACK", False)
+            direct_read_mode=os.getenv(
+                "MOONCAKE_EPD_DIRECT_READ_MODE",
+                "registered_tensor",
+            ).strip().lower(),
+            direct_read_slow_ms=_env_float(
+                "MOONCAKE_EPD_DIRECT_READ_SLOW_MS",
+                750.0,
+                minimum=0.0,
+            ),
+            direct_read_managed_cooldown_reads=int(
+                _env_float(
+                    "MOONCAKE_EPD_DIRECT_READ_MANAGED_COOLDOWN_READS",
+                    8.0,
+                    minimum=0.0,
+                )
+            ),
+            direct_read_adaptive_min_samples=int(
+                _env_float(
+                    "MOONCAKE_EPD_DIRECT_READ_ADAPTIVE_MIN_SAMPLES",
+                    4.0,
+                    minimum=1.0,
+                )
+            ),
+            direct_read_adaptive_ewma_alpha=min(
+                1.0,
+                _env_float(
+                    "MOONCAKE_EPD_DIRECT_READ_ADAPTIVE_EWMA_ALPHA",
+                    0.25,
+                    minimum=0.0,
+                ),
+            ),
+            direct_read_adaptive_slow_ratio=_env_float(
+                "MOONCAKE_EPD_DIRECT_READ_ADAPTIVE_SLOW_RATIO",
+                3.0,
+                minimum=1.0,
+            ),
+            direct_read_adaptive_min_observation_ms=_env_float(
+                "MOONCAKE_EPD_DIRECT_READ_ADAPTIVE_MIN_OBSERVATION_MS",
+                20.0,
+                minimum=0.0,
+            ),
+            direct_read_adaptive_max_buckets=int(
+                _env_float(
+                    "MOONCAKE_EPD_DIRECT_READ_ADAPTIVE_MAX_BUCKETS",
+                    32.0,
+                    minimum=1.0,
+                )
             ),
         )
+
+
+@dataclass
+class _AdaptiveDirectReadState:
+    managed_remaining: int = 0
+    managed_probe_pending: bool = False
+    baseline_samples: int = 0
+    baseline_ms_per_mib: Optional[float] = None
+    slow_events: int = 0
 
 
 def _empty_to_none(value: Optional[str]) -> Optional[str]:
@@ -237,104 +281,138 @@ def _tensor_from_direct_bytes(raw: bytes, spec: TensorSpec, *, device: torch.dev
             f"direct peer-buffer read size mismatch: got={len(raw)} expected={spec.nbytes}"
         )
     dtype = _dtype_from_spec(spec)
-    # Do not wrap raw bytes in bytearray: for Qwen-VL hidden states this adds a
-    # full 30-100MiB copy before the tensor is even moved to the target device.
-    # ``torch.frombuffer`` keeps a reference to the buffer owner; the tensor is
-    # read-only by contract until the optional device copy below materializes it.
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="The given buffer is not writable.*",
-            category=UserWarning,
-        )
-        tensor = torch.frombuffer(memoryview(raw), dtype=dtype).reshape(tuple(spec.shape))
-    target_device = torch.device(device)
-    if tensor.device == target_device:
-        return tensor
-    return tensor.to(device=target_device, dtype=dtype, non_blocking=False)
+    tensor = torch.frombuffer(bytearray(raw), dtype=dtype).reshape(tuple(spec.shape))
+    return tensor.to(device=device, dtype=dtype, non_blocking=False)
 
 
-def _move_feature_tensor(
-    tensor: torch.Tensor,
-    *,
-    device: torch.device,
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    target_dtype = dtype or tensor.dtype
-    if tensor.device == device and tensor.dtype == target_dtype:
-        return tensor
-    return tensor.to(device=device, dtype=target_dtype, non_blocking=True)
-
-
-def _feature_bundle_cache_key(handle: FeatureHandle) -> str:
-    descriptor = handle.descriptor
-    checksum_parts: List[str] = []
-    for spec in [descriptor.last_hidden, descriptor.grid_thw]:
-        if spec is not None and spec.checksum:
-            checksum_parts.append(str(spec.checksum))
-    for _, spec in descriptor.intermediates:
-        if spec.checksum:
-            checksum_parts.append(str(spec.checksum))
-    checksum = "|".join(checksum_parts)
-    return "|".join(
-        [
-            str(handle.uri or ""),
-            str(handle.store_id or ""),
-            str(descriptor.feature_id or handle.feature_id or ""),
-            str(descriptor.nbytes),
-            checksum,
-        ]
+def _empty_tensor_from_spec(spec: TensorSpec, *, device: torch.device | str) -> torch.Tensor:
+    tensor = torch.empty(
+        tuple(int(dim) for dim in spec.shape),
+        dtype=_dtype_from_spec(spec),
+        device=torch.device(device),
     )
+    if int(tensor.nelement() * tensor.element_size()) != int(spec.nbytes):
+        raise FeatureHandleError(
+            "direct tensor allocation size mismatch: "
+            f"allocated={tensor.nelement() * tensor.element_size()} expected={spec.nbytes}"
+        )
+    return tensor.contiguous()
 
 
-def _bundle_cache_get(key: str, *, config: FeatureHandleProviderConfig) -> Optional[FeatureBundle]:
-    if config.bundle_cache_entries <= 0 or config.bundle_cache_max_bytes <= 0:
+def _grid_thw_from_descriptor_metadata(
+    descriptor: FeatureBundleDescriptor,
+    *,
+    device: torch.device | str,
+) -> Optional[torch.Tensor]:
+    """Rebuild and validate semantic grid metadata carried by the descriptor.
+
+    vLLM marks ``image_grid_thw`` as ``keep_on_cpu=True`` and only uses it to
+    derive per-item split sizes. Keeping this semantic tensor on CPU avoids a
+    needless CUDA allocation and, more importantly, removes it from the
+    external-DMA/CUDA-stream lifetime domain entirely.
+    """
+
+    del device
+
+    raw_values = descriptor.metadata.get("grid_thw_values")
+    if raw_values is None:
         return None
-    with _BUNDLE_CACHE_LOCK:
-        item = _BUNDLE_CACHE.get(key)
-        if item is None:
-            return None
-        _BUNDLE_CACHE.move_to_end(key)
-        trace_vllm_mm_hidden_event("feature_handle_bundle_cache_hit", key_hash=_cache_key_digest(key), nbytes=item[0])
-        return item[1]
+    spec = descriptor.grid_thw
+    if spec is None:
+        raise FeatureHandleError(
+            "FeatureHandle descriptor carries grid_thw_values without a grid_thw TensorSpec"
+        )
+    dtype = _dtype_from_spec(spec)
+    if dtype not in {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}:
+        raise FeatureHandleError(
+            f"grid_thw descriptor must use an integer dtype, got {spec.dtype}"
+        )
+    try:
+        cpu_grid = torch.as_tensor(raw_values)
+    except Exception as exc:
+        raise FeatureHandleError(
+            f"invalid grid_thw_values in FeatureHandle descriptor: {exc}"
+        ) from exc
+    if cpu_grid.dtype == torch.bool:
+        raise FeatureHandleError("grid_thw_values must be integers, not bool")
+    if cpu_grid.is_floating_point():
+        if not bool(torch.isfinite(cpu_grid).all().item()):
+            raise FeatureHandleError("grid_thw_values contain non-finite values")
+        if not bool(torch.eq(cpu_grid, torch.round(cpu_grid)).all().item()):
+            raise FeatureHandleError("grid_thw_values contain non-integer values")
+    try:
+        cpu_grid = cpu_grid.to(dtype=dtype).reshape(tuple(int(dim) for dim in spec.shape))
+    except Exception as exc:
+        raise FeatureHandleError(
+            "grid_thw_values do not match the descriptor TensorSpec shape: "
+            f"expected={tuple(spec.shape)}"
+        ) from exc
+    if int(cpu_grid.nelement() * cpu_grid.element_size()) != int(spec.nbytes):
+        raise FeatureHandleError(
+            "grid_thw_values do not match the descriptor TensorSpec size: "
+            f"materialized={cpu_grid.nelement() * cpu_grid.element_size()} expected={spec.nbytes}"
+        )
+    _validate_grid_thw_semantics(descriptor, cpu_grid)
+    return cpu_grid.contiguous()
 
 
-def _bundle_cache_put(key: str, bundle: FeatureBundle, *, nbytes: int, config: FeatureHandleProviderConfig) -> None:
-    global _BUNDLE_CACHE_BYTES
-    max_entries = int(config.bundle_cache_entries)
-    max_bytes = int(config.bundle_cache_max_bytes)
-    if max_entries <= 0 or max_bytes <= 0 or nbytes <= 0 or nbytes > max_bytes:
-        return
-    with _BUNDLE_CACHE_LOCK:
-        old = _BUNDLE_CACHE.pop(key, None)
-        if old is not None:
-            _BUNDLE_CACHE_BYTES -= int(old[0])
-        _BUNDLE_CACHE[key] = (int(nbytes), bundle)
-        _BUNDLE_CACHE_BYTES += int(nbytes)
-        while _BUNDLE_CACHE and (len(_BUNDLE_CACHE) > max_entries or _BUNDLE_CACHE_BYTES > max_bytes):
-            _, (evicted_nbytes, _) = _BUNDLE_CACHE.popitem(last=False)
-            _BUNDLE_CACHE_BYTES -= int(evicted_nbytes)
-        trace_vllm_mm_hidden_event(
-            "feature_handle_bundle_cache_store",
-            key_hash=_cache_key_digest(key),
-            nbytes=nbytes,
-            entries=len(_BUNDLE_CACHE),
-            bytes=_BUNDLE_CACHE_BYTES,
+def _validate_grid_thw_semantics(
+    descriptor: FeatureBundleDescriptor,
+    grid: torch.Tensor,
+) -> None:
+    """Fail before model execution when grid metadata cannot index hidden rows."""
+
+    if grid.ndim != 2 or grid.shape[-1] != 3:
+        raise FeatureHandleError(
+            f"grid_thw must have shape [N, 3], got {tuple(grid.shape)}"
+        )
+    cpu_grid = grid.detach().to(device="cpu")
+    if not bool(torch.gt(cpu_grid, 0).all().item()):
+        raise FeatureHandleError(
+            f"grid_thw values must be positive, got {cpu_grid.tolist()}"
         )
 
+    raw_split_sizes = descriptor.metadata.get("split_sizes")
+    if raw_split_sizes is None:
+        return
+    try:
+        split_sizes = [int(value) for value in list(raw_split_sizes)]
+    except Exception as exc:
+        raise FeatureHandleError("invalid split_sizes in FeatureHandle descriptor") from exc
+    if not split_sizes or any(value <= 0 for value in split_sizes):
+        raise FeatureHandleError(
+            f"split_sizes must contain positive row counts, got {split_sizes}"
+        )
+    expected_rows = int(descriptor.last_hidden.shape[0]) if descriptor.last_hidden.shape else 0
+    if sum(split_sizes) != expected_rows:
+        raise FeatureHandleError(
+            "split_sizes do not cover last_hidden rows: "
+            f"sum={sum(split_sizes)} rows={expected_rows}"
+        )
 
-def _cache_key_digest(key: str) -> str:
-    return hashlib.sha256(str(key).encode("utf-8", errors="replace")).hexdigest()[:16]
-
-
-def clear_feature_handle_bundle_cache() -> None:
-    global _BUNDLE_CACHE_BYTES, _RESOLVED_CACHE_BYTES
-    with _BUNDLE_CACHE_LOCK:
-        _BUNDLE_CACHE.clear()
-        _BUNDLE_CACHE_BYTES = 0
-    with _RESOLVED_CACHE_LOCK:
-        _RESOLVED_CACHE.clear()
-        _RESOLVED_CACHE_BYTES = 0
+    raw_merge_size = descriptor.metadata.get("spatial_merge_size")
+    if raw_merge_size is None:
+        return
+    merge_size = int(raw_merge_size)
+    if merge_size <= 0:
+        raise FeatureHandleError(
+            f"spatial_merge_size must be positive, got {merge_size}"
+        )
+    if len(split_sizes) != int(cpu_grid.shape[0]):
+        raise FeatureHandleError(
+            "split_sizes/grid_thw item count mismatch: "
+            f"split_sizes={len(split_sizes)} grid_rows={int(cpu_grid.shape[0])}"
+        )
+    expected_split_sizes = [
+        int(row.prod().item()) // (merge_size * merge_size)
+        for row in cpu_grid
+    ]
+    if expected_split_sizes != split_sizes:
+        raise FeatureHandleError(
+            "grid_thw does not match encoded hidden row counts: "
+            f"grid_rows={expected_split_sizes} split_sizes={split_sizes} "
+            f"spatial_merge_size={merge_size}"
+        )
 
 
 def _resolved_cache_key(
@@ -344,22 +422,44 @@ def _resolved_cache_key(
     dtype: Optional[torch.dtype],
     config: FeatureHandleProviderConfig,
 ) -> str:
-    parts: List[str] = [str(device or config.device), str(dtype or "native")]
+    """Build a content/model/device key while excluding ephemeral pointers.
+
+    Direct handles carry a fresh ticket, handle id, and remote pointer plan for
+    every request.  Those fields must not defeat Prefill reuse.  Conversely,
+    tensor layout plus model/processor fingerprints are included so a process
+    cannot reuse embeddings across incompatible encoder revisions.
+    """
+
+    parts: List[str] = [str(torch.device(device or config.device)), str(dtype or "native")]
     for handle in handles:
-        parts.append(_feature_bundle_cache_key(handle))
-    return _cache_key_digest("\n".join(parts))
+        descriptor = handle.descriptor
+        descriptor_payload = descriptor.to_dict()
+        parts.extend(
+            [
+                str(handle.uri or ""),
+                str(handle.store_id or ""),
+                str(descriptor.feature_id or handle.feature_id or ""),
+                str(descriptor.model_fingerprint or ""),
+                str(descriptor.processor_fingerprint or ""),
+                json.dumps(descriptor_payload, sort_keys=True, separators=(",", ":"), default=str),
+            ]
+        )
+    return hashlib.sha256("\n".join(parts).encode("utf-8", errors="replace")).hexdigest()
 
 
 def _resolved_cache_nbytes(resolved: ResolvedFeatureHandles) -> int:
-    total = int(getattr(resolved.image_embeds, "nbytes", 0) or 0)
+    tensors: List[torch.Tensor] = [resolved.image_embeds]
     if resolved.image_grid_thw is not None:
-        total += int(getattr(resolved.image_grid_thw, "nbytes", 0) or 0)
-    for _, tensor in resolved.deepstack_image_embeds:
-        total += int(getattr(tensor, "nbytes", 0) or 0)
-    return total
+        tensors.append(resolved.image_grid_thw)
+    tensors.extend(tensor for _, tensor in resolved.deepstack_image_embeds)
+    return sum(int(tensor.nelement() * tensor.element_size()) for tensor in tensors)
 
 
-def _resolved_cache_get(key: str, *, config: FeatureHandleProviderConfig) -> Optional[ResolvedFeatureHandles]:
+def _resolved_cache_get(
+    key: str,
+    *,
+    config: FeatureHandleProviderConfig,
+) -> Optional[ResolvedFeatureHandles]:
     if config.resolved_cache_entries <= 0 or config.resolved_cache_max_bytes <= 0:
         return None
     with _RESOLVED_CACHE_LOCK:
@@ -367,11 +467,20 @@ def _resolved_cache_get(key: str, *, config: FeatureHandleProviderConfig) -> Opt
         if item is None:
             return None
         _RESOLVED_CACHE.move_to_end(key)
-        trace_vllm_mm_hidden_event("feature_handle_resolved_cache_hit", key_hash=key, nbytes=item[0])
+        trace_vllm_mm_hidden_event(
+            "feature_handle_resolved_cache_hit",
+            key_hash=key[:16],
+            nbytes=int(item[0]),
+        )
         return item[1]
 
 
-def _resolved_cache_put(key: str, resolved: ResolvedFeatureHandles, *, config: FeatureHandleProviderConfig) -> None:
+def _resolved_cache_put(
+    key: str,
+    resolved: ResolvedFeatureHandles,
+    *,
+    config: FeatureHandleProviderConfig,
+) -> None:
     global _RESOLVED_CACHE_BYTES
     max_entries = int(config.resolved_cache_entries)
     max_bytes = int(config.resolved_cache_max_bytes)
@@ -379,30 +488,30 @@ def _resolved_cache_put(key: str, resolved: ResolvedFeatureHandles, *, config: F
     if max_entries <= 0 or max_bytes <= 0 or nbytes <= 0 or nbytes > max_bytes:
         return
     with _RESOLVED_CACHE_LOCK:
-        old = _RESOLVED_CACHE.pop(key, None)
-        if old is not None:
-            _RESOLVED_CACHE_BYTES -= int(old[0])
-        _RESOLVED_CACHE[key] = (int(nbytes), resolved)
-        _RESOLVED_CACHE_BYTES += int(nbytes)
-        while _RESOLVED_CACHE and (len(_RESOLVED_CACHE) > max_entries or _RESOLVED_CACHE_BYTES > max_bytes):
+        previous = _RESOLVED_CACHE.pop(key, None)
+        if previous is not None:
+            _RESOLVED_CACHE_BYTES -= int(previous[0])
+        _RESOLVED_CACHE[key] = (nbytes, resolved)
+        _RESOLVED_CACHE_BYTES += nbytes
+        while _RESOLVED_CACHE and (
+            len(_RESOLVED_CACHE) > max_entries or _RESOLVED_CACHE_BYTES > max_bytes
+        ):
             _, (evicted_nbytes, _) = _RESOLVED_CACHE.popitem(last=False)
             _RESOLVED_CACHE_BYTES -= int(evicted_nbytes)
         trace_vllm_mm_hidden_event(
             "feature_handle_resolved_cache_store",
-            key_hash=key,
+            key_hash=key[:16],
             nbytes=nbytes,
             entries=len(_RESOLVED_CACHE),
             bytes=_RESOLVED_CACHE_BYTES,
         )
 
 
-def _provider_config_cache_key(config: FeatureHandleProviderConfig) -> Tuple[Any, ...]:
-    return (
-        str(config.mooncake_store_url or ""),
-        str(config.mooncake_config_path or ""),
-        str(config.timeout_s),
-        bool(config.mooncake_http_binary_payload),
-    )
+def clear_feature_handle_resolved_cache() -> None:
+    global _RESOLVED_CACHE_BYTES
+    with _RESOLVED_CACHE_LOCK:
+        _RESOLVED_CACHE.clear()
+        _RESOLVED_CACHE_BYTES = 0
 
 
 def _feature_handle_direct_local_hostname() -> str:
@@ -426,7 +535,10 @@ def _get_direct_read_engine() -> TransferEngine:
     with _DIRECT_READ_ENGINE_LOCK:
         if _DIRECT_READ_ENGINE is None:
             _DIRECT_READ_ENGINE = TransferEngine(
-                protocol=os.getenv("MOONCAKE_EPD_DIRECT_ENGINE_PROTOCOL", os.getenv("MOONCAKE_PROTOCOL", "tcp")),
+                protocol=os.getenv(
+                    "MOONCAKE_EPD_DIRECT_ENGINE_PROTOCOL",
+                    os.getenv("MOONCAKE_PROTOCOL", "tcp"),
+                ),
                 local_hostname=_feature_handle_direct_local_hostname(),
                 metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
                 device_name=os.getenv("MOONCAKE_DEVICE_NAME", ""),
@@ -546,40 +658,180 @@ def publish_feature_bundle_to_dir(
 class FeatureHandleProvider:
     def __init__(self, config: Optional[FeatureHandleProviderConfig] = None):
         self.config = config or FeatureHandleProviderConfig.from_env()
-        self._store_cache: Dict[Tuple[Any, ...], MooncakeFeatureBundleStore] = {}
-        self._store_cache_lock = threading.RLock()
-
-    def close(self) -> None:
-        with self._store_cache_lock:
-            stores = list(self._store_cache.values())
-            self._store_cache.clear()
-        for store in stores:
-            try:
-                store.close()
-            except Exception:
-                pass
-
-    def _get_mooncake_store(self, *, store_id: str) -> MooncakeFeatureBundleStore:
-        cfg = MooncakeFeatureBundleStoreConfig(
-            store_id=store_id or self.config.mooncake_store_id,
-            store_url=self.config.mooncake_store_url,
-            config_path=self.config.mooncake_config_path,
-            timeout_s=self.config.timeout_s,
-            http_binary_payload=self.config.mooncake_http_binary_payload,
+        self._direct_read_policy_lock = threading.Lock()
+        self._direct_read_policy_states: "OrderedDict[str, _AdaptiveDirectReadState]" = (
+            OrderedDict()
         )
-        key = (str(cfg.store_id),) + _provider_config_cache_key(self.config)
-        with self._store_cache_lock:
-            store = self._store_cache.get(key)
-            if store is None:
-                store = MooncakeFeatureBundleStore(cfg)
-                self._store_cache[key] = store
-                trace_vllm_mm_hidden_event(
-                    "feature_handle_store_client_created",
-                    store_id=cfg.store_id,
-                    http=bool(cfg.store_url),
-                    config_path=bool(cfg.config_path),
+
+    @staticmethod
+    def _direct_read_policy_key(*, remote_session: str, nbytes: int) -> str:
+        """Scope adaptive state by peer and a power-of-two payload bucket."""
+
+        size = max(1, int(nbytes))
+        lower = 1 << (size.bit_length() - 1)
+        upper = lower << 1
+        return f"{str(remote_session)}|bytes[{lower},{upper})"
+
+    def _direct_read_state_locked(self, policy_key: str) -> _AdaptiveDirectReadState:
+        key = str(policy_key or "global")
+        state = self._direct_read_policy_states.pop(key, None)
+        if state is None:
+            state = _AdaptiveDirectReadState()
+        self._direct_read_policy_states[key] = state
+        max_buckets = max(1, int(self.config.direct_read_adaptive_max_buckets))
+        while len(self._direct_read_policy_states) > max_buckets:
+            self._direct_read_policy_states.popitem(last=False)
+        return state
+
+    def _select_direct_read_mode(
+        self,
+        policy_key: str = "global",
+    ) -> Tuple[str, str, Optional[str]]:
+        requested = str(self.config.direct_read_mode).strip().lower()
+        if requested in {"registered_tensor", "managed_buffer"}:
+            return requested, requested, None
+        if requested != "adaptive":
+            raise FeatureHandleError(f"unsupported epd-direct read mode: {requested}")
+        with self._direct_read_policy_lock:
+            state = self._direct_read_state_locked(policy_key)
+            if state.managed_remaining > 0:
+                state.managed_remaining -= 1
+                state.managed_probe_pending = True
+                return requested, "managed_buffer", "adaptive_managed_cooldown"
+            if state.managed_probe_pending:
+                state.managed_probe_pending = False
+                return requested, "registered_tensor", "adaptive_registered_probe"
+        return requested, "registered_tensor", None
+
+    def _observe_direct_read(
+        self,
+        *,
+        requested_mode: str,
+        selected_mode: str,
+        timings_ms: Mapping[str, float],
+        policy_key: str = "global",
+    ) -> Tuple[Optional[str], int]:
+        transition, remaining, _ = self._observe_direct_read_detailed(
+            requested_mode=requested_mode,
+            selected_mode=selected_mode,
+            timings_ms=timings_ms,
+            policy_key=policy_key,
+        )
+        return transition, remaining
+
+    def _observe_direct_read_detailed(
+        self,
+        *,
+        requested_mode: str,
+        selected_mode: str,
+        timings_ms: Mapping[str, float],
+        policy_key: str = "global",
+    ) -> Tuple[Optional[str], int, Dict[str, Any]]:
+        total_ms = float(timings_ms.get("total_ms", 0.0) or 0.0)
+        nbytes = max(0.0, float(timings_ms.get("nbytes", 0.0) or 0.0))
+        payload_mib = nbytes / float(1024 * 1024)
+        normalized_ms_per_mib = (
+            total_ms / payload_mib if total_ms >= 0.0 and payload_mib > 0.0 else None
+        )
+        effective_mib_per_s = (
+            payload_mib * 1000.0 / total_ms
+            if payload_mib > 0.0 and total_ms > 0.0
+            else None
+        )
+        if requested_mode != "adaptive":
+            return None, 0, {
+                "policy_key": str(policy_key),
+                "payload_mib": payload_mib,
+                "normalized_ms_per_mib": normalized_ms_per_mib,
+                "effective_mib_per_s": effective_mib_per_s,
+                "baseline_samples": 0,
+                "baseline_ms_per_mib": None,
+                "relative_slow_threshold_ms_per_mib": None,
+                "slow_reason": None,
+            }
+
+        transition: Optional[str] = None
+        slow_reason: Optional[str] = None
+        with self._direct_read_policy_lock:
+            state = self._direct_read_state_locked(policy_key)
+            baseline_before = state.baseline_ms_per_mib
+            minimum_samples = max(
+                1,
+                int(self.config.direct_read_adaptive_min_samples),
+            )
+            relative_ratio = max(
+                1.0,
+                float(self.config.direct_read_adaptive_slow_ratio),
+            )
+            relative_threshold = (
+                float(baseline_before) * relative_ratio
+                if baseline_before is not None
+                and state.baseline_samples >= minimum_samples
+                else None
+            )
+            absolute_slow = total_ms >= float(self.config.direct_read_slow_ms)
+            relative_slow = bool(
+                normalized_ms_per_mib is not None
+                and relative_threshold is not None
+                and total_ms
+                >= float(self.config.direct_read_adaptive_min_observation_ms)
+                and normalized_ms_per_mib >= relative_threshold
+            )
+            is_slow = bool(absolute_slow or relative_slow)
+
+            if selected_mode == "registered_tensor" and is_slow:
+                if absolute_slow and relative_slow:
+                    slow_reason = "absolute_and_relative_ewma"
+                elif relative_slow:
+                    slow_reason = "relative_ewma"
+                else:
+                    slow_reason = "absolute"
+                if int(self.config.direct_read_managed_cooldown_reads) > 0:
+                    state.managed_remaining = max(
+                        state.managed_remaining,
+                        int(self.config.direct_read_managed_cooldown_reads),
+                    )
+                    transition = (
+                        "adaptive_registered_slow_to_managed"
+                        if absolute_slow
+                        else "adaptive_registered_relative_slow_to_managed"
+                    )
+                state.slow_events += 1
+            elif (
+                selected_mode == "registered_tensor"
+                and normalized_ms_per_mib is not None
+            ):
+                alpha = min(
+                    1.0,
+                    max(0.0, float(self.config.direct_read_adaptive_ewma_alpha)),
                 )
-            return store
+                if state.baseline_ms_per_mib is None:
+                    state.baseline_ms_per_mib = normalized_ms_per_mib
+                else:
+                    state.baseline_ms_per_mib = (
+                        alpha * normalized_ms_per_mib
+                        + (1.0 - alpha) * state.baseline_ms_per_mib
+                    )
+                state.baseline_samples += 1
+
+            remaining = int(state.managed_remaining)
+            observation = {
+                "policy_key": str(policy_key),
+                "payload_mib": payload_mib,
+                "normalized_ms_per_mib": normalized_ms_per_mib,
+                "effective_mib_per_s": effective_mib_per_s,
+                "baseline_samples": int(state.baseline_samples),
+                "baseline_ms_per_mib": state.baseline_ms_per_mib,
+                "relative_slow_threshold_ms_per_mib": (
+                    float(state.baseline_ms_per_mib) * relative_ratio
+                    if state.baseline_ms_per_mib is not None
+                    and state.baseline_samples >= minimum_samples
+                    else None
+                ),
+                "slow_reason": slow_reason,
+                "slow_events": int(state.slow_events),
+            }
+        return transition, remaining, observation
 
     def resolve_from_sources(
         self,
@@ -592,27 +844,42 @@ class FeatureHandleProvider:
             return None
         try:
             handles = tuple(FeatureHandle.from_control_payload(dict(item)) for item in payloads)
-            resolved_key = _resolved_cache_key(handles, device=device, dtype=dtype, config=self.config)
-            cached = _resolved_cache_get(resolved_key, config=self.config)
+            cache_key = _resolved_cache_key(
+                handles,
+                device=device,
+                dtype=dtype,
+                config=self.config,
+            )
+            cached = _resolved_cache_get(cache_key, config=self.config)
             if cached is not None:
-                record_vllm_precomputed_image_embeds_hit(cached.count, stable_keys=[h.metadata.get("source_mm_hash") or h.feature_id for h in cached.handles])
+                record_vllm_precomputed_image_embeds_hit(
+                    cached.count,
+                    stable_keys=[
+                        handle.metadata.get("source_mm_hash") or handle.feature_id
+                        for handle in cached.handles
+                    ],
+                )
                 return cached
+
             started = time.perf_counter()
             materialize_device = torch.device(device or self.config.device)
-            resolve_started = time.perf_counter()
-            bundles = [self._resolve_one(handle, materialize_device=materialize_device) for handle in handles]
-            resolve_ms = (time.perf_counter() - resolve_started) * 1000.0
-            merge_started = time.perf_counter()
-            resolved = self._merge(handles, bundles, device=device, dtype=dtype, source="feature_handle")
-            merge_ms = (time.perf_counter() - merge_started) * 1000.0
-            _resolved_cache_put(resolved_key, resolved, config=self.config)
+            bundles = [
+                self._resolve_one(handle, materialize_device=materialize_device)
+                for handle in handles
+            ]
+            resolved = self._merge(
+                handles,
+                bundles,
+                device=device,
+                dtype=dtype,
+                source="feature_handle",
+            )
+            _resolved_cache_put(cache_key, resolved, config=self.config)
             trace_vllm_mm_hidden_event(
                 "feature_handle_resolve_complete",
                 count=len(handles),
                 elapsed_ms=(time.perf_counter() - started) * 1000.0,
-                bundle_resolve_ms=resolve_ms,
-                merge_pack_ms=merge_ms,
-                cache_key=resolved_key,
+                cache_key=cache_key[:16],
             )
             return resolved
         except Exception as exc:
@@ -621,21 +888,16 @@ class FeatureHandleProvider:
                 error=f"{type(exc).__name__}: {exc}",
                 strict=self.config.strict,
             )
-            direct_handle_failure = any(
-                str(handle.uri or "").startswith("epd-direct://")
-                for handle in locals().get("handles", ())
-            )
-            if (
-                self.config.strict
-                or (
-                    direct_handle_failure
-                    and not self.config.allow_direct_feature_fallback
-                )
-            ):
+            if self.config.strict:
                 raise
             return None
 
-    def _resolve_one(self, handle: FeatureHandle, *, materialize_device: Optional[torch.device] = None) -> FeatureBundle:
+    def _resolve_one(
+        self,
+        handle: FeatureHandle,
+        *,
+        materialize_device: Optional[torch.device] = None,
+    ) -> FeatureBundle:
         with _REGISTRY_LOCK:
             registry = _REGISTRIES.get(handle.store_id)
         if registry is not None:
@@ -653,7 +915,10 @@ class FeatureHandleProvider:
                 require_checksum=self.config.require_checksum,
             )
 
-        bundle = self._load_from_uri_or_dirs(handle, materialize_device=materialize_device)
+        bundle = self._load_from_uri_or_dirs(
+            handle,
+            materialize_device=materialize_device,
+        )
         handle.descriptor.validate_bundle(
             bundle,
             expected_model_fingerprint=self.config.expected_model_fingerprint,
@@ -662,16 +927,15 @@ class FeatureHandleProvider:
         )
         return bundle
 
-    def _load_from_uri_or_dirs(self, handle: FeatureHandle, *, materialize_device: Optional[torch.device] = None) -> FeatureBundle:
+    def _load_from_uri_or_dirs(
+        self,
+        handle: FeatureHandle,
+        *,
+        materialize_device: Optional[torch.device] = None,
+    ) -> FeatureBundle:
         candidates: List[Path] = []
         uri = str(handle.uri or "")
         mooncake_error: Optional[BaseException] = None
-        cacheable_uri = uri.startswith(("mooncake://", "file://")) or (uri and not uri.startswith(("mmstore://", "epd-direct://")))
-        cache_key = _feature_bundle_cache_key(handle) if cacheable_uri else ""
-        if cache_key:
-            cached = _bundle_cache_get(cache_key, config=self.config)
-            if cached is not None:
-                return cached
         if uri.startswith("epd-direct://"):
             registry = get_direct_feature_buffer_registry(self.config.worker_id)
             if registry is not None:
@@ -679,20 +943,25 @@ class FeatureHandleProvider:
             for candidate in iter_direct_feature_buffer_registries():
                 if candidate.get(handle.feature_id) is not None:
                     return candidate.resolve_handle(handle)
-            return self._load_epd_direct_remote_bundle(handle, materialize_device=materialize_device)
+            return self._load_epd_direct_remote_bundle(
+                handle,
+                materialize_device=materialize_device,
+            )
         if uri.startswith("mooncake://"):
             try:
                 store_id, _ = parse_mooncake_feature_uri(uri)
-                store = self._get_mooncake_store(store_id=store_id or self.config.mooncake_store_id)
-                bundle = store.load_bundle(uri)
-                if cache_key:
-                    _bundle_cache_put(
-                        cache_key,
-                        bundle,
-                        nbytes=int(handle.descriptor.nbytes),
-                        config=self.config,
+                store = MooncakeFeatureBundleStore(
+                    MooncakeFeatureBundleStoreConfig(
+                        store_id=store_id or self.config.mooncake_store_id,
+                        store_url=self.config.mooncake_store_url,
+                        config_path=self.config.mooncake_config_path,
+                        timeout_s=self.config.timeout_s,
                     )
-                return bundle
+                )
+                try:
+                    return store.load_bundle(uri)
+                finally:
+                    store.close()
             except Exception as exc:
                 mooncake_error = exc
                 trace_vllm_mm_hidden_event(
@@ -708,13 +977,9 @@ class FeatureHandleProvider:
                         f"set MOONCAKE_STORE_URL/MOONCAKE_CONFIG_PATH or enable explicit file fallback"
                     ) from exc
         if uri.startswith("file://"):
-            candidate = Path(uri[7:]).expanduser()
-            self._validate_file_candidate(candidate)
-            candidates.append(candidate)
+            candidates.append(Path(uri[7:]))
         elif uri and not uri.startswith(("mmstore://", "mooncake://")):
-            candidate = Path(uri).expanduser()
-            self._validate_file_candidate(candidate)
-            candidates.append(candidate)
+            candidates.append(Path(uri).expanduser())
         for store in self.config.store_dirs:
             candidates.append(store / f"{_safe_feature_id(handle.feature_id)}.pt")
             candidates.append(store / f"{_safe_feature_id(handle.descriptor.feature_id)}.pt")
@@ -723,9 +988,7 @@ class FeatureHandleProvider:
         for key in ("feature_path", "bundle_path", "path"):
             value = handle.metadata.get(key)
             if value:
-                candidate = Path(str(value)).expanduser()
-                self._validate_file_candidate(candidate)
-                candidates.insert(0, candidate)
+                candidates.insert(0, Path(str(value)).expanduser())
 
         seen: set[str] = set()
         for path in candidates:
@@ -737,15 +1000,10 @@ class FeatureHandleProvider:
                 continue
             loaded = torch.load(path, map_location="cpu", weights_only=False)
             if isinstance(loaded, FeatureBundle):
-                bundle = loaded
-                if cache_key:
-                    _bundle_cache_put(cache_key, bundle, nbytes=int(handle.descriptor.nbytes), config=self.config)
-                return bundle
+                return loaded
             if isinstance(loaded, Mapping):
                 bundle = loaded.get("bundle")
                 if isinstance(bundle, FeatureBundle):
-                    if cache_key:
-                        _bundle_cache_put(cache_key, bundle, nbytes=int(handle.descriptor.nbytes), config=self.config)
                     return bundle
             raise FeatureHandleError(f"invalid feature bundle file: {path}")
         extra = f"; mooncake_error={mooncake_error!r}" if mooncake_error is not None else ""
@@ -754,20 +1012,12 @@ class FeatureHandleProvider:
             f"uri={handle.uri!r} store_dirs={[str(p) for p in self.config.store_dirs]}{extra}"
         )
 
-    def _validate_file_candidate(self, path: Path) -> None:
-        """Restrict strict serving to explicitly configured FeatureBundle roots."""
-
-        if not self.config.strict:
-            return
-        candidate = path.resolve(strict=False)
-        roots = [root.expanduser().resolve(strict=False) for root in self.config.store_dirs]
-        if not roots or not any(candidate == root or root in candidate.parents for root in roots):
-            raise FeatureHandleError(
-                "strict FeatureHandle file access requires a path under "
-                "MOONCAKE_EPD_FEATURE_HANDLE_STORE_DIRS"
-            )
-
-    def _load_epd_direct_remote_bundle(self, handle: FeatureHandle, *, materialize_device: Optional[torch.device] = None) -> FeatureBundle:
+    def _load_epd_direct_remote_bundle(
+        self,
+        handle: FeatureHandle,
+        *,
+        materialize_device: Optional[torch.device] = None,
+    ) -> FeatureBundle:
         """Materialize an ``epd-direct://`` handle from remote peer buffers.
 
         In real vLLM serving the direct allocation HTTP route is installed in
@@ -788,6 +1038,12 @@ class FeatureHandleProvider:
         if not targets:
             raise FeatureHandleError("epd-direct handle missing direct_plan.targets")
 
+        target_device = materialize_device or torch.device(self.config.device)
+        semantic_grid = _grid_thw_from_descriptor_metadata(
+            descriptor,
+            device=target_device,
+        )
+
         by_name: Dict[str, Dict[str, Any]] = {}
         for item in targets:
             if isinstance(item, Mapping) and item.get("name") is not None:
@@ -796,7 +1052,7 @@ class FeatureHandleProvider:
         specs: List[Tuple[str, TensorSpec, Optional[int]]] = [
             ("last_hidden", descriptor.last_hidden, None),
         ]
-        if descriptor.grid_thw is not None:
+        if descriptor.grid_thw is not None and semantic_grid is None:
             specs.append(("grid_thw", descriptor.grid_thw, None))
         for ordinal, (layer, spec) in enumerate(descriptor.intermediates):
             specs.append((f"intermediate:{int(layer)}:{ordinal}", spec, int(layer)))
@@ -820,40 +1076,31 @@ class FeatureHandleProvider:
 
         tensors: Dict[str, torch.Tensor] = {}
         intermediates: List[Tuple[int, torch.Tensor]] = []
-        direct_read_mode = str(os.getenv("MOONCAKE_EPD_DIRECT_READ_MODE", "registered_tensor")).lower()
-        direct_read_timings: Dict[str, float] = {}
-        if direct_read_mode not in {"registered_tensor", "managed_buffer"}:
-            raise FeatureHandleError(f"unsupported epd-direct read mode: {direct_read_mode}")
+        direct_read_policy_key = self._direct_read_policy_key(
+            remote_session=remote_session,
+            nbytes=sum(lengths),
+        )
+        requested_read_mode, direct_read_mode, selection_transition = (
+            self._select_direct_read_mode(direct_read_policy_key)
+        )
 
-        tensor_started = time.perf_counter()
+        direct_read_timings: Dict[str, float]
         if direct_read_mode == "registered_tensor":
-            allocated: List[torch.Tensor] = []
-            target_device = torch.device(materialize_device or self.config.device)
-            for name, spec, _ in ordered:
-                dtype = _dtype_from_spec(spec)
-                tensor = torch.empty(tuple(spec.shape), dtype=dtype, device=target_device)
-                if int(tensor.nelement() * tensor.element_size()) != int(spec.nbytes):
-                    raise FeatureHandleError(
-                        f"direct tensor allocation nbytes mismatch for {name}: "
-                        f"allocated={tensor.nelement() * tensor.element_size()} spec={spec.nbytes}"
-                    )
-                allocated.append(tensor.contiguous())
-            allocation_ms = (time.perf_counter() - tensor_started) * 1000.0
-            read_started = time.perf_counter()
+            target_tensors = [
+                _empty_tensor_from_spec(spec, device=target_device)
+                for _, spec, _ in ordered
+            ]
             try:
                 direct_read_timings = _get_direct_read_engine().read_remote_peer_buffers_into_tensors(
                     remote_session=remote_session,
                     remote_pointers=remote_pointers,
-                    tensors=allocated,
+                    tensors=target_tensors,
                 )
             except Exception as exc:
                 raise FeatureHandleError(
                     f"epd-direct FeatureHandle direct tensor materialization failed: {exc}"
                 ) from exc
-            read_ms = (time.perf_counter() - read_started) * 1000.0
-            direct_read_timings = dict(direct_read_timings or {})
-            direct_read_timings["allocation_ms"] = allocation_ms
-            for (name, _, layer), tensor in zip(ordered, allocated):
+            for (name, _spec, layer), tensor in zip(ordered, target_tensors):
                 tensors[name] = tensor
                 if layer is not None:
                     intermediates.append((int(layer), tensor))
@@ -869,14 +1116,35 @@ class FeatureHandleProvider:
                 raise FeatureHandleError(
                     f"epd-direct FeatureHandle remote peer-buffer materialization failed: {exc}"
                 ) from exc
-            read_ms = (time.perf_counter() - read_started) * 1000.0
-            direct_read_timings = {"read_ms": read_ms, "nbytes": float(sum(lengths)), "descriptor_count": float(len(lengths))}
+            direct_read_timings = {
+                "total_ms": (time.perf_counter() - read_started) * 1000.0,
+                "descriptor_count": float(len(lengths)),
+                "nbytes": float(sum(lengths)),
+            }
             for (name, spec, layer), raw in zip(ordered, raw_payloads):
-                tensor = _tensor_from_direct_bytes(raw, spec, device=materialize_device or self.config.device)
+                tensor = _tensor_from_direct_bytes(raw, spec, device=target_device)
                 tensors[name] = tensor
                 if layer is not None:
                     intermediates.append((int(layer), tensor))
-        tensor_ms = (time.perf_counter() - tensor_started) * 1000.0
+
+        (
+            observation_transition,
+            adaptive_managed_remaining,
+            adaptive_observation,
+        ) = self._observe_direct_read_detailed(
+            requested_mode=requested_read_mode,
+            selected_mode=direct_read_mode,
+            timings_ms=direct_read_timings,
+            policy_key=direct_read_policy_key,
+        )
+
+        if semantic_grid is not None:
+            tensors["grid_thw"] = semantic_grid
+        elif descriptor.grid_thw is not None:
+            direct_grid = tensors.get("grid_thw")
+            if direct_grid is None:
+                raise FeatureHandleError("epd-direct materialization did not produce grid_thw")
+            _validate_grid_thw_semantics(descriptor, direct_grid)
 
         bundle_metadata = dict(descriptor.metadata or {})
         if descriptor.model_fingerprint:
@@ -896,25 +1164,45 @@ class FeatureHandleProvider:
             grid_thw=tensors.get("grid_thw"),
             metadata=bundle_metadata,
         )
-        validate_started = time.perf_counter()
         descriptor.validate_bundle(
             bundle,
             expected_model_fingerprint=self.config.expected_model_fingerprint,
             expected_processor_fingerprint=self.config.expected_processor_fingerprint,
             require_checksum=bool(self.config.require_checksum),
         )
-        validate_ms = (time.perf_counter() - validate_started) * 1000.0
         trace_vllm_mm_hidden_event(
             "feature_handle_direct_remote_resolved",
             feature_id=handle.feature_id,
             remote_session=remote_session,
             tensor_count=len(ordered),
             nbytes=sum(lengths),
+            direct_read_requested_mode=requested_read_mode,
             direct_read_mode=direct_read_mode,
-            remote_read_ms=read_ms,
-            tensor_materialize_ms=tensor_ms,
             direct_read_timings_ms=direct_read_timings,
-            validate_ms=validate_ms,
+            direct_read_adaptive_slow_ms=float(self.config.direct_read_slow_ms),
+            direct_read_adaptive_managed_remaining=adaptive_managed_remaining,
+            direct_read_adaptive_transition=(
+                observation_transition or selection_transition
+            ),
+            direct_read_adaptive_policy_key=direct_read_policy_key,
+            direct_read_adaptive_min_samples=int(
+                self.config.direct_read_adaptive_min_samples
+            ),
+            direct_read_adaptive_slow_ratio=float(
+                self.config.direct_read_adaptive_slow_ratio
+            ),
+            direct_read_adaptive_observation=adaptive_observation,
+            grid_thw_source=(
+                "descriptor_metadata" if semantic_grid is not None else "direct_peer_buffer"
+            ),
+            grid_thw_direct_read_skipped=bool(semantic_grid is not None),
+            grid_thw_values=(
+                semantic_grid.detach().to(device="cpu").tolist()
+                if semantic_grid is not None
+                else tensors.get("grid_thw").detach().to(device="cpu").tolist()
+                if isinstance(tensors.get("grid_thw"), torch.Tensor)
+                else None
+            ),
         )
         return bundle
 
@@ -928,38 +1216,29 @@ class FeatureHandleProvider:
         source: str,
     ) -> ResolvedFeatureHandles:
         target_device = torch.device(device or self.config.device)
-        if len(bundles) == 1:
-            main_embeds = _move_feature_tensor(
-                bundles[0].last_hidden,
-                device=target_device,
-                dtype=dtype,
-            )
-        else:
-            main_embeds = torch.cat(
-                [
-                    _move_feature_tensor(b.last_hidden, device=target_device, dtype=dtype)
-                    for b in bundles
-                ],
-                dim=0,
-            )
+        moved_main = [
+            b.last_hidden.to(device=target_device, dtype=dtype, non_blocking=True)
+            for b in bundles
+        ]
+        main_embeds = moved_main[0] if len(moved_main) == 1 else torch.cat(moved_main, dim=0)
         grids = [b.grid_thw for b in bundles if b.grid_thw is not None]
         image_grid_thw = None
         if len(grids) == len(bundles):
-            if len(grids) == 1:
-                image_grid_thw = _move_feature_tensor(
-                    grids[0],
-                    device=target_device,
-                    dtype=grids[0].dtype,
-                )
-            else:
-                image_grid_thw = torch.cat(
-                    [
-                        _move_feature_tensor(g, device=target_device, dtype=g.dtype)
-                        for g in grids
-                        if g is not None
-                    ],
-                    dim=0,
-                )
+            # image_grid_thw is semantic shape metadata. vLLM's native field
+            # contract keeps it on CPU, while image/deepstack embeddings stay
+            # on the target accelerator. This also establishes a synchronous
+            # readback barrier for legacy direct descriptors that did not carry
+            # grid_thw_values in their control metadata.
+            moved_grids = [
+                g.detach().to(device="cpu", non_blocking=False).contiguous()
+                for g in grids
+                if g is not None
+            ]
+            image_grid_thw = (
+                moved_grids[0]
+                if len(moved_grids) == 1
+                else torch.cat(moved_grids, dim=0)
+            )
 
         deep_by_layer: Dict[int, List[torch.Tensor]] = {}
         for bundle in bundles:
@@ -970,28 +1249,14 @@ class FeatureHandleProvider:
             tensors = deep_by_layer[layer]
             if len(tensors) != len(bundles):
                 continue
-            if len(tensors) == 1:
-                deepstack.append(
-                    (
-                        layer,
-                        _move_feature_tensor(
-                            tensors[0],
-                            device=target_device,
-                            dtype=dtype,
-                        ),
-                    )
-                )
-                continue
+            moved = [
+                tensor.to(device=target_device, dtype=dtype, non_blocking=True)
+                for tensor in tensors
+            ]
             deepstack.append(
                 (
                     layer,
-                    torch.cat(
-                        [
-                            _move_feature_tensor(t, device=target_device, dtype=dtype)
-                            for t in tensors
-                        ],
-                        dim=0,
-                    ),
+                    moved[0] if len(moved) == 1 else torch.cat(moved, dim=0),
                 )
             )
 
@@ -1040,10 +1305,7 @@ def get_default_feature_handle_provider() -> FeatureHandleProvider:
 def close_default_feature_handle_provider() -> None:
     global _DEFAULT_PROVIDER
     with _DEFAULT_PROVIDER_LOCK:
-        provider = _DEFAULT_PROVIDER
         _DEFAULT_PROVIDER = None
-    if provider is not None:
-        provider.close()
 
 
 atexit.register(close_default_feature_handle_provider)
@@ -1055,7 +1317,11 @@ def resolve_feature_handles_for_vllm(
     dtype: Optional[torch.dtype] = None,
     provider: Optional[FeatureHandleProvider] = None,
 ) -> Optional[ResolvedFeatureHandles]:
-    return (provider or get_default_feature_handle_provider()).resolve_from_sources(*sources, device=device, dtype=dtype)
+    return (provider or get_default_feature_handle_provider()).resolve_from_sources(
+        *sources,
+        device=device,
+        dtype=dtype,
+    )
 
 
 def maybe_inject_feature_handle_kwargs(
@@ -1157,6 +1423,16 @@ def inject_feature_handles_into_vllm_mm_kwargs(
                     req_id=req_id,
                     mm_hash=mm_hash,
                     handle_id=handle.handle_id,
+                    grid_thw_device=(
+                        str(resolved.image_grid_thw.device)
+                        if resolved.image_grid_thw is not None
+                        else None
+                    ),
+                    grid_thw_values=(
+                        resolved.image_grid_thw.detach().to(device="cpu").tolist()
+                        if resolved.image_grid_thw is not None
+                        else None
+                    ),
                 )
         except Exception as exc:
             trace_vllm_mm_hidden_event(
@@ -1165,18 +1441,7 @@ def inject_feature_handles_into_vllm_mm_kwargs(
                 error=f"{type(exc).__name__}: {exc}",
                 strict=provider.config.strict,
             )
-            direct_handle_failure = (
-                "handle" in locals()
-                and handle is not None
-                and str(handle.uri or "").startswith("epd-direct://")
-            )
-            if (
-                provider.config.strict
-                or (
-                    direct_handle_failure
-                    and not provider.config.allow_direct_feature_fallback
-                )
-            ):
+            if provider.config.strict:
                 raise
             continue
     return list(mm_hashes), out_kwargs, list(mm_lora_refs)

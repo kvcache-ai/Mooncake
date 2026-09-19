@@ -41,7 +41,7 @@ from .vllm_feature_handle_provider import (
     FeatureHandleProvider,
     FeatureHandleProviderConfig,
     ResolvedFeatureHandles,
-    clear_feature_handle_bundle_cache,
+    clear_feature_handle_resolved_cache,
     close_default_feature_handle_provider,
     extract_feature_handle_payloads,
     get_default_feature_handle_provider,
@@ -68,7 +68,9 @@ from .vllm_mm_hidden_cache import (
 from .omni_hidden_prefix_cache import (
     OmniHiddenPrefixCache,
     OmniHiddenPrefixCacheConfig,
+    get_current_omni_hidden_cache_keys,
     install_qwen2_5_omni_hidden_prefix_cache,
+    use_omni_hidden_cache_keys,
 )
 from .relay_recompute import RelayRecompute, Segment, split_segments
 from .attention_similarity import AttentionSimilarityReuse, attention_similarity
@@ -115,6 +117,8 @@ __all__ = [
     "RadixTree",
     "RelayRecompute",
     "ResolvedFeatureHandles",
+    "clear_feature_handle_resolved_cache",
+    "close_default_feature_handle_provider",
     "Segment",
     "StateLayer",
     "StateMeta",
@@ -123,7 +127,9 @@ __all__ = [
     "WorkflowStateRegistry",
     "attention_similarity",
     "get_current_mm_hidden_cache_keys",
+    "get_current_omni_hidden_cache_keys",
     "get_global_mm_hidden_cache",
+    "get_default_feature_handle_provider",
     "get_or_compute_qwen3vl_image_embeds",
     "install_qwen2_5_omni_hidden_prefix_cache",
     "extract_feature_handle_payloads",
@@ -136,12 +142,10 @@ __all__ = [
     "record_vllm_precomputed_image_embeds_hit",
     "trace_vllm_mm_hidden_event",
     "use_mm_hidden_cache_keys",
+    "use_omni_hidden_cache_keys",
     "unregister_feature_handle_registry",
     "use_kv_transfer_params",
     "build_mooncake_feature_uri",
-    "clear_feature_handle_bundle_cache",
-    "close_default_feature_handle_provider",
-    "get_default_feature_handle_provider",
     "parse_mooncake_feature_uri",
     "split_segments",
 ]

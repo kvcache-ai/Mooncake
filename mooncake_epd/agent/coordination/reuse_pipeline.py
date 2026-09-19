@@ -29,6 +29,7 @@ from ...core.state import (
     RadixTree,
     RelayRecompute,
     StateLayer,
+    split_segments,
 )
 
 
@@ -56,6 +57,15 @@ class ReuseStats:
     tier1_ms: float = 0.0
     tier2_ms: float = 0.0
     tier3_ms: float = 0.0
+    cost_gate_enabled: bool = False
+    cost_gate_decision: str = "not_evaluated"
+    fallback_reason: str = ""
+    predicted_reusable_tokens: int = 0
+    predicted_recompute_tokens: int = 0
+    estimated_prefill_ms_per_token: Optional[float] = None
+    predicted_saved_prefill_ms: Optional[float] = None
+    predicted_relay_overhead_ms: Optional[float] = None
+    predicted_net_benefit_ms: Optional[float] = None
 
     @property
     def reused_tokens(self) -> int:
@@ -98,18 +108,143 @@ class ReusePipeline:
         attention_threshold: float = 0.90,
         enable_tier2: bool = True,
         enable_tier3: bool = True,
+        relay_min_match_run: int = 4,
+        enable_cost_gate: bool = False,
+        force_approximate: bool = False,
+        estimated_prefill_ms_per_token: Optional[float] = None,
+        relay_fixed_overhead_ms: float = 0.25,
+        relay_segment_overhead_ms: float = 0.05,
+        relay_tier3_page_overhead_ms: float = 0.05,
+        min_net_benefit_ms: float = 0.5,
     ):
         self.sl = state_layer
         self.prefill_fn = prefill_fn
         self.relay_threshold = relay_threshold
         self.enable_tier2 = enable_tier2
         self.enable_tier3 = enable_tier3
+        self.enable_cost_gate = bool(enable_cost_gate)
+        self.force_approximate = bool(force_approximate)
+        self.estimated_prefill_ms_per_token = (
+            float(estimated_prefill_ms_per_token)
+            if estimated_prefill_ms_per_token is not None
+            and float(estimated_prefill_ms_per_token) > 0.0
+            else None
+        )
+        self.relay_fixed_overhead_ms = max(0.0, float(relay_fixed_overhead_ms))
+        self.relay_segment_overhead_ms = max(0.0, float(relay_segment_overhead_ms))
+        self.relay_tier3_page_overhead_ms = max(
+            0.0, float(relay_tier3_page_overhead_ms)
+        )
+        self.min_net_benefit_ms = max(0.0, float(min_net_benefit_ms))
         self.relay = RelayRecompute(
-            state_layer.pm, state_layer.radix, prefill_fn,
+            state_layer.pm,
+            state_layer.radix,
+            prefill_fn,
+            min_match_run=max(1, int(relay_min_match_run)),
         ) if enable_tier2 else None
         self.attn = AttentionSimilarityReuse(
             state_layer.pm, threshold=attention_threshold,
         ) if enable_tier3 else None
+
+    def update_cost_calibration(self, ms_per_token: Optional[float]) -> None:
+        if ms_per_token is None or float(ms_per_token) <= 0.0:
+            return
+        observed = float(ms_per_token)
+        if self.estimated_prefill_ms_per_token is None:
+            self.estimated_prefill_ms_per_token = observed
+        else:
+            self.estimated_prefill_ms_per_token = (
+                0.8 * self.estimated_prefill_ms_per_token + 0.2 * observed
+            )
+
+    def _evaluate_cost_gate(
+        self,
+        *,
+        delta_tokens: Sequence[int],
+        prev_tokens: Sequence[int],
+        workflow_id: Optional[str],
+        stats: ReuseStats,
+    ) -> bool:
+        stats.cost_gate_enabled = bool(self.enable_cost_gate)
+        if not self.enable_cost_gate:
+            stats.cost_gate_decision = "disabled"
+            return True
+        segments = split_segments(
+            delta_tokens,
+            prev_tokens,
+            self.sl.pm.page_size,
+            min_match_run=(self.relay.min_match_run if self.relay is not None else 4),
+        )
+        cursor = 0
+        reusable_tokens = 0
+        candidate_pages = 0
+        for segment in segments:
+            token_count = len(segment.tokens)
+            if (
+                segment.reusable
+                and segment.prev_offset >= 0
+                and cursor % self.sl.pm.page_size == 0
+                and segment.prev_offset % self.sl.pm.page_size == 0
+                and token_count % self.sl.pm.page_size == 0
+            ):
+                covering_refs, start_offset = self.sl.radix.match_substring(
+                    segment.tokens,
+                    scope=workflow_id,
+                )
+                picked_tokens = 0
+                picked_start = None
+                path_cursor = 0
+                for ref in covering_refs:
+                    page_end = path_cursor + int(ref.filled)
+                    if page_end > start_offset and path_cursor < start_offset + token_count:
+                        if picked_start is None:
+                            picked_start = path_cursor
+                        picked_tokens += int(ref.filled)
+                    path_cursor = page_end
+                if (
+                    start_offset >= 0
+                    and picked_start == start_offset
+                    and picked_tokens == token_count
+                ):
+                    reusable_tokens += token_count
+                    candidate_pages += token_count // self.sl.pm.page_size
+            cursor += token_count
+        stats.predicted_reusable_tokens = int(reusable_tokens)
+        stats.predicted_recompute_tokens = max(0, len(delta_tokens) - reusable_tokens)
+        stats.estimated_prefill_ms_per_token = self.estimated_prefill_ms_per_token
+
+        if self.force_approximate:
+            stats.cost_gate_decision = "forced_relay"
+            return True
+        if reusable_tokens <= 0:
+            stats.cost_gate_decision = "exact_fallback"
+            stats.fallback_reason = "no_full_page_reuse_candidate"
+            return False
+        if self.estimated_prefill_ms_per_token is None:
+            stats.cost_gate_decision = "exact_fallback"
+            stats.fallback_reason = "no_calibrated_prefill_cost"
+            return False
+
+        saved_ms = reusable_tokens * self.estimated_prefill_ms_per_token
+        overhead_ms = (
+            self.relay_fixed_overhead_ms
+            + len(segments) * self.relay_segment_overhead_ms
+            + (
+                candidate_pages * self.relay_tier3_page_overhead_ms
+                if self.enable_tier3
+                else 0.0
+            )
+        )
+        net_ms = saved_ms - overhead_ms
+        stats.predicted_saved_prefill_ms = float(saved_ms)
+        stats.predicted_relay_overhead_ms = float(overhead_ms)
+        stats.predicted_net_benefit_ms = float(net_ms)
+        if net_ms < self.min_net_benefit_ms:
+            stats.cost_gate_decision = "exact_fallback"
+            stats.fallback_reason = "predicted_net_benefit_below_margin"
+            return False
+        stats.cost_gate_decision = "relay"
+        return True
 
     def _materialize_prev_candidate_refs(
         self,
@@ -239,7 +374,10 @@ class ReusePipeline:
             else:
                 new_refs, logits = [], None
             stats.elapsed_ms = (time.perf_counter() - t0) * 1000
-            return list(matched_pages) + list(new_refs), logits, stats
+            return self.sl._normalize_committed_refs(
+                matched_pages=matched_pages,
+                committed_refs=new_refs,
+            ), logits, stats
 
         # -- Tier 2: selective recomputation ---------------------------
         reuse_ratio_after_t1 = stats.tier1_matched_tokens / max(1, len(full_tokens))
@@ -258,7 +396,35 @@ class ReusePipeline:
             else:
                 new_refs, logits = [], None
             stats.elapsed_ms = (time.perf_counter() - t0) * 1000
-            return list(matched_pages) + list(new_refs), logits, stats
+            return self.sl._normalize_committed_refs(
+                matched_pages=matched_pages,
+                committed_refs=new_refs,
+            ), logits, stats
+
+        if not self._evaluate_cost_gate(
+            delta_tokens=delta_tokens,
+            prev_tokens=prev_tokens,
+            workflow_id=workflow_id,
+            stats=stats,
+        ):
+            if self.prefill_fn is not None:
+                prefill_t0 = time.perf_counter()
+                new_refs, logits = self.prefill_fn(
+                    delta_tokens,
+                    prefix_kv_refs=matched_pages or None,
+                    pixel_values=new_pixel_values,
+                    image_grid_thw=new_image_grid_thw,
+                )
+                stats.delta_prefill_ms += (time.perf_counter() - prefill_t0) * 1000.0
+                stats.delta_prefill_calls += 1
+                stats.delta_prefill_tokens += len(delta_tokens)
+            else:
+                new_refs, logits = [], None
+            stats.elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return self.sl._normalize_committed_refs(
+                matched_pages=matched_pages,
+                committed_refs=new_refs,
+            ), logits, stats
 
         tier2_t0 = time.perf_counter()
         relay_refs, relay_stats, tier3_candidates = self.relay.run_with_trace(

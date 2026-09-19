@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT.parent))
 
-from mooncake_epd.demo.vllm_integration import VLLMDisaggConfig, generate_configs  # noqa: E402
+from mooncake_epd.demo.vllm_integration import MODEL_PATH, VLLMDisaggConfig, generate_configs  # noqa: E402
 from mooncake_epd.scripts.run_vllm_serving_e2e import (  # noqa: E402
     _cleanup_previous_run_artifacts,
     _ensure_process_running,
@@ -168,19 +168,12 @@ def _post_feature_handle_request(proxy_url: str, request_path: Path, *, timeout_
 
 def summarize_feature_handle_metrics(metrics_payload: Dict[str, Any]) -> Dict[str, Any]:
     metrics = dict(metrics_payload.get("metrics") or {})
-    precomputed_hits = int(metrics.get("mm_hidden_cache_precomputed_image_embeds_hits", 0) or 0)
-    hidden_cache_hits = int(metrics.get("mm_hidden_cache_hits", 0) or 0)
-    native_encoder_cache_hits = int(metrics.get("mm_hidden_cache_native_encoder_cache_hits", 0) or 0)
     return {
         "requests_total": int(metrics.get("requests_total", 0) or 0),
         "requests_multimodal": int(metrics.get("requests_multimodal", 0) or 0),
-        "requests_text": int(metrics.get("requests_text", 0) or 0),
         "mm_prefetch_attempted": int(metrics.get("mm_prefetch_attempted", 0) or 0),
         "mm_prefetch_completed": int(metrics.get("mm_prefetch_completed", 0) or 0),
-        "precomputed_hits": precomputed_hits,
-        "hidden_cache_hits": hidden_cache_hits,
-        "native_encoder_cache_hits": native_encoder_cache_hits,
-        "vision_skip_hits": max(precomputed_hits, hidden_cache_hits + native_encoder_cache_hits),
+        "precomputed_hits": int(metrics.get("mm_hidden_cache_precomputed_image_embeds_hits", 0) or 0),
         "hidden_cache_errors": int(metrics.get("mm_hidden_cache_errors", 0) or 0),
         "hidden_cache_full_miss_batches": int(metrics.get("mm_hidden_cache_full_miss_batches", 0) or 0),
         "hidden_cache_vision_compute_ms_avg": float(metrics.get("mm_hidden_cache_vision_compute_ms_avg", 0.0) or 0.0),
@@ -190,37 +183,7 @@ def summarize_feature_handle_metrics(metrics_payload: Dict[str, Any]) -> Dict[st
         "layered_transfer_failed_batches": int(metrics.get("layered_transfer_failed_batches", 0) or 0),
         "peer_buffer_batches": int(metrics.get("peer_buffer_batches", 0) or 0),
         "peer_buffer_bytes": int(metrics.get("peer_buffer_bytes", 0) or 0),
-        "peer_buffer_dispatch_ms": float(metrics.get("peer_buffer_dispatch_ms", 0.0) or 0.0),
-        "peer_buffer_dispatch_ms_avg": float(metrics.get("peer_buffer_dispatch_ms_avg", 0.0) or 0.0),
-        "peer_buffer_prepare_ms": float(metrics.get("peer_buffer_prepare_ms", 0.0) or 0.0),
-        "peer_buffer_prepare_ms_avg": float(metrics.get("peer_buffer_prepare_ms_avg", 0.0) or 0.0),
-        "peer_buffer_write_ms": float(metrics.get("peer_buffer_write_ms", 0.0) or 0.0),
-        "peer_buffer_write_ms_avg": float(metrics.get("peer_buffer_write_ms_avg", 0.0) or 0.0),
-        "peer_buffer_write_bandwidth_gbps": float(metrics.get("peer_buffer_write_bandwidth_gbps", 0.0) or 0.0),
-        "layered_receive_kv_requests": int(metrics.get("layered_receive_kv_requests", 0) or 0),
-        "layered_receive_kv_worker_roundtrips": int(metrics.get("layered_receive_kv_worker_roundtrips", 0) or 0),
-        "layered_receive_kv_worker_ms_avg": float(metrics.get("layered_receive_kv_worker_ms_avg", 0.0) or 0.0),
-        "layered_receive_kv_response_messages": int(metrics.get("layered_receive_kv_response_messages", 0) or 0),
-        "layered_receive_kv_first_response_count": int(metrics.get("layered_receive_kv_first_response_count", 0) or 0),
-        "layered_receive_kv_first_response_ms_avg": float(metrics.get("layered_receive_kv_first_response_ms_avg", 0.0) or 0.0),
-        "layered_receive_kv_last_response_count": int(metrics.get("layered_receive_kv_last_response_count", 0) or 0),
-        "layered_receive_kv_last_response_ms_avg": float(metrics.get("layered_receive_kv_last_response_ms_avg", 0.0) or 0.0),
-        "layered_receive_kv_response_process_count": int(metrics.get("layered_receive_kv_response_process_count", 0) or 0),
-        "layered_receive_kv_response_process_ms_avg": float(metrics.get("layered_receive_kv_response_process_ms_avg", 0.0) or 0.0),
-        "layered_receive_kv_first_group_count": int(metrics.get("layered_receive_kv_first_group_count", 0) or 0),
-        "layered_receive_kv_first_group_ms_avg": float(metrics.get("layered_receive_kv_first_group_ms_avg", 0.0) or 0.0),
-        "layered_receive_kv_finished_count": int(metrics.get("layered_receive_kv_finished_count", 0) or 0),
-        "layered_receive_kv_finished_ms_avg": float(metrics.get("layered_receive_kv_finished_ms_avg", 0.0) or 0.0),
         "backend_counts": dict(metrics.get("remote_transfer_backend_counts") or {}),
-        "decode_engine_timing_workers": int(metrics.get("decode_engine_timing_workers", 0) or 0),
-        "decode_engine_first_token_requests": int(metrics.get("decode_engine_first_token_requests", 0) or 0),
-        "decode_engine_first_token_latency_ms_total": float(metrics.get("decode_engine_first_token_latency_ms_total", 0.0) or 0.0),
-        "decode_engine_first_token_latency_ms_avg": float(metrics.get("decode_engine_first_token_latency_ms_avg", 0.0) or 0.0),
-        "decode_engine_kv_first_token_requests": int(metrics.get("decode_engine_kv_first_token_requests", 0) or 0),
-        "decode_engine_kv_first_token_latency_ms_total": float(metrics.get("decode_engine_kv_first_token_latency_ms_total", 0.0) or 0.0),
-        "decode_engine_kv_first_token_latency_ms_avg": float(metrics.get("decode_engine_kv_first_token_latency_ms_avg", 0.0) or 0.0),
-        "decode_engine_kv_first_token_output_tokens": int(metrics.get("decode_engine_kv_first_token_output_tokens", 0) or 0),
-        "decode_engine_scheduler_update_calls": int(metrics.get("decode_engine_scheduler_update_calls", 0) or 0),
     }
 
 
@@ -301,6 +264,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         decode_gpu=int(args.decode_gpu),
         gpu_memory_utilization=float(args.gpu_memory_utilization),
         max_model_len=int(args.max_model_len),
+        strict_no_fallback=True,
     )
     files = generate_configs(str(workdir), cfg)
     prefill_port = _extract_port(Path(files["prefill"]))
@@ -395,10 +359,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Run real vLLM FeatureHandle EPD serving E2E validation.")
     ap.add_argument("--workdir", default="/tmp/mooncake_epd_feature_handle_e2e")
-    ap.add_argument(
-        "--model",
-        default=os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct"),
-    )
+    ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--request", default=None, help="Reuse an existing FeatureHandle-backed request JSON.")
     ap.add_argument("--store-dir", default=None, help="FeatureBundle store dir; defaults to <workdir>/feature_handle_store.")
     ap.add_argument("--keep-feature-store", action=argparse.BooleanOptionalAction, default=False)
@@ -419,7 +380,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--image-path", default=None)
     ap.add_argument("--checksum", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--max-group-bytes", type=int, default=16 * 1024 * 1024)
-    ap.add_argument("--max-transfer-descriptors", type=int, default=128)
+    ap.add_argument("--max-transfer-descriptors", type=int, default=64)
     ap.add_argument("--max-transfer-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--owner-shards", type=int, default=1)
     ap.add_argument("--kv-directory-rpc-url", default=None)

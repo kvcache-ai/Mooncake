@@ -225,9 +225,14 @@ class VLLMMMHiddenStateCache:
         )
         self._lock = threading.RLock()
         self._entries: "OrderedDict[str, MMHiddenCacheEntry]" = OrderedDict()
+        self._inflight: Dict[str, threading.Event] = {}
         self._bytes = 0
         self._last_flush = 0.0
         self._recent_keys: "deque[dict[str, Any]]" = deque(maxlen=16)
+        self._lookup_lock_wait_samples_ms: "deque[float]" = deque(maxlen=2048)
+        self._lookup_lock_hold_samples_ms: "deque[float]" = deque(maxlen=2048)
+        self._cache_load_samples_ms: "deque[float]" = deque(maxlen=2048)
+        self._sampled_candidates: "OrderedDict[str, str]" = OrderedDict()
         self._metrics: Dict[str, Any] = {
             "enabled": bool(self.enabled),
             "lookups": 0,
@@ -245,9 +250,14 @@ class VLLMMMHiddenStateCache:
             "partial_hit_batches": 0,
             "full_hit_batches": 0,
             "full_miss_batches": 0,
+            "vision_encoder_calls": 0,
+            "coalesced_waits": 0,
+            "coalesced_hits": 0,
             "vision_compute_ms_total": 0.0,
             "cache_load_ms_total": 0.0,
             "hash_ms_total": 0.0,
+            "collision_full_verifies": 0,
+            "sampled_candidate_collisions": 0,
             "errors": 0,
             "last_error": "",
         }
@@ -271,6 +281,13 @@ class VLLMMMHiddenStateCache:
             )
             if self.debug:
                 out["recent_keys"] = list(self._recent_keys)
+            out["lookup_lock_wait_p95_ms"] = self._percentile(
+                self._lookup_lock_wait_samples_ms, 0.95
+            )
+            out["lookup_lock_hold_p95_ms"] = self._percentile(
+                self._lookup_lock_hold_samples_ms, 0.95
+            )
+            out["cache_load_p95_ms"] = self._percentile(self._cache_load_samples_ms, 0.95)
             return out
 
     def get_or_compute(
@@ -439,31 +456,75 @@ class VLLMMMHiddenStateCache:
             missing=missing,
         )
         if missing:
-            pixel_chunks = list(torch.split(pixel_values, input_sizes, dim=0))
-            miss_pixels = torch.cat([pixel_chunks[i] for i in missing], dim=0)
-            miss_grid = grid_thw[missing]
-            compute_started = time.perf_counter()
-            miss_embeds = visual(miss_pixels, grid_thw=miss_grid)
-            compute_ms = (time.perf_counter() - compute_started) * 1000.0
-            miss_output_sizes = [output_sizes[i] for i in missing]
-            miss_chunks = list(torch.split(miss_embeds, miss_output_sizes, dim=0))
-            if len(miss_chunks) != len(missing):
-                raise RuntimeError(
-                    "Qwen3-VL hidden cache split mismatch: "
-                    f"missing={len(missing)} chunks={len(miss_chunks)}"
-                )
-            for item_idx, tensor in zip(missing, miss_chunks):
-                outputs[item_idx] = tensor
-                self._store(cache_keys[item_idx], tensor)
-            trace_vllm_mm_hidden_event(
-                "qwen3vl_cache_compute_missing",
-                missing=missing,
-                compute_ms=compute_ms,
-                miss_pixel_shape=list(miss_pixels.shape),
-                miss_grid_shape=list(miss_grid.shape),
+            compute_indices, waiting = self._claim_or_join_inflight(
+                [(item_idx, cache_keys[item_idx]) for item_idx in missing]
             )
+
+            for item_idx, event in waiting:
+                event.wait()
+                cached = self._lookup(
+                    cache_keys[item_idx],
+                    target_device=pixel_values.device,
+                    target_dtype=None,
+                    record_metrics=False,
+                )
+                if cached is not None:
+                    outputs[item_idx] = cached
+                    with self._lock:
+                        self._metrics["coalesced_hits"] += 1
+                    continue
+                # The owner failed before storing. Claim the key and recompute
+                # it rather than letting a failed singleflight poison future
+                # requests.
+                retry_event = self._begin_or_join_inflight(cache_keys[item_idx])
+                if retry_event is None:
+                    compute_indices.append(item_idx)
+                else:
+                    retry_event.wait()
+                    cached = self._lookup(
+                        cache_keys[item_idx],
+                        target_device=pixel_values.device,
+                        target_dtype=None,
+                        record_metrics=False,
+                    )
+                    if cached is None:
+                        raise RuntimeError("coalesced vision compute completed without a cache entry")
+                    outputs[item_idx] = cached
+                    with self._lock:
+                        self._metrics["coalesced_hits"] += 1
+
+            pixel_chunks = list(torch.split(pixel_values, input_sizes, dim=0))
+            if compute_indices:
+                try:
+                    miss_pixels = torch.cat([pixel_chunks[i] for i in compute_indices], dim=0)
+                    miss_grid = grid_thw[compute_indices]
+                    compute_started = time.perf_counter()
+                    miss_embeds = visual(miss_pixels, grid_thw=miss_grid)
+                    compute_ms = (time.perf_counter() - compute_started) * 1000.0
+                    miss_output_sizes = [output_sizes[i] for i in compute_indices]
+                    miss_chunks = list(torch.split(miss_embeds, miss_output_sizes, dim=0))
+                    if len(miss_chunks) != len(compute_indices):
+                        raise RuntimeError(
+                            "Qwen3-VL hidden cache split mismatch: "
+                            f"missing={len(compute_indices)} chunks={len(miss_chunks)}"
+                        )
+                    for item_idx, tensor in zip(compute_indices, miss_chunks):
+                        outputs[item_idx] = tensor
+                        self._store(cache_keys[item_idx], tensor)
+                    trace_vllm_mm_hidden_event(
+                        "qwen3vl_cache_compute_missing",
+                        missing=compute_indices,
+                        compute_ms=compute_ms,
+                        miss_pixel_shape=list(miss_pixels.shape),
+                        miss_grid_shape=list(miss_grid.shape),
+                    )
+                    with self._lock:
+                        self._metrics["vision_encoder_calls"] += 1
+                        self._metrics["vision_compute_ms_total"] += float(compute_ms)
+                finally:
+                    for item_idx in compute_indices:
+                        self._finish_inflight(cache_keys[item_idx])
             with self._lock:
-                self._metrics["vision_compute_ms_total"] += float(compute_ms)
                 if len(missing) == num_items:
                     self._metrics["full_miss_batches"] += 1
                 else:
@@ -559,9 +620,29 @@ class VLLMMMHiddenStateCache:
         raw = self._tensor_raw_bytes(pixel_values)
         if self.hash_sample_bytes and len(raw) > self.hash_sample_bytes * 2:
             n = int(self.hash_sample_bytes)
-            h.update(len(raw).to_bytes(8, "little", signed=False))
-            h.update(raw[:n])
-            h.update(raw[-n:])
+            candidate = hashlib.sha256()
+            candidate.update(len(raw).to_bytes(8, "little", signed=False))
+            candidate.update(raw[:n])
+            candidate.update(raw[-n:])
+            candidate_digest = candidate.hexdigest()
+            full_digest = hashlib.sha256(raw).hexdigest()
+            # Sampling is only a candidate index. The full digest remains in
+            # the final key, so a sampled collision cannot return stale hidden
+            # state. This does not add a D2H copy: ``raw`` already contains the
+            # complete fallback tensor bytes.
+            h.update(b"\0sampled-candidate\0")
+            h.update(candidate_digest.encode("ascii"))
+            h.update(b"\0full-sha256\0")
+            h.update(full_digest.encode("ascii"))
+            with self._lock:
+                self._metrics["collision_full_verifies"] += 1
+                previous = self._sampled_candidates.get(candidate_digest)
+                if previous is not None and previous != full_digest:
+                    self._metrics["sampled_candidate_collisions"] += 1
+                self._sampled_candidates[candidate_digest] = full_digest
+                self._sampled_candidates.move_to_end(candidate_digest)
+                while len(self._sampled_candidates) > 256:
+                    self._sampled_candidates.popitem(last=False)
         else:
             h.update(raw)
         key = h.hexdigest()
@@ -599,22 +680,87 @@ class VLLMMMHiddenStateCache:
         *,
         target_device: torch.device,
         target_dtype: Optional[torch.dtype],
+        record_metrics: bool = True,
     ) -> Optional[torch.Tensor]:
         load_started = time.perf_counter()
+        lock_wait_started = time.perf_counter()
         with self._lock:
+            lock_acquired = time.perf_counter()
             entry = self._entries.get(key)
             if entry is None:
-                self._metrics["misses"] += 1
+                if record_metrics:
+                    self._metrics["misses"] += 1
+                self._lookup_lock_wait_samples_ms.append(
+                    (lock_acquired - lock_wait_started) * 1000.0
+                )
+                self._lookup_lock_hold_samples_ms.append(
+                    (time.perf_counter() - lock_acquired) * 1000.0
+                )
                 return None
             self._entries.move_to_end(key)
             entry.hits += 1
             entry.last_access_at = time.time()
             tensor = entry.tensor
-            self._metrics["hits"] += 1
-        out = tensor.to(device=target_device, dtype=target_dtype, non_blocking=True) if target_dtype else tensor.to(device=target_device, non_blocking=True)
+            if record_metrics:
+                self._metrics["hits"] += 1
+            self._lookup_lock_wait_samples_ms.append(
+                (lock_acquired - lock_wait_started) * 1000.0
+            )
+            self._lookup_lock_hold_samples_ms.append(
+                (time.perf_counter() - lock_acquired) * 1000.0
+            )
+        out = (
+            tensor.to(device=target_device, dtype=target_dtype, non_blocking=True)
+            if target_dtype
+            else tensor.to(device=target_device, non_blocking=True)
+        )
+        load_ms = (time.perf_counter() - load_started) * 1000.0
         with self._lock:
-            self._metrics["cache_load_ms_total"] += (time.perf_counter() - load_started) * 1000.0
+            self._metrics["cache_load_ms_total"] += load_ms
+            self._cache_load_samples_ms.append(load_ms)
         return out
+
+    @staticmethod
+    def _percentile(samples: Sequence[float], fraction: float) -> Optional[float]:
+        if not samples:
+            return None
+        ordered = sorted(float(value) for value in samples)
+        index = max(0, min(len(ordered) - 1, int(round((len(ordered) - 1) * fraction))))
+        return ordered[index]
+
+    def _begin_or_join_inflight(self, key: str) -> Optional[threading.Event]:
+        with self._lock:
+            event = self._inflight.get(key)
+            if event is not None:
+                self._metrics["coalesced_waits"] += 1
+                return event
+            self._inflight[key] = threading.Event()
+            return None
+
+    def _claim_or_join_inflight(
+        self,
+        items: Sequence[tuple[int, str]],
+    ) -> tuple[list[int], list[tuple[int, threading.Event]]]:
+        """Atomically claim a batch of keys to prevent cross-batch deadlocks."""
+
+        owners: list[int] = []
+        waiting: list[tuple[int, threading.Event]] = []
+        with self._lock:
+            for item_idx, key in items:
+                event = self._inflight.get(key)
+                if event is None:
+                    self._inflight[key] = threading.Event()
+                    owners.append(item_idx)
+                else:
+                    self._metrics["coalesced_waits"] += 1
+                    waiting.append((item_idx, event))
+        return owners, waiting
+
+    def _finish_inflight(self, key: str) -> None:
+        with self._lock:
+            event = self._inflight.pop(key, None)
+            if event is not None:
+                event.set()
 
     def _store(self, key: str, tensor: torch.Tensor) -> None:
         detached = tensor.detach()

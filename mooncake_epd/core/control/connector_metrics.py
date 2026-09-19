@@ -64,18 +64,23 @@ class ConnectorMetricsSink:
         tp_rank: int | None = None,
         pid: int | None = None,
         flush_interval_s: float = 0.0,
+        max_pending_records: int = 1,
     ):
         self._lock = threading.RLock()
         self._totals = LayeredTransferWorkerMeta()
         self._path_totals: Dict[str, LayeredTransferWorkerMeta] = {}
-        # Keep standalone diagnostics eager by default. vLLM workers pass a
-        # short interval so group-level transfer accounting stays in memory.
-        self._flush_interval_s = max(0.0, float(flush_interval_s))
-        self._last_flush_monotonic = 0.0
-        self._dirty = False
         self._enabled = bool(metrics_dir)
         self._dir = Path(metrics_dir).expanduser() if metrics_dir else None
         self._path: Optional[Path] = None
+        self._flush_interval_s = max(0.0, float(flush_interval_s))
+        self._max_pending_records = max(1, int(max_pending_records))
+        self._pending_records = 0
+        self._last_flush_mono = time.monotonic()
+        self._io_stats = {
+            "records": 0,
+            "deferred_records": 0,
+            "flushes": 0,
+        }
         self._identity = {
             "engine_id": str(engine_id),
             "role": str(role),
@@ -107,6 +112,11 @@ class ConnectorMetricsSink:
     def path(self) -> Optional[Path]:
         return self._path
 
+    @property
+    def io_stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {str(key): int(value) for key, value in self._io_stats.items()}
+
     def record(
         self,
         meta: LayeredTransferWorkerMeta | None,
@@ -130,27 +140,33 @@ class ConnectorMetricsSink:
                 bucket = _sanitize_component(path).upper()
                 existing = self._path_totals.get(bucket, LayeredTransferWorkerMeta())
                 self._path_totals[bucket] = existing.aggregate(delta)
-            self._dirty = True
-            if force or self._flush_due_locked():
+            self._pending_records += 1
+            self._io_stats["records"] += 1
+            elapsed = time.monotonic() - self._last_flush_mono
+            should_flush = (
+                force
+                or self._flush_interval_s <= 0.0
+                or self._pending_records >= self._max_pending_records
+                or elapsed >= self._flush_interval_s
+            )
+            if should_flush:
                 self._flush_locked()
+            else:
+                self._io_stats["deferred_records"] += 1
 
-    def flush(self, *, force: bool = True) -> bool:
-        """Persist accumulated counters at an explicit terminal boundary.
-
-        No background timer is used: an idle vLLM worker should not wake just
-        to write observability state. The next record still flushes when the
-        configured interval has elapsed.
-        """
-
+    def flush(self) -> None:
         if not self.enabled:
-            return False
+            return
         with self._lock:
-            if not self._dirty:
-                return False
-            if not force and not self._flush_due_locked():
-                return False
+            if self._pending_records <= 0:
+                if self._path is not None and self._path.exists():
+                    return
+                if self._totals.is_empty() and not self._path_totals:
+                    return
             self._flush_locked()
-            return True
+
+    def close(self) -> None:
+        self.flush()
 
     def snapshot(self) -> ConnectorMetricsAggregate:
         with self._lock:
@@ -164,13 +180,6 @@ class ConnectorMetricsSink:
                 },
             )
 
-    def _flush_due_locked(self) -> bool:
-        return (
-            self._flush_interval_s <= 0.0
-            or self._last_flush_monotonic <= 0.0
-            or (time.monotonic() - self._last_flush_monotonic) >= self._flush_interval_s
-        )
-
     def _flush_locked(self) -> None:
         assert self._path is not None
         payload = {
@@ -182,6 +191,10 @@ class ConnectorMetricsSink:
                 str(path): meta.to_dict()
                 for path, meta in sorted(self._path_totals.items())
             },
+            "io": {
+                **self.io_stats,
+                "flushes": int(self._io_stats["flushes"]) + 1,
+            },
         }
         tmp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
         tmp_path.write_text(
@@ -189,8 +202,9 @@ class ConnectorMetricsSink:
             encoding="utf-8",
         )
         os.replace(tmp_path, self._path)
-        self._dirty = False
-        self._last_flush_monotonic = time.monotonic()
+        self._pending_records = 0
+        self._last_flush_mono = time.monotonic()
+        self._io_stats["flushes"] += 1
 
     def _cleanup_stale_worker_files(self) -> None:
         assert self._dir is not None
@@ -344,60 +358,6 @@ class ConnectorMetricsReader:
         )
         totals["identities"] = identities
         totals["last_errors"] = last_errors[-5:]
-        return totals
-
-    def aggregate_decode_engine_timing(self) -> Dict[str, Any]:
-        """Aggregate vLLM EngineCore first-token timing snapshots."""
-
-        totals: Dict[str, Any] = {
-            "workers": 0,
-            "updated_at_max": 0.0,
-            "first_token_requests": 0,
-            "first_token_latency_ms_total": 0.0,
-            "first_token_latency_ms_avg": 0.0,
-            "kv_first_token_requests": 0,
-            "kv_first_token_latency_ms_total": 0.0,
-            "kv_first_token_latency_ms_avg": 0.0,
-            "kv_first_token_output_tokens": 0,
-            "scheduler_update_calls": 0,
-        }
-        if self._dir is None or not self._dir.exists():
-            return totals
-
-        for payload in self._iter_payloads(include_auxiliary=True):
-            if payload.get("kind") != "decode_engine_timing":
-                continue
-            metrics = dict(payload.get("metrics") or {})
-            totals["workers"] += 1
-            totals["updated_at_max"] = max(
-                float(totals["updated_at_max"]),
-                float(payload.get("updated_at", 0.0) or 0.0),
-            )
-            for key in (
-                "first_token_requests",
-                "kv_first_token_requests",
-                "kv_first_token_output_tokens",
-                "scheduler_update_calls",
-            ):
-                totals[key] += int(metrics.get(key, 0) or 0)
-            for key in (
-                "first_token_latency_ms_total",
-                "kv_first_token_latency_ms_total",
-            ):
-                totals[key] += float(metrics.get(key, 0.0) or 0.0)
-
-        totals["first_token_latency_ms_avg"] = (
-            float(totals["first_token_latency_ms_total"])
-            / int(totals["first_token_requests"])
-            if int(totals["first_token_requests"])
-            else 0.0
-        )
-        totals["kv_first_token_latency_ms_avg"] = (
-            float(totals["kv_first_token_latency_ms_total"])
-            / int(totals["kv_first_token_requests"])
-            if int(totals["kv_first_token_requests"])
-            else 0.0
-        )
         return totals
 
     def _iter_payloads(self, *, include_auxiliary: bool = False) -> Iterable[Dict[str, Any]]:

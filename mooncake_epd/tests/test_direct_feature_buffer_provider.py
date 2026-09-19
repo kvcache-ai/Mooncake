@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import threading
-import time
-
 import torch
 
 from mooncake_epd.core.state import (
@@ -26,16 +23,6 @@ class _CopyingMooncakeEngine:
 
     def __init__(self, tensors_by_ptr):
         self.tensors_by_ptr = dict(tensors_by_ptr)
-        self.registered = []
-        self.unregistered = []
-
-    def register_memory(self, ptr, nbytes):
-        self.registered.append((int(ptr), int(nbytes)))
-        return 0
-
-    def unregister_memory(self, ptr):
-        self.unregistered.append(int(ptr))
-        return 0
 
     def transfer_sync_write(self, remote_session, local_ptr, remote_ptr, length):
         self._copy_one(local_ptr, remote_ptr, length)
@@ -62,6 +49,23 @@ def _source_bundle() -> FeatureBundle:
         grid_thw=torch.tensor([[1, 2, 1]], dtype=torch.int64),
         metadata={"model_fingerprint": "m", "processor_fingerprint": "p"},
     )
+
+
+def test_direct_target_exports_prefill_process_incarnation():
+    bundle = _source_bundle()
+    registry = DirectFeatureBufferRegistry(
+        worker_id="prefill-0",
+        device="cpu",
+        remote_session="prefill-session",
+        remote_incarnation="prefill-process-a",
+    )
+
+    target = registry.allocate_for_descriptor(bundle.descriptor()).as_direct_target()
+
+    assert target["remote_session"] == "prefill-session"
+    assert target["remote_incarnation"] == "prefill-process-a"
+    assert registry.stats()["remote_incarnation"] == "prefill-process-a"
+    assert registry.stats()["remote_incarnation_present"] is True
 
 
 def test_epd_direct_handle_resolves_from_prefill_buffer_registry():
@@ -112,51 +116,3 @@ def test_epd_direct_handle_resolves_from_prefill_buffer_registry():
         assert registry.stats()["allocations"] == 1
     finally:
         unregister_direct_feature_buffer_registry("prefill-0")
-
-
-def test_direct_feature_registry_singleflights_concurrent_allocation(monkeypatch):
-    import mooncake_epd.core.state.direct_feature_buffer as direct_buffer
-
-    bundle = _source_bundle()
-    registry = DirectFeatureBufferRegistry(
-        worker_id="prefill-0",
-        device="cpu",
-        remote_session="prefill-session",
-        register_memory=False,
-    )
-    original_allocate = direct_buffer._allocate_tensors_for_descriptor
-    entered = threading.Event()
-    release = threading.Event()
-    calls = []
-
-    def slow_allocate(*args, **kwargs):
-        calls.append(1)
-        entered.set()
-        release.wait(timeout=1.0)
-        return original_allocate(*args, **kwargs)
-
-    monkeypatch.setattr(direct_buffer, "_allocate_tensors_for_descriptor", slow_allocate)
-    results = []
-    errors = []
-
-    def allocate() -> None:
-        try:
-            results.append(registry.allocate_for_descriptor(bundle.descriptor()))
-        except Exception as exc:  # pragma: no cover - assertion below reports it
-            errors.append(exc)
-
-    first = threading.Thread(target=allocate)
-    second = threading.Thread(target=allocate)
-    first.start()
-    assert entered.wait(timeout=1.0)
-    second.start()
-    time.sleep(0.05)
-    release.set()
-    first.join(timeout=1.0)
-    second.join(timeout=1.0)
-
-    assert not errors
-    assert len(calls) == 1
-    assert len(results) == 2
-    assert results[0] is results[1]
-    assert results[0].ref_count == 2

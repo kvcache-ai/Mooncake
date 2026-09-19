@@ -2,10 +2,42 @@ from __future__ import annotations
 
 import threading
 
+import pytest
 import torch
 
-from mooncake_epd.core.state import FeatureBundle, FeatureStore, MMStore
+from mooncake_epd.core.state import (
+    FeatureBundle,
+    FeatureStore,
+    MMStore,
+    MMStoreBackpressureError,
+)
 from mooncake_epd.core.transfer import TransferEngine
+
+
+def test_mm_store_publish_surfaces_shared_store_admission_rejection():
+    shared = FeatureStore(max_bytes=64, max_entries=1)
+    resident = FeatureBundle(
+        image_hash="resident",
+        last_hidden=torch.ones(8, dtype=torch.float32),
+        intermediates=[],
+    )
+    candidate = FeatureBundle(
+        image_hash="candidate",
+        last_hidden=torch.ones(8, dtype=torch.float32),
+        intermediates=[],
+    )
+    assert shared.put(resident.image_hash, resident) is True
+    shared.incref(resident.image_hash)
+    store = MMStore(shared, TransferEngine(protocol="local"))
+    try:
+        with pytest.raises(MMStoreBackpressureError, match="admission rejected"):
+            store.publish(candidate)
+        assert shared.has("candidate") is False
+        assert store.stats()["published"] == 0
+        assert store.stats()["publish_rejections"] == 1
+    finally:
+        shared.release(resident.image_hash)
+        store.stop()
 
 
 def test_mm_store_deduplicates_same_worker_prefetch():

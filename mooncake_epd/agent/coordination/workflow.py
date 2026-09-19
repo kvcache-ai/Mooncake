@@ -75,6 +75,9 @@ class Workflow:
         relay_min_match_run: int = 4,
         enable_tier3: bool = False,
         attention_threshold: float = 0.90,
+        enable_relay_cost_gate: bool = True,
+        force_relay: bool = False,
+        relay_min_net_benefit_ms: float = 0.5,
     ):
         self.workflow_id = workflow_id or uuid.uuid4().hex
         self.agent_id = agent_id
@@ -85,8 +88,12 @@ class Workflow:
         self.relay_min_match_run = relay_min_match_run
         self.enable_tier3 = enable_tier3
         self.attention_threshold = attention_threshold
+        self.enable_relay_cost_gate = bool(enable_relay_cost_gate)
+        self.force_relay = bool(force_relay)
+        self.relay_min_net_benefit_ms = max(0.0, float(relay_min_net_benefit_ms))
         self.steps: List[WorkflowStep] = []
         self._reuse_pipeline = None
+        self._prefill_ms_per_token_ewma: Optional[float] = None
 
     # ------------------------------------------------------------------
     @property
@@ -142,6 +149,15 @@ class Workflow:
             "delta_prefill_ms": float(relay.get("prefill_ms", prefill_ms) or prefill_ms),
             "delta_prefill_calls": delta_prefill_calls,
             "delta_prefill_tokens": delta_prefill_tokens,
+            "cost_gate_enabled": bool(relay.get("cost_gate_enabled", False)),
+            "cost_gate_decision": str(relay.get("cost_gate_decision", "not_evaluated")),
+            "fallback_reason": str(relay.get("fallback_reason", "")),
+            "predicted_reusable_tokens": int(relay.get("predicted_reusable_tokens", 0) or 0),
+            "predicted_recompute_tokens": int(relay.get("predicted_recompute_tokens", 0) or 0),
+            "estimated_prefill_ms_per_token": relay.get("estimated_prefill_ms_per_token"),
+            "predicted_saved_prefill_ms": relay.get("predicted_saved_prefill_ms"),
+            "predicted_relay_overhead_ms": relay.get("predicted_relay_overhead_ms"),
+            "predicted_net_benefit_ms": relay.get("predicted_net_benefit_ms"),
             "relay_stats": relay,
         }
 
@@ -170,6 +186,7 @@ class Workflow:
         reuse_ratio = 0.0
         approximate = False
         relay_stats = None
+        pipeline_stats = None
         tier1_matched_tokens = 0
 
         if (
@@ -193,6 +210,15 @@ class Workflow:
                     attention_threshold=self.attention_threshold,
                     enable_tier2=True,
                     enable_tier3=self.enable_tier3,
+                    relay_min_match_run=self.relay_min_match_run,
+                    enable_cost_gate=self.enable_relay_cost_gate,
+                    force_approximate=self.force_relay,
+                    estimated_prefill_ms_per_token=self._prefill_ms_per_token_ewma,
+                    min_net_benefit_ms=self.relay_min_net_benefit_ms,
+                )
+            else:
+                self._reuse_pipeline.update_cost_calibration(
+                    self._prefill_ms_per_token_ewma
                 )
             new_kv_refs, first_logits, pipeline_stats = self._reuse_pipeline.run(
                 new_tokens=new_tokens,
@@ -244,6 +270,25 @@ class Workflow:
                 new_kv_refs = []
                 first_logits = None
             prefill_ms = (time.perf_counter() - t0) * 1000
+
+        calibration_tokens = (
+            int(pipeline_stats.delta_prefill_tokens)
+            if pipeline_stats is not None
+            else len(delta_tokens)
+        )
+        calibration_ms = (
+            float(pipeline_stats.delta_prefill_ms)
+            if pipeline_stats is not None
+            else float(prefill_ms)
+        )
+        if calibration_tokens > 0 and calibration_ms > 0.0:
+            observed = calibration_ms / calibration_tokens
+            if self._prefill_ms_per_token_ewma is None:
+                self._prefill_ms_per_token_ewma = observed
+            else:
+                self._prefill_ms_per_token_ewma = (
+                    0.8 * self._prefill_ms_per_token_ewma + 0.2 * observed
+                )
 
         reuse_telemetry = self._build_reuse_telemetry(
             matched_pages=matched_pages,

@@ -257,10 +257,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run real Qwen2.5-Omni hidden-state prefix cache benchmark")
-    ap.add_argument(
-        "--model",
-        default=os.getenv("MOONCAKE_EPD_OMNI_MODEL", "models/Qwen2.5-Omni-7B"),
-    )
+    ap.add_argument("--model", default="/home/songbinbin/Qwen2.5-Omni-7B")
     ap.add_argument("--device", default="cuda:2")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "bf16", "float16", "fp16", "float32", "fp32"])
     ap.add_argument("--output", default="artifacts/qwen25_omni_hidden_prefix_cache_benchmark.json")

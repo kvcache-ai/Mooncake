@@ -9,9 +9,7 @@ import pytest
 import torch
 
 
-MODEL_PATH = Path(
-    os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct")
-)
+MODEL_PATH = Path(os.getenv("MOONCAKE_EPD_MODEL_PATH", "/data01/LWX/Qwen3-VL-8B-Instruct"))
 
 
 def get_test_gpu_id(role: str, default: int) -> int:

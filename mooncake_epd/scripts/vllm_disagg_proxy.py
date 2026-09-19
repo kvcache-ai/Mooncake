@@ -18,23 +18,29 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
+import ipaddress
 import json
 import logging
 import os
+import random
+import socket
 import sys
 import time
 import uuid
 from collections import OrderedDict
-from copy import deepcopy
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urljoin, urlsplit
 
 import httpx
+import tokenizers
 import torch
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from vllm.tokenizers import get_tokenizer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT.parent) not in sys.path:
@@ -42,90 +48,19 @@ if str(REPO_ROOT.parent) not in sys.path:
 
 from mooncake_epd.agent.coordination.scheduler import AdmissionAction  # noqa: E402
 from mooncake_epd.core.control import ServingControlPlane, ServingControlPlaneConfig  # noqa: E402
-from mooncake_epd.core.strict_mode import strict_no_fallback_enabled  # noqa: E402
-from mooncake_epd.core.state import (  # noqa: E402
-    FeatureBundle,
-    FeatureBundleDescriptor,
-    FeatureHandle,
-    FeatureHandleError,
-    MMStore,
+from mooncake_epd.core.control.vllm_incarnation import (  # noqa: E402
+    VLLM_EXPECTED_INCARNATION_HEADER,
+    VLLM_INCARNATION_ENDPOINT,
+    VLLM_INCARNATION_HEADER,
+    VLLM_INCARNATION_MISMATCH_HEADER,
 )
+from mooncake_epd.core.strict_mode import strict_no_fallback_enabled  # noqa: E402
+from mooncake_epd.core.state import FeatureBundle, FeatureHandle, MMStore  # noqa: E402
 from mooncake_epd.core.transfer import TransferEngine  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
-def _set_proxy_timing(req_data: Dict[str, Any], key: str, value_ms: float) -> None:
-    metadata = dict(req_data.get("metadata") or {})
-    timings = dict(metadata.get("mooncake_epd_proxy_timings_ms") or {})
-    timings[str(key)] = float(value_ms)
-    metadata["mooncake_epd_proxy_timings_ms"] = timings
-    req_data["metadata"] = metadata
-
-
-def _get_proxy_timings(req_data: Dict[str, Any]) -> Dict[str, float]:
-    metadata = dict(req_data.get("metadata") or {})
-    raw = dict(metadata.get("mooncake_epd_proxy_timings_ms") or {})
-    out: Dict[str, float] = {}
-    for key, value in raw.items():
-        try:
-            out[str(key)] = float(value)
-        except Exception:
-            continue
-    return out
-
-
-def _timing_header(req_data: Dict[str, Any]) -> str:
-    return json.dumps(_get_proxy_timings(req_data), ensure_ascii=True, separators=(",", ":"))
-
-
-def _merge_timing_header(headers: Dict[str, str], key: str, value_ms: float) -> None:
-    try:
-        current = json.loads(str(headers.get("X-EPD-Timing-Ms") or "{}"))
-        if not isinstance(current, dict):
-            current = {}
-    except Exception:
-        current = {}
-    current[str(key)] = float(value_ms)
-    headers["X-EPD-Timing-Ms"] = json.dumps(
-        current,
-        ensure_ascii=True,
-        separators=(",", ":"),
-    )
-
-
-def _packet_content_delta(packet: Dict[str, Any]) -> str:
-    try:
-        choices = list(packet.get("choices") or [])
-        if not choices:
-            return ""
-        first = dict(choices[0] or {})
-        delta = first.get("delta")
-        if isinstance(delta, dict):
-            content = delta.get("content")
-            return str(content) if content is not None else ""
-        message = first.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            return str(content) if content is not None else ""
-    except Exception:
-        return ""
-    return ""
-
-
-def _attach_packet_timings(packet: Dict[str, Any], timings: Dict[str, float]) -> Dict[str, Any]:
-    if not timings:
-        return packet
-    merged = dict(packet.get("_mooncake_epd_proxy_timings_ms") or {})
-    for key, value in timings.items():
-        try:
-            merged[str(key)] = float(value)
-        except Exception:
-            continue
-    packet["_mooncake_epd_proxy_timings_ms"] = merged
-    return packet
 
 
 @dataclass
@@ -141,42 +76,64 @@ class ProxyConfig:
     critical_rho: float = 0.95
     max_backpressure_delay_ms: float = 150.0
     transport_backend: str = "mooncake_engine_direct"
-    mooncake_protocol: str = "tcp"
     node_id: str = "proxy"
     owner_shards: int = 1
     kv_directory_rpc_url: Optional[str] = None
     connector_metrics_dir: Optional[str] = None
     workflow_registry_wal_path: Optional[str] = None
+    workflow_registry_wal_fsync_interval_s: float = 0.25
+    workflow_registry_wal_max_pending_records: int = 64
+    enable_decode_pipeline: bool = False
+    decode_pipeline_max_inflight: int = 0
+    enable_prerendered_decode: bool = False
+    prerendered_decode_model: Optional[str] = None
+    enable_decode_mm_hash_cache: bool = False
+    decode_mm_hash_cache_max_entries: int = 64
+    decode_mm_hash_cache_ttl_s: float = 120.0
+    decode_mm_hash_epoch_poll_s: float = 1.0
+    decode_mm_hash_epoch_probe_timeout_s: float = 0.5
+    decode_mm_hash_epoch_freshness_s: float = 0.0
+    decode_mm_hash_epoch_endpoint: str = "/metrics"
+    enable_decode_mm_hash_epoch_guard: bool = False
+    enable_decode_mm_hash_epoch_probe_singleflight: bool = True
     enable_mm_prefetch: bool = True
     mm_prefetch_mode: str = "asset_bytes"
     prefill_supports_feature_handles: bool = False
     mm_prefetch_wait_ms: float = 100.0
     mm_prefetch_max_asset_bytes: int = 16 * 1024 * 1024
     mm_prefetch_queue_size: int = 256
+    allow_private_mm_urls: bool = False
     encoder_service_url: Optional[str] = None
     encoder_service_timeout_s: float = 120.0
     prefill_direct_buffer_service_url: Optional[str] = None
-    prefill_direct_buffer_service_urls: List[str] = field(default_factory=list)
     prefill_direct_buffer_timeout_s: float = 30.0
-    direct_feature_buffer_auth_token: Optional[str] = None
     release_direct_feature_buffers_after_prefill: bool = True
-    direct_feature_release_max_inflight: int = 128
     enable_direct_feature_handle_cache: bool = False
-    direct_feature_handle_cache_max_entries: int = 4096
+    direct_feature_handle_cache_max_entries: int = 64
+    direct_feature_handle_cache_max_bytes: int = 4 * 1024 * 1024 * 1024
     direct_feature_handle_cache_ttl_s: float = 600.0
-    direct_feature_singleflight_max_locks: int = 4096
-    prefill_dispatch_mode: str = "render_generate"  # render_generate | openai_prompt_only
-    # ``openai_prompt_only`` has a lower control-plane cost, but has not shown
-    # output equivalence for every real vLLM P-D continuation configuration.
-    # Strict serving therefore requires an explicit compatibility override.
-    allow_unverified_openai_prompt_only: bool = False
+    prefill_incarnation_poll_s: float = 0.0
+    prefill_incarnation_poll_jitter_ratio: float = 0.0
+    prefill_incarnation_failure_threshold: int = 3
+    prefill_incarnation_probe_timeout_s: float = 0.5
+    prefill_incarnation_freshness_s: float = 0.0
+    prefill_incarnation_endpoint: str = VLLM_INCARNATION_ENDPOINT
+    enable_prefill_incarnation_guard: bool = False
+    enable_prefill_incarnation_probe_singleflight: bool = True
+    enable_prefill_render_cache: bool = False
+    prefill_render_cache_max_entries: int = 128
+    prefill_render_cache_max_bytes: int = 512 * 1024 * 1024
+    prefill_render_cache_ttl_s: float = 600.0
+    enable_client_mm_uuid_references: bool = False
     strict_no_fallback: bool = field(default_factory=strict_no_fallback_enabled)
     enable_agent_state_clone: bool = True
     high_prefill_worker_ids: List[str] = field(default_factory=list)
     low_latency_decode_worker_ids: List[str] = field(default_factory=list)
     standard_prefill_worker_ids: List[str] = field(default_factory=list)
     standard_decode_worker_ids: List[str] = field(default_factory=list)
-    prefill_decode_affinity: List[Tuple[str, str]] = field(default_factory=list)
+    upstream_max_connections: int = 64
+    upstream_max_keepalive_connections: int = 16
+    upstream_keepalive_expiry_s: float = 1.0
 
 
 @dataclass
@@ -199,28 +156,1087 @@ class _PrefillContinuation:
         return self.completion_tokens > 0 and bool(self.text)
 
 
-def _parse_prefill_decode_affinity(values: Optional[Sequence[str]]) -> List[Tuple[str, str]]:
-    """Parse explicit `prefill-worker=decode-worker` locality pairs."""
+@dataclass
+class _OpenedDecodeStream:
+    stream_ctx: Any
+    response: httpx.Response
+    started_at: float
+    opened_at: float
 
-    parsed: List[Tuple[str, str]] = []
-    seen: Dict[str, str] = {}
-    for raw in values or ():
-        source, separator, target = str(raw or "").partition("=")
-        source = source.strip()
-        target = target.strip()
-        if not separator or not source or not target:
-            raise ValueError(
-                "--prefill-decode-affinity entries must use prefill-worker=decode-worker"
+
+@dataclass
+class _DecodeMMHashLease:
+    """One request's ownership of a Decode-side multimodal cache assumption."""
+
+    cache: Any
+    worker_id: str
+    referenced_hashes: Tuple[str, ...]
+    promote_hashes: Tuple[str, ...]
+    invalidate_hashes: Tuple[str, ...]
+    mode: str
+    avoided_bytes: int = 0
+    expected_worker_epoch: Optional[str] = None
+    epoch_guard_attached: bool = False
+    epoch_guard_rejection_recorded: bool = False
+    finalized: bool = False
+
+    def succeed(self) -> None:
+        if self.finalized:
+            return
+        self.cache.complete(self, success=True)
+        self.finalized = True
+
+    def fail(self) -> None:
+        if self.finalized:
+            return
+        self.cache.complete(self, success=False)
+        self.finalized = True
+
+    def record_epoch_guard_rejection(
+        self,
+        actual_worker_epoch: Optional[str] = None,
+    ) -> None:
+        if self.epoch_guard_rejection_recorded:
+            return
+        self.cache.record_epoch_guard_rejection(
+            worker_id=self.worker_id,
+            actual_worker_epoch=actual_worker_epoch,
+        )
+        self.epoch_guard_rejection_recorded = True
+
+
+@dataclass
+class _PipelinedDecodeDispatch:
+    decision: Any
+    client: Dict[str, Any]
+    started_at: float
+    open_task: asyncio.Task
+    topology: Dict[str, Any]
+    kv_transfer_params: Dict[str, Any]
+    mm_hash_lease: Optional[_DecodeMMHashLease] = None
+
+
+@dataclass(frozen=True)
+class _PrerenderedDecodeContext:
+    tokenizer: Any
+    prompt_token_ids: Tuple[int, ...]
+    model: str
+    skip_special_tokens: bool = True
+
+
+class _IncrementalTokenDecoder:
+    """Per-request incremental decoder for the token-only disagg endpoint.
+
+    Fast HF tokenizers use the Rust ``DecodeStream`` primed with prompt token
+    IDs, preserving byte-fallback and whitespace semantics without repeatedly
+    decoding the complete output.  The cumulative fallback keeps injected test
+    tokenizers and uncommon slow tokenizers correct.
+    """
+
+    def __init__(
+        self,
+        tokenizer_obj: Any,
+        *,
+        prompt_token_ids: Sequence[int],
+        skip_special_tokens: bool,
+    ) -> None:
+        self._tokenizer = tokenizer_obj
+        self._skip_special_tokens = bool(skip_special_tokens)
+        self._prompt_token_ids = [int(token_id) for token_id in prompt_token_ids]
+        self._output_token_ids: List[int] = []
+        self._decoded_text = ""
+        self._stream = None
+        backend = getattr(tokenizer_obj, "_tokenizer", None)
+        if backend is not None:
+            try:
+                self._stream = tokenizers.decoders.DecodeStream(
+                    ids=self._prompt_token_ids,
+                    skip_special_tokens=self._skip_special_tokens,
+                )
+                self._backend = backend
+            except Exception:
+                logger.exception(
+                    "failed to initialize fast incremental detokenizer; "
+                    "using cumulative decode"
+                )
+                self._stream = None
+                self._backend = None
+        else:
+            self._backend = None
+
+    def push(self, token_ids: Sequence[int]) -> str:
+        normalized = [int(token_id) for token_id in token_ids]
+        if not normalized:
+            return ""
+        if self._stream is not None and self._backend is not None:
+            pieces: List[str] = []
+            for token_id in normalized:
+                piece = self._stream.step(self._backend, token_id)
+                if piece:
+                    pieces.append(piece)
+            self._output_token_ids.extend(normalized)
+            decoded = "".join(pieces)
+            self._decoded_text += decoded
+            return decoded
+
+        self._output_token_ids.extend(normalized)
+        prompt_text = str(
+            self._tokenizer.decode(
+                self._prompt_token_ids,
+                skip_special_tokens=self._skip_special_tokens,
             )
-        previous = seen.get(source)
-        if previous is not None and previous != target:
-            raise ValueError(
-                f"conflicting Decode affinity targets for {source}: {previous} and {target}"
+        )
+        full_text = str(
+            self._tokenizer.decode(
+                self._prompt_token_ids + self._output_token_ids,
+                skip_special_tokens=self._skip_special_tokens,
             )
-        if previous is None:
-            seen[source] = target
-            parsed.append((source, target))
-    return parsed
+        )
+        if not full_text.startswith(prompt_text):
+            raise RuntimeError(
+                "tokenizer changed the decoded prompt boundary; strict "
+                "prerendered Decode cannot preserve streaming semantics"
+            )
+        decoded = full_text[len(prompt_text) :]
+        if not decoded.startswith(self._decoded_text):
+            raise RuntimeError(
+                "tokenizer produced a non-monotonic cumulative decode; "
+                "strict prerendered Decode cannot preserve streaming semantics"
+            )
+        delta = decoded[len(self._decoded_text) :]
+        self._decoded_text = decoded
+        return delta
+
+
+class _DecodePipelineStartupError(RuntimeError):
+    """Raised when an early Decode stream fails before Prefill completes."""
+
+
+@dataclass
+class _CachedDirectFeatureHandle:
+    handle: Dict[str, Any]
+    nbytes: int
+    expires_at: float
+
+
+class _DirectFeatureHandleCache:
+    """Bounded Prefill-owned cache for reusable E-stage feature buffers.
+
+    Entries retain the original ``epd-direct://`` handle and destination
+    allocation.  A vLLM MM-cache hit avoids resolving the handle entirely; if
+    that cache evicts, the still-live direct allocation remains a correctness
+    fallback and can be read again without rerunning the Encoder.
+    """
+
+    def __init__(self, *, enabled: bool, max_entries: int, max_bytes: int, ttl_s: float) -> None:
+        self.enabled = bool(enabled)
+        self.max_entries = max(1, int(max_entries))
+        self.max_bytes = max(1, int(max_bytes))
+        self.ttl_s = max(0.0, float(ttl_s))
+        self._entries: "OrderedDict[Tuple[str, str], _CachedDirectFeatureHandle]" = OrderedDict()
+        self._bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._stores = 0
+        self._evictions = 0
+        self._expired = 0
+        self._worker_incarnations: Dict[str, str] = {}
+        self._worker_incarnation_observed_at: Dict[str, float] = {}
+        self._worker_incarnation_observations = 0
+        self._worker_incarnation_changes = 0
+        self._worker_invalidations = 0
+        self._worker_invalidated_entries = 0
+        self._worker_unavailable = 0
+        self._worker_unavailable_transitions = 0
+        self._worker_recovery_transitions = 0
+        self._worker_availability: Dict[str, bool] = {}
+        self._incarnation_probe_responses = 0
+        self._incarnation_probe_failures = 0
+        self._incarnation_probe_response_bytes = 0
+        self._incarnation_probe_latency_ms = 0.0
+        self._incarnation_monitor_failure_streaks: Dict[str, int] = {}
+        self._incarnation_monitor_max_failure_streak = 0
+        self._incarnation_monitor_transient_failures = 0
+        self._incarnation_monitor_threshold_reaches = 0
+        self._incarnation_monitor_streak_resets = 0
+        self._incarnation_monitor_superseded_failures = 0
+        self._synchronous_incarnation_probes = 0
+        self._synchronous_incarnation_probe_dispatches = 0
+        self._synchronous_incarnation_probe_collapsed = 0
+        self._incarnation_freshness_skips = 0
+        self._incarnation_guarded_requests = 0
+        self._incarnation_guard_rejections = 0
+        self._stale_singleflight_rejections = 0
+
+    @staticmethod
+    def _key(target_worker_id: str, feature_id: str) -> Tuple[str, str]:
+        return str(target_worker_id), str(feature_id)
+
+    def has_worker_entries(self, target_worker_id: str) -> bool:
+        worker_id = str(target_worker_id)
+        return any(key[0] == worker_id for key in self._entries)
+
+    def worker_incarnation(self, target_worker_id: str) -> Optional[str]:
+        return self._worker_incarnations.get(str(target_worker_id))
+
+    def worker_incarnation_observed_since(
+        self,
+        target_worker_id: str,
+        started_at: float,
+    ) -> bool:
+        observed_at = self._worker_incarnation_observed_at.get(
+            str(target_worker_id)
+        )
+        return observed_at is not None and observed_at > float(started_at)
+
+    def use_fresh_worker_incarnation(
+        self,
+        target_worker_id: str,
+        freshness_s: float,
+    ) -> bool:
+        freshness_s = max(0.0, float(freshness_s))
+        worker_id = str(target_worker_id)
+        observed_at = self._worker_incarnation_observed_at.get(worker_id)
+        if (
+            freshness_s <= 0
+            or observed_at is None
+            or worker_id not in self._worker_incarnations
+            or time.monotonic() - observed_at > freshness_s
+        ):
+            return False
+        self._incarnation_freshness_skips += 1
+        return True
+
+    def _invalidate_worker_entries(self, target_worker_id: str) -> List[str]:
+        worker_id = str(target_worker_id)
+        feature_ids: List[str] = []
+        for key in [key for key in self._entries if key[0] == worker_id]:
+            entry = self._entries.pop(key)
+            self._bytes -= int(entry.nbytes)
+            feature_ids.append(str(entry.handle.get("feature_id") or key[1]))
+        if feature_ids:
+            self._worker_invalidations += 1
+            self._worker_invalidated_entries += len(feature_ids)
+        return sorted(set(feature_id for feature_id in feature_ids if feature_id))
+
+    def invalidate_worker(self, target_worker_id: str) -> List[str]:
+        return self._invalidate_worker_entries(target_worker_id)
+
+    def mark_worker_unavailable(self, target_worker_id: str) -> List[str]:
+        worker_id = str(target_worker_id)
+        self._worker_unavailable += 1
+        if self._worker_availability.get(worker_id) is not False:
+            self._worker_unavailable_transitions += 1
+        self._worker_availability[worker_id] = False
+        # Keep the last authoritative token so the next successful probe can
+        # distinguish a restart from a transient outage.  Freshness is revoked
+        # and all process-owned entries are still invalidated immediately.
+        self._worker_incarnation_observed_at.pop(worker_id, None)
+        return self._invalidate_worker_entries(worker_id)
+
+    def mark_worker_available(self, target_worker_id: str) -> None:
+        worker_id = str(target_worker_id)
+        previous = self._worker_availability.get(worker_id)
+        self._worker_availability[worker_id] = True
+        if previous is False:
+            self._worker_recovery_transitions += 1
+
+    def observe_worker_incarnation(
+        self,
+        target_worker_id: str,
+        incarnation: str,
+    ) -> Tuple[bool, List[str]]:
+        worker_id = str(target_worker_id)
+        token = _bounded_epoch_token(incarnation)
+        if token is None:
+            raise ValueError("invalid Prefill process-incarnation token")
+        previous = self._worker_incarnations.get(worker_id)
+        self._worker_incarnation_observations += 1
+        changed = previous is not None and previous != token
+        invalidated = self._invalidate_worker_entries(worker_id) if changed else []
+        if changed:
+            self._worker_incarnation_changes += 1
+        self._worker_incarnations[worker_id] = token
+        self._worker_incarnation_observed_at[worker_id] = time.monotonic()
+        # Any authoritative success, including a synchronous request fence,
+        # breaks the background monitor's consecutive-failure sequence.
+        self.reset_incarnation_monitor_failure_streak(worker_id)
+        return changed, invalidated
+
+    def record_incarnation_probe_response(
+        self,
+        *,
+        response_bytes: int,
+        latency_s: float,
+    ) -> None:
+        self._incarnation_probe_responses += 1
+        self._incarnation_probe_response_bytes += max(0, int(response_bytes))
+        self._incarnation_probe_latency_ms += max(0.0, float(latency_s)) * 1000.0
+
+    def record_incarnation_probe_failure(self) -> None:
+        self._incarnation_probe_failures += 1
+
+    def reset_incarnation_monitor_failure_streak(
+        self,
+        target_worker_id: str,
+    ) -> None:
+        worker_id = str(target_worker_id)
+        if self._incarnation_monitor_failure_streaks.pop(worker_id, 0) > 0:
+            self._incarnation_monitor_streak_resets += 1
+
+    def record_superseded_incarnation_monitor_failure(self) -> None:
+        self._incarnation_monitor_superseded_failures += 1
+
+    def record_incarnation_monitor_probe_result(
+        self,
+        target_worker_id: str,
+        *,
+        healthy: bool,
+        failure_threshold: int,
+    ) -> bool:
+        """Track monitor-only failures and signal one threshold transition.
+
+        Synchronous freshness probes deliberately do not use this debounce: a
+        request that cannot prove the current Prefill incarnation must still
+        fail closed.  The threshold only prevents a single background timeout
+        from removing an otherwise healthy worker from scheduling.
+        """
+
+        worker_id = str(target_worker_id)
+        threshold = max(1, int(failure_threshold))
+        previous = self._incarnation_monitor_failure_streaks.get(worker_id, 0)
+        if healthy:
+            self.reset_incarnation_monitor_failure_streak(worker_id)
+            return False
+
+        streak = previous + 1
+        self._incarnation_monitor_failure_streaks[worker_id] = streak
+        self._incarnation_monitor_max_failure_streak = max(
+            self._incarnation_monitor_max_failure_streak,
+            streak,
+        )
+        if streak < threshold:
+            self._incarnation_monitor_transient_failures += 1
+            return False
+        if streak == threshold:
+            self._incarnation_monitor_threshold_reaches += 1
+            return True
+        return False
+
+    def record_synchronous_incarnation_probe(self) -> None:
+        self._synchronous_incarnation_probes += 1
+
+    def record_synchronous_incarnation_probe_dispatch(self) -> None:
+        self._synchronous_incarnation_probe_dispatches += 1
+
+    def record_synchronous_incarnation_probe_collapsed(self) -> None:
+        self._synchronous_incarnation_probe_collapsed += 1
+
+    def record_incarnation_guarded_request(self) -> None:
+        self._incarnation_guarded_requests += 1
+
+    def record_incarnation_guard_rejection(self) -> None:
+        self._incarnation_guard_rejections += 1
+
+    def get_many(
+        self,
+        *,
+        target_worker_id: str,
+        feature_ids: Sequence[str],
+    ) -> Tuple[Optional[List[Dict[str, Any]]], List[str]]:
+        if not self.enabled or not feature_ids:
+            return None, []
+        now = time.monotonic()
+        handles: List[Dict[str, Any]] = []
+        expired_ids: List[str] = []
+        for feature_id in feature_ids:
+            key = self._key(target_worker_id, feature_id)
+            entry = self._entries.get(key)
+            if entry is None:
+                self._misses += 1
+                return None, expired_ids
+            if entry.expires_at > 0 and entry.expires_at <= now:
+                self._entries.pop(key, None)
+                self._bytes -= int(entry.nbytes)
+                self._expired += 1
+                self._misses += 1
+                expired_ids.append(str(entry.handle.get("feature_id") or feature_id))
+                return None, expired_ids
+            self._entries.move_to_end(key)
+            handles.append(dict(entry.handle))
+        self._hits += len(handles)
+        return handles, expired_ids
+
+    def put_many(
+        self,
+        *,
+        target_worker_id: str,
+        handles: Sequence[Dict[str, Any]],
+        expected_worker_incarnation: Optional[str] = None,
+        enforce_expected_incarnation: bool = False,
+    ) -> Tuple[bool, List[str]]:
+        if not self.enabled:
+            return False, []
+        evicted_ids: List[str] = []
+        incarnations = {
+            token
+            for raw_handle in handles
+            if (
+                token := _bounded_epoch_token(
+                    (dict(raw_handle).get("metadata") or {}).get(
+                        "direct_remote_incarnation"
+                    )
+                )
+            )
+            is not None
+        }
+        if len(incarnations) > 1:
+            raise ValueError(
+                "direct feature handles disagree on Prefill process incarnation"
+            )
+        incoming_incarnation = next(iter(incarnations)) if incarnations else None
+        expected_incarnation = _bounded_epoch_token(expected_worker_incarnation)
+        current_incarnation = self.worker_incarnation(target_worker_id)
+        if (
+            enforce_expected_incarnation
+            and
+            current_incarnation is not None
+            and current_incarnation != expected_incarnation
+            and incoming_incarnation != current_incarnation
+        ):
+            self._stale_singleflight_rejections += 1
+            raise RuntimeError(
+                "stale Prefill direct-handle singleflight completed after an incarnation change"
+            )
+        incarnation_changed = False
+        if incoming_incarnation is not None:
+            incarnation_changed, invalidated_ids = self.observe_worker_incarnation(
+                target_worker_id,
+                incoming_incarnation,
+            )
+            evicted_ids.extend(invalidated_ids)
+        now = time.monotonic()
+        expires_at = now + self.ttl_s if self.ttl_s > 0 else 0.0
+        for raw_handle in handles:
+            handle = dict(raw_handle)
+            feature_id = str(
+                (handle.get("metadata") or {}).get("source_mm_hash")
+                or handle.get("feature_id")
+                or ""
+            )
+            if not feature_id:
+                continue
+            descriptor = dict(handle.get("descriptor") or {})
+            nbytes = int(descriptor.get("nbytes", 0) or 0)
+            if nbytes <= 0 or nbytes > self.max_bytes:
+                continue
+            key = self._key(target_worker_id, feature_id)
+            previous = self._entries.pop(key, None)
+            if previous is not None:
+                self._bytes -= int(previous.nbytes)
+            self._entries[key] = _CachedDirectFeatureHandle(
+                handle=handle,
+                nbytes=nbytes,
+                expires_at=expires_at,
+            )
+            self._bytes += nbytes
+            self._stores += 1
+
+        while self._entries and (
+            len(self._entries) > self.max_entries or self._bytes > self.max_bytes
+        ):
+            (_worker, feature_id), entry = self._entries.popitem(last=False)
+            self._bytes -= int(entry.nbytes)
+            self._evictions += 1
+            evicted_ids.append(str(entry.handle.get("feature_id") or feature_id))
+        return incarnation_changed, sorted(set(evicted_ids))
+
+    def drain(self) -> List[str]:
+        feature_ids = [
+            str(entry.handle.get("feature_id") or key[1])
+            for key, entry in self._entries.items()
+        ]
+        self._entries.clear()
+        self._bytes = 0
+        self._worker_incarnations.clear()
+        self._worker_incarnation_observed_at.clear()
+        self._worker_availability.clear()
+        self._incarnation_monitor_failure_streaks.clear()
+        return sorted(set(fid for fid in feature_ids if fid))
+
+    def stats(self) -> Dict[str, Any]:
+        lookups = self._hits + self._misses
+        return {
+            "enabled": self.enabled,
+            "entries": len(self._entries),
+            "bytes": self._bytes,
+            "max_entries": self.max_entries,
+            "max_bytes": self.max_bytes,
+            "ttl_s": self.ttl_s,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": (float(self._hits) / float(lookups)) if lookups else 0.0,
+            "stores": self._stores,
+            "evictions": self._evictions,
+            "expired": self._expired,
+            "worker_incarnations": dict(self._worker_incarnations),
+            "worker_incarnation_observations": self._worker_incarnation_observations,
+            "worker_incarnation_changes": self._worker_incarnation_changes,
+            "worker_invalidations": self._worker_invalidations,
+            "worker_invalidated_entries": self._worker_invalidated_entries,
+            "worker_unavailable": self._worker_unavailable,
+            "worker_unavailable_attempts": self._worker_unavailable,
+            "worker_unavailable_transitions": self._worker_unavailable_transitions,
+            "worker_recovery_transitions": self._worker_recovery_transitions,
+            "worker_availability": dict(self._worker_availability),
+            "unavailable_workers": sorted(
+                worker_id
+                for worker_id, available in self._worker_availability.items()
+                if not available
+            ),
+            "incarnation_probe_responses": self._incarnation_probe_responses,
+            "incarnation_probe_failures": self._incarnation_probe_failures,
+            "incarnation_probe_response_bytes": self._incarnation_probe_response_bytes,
+            "incarnation_probe_latency_ms": self._incarnation_probe_latency_ms,
+            "incarnation_monitor_failure_streaks": dict(
+                self._incarnation_monitor_failure_streaks
+            ),
+            "incarnation_monitor_max_failure_streak": (
+                self._incarnation_monitor_max_failure_streak
+            ),
+            "incarnation_monitor_transient_failures": (
+                self._incarnation_monitor_transient_failures
+            ),
+            "incarnation_monitor_threshold_reaches": (
+                self._incarnation_monitor_threshold_reaches
+            ),
+            "incarnation_monitor_streak_resets": (
+                self._incarnation_monitor_streak_resets
+            ),
+            "incarnation_monitor_superseded_failures": (
+                self._incarnation_monitor_superseded_failures
+            ),
+            "synchronous_incarnation_probes": self._synchronous_incarnation_probes,
+            "synchronous_incarnation_probe_dispatches": (
+                self._synchronous_incarnation_probe_dispatches
+            ),
+            "synchronous_incarnation_probe_collapsed": (
+                self._synchronous_incarnation_probe_collapsed
+            ),
+            "incarnation_freshness_skips": self._incarnation_freshness_skips,
+            "incarnation_guarded_requests": self._incarnation_guarded_requests,
+            "incarnation_guard_rejections": self._incarnation_guard_rejections,
+            "stale_singleflight_rejections": self._stale_singleflight_rejections,
+        }
+
+
+@dataclass
+class _CachedPrefillRender:
+    payload: Dict[str, Any]
+    nbytes: int
+    expires_at: float
+
+
+class _PrefillRenderCache:
+    """Bounded semantic cache for vLLM's processor/render response.
+
+    The cached object is an intermediate prompt representation, never a model
+    response.  Per-request KV-transfer metadata is injected only after lookup,
+    so a hit cannot reuse another request's transfer_id or handoff topology.
+    """
+
+    def __init__(self, *, enabled: bool, max_entries: int, max_bytes: int, ttl_s: float) -> None:
+        self.enabled = bool(enabled)
+        self.max_entries = max(1, int(max_entries))
+        self.max_bytes = max(1, int(max_bytes))
+        self.ttl_s = max(0.0, float(ttl_s))
+        self._entries: "OrderedDict[Tuple[str, str, str, str], _CachedPrefillRender]" = OrderedDict()
+        self._bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._stores = 0
+        self._evictions = 0
+        self._expired = 0
+        self._worker_invalidations = 0
+        self._worker_invalidated_entries = 0
+
+    def get(self, key: Tuple[str, str, str, str]) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        entry = self._entries.get(key)
+        if entry is None:
+            self._misses += 1
+            return None
+        now = time.monotonic()
+        if entry.expires_at > 0 and entry.expires_at <= now:
+            self._entries.pop(key, None)
+            self._bytes -= entry.nbytes
+            self._misses += 1
+            self._expired += 1
+            return None
+        self._entries.move_to_end(key)
+        self._hits += 1
+        return dict(entry.payload)
+
+    def put(self, key: Tuple[str, str, str, str], payload: Dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        nbytes = len(encoded)
+        if nbytes <= 0 or nbytes > self.max_bytes:
+            return
+        previous = self._entries.pop(key, None)
+        if previous is not None:
+            self._bytes -= previous.nbytes
+        expires_at = time.monotonic() + self.ttl_s if self.ttl_s > 0 else 0.0
+        self._entries[key] = _CachedPrefillRender(
+            payload=dict(payload),
+            nbytes=nbytes,
+            expires_at=expires_at,
+        )
+        self._bytes += nbytes
+        self._stores += 1
+        while self._entries and (
+            len(self._entries) > self.max_entries or self._bytes > self.max_bytes
+        ):
+            _, evicted = self._entries.popitem(last=False)
+            self._bytes -= evicted.nbytes
+            self._evictions += 1
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
+
+    def invalidate_worker(self, worker_id: str) -> int:
+        worker_id = str(worker_id)
+        removed = 0
+        for key in [key for key in self._entries if key[0] == worker_id]:
+            entry = self._entries.pop(key)
+            self._bytes -= entry.nbytes
+            removed += 1
+        if removed:
+            self._worker_invalidations += 1
+            self._worker_invalidated_entries += removed
+        return removed
+
+    def stats(self) -> Dict[str, Any]:
+        lookups = self._hits + self._misses
+        return {
+            "enabled": self.enabled,
+            "entries": len(self._entries),
+            "bytes": self._bytes,
+            "max_entries": self.max_entries,
+            "max_bytes": self.max_bytes,
+            "ttl_s": self.ttl_s,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": (float(self._hits) / float(lookups)) if lookups else 0.0,
+            "stores": self._stores,
+            "evictions": self._evictions,
+            "expired": self._expired,
+            "worker_invalidations": self._worker_invalidations,
+            "worker_invalidated_entries": self._worker_invalidated_entries,
+        }
+
+
+class _DecodeMMHashWarmCache:
+    """Bounded evidence cache for vLLM's Decode-side MM receiver cache.
+
+    vLLM's internal Generate protocol accepts ``features.kwargs_data=None``
+    only when the engine-core receiver cache already owns every referenced
+    multimodal item. Hashes are therefore promoted only after a real Generate
+    response passes protocol and detokenization validation. A failed hash-only
+    request invalidates the assumption and is never retried in-place.
+    """
+
+    def __init__(self, *, enabled: bool, max_entries: int, ttl_s: float) -> None:
+        self.enabled = bool(enabled)
+        self.max_entries = max(1, int(max_entries))
+        self.ttl_s = max(0.0, float(ttl_s))
+        self._entries: "OrderedDict[Tuple[str, str], float]" = OrderedDict()
+        self._lookups = 0
+        self._hash_only_requests = 0
+        self._full_requests = 0
+        self._no_feature_requests = 0
+        self._promotions = 0
+        self._renewals = 0
+        self._invalidations = 0
+        self._worker_invalidations = 0
+        self._worker_invalidated_entries = 0
+        self._worker_epochs: Dict[str, str] = {}
+        self._worker_epoch_observed_at: Dict[str, float] = {}
+        self._epoch_observations = 0
+        self._epoch_changes = 0
+        self._epoch_probe_failures = 0
+        self._epoch_probe_responses = 0
+        self._epoch_probe_response_bytes = 0
+        self._epoch_probe_latency_seconds = 0.0
+        self._epoch_probe_latency_seconds_max = 0.0
+        self._epoch_probe_source_counts: Dict[str, int] = {}
+        self._epoch_guarded_hash_only_requests = 0
+        self._epoch_guard_rejections = 0
+        self._epoch_guard_epoch_learns = 0
+        self._worker_unavailable_events = 0
+        self._epoch_unconfirmed_full_requests = 0
+        self._synchronous_epoch_probes = 0
+        self._synchronous_epoch_probe_dispatches = 0
+        self._synchronous_epoch_probe_collapsed = 0
+        self._epoch_freshness_skips = 0
+        self._evictions = 0
+        self._expired = 0
+        self._rejected_cold_metadata_only = 0
+        self._avoided_bytes = 0
+
+    @staticmethod
+    def _key(worker_id: str, mm_hash: str) -> Tuple[str, str]:
+        return str(worker_id), str(mm_hash)
+
+    def _is_warm(self, key: Tuple[str, str], *, now: float) -> bool:
+        expires_at = self._entries.get(key)
+        if expires_at is None:
+            return False
+        if expires_at > 0 and expires_at <= now:
+            self._entries.pop(key, None)
+            self._expired += 1
+            return False
+        self._entries.move_to_end(key)
+        return True
+
+    @staticmethod
+    def _flatten_features(
+        features: Dict[str, Any],
+    ) -> Tuple[List[Tuple[str, str, Optional[str]]], int]:
+        mm_hashes = features.get("mm_hashes")
+        if not isinstance(mm_hashes, dict) or not mm_hashes:
+            raise ValueError("Decode multimodal features require non-empty mm_hashes")
+        kwargs_data = features.get("kwargs_data")
+        if kwargs_data is not None and not isinstance(kwargs_data, dict):
+            raise TypeError("Decode multimodal kwargs_data must be an object or null")
+
+        flattened: List[Tuple[str, str, Optional[str]]] = []
+        full_bytes = 0
+        for modality, raw_hashes in mm_hashes.items():
+            if not isinstance(raw_hashes, list) or not raw_hashes:
+                raise ValueError(
+                    f"Decode multimodal hashes for {modality!r} must be non-empty"
+                )
+            if kwargs_data is None:
+                raw_items: List[Optional[str]] = [None] * len(raw_hashes)
+            else:
+                candidate = kwargs_data.get(modality)
+                if not isinstance(candidate, list) or len(candidate) != len(raw_hashes):
+                    raise ValueError(
+                        "Decode multimodal kwargs_data must be parallel to mm_hashes"
+                    )
+                raw_items = list(candidate)
+            for raw_hash, raw_item in zip(raw_hashes, raw_items):
+                if not isinstance(raw_hash, str) or not raw_hash:
+                    raise TypeError("Decode multimodal hashes must be non-empty strings")
+                if raw_item is not None and not isinstance(raw_item, str):
+                    raise TypeError(
+                        "Decode multimodal kwargs_data entries must be strings or null"
+                    )
+                if isinstance(raw_item, str):
+                    full_bytes += len(raw_item.encode("utf-8"))
+                flattened.append((str(modality), raw_hash, raw_item))
+        return flattened, full_bytes
+
+    def prepare(
+        self,
+        *,
+        worker_id: str,
+        payload: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Optional[_DecodeMMHashLease]]:
+        if not self.enabled:
+            return payload, None
+        raw_features = payload.get("features")
+        if raw_features is None:
+            self._no_feature_requests += 1
+            return payload, None
+        if not isinstance(raw_features, dict):
+            raise TypeError("Decode multimodal features must be an object")
+
+        features = dict(raw_features)
+        flattened, full_bytes = self._flatten_features(features)
+        now = time.monotonic()
+        self._lookups += 1
+        referenced = tuple(dict.fromkeys(item[1] for item in flattened))
+        warm = {
+            mm_hash: self._is_warm(self._key(worker_id, mm_hash), now=now)
+            for mm_hash in referenced
+        }
+        metadata_only = tuple(
+            dict.fromkeys(
+                mm_hash
+                for _modality, mm_hash, item in flattened
+                if item is None
+            )
+        )
+        cold_metadata_only = [mm_hash for mm_hash in metadata_only if not warm[mm_hash]]
+        if cold_metadata_only:
+            self._rejected_cold_metadata_only += 1
+            raise RuntimeError(
+                "Decode render supplied hash-only multimodal features before "
+                "the target worker cache was confirmed warm"
+            )
+
+        promote_hashes = tuple(
+            dict.fromkeys(
+                mm_hash
+                for _modality, mm_hash, item in flattened
+                if item is not None
+            )
+        )
+        epoch_confirmed = str(worker_id) in self._worker_epochs
+        if all(warm.values()) and epoch_confirmed:
+            optimized_payload = dict(payload)
+            features["kwargs_data"] = None
+            optimized_payload["features"] = features
+            self._hash_only_requests += 1
+            self._avoided_bytes += full_bytes
+            return optimized_payload, _DecodeMMHashLease(
+                cache=self,
+                worker_id=str(worker_id),
+                referenced_hashes=referenced,
+                promote_hashes=(),
+                invalidate_hashes=referenced,
+                mode="hash-only",
+                avoided_bytes=full_bytes,
+                expected_worker_epoch=self._worker_epochs.get(str(worker_id)),
+            )
+
+        if all(warm.values()) and not epoch_confirmed:
+            self._epoch_unconfirmed_full_requests += 1
+
+        self._full_requests += 1
+        return payload, _DecodeMMHashLease(
+            cache=self,
+            worker_id=str(worker_id),
+            referenced_hashes=referenced,
+            promote_hashes=promote_hashes,
+            invalidate_hashes=metadata_only,
+            mode="full",
+        )
+
+    def complete(self, lease: _DecodeMMHashLease, *, success: bool) -> None:
+        if success:
+            now = time.monotonic()
+            expires_at = now + self.ttl_s if self.ttl_s > 0 else 0.0
+            if lease.mode == "hash-only":
+                # Renew only after a legal terminal response. Never recreate an
+                # entry removed by an epoch change/unavailable event while the
+                # request was in flight.
+                for mm_hash in lease.referenced_hashes:
+                    key = self._key(lease.worker_id, mm_hash)
+                    if key not in self._entries:
+                        continue
+                    self._entries[key] = expires_at
+                    self._entries.move_to_end(key)
+                    self._renewals += 1
+                return
+            for mm_hash in lease.promote_hashes:
+                key = self._key(lease.worker_id, mm_hash)
+                self._entries.pop(key, None)
+                self._entries[key] = expires_at
+                self._promotions += 1
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+                self._evictions += 1
+            return
+
+        # A hash-only failure is evidence that the target Decode worker's
+        # receiver-cache generation may have changed (for example, after a
+        # worker restart).  Every warm assumption for that worker belongs to
+        # the same opaque engine-local cache lifetime, so retaining unrelated
+        # hashes would turn one restart into one user-visible failure per hash.
+        # Keep strict-no-fallback semantics for the failed request, but
+        # conservatively make all subsequent requests cold for this worker.
+        if lease.mode == "hash-only":
+            self.invalidate_worker(lease.worker_id)
+            return
+
+        for mm_hash in lease.invalidate_hashes:
+            if self._entries.pop(self._key(lease.worker_id, mm_hash), None) is not None:
+                self._invalidations += 1
+
+    def invalidate_worker(self, worker_id: str) -> int:
+        normalized_worker = str(worker_id)
+        keys = [key for key in self._entries if key[0] == normalized_worker]
+        if not keys:
+            return 0
+        for key in keys:
+            self._entries.pop(key, None)
+        count = len(keys)
+        self._invalidations += count
+        self._worker_invalidations += 1
+        self._worker_invalidated_entries += count
+        return count
+
+    def has_worker_entries(self, worker_id: str) -> bool:
+        normalized_worker = str(worker_id)
+        return any(key[0] == normalized_worker for key in self._entries)
+
+    def observe_worker_epoch(self, worker_id: str, epoch: str) -> None:
+        normalized_worker = str(worker_id)
+        normalized_epoch = str(epoch)
+        previous = self._worker_epochs.get(normalized_worker)
+        self._epoch_observations += 1
+        if previous is not None and previous != normalized_epoch:
+            self._epoch_changes += 1
+            self.invalidate_worker(normalized_worker)
+        self._worker_epochs[normalized_worker] = normalized_epoch
+        self._worker_epoch_observed_at[normalized_worker] = time.monotonic()
+
+    def use_fresh_worker_epoch(self, worker_id: str, freshness_s: float) -> bool:
+        """Consume a bounded recent epoch observation instead of probing again.
+
+        The optimization is disabled at zero. Correctness remains fail-closed:
+        monitor-confirmed epoch changes invalidate all warm hashes, while any
+        failed hash-only Generate still invalidates the worker generation and
+        is never retried in place.
+        """
+
+        max_age = max(0.0, float(freshness_s))
+        if max_age <= 0:
+            return False
+        normalized_worker = str(worker_id)
+        if normalized_worker not in self._worker_epochs:
+            return False
+        observed_at = self._worker_epoch_observed_at.get(normalized_worker)
+        if observed_at is None or time.monotonic() - observed_at > max_age:
+            return False
+        self._epoch_freshness_skips += 1
+        return True
+
+    def mark_worker_unavailable(self, worker_id: str) -> None:
+        normalized_worker = str(worker_id)
+        self.record_epoch_probe_failure()
+        had_epoch = normalized_worker in self._worker_epochs
+        invalidated = self.invalidate_worker(normalized_worker)
+        if had_epoch or invalidated > 0:
+            self._worker_unavailable_events += 1
+        # Removing the epoch makes the first successful observation after
+        # recovery establish a new generation without double-counting a
+        # second invalidation event.
+        self._worker_epochs.pop(normalized_worker, None)
+        self._worker_epoch_observed_at.pop(normalized_worker, None)
+
+    def record_epoch_probe_failure(self) -> None:
+        self._epoch_probe_failures += 1
+
+    def record_epoch_probe_response(
+        self,
+        *,
+        response_bytes: int,
+        latency_s: float,
+        source: Optional[str] = None,
+    ) -> None:
+        self._epoch_probe_responses += 1
+        self._epoch_probe_response_bytes += max(0, int(response_bytes))
+        normalized_latency = max(0.0, float(latency_s))
+        self._epoch_probe_latency_seconds += normalized_latency
+        self._epoch_probe_latency_seconds_max = max(
+            self._epoch_probe_latency_seconds_max,
+            normalized_latency,
+        )
+        if source:
+            normalized_source = str(source)
+            self._epoch_probe_source_counts[normalized_source] = (
+                self._epoch_probe_source_counts.get(normalized_source, 0) + 1
+            )
+
+    def record_epoch_guarded_hash_only_request(self) -> None:
+        self._epoch_guarded_hash_only_requests += 1
+
+    def record_epoch_guard_rejection(
+        self,
+        *,
+        worker_id: Optional[str] = None,
+        actual_worker_epoch: Optional[str] = None,
+    ) -> None:
+        self._epoch_guard_rejections += 1
+        if worker_id is None or actual_worker_epoch is None:
+            return
+        normalized_worker = str(worker_id)
+        normalized_epoch = str(actual_worker_epoch)
+        previous = self._worker_epochs.get(normalized_worker)
+        self.observe_worker_epoch(normalized_worker, normalized_epoch)
+        if previous != normalized_epoch:
+            self._epoch_guard_epoch_learns += 1
+
+    def record_synchronous_epoch_probe(self) -> None:
+        self._synchronous_epoch_probes += 1
+
+    def record_synchronous_epoch_probe_dispatch(self) -> None:
+        self._synchronous_epoch_probe_dispatches += 1
+
+    def record_synchronous_epoch_probe_collapsed(self) -> None:
+        self._synchronous_epoch_probe_collapsed += 1
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def stats(self) -> Dict[str, Any]:
+        entries_by_worker: Dict[str, int] = {}
+        for worker_id, _mm_hash in self._entries:
+            entries_by_worker[worker_id] = entries_by_worker.get(worker_id, 0) + 1
+        return {
+            "enabled": self.enabled,
+            "entries": len(self._entries),
+            "entries_by_worker": entries_by_worker,
+            "max_entries": self.max_entries,
+            "ttl_s": self.ttl_s,
+            "lookups": self._lookups,
+            "hash_only_requests": self._hash_only_requests,
+            "full_requests": self._full_requests,
+            "no_feature_requests": self._no_feature_requests,
+            "promotions": self._promotions,
+            "renewals": self._renewals,
+            "invalidations": self._invalidations,
+            "worker_invalidations": self._worker_invalidations,
+            "worker_invalidated_entries": self._worker_invalidated_entries,
+            "worker_epochs": dict(self._worker_epochs),
+            "epoch_observations": self._epoch_observations,
+            "epoch_changes": self._epoch_changes,
+            "epoch_probe_failures": self._epoch_probe_failures,
+            "epoch_probe_responses": self._epoch_probe_responses,
+            "epoch_probe_response_bytes": self._epoch_probe_response_bytes,
+            "epoch_probe_response_bytes_avg": (
+                float(self._epoch_probe_response_bytes)
+                / float(self._epoch_probe_responses)
+                if self._epoch_probe_responses
+                else 0.0
+            ),
+            "epoch_probe_latency_ms_avg": (
+                1000.0 * self._epoch_probe_latency_seconds
+                / float(self._epoch_probe_responses)
+                if self._epoch_probe_responses
+                else 0.0
+            ),
+            "epoch_probe_latency_ms_max": (
+                1000.0 * self._epoch_probe_latency_seconds_max
+            ),
+            "epoch_probe_source_counts": dict(self._epoch_probe_source_counts),
+            "epoch_guarded_hash_only_requests": (
+                self._epoch_guarded_hash_only_requests
+            ),
+            "epoch_guard_rejections": self._epoch_guard_rejections,
+            "epoch_guard_epoch_learns": self._epoch_guard_epoch_learns,
+            "worker_unavailable_events": self._worker_unavailable_events,
+            "epoch_unconfirmed_full_requests": self._epoch_unconfirmed_full_requests,
+            "synchronous_epoch_probes": self._synchronous_epoch_probes,
+            "synchronous_epoch_probe_dispatches": (
+                self._synchronous_epoch_probe_dispatches
+            ),
+            "synchronous_epoch_probe_collapsed": (
+                self._synchronous_epoch_probe_collapsed
+            ),
+            "epoch_freshness_skips": self._epoch_freshness_skips,
+            "evictions": self._evictions,
+            "expired": self._expired,
+            "rejected_cold_metadata_only": self._rejected_cold_metadata_only,
+            "avoided_serialized_bytes": self._avoided_bytes,
+        }
 
 
 def parse_args() -> ProxyConfig:
@@ -238,44 +1254,267 @@ def parse_args() -> ProxyConfig:
     parser.add_argument("--critical-rho", type=float, default=0.95)
     parser.add_argument("--max-backpressure-delay-ms", type=float, default=150.0)
     parser.add_argument("--transport-backend", type=str, default="mooncake_engine_direct")
-    parser.add_argument("--mooncake-protocol", type=str, default=os.getenv("MOONCAKE_PROTOCOL", "tcp"))
     parser.add_argument("--node-id", type=str, default="proxy")
     parser.add_argument("--owner-shards", type=int, default=1)
     parser.add_argument("--kv-directory-rpc-url", type=str, default=None)
     parser.add_argument("--connector-metrics-dir", type=str, default=None)
     parser.add_argument("--workflow-registry-wal", type=str, default=None)
+    parser.add_argument("--workflow-registry-wal-fsync-interval-s", type=float, default=0.25)
+    parser.add_argument("--workflow-registry-wal-max-pending", type=int, default=64)
+    parser.add_argument("--enable-decode-pipeline", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--decode-pipeline-max-inflight",
+        type=int,
+        default=int(os.getenv("MOONCAKE_EPD_DECODE_PIPELINE_MAX_INFLIGHT", "0")),
+        help=(
+            "Maximum already-active Decode requests that may coexist with a new "
+            "early-open pipeline; 0 keeps the legacy unlimited behavior."
+        ),
+    )
+    parser.add_argument(
+        "--enable-prerendered-decode",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("MOONCAKE_EPD_PRERENDERED_DECODE", "0").lower()
+        not in {"", "0", "false", "no", "off"},
+    )
+    parser.add_argument(
+        "--prerendered-decode-model",
+        type=str,
+        default=os.getenv("MOONCAKE_EPD_PRERENDERED_DECODE_MODEL"),
+    )
+    parser.add_argument(
+        "--enable-decode-mm-hash-cache",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("MOONCAKE_EPD_DECODE_MM_HASH_CACHE", "0").lower()
+        not in {"", "0", "false", "no", "off"},
+        help=(
+            "After a successful full multimodal Generate request, send only "
+            "hashes to the same Decode worker while the bounded evidence TTL is live."
+        ),
+    )
+    parser.add_argument(
+        "--decode-mm-hash-cache-max-entries",
+        type=int,
+        default=int(os.getenv("MOONCAKE_EPD_DECODE_MM_HASH_CACHE_MAX_ENTRIES", "64")),
+    )
+    parser.add_argument(
+        "--decode-mm-hash-cache-ttl-s",
+        type=float,
+        default=float(os.getenv("MOONCAKE_EPD_DECODE_MM_HASH_CACHE_TTL_S", "120")),
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-poll-s",
+        type=float,
+        default=float(os.getenv("MOONCAKE_EPD_DECODE_MM_HASH_EPOCH_POLL_S", "1")),
+        help=(
+            "Background interval for fencing warm MM hashes with Decode process_start_time_seconds; "
+            "0 disables proactive restart detection."
+        ),
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-probe-timeout-s",
+        type=float,
+        default=float(
+            os.getenv("MOONCAKE_EPD_DECODE_MM_HASH_EPOCH_PROBE_TIMEOUT_S", "0.5")
+        ),
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-endpoint",
+        type=str,
+        default=os.getenv(
+            "MOONCAKE_EPD_DECODE_MM_HASH_EPOCH_ENDPOINT",
+            "/metrics",
+        ),
+        help=(
+            "Decode worker path returning a process-incarnation token. "
+            "Use /metrics for backward compatibility or "
+            "/mooncake_epd/incarnation with the repo vLLM middleware."
+        ),
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-guard",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv(
+            "MOONCAKE_EPD_DECODE_MM_HASH_EPOCH_GUARD",
+            "0",
+        ).lower()
+        not in {"", "0", "false", "no", "off"},
+        help=(
+            "Attach the observed Decode incarnation to hash-only requests so "
+            "the vLLM middleware rejects stale cache generations before engine dispatch."
+        ),
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-probe-singleflight",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv(
+            "MOONCAKE_EPD_DECODE_MM_HASH_EPOCH_PROBE_SINGLEFLIGHT",
+            "1",
+        ).lower()
+        not in {"", "0", "false", "no", "off"},
+        help="Collapse concurrent hot requests for one Decode worker onto one epoch probe.",
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-freshness-s",
+        type=float,
+        default=float(
+            os.getenv("MOONCAKE_EPD_DECODE_MM_HASH_EPOCH_FRESHNESS_S", "0")
+        ),
+        help=(
+            "Reuse a successful Decode epoch observation for this bounded interval. "
+            "Zero preserves per-hot-request probing."
+        ),
+    )
     parser.add_argument("--enable-mm-prefetch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mm-prefetch-mode", choices=["asset_bytes", "feature_handle"], default="asset_bytes")
     parser.add_argument("--prefill-supports-feature-handles", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mm-prefetch-wait-ms", type=float, default=100.0)
     parser.add_argument("--mm-prefetch-max-asset-bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--mm-prefetch-queue-size", type=int, default=256)
+    parser.add_argument(
+        "--allow-private-mm-urls",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow HTTP(S) multimodal URLs resolving to private/local networks. "
+            "Disabled by default to prevent serving-side SSRF."
+        ),
+    )
     parser.add_argument("--encoder-service-url", type=str, default=os.getenv("MOONCAKE_EPD_ENCODER_SERVICE_URL"))
     parser.add_argument("--encoder-service-timeout-s", type=float, default=float(os.getenv("MOONCAKE_EPD_ENCODER_SERVICE_TIMEOUT_S", "120")))
     parser.add_argument("--prefill-direct-buffer-service-url", type=str, default=os.getenv("MOONCAKE_EPD_PREFILL_DIRECT_BUFFER_SERVICE_URL"))
-    parser.add_argument("--prefill-direct-buffer-service-urls", type=str, nargs="*", default=None)
     parser.add_argument("--prefill-direct-buffer-timeout-s", type=float, default=float(os.getenv("MOONCAKE_EPD_PREFILL_DIRECT_BUFFER_TIMEOUT_S", "30")))
-    parser.add_argument(
-        "--direct-feature-buffer-auth-token",
-        default=os.getenv("MOONCAKE_EPD_DIRECT_BUFFER_AUTH_TOKEN"),
-    )
     parser.add_argument("--release-direct-feature-buffers-after-prefill", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
-        "--direct-feature-release-max-inflight",
-        type=int,
-        default=int(os.getenv("MOONCAKE_EPD_DIRECT_FEATURE_RELEASE_MAX_INFLIGHT", "128")),
-    )
-    parser.add_argument("--enable-direct-feature-handle-cache", action=argparse.BooleanOptionalAction, default=os.getenv("MOONCAKE_EPD_DIRECT_FEATURE_HANDLE_CACHE", "0").lower() in {"1", "true", "yes", "on"})
-    parser.add_argument("--direct-feature-handle-cache-max-entries", type=int, default=int(os.getenv("MOONCAKE_EPD_DIRECT_FEATURE_HANDLE_CACHE_MAX_ENTRIES", "4096")))
-    parser.add_argument("--direct-feature-handle-cache-ttl-s", type=float, default=float(os.getenv("MOONCAKE_EPD_DIRECT_FEATURE_HANDLE_CACHE_TTL_S", "600")))
-    parser.add_argument("--direct-feature-singleflight-max-locks", type=int, default=int(os.getenv("MOONCAKE_EPD_DIRECT_FEATURE_SINGLEFLIGHT_MAX_LOCKS", "4096")))
-    parser.add_argument("--prefill-dispatch-mode", choices=["render_generate", "openai_prompt_only"], default=os.getenv("MOONCAKE_EPD_PREFILL_DISPATCH_MODE", "render_generate"))
-    parser.add_argument(
-        "--allow-unverified-openai-prompt-only",
+        "--enable-direct-feature-handle-cache",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MOONCAKE_EPD_ALLOW_UNVERIFIED_OPENAI_PROMPT_ONLY", "0").lower()
-        in {"1", "true", "yes", "on"},
-        help="Permit openai_prompt_only in strict serving after workload-specific output-equivalence validation.",
+        default=os.getenv("MOONCAKE_EPD_DIRECT_FEATURE_HANDLE_CACHE", "0").lower()
+        not in {"", "0", "false", "no", "off"},
+    )
+    parser.add_argument(
+        "--direct-feature-handle-cache-max-entries",
+        type=int,
+        default=int(os.getenv("MOONCAKE_EPD_DIRECT_FEATURE_HANDLE_CACHE_MAX_ENTRIES", "64")),
+    )
+    parser.add_argument(
+        "--direct-feature-handle-cache-max-bytes",
+        type=int,
+        default=int(os.getenv("MOONCAKE_EPD_DIRECT_FEATURE_HANDLE_CACHE_MAX_BYTES", str(4 * 1024 * 1024 * 1024))),
+    )
+    parser.add_argument(
+        "--direct-feature-handle-cache-ttl-s",
+        type=float,
+        default=float(os.getenv("MOONCAKE_EPD_DIRECT_FEATURE_HANDLE_CACHE_TTL_S", "600")),
+    )
+    parser.add_argument(
+        "--prefill-incarnation-poll-s",
+        type=float,
+        default=float(os.getenv("MOONCAKE_EPD_PREFILL_INCARNATION_POLL_S", "0")),
+        help=(
+            "Background interval for invalidating direct handles and cached KV "
+            "topology after a Prefill API-process restart; 0 disables polling."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-incarnation-poll-jitter-ratio",
+        type=float,
+        default=float(
+            os.getenv(
+                "MOONCAKE_EPD_PREFILL_INCARNATION_POLL_JITTER_RATIO",
+                "0",
+            )
+        ),
+        help=(
+            "Symmetric fractional jitter applied after each background Prefill "
+            "incarnation probe; 0 preserves a fixed interval and 1 allows "
+            "delays from zero to twice the configured interval."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-incarnation-probe-timeout-s",
+        type=float,
+        default=float(
+            os.getenv("MOONCAKE_EPD_PREFILL_INCARNATION_PROBE_TIMEOUT_S", "0.5")
+        ),
+    )
+    parser.add_argument(
+        "--prefill-incarnation-failure-threshold",
+        type=int,
+        default=int(
+            os.getenv("MOONCAKE_EPD_PREFILL_INCARNATION_FAILURE_THRESHOLD", "3")
+        ),
+        help=(
+            "Consecutive failed background Prefill incarnation probes required "
+            "before removing the worker; synchronous request fences remain "
+            "fail-closed on the first failed proof."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-incarnation-freshness-s",
+        type=float,
+        default=float(
+            os.getenv("MOONCAKE_EPD_PREFILL_INCARNATION_FRESHNESS_S", "0")
+        ),
+        help="Bounded lifetime of a successful Prefill incarnation observation.",
+    )
+    parser.add_argument(
+        "--prefill-incarnation-endpoint",
+        type=str,
+        default=os.getenv(
+            "MOONCAKE_EPD_PREFILL_INCARNATION_ENDPOINT",
+            VLLM_INCARNATION_ENDPOINT,
+        ),
+    )
+    parser.add_argument(
+        "--prefill-incarnation-guard",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("MOONCAKE_EPD_PREFILL_INCARNATION_GUARD", "0").lower()
+        not in {"", "0", "false", "no", "off"},
+        help=(
+            "Attach the expected Prefill API-process incarnation so stale direct "
+            "handles are rejected before render or engine dispatch."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-incarnation-probe-singleflight",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv(
+            "MOONCAKE_EPD_PREFILL_INCARNATION_PROBE_SINGLEFLIGHT",
+            "1",
+        ).lower()
+        not in {"", "0", "false", "no", "off"},
+        help="Collapse concurrent direct-handle reuse checks per Prefill worker.",
+    )
+    parser.add_argument(
+        "--enable-prefill-render-cache",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("MOONCAKE_EPD_PREFILL_RENDER_CACHE", "0").lower()
+        not in {"", "0", "false", "no", "off"},
+    )
+    parser.add_argument(
+        "--prefill-render-cache-max-entries",
+        type=int,
+        default=int(os.getenv("MOONCAKE_EPD_PREFILL_RENDER_CACHE_MAX_ENTRIES", "128")),
+    )
+    parser.add_argument(
+        "--prefill-render-cache-max-bytes",
+        type=int,
+        default=int(os.getenv("MOONCAKE_EPD_PREFILL_RENDER_CACHE_MAX_BYTES", str(512 * 1024 * 1024))),
+    )
+    parser.add_argument(
+        "--prefill-render-cache-ttl-s",
+        type=float,
+        default=float(os.getenv("MOONCAKE_EPD_PREFILL_RENDER_CACHE_TTL_S", "600")),
+    )
+    parser.add_argument(
+        "--enable-client-mm-uuid-references",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("MOONCAKE_EPD_CLIENT_MM_UUID_REFERENCES", "0").lower()
+        not in {"", "0", "false", "no", "off"},
+        help=(
+            "Accept vLLM-compatible UUID-only multimodal items after a full warmup. "
+            "Cold direct-feature or Prefill-render misses fail closed."
+        ),
     )
     parser.add_argument("--strict-no-fallback", action=argparse.BooleanOptionalAction, default=strict_no_fallback_enabled())
     parser.add_argument("--enable-agent-state-clone", action=argparse.BooleanOptionalAction, default=True)
@@ -283,19 +1522,110 @@ def parse_args() -> ProxyConfig:
     parser.add_argument("--low-latency-decode-worker-ids", nargs="*", default=None)
     parser.add_argument("--standard-prefill-worker-ids", nargs="*", default=None)
     parser.add_argument("--standard-decode-worker-ids", nargs="*", default=None)
-    parser.add_argument(
-        "--prefill-decode-affinity",
-        nargs="*",
-        default=None,
-        metavar="PREFILL=DECODE",
-        help="Soft P->D transport-locality pairs; overload admission may select another Decode worker.",
-    )
+    parser.add_argument("--upstream-max-connections", type=int, default=64)
+    parser.add_argument("--upstream-max-keepalive-connections", type=int, default=16)
+    parser.add_argument("--upstream-keepalive-expiry-s", type=float, default=1.0)
     args = parser.parse_args()
 
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
     if len(args.decoder_hosts) != len(args.decoder_ports):
         raise ValueError("Number of decoder hosts must match number of decoder ports")
+    if args.upstream_max_connections < 1:
+        raise ValueError("upstream max connections must be positive")
+    if not 0 <= args.upstream_max_keepalive_connections <= args.upstream_max_connections:
+        raise ValueError(
+            "upstream max keepalive connections must be between zero and max connections"
+        )
+    if args.upstream_keepalive_expiry_s < 0:
+        raise ValueError("upstream keepalive expiry must be non-negative")
+    if args.workflow_registry_wal_fsync_interval_s < 0:
+        raise ValueError("workflow registry WAL fsync interval must be non-negative")
+    if args.workflow_registry_wal_max_pending < 1:
+        raise ValueError("workflow registry WAL max pending records must be positive")
+    if args.decode_pipeline_max_inflight < 0:
+        raise ValueError("Decode pipeline max inflight must be non-negative")
+    if args.direct_feature_handle_cache_max_entries < 1:
+        raise ValueError("direct feature handle cache max entries must be positive")
+    if args.direct_feature_handle_cache_max_bytes < 1:
+        raise ValueError("direct feature handle cache max bytes must be positive")
+    if args.direct_feature_handle_cache_ttl_s < 0:
+        raise ValueError("direct feature handle cache TTL must be non-negative")
+    if args.prefill_incarnation_poll_s < 0:
+        raise ValueError("Prefill incarnation poll interval must be non-negative")
+    if not 0 <= args.prefill_incarnation_poll_jitter_ratio <= 1:
+        raise ValueError("Prefill incarnation poll jitter ratio must be between 0 and 1")
+    if args.prefill_incarnation_probe_timeout_s <= 0:
+        raise ValueError("Prefill incarnation probe timeout must be positive")
+    if args.prefill_incarnation_failure_threshold < 1:
+        raise ValueError("Prefill incarnation failure threshold must be positive")
+    if args.prefill_incarnation_freshness_s < 0:
+        raise ValueError("Prefill incarnation freshness must be non-negative")
+    prefill_incarnation_endpoint_parts = urlsplit(
+        str(args.prefill_incarnation_endpoint)
+    )
+    if (
+        not prefill_incarnation_endpoint_parts.path.startswith("/")
+        or prefill_incarnation_endpoint_parts.scheme
+        or prefill_incarnation_endpoint_parts.netloc
+        or prefill_incarnation_endpoint_parts.query
+        or prefill_incarnation_endpoint_parts.fragment
+    ):
+        raise ValueError(
+            "Prefill incarnation endpoint must be an absolute URL path without "
+            "scheme, host, query, or fragment"
+        )
+    if (
+        args.prefill_incarnation_guard
+        and prefill_incarnation_endpoint_parts.path.rstrip("/")
+        != VLLM_INCARNATION_ENDPOINT
+    ):
+        raise ValueError(
+            "Prefill incarnation guard requires the repo incarnation endpoint"
+        )
+    if args.prefill_render_cache_max_entries < 1:
+        raise ValueError("prefill render cache max entries must be positive")
+    if args.prefill_render_cache_max_bytes < 1:
+        raise ValueError("prefill render cache max bytes must be positive")
+    if args.prefill_render_cache_ttl_s < 0:
+        raise ValueError("prefill render cache TTL must be non-negative")
+    if args.enable_prerendered_decode and not args.prerendered_decode_model:
+        raise ValueError(
+            "--enable-prerendered-decode requires --prerendered-decode-model"
+        )
+    if args.enable_decode_mm_hash_cache and not args.enable_prerendered_decode:
+        raise ValueError(
+            "--enable-decode-mm-hash-cache requires --enable-prerendered-decode"
+        )
+    if args.decode_mm_hash_cache_max_entries < 1:
+        raise ValueError("Decode MM hash cache max entries must be positive")
+    if args.decode_mm_hash_cache_ttl_s < 0:
+        raise ValueError("Decode MM hash cache TTL must be non-negative")
+    if args.decode_mm_hash_epoch_poll_s < 0:
+        raise ValueError("Decode MM hash epoch poll interval must be non-negative")
+    if args.decode_mm_hash_epoch_probe_timeout_s <= 0:
+        raise ValueError("Decode MM hash epoch probe timeout must be positive")
+    if args.decode_mm_hash_epoch_freshness_s < 0:
+        raise ValueError("Decode MM hash epoch freshness must be non-negative")
+    epoch_endpoint_parts = urlsplit(str(args.decode_mm_hash_epoch_endpoint))
+    if (
+        not epoch_endpoint_parts.path.startswith("/")
+        or epoch_endpoint_parts.scheme
+        or epoch_endpoint_parts.netloc
+        or epoch_endpoint_parts.query
+        or epoch_endpoint_parts.fragment
+    ):
+        raise ValueError(
+            "Decode MM hash epoch endpoint must be an absolute URL path without "
+            "scheme, host, query, or fragment"
+        )
+    if (
+        args.decode_mm_hash_epoch_guard
+        and epoch_endpoint_parts.path.rstrip("/") != VLLM_INCARNATION_ENDPOINT
+    ):
+        raise ValueError(
+            "Decode MM hash epoch guard requires the repo incarnation endpoint"
+        )
 
     return ProxyConfig(
         host=args.host,
@@ -309,123 +1639,636 @@ def parse_args() -> ProxyConfig:
         critical_rho=args.critical_rho,
         max_backpressure_delay_ms=args.max_backpressure_delay_ms,
         transport_backend=args.transport_backend,
-        mooncake_protocol=str(args.mooncake_protocol),
         node_id=args.node_id,
         owner_shards=args.owner_shards,
         kv_directory_rpc_url=args.kv_directory_rpc_url,
         connector_metrics_dir=args.connector_metrics_dir,
         workflow_registry_wal_path=args.workflow_registry_wal,
+        workflow_registry_wal_fsync_interval_s=(
+            args.workflow_registry_wal_fsync_interval_s
+        ),
+        workflow_registry_wal_max_pending_records=(
+            args.workflow_registry_wal_max_pending
+        ),
+        enable_decode_pipeline=bool(args.enable_decode_pipeline),
+        decode_pipeline_max_inflight=int(args.decode_pipeline_max_inflight),
+        enable_prerendered_decode=bool(args.enable_prerendered_decode),
+        prerendered_decode_model=args.prerendered_decode_model,
+        enable_decode_mm_hash_cache=bool(args.enable_decode_mm_hash_cache),
+        decode_mm_hash_cache_max_entries=int(args.decode_mm_hash_cache_max_entries),
+        decode_mm_hash_cache_ttl_s=float(args.decode_mm_hash_cache_ttl_s),
+        decode_mm_hash_epoch_poll_s=float(args.decode_mm_hash_epoch_poll_s),
+        decode_mm_hash_epoch_probe_timeout_s=float(
+            args.decode_mm_hash_epoch_probe_timeout_s
+        ),
+        decode_mm_hash_epoch_freshness_s=float(
+            args.decode_mm_hash_epoch_freshness_s
+        ),
+        decode_mm_hash_epoch_endpoint=str(args.decode_mm_hash_epoch_endpoint),
+        enable_decode_mm_hash_epoch_guard=bool(
+            args.decode_mm_hash_epoch_guard
+        ),
+        enable_decode_mm_hash_epoch_probe_singleflight=bool(
+            args.decode_mm_hash_epoch_probe_singleflight
+        ),
         enable_mm_prefetch=bool(args.enable_mm_prefetch),
         mm_prefetch_mode=str(args.mm_prefetch_mode),
         prefill_supports_feature_handles=bool(args.prefill_supports_feature_handles),
         mm_prefetch_wait_ms=args.mm_prefetch_wait_ms,
         mm_prefetch_max_asset_bytes=args.mm_prefetch_max_asset_bytes,
         mm_prefetch_queue_size=args.mm_prefetch_queue_size,
+        allow_private_mm_urls=bool(args.allow_private_mm_urls),
         encoder_service_url=args.encoder_service_url,
         encoder_service_timeout_s=args.encoder_service_timeout_s,
         prefill_direct_buffer_service_url=args.prefill_direct_buffer_service_url,
-        prefill_direct_buffer_service_urls=list(args.prefill_direct_buffer_service_urls or []),
         prefill_direct_buffer_timeout_s=args.prefill_direct_buffer_timeout_s,
-        direct_feature_buffer_auth_token=args.direct_feature_buffer_auth_token,
         release_direct_feature_buffers_after_prefill=bool(args.release_direct_feature_buffers_after_prefill),
-        direct_feature_release_max_inflight=max(1, int(args.direct_feature_release_max_inflight)),
         enable_direct_feature_handle_cache=bool(args.enable_direct_feature_handle_cache),
-        direct_feature_handle_cache_max_entries=max(0, int(args.direct_feature_handle_cache_max_entries)),
-        direct_feature_handle_cache_ttl_s=max(0.0, float(args.direct_feature_handle_cache_ttl_s)),
-        direct_feature_singleflight_max_locks=max(16, int(args.direct_feature_singleflight_max_locks)),
-        prefill_dispatch_mode=str(args.prefill_dispatch_mode),
-        allow_unverified_openai_prompt_only=bool(args.allow_unverified_openai_prompt_only),
+        direct_feature_handle_cache_max_entries=int(args.direct_feature_handle_cache_max_entries),
+        direct_feature_handle_cache_max_bytes=int(args.direct_feature_handle_cache_max_bytes),
+        direct_feature_handle_cache_ttl_s=float(args.direct_feature_handle_cache_ttl_s),
+        prefill_incarnation_poll_s=float(args.prefill_incarnation_poll_s),
+        prefill_incarnation_poll_jitter_ratio=float(
+            args.prefill_incarnation_poll_jitter_ratio
+        ),
+        prefill_incarnation_probe_timeout_s=float(
+            args.prefill_incarnation_probe_timeout_s
+        ),
+        prefill_incarnation_failure_threshold=int(
+            args.prefill_incarnation_failure_threshold
+        ),
+        prefill_incarnation_freshness_s=float(
+            args.prefill_incarnation_freshness_s
+        ),
+        prefill_incarnation_endpoint=str(args.prefill_incarnation_endpoint),
+        enable_prefill_incarnation_guard=bool(args.prefill_incarnation_guard),
+        enable_prefill_incarnation_probe_singleflight=bool(
+            args.prefill_incarnation_probe_singleflight
+        ),
+        enable_prefill_render_cache=bool(args.enable_prefill_render_cache),
+        prefill_render_cache_max_entries=int(args.prefill_render_cache_max_entries),
+        prefill_render_cache_max_bytes=int(args.prefill_render_cache_max_bytes),
+        prefill_render_cache_ttl_s=float(args.prefill_render_cache_ttl_s),
+        enable_client_mm_uuid_references=bool(
+            args.enable_client_mm_uuid_references
+        ),
         strict_no_fallback=bool(args.strict_no_fallback),
         enable_agent_state_clone=bool(args.enable_agent_state_clone),
         high_prefill_worker_ids=list(args.high_prefill_worker_ids or []),
         low_latency_decode_worker_ids=list(args.low_latency_decode_worker_ids or []),
         standard_prefill_worker_ids=list(args.standard_prefill_worker_ids or []),
         standard_decode_worker_ids=list(args.standard_decode_worker_ids or []),
-        prefill_decode_affinity=_parse_prefill_decode_affinity(
-            args.prefill_decode_affinity
-        ),
+        upstream_max_connections=args.upstream_max_connections,
+        upstream_max_keepalive_connections=args.upstream_max_keepalive_connections,
+        upstream_keepalive_expiry_s=args.upstream_keepalive_expiry_s,
     )
 
 
-def _make_client(base_url: str) -> httpx.AsyncClient:
+def _make_client(base_url: str, config: ProxyConfig) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         timeout=None,
         base_url=base_url,
         limits=httpx.Limits(
-            max_connections=None,
-            max_keepalive_connections=None,
+            max_connections=config.upstream_max_connections,
+            max_keepalive_connections=config.upstream_max_keepalive_connections,
+            keepalive_expiry=config.upstream_keepalive_expiry_s,
         ),
         trust_env=False,
     )
 
 
-def _make_control_client(
-    base_url: str,
-    timeout_s: float,
+def _decode_process_epoch(metrics_text: str) -> Optional[str]:
+    for raw_line in str(metrics_text).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("process_start_time_seconds"):
+            continue
+        parts = line.split()
+        if len(parts) == 2 and parts[1]:
+            return parts[1]
+    return None
+
+
+def _bounded_epoch_token(raw_value: Any) -> Optional[str]:
+    value = str(raw_value or "").strip()
+    if not value or len(value) > 512 or "\n" in value or "\r" in value:
+        return None
+    return value
+
+
+def _decode_worker_epoch_from_response(
+    response: httpx.Response,
     *,
-    auth_token: Optional[str] = None,
-) -> httpx.AsyncClient:
-    headers = {}
-    if str(auth_token or "").strip():
-        headers["X-Mooncake-EPD-Token"] = str(auth_token)
-    return httpx.AsyncClient(
-        timeout=httpx.Timeout(float(timeout_s), connect=5.0),
-        follow_redirects=True,
-        trust_env=False,
-        base_url=str(base_url).rstrip("/"),
-        headers=headers,
+    epoch_endpoint: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    header_value = getattr(response, "headers", {}).get(VLLM_INCARNATION_HEADER)
+    header_epoch = _bounded_epoch_token(header_value)
+    if header_epoch is not None:
+        return header_epoch, "incarnation-header"
+    if str(epoch_endpoint).rstrip("/") == "/metrics":
+        metrics_epoch = _decode_process_epoch(response.text)
+        if metrics_epoch is not None:
+            return metrics_epoch, "prometheus-process-start"
+        return None, None
+    body_epoch = _bounded_epoch_token(response.text)
+    if body_epoch is not None:
+        return body_epoch, "incarnation-body"
+    return None, None
+
+
+async def _probe_decode_worker_epoch(
+    *,
+    cache: _DecodeMMHashWarmCache,
+    client_info: Dict[str, Any],
+    timeout_s: float,
+    epoch_endpoint: str = "/metrics",
+    control_plane: Optional[ServingControlPlane] = None,
+) -> bool:
+    worker_id = str(client_info.get("worker_id") or "")
+    client: httpx.AsyncClient = client_info["client"]
+
+    def _set_available(available: bool) -> None:
+        if control_plane is not None:
+            control_plane.set_stage_worker_available(
+                "decode",
+                worker_id,
+                available=available,
+            )
+
+    probe_started_at = time.perf_counter()
+    try:
+        response = await asyncio.wait_for(
+            client.get(str(epoch_endpoint)),
+            timeout=max(0.05, float(timeout_s)),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        cache.mark_worker_unavailable(worker_id)
+        _set_available(False)
+        return False
+    try:
+        try:
+            response_bytes = len(response.content)
+        except Exception:
+            response_bytes = len(str(response.text).encode("utf-8"))
+        epoch: Optional[str] = None
+        source: Optional[str] = None
+        if response.status_code == 200:
+            epoch, source = _decode_worker_epoch_from_response(
+                response,
+                epoch_endpoint=str(epoch_endpoint),
+            )
+        cache.record_epoch_probe_response(
+            response_bytes=response_bytes,
+            latency_s=time.perf_counter() - probe_started_at,
+            source=source,
+        )
+        if response.status_code >= 500:
+            cache.mark_worker_unavailable(worker_id)
+            _set_available(False)
+            return False
+        if response.status_code != 200:
+            cache.record_epoch_probe_failure()
+            cache.invalidate_worker(worker_id)
+            _set_available(False)
+            return False
+        if epoch is None:
+            cache.record_epoch_probe_failure()
+            cache.invalidate_worker(worker_id)
+            _set_available(False)
+            return False
+        cache.observe_worker_epoch(worker_id, epoch)
+        _set_available(True)
+        return True
+    finally:
+        await response.aclose()
+
+
+async def _monitor_decode_worker_epochs(app: FastAPI) -> None:
+    config: ProxyConfig = app.state.proxy_config
+    cache: _DecodeMMHashWarmCache = app.state.decode_mm_hash_cache
+    interval_s = max(0.01, float(config.decode_mm_hash_epoch_poll_s))
+    while True:
+        await asyncio.gather(
+            *(
+                _probe_decode_worker_epoch(
+                    cache=cache,
+                    client_info=client_info,
+                    timeout_s=config.decode_mm_hash_epoch_probe_timeout_s,
+                    epoch_endpoint=config.decode_mm_hash_epoch_endpoint,
+                    control_plane=app.state.control_plane,
+                )
+                for client_info in app.state.decode_clients
+            )
+        )
+        await asyncio.sleep(interval_s)
+
+
+async def _fence_decode_mm_hash_reuse(
+    *,
+    app: FastAPI,
+    decode_client: Dict[str, Any],
+) -> None:
+    cache: _DecodeMMHashWarmCache = app.state.decode_mm_hash_cache
+    worker_id = str(decode_client.get("worker_id") or "")
+    if not cache.enabled or not cache.has_worker_entries(worker_id):
+        return
+    freshness_s = float(
+        getattr(
+            app.state.proxy_config,
+            "decode_mm_hash_epoch_freshness_s",
+            0.0,
+        )
     )
+    if cache.use_fresh_worker_epoch(worker_id, freshness_s):
+        return
+    cache.record_synchronous_epoch_probe()
+    if not app.state.proxy_config.enable_decode_mm_hash_epoch_probe_singleflight:
+        cache.record_synchronous_epoch_probe_dispatch()
+        await _probe_decode_worker_epoch(
+            cache=cache,
+            client_info=decode_client,
+            timeout_s=app.state.proxy_config.decode_mm_hash_epoch_probe_timeout_s,
+            epoch_endpoint=getattr(
+                app.state.proxy_config,
+                "decode_mm_hash_epoch_endpoint",
+                "/metrics",
+            ),
+            control_plane=getattr(app.state, "control_plane", None),
+        )
+        return
+    inflight: Dict[str, asyncio.Task] = app.state.decode_epoch_probe_inflight
+    task = inflight.get(worker_id)
+    if task is None:
+        cache.record_synchronous_epoch_probe_dispatch()
+        task = asyncio.create_task(
+            _probe_decode_worker_epoch(
+                cache=cache,
+                client_info=decode_client,
+                timeout_s=(
+                    app.state.proxy_config.decode_mm_hash_epoch_probe_timeout_s
+                ),
+                epoch_endpoint=getattr(
+                    app.state.proxy_config,
+                    "decode_mm_hash_epoch_endpoint",
+                    "/metrics",
+                ),
+                control_plane=getattr(app.state, "control_plane", None),
+            ),
+            name=f"epd-decode-epoch-fence-{worker_id}",
+        )
+        inflight[worker_id] = task
+
+        def _remove_completed_probe(done: asyncio.Task) -> None:
+            if inflight.get(worker_id) is done:
+                inflight.pop(worker_id, None)
+
+        task.add_done_callback(_remove_completed_probe)
+    else:
+        cache.record_synchronous_epoch_probe_collapsed()
+    await asyncio.shield(task)
 
 
-def _has_prefill_direct_buffer_service(config: ProxyConfig) -> bool:
-    return bool(
-        (config.prefill_direct_buffer_service_url or "").strip()
-        or [u for u in list(config.prefill_direct_buffer_service_urls or []) if str(u or "").strip()]
+def _invalidate_prefill_cached_topology(prefill_client: Dict[str, Any]) -> None:
+    prefill_client.pop("remote_kv_topology", None)
+    prefill_client.pop("remote_kv_topology_api_incarnation", None)
+
+
+async def _release_retired_direct_feature_ids(
+    app: FastAPI,
+    feature_ids: Sequence[str],
+) -> None:
+    if not feature_ids:
+        return
+    try:
+        await _release_direct_feature_ids(app, feature_ids)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "failed to release retired Prefill direct feature buffers",
+            exc_info=True,
+        )
+
+
+async def _observe_prefill_worker_incarnation(
+    *,
+    app: FastAPI,
+    prefill_client: Dict[str, Any],
+    incarnation: str,
+) -> bool:
+    cache: _DirectFeatureHandleCache = app.state.direct_feature_handle_cache
+    worker_id = str(prefill_client.get("worker_id") or "")
+    changed, retired_ids = cache.observe_worker_incarnation(
+        worker_id,
+        incarnation,
     )
+    cache.mark_worker_available(worker_id)
+    prefill_client["remote_api_incarnation"] = cache.worker_incarnation(worker_id)
+    if changed:
+        _invalidate_prefill_cached_topology(prefill_client)
+        render_cache = getattr(app.state, "prefill_render_cache", None)
+        if render_cache is not None:
+            render_cache.invalidate_worker(worker_id)
+    await _release_retired_direct_feature_ids(app, retired_ids)
+    return changed
 
 
-def _direct_cache_key(target_worker_id: str, feature_id: str) -> str:
-    return f"{str(target_worker_id or '*')}::{str(feature_id)}"
+async def _mark_prefill_worker_unavailable(
+    *,
+    app: FastAPI,
+    prefill_client: Dict[str, Any],
+) -> None:
+    cache: _DirectFeatureHandleCache = app.state.direct_feature_handle_cache
+    worker_id = str(prefill_client.get("worker_id") or "")
+    retired_ids = cache.mark_worker_unavailable(worker_id)
+    prefill_client.pop("remote_api_incarnation", None)
+    _invalidate_prefill_cached_topology(prefill_client)
+    render_cache = getattr(app.state, "prefill_render_cache", None)
+    if render_cache is not None:
+        render_cache.invalidate_worker(worker_id)
+    control_plane = getattr(app.state, "control_plane", None)
+    if control_plane is not None:
+        control_plane.set_stage_worker_available(
+            "prefill",
+            worker_id,
+            available=False,
+        )
+    await _release_retired_direct_feature_ids(app, retired_ids)
 
 
-def _direct_worker_id_from_handle(handle: Dict[str, Any], default_worker_id: str = "") -> str:
-    metadata = dict(handle.get("metadata") or {}) if isinstance(handle, dict) else {}
-    return str(
-        metadata.get("mooncake_epd_target_worker_id")
-        or metadata.get("target_worker_id")
-        or handle.get("target_worker_id")
-        or default_worker_id
-        or ""
+async def _probe_prefill_worker_incarnation(
+    *,
+    app: FastAPI,
+    prefill_client: Dict[str, Any],
+    mark_unavailable_on_failure: bool = True,
+) -> bool:
+    cache: _DirectFeatureHandleCache = app.state.direct_feature_handle_cache
+    config = app.state.proxy_config
+    client: httpx.AsyncClient = prefill_client["client"]
+    endpoint = str(
+        getattr(config, "prefill_incarnation_endpoint", VLLM_INCARNATION_ENDPOINT)
     )
+    timeout_s = max(
+        0.05,
+        float(getattr(config, "prefill_incarnation_probe_timeout_s", 0.5)),
+    )
+    probe_started_at = time.perf_counter()
+    try:
+        response = await asyncio.wait_for(
+            client.get(endpoint),
+            timeout=timeout_s,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        cache.record_incarnation_probe_failure()
+        if mark_unavailable_on_failure:
+            await _mark_prefill_worker_unavailable(
+                app=app,
+                prefill_client=prefill_client,
+            )
+        return False
+    try:
+        try:
+            response_bytes = len(response.content)
+        except Exception:
+            response_bytes = len(str(response.text).encode("utf-8"))
+        cache.record_incarnation_probe_response(
+            response_bytes=response_bytes,
+            latency_s=time.perf_counter() - probe_started_at,
+        )
+        incarnation: Optional[str] = None
+        if response.status_code == 200:
+            incarnation, _source = _decode_worker_epoch_from_response(
+                response,
+                epoch_endpoint=endpoint,
+            )
+        if response.status_code != 200 or incarnation is None:
+            cache.record_incarnation_probe_failure()
+            if mark_unavailable_on_failure:
+                await _mark_prefill_worker_unavailable(
+                    app=app,
+                    prefill_client=prefill_client,
+                )
+            return False
+        await _observe_prefill_worker_incarnation(
+            app=app,
+            prefill_client=prefill_client,
+            incarnation=incarnation,
+        )
+        control_plane = getattr(app.state, "control_plane", None)
+        if control_plane is not None:
+            control_plane.set_stage_worker_available(
+                "prefill",
+                str(prefill_client.get("worker_id") or ""),
+                available=True,
+            )
+        return True
+    finally:
+        await response.aclose()
 
 
-def _prefill_direct_buffer_client_for(app: FastAPI, target_worker_id: str) -> Optional[httpx.AsyncClient]:
-    single_client = getattr(app.state, "prefill_direct_buffer_client", None)
-    clients = getattr(app.state, "prefill_direct_buffer_clients", None)
-    if isinstance(clients, dict):
-        client = clients.get(str(target_worker_id or ""))
-        if client is not None:
-            # Unit tests often replace the legacy single client after lifespan
-            # startup with an ASGITransport client.  Preserve production
-            # per-worker routing, but honor that explicit override when it
-            # points at the same endpoint.
-            if (
-                single_client is not None
-                and single_client is not client
-                and str(getattr(single_client, "base_url", "")) == str(getattr(client, "base_url", ""))
-            ):
-                return single_client
-            return client
-        default_client = clients.get("*")
-        if default_client is not None:
-            if (
-                single_client is not None
-                and single_client is not default_client
-                and str(getattr(single_client, "base_url", "")) == str(getattr(default_client, "base_url", ""))
-            ):
-                return single_client
-            return default_client
-    return single_client
+async def _probe_prefill_worker_incarnation_for_monitor(
+    *,
+    app: FastAPI,
+    prefill_client: Dict[str, Any],
+) -> bool:
+    """Probe one Prefill worker with monitor-only consecutive-failure debounce."""
+
+    probe_started_at = time.monotonic()
+    healthy = await _probe_prefill_worker_incarnation(
+        app=app,
+        prefill_client=prefill_client,
+        mark_unavailable_on_failure=False,
+    )
+    cache: _DirectFeatureHandleCache = app.state.direct_feature_handle_cache
+    worker_id = str(prefill_client.get("worker_id") or "")
+    if (
+        not healthy
+        and cache.worker_incarnation_observed_since(worker_id, probe_started_at)
+    ):
+        # A newer synchronous proof completed while this older background
+        # probe was in flight.  Do not let the stale failure overwrite the
+        # authoritative success or contribute to worker removal.
+        cache.record_superseded_incarnation_monitor_failure()
+        return False
+    threshold = max(
+        1,
+        int(
+            getattr(
+                app.state.proxy_config,
+                "prefill_incarnation_failure_threshold",
+                3,
+            )
+        ),
+    )
+    threshold_reached = cache.record_incarnation_monitor_probe_result(
+        worker_id,
+        healthy=healthy,
+        failure_threshold=threshold,
+    )
+    if threshold_reached:
+        await _mark_prefill_worker_unavailable(
+            app=app,
+            prefill_client=prefill_client,
+        )
+    return healthy
+
+
+def _jittered_poll_delay_s(
+    *,
+    interval_s: float,
+    jitter_ratio: float,
+    unit_sample: float,
+) -> float:
+    """Return a bounded symmetric poll delay for replica de-synchronization.
+
+    ``unit_sample`` is explicit rather than sampled internally so the bound is
+    deterministic in tests and callers may own an isolated RNG.  The 10 ms
+    floor matches the monitor's existing minimum interval.
+    """
+
+    interval = max(0.01, float(interval_s))
+    ratio = min(1.0, max(0.0, float(jitter_ratio)))
+    sample = min(1.0, max(0.0, float(unit_sample)))
+    return max(0.01, interval * (1.0 + ratio * (2.0 * sample - 1.0)))
+
+
+async def _monitor_prefill_worker_incarnations(app: FastAPI) -> None:
+    config: ProxyConfig = app.state.proxy_config
+    interval_s = max(0.01, float(config.prefill_incarnation_poll_s))
+    jitter_ratio = min(
+        1.0,
+        max(
+            0.0,
+            float(
+                getattr(
+                    config,
+                    "prefill_incarnation_poll_jitter_ratio",
+                    0.0,
+                )
+            ),
+        ),
+    )
+    rng = getattr(app.state, "prefill_incarnation_poll_rng", None)
+    if rng is None:
+        rng = random.Random(f"{os.getpid()}:{time.time_ns()}")
+        app.state.prefill_incarnation_poll_rng = rng
+    while True:
+        await asyncio.gather(
+            *(
+                _probe_prefill_worker_incarnation_for_monitor(
+                    app=app,
+                    prefill_client=prefill_client,
+                )
+                for prefill_client in app.state.prefill_clients
+            )
+        )
+        await asyncio.sleep(
+            _jittered_poll_delay_s(
+                interval_s=interval_s,
+                jitter_ratio=jitter_ratio,
+                unit_sample=rng.random(),
+            )
+        )
+
+
+async def _fence_prefill_direct_handle_reuse(
+    *,
+    app: FastAPI,
+    prefill_client: Dict[str, Any],
+) -> None:
+    cache: _DirectFeatureHandleCache = app.state.direct_feature_handle_cache
+    worker_id = str(prefill_client.get("worker_id") or "")
+    config = app.state.proxy_config
+    fencing_enabled = bool(
+        getattr(config, "enable_prefill_incarnation_guard", False)
+        or float(getattr(config, "prefill_incarnation_poll_s", 0.0)) > 0
+    )
+    if (
+        not fencing_enabled
+        or not cache.enabled
+        or not cache.has_worker_entries(worker_id)
+    ):
+        return
+    freshness_s = float(
+        getattr(app.state.proxy_config, "prefill_incarnation_freshness_s", 0.0)
+    )
+    if cache.use_fresh_worker_incarnation(worker_id, freshness_s):
+        return
+    cache.record_synchronous_incarnation_probe()
+    if not bool(
+        getattr(
+            app.state.proxy_config,
+            "enable_prefill_incarnation_probe_singleflight",
+            True,
+        )
+    ):
+        cache.record_synchronous_incarnation_probe_dispatch()
+        healthy = await _probe_prefill_worker_incarnation(
+            app=app,
+            prefill_client=prefill_client,
+        )
+        if not healthy:
+            raise HTTPException(
+                status_code=502,
+                detail="Prefill incarnation probe failed; stale direct handles were not reused",
+            )
+        return
+
+    inflight: Dict[str, asyncio.Task] = app.state.prefill_incarnation_probe_inflight
+    task = inflight.get(worker_id)
+    if task is None:
+        cache.record_synchronous_incarnation_probe_dispatch()
+        task = asyncio.create_task(
+            _probe_prefill_worker_incarnation(
+                app=app,
+                prefill_client=prefill_client,
+            ),
+            name=f"epd-prefill-incarnation-fence-{worker_id}",
+        )
+        inflight[worker_id] = task
+
+        def _remove_completed_probe(done: asyncio.Task) -> None:
+            if inflight.get(worker_id) is done:
+                inflight.pop(worker_id, None)
+
+        task.add_done_callback(_remove_completed_probe)
+    else:
+        cache.record_synchronous_incarnation_probe_collapsed()
+    healthy = await asyncio.shield(task)
+    if not healthy:
+        raise HTTPException(
+            status_code=502,
+            detail="Prefill incarnation probe failed; stale direct handles were not reused",
+        )
+
+
+async def _learn_prefill_incarnation_guard_rejection(
+    *,
+    app: FastAPI,
+    prefill_client: Dict[str, Any],
+    exc: BaseException,
+) -> None:
+    if not _is_decode_epoch_guard_rejection(exc):
+        return
+    cache: _DirectFeatureHandleCache = app.state.direct_feature_handle_cache
+    cache.record_incarnation_guard_rejection()
+    actual = _decode_epoch_guard_rejection_epoch(exc)
+    if actual is None:
+        await _mark_prefill_worker_unavailable(
+            app=app,
+            prefill_client=prefill_client,
+        )
+        return
+    await _observe_prefill_worker_incarnation(
+        app=app,
+        prefill_client=prefill_client,
+        incarnation=actual,
+    )
 
 
 @asynccontextmanager
@@ -438,7 +2281,7 @@ async def _lifespan(app: FastAPI):
     if prefill_overrides is None:
         app.state.prefill_clients = [
             {
-                "client": _make_client(f"http://{host}:{port}"),
+                "client": _make_client(f"http://{host}:{port}", config),
                 "host": host,
                 "port": port,
                 "id": idx,
@@ -452,7 +2295,7 @@ async def _lifespan(app: FastAPI):
     if decode_overrides is None:
         app.state.decode_clients = [
             {
-                "client": _make_client(f"http://{host}:{port}"),
+                "client": _make_client(f"http://{host}:{port}", config),
                 "host": host,
                 "port": port,
                 "id": idx,
@@ -471,7 +2314,7 @@ async def _lifespan(app: FastAPI):
     )
     app.state.mm_fetch_client = httpx.AsyncClient(
         timeout=httpx.Timeout(10.0, connect=5.0),
-        follow_redirects=True,
+        follow_redirects=False,
         trust_env=False,
     )
     app.state.encoder_client = httpx.AsyncClient(
@@ -480,70 +2323,112 @@ async def _lifespan(app: FastAPI):
         trust_env=False,
         base_url=(config.encoder_service_url.rstrip("/") if config.encoder_service_url else ""),
     )
-    direct_urls = [
-        str(url).rstrip("/")
-        for url in list(config.prefill_direct_buffer_service_urls or [])
-        if str(url or "").strip()
-    ]
-    if not direct_urls and config.prefill_direct_buffer_service_url:
-        direct_urls = [str(config.prefill_direct_buffer_service_url).rstrip("/")]
-    app.state.prefill_direct_buffer_clients = {}
-    app.state.prefill_direct_buffer_urls = {}
-    if direct_urls:
-        prefill_clients = list(getattr(app.state, "prefill_clients", []) or [])
-        if len(direct_urls) == 1:
-            client = _make_control_client(
-                direct_urls[0],
-                config.prefill_direct_buffer_timeout_s,
-                auth_token=config.direct_feature_buffer_auth_token,
-            )
-            app.state.prefill_direct_buffer_client = client
-            app.state.prefill_direct_buffer_clients["*"] = client
-            for info in prefill_clients:
-                worker_id = str(info.get("worker_id") or "")
-                if worker_id:
-                    app.state.prefill_direct_buffer_clients[worker_id] = client
-                    app.state.prefill_direct_buffer_urls[worker_id] = direct_urls[0]
-        else:
-            if len(direct_urls) != len(prefill_clients):
-                raise RuntimeError(
-                    "--prefill-direct-buffer-service-urls count must match prefiller count "
-                    f"when multiple URLs are provided: urls={len(direct_urls)} prefill={len(prefill_clients)}"
-                )
-            first_client: Optional[httpx.AsyncClient] = None
-            for info, url in zip(prefill_clients, direct_urls):
-                worker_id = str(info.get("worker_id") or "")
-                client = _make_control_client(
-                    url,
-                    config.prefill_direct_buffer_timeout_s,
-                    auth_token=config.direct_feature_buffer_auth_token,
-                )
-                if first_client is None:
-                    first_client = client
-                if worker_id:
-                    app.state.prefill_direct_buffer_clients[worker_id] = client
-                    app.state.prefill_direct_buffer_urls[worker_id] = url
-            app.state.prefill_direct_buffer_client = first_client
-    else:
-        app.state.prefill_direct_buffer_client = None
+    app.state.prefill_direct_buffer_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(config.prefill_direct_buffer_timeout_s, connect=5.0),
+        follow_redirects=True,
+        trust_env=False,
+        base_url=(
+            config.prefill_direct_buffer_service_url.rstrip("/")
+            if config.prefill_direct_buffer_service_url
+            else ""
+        ),
+    )
+    decode_epoch_monitor_task: Optional[asyncio.Task] = None
+    if (
+        config.enable_decode_mm_hash_cache
+        and config.decode_mm_hash_epoch_poll_s > 0
+    ):
+        decode_epoch_monitor_task = asyncio.create_task(
+            _monitor_decode_worker_epochs(app),
+            name="epd-decode-mm-hash-epoch-monitor",
+        )
+    app.state.decode_mm_hash_epoch_monitor_task = decode_epoch_monitor_task
+    prefill_incarnation_monitor_task: Optional[asyncio.Task] = None
+    if (
+        app.state.direct_feature_handle_cache.enabled
+        and config.prefill_incarnation_poll_s > 0
+    ):
+        prefill_incarnation_monitor_task = asyncio.create_task(
+            _monitor_prefill_worker_incarnations(app),
+            name="epd-prefill-incarnation-monitor",
+        )
+    app.state.prefill_incarnation_monitor_task = prefill_incarnation_monitor_task
 
     try:
         yield
     finally:
-        await _shutdown_direct_feature_release_dispatcher(app)
+        if prefill_incarnation_monitor_task is not None:
+            prefill_incarnation_monitor_task.cancel()
+            await asyncio.gather(
+                prefill_incarnation_monitor_task,
+                return_exceptions=True,
+            )
+        prefill_incarnation_probes = list(
+            getattr(app.state, "prefill_incarnation_probe_inflight", {}).values()
+        )
+        for task in prefill_incarnation_probes:
+            if not task.done():
+                task.cancel()
+        if prefill_incarnation_probes:
+            await asyncio.gather(
+                *prefill_incarnation_probes,
+                return_exceptions=True,
+            )
+        app.state.prefill_incarnation_probe_inflight.clear()
+        if decode_epoch_monitor_task is not None:
+            decode_epoch_monitor_task.cancel()
+            await asyncio.gather(decode_epoch_monitor_task, return_exceptions=True)
+        epoch_probes = list(
+            getattr(app.state, "decode_epoch_probe_inflight", {}).values()
+        )
+        for task in epoch_probes:
+            if not task.done():
+                task.cancel()
+        if epoch_probes:
+            await asyncio.gather(*epoch_probes, return_exceptions=True)
+        app.state.decode_epoch_probe_inflight.clear()
         mm_fetch_client = getattr(app.state, "mm_fetch_client", None)
         if mm_fetch_client is not None:
             await mm_fetch_client.aclose()
         encoder_client = getattr(app.state, "encoder_client", None)
         if encoder_client is not None:
             await encoder_client.aclose()
-        closed_direct_clients = set()
-        for prefill_direct_client in list((getattr(app.state, "prefill_direct_buffer_clients", {}) or {}).values()):
-            if prefill_direct_client is not None and id(prefill_direct_client) not in closed_direct_clients:
-                closed_direct_clients.add(id(prefill_direct_client))
-                await prefill_direct_client.aclose()
         prefill_direct_client = getattr(app.state, "prefill_direct_buffer_client", None)
-        if prefill_direct_client is not None and id(prefill_direct_client) not in closed_direct_clients:
+        inflight = list(
+            getattr(app.state, "direct_feature_handle_inflight", {}).values()
+        )
+        for task in inflight:
+            if not task.done():
+                task.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        render_inflight = list(
+            getattr(app.state, "prefill_render_inflight", {}).values()
+        )
+        for task in render_inflight:
+            if not task.done():
+                task.cancel()
+        if render_inflight:
+            await asyncio.gather(*render_inflight, return_exceptions=True)
+        render_cache = getattr(app.state, "prefill_render_cache", None)
+        if render_cache is not None:
+            render_cache.clear()
+        decode_mm_hash_cache = getattr(app.state, "decode_mm_hash_cache", None)
+        if decode_mm_hash_cache is not None:
+            decode_mm_hash_cache.clear()
+        cache = getattr(app.state, "direct_feature_handle_cache", None)
+        cached_feature_ids = cache.drain() if cache is not None else []
+        if prefill_direct_client is not None and cached_feature_ids:
+            try:
+                response = await prefill_direct_client.post(
+                    "release",
+                    json={"feature_ids": cached_feature_ids},
+                )
+                response.raise_for_status()
+                await response.aclose()
+            except Exception:
+                logger.exception("failed to release cached direct feature buffers during shutdown")
+        if prefill_direct_client is not None:
             await prefill_direct_client.aclose()
         mm_store = getattr(app.state, "mm_store", None)
         if mm_store is not None:
@@ -552,6 +2437,7 @@ async def _lifespan(app: FastAPI):
             client = client_info.get("client")
             if client is not None:
                 await client.aclose()
+        control_plane.close()
 
 
 def create_app(
@@ -560,8 +2446,22 @@ def create_app(
     prefill_clients: Optional[Sequence[Dict[str, Any]]] = None,
     decode_clients: Optional[Sequence[Dict[str, Any]]] = None,
     control_plane: Optional[ServingControlPlane] = None,
+    decode_tokenizer: Any = None,
 ) -> FastAPI:
     config = config or ProxyConfig()
+    if config.enable_decode_mm_hash_cache and not config.enable_prerendered_decode:
+        raise ValueError(
+            "Decode MM hash cache requires the prerendered Decode protocol"
+        )
+    if config.enable_prerendered_decode and decode_tokenizer is None:
+        if not config.prerendered_decode_model:
+            raise ValueError(
+                "prerendered Decode requires an explicit tokenizer/model path"
+            )
+        decode_tokenizer = get_tokenizer(
+            config.prerendered_decode_model,
+            trust_remote_code=True,
+        )
     cp = control_plane or ServingControlPlane(
         ServingControlPlaneConfig(
             node_id=config.node_id,
@@ -572,11 +2472,16 @@ def create_app(
             critical_rho=config.critical_rho,
             max_backpressure_delay_ms=config.max_backpressure_delay_ms,
             transport_backend=config.transport_backend,
-            mooncake_protocol=config.mooncake_protocol,
             owner_shards=config.owner_shards,
             kv_directory_rpc_url=config.kv_directory_rpc_url,
             connector_metrics_dir=config.connector_metrics_dir,
             workflow_registry_wal_path=config.workflow_registry_wal_path,
+            workflow_registry_wal_fsync_interval_s=(
+                config.workflow_registry_wal_fsync_interval_s
+            ),
+            workflow_registry_wal_max_pending_records=(
+                config.workflow_registry_wal_max_pending_records
+            ),
             enable_mm_prefetch=config.enable_mm_prefetch,
             strict_no_fallback=config.strict_no_fallback,
             enable_agent_state_clone=config.enable_agent_state_clone,
@@ -584,43 +2489,64 @@ def create_app(
             low_latency_decode_worker_ids=tuple(config.low_latency_decode_worker_ids),
             standard_prefill_worker_ids=tuple(config.standard_prefill_worker_ids),
             standard_decode_worker_ids=tuple(config.standard_decode_worker_ids),
-            prefill_decode_affinity=tuple(config.prefill_decode_affinity),
         )
     )
     app = FastAPI(lifespan=_lifespan)
     app.state.proxy_config = config
     app.state.control_plane = cp
+    app.state.direct_feature_handle_cache = _DirectFeatureHandleCache(
+        enabled=(
+            config.enable_direct_feature_handle_cache
+            and bool(config.prefill_direct_buffer_service_url)
+        ),
+        max_entries=config.direct_feature_handle_cache_max_entries,
+        max_bytes=config.direct_feature_handle_cache_max_bytes,
+        ttl_s=config.direct_feature_handle_cache_ttl_s,
+    )
+    app.state.direct_feature_handle_inflight = {}
+    app.state.prefill_incarnation_probe_inflight = {}
+    app.state.prefill_render_cache = _PrefillRenderCache(
+        enabled=config.enable_prefill_render_cache,
+        max_entries=config.prefill_render_cache_max_entries,
+        max_bytes=config.prefill_render_cache_max_bytes,
+        ttl_s=config.prefill_render_cache_ttl_s,
+    )
+    app.state.prefill_render_inflight = {}
+    app.state.client_mm_uuid_reference_stats = {
+        "legacy_full_requests": 0,
+        "uuid_full_requests": 0,
+        "compact_requests": 0,
+        "mixed_requests": 0,
+        "uuid_items": 0,
+        "compact_items": 0,
+        "request_body_bytes": 0,
+        "compact_request_body_bytes": 0,
+        "cold_misses": 0,
+        "cold_misses_by_stage": {},
+    }
+    app.state.decode_mm_hash_cache = _DecodeMMHashWarmCache(
+        enabled=config.enable_decode_mm_hash_cache,
+        max_entries=config.decode_mm_hash_cache_max_entries,
+        ttl_s=config.decode_mm_hash_cache_ttl_s,
+    )
+    app.state.decode_epoch_probe_inflight = {}
+    app.state.decode_tokenizer = decode_tokenizer
+    app.state.prerendered_decode_stats = {
+        "selected": 0,
+        "streaming": 0,
+        "non_streaming": 0,
+        "bypassed": 0,
+        "bypass_reasons": {},
+    }
+    app.state.decode_pipeline_stats = {
+        "eligible": 0,
+        "active": 0,
+        "suppressed_inflight": 0,
+    }
     app.state.prefill_client_overrides = list(prefill_clients) if prefill_clients is not None else None
     app.state.decode_client_overrides = list(decode_clients) if decode_clients is not None else None
-    app.state.direct_feature_handle_cache = OrderedDict()
-    app.state.direct_feature_handle_cache_stats = {
-        "hits": 0,
-        "misses": 0,
-        "stores": 0,
-        "evictions": 0,
-        "expired": 0,
-        "ttl_sweeps": 0,
-        "ttl_sweep_entries_scanned": 0,
-        "entries": 0,
-    }
-    app.state.direct_feature_handle_cache_next_ttl_sweep_at = 0.0
-    app.state.direct_feature_handle_inflight_locks = {}
-    app.state.direct_feature_handle_inflight_last_used = {}
-    app.state.direct_feature_handle_singleflight_stats = {"created": 0, "joined": 0, "evicted": 0, "active": 0}
-    app.state.direct_feature_release_queue = None
-    app.state.direct_feature_release_workers = set()
-    app.state.direct_feature_release_overflow = {}
-    app.state.direct_feature_release_stats = {
-        "scheduled": 0,
-        "completed": 0,
-        "failed": 0,
-        "max_inflight": 0,
-        "queue_full": 0,
-        "coalesced": 0,
-    }
-    mm_store_protocol = "shm" if str(config.mooncake_protocol).lower() == "shm" else "local"
     app.state.mm_store = MMStore(
-        transfer_engine=TransferEngine(protocol=mm_store_protocol),
+        transfer_engine=TransferEngine(protocol="local"),
         max_queue_size=max(1, int(config.mm_prefetch_queue_size)),
         dispatcher_workers=2,
         inline_fallback_on_queue_full=not config.strict_no_fallback,
@@ -631,40 +2557,160 @@ def create_app(
     async def health() -> Dict[str, Any]:
         return {"status": "ok", "prefill_clients": len(app.state.prefill_clients), "decode_clients": len(app.state.decode_clients)}
 
+    @app.get("/ready")
+    async def ready() -> Response:
+        async def _check(
+            label: str,
+            client: httpx.AsyncClient,
+            path: str = "/health",
+        ) -> Tuple[str, Dict[str, Any]]:
+            try:
+                response = await asyncio.wait_for(client.get(path), timeout=1.0)
+            except Exception as exc:
+                return label, {
+                    "ready": False,
+                    "error": type(exc).__name__,
+                }
+            try:
+                return label, {
+                    "ready": response.status_code == 200,
+                    "status_code": int(response.status_code),
+                }
+            finally:
+                await response.aclose()
+
+        probes = [
+            _check(
+                f"prefill:{client_info['worker_id']}",
+                client_info["client"],
+            )
+            for client_info in app.state.prefill_clients
+        ]
+        probes.extend(
+            _check(
+                f"decode:{client_info['worker_id']}",
+                client_info["client"],
+            )
+            for client_info in app.state.decode_clients
+        )
+        if config.encoder_service_url:
+            probes.append(_check("encoder", app.state.encoder_client))
+        if config.prefill_direct_buffer_service_url:
+            probes.append(
+                _check("prefill_direct_buffer", app.state.prefill_direct_buffer_client)
+            )
+        results = dict(await asyncio.gather(*probes))
+        is_ready = bool(results) and all(
+            bool(item.get("ready")) for item in results.values()
+        )
+        return JSONResponse(
+            {
+                "status": "ready" if is_ready else "not_ready",
+                "upstreams": results,
+            },
+            status_code=200 if is_ready else 503,
+        )
+
     @app.get("/metrics")
     async def metrics() -> Dict[str, Any]:
         payload = cp.snapshot()
+        payload["proxy_upstream_http_pool"] = {
+            "max_connections": config.upstream_max_connections,
+            "max_keepalive_connections": config.upstream_max_keepalive_connections,
+            "keepalive_expiry_s": config.upstream_keepalive_expiry_s,
+        }
         mm_store = getattr(app.state, "mm_store", None)
         if mm_store is not None:
             payload["mm_store"] = mm_store.stats()
-        sf_stats = getattr(app.state, "direct_feature_handle_singleflight_stats", None)
-        if isinstance(sf_stats, dict):
-            stats = dict(sf_stats)
-            locks = getattr(app.state, "direct_feature_handle_inflight_locks", None)
-            if isinstance(locks, dict):
-                stats["active"] = len(locks)
-            payload["direct_feature_singleflight"] = stats
-        direct_cache = getattr(app.state, "direct_feature_handle_cache", None)
-        direct_cache_stats = getattr(app.state, "direct_feature_handle_cache_stats", None)
-        if isinstance(direct_cache_stats, dict):
-            stats = dict(direct_cache_stats)
-            stats["entries"] = len(direct_cache) if isinstance(direct_cache, dict) else 0
-            payload["direct_feature_handle_cache"] = stats
-        release_stats = getattr(app.state, "direct_feature_release_stats", None)
-        if isinstance(release_stats, dict):
-            stats = dict(release_stats)
-            queue = getattr(app.state, "direct_feature_release_queue", None)
-            overflow = getattr(app.state, "direct_feature_release_overflow", None)
-            workers = getattr(app.state, "direct_feature_release_workers", None)
-            stats["queued"] = queue.qsize() if isinstance(queue, asyncio.Queue) else 0
-            stats["overflow_features"] = (
-                sum(len(ids) for ids in overflow.values())
-                if isinstance(overflow, dict)
-                else 0
+        direct_cache_stats = app.state.direct_feature_handle_cache.stats()
+        direct_cache_stats["inflight"] = len(app.state.direct_feature_handle_inflight)
+        direct_cache_stats["incarnation_monitor_enabled"] = bool(
+            app.state.direct_feature_handle_cache.enabled
+            and config.prefill_incarnation_poll_s > 0
+        )
+        direct_cache_stats["incarnation_poll_s"] = float(
+            config.prefill_incarnation_poll_s
+        )
+        direct_cache_stats["incarnation_poll_jitter_ratio"] = float(
+            config.prefill_incarnation_poll_jitter_ratio
+        )
+        if float(config.prefill_incarnation_poll_s) > 0:
+            direct_cache_stats["incarnation_poll_delay_min_s"] = max(
+                0.01,
+                float(config.prefill_incarnation_poll_s)
+                * (1.0 - float(config.prefill_incarnation_poll_jitter_ratio)),
             )
-            stats["workers"] = len(workers) if isinstance(workers, set) else 0
-            stats["inflight"] = stats["queued"] + stats["overflow_features"]
-            payload["direct_feature_release"] = stats
+            direct_cache_stats["incarnation_poll_delay_max_s"] = max(
+                0.01,
+                float(config.prefill_incarnation_poll_s)
+                * (1.0 + float(config.prefill_incarnation_poll_jitter_ratio)),
+            )
+        else:
+            direct_cache_stats["incarnation_poll_delay_min_s"] = 0.0
+            direct_cache_stats["incarnation_poll_delay_max_s"] = 0.0
+        direct_cache_stats["incarnation_probe_timeout_s"] = float(
+            config.prefill_incarnation_probe_timeout_s
+        )
+        direct_cache_stats["incarnation_failure_threshold"] = int(
+            config.prefill_incarnation_failure_threshold
+        )
+        direct_cache_stats["incarnation_freshness_s"] = float(
+            config.prefill_incarnation_freshness_s
+        )
+        direct_cache_stats["incarnation_endpoint"] = str(
+            config.prefill_incarnation_endpoint
+        )
+        direct_cache_stats["incarnation_guard_enabled"] = bool(
+            config.enable_prefill_incarnation_guard
+        )
+        direct_cache_stats["incarnation_probe_singleflight_enabled"] = bool(
+            config.enable_prefill_incarnation_probe_singleflight
+        )
+        payload["direct_feature_handle_cache"] = direct_cache_stats
+        render_cache_stats = app.state.prefill_render_cache.stats()
+        render_cache_stats["inflight"] = len(app.state.prefill_render_inflight)
+        payload["prefill_render_cache"] = render_cache_stats
+        uuid_stats = dict(app.state.client_mm_uuid_reference_stats)
+        uuid_stats["cold_misses_by_stage"] = dict(
+            uuid_stats.get("cold_misses_by_stage") or {}
+        )
+        uuid_stats["enabled"] = bool(config.enable_client_mm_uuid_references)
+        payload["client_mm_uuid_references"] = uuid_stats
+        decode_mm_hash_stats = app.state.decode_mm_hash_cache.stats()
+        decode_mm_hash_stats["epoch_monitor_enabled"] = bool(
+            config.enable_decode_mm_hash_cache
+            and config.decode_mm_hash_epoch_poll_s > 0
+        )
+        decode_mm_hash_stats["epoch_poll_s"] = float(
+            config.decode_mm_hash_epoch_poll_s
+        )
+        decode_mm_hash_stats["epoch_probe_timeout_s"] = float(
+            config.decode_mm_hash_epoch_probe_timeout_s
+        )
+        decode_mm_hash_stats["epoch_freshness_s"] = float(
+            config.decode_mm_hash_epoch_freshness_s
+        )
+        decode_mm_hash_stats["epoch_endpoint"] = str(
+            config.decode_mm_hash_epoch_endpoint
+        )
+        decode_mm_hash_stats["epoch_guard_enabled"] = bool(
+            config.enable_decode_mm_hash_epoch_guard
+        )
+        decode_mm_hash_stats["epoch_probe_singleflight_enabled"] = bool(
+            config.enable_decode_mm_hash_epoch_probe_singleflight
+        )
+        payload["decode_mm_hash_cache"] = decode_mm_hash_stats
+        prerendered_stats = dict(app.state.prerendered_decode_stats)
+        prerendered_stats["bypass_reasons"] = dict(
+            prerendered_stats.get("bypass_reasons") or {}
+        )
+        prerendered_stats["enabled"] = bool(config.enable_prerendered_decode)
+        prerendered_stats["model"] = config.prerendered_decode_model
+        payload["prerendered_decode"] = prerendered_stats
+        pipeline_stats = dict(app.state.decode_pipeline_stats)
+        pipeline_stats["enabled"] = bool(config.enable_decode_pipeline)
+        pipeline_stats["max_inflight"] = int(config.decode_pipeline_max_inflight)
+        payload["decode_pipeline"] = pipeline_stats
         return payload
 
     @app.post("/mooncake_epd/agent_state/register")
@@ -803,139 +2849,150 @@ def create_app(
     return app
 
 
-def _extract_agent_state_id(req_data: Dict[str, Any], request: Optional[Request] = None) -> str:
-    metadata = req_data.get("metadata") if isinstance(req_data.get("metadata"), dict) else {}
-    candidates = [
-        metadata.get("mooncake_epd_agent_state_id"),
-        metadata.get("agent_state_id"),
-        metadata.get("branch_id"),
-        req_data.get("mooncake_epd_agent_state_id"),
-        req_data.get("agent_state_id"),
-        req_data.get("branch_id"),
-    ]
-    if request is not None:
-        candidates.extend(
-            [
-                request.headers.get("X-Agent-State-Id"),
-                request.headers.get("X-Mooncake-EPD-Agent-State-Id"),
-            ]
-        )
-    for item in candidates:
-        text = str(item or "").strip()
-        if text:
-            return text
-    return ""
+async def _cancel_background_task(task: Optional[asyncio.Task]) -> None:
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except BaseException:
+        return
 
 
-async def _handle_agent_state_decode_request(
+async def _abort_pipelined_decode_dispatch(
+    dispatch: Optional[_PipelinedDecodeDispatch],
+) -> None:
+    if dispatch is None:
+        return
+    if dispatch.mm_hash_lease is not None:
+        dispatch.mm_hash_lease.fail()
+    task = dispatch.open_task
+    if not task.done():
+        task.cancel()
+    try:
+        opened = await task
+    except BaseException:
+        return
+    await _close_opened_decode_stream(opened)
+
+
+async def _open_decode_stream_after_backpressure(
     *,
-    app: FastAPI,
     api: str,
-    request: Request,
-    req_data: Dict[str, Any],
-    request_id: str,
+    control_plane: ServingControlPlane,
     ctx,
-    agent_state_id: str,
-):
-    control_plane: ServingControlPlane = app.state.control_plane
-    ctx.routing_path = "AGENT_STATE"
-    try:
-        decode_decision = _admit_or_raise(control_plane, "decode", ctx)
-    except HTTPException:
-        control_plane.finish_request(request_id)
-        raise
-    decode_client = _client_for_worker(app.state.decode_clients, decode_decision.worker_id)
-    if decode_client is None:
-        control_plane.mark_stage_complete(
-            "decode",
-            decode_decision.worker_id,
-            latency_ms=0.0,
-            success=False,
-        )
-        control_plane.finish_request(request_id)
-        raise HTTPException(status_code=503, detail="no decode client available")
-    if decode_decision.wait_ms > 0:
-        await asyncio.sleep(decode_decision.wait_ms / 1000.0)
-    try:
-        metadata = dict(req_data.get("metadata") or {})
-        for_write = bool(metadata.get("agent_state_for_write", req_data.get("agent_state_for_write", False)))
-        decode_payload = dict(req_data)
-        decode_payload["kv_transfer_params"] = control_plane.consume_agent_state(
+    decode_client: Dict[str, Any],
+    decode_payload: Dict[str, Any],
+    decode_headers: Dict[str, str],
+    wait_ms: float,
+) -> _OpenedDecodeStream:
+    if wait_ms > 0:
+        wait_started = time.monotonic()
+        await asyncio.sleep(wait_ms / 1000.0)
+        control_plane.record_stage_span(
             ctx,
-            state_id=agent_state_id,
-            target_node_id=decode_client["worker_id"],
-            for_write=for_write,
+            "decode_backpressure_wait",
+            started_at=wait_started,
         )
-        # Keep the user payload intact for vLLM tokenization, but make the
-        # state-consumption contract visible to downstream logs/handlers.
-        metadata = dict(decode_payload.get("metadata") or {})
-        metadata["mooncake_epd_agent_state_id"] = agent_state_id
-        metadata["mooncake_epd_agent_state_decode_only"] = True
-        decode_payload["metadata"] = metadata
-    except Exception as exc:
-        control_plane.mark_stage_complete(
-            "decode",
-            decode_decision.worker_id,
-            latency_ms=0.0,
-            success=False,
-        )
-        control_plane.finish_request(request_id)
-        raise HTTPException(status_code=409, detail=f"agent state consume failed: {exc}") from exc
-
-    response_headers = {
-        "X-Request-Id": request_id,
-        "X-EPD-Routing-Path": "AGENT_STATE",
-        "X-EPD-Admission": decode_decision.decision.action.value,
-        "X-EPD-Degrade-Level": ctx.degrade_level.value,
-        "X-Agent-State-Id": agent_state_id,
-    }
-    if bool(req_data.get("stream")):
-        return await _dispatch_streaming_decode(
-            api=api,
-            control_plane=control_plane,
-            ctx=ctx,
-            decode_client=decode_client,
-            decode_payload=decode_payload,
-            decode_headers=_forward_headers(request, request_id),
-            response_headers=response_headers,
-            continuation=_PrefillContinuation(),
-        )
-    return await _dispatch_non_streaming_decode(
+    return await _open_decode_stream(
         api=api,
-        control_plane=control_plane,
-        ctx=ctx,
         decode_client=decode_client,
         decode_payload=decode_payload,
-        decode_headers=_forward_headers(request, request_id),
-        response_headers=response_headers,
-        continuation=_PrefillContinuation(),
+        decode_headers=decode_headers,
     )
 
 
+async def _await_pipelined_prefill(
+    *,
+    prefill_task: asyncio.Task,
+    dispatch: _PipelinedDecodeDispatch,
+) -> Dict[str, Any]:
+    done, _ = await asyncio.wait(
+        {prefill_task, dispatch.open_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if dispatch.open_task in done:
+        if dispatch.open_task.cancelled():
+            await _cancel_background_task(prefill_task)
+            raise _DecodePipelineStartupError(
+                "early Decode stream was cancelled before Prefill completed"
+            )
+        startup_error = dispatch.open_task.exception()
+        if startup_error is not None:
+            if (
+                dispatch.mm_hash_lease is not None
+                and _is_decode_epoch_guard_rejection(startup_error)
+            ):
+                dispatch.mm_hash_lease.record_epoch_guard_rejection(
+                    _decode_epoch_guard_rejection_epoch(startup_error)
+                )
+            await _cancel_background_task(prefill_task)
+            raise _DecodePipelineStartupError(
+                f"{type(startup_error).__name__}: {startup_error}"
+            ) from startup_error
+    return await prefill_task
+
+
 async def _handle_generation_request(app: FastAPI, api: str, request: Request):
+    request_started = time.monotonic()
     req_data = await request.json()
+    request_body_bytes = len(await request.body())
     request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
     req_data = _merge_control_headers(req_data, request)
-    config: ProxyConfig = app.state.proxy_config
-    control_plane: ServingControlPlane = app.state.control_plane
-    ctx = control_plane.start_request(req_data, request_id)
-    agent_state_id = _extract_agent_state_id(req_data, request)
-    if agent_state_id:
-        return await _handle_agent_state_decode_request(
-            app=app,
-            api=api,
-            request=request,
-            req_data=req_data,
-            request_id=request_id,
-            ctx=ctx,
-            agent_state_id=agent_state_id,
+    try:
+        client_mm_uuid_mode, uuid_items, compact_items = (
+            _client_mm_uuid_request_mode(req_data)
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    config: ProxyConfig = app.state.proxy_config
+    if compact_items and not config.enable_client_mm_uuid_references:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "UUID-only multimodal inputs require "
+                "--enable-client-mm-uuid-references"
+            ),
+        )
+    _record_client_mm_uuid_request(
+        app,
+        mode=client_mm_uuid_mode,
+        uuid_items=uuid_items,
+        compact_items=compact_items,
+        request_body_bytes=request_body_bytes,
+    )
+    request_parsed = time.monotonic()
+    control_plane: ServingControlPlane = app.state.control_plane
+    ctx = control_plane.start_request(
+        req_data,
+        request_id,
+        created_at=request_started,
+    )
+    control_plane.record_stage_span(
+        ctx,
+        "proxy_parse",
+        started_at=request_started,
+        ended_at=request_parsed,
+    )
 
+    prefill_admission_started = time.monotonic()
     try:
         prefill_decision = _admit_or_raise(control_plane, "prefill", ctx)
     except HTTPException:
+        control_plane.record_stage_span(
+            ctx,
+            "prefill_admission",
+            started_at=prefill_admission_started,
+        )
         control_plane.finish_request(request_id)
         raise
+    control_plane.record_stage_span(
+        ctx,
+        "prefill_admission",
+        started_at=prefill_admission_started,
+    )
+    decode_peek = _peek_lowest_load_worker(control_plane, "decode")
     prefill_client = _client_for_worker(app.state.prefill_clients, prefill_decision.worker_id)
     if prefill_client is None:
         control_plane.mark_stage_complete(
@@ -948,9 +3005,15 @@ async def _handle_generation_request(app: FastAPI, api: str, request: Request):
         raise HTTPException(status_code=503, detail="no prefill client available")
 
     if prefill_decision.wait_ms > 0:
+        prefill_wait_started = time.monotonic()
         await asyncio.sleep(prefill_decision.wait_ms / 1000.0)
+        control_plane.record_stage_span(
+            ctx,
+            "prefill_backpressure_wait",
+            started_at=prefill_wait_started,
+        )
 
-    prepare_start = time.perf_counter()
+    mm_prepare_started = time.monotonic()
     try:
         req_data = await _prepare_multimodal_inputs_for_prefill(
             app=app,
@@ -958,8 +3021,12 @@ async def _handle_generation_request(app: FastAPI, api: str, request: Request):
             ctx=ctx,
             target_worker_id=prefill_decision.worker_id,
         )
-        _set_proxy_timing(req_data, "mm_prepare_ms", (time.perf_counter() - prepare_start) * 1000.0)
     except HTTPException:
+        control_plane.record_stage_span(
+            ctx,
+            "mm_prepare",
+            started_at=mm_prepare_started,
+        )
         control_plane.mark_stage_complete(
             "prefill",
             prefill_decision.worker_id,
@@ -968,27 +3035,127 @@ async def _handle_generation_request(app: FastAPI, api: str, request: Request):
         )
         control_plane.finish_request(request_id)
         raise
+    control_plane.record_stage_span(
+        ctx,
+        "mm_prepare",
+        started_at=mm_prepare_started,
+    )
 
-    prefill_headers = _forward_headers(request, request_id)
-    prefill_start = time.perf_counter()
+    prefill_headers = _prefill_request_headers(
+        app=app,
+        request=request,
+        request_id=request_id,
+        prefill_client=prefill_client,
+    )
+    prefill_start = time.monotonic()
     prefill_response = None
     prompt_only_prefill = _should_use_prompt_only_prefill(api)
+    cached_topology = _cached_prefill_kv_topology(prefill_client)
+    pipeline_eligible = bool(
+        config.enable_decode_pipeline
+        and prompt_only_prefill
+        and req_data.get("stream")
+        and cached_topology is not None
+    )
+    if pipeline_eligible:
+        app.state.decode_pipeline_stats["eligible"] += 1
+    pipeline_inflight = int(getattr(decode_peek, "current_load", 0) or 0)
+    pipeline_limit = int(config.decode_pipeline_max_inflight)
+    use_decode_pipeline = bool(
+        pipeline_eligible
+        and (pipeline_limit <= 0 or pipeline_inflight < pipeline_limit)
+    )
+    if use_decode_pipeline:
+        app.state.decode_pipeline_stats["active"] += 1
+    elif pipeline_eligible:
+        app.state.decode_pipeline_stats["suppressed_inflight"] += 1
+    decode_decision = None
+    decode_client = None
+    pipelined_dispatch: Optional[_PipelinedDecodeDispatch] = None
+    pipelined_prefill_task: Optional[asyncio.Task] = None
+    pipelined_handoff_id: Optional[str] = None
+    rendered_payload: Optional[Dict[str, Any]] = None
+    prerendered_decode_context: Optional[_PrerenderedDecodeContext] = None
+    decode_mm_hash_lease: Optional[_DecodeMMHashLease] = None
+    prerendered_bypass_reason = None
+    use_prerendered_decode = False
+    if config.enable_prerendered_decode:
+        prerendered_bypass_reason = _prerendered_decode_bypass_reason(
+            api=api,
+            request_body=req_data,
+            tokenizer_obj=app.state.decode_tokenizer,
+        )
+        use_prerendered_decode = prerendered_bypass_reason is None
+        _record_prerendered_decode_selection(
+            app,
+            selected=use_prerendered_decode,
+            stream=bool(req_data.get("stream")),
+            bypass_reason=prerendered_bypass_reason,
+        )
+
+    async def _finalize_failed_prefill() -> None:
+        await _cancel_background_task(pipelined_prefill_task)
+        await _abort_pipelined_decode_dispatch(pipelined_dispatch)
+        failed_at = time.monotonic()
+        control_plane.record_stage_span(
+            ctx,
+            "prefill_dispatch",
+            started_at=prefill_start,
+            ended_at=failed_at,
+        )
+        control_plane.mark_stage_complete(
+            "prefill",
+            prefill_client["worker_id"],
+            latency_ms=(failed_at - prefill_start) * 1000.0,
+            success=False,
+        )
+        if use_decode_pipeline and decode_decision is not None:
+            decode_started_at = (
+                pipelined_dispatch.started_at
+                if pipelined_dispatch is not None
+                else failed_at
+            )
+            control_plane.mark_stage_complete(
+                "decode",
+                decode_decision.worker_id,
+                latency_ms=max(0.0, (failed_at - decode_started_at) * 1000.0),
+                success=False,
+            )
+        control_plane.finish_request(request_id)
+
     try:
+        if use_decode_pipeline:
+            decode_admission_started = time.monotonic()
+            try:
+                decode_decision = _admit_or_raise(control_plane, "decode", ctx)
+            except HTTPException:
+                control_plane.record_stage_span(
+                    ctx,
+                    "decode_admission",
+                    started_at=decode_admission_started,
+                )
+                raise
+            control_plane.record_stage_span(
+                ctx,
+                "decode_admission",
+                started_at=decode_admission_started,
+            )
+            decode_client = _client_for_worker(
+                app.state.decode_clients,
+                decode_decision.worker_id,
+            )
+            if decode_client is None:
+                raise HTTPException(status_code=503, detail="no decode client available")
+            pipelined_handoff_id = control_plane.reserve_handoff_id(ctx)
+
         prefill_base_params = dict(req_data.get("kv_transfer_params") or {})
-        paired_decode_worker_id = control_plane.preferred_decode_worker_for_prefill(
-            prefill_decision.worker_id
-        )
-        decode_peek = (
-            None
-            if paired_decode_worker_id
-            else _peek_lowest_load_worker(control_plane, "decode")
-        )
         prefill_kv_params = control_plane.build_prefill_kv_params(
             ctx,
             prefill_decision,
             decode_worker_id=(
-                paired_decode_worker_id
-                or (decode_peek.worker_id if decode_peek is not None else None)
+                decode_decision.worker_id
+                if decode_decision is not None
+                else (decode_peek.worker_id if decode_peek is not None else None)
             ),
             base_params=prefill_base_params,
         )
@@ -1000,37 +3167,122 @@ async def _handle_generation_request(app: FastAPI, api: str, request: Request):
                 prefill_decision.worker_id,
             )
         if prompt_only_prefill:
-            dispatch_mode = str(config.prefill_dispatch_mode or "render_generate").strip().lower()
-            if dispatch_mode == "openai_prompt_only":
-                if config.strict_no_fallback and not config.allow_unverified_openai_prompt_only:
-                    raise ValueError(
-                        "openai_prompt_only is not verified for strict P-D serving; "
-                        "use render_generate or explicitly set "
-                        "--allow-unverified-openai-prompt-only after output-equivalence validation"
+            prefill_render_started = time.monotonic()
+            try:
+                rendered_payload = await _get_or_render_prompt_only_prefill(
+                    app=app,
+                    api=api,
+                    prefill_client=prefill_client,
+                    prefill_headers=prefill_headers,
+                    request_body=req_data,
+                    mm_hashes=list(getattr(ctx, "mm_hashes", []) or []),
+                )
+                if use_prerendered_decode:
+                    prerendered_decode_context = _build_prerendered_decode_context(
+                        rendered_payload,
+                        tokenizer_obj=app.state.decode_tokenizer,
                     )
-                prefill_json = await _dispatch_openai_prompt_only_prefill(
-                    api=api,
-                    prefill_client=prefill_client,
-                    prefill_headers=prefill_headers,
-                    request_id=request_id,
-                    request_body=req_data,
-                    kv_transfer_params=prefill_kv_params,
+            finally:
+                control_plane.record_stage_span(
+                    ctx,
+                    "prefill_render",
+                    started_at=prefill_render_started,
                 )
-            elif dispatch_mode == "render_generate":
-                prefill_json = await _dispatch_prompt_only_prefill(
-                    api=api,
-                    prefill_client=prefill_client,
-                    prefill_headers=prefill_headers,
-                    request_id=request_id,
-                    request_body=req_data,
-                    kv_transfer_params=prefill_kv_params,
+            prefill_generate_started = time.monotonic()
+            try:
+                if use_decode_pipeline:
+                    assert cached_topology is not None
+                    assert decode_decision is not None
+                    assert decode_client is not None
+                    provisional_decode_kv = _build_pipelined_decode_kv_params(
+                        prefill_kv_params=prefill_kv_params,
+                        topology=cached_topology,
+                        prefill_worker_id=prefill_client["worker_id"],
+                        decode_decision=decode_decision,
+                        handoff_id=str(pipelined_handoff_id or ""),
+                    )
+                    if use_prerendered_decode:
+                        provisional_decode_payload = (
+                            _inject_decode_kv_into_rendered_request(
+                                rendered_payload,
+                                request_id=request_id,
+                                request_body=req_data,
+                                kv_transfer_params=provisional_decode_kv,
+                            )
+                        )
+                        await _fence_decode_mm_hash_reuse(
+                            app=app,
+                            decode_client=decode_client,
+                        )
+                        (
+                            provisional_decode_payload,
+                            decode_mm_hash_lease,
+                        ) = app.state.decode_mm_hash_cache.prepare(
+                            worker_id=decode_client["worker_id"],
+                            payload=provisional_decode_payload,
+                        )
+                        provisional_decode_api = "/inference/v1/generate"
+                    else:
+                        provisional_decode_payload = dict(req_data)
+                        provisional_decode_payload["kv_transfer_params"] = (
+                            provisional_decode_kv
+                        )
+                        provisional_decode_api = api
+                    pipelined_prefill_task = asyncio.create_task(
+                        _dispatch_rendered_prompt_only_prefill(
+                            prefill_client=prefill_client,
+                            prefill_headers=prefill_headers,
+                            request_id=request_id,
+                            rendered_payload=rendered_payload,
+                            kv_transfer_params=prefill_kv_params,
+                        ),
+                        name=f"epd-prefill-{request_id}",
+                    )
+                    pipeline_started = time.monotonic()
+                    decode_open_task = asyncio.create_task(
+                        _open_decode_stream_after_backpressure(
+                            api=provisional_decode_api,
+                            control_plane=control_plane,
+                            ctx=ctx,
+                            decode_client=decode_client,
+                            decode_payload=provisional_decode_payload,
+                            decode_headers=_decode_request_headers(
+                                app=app,
+                                request=request,
+                                request_id=request_id,
+                                mm_hash_lease=decode_mm_hash_lease,
+                            ),
+                            wait_ms=float(decode_decision.wait_ms),
+                        ),
+                        name=f"epd-decode-open-{request_id}",
+                    )
+                    pipelined_dispatch = _PipelinedDecodeDispatch(
+                        decision=decode_decision,
+                        client=decode_client,
+                        started_at=pipeline_started,
+                        open_task=decode_open_task,
+                        topology=dict(cached_topology),
+                        kv_transfer_params=provisional_decode_kv,
+                        mm_hash_lease=decode_mm_hash_lease,
+                    )
+                    prefill_json = await _await_pipelined_prefill(
+                        prefill_task=pipelined_prefill_task,
+                        dispatch=pipelined_dispatch,
+                    )
+                else:
+                    prefill_json = await _dispatch_rendered_prompt_only_prefill(
+                        prefill_client=prefill_client,
+                        prefill_headers=prefill_headers,
+                        request_id=request_id,
+                        rendered_payload=rendered_payload,
+                        kv_transfer_params=prefill_kv_params,
+                    )
+            finally:
+                control_plane.record_stage_span(
+                    ctx,
+                    "prefill_generate",
+                    started_at=prefill_generate_started,
                 )
-            else:
-                raise ValueError(f"unsupported prefill dispatch mode: {dispatch_mode}")
-            for timing_key, timing_value in dict(
-                prefill_json.get("_mooncake_epd_proxy_timings_ms") or {}
-            ).items():
-                _set_proxy_timing(req_data, str(timing_key), float(timing_value))
         else:
             prefill_payload = dict(req_data)
             prefill_payload["kv_transfer_params"] = prefill_kv_params
@@ -1046,34 +3298,103 @@ async def _handle_generation_request(app: FastAPI, api: str, request: Request):
             )
             prefill_response.raise_for_status()
             prefill_json = prefill_response.json()
+    except asyncio.CancelledError:
+        await _finalize_failed_prefill()
+        raise
+    except HTTPException:
+        await _finalize_failed_prefill()
+        raise
+    except _DecodePipelineStartupError as exc:
+        await _finalize_failed_prefill()
+        raise HTTPException(
+            status_code=502,
+            detail=f"decode request failed during early pipeline startup: {exc}",
+        ) from exc
     except Exception as exc:
-        control_plane.mark_stage_complete(
-            "prefill",
-            prefill_client["worker_id"],
-            latency_ms=(time.perf_counter() - prefill_start) * 1000.0,
-            success=False,
+        await _learn_prefill_incarnation_guard_rejection(
+            app=app,
+            prefill_client=prefill_client,
+            exc=exc,
         )
-        control_plane.finish_request(request_id)
-        raise HTTPException(status_code=502, detail=f"prefill request failed: {exc}") from exc
+        await _finalize_failed_prefill()
+        raise HTTPException(
+            status_code=502,
+            detail=f"prefill request failed: {type(exc).__name__}: {exc}",
+        ) from exc
     finally:
         if prefill_response is not None:
             await prefill_response.aclose()
 
-    await _schedule_direct_feature_buffer_release(app, req_data)
-    _set_proxy_timing(req_data, "prefill_ms", (time.perf_counter() - prefill_start) * 1000.0)
+    try:
+        await _release_direct_feature_buffers_after_prefill(app, req_data)
+    except asyncio.CancelledError:
+        await _abort_pipelined_decode_dispatch(pipelined_dispatch)
+        prefill_end = time.monotonic()
+        control_plane.record_stage_span(
+            ctx,
+            "prefill_dispatch",
+            started_at=prefill_start,
+            ended_at=prefill_end,
+        )
+        control_plane.mark_stage_complete(
+            "prefill",
+            prefill_client["worker_id"],
+            latency_ms=(prefill_end - prefill_start) * 1000.0,
+            success=True,
+        )
+        if decode_decision is not None:
+            control_plane.mark_stage_complete(
+                "decode",
+                decode_decision.worker_id,
+                latency_ms=0.0,
+                success=False,
+            )
+        control_plane.finish_request(request_id)
+        raise
 
+    prefill_end = time.monotonic()
+    control_plane.record_stage_span(
+        ctx,
+        "prefill_dispatch",
+        started_at=prefill_start,
+        ended_at=prefill_end,
+    )
     control_plane.mark_stage_complete(
         "prefill",
         prefill_client["worker_id"],
-        latency_ms=(time.perf_counter() - prefill_start) * 1000.0,
+        latency_ms=(prefill_end - prefill_start) * 1000.0,
         success=True,
     )
+    actual_topology = _cache_prefill_kv_topology(
+        prefill_client,
+        prefill_json.get("kv_transfer_params"),
+    )
+    if pipelined_dispatch is not None and actual_topology != pipelined_dispatch.topology:
+        await _abort_pipelined_decode_dispatch(pipelined_dispatch)
+        control_plane.mark_stage_complete(
+            "decode",
+            pipelined_dispatch.decision.worker_id,
+            latency_ms=max(
+                0.0,
+                (time.monotonic() - pipelined_dispatch.started_at) * 1000.0,
+            ),
+            success=False,
+        )
+        control_plane.finish_request(request_id)
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Prefill KV topology changed while the early Decode request "
+                "was in flight; strict mode will not retry or fall back"
+            ),
+        )
     prefill_continuation = (
         _PrefillContinuation()
         if prompt_only_prefill
         else _extract_prefill_continuation(api, prefill_json)
     )
     if not prompt_only_prefill and _should_short_circuit_after_prefill(req_data, prefill_continuation):
+        control_plane.mark_first_token(ctx)
         control_plane.finish_request(request_id)
         return _build_prefill_terminal_response(
             api=api,
@@ -1084,21 +3405,38 @@ async def _handle_generation_request(app: FastAPI, api: str, request: Request):
             degrade_level=ctx.degrade_level.value,
         )
 
-    try:
-        decode_decision = _admit_or_raise(control_plane, "decode", ctx)
-    except HTTPException:
-        control_plane.finish_request(request_id)
-        raise
-    decode_client = _client_for_worker(app.state.decode_clients, decode_decision.worker_id)
-    if decode_client is None:
-        control_plane.mark_stage_complete(
-            "decode",
-            decode_decision.worker_id,
-            latency_ms=0.0,
-            success=False,
+    if decode_decision is None:
+        decode_admission_started = time.monotonic()
+        try:
+            decode_decision = _admit_or_raise(control_plane, "decode", ctx)
+        except HTTPException:
+            control_plane.record_stage_span(
+                ctx,
+                "decode_admission",
+                started_at=decode_admission_started,
+            )
+            control_plane.finish_request(request_id)
+            raise
+        control_plane.record_stage_span(
+            ctx,
+            "decode_admission",
+            started_at=decode_admission_started,
         )
-        control_plane.finish_request(request_id)
-        raise HTTPException(status_code=503, detail="no decode client available")
+        decode_client = _client_for_worker(
+            app.state.decode_clients,
+            decode_decision.worker_id,
+        )
+        if decode_client is None:
+            control_plane.mark_stage_complete(
+                "decode",
+                decode_decision.worker_id,
+                latency_ms=0.0,
+                success=False,
+            )
+            control_plane.finish_request(request_id)
+            raise HTTPException(status_code=503, detail="no decode client available")
+
+    assert decode_client is not None
 
     try:
         prefill_kv = control_plane.note_prefill_response(
@@ -1107,6 +3445,7 @@ async def _handle_generation_request(app: FastAPI, api: str, request: Request):
             decode_worker_id=decode_client["worker_id"],
         )
     except Exception as exc:
+        await _abort_pipelined_decode_dispatch(pipelined_dispatch)
         control_plane.mark_stage_complete(
             "decode",
             decode_decision.worker_id,
@@ -1119,29 +3458,81 @@ async def _handle_generation_request(app: FastAPI, api: str, request: Request):
             detail=f"prefill response missing usable KV handoff metadata: {exc}",
         ) from exc
 
-    if decode_decision.wait_ms > 0:
+    if pipelined_dispatch is None and decode_decision.wait_ms > 0:
+        decode_wait_started = time.monotonic()
         await asyncio.sleep(decode_decision.wait_ms / 1000.0)
+        control_plane.record_stage_span(
+            ctx,
+            "decode_backpressure_wait",
+            started_at=decode_wait_started,
+        )
 
-    decode_payload = dict(req_data)
-    decode_payload = _apply_prefill_continuation_to_decode_payload(
-        api=api,
-        decode_payload=decode_payload,
-        continuation=prefill_continuation,
-    )
+    decode_prepare_started = time.monotonic()
     try:
-        decode_payload["kv_transfer_params"] = control_plane.build_decode_kv_params(
+        decode_kv_params = control_plane.build_decode_kv_params(
             ctx,
             decode_decision,
             prefill_kv,
         )
+        if pipelined_dispatch is not None:
+            _validate_pipelined_decode_kv_params(
+                pipelined_dispatch.kv_transfer_params,
+                decode_kv_params,
+            )
         if prefill_continuation.active:
-            decode_payload["kv_transfer_params"].update(
+            decode_kv_params.update(
                 _build_prefill_decode_semantic_hints(
                     continuation=prefill_continuation,
                     prefill_kv=prefill_kv,
                 )
             )
+        if use_prerendered_decode:
+            if rendered_payload is None or prerendered_decode_context is None:
+                raise RuntimeError(
+                    "prerendered Decode was selected without a validated render payload"
+                )
+            if pipelined_dispatch is not None:
+                # The early stream already owns the provisional payload. The
+                # actual Prefill topology was checked above, so rebuilding the
+                # full rendered payload here would only rescan/copy large MM
+                # features that _dispatch_streaming_decode never consumes.
+                decode_payload = {}
+                decode_mm_hash_lease = pipelined_dispatch.mm_hash_lease
+            else:
+                decode_payload = _inject_decode_kv_into_rendered_request(
+                    rendered_payload,
+                    request_id=request_id,
+                    request_body=req_data,
+                    kv_transfer_params=decode_kv_params,
+                )
+                await _fence_decode_mm_hash_reuse(
+                    app=app,
+                    decode_client=decode_client,
+                )
+                (
+                    decode_payload,
+                    decode_mm_hash_lease,
+                ) = app.state.decode_mm_hash_cache.prepare(
+                    worker_id=decode_client["worker_id"],
+                    payload=decode_payload,
+                )
+            decode_api = "/inference/v1/generate"
+        else:
+            decode_payload = dict(req_data)
+            decode_payload = _apply_prefill_continuation_to_decode_payload(
+                api=api,
+                decode_payload=decode_payload,
+                continuation=prefill_continuation,
+            )
+            decode_payload["kv_transfer_params"] = decode_kv_params
+            decode_api = api
     except Exception as exc:
+        control_plane.record_stage_span(
+            ctx,
+            "decode_prepare",
+            started_at=decode_prepare_started,
+        )
+        await _abort_pipelined_decode_dispatch(pipelined_dispatch)
         control_plane.rollback_handoff(ctx)
         control_plane.mark_stage_complete(
             "decode",
@@ -1154,34 +3545,66 @@ async def _handle_generation_request(app: FastAPI, api: str, request: Request):
             status_code=502,
             detail=f"decode request missing usable KV transfer params: {exc}",
         ) from exc
+    control_plane.record_stage_span(
+        ctx,
+        "decode_prepare",
+        started_at=decode_prepare_started,
+    )
 
     response_headers = {
         "X-Request-Id": request_id,
         "X-EPD-Routing-Path": ctx.routing_path,
         "X-EPD-Admission": decode_decision.decision.action.value,
         "X-EPD-Degrade-Level": ctx.degrade_level.value,
-        "X-EPD-Timing-Ms": _timing_header(req_data),
+        "X-EPD-Decode-Pipeline": (
+            "active" if pipelined_dispatch is not None else "serial"
+        ),
+        "X-EPD-Decode-Protocol": (
+            "prerendered-generate" if use_prerendered_decode else "openai"
+        ),
+        "X-EPD-Decode-MM-Features": (
+            decode_mm_hash_lease.mode if decode_mm_hash_lease is not None else "unchanged"
+        ),
+        "X-EPD-Decode-Worker": str(decode_client["worker_id"]),
+        "X-EPD-Client-MM-UUID-Mode": client_mm_uuid_mode,
     }
     if bool(req_data.get("stream")):
         return await _dispatch_streaming_decode(
             api=api,
+            decode_api=decode_api,
             control_plane=control_plane,
             ctx=ctx,
             decode_client=decode_client,
             decode_payload=decode_payload,
-            decode_headers=_forward_headers(request, request_id),
+            decode_headers=_decode_request_headers(
+                app=app,
+                request=request,
+                request_id=request_id,
+                mm_hash_lease=decode_mm_hash_lease,
+            ),
             response_headers=response_headers,
             continuation=prefill_continuation,
+            pipelined_dispatch=pipelined_dispatch,
+            prerendered_context=prerendered_decode_context,
+            mm_hash_lease=decode_mm_hash_lease,
         )
     return await _dispatch_non_streaming_decode(
         api=api,
+        decode_api=decode_api,
         control_plane=control_plane,
         ctx=ctx,
         decode_client=decode_client,
         decode_payload=decode_payload,
-        decode_headers=_forward_headers(request, request_id),
+        decode_headers=_decode_request_headers(
+            app=app,
+            request=request,
+            request_id=request_id,
+            mm_hash_lease=decode_mm_hash_lease,
+        ),
         response_headers=response_headers,
         continuation=prefill_continuation,
+        prerendered_context=prerendered_decode_context,
+        mm_hash_lease=decode_mm_hash_lease,
     )
 
 
@@ -1213,6 +3636,58 @@ async def _prepare_multimodal_inputs_for_prefill(
     raise HTTPException(status_code=500, detail=f"unsupported mm_prefetch_mode: {mode}")
 
 
+def _copy_request_for_mm_url_rewrite(req_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Structurally copy only containers mutated by MM URL rewriting.
+
+    OpenAI-compatible multimodal requests can contain multi-megabyte data URLs.
+    A JSON serialize/parse round trip duplicates those strings and spends CPU on
+    content that remains immutable.  This copy keeps large strings shared while
+    cloning every dict/list shell that `_set_image_url_on_item` may mutate.
+    """
+
+    rewritten = dict(req_data)
+
+    messages = req_data.get("messages")
+    if isinstance(messages, list):
+        copied_messages: List[Any] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                copied_messages.append(message)
+                continue
+            copied_message = dict(message)
+            content = message.get("content")
+            if isinstance(content, list):
+                copied_content: List[Any] = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        copied_content.append(item)
+                        continue
+                    copied_item = dict(item)
+                    image_url = item.get("image_url")
+                    if isinstance(image_url, dict):
+                        copied_item["image_url"] = dict(image_url)
+                    copied_content.append(copied_item)
+                copied_message["content"] = copied_content
+            copied_messages.append(copied_message)
+        rewritten["messages"] = copied_messages
+
+    prompt = req_data.get("prompt")
+    if isinstance(prompt, list):
+        copied_prompt: List[Any] = []
+        for item in prompt:
+            if not isinstance(item, dict):
+                copied_prompt.append(item)
+                continue
+            copied_item = dict(item)
+            image_url = item.get("image_url")
+            if isinstance(image_url, dict):
+                copied_item["image_url"] = dict(image_url)
+            copied_prompt.append(copied_item)
+        rewritten["prompt"] = copied_prompt
+
+    return rewritten
+
+
 async def _prepare_feature_handle_multimodal_inputs(
     *,
     app: FastAPI,
@@ -1238,27 +3713,18 @@ async def _prepare_feature_handle_multimodal_inputs(
         or req_data.get("mooncake_epd_feature_handles")
     )
     if not isinstance(raw_handles, list) or not raw_handles:
-        if (
-            _has_prefill_direct_buffer_service(config)
-            and not config.release_direct_feature_buffers_after_prefill
-        ):
-            raw_handles = _lookup_proxy_cached_direct_feature_handles(
-                app=app,
-                feature_ids=[str(item) for item in list(getattr(ctx, "mm_hashes", []) or [])],
-                target_worker_id=target_worker_id,
-            )
-        if (not isinstance(raw_handles, list) or not raw_handles) and _has_prefill_direct_buffer_service(config):
-            raw_handles = await _lookup_prefill_cached_direct_feature_handles(
-                app=app,
-                feature_ids=[str(item) for item in list(getattr(ctx, "mm_hashes", []) or [])],
-                target_worker_id=target_worker_id,
-            )
-        if not isinstance(raw_handles, list) or not raw_handles:
-            raw_handles = await _request_feature_handles_from_encoder_service_singleflight(
+        if config.prefill_direct_buffer_service_url:
+            raw_handles = await _get_or_create_direct_feature_handles(
                 app=app,
                 req_data=req_data,
                 target_worker_id=target_worker_id,
-                feature_ids=[str(item) for item in list(getattr(ctx, "mm_hashes", []) or [])],
+                feature_ids=list(getattr(ctx, "mm_hashes", []) or []),
+            )
+        else:
+            raw_handles = await _request_feature_handles_from_encoder_service(
+                app=app,
+                req_data=req_data,
+                target_worker_id=target_worker_id,
             )
     try:
         handles = [FeatureHandle.from_control_payload(dict(item)) for item in raw_handles]
@@ -1280,19 +3746,10 @@ async def _prepare_feature_handle_multimodal_inputs(
                     f"handle={handle.feature_id} request={image_hash}"
                 ),
             )
-    _store_proxy_direct_feature_handles(app, handle_payloads, target_worker_id=target_worker_id)
-    # Only metadata and KV-transfer metadata are rewritten below.  Avoid a
-    # JSON round-trip over large image/audio data URLs on every cache hit.
     rewritten = dict(req_data)
     metadata = dict(rewritten.get("metadata") or {})
     metadata["mooncake_epd_feature_handles"] = handle_payloads
     metadata["mooncake_epd_feature_handle_target_worker"] = target_worker_id
-    if handles:
-        direct_timings = dict(handles[0].metadata.get("proxy_direct_timings_ms") or {})
-        if direct_timings:
-            timings = dict(metadata.get("mooncake_epd_proxy_timings_ms") or {})
-            timings.update(direct_timings)
-            metadata["mooncake_epd_proxy_timings_ms"] = timings
     rewritten["metadata"] = metadata
     kv = dict(rewritten.get("kv_transfer_params") or {})
     kv["mm_prefetch_policy"] = "feature_handle"
@@ -1300,112 +3757,6 @@ async def _prepare_feature_handle_multimodal_inputs(
     kv["mm_feature_handle_target_worker"] = target_worker_id
     rewritten["kv_transfer_params"] = kv
     return rewritten
-
-
-def _singleflight_stats(app: FastAPI) -> Dict[str, Any]:
-    stats = getattr(app.state, "direct_feature_handle_singleflight_stats", None)
-    if not isinstance(stats, dict):
-        stats = {"created": 0, "joined": 0, "evicted": 0, "active": 0}
-        app.state.direct_feature_handle_singleflight_stats = stats
-    return stats
-
-
-def _prune_singleflight_locks(app: FastAPI, *, max_locks: int) -> None:
-    locks = getattr(app.state, "direct_feature_handle_inflight_locks", None)
-    last_used = getattr(app.state, "direct_feature_handle_inflight_last_used", None)
-    if not isinstance(locks, dict) or not isinstance(last_used, dict):
-        return
-    limit = max(16, int(max_locks))
-    if len(locks) <= limit:
-        return
-    stats = _singleflight_stats(app)
-    # Remove oldest currently-unlocked entries only.  Locked entries may have
-    # waiters and must keep their rendezvous object until all waiters finish.
-    candidates = sorted(last_used.items(), key=lambda item: float(item[1] or 0.0))
-    target = max(0, limit // 2)
-    for key, _ in candidates:
-        if len(locks) <= target:
-            break
-        lock = locks.get(key)
-        if lock is not None and getattr(lock, "locked", lambda: False)():
-            continue
-        if locks.pop(key, None) is not None:
-            last_used.pop(key, None)
-            stats["evicted"] = int(stats.get("evicted", 0) or 0) + 1
-
-
-async def _request_feature_handles_from_encoder_service_singleflight(
-    *,
-    app: FastAPI,
-    req_data: Dict[str, Any],
-    target_worker_id: str,
-    feature_ids: Sequence[str],
-) -> List[Dict[str, Any]]:
-    """Request online feature handles with per-target single-flight de-dup.
-
-    Concurrent same-image requests are common in agent/multimodal workloads.
-    Without this guard, every request can allocate/publish the same Prefill
-    direct buffer, while non-publishers wait on ``ready`` and may time out
-    behind a slow duplicate publish.  The first request for a
-    ``(prefill_worker, feature_ids)`` tuple performs E→P direct publish;
-    followers wait for the lock, then re-check both proxy and Prefill
-    persistent caches and return hot ``epd-direct://`` handles.
-    """
-
-    config: ProxyConfig = app.state.proxy_config
-    ids = tuple(str(item) for item in feature_ids if str(item or "").strip())
-    if not ids or not _has_prefill_direct_buffer_service(config):
-        return await _request_feature_handles_from_encoder_service(
-            app=app,
-            req_data=req_data,
-            target_worker_id=target_worker_id,
-        )
-    key = (str(target_worker_id), ids)
-    locks = getattr(app.state, "direct_feature_handle_inflight_locks", None)
-    if not isinstance(locks, dict):
-        locks = {}
-        app.state.direct_feature_handle_inflight_locks = locks
-    last_used = getattr(app.state, "direct_feature_handle_inflight_last_used", None)
-    if not isinstance(last_used, dict):
-        last_used = {}
-        app.state.direct_feature_handle_inflight_last_used = last_used
-    stats = _singleflight_stats(app)
-    lock = locks.get(key)
-    if lock is None:
-        _prune_singleflight_locks(
-            app,
-            max_locks=int(getattr(config, "direct_feature_singleflight_max_locks", 4096)),
-        )
-        lock = locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        locks[key] = lock
-        stats["created"] = int(stats.get("created", 0) or 0) + 1
-    else:
-        stats["joined"] = int(stats.get("joined", 0) or 0) + int(bool(lock.locked()))
-    last_used[key] = time.monotonic()
-    async with lock:
-        last_used[key] = time.monotonic()
-        raw_handles = []
-        if not config.release_direct_feature_buffers_after_prefill:
-            raw_handles = _lookup_proxy_cached_direct_feature_handles(
-                app=app,
-                feature_ids=list(ids),
-                target_worker_id=target_worker_id,
-            )
-        if not isinstance(raw_handles, list) or not raw_handles:
-            raw_handles = await _lookup_prefill_cached_direct_feature_handles(
-                app=app,
-                feature_ids=list(ids),
-                target_worker_id=target_worker_id,
-            )
-        if isinstance(raw_handles, list) and raw_handles:
-            return [dict(item) for item in raw_handles]
-        return await _request_feature_handles_from_encoder_service(
-            app=app,
-            req_data=req_data,
-            target_worker_id=target_worker_id,
-        )
 
 
 async def _request_feature_handles_from_encoder_service(
@@ -1423,13 +3774,11 @@ async def _request_feature_handles_from_encoder_service(
                 "or --encoder-service-url for online E-stage encoding"
             ),
         )
-    # This request is serialized by httpx immediately; no nested user content
-    # is mutated, so a top-level copy avoids duplicating multimodal payloads.
     payload = dict(req_data)
     metadata = dict(payload.get("metadata") or {})
     metadata["mooncake_epd_target_worker_id"] = target_worker_id
     payload["metadata"] = metadata
-    if _has_prefill_direct_buffer_service(config):
+    if config.prefill_direct_buffer_service_url:
         return await _request_direct_feature_handles_from_encoder_service(
             app=app,
             payload=payload,
@@ -1451,226 +3800,128 @@ async def _request_feature_handles_from_encoder_service(
     return [dict(item) for item in handles]
 
 
-def _lookup_proxy_cached_direct_feature_handles(
-    *,
-    app: FastAPI,
-    feature_ids: Sequence[str],
-    target_worker_id: str,
-) -> List[Dict[str, Any]]:
-    config: ProxyConfig = app.state.proxy_config
-    if not config.enable_direct_feature_handle_cache:
-        return []
-    ids = [str(item) for item in feature_ids if str(item or "").strip()]
+async def _release_direct_feature_ids(app: FastAPI, feature_ids: Sequence[str]) -> None:
+    ids = sorted(set(str(feature_id) for feature_id in feature_ids if feature_id))
     if not ids:
-        return []
-    cache = getattr(app.state, "direct_feature_handle_cache", None)
-    if not isinstance(cache, dict):
-        return []
-    stats = _direct_feature_handle_cache_stats(app)
-    started = time.perf_counter()
-    handles: List[Dict[str, Any]] = []
-    now = time.monotonic()
-    for fid in ids:
-        cache_key = _direct_cache_key(target_worker_id, fid)
-        cached_entry = cache.get(cache_key)
-        if not isinstance(cached_entry, dict):
-            stats["misses"] = int(stats.get("misses", 0) or 0) + 1
-            return []
-        cached = dict(cached_entry.get("handle") or {}) if "handle" in cached_entry else dict(cached_entry)
-        stored_at = float(cached_entry.get("stored_at", now) or now) if "handle" in cached_entry else now
-        ttl_s = float(getattr(config, "direct_feature_handle_cache_ttl_s", 600.0) or 0.0)
-        if ttl_s > 0.0 and now - stored_at > ttl_s:
-            cache.pop(cache_key, None)
-            stats["expired"] = int(stats.get("expired", 0) or 0) + 1
-            stats["misses"] = int(stats.get("misses", 0) or 0) + 1
-            stats["entries"] = len(cache)
-            return []
-        if isinstance(cache, OrderedDict):
-            cache.move_to_end(cache_key)
-        elif isinstance(cached_entry, dict) and "handle" in cached_entry:
-            cached_entry["last_used_at"] = now
-        item = _clone_direct_feature_handle(cached)
-        md = dict(item.get("metadata") or {})
-        timings = {
-            "direct_proxy_cache_lookup_ms": (time.perf_counter() - started) * 1000.0,
-            "direct_proxy_cache_hits": float(len(ids)),
-            "direct_cache_lookup_ms": 0.0,
-            "direct_describe_ms": 0.0,
-            "direct_allocate_ms": 0.0,
-            "direct_publish_ms": 0.0,
-        }
-        md["proxy_direct_timings_ms"] = timings
-        md["direct_backend"] = "prefill_proxy_handle_cache"
-        item["metadata"] = md
-        handles.append(item)
-    stats["hits"] = int(stats.get("hits", 0) or 0) + len(ids)
-    stats["entries"] = len(cache)
-    return handles
-
-
-def _store_proxy_direct_feature_handles(app: FastAPI, handles: Sequence[Dict[str, Any]], *, target_worker_id: str) -> None:
-    config: ProxyConfig = app.state.proxy_config
-    if not config.enable_direct_feature_handle_cache:
         return
-    cache = getattr(app.state, "direct_feature_handle_cache", None)
-    if not isinstance(cache, dict):
-        return
-    stats = _direct_feature_handle_cache_stats(app)
-    max_entries = max(0, int(getattr(config, "direct_feature_handle_cache_max_entries", 4096) or 0))
-    if max_entries == 0:
-        if cache:
-            stats["evictions"] = int(stats.get("evictions", 0) or 0) + len(cache)
-            cache.clear()
-            stats["entries"] = 0
-        return
-    now = time.monotonic()
-    for handle in handles:
-        if not isinstance(handle, dict):
-            continue
-        uri = str(handle.get("uri") or "")
-        feature_id = str(handle.get("feature_id") or "")
-        metadata = dict(handle.get("metadata") or {})
-        if not feature_id or not uri.startswith("epd-direct://"):
-            continue
-        if not metadata.get("direct_plan") or not metadata.get("direct_remote_session"):
-            continue
-        cached = _clone_direct_feature_handle(handle)
-        cached_md = dict(cached.get("metadata") or {})
-        cached_md["mooncake_epd_target_worker_id"] = str(target_worker_id)
-        cached_md.pop("proxy_direct_timings_ms", None)
-        cached["metadata"] = cached_md
-        cache_key = _direct_cache_key(target_worker_id, feature_id)
-        cache[cache_key] = {
-            "handle": cached,
-            "stored_at": now,
-            "last_used_at": now,
-        }
-        if isinstance(cache, OrderedDict):
-            cache.move_to_end(cache_key)
-        stats["stores"] = int(stats.get("stores", 0) or 0) + 1
-    # Capacity eviction is O(1) with the OrderedDict. TTL expiry can require a
-    # full scan, so perform it at a bounded cadence rather than once per handle
-    # on every multimodal request.
-    _prune_proxy_direct_feature_handle_cache(app, now=now)
-    stats["entries"] = len(cache)
+    client: httpx.AsyncClient = app.state.prefill_direct_buffer_client
+    response = await client.post("release", json={"feature_ids": ids})
+    try:
+        response.raise_for_status()
+    finally:
+        await response.aclose()
 
 
-def _clone_direct_feature_handle(handle: Dict[str, Any]) -> Dict[str, Any]:
-    """Copy only mutable FeatureHandle control-plane containers.
-
-    Direct handles carry descriptors and pointer plans, not image bytes. A
-    JSON round-trip was nevertheless used here and in the cache-hit path. It
-    added serialization work to every cached multimodal request and is unsafe
-    for future non-JSON metadata. Keep the clone narrow and explicit instead.
-    """
-
-    cloned = dict(handle)
-    descriptor = handle.get("descriptor")
-    if isinstance(descriptor, dict):
-        descriptor_copy = dict(descriptor)
-        if isinstance(descriptor.get("metadata"), dict):
-            descriptor_copy["metadata"] = dict(descriptor["metadata"])
-        if isinstance(descriptor.get("intermediates"), list):
-            descriptor_copy["intermediates"] = [
-                dict(item) if isinstance(item, dict) else item
-                for item in descriptor["intermediates"]
-            ]
-        cloned["descriptor"] = descriptor_copy
-    metadata = handle.get("metadata")
-    if isinstance(metadata, dict):
-        metadata_copy = dict(metadata)
-        direct_plan = metadata.get("direct_plan")
-        if isinstance(direct_plan, dict):
-            direct_plan_copy = dict(direct_plan)
-            if isinstance(direct_plan.get("targets"), list):
-                direct_plan_copy["targets"] = [
-                    dict(item) if isinstance(item, dict) else item
-                    for item in direct_plan["targets"]
-                ]
-            metadata_copy["direct_plan"] = direct_plan_copy
-        timings = metadata.get("proxy_direct_timings_ms")
-        if isinstance(timings, dict):
-            metadata_copy["proxy_direct_timings_ms"] = dict(timings)
-        cloned["metadata"] = metadata_copy
-    return cloned
-
-
-def _direct_feature_handle_cache_stats(app: FastAPI) -> Dict[str, Any]:
-    stats = getattr(app.state, "direct_feature_handle_cache_stats", None)
-    if not isinstance(stats, dict):
-        stats = {
-            "hits": 0,
-            "misses": 0,
-            "stores": 0,
-            "evictions": 0,
-            "expired": 0,
-            "ttl_sweeps": 0,
-            "ttl_sweep_entries_scanned": 0,
-            "entries": 0,
-        }
-        app.state.direct_feature_handle_cache_stats = stats
-    return stats
-
-
-def _prune_proxy_direct_feature_handle_cache(
-    app: FastAPI,
+async def _get_or_create_direct_feature_handles(
     *,
-    now: Optional[float] = None,
-    force_ttl_sweep: bool = False,
-) -> None:
-    config: ProxyConfig = app.state.proxy_config
-    cache = getattr(app.state, "direct_feature_handle_cache", None)
-    if not isinstance(cache, dict):
-        return
-    stats = _direct_feature_handle_cache_stats(app)
-    max_entries = max(0, int(getattr(config, "direct_feature_handle_cache_max_entries", 4096) or 0))
-    ttl_s = max(0.0, float(getattr(config, "direct_feature_handle_cache_ttl_s", 600.0) or 0.0))
-    now = time.monotonic() if now is None else float(now)
-    next_ttl_sweep_at = float(
-        getattr(app.state, "direct_feature_handle_cache_next_ttl_sweep_at", 0.0) or 0.0
+    app: FastAPI,
+    req_data: Dict[str, Any],
+    target_worker_id: str,
+    feature_ids: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Reuse Prefill-owned feature buffers and coalesce concurrent misses."""
+
+    cache: _DirectFeatureHandleCache = app.state.direct_feature_handle_cache
+    prefill_client = _client_for_worker(
+        app.state.prefill_clients,
+        str(target_worker_id),
     )
-    should_sweep_ttl = ttl_s > 0.0 and (force_ttl_sweep or now >= next_ttl_sweep_at)
-    if should_sweep_ttl:
-        # Keep expiry bounded without rescanning up to 4096 cached handles on
-        # every cache write. Per-key lookup still rejects an expired handle
-        # immediately, so this cadence only affects stale-memory reclamation.
-        sweep_interval_s = min(10.0, max(0.25, ttl_s / 16.0))
-        app.state.direct_feature_handle_cache_next_ttl_sweep_at = now + sweep_interval_s
-        stats["ttl_sweeps"] = int(stats.get("ttl_sweeps", 0) or 0) + 1
-        stats["ttl_sweep_entries_scanned"] = int(
-            stats.get("ttl_sweep_entries_scanned", 0) or 0
-        ) + len(cache)
-        expired_keys = []
-        for key, entry in cache.items():
-            if not isinstance(entry, dict):
-                continue
-            stored_at = float(entry.get("stored_at", now) or now) if "handle" in entry else now
-            if now - stored_at > ttl_s:
-                expired_keys.append(key)
-        for key in expired_keys:
-            if cache.pop(key, None) is not None:
-                stats["expired"] = int(stats.get("expired", 0) or 0) + 1
-    if max_entries <= 0:
-        if cache:
-            stats["evictions"] = int(stats.get("evictions", 0) or 0) + len(cache)
-            cache.clear()
-        stats["entries"] = 0
-        return
-    while len(cache) > max_entries:
-        if isinstance(cache, OrderedDict):
-            cache.popitem(last=False)
-        else:
-            victim = min(
-                cache.items(),
-                key=lambda item: float(
-                    dict(item[1]).get("last_used_at", dict(item[1]).get("stored_at", 0.0))
-                    if isinstance(item[1], dict)
-                    else 0.0
-                ),
-            )[0]
-            cache.pop(victim, None)
-        stats["evictions"] = int(stats.get("evictions", 0) or 0) + 1
-    stats["entries"] = len(cache)
+    if prefill_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"no Prefill client for direct feature target {target_worker_id}",
+        )
+    await _fence_prefill_direct_handle_reuse(
+        app=app,
+        prefill_client=prefill_client,
+    )
+    normalized_ids = tuple(str(feature_id) for feature_id in feature_ids if feature_id)
+    cached, expired = cache.get_many(
+        target_worker_id=target_worker_id,
+        feature_ids=normalized_ids,
+    )
+    if expired:
+        await _release_direct_feature_ids(app, expired)
+    if cached is not None:
+        return cached
+
+    if _request_has_compact_mm_uuid_references(req_data):
+        _record_client_mm_uuid_cold_miss(app, "direct_feature_handle")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "multimodal UUID reference missed the direct feature-handle cache; "
+                "resend the full media payload to warm the EPD path"
+            ),
+        )
+
+    if not cache.enabled or not normalized_ids:
+        return await _request_direct_feature_handles_from_encoder_service(
+            app=app,
+            payload=req_data,
+            target_worker_id=target_worker_id,
+        )
+
+    inflight: Dict[Tuple[str, str, Tuple[str, ...]], asyncio.Task] = (
+        app.state.direct_feature_handle_inflight
+    )
+    expected_incarnation = cache.worker_incarnation(target_worker_id)
+    flight_key = (
+        str(target_worker_id),
+        str(expected_incarnation or ""),
+        normalized_ids,
+    )
+    task = inflight.get(flight_key)
+    if task is None:
+        async def _create() -> List[Dict[str, Any]]:
+            handles = await _request_direct_feature_handles_from_encoder_service(
+                app=app,
+                payload=req_data,
+                target_worker_id=target_worker_id,
+            )
+            try:
+                incarnation_changed, evicted = cache.put_many(
+                    target_worker_id=target_worker_id,
+                    handles=handles,
+                    expected_worker_incarnation=expected_incarnation,
+                    enforce_expected_incarnation=True,
+                )
+            except RuntimeError as exc:
+                await _release_retired_direct_feature_ids(
+                    app,
+                    [
+                        str(dict(handle).get("feature_id") or "")
+                        for handle in handles
+                    ],
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Prefill incarnation changed while direct feature handles "
+                        "were being created; the stale result was discarded"
+                    ),
+                ) from exc
+            observed_incarnation = cache.worker_incarnation(target_worker_id)
+            if observed_incarnation is not None:
+                prefill_client["remote_api_incarnation"] = observed_incarnation
+            if incarnation_changed:
+                _invalidate_prefill_cached_topology(prefill_client)
+            if evicted:
+                await _release_direct_feature_ids(app, evicted)
+            return handles
+
+        task = asyncio.create_task(
+            _create(),
+            name=f"epd-direct-feature-{target_worker_id}-{'-'.join(normalized_ids)}",
+        )
+        inflight[flight_key] = task
+
+        def _release(done: asyncio.Task, *, key=flight_key) -> None:
+            if inflight.get(key) is done:
+                inflight.pop(key, None)
+
+        task.add_done_callback(_release)
+    return await asyncio.shield(task)
 
 
 async def _request_direct_feature_handles_from_encoder_service(
@@ -1680,16 +3931,32 @@ async def _request_direct_feature_handles_from_encoder_service(
     target_worker_id: str,
 ) -> List[Dict[str, Any]]:
     encoder_client: httpx.AsyncClient = app.state.encoder_client
-    direct_client = _prefill_direct_buffer_client_for(app, target_worker_id)
-    if direct_client is None:
-        raise HTTPException(status_code=500, detail=f"no Prefill direct-buffer service configured for {target_worker_id}")
-    timings: Dict[str, float] = {}
+    direct_client: httpx.AsyncClient = app.state.prefill_direct_buffer_client
+    ticket = ""
+    allocated_feature_ids: List[str] = []
+
+    async def _cleanup_failed_handshake() -> List[str]:
+        errors: List[str] = []
+        if ticket:
+            try:
+                cleanup = await encoder_client.post(
+                    "/discard_direct",
+                    json={"ticket": ticket},
+                )
+                cleanup.raise_for_status()
+            except Exception as exc:
+                errors.append(f"encoder ticket cleanup failed: {exc}")
+        if allocated_feature_ids:
+            try:
+                await _release_direct_feature_ids(app, allocated_feature_ids)
+            except Exception as exc:
+                errors.append(f"prefill allocation cleanup failed: {exc}")
+        return errors
+
     try:
-        started = time.perf_counter()
         described_resp = await encoder_client.post("/describe", json=payload)
         described_resp.raise_for_status()
         described = described_resp.json()
-        timings["direct_describe_ms"] = (time.perf_counter() - started) * 1000.0
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:1000] if exc.response is not None else str(exc)
         raise HTTPException(status_code=502, detail=f"encoder describe returned error: {detail}") from exc
@@ -1702,343 +3969,105 @@ async def _request_direct_feature_handles_from_encoder_service(
         raise HTTPException(status_code=502, detail="encoder describe returned no direct descriptors/ticket")
 
     try:
-        started = time.perf_counter()
         alloc_resp = await direct_client.post(
-            "/mooncake_epd/direct_feature_buffer/allocate",
+            "allocate",
             json={
                 "descriptors": descriptors,
                 "target_worker_id": target_worker_id,
                 "zero_fill": False,
-                "reuse_ready": True,
             },
         )
         alloc_resp.raise_for_status()
         allocation = alloc_resp.json()
-        timings["direct_allocate_ms"] = (time.perf_counter() - started) * 1000.0
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:1000] if exc.response is not None else str(exc)
+        cleanup_errors = await _cleanup_failed_handshake()
+        if cleanup_errors:
+            detail += f"; cleanup={cleanup_errors}"
         raise HTTPException(status_code=502, detail=f"prefill direct allocation returned error: {detail}") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"prefill direct allocation failed: {exc}") from exc
+        cleanup_errors = await _cleanup_failed_handshake()
+        raise HTTPException(
+            status_code=502,
+            detail=f"prefill direct allocation failed: {exc}; cleanup={cleanup_errors}",
+        ) from exc
 
     targets = allocation.get("targets")
+    if isinstance(targets, list):
+        allocated_feature_ids.extend(
+            str(dict(target).get("feature_id") or "")
+            for target in targets
+            if isinstance(target, dict) and str(target.get("feature_id") or "")
+        )
     if not isinstance(targets, list) or len(targets) != len(descriptors):
+        cleanup_errors = await _cleanup_failed_handshake()
         raise HTTPException(
             status_code=502,
             detail=(
                 "prefill direct allocation target count mismatch: "
-                f"targets={0 if not isinstance(targets, list) else len(targets)} descriptors={len(descriptors)}"
+                f"targets={0 if not isinstance(targets, list) else len(targets)} "
+                f"descriptors={len(descriptors)} cleanup={cleanup_errors}"
             ),
         )
 
-    publish_mask = [bool(dict(target).get("publish_required", True)) for target in targets]
     publish_payload = {
         "ticket": ticket,
         "metadata": dict(payload.get("metadata") or {}),
         "mooncake_epd_direct_feature_targets": targets,
-        "mooncake_epd_direct_publish_mask": publish_mask,
     }
     try:
-        started = time.perf_counter()
         publish_resp = await encoder_client.post("/publish_direct", json=publish_payload)
         publish_resp.raise_for_status()
         published = publish_resp.json()
-        timings["direct_publish_ms"] = (time.perf_counter() - started) * 1000.0
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:1000] if exc.response is not None else str(exc)
+        cleanup_errors = await _cleanup_failed_handshake()
+        if cleanup_errors:
+            detail += f"; cleanup={cleanup_errors}"
         raise HTTPException(status_code=502, detail=f"encoder direct publish returned error: {detail}") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"encoder direct publish failed: {exc}") from exc
+        cleanup_errors = await _cleanup_failed_handshake()
+        raise HTTPException(
+            status_code=502,
+            detail=f"encoder direct publish failed: {exc}; cleanup={cleanup_errors}",
+        ) from exc
     handles = published.get("handles")
     if not isinstance(handles, list) or not handles:
-        raise HTTPException(status_code=502, detail="encoder direct publish returned no feature handles")
-    ready_feature_ids = [
-        str(handle.get("feature_id") or "")
-        for handle, should_publish in zip(handles, publish_mask)
-        if should_publish and isinstance(handle, dict) and str(handle.get("feature_id") or "")
-    ]
-    if ready_feature_ids:
-        try:
-            started = time.perf_counter()
-            ready_resp = await direct_client.post(
-                "/mooncake_epd/direct_feature_buffer/mark_ready",
-                json={"feature_ids": sorted(set(ready_feature_ids))},
-            )
-            ready_resp.raise_for_status()
-            timings["direct_mark_ready_ms"] = (time.perf_counter() - started) * 1000.0
-        except httpx.HTTPStatusError as exc:
-            detail = exc.response.text[:1000] if exc.response is not None else str(exc)
-            raise HTTPException(status_code=502, detail=f"prefill direct mark_ready returned error: {detail}") from exc
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"prefill direct mark_ready failed: {exc}") from exc
-    wait_feature_ids = [
-        str(handle.get("feature_id") or "")
-        for handle, should_publish in zip(handles, publish_mask)
-        if (not should_publish) and isinstance(handle, dict) and str(handle.get("feature_id") or "")
-    ]
-    if wait_feature_ids:
-        try:
-            started = time.perf_counter()
-            wait_resp = await direct_client.post(
-                "/mooncake_epd/direct_feature_buffer/wait_ready",
-                json={
-                    "feature_ids": sorted(set(wait_feature_ids)),
-                    "timeout_s": max(1.0, float(getattr(app.state.proxy_config, "prefill_direct_buffer_timeout_s", 30.0))),
-                },
-            )
-            wait_resp.raise_for_status()
-            timings["direct_wait_ready_ms"] = (time.perf_counter() - started) * 1000.0
-        except httpx.HTTPStatusError as exc:
-            detail = exc.response.text[:1000] if exc.response is not None else str(exc)
-            raise HTTPException(status_code=502, detail=f"prefill direct wait_ready returned error: {detail}") from exc
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"prefill direct wait_ready failed: {exc}") from exc
-    # Surface encoder-side direct-engine sub-timings in the same response
-    # header as proxy timings. This makes real serving TTFT attribution precise:
-    # /publish_direct wall time can now be split into tensor registration,
-    # Mooncake peer-buffer write, unregister, and any staging/build overhead.
+        cleanup_errors = await _cleanup_failed_handshake()
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "encoder direct publish returned no feature handles; "
+                f"cleanup={cleanup_errors}"
+            ),
+        )
     for handle in handles:
-        if not isinstance(handle, dict):
-            continue
-        md = dict(handle.get("metadata") or {})
-        sub = md.get("direct_transfer_timings_ms")
-        if not isinstance(sub, dict):
-            continue
-        for key, value in sub.items():
-            try:
-                timings[f"direct_publish_engine_{key}"] = (
-                    float(timings.get(f"direct_publish_engine_{key}", 0.0) or 0.0)
-                    + float(value or 0.0)
-                )
-            except Exception:
-                continue
-    return_items: List[Dict[str, Any]] = []
-    for handle in handles:
-        item = dict(handle)
-        if not str(item.get("uri") or "").startswith("epd-direct://"):
-            raise HTTPException(status_code=502, detail="encoder direct publish returned non-direct handle")
-        metadata = dict(item.get("metadata") or {})
-        metadata["proxy_direct_timings_ms"] = dict(timings)
-        metadata["mooncake_epd_target_worker_id"] = str(target_worker_id)
-        metadata["target_worker_id"] = str(target_worker_id)
-        item["metadata"] = metadata
-        item["target_worker_id"] = str(target_worker_id)
-        return_items.append(item)
-    return return_items
-
-
-async def _lookup_prefill_cached_direct_feature_handles(
-    *,
-    app: FastAPI,
-    feature_ids: Sequence[str],
-    target_worker_id: str,
-) -> List[Dict[str, Any]]:
-    """Return hot Prefill-side direct handles without touching Encoder.
-
-    This is the zero-copy closed-loop fast path for repeated multimodal inputs:
-    the Prefill API process already owns registered peer buffers from an earlier
-    E→P publish, so the proxy only fetches descriptors/pointers and sends an
-    ``epd-direct://`` handle.  EngineCore still reads the registered peer buffer
-    through Mooncake; no Python bytes/object-store/file path is introduced.
-    """
-
-    config: ProxyConfig = app.state.proxy_config
-    if not _has_prefill_direct_buffer_service(config):
-        return []
-    ids = [str(item) for item in feature_ids if str(item or "").strip()]
-    if not ids:
-        return []
-    direct_client = _prefill_direct_buffer_client_for(app, target_worker_id)
-    if direct_client is None:
-        return []
-    started = time.perf_counter()
-    try:
-        resp = await direct_client.post(
-            "/mooncake_epd/direct_feature_buffer/lookup",
-            json={"feature_ids": ids, "target_worker_id": target_worker_id},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception:
-        logger.debug("prefill direct cache lookup failed", exc_info=True)
-        return []
-    if not bool(payload.get("all_hit")):
-        # Release any acquired partial hits immediately; mixed all-hit/all-miss
-        # composition is handled by the normal direct publish path below.
-        hits = [str(item.get("feature_id") or "") for item in list(payload.get("hits") or []) if isinstance(item, dict)]
-        if hits:
-            try:
-                await direct_client.post(
-                    "/mooncake_epd/direct_feature_buffer/release",
-                    json={"feature_ids": hits},
-                )
-            except Exception:
-                logger.debug("prefill direct partial-cache release failed", exc_info=True)
-        return []
-    handles: List[Dict[str, Any]] = []
-    lookup_ms = (time.perf_counter() - started) * 1000.0
-    by_id = {
-        str(item.get("feature_id") or ""): dict(item)
-        for item in list(payload.get("hits") or [])
-        if isinstance(item, dict)
-    }
-    for feature_id in ids:
-        item = by_id.get(feature_id)
-        if not item:
-            return []
-        descriptor = FeatureBundleDescriptor.from_dict(dict(item.get("descriptor") or {}))
-        target = dict(item.get("target") or {})
-        handle = _build_direct_handle_from_target(
-            descriptor=descriptor,
-            target=target,
-            store_id=str(target.get("store_id") or "direct"),
-            metadata={
-                "backend": "direct_engine",
-                "direct_backend": "prefill_persistent_cache",
-                "source_mm_hash": feature_id,
-                "mooncake_epd_target_worker_id": str(target_worker_id),
-                "target_worker_id": str(target_worker_id),
-                "proxy_direct_timings_ms": {
-                    "direct_cache_lookup_ms": lookup_ms,
-                    "direct_cache_hits": float(len(ids)),
-                    "direct_describe_ms": 0.0,
-                    "direct_allocate_ms": 0.0,
-                    "direct_publish_ms": 0.0,
-                },
-            },
-        )
-        handles.append(handle.as_control_payload())
-    return handles
-
-
-def _build_direct_handle_from_target(
-    *,
-    descriptor: FeatureBundleDescriptor,
-    target: Dict[str, Any],
-    store_id: str,
-    metadata: Optional[Dict[str, Any]] = None,
-) -> FeatureHandle:
-    remote_session = str(target.get("remote_session") or "")
-    remote_pointers = dict(target.get("remote_pointers") or {})
-    if not remote_session or not remote_pointers:
-        raise FeatureHandleError("cached direct target missing remote session/pointers")
-    plan_targets = []
-    for name, pointer in remote_pointers.items():
-        name = str(name)
-        if name.endswith(":nbytes"):
-            continue
-        nbytes = int(remote_pointers.get(f"{name}:nbytes", 0) or 0)
-        if nbytes <= 0:
-            raise FeatureHandleError(f"cached direct target missing nbytes for {name}")
-        plan_targets.append(
-            {
-                "name": name,
-                "remote_pointer": int(pointer),
-                "nbytes": nbytes,
-            }
-        )
-    md = dict(metadata or {})
-    md.update(
-        {
-            "direct_remote_session": remote_session,
-            "direct_plan": {
-                "feature_id": descriptor.feature_id,
-                "targets": plan_targets,
-            },
-            "direct_tensor_count": len(plan_targets),
-            "direct_descriptor_count": len(plan_targets),
-            "direct_bytes": sum(int(item["nbytes"]) for item in plan_targets),
-        }
-    )
-    return FeatureHandle(
-        handle_id=f"direct-cache-{descriptor.feature_id}-{int(time.time() * 1_000_000)}",
-        feature_id=str(descriptor.feature_id),
-        store_id=str(store_id or "direct"),
-        uri=f"epd-direct://{store_id or 'direct'}/{descriptor.feature_id}",
-        descriptor=descriptor,
-        metadata=md,
-    )
-
-
-async def _schedule_direct_feature_buffer_release(
-    app: FastAPI,
-    req_data: Dict[str, Any],
-) -> None:
-    """Detach post-Prefill buffer cleanup from the user-visible decode path.
-
-    A direct FeatureBundle is safe to release after the Prefill OpenAI response
-    returns: the GPU worker has consumed the handle before that response is
-    emitted. Cleanup is handed to a bounded queue. In particular, a saturated
-    cleanup plane must never block Decode dispatch and inflate TTFT.
-    """
-
-    config: ProxyConfig = app.state.proxy_config
-    if not config.release_direct_feature_buffers_after_prefill:
-        return
-    if not _has_prefill_direct_buffer_service(config):
-        return
-
-    by_worker = _collect_direct_feature_release_ids(req_data)
-    if not by_worker:
-        return
-
-    started = time.perf_counter()
-    stats = getattr(app.state, "direct_feature_release_stats", None)
-    if not isinstance(stats, dict):
-        stats = {
-            "scheduled": 0,
-            "completed": 0,
-            "failed": 0,
-            "max_inflight": 0,
-            "queue_full": 0,
-            "coalesced": 0,
-        }
-        app.state.direct_feature_release_stats = stats
-
-    queue = _ensure_direct_feature_release_dispatcher(app)
-    try:
-        queue.put_nowait(by_worker)
-    except asyncio.QueueFull:
-        _merge_direct_feature_release_overflow(app, by_worker)
-        stats["queue_full"] = int(stats.get("queue_full", 0) or 0) + 1
-        stats["coalesced"] = int(stats.get("coalesced", 0) or 0) + sum(
-            len(feature_ids) for feature_ids in by_worker.values()
-        )
-    else:
-        stats["scheduled"] = int(stats.get("scheduled", 0) or 0) + 1
-    overflow = getattr(app.state, "direct_feature_release_overflow", {})
-    inflight = queue.qsize() + (
-        sum(len(ids) for ids in overflow.values()) if isinstance(overflow, dict) else 0
-    )
-    stats["max_inflight"] = max(int(stats.get("max_inflight", 0) or 0), inflight)
-    _set_proxy_timing(
-        req_data,
-        "direct_release_enqueue_ms",
-        (time.perf_counter() - started) * 1000.0,
-    )
+        if not str(dict(handle).get("uri") or "").startswith("epd-direct://"):
+            cleanup_errors = await _cleanup_failed_handshake()
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "encoder direct publish returned non-direct handle; "
+                    f"cleanup={cleanup_errors}"
+                ),
+            )
+    return [dict(item) for item in handles]
 
 
 async def _release_direct_feature_buffers_after_prefill(app: FastAPI, req_data: Dict[str, Any]) -> None:
     """Release Prefill-owned E→P direct buffers once Prefill has consumed them."""
 
     config: ProxyConfig = app.state.proxy_config
+    cache = getattr(app.state, "direct_feature_handle_cache", None)
+    if cache is not None and cache.enabled:
+        return
     if not config.release_direct_feature_buffers_after_prefill:
         return
-    if not _has_prefill_direct_buffer_service(config):
+    if not config.prefill_direct_buffer_service_url:
         return
-    by_worker = _collect_direct_feature_release_ids(req_data)
-    if by_worker:
-        await _release_direct_feature_buffer_ids(app, by_worker)
-
-
-def _collect_direct_feature_release_ids(req_data: Dict[str, Any]) -> Dict[str, List[str]]:
+    feature_ids: List[str] = []
     kv = dict(req_data.get("kv_transfer_params") or {})
     metadata = dict(req_data.get("metadata") or {})
-    default_worker_id = str(
-        kv.get("mm_feature_handle_target_worker")
-        or metadata.get("mooncake_epd_feature_handle_target_worker")
-        or ""
-    )
     raw_handles = (
         kv.get("mm_feature_handles")
         or metadata.get("mooncake_epd_feature_handles")
@@ -2046,153 +4075,24 @@ def _collect_direct_feature_release_ids(req_data: Dict[str, Any]) -> Dict[str, L
         or []
     )
     if not isinstance(raw_handles, list):
-        return {}
-    by_worker: Dict[str, List[str]] = {}
+        return
     for item in raw_handles:
         if not isinstance(item, dict):
             continue
         if not str(item.get("uri") or "").startswith("epd-direct://"):
             continue
         fid = str(item.get("feature_id") or "")
-        if not fid:
-            continue
-        worker_id = _direct_worker_id_from_handle(item, default_worker_id)
-        by_worker.setdefault(worker_id, []).append(fid)
-    return {
-        worker_id: sorted(set(feature_ids))
-        for worker_id, feature_ids in by_worker.items()
-        if feature_ids
-    }
-
-
-async def _release_direct_feature_buffer_ids(
-    app: FastAPI,
-    by_worker: Dict[str, List[str]],
-) -> int:
-    """Issue release RPCs and return the number of failed worker batches."""
-
-    failures = 0
-    for worker_id, feature_ids in by_worker.items():
-        if not feature_ids:
-            continue
-        client = _prefill_direct_buffer_client_for(app, worker_id)
-        if client is None:
-            logger.error("no direct-buffer client for release worker=%s feature_ids=%s", worker_id, feature_ids)
-            failures += 1
-            continue
-        try:
-            response = await client.post(
-                "/mooncake_epd/direct_feature_buffer/release",
-                json={"feature_ids": sorted(set(feature_ids)), "target_worker_id": worker_id},
-            )
-            response.raise_for_status()
-        except Exception as exc:
-            # Release failure is operationally serious but the P→D handoff may have
-            # already succeeded. Report through logs/metrics rather than corrupting
-            # the user response after Prefill has completed.
-            logger.error("failed to release direct feature buffers after prefill worker=%s: %s", worker_id, exc)
-            failures += 1
-    return failures
-
-
-def _ensure_direct_feature_release_dispatcher(app: FastAPI) -> asyncio.Queue[Dict[str, List[str]]]:
-    queue = getattr(app.state, "direct_feature_release_queue", None)
-    if isinstance(queue, asyncio.Queue):
-        return queue
-    config: ProxyConfig = app.state.proxy_config
-    queue = asyncio.Queue(
-        maxsize=max(
-            1,
-            int(getattr(config, "direct_feature_release_max_inflight", 128) or 128),
-        )
-    )
-    app.state.direct_feature_release_queue = queue
-    workers = getattr(app.state, "direct_feature_release_workers", None)
-    if not isinstance(workers, set):
-        workers = set()
-        app.state.direct_feature_release_workers = workers
-    workers.add(asyncio.create_task(_direct_feature_release_worker(app, queue)))
-    return queue
-
-
-def _merge_direct_feature_release_overflow(
-    app: FastAPI,
-    by_worker: Dict[str, List[str]],
-) -> None:
-    overflow = getattr(app.state, "direct_feature_release_overflow", None)
-    if not isinstance(overflow, dict):
-        overflow = {}
-        app.state.direct_feature_release_overflow = overflow
-    for worker_id, feature_ids in by_worker.items():
-        bucket = overflow.setdefault(str(worker_id), set())
-        bucket.update(str(feature_id) for feature_id in feature_ids)
-
-
-def _take_direct_feature_release_overflow(app: FastAPI) -> Dict[str, List[str]]:
-    overflow = getattr(app.state, "direct_feature_release_overflow", None)
-    if not isinstance(overflow, dict) or not overflow:
-        return {}
-    app.state.direct_feature_release_overflow = {}
-    return {
-        str(worker_id): sorted(str(feature_id) for feature_id in feature_ids)
-        for worker_id, feature_ids in overflow.items()
-        if feature_ids
-    }
-
-
-async def _direct_feature_release_worker(
-    app: FastAPI,
-    queue: asyncio.Queue[Dict[str, List[str]] | None],
-) -> None:
-    while True:
-        job = await queue.get()
-        try:
-            if job is None:
-                return
-            failures = await _release_direct_feature_buffer_ids(app, job)
-            stats = getattr(app.state, "direct_feature_release_stats", None)
-            if isinstance(stats, dict):
-                stats["completed"] = int(stats.get("completed", 0) or 0) + 1
-                if failures:
-                    stats["failed"] = int(stats.get("failed", 0) or 0) + failures
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("background direct feature release failed")
-            stats = getattr(app.state, "direct_feature_release_stats", None)
-            if isinstance(stats, dict):
-                stats["failed"] = int(stats.get("failed", 0) or 0) + 1
-        finally:
-            queue.task_done()
-
-        # Coalesced work is only moved back into the bounded queue by the
-        # worker, never by a request handler. This preserves a strict TTFT
-        # boundary even when release RPCs are slower than incoming Prefill work.
-        overflow = _take_direct_feature_release_overflow(app)
-        if overflow:
-            try:
-                queue.put_nowait(overflow)
-                stats = getattr(app.state, "direct_feature_release_stats", None)
-                if isinstance(stats, dict):
-                    stats["scheduled"] = int(stats.get("scheduled", 0) or 0) + 1
-            except asyncio.QueueFull:
-                _merge_direct_feature_release_overflow(app, overflow)
-
-
-async def _shutdown_direct_feature_release_dispatcher(app: FastAPI) -> None:
-    queue = getattr(app.state, "direct_feature_release_queue", None)
-    workers = getattr(app.state, "direct_feature_release_workers", None)
-    if not isinstance(queue, asyncio.Queue) or not isinstance(workers, set) or not workers:
+        if fid:
+            feature_ids.append(fid)
+    if not feature_ids:
         return
-    overflow = _take_direct_feature_release_overflow(app)
-    if overflow:
-        await queue.put(overflow)
-    await queue.join()
-    active_workers = list(workers)
-    for _ in active_workers:
-        await queue.put(None)
-    await asyncio.gather(*active_workers, return_exceptions=True)
-    workers.clear()
+    try:
+        await _release_direct_feature_ids(app, feature_ids)
+    except Exception as exc:
+        # Release failure is operationally serious but the P→D handoff may have
+        # already succeeded. Report through logs/metrics rather than corrupting
+        # the user response after Prefill has completed.
+        logger.error("failed to release direct feature buffers after prefill: %s", exc)
 
 
 async def _prefetch_and_rewrite_multimodal_assets(
@@ -2214,10 +4114,7 @@ async def _prefetch_and_rewrite_multimodal_assets(
     if not config.enable_mm_prefetch or mm_store is None or not getattr(ctx, "mm_hashes", None):
         return req_data
 
-    # Request bodies are already JSON-compatible dict/list trees. Avoid a JSON
-    # serialize/parse round trip on the E->P hot path while keeping the caller's
-    # payload immutable for the later Decode leg.
-    rewritten = deepcopy(req_data)
+    rewritten = _copy_request_for_mm_url_rewrite(req_data)
     items = list(_iter_mutable_mm_url_items(rewritten))
     if not items:
         return req_data
@@ -2295,13 +4192,178 @@ def _iter_mutable_mm_url_items(req_data: Dict[str, Any]):
             content = message.get("content")
             if isinstance(content, list):
                 for item in content:
-                    if isinstance(item, dict) and _image_url_from_item(item):
+                    if isinstance(item, dict) and _is_image_content_item(item):
                         yield item
     prompt = req_data.get("prompt")
     if isinstance(prompt, list):
         for item in prompt:
-            if isinstance(item, dict) and _image_url_from_item(item):
+            if isinstance(item, dict) and _is_image_content_item(item):
                 yield item
+
+
+def _is_image_content_item(item: Dict[str, Any]) -> bool:
+    return str(item.get("type", "")).strip().lower() in {
+        "image",
+        "image_url",
+        "input_image",
+    }
+
+
+def _iter_multimodal_content_items(req_data: Dict[str, Any]):
+    messages = req_data.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type", "")).strip().lower() in {
+                    "image",
+                    "image_url",
+                    "input_image",
+                    "audio",
+                    "audio_url",
+                    "input_audio",
+                    "video",
+                    "video_url",
+                    "input_video",
+                    "file",
+                    "input_file",
+                }:
+                    yield item
+    prompt = req_data.get("prompt")
+    if isinstance(prompt, list):
+        for item in prompt:
+            if isinstance(item, dict) and str(
+                item.get("type", "")
+            ).strip().lower() in {
+                "image",
+                "image_url",
+                "input_image",
+                "audio",
+                "audio_url",
+                "input_audio",
+                "video",
+                "video_url",
+                "input_video",
+                "file",
+                "input_file",
+            }:
+                yield item
+
+
+def _media_payload_present(item: Dict[str, Any]) -> bool:
+    for key in (
+        "image_url",
+        "image",
+        "image_pil",
+        "audio_url",
+        "audio",
+        "input_audio",
+        "video_url",
+        "video",
+        "file",
+        "file_data",
+        "url",
+    ):
+        if key not in item:
+            continue
+        value = item.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value:
+                return True
+            continue
+        if isinstance(value, dict):
+            if "url" in value:
+                if value.get("url"):
+                    return True
+                continue
+            if value:
+                return True
+            continue
+        return True
+    return False
+
+
+def _client_mm_uuid_request_mode(
+    req_data: Dict[str, Any],
+) -> Tuple[str, int, int]:
+    items = list(_iter_multimodal_content_items(req_data))
+    if not items:
+        return "none", 0, 0
+    uuid_items = 0
+    compact_items = 0
+    for item in items:
+        supplied_uuid = item.get("uuid")
+        has_uuid = supplied_uuid is not None and bool(str(supplied_uuid).strip())
+        has_payload = _media_payload_present(item)
+        if has_uuid:
+            uuid_items += 1
+        if not has_payload:
+            if not has_uuid:
+                raise ValueError(
+                    "multimodal item with an omitted payload requires a non-empty uuid"
+                )
+            compact_items += 1
+    if compact_items == len(items):
+        return "compact", uuid_items, compact_items
+    if compact_items:
+        return "mixed", uuid_items, compact_items
+    if uuid_items:
+        return "full", uuid_items, 0
+    return "legacy-full", 0, 0
+
+
+def _request_has_compact_mm_uuid_references(req_data: Dict[str, Any]) -> bool:
+    try:
+        _mode, _uuid_items, compact_items = _client_mm_uuid_request_mode(req_data)
+    except ValueError:
+        return False
+    return compact_items > 0
+
+
+def _record_client_mm_uuid_request(
+    app: FastAPI,
+    *,
+    mode: str,
+    uuid_items: int,
+    compact_items: int,
+    request_body_bytes: int,
+) -> None:
+    stats = app.state.client_mm_uuid_reference_stats
+    counter = {
+        "legacy-full": "legacy_full_requests",
+        "full": "uuid_full_requests",
+        "compact": "compact_requests",
+        "mixed": "mixed_requests",
+    }.get(str(mode))
+    if counter is not None:
+        stats[counter] = int(stats.get(counter, 0)) + 1
+    stats["uuid_items"] = int(stats.get("uuid_items", 0)) + int(uuid_items)
+    stats["compact_items"] = int(stats.get("compact_items", 0)) + int(
+        compact_items
+    )
+    stats["request_body_bytes"] = int(stats.get("request_body_bytes", 0)) + int(
+        request_body_bytes
+    )
+    if compact_items:
+        stats["compact_request_body_bytes"] = int(
+            stats.get("compact_request_body_bytes", 0)
+        ) + int(request_body_bytes)
+
+
+def _record_client_mm_uuid_cold_miss(app: FastAPI, stage: str) -> None:
+    stats = app.state.client_mm_uuid_reference_stats
+    stats["cold_misses"] = int(stats.get("cold_misses", 0)) + 1
+    by_stage = stats.setdefault("cold_misses_by_stage", {})
+    key = str(stage)
+    by_stage[key] = int(by_stage.get(key, 0)) + 1
 
 
 def _image_url_from_item(item: Dict[str, Any]) -> Optional[str]:
@@ -2327,6 +4389,21 @@ def _set_image_url_on_item(item: Dict[str, Any], data_url: str) -> None:
         item["image_url"] = data_url
     else:
         item["url"] = data_url
+
+
+def _set_canonical_mm_cache_url(item: Dict[str, Any], cache_url: str) -> None:
+    """Normalize full and UUID-only image parts to one render-cache shape."""
+
+    if "image_url" in item:
+        current = item.get("image_url")
+        extras = (
+            {key: value for key, value in current.items() if key != "url"}
+            if isinstance(current, dict)
+            else {}
+        )
+        item["image_url"] = {"url": cache_url, **extras}
+        return
+    item["url"] = cache_url
 
 
 async def _get_or_create_serving_mm_bundle(
@@ -2362,19 +4439,95 @@ async def _get_or_create_serving_mm_bundle(
     return bundle, data_url, False
 
 
-async def _load_mm_url_bytes(app: FastAPI, url: str, *, max_bytes: int) -> Tuple[bytes, str]:
+async def _validate_remote_mm_url(url: str, *, allow_private: bool) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"unsupported multimodal URL: {url[:64]}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("multimodal URL credentials are not allowed")
+    if allow_private:
+        return
+
+    hostname = str(parsed.hostname).strip().rstrip(".")
+    try:
+        addresses = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        try:
+            resolved = await asyncio.to_thread(
+                socket.getaddrinfo,
+                hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            raise ValueError(
+                f"multimodal URL hostname could not be resolved: {hostname}"
+            ) from exc
+        addresses = []
+        for item in resolved:
+            address = ipaddress.ip_address(item[4][0])
+            if address not in addresses:
+                addresses.append(address)
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError(
+            "multimodal URL resolves to a non-public address; "
+            "use --allow-private-mm-urls only in a trusted deployment"
+        )
+
+
+async def _load_mm_url_bytes(
+    app: FastAPI,
+    url: str,
+    *,
+    max_bytes: int,
+) -> Tuple[bytes, str]:
     if url.startswith("data:"):
         return _parse_data_url(url, max_bytes=max_bytes)
     if not (url.startswith("http://") or url.startswith("https://")):
         raise ValueError(f"unsupported multimodal URL scheme: {url[:32]}")
+    if max_bytes < 1:
+        raise ValueError("multimodal asset byte limit must be positive")
     client: httpx.AsyncClient = app.state.mm_fetch_client
-    response = await client.get(url)
-    response.raise_for_status()
-    payload = response.content
-    if len(payload) > max_bytes:
-        raise ValueError(f"multimodal asset too large: {len(payload)} > {max_bytes}")
-    content_type = response.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
-    return payload, content_type or "application/octet-stream"
+    current_url = url
+    for _ in range(4):
+        await _validate_remote_mm_url(
+            current_url,
+            allow_private=bool(app.state.proxy_config.allow_private_mm_urls),
+        )
+        async with client.stream("GET", current_url) as response:
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError("multimodal URL redirect is missing Location")
+                current_url = urljoin(current_url, location)
+                continue
+            response.raise_for_status()
+            content_length = response.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > max_bytes:
+                        raise ValueError(
+                            "multimodal asset Content-Length exceeds limit: "
+                            f"{content_length} > {max_bytes}"
+                        )
+                except ValueError as exc:
+                    if "exceeds limit" in str(exc):
+                        raise
+            chunks: List[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(
+                        f"multimodal asset too large: {total} > {max_bytes}"
+                    )
+                chunks.append(chunk)
+            content_type = response.headers.get(
+                "content-type",
+                "application/octet-stream",
+            ).split(";")[0].strip()
+            return b"".join(chunks), content_type or "application/octet-stream"
+    raise ValueError("multimodal URL exceeded the redirect limit")
 
 
 def _parse_data_url(url: str, *, max_bytes: int) -> Tuple[bytes, str]:
@@ -2432,10 +4585,8 @@ def _merge_control_headers(req_data: Dict[str, Any], request: Request) -> Dict[s
             updates[key] = value
     if not updates:
         return req_data
-    # Header propagation mutates only top-level metadata. Deep JSON cloning
-    # duplicated large image/audio data URLs before Prefill dispatch.
     merged = dict(req_data)
-    metadata = dict(req_data.get("metadata") or {})
+    metadata = dict(merged.get("metadata") or {})
     for key, value in updates.items():
         metadata.setdefault(key, value)
     merged["metadata"] = metadata
@@ -2457,6 +4608,149 @@ def _client_for_worker(clients: Sequence[Dict[str, Any]], worker_id: str) -> Opt
         if client.get("worker_id") == worker_id:
             return client
     return None
+
+
+def _normalize_remote_kv_topology(
+    kv_transfer_params: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(kv_transfer_params, dict):
+        return None
+    remote_engine_id = str(kv_transfer_params.get("remote_engine_id") or "").strip()
+    remote_bootstrap_addr = str(
+        kv_transfer_params.get("remote_bootstrap_addr") or ""
+    ).strip().rstrip("/")
+    try:
+        tp_size = int(kv_transfer_params.get("tp_size"))
+    except (TypeError, ValueError):
+        return None
+    if not remote_engine_id or not remote_bootstrap_addr or tp_size < 1:
+        return None
+    topology = {
+        "remote_engine_id": remote_engine_id,
+        "remote_bootstrap_addr": remote_bootstrap_addr,
+        "tp_size": tp_size,
+    }
+    remote_engine_incarnation = str(
+        kv_transfer_params.get("remote_engine_incarnation") or ""
+    ).strip()
+    if remote_engine_incarnation:
+        topology["remote_engine_incarnation"] = remote_engine_incarnation
+    return topology
+
+
+def _cached_prefill_kv_topology(
+    prefill_client: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    current_api_incarnation = str(
+        prefill_client.get("remote_api_incarnation") or ""
+    )
+    topology_api_incarnation = str(
+        prefill_client.get("remote_kv_topology_api_incarnation") or ""
+    )
+    if (
+        current_api_incarnation
+        and topology_api_incarnation != current_api_incarnation
+    ):
+        _invalidate_prefill_cached_topology(prefill_client)
+        return None
+    topology = _normalize_remote_kv_topology(
+        prefill_client.get("remote_kv_topology")
+    )
+    if topology is None:
+        _invalidate_prefill_cached_topology(prefill_client)
+        return None
+    return topology
+
+
+def _cache_prefill_kv_topology(
+    prefill_client: Dict[str, Any],
+    kv_transfer_params: Any,
+) -> Optional[Dict[str, Any]]:
+    topology = _normalize_remote_kv_topology(kv_transfer_params)
+    if topology is None:
+        _invalidate_prefill_cached_topology(prefill_client)
+        return None
+    # Replace the whole mapping atomically so concurrent request coroutines
+    # never observe a partially refreshed engine topology.
+    prefill_client["remote_kv_topology"] = topology
+    current_api_incarnation = str(
+        prefill_client.get("remote_api_incarnation") or ""
+    )
+    if current_api_incarnation:
+        prefill_client["remote_kv_topology_api_incarnation"] = (
+            current_api_incarnation
+        )
+    else:
+        prefill_client.pop("remote_kv_topology_api_incarnation", None)
+    return dict(topology)
+
+
+def _build_pipelined_decode_kv_params(
+    *,
+    prefill_kv_params: Dict[str, Any],
+    topology: Dict[str, Any],
+    prefill_worker_id: str,
+    decode_decision: Any,
+    handoff_id: str,
+) -> Dict[str, Any]:
+    transfer_id = str(prefill_kv_params.get("transfer_id") or "").strip()
+    if not transfer_id:
+        raise RuntimeError("early Decode pipeline requires a stable transfer_id")
+    normalized_topology = _normalize_remote_kv_topology(topology)
+    if normalized_topology is None:
+        raise RuntimeError("early Decode pipeline requires a complete cached KV topology")
+    handoff_id = str(handoff_id or "").strip()
+    if not handoff_id:
+        raise RuntimeError("early Decode pipeline requires a reserved handoff_id")
+
+    decision = decode_decision.decision
+    kv = dict(prefill_kv_params)
+    kv.pop("remote_block_ids", None)
+    kv.update(normalized_topology)
+    kv.update(
+        {
+            "transfer_id": transfer_id,
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "control_stage": "decode",
+            "control_worker_id": decode_decision.worker_id,
+            "scheduler_rho": decision.rho,
+            "admission_action": decision.action.value,
+            "degrade_level": decision.degrade_level.value,
+            "handoff_id": handoff_id,
+            "a2a_source_node": prefill_worker_id,
+            "a2a_target_node": decode_decision.worker_id,
+        }
+    )
+    return kv
+
+
+def _validate_pipelined_decode_kv_params(
+    provisional_params: Dict[str, Any],
+    finalized_params: Dict[str, Any],
+) -> None:
+    provisional_topology = _normalize_remote_kv_topology(provisional_params)
+    finalized_topology = _normalize_remote_kv_topology(finalized_params)
+    if provisional_topology is None or finalized_topology != provisional_topology:
+        raise RuntimeError(
+            "Prefill KV topology changed while the early Decode request was in flight"
+        )
+    provisional_transfer_id = str(provisional_params.get("transfer_id") or "")
+    finalized_transfer_id = str(finalized_params.get("transfer_id") or "")
+    if not provisional_transfer_id or finalized_transfer_id != provisional_transfer_id:
+        raise RuntimeError(
+            "Prefill transfer_id changed while the early Decode request was in flight"
+        )
+    if not finalized_params.get("do_remote_prefill") or finalized_params.get(
+        "do_remote_decode"
+    ):
+        raise RuntimeError("finalized Decode KV direction is incompatible with the pipeline")
+    provisional_handoff_id = str(provisional_params.get("handoff_id") or "")
+    finalized_handoff_id = str(finalized_params.get("handoff_id") or "")
+    if not provisional_handoff_id or finalized_handoff_id != provisional_handoff_id:
+        raise RuntimeError(
+            "Prefill handoff_id changed while the early Decode request was in flight"
+        )
 
 
 def _should_use_prompt_only_prefill(api: str) -> bool:
@@ -2505,6 +4799,113 @@ def _inject_prefill_kv_into_rendered_request(
     return payload
 
 
+def _prerendered_decode_bypass_reason(
+    *,
+    api: str,
+    request_body: Dict[str, Any],
+    tokenizer_obj: Any,
+) -> Optional[str]:
+    """Return why the token-only Decode adapter cannot preserve semantics.
+
+    The internal Generate protocol is intentionally selected only for the
+    common, high-throughput single-choice chat path.  Requests whose public
+    response needs server-side tool/reasoning/logprob parsing remain on the
+    OpenAI endpoint rather than approximating their schema in the proxy.
+    """
+
+    if api != "/v1/chat/completions":
+        return "unsupported_api"
+    if tokenizer_obj is None:
+        return "tokenizer_unavailable"
+    try:
+        if int(request_body.get("n", 1) or 1) != 1:
+            return "multiple_choices"
+    except (TypeError, ValueError):
+        return "invalid_choice_count"
+    if request_body.get("tools"):
+        return "tool_response_parsing"
+    tool_choice = request_body.get("tool_choice")
+    if tool_choice not in (None, "none"):
+        return "tool_response_parsing"
+    if request_body.get("logprobs") or request_body.get("top_logprobs") is not None:
+        return "logprobs_response"
+    if request_body.get("prompt_logprobs") is not None:
+        return "prompt_logprobs_response"
+    if request_body.get("return_token_ids") or request_body.get(
+        "return_tokens_as_token_ids"
+    ):
+        return "token_id_response"
+    if request_body.get("echo"):
+        return "echo_response"
+    return None
+
+
+def _record_prerendered_decode_selection(
+    app: FastAPI,
+    *,
+    selected: bool,
+    stream: bool,
+    bypass_reason: Optional[str] = None,
+) -> None:
+    stats = app.state.prerendered_decode_stats
+    if selected:
+        stats["selected"] = int(stats.get("selected", 0)) + 1
+        key = "streaming" if stream else "non_streaming"
+        stats[key] = int(stats.get(key, 0)) + 1
+        return
+    stats["bypassed"] = int(stats.get("bypassed", 0)) + 1
+    reason = str(bypass_reason or "unknown")
+    reasons = stats.setdefault("bypass_reasons", {})
+    reasons[reason] = int(reasons.get(reason, 0)) + 1
+
+
+def _build_prerendered_decode_context(
+    rendered_request: Dict[str, Any],
+    *,
+    tokenizer_obj: Any,
+) -> _PrerenderedDecodeContext:
+    token_ids = rendered_request.get("token_ids")
+    if not isinstance(token_ids, list) or not token_ids:
+        raise ValueError("rendered Decode request must contain non-empty token_ids")
+    if any(not isinstance(token_id, int) for token_id in token_ids):
+        raise TypeError("rendered Decode token_ids must be integers")
+    sampling_params = dict(rendered_request.get("sampling_params") or {})
+    model = str(rendered_request.get("model") or "").strip()
+    if not model:
+        raise ValueError("rendered Decode request must contain a model")
+    return _PrerenderedDecodeContext(
+        tokenizer=tokenizer_obj,
+        prompt_token_ids=tuple(token_ids),
+        model=model,
+        skip_special_tokens=bool(sampling_params.get("skip_special_tokens", True)),
+    )
+
+
+def _inject_decode_kv_into_rendered_request(
+    rendered_request: Dict[str, Any],
+    *,
+    request_id: str,
+    request_body: Dict[str, Any],
+    kv_transfer_params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Clone reusable render semantics and attach per-request Decode state."""
+
+    payload = dict(rendered_request)
+    sampling_params = dict(payload.get("sampling_params") or {})
+    extra_args = dict(sampling_params.get("extra_args") or {})
+    extra_args["kv_transfer_params"] = dict(kv_transfer_params)
+    sampling_params["extra_args"] = extra_args
+    payload["sampling_params"] = sampling_params
+    payload["request_id"] = request_id
+    payload["stream"] = bool(request_body.get("stream"))
+    if payload["stream"] and request_body.get("stream_options") is not None:
+        payload["stream_options"] = dict(request_body.get("stream_options") or {})
+    else:
+        payload.pop("stream_options", None)
+    payload["kv_transfer_params"] = dict(kv_transfer_params)
+    return payload
+
+
 async def _dispatch_prompt_only_prefill(
     *,
     api: str,
@@ -2514,8 +4915,155 @@ async def _dispatch_prompt_only_prefill(
     request_body: Dict[str, Any],
     kv_transfer_params: Dict[str, Any],
 ) -> Dict[str, Any]:
-    timings: Dict[str, float] = {}
-    started = time.perf_counter()
+    rendered_payload = await _render_prompt_only_prefill(
+        api=api,
+        prefill_client=prefill_client,
+        prefill_headers=prefill_headers,
+        request_body=request_body,
+    )
+    return await _dispatch_rendered_prompt_only_prefill(
+        prefill_client=prefill_client,
+        prefill_headers=prefill_headers,
+        request_id=request_id,
+        rendered_payload=rendered_payload,
+        kv_transfer_params=kv_transfer_params,
+    )
+
+
+def _prefill_render_cache_digest(
+    request_body: Dict[str, Any],
+    *,
+    mm_hashes: Sequence[str],
+) -> str:
+    """Hash render semantics without re-hashing multi-megabyte image URLs.
+
+    Workflow/request IDs and KV handoff topology do not alter tokenization or
+    multimodal preprocessing.  Image URLs are replaced by the scheduler's
+    already-computed content hashes; all prompt/tool/template-affecting fields
+    remain in the canonical payload.
+    """
+
+    normalized = _copy_request_for_mm_url_rewrite(request_body)
+    normalized.pop("stream", None)
+    normalized.pop("stream_options", None)
+    metadata = dict(normalized.get("metadata") or {})
+    for key in (
+        "workflow_id",
+        "request_id",
+        "trace_id",
+        "span_id",
+        "mooncake_epd_target_worker_id",
+        "mooncake_epd_decode_worker_id",
+    ):
+        metadata.pop(key, None)
+    if metadata:
+        normalized["metadata"] = metadata
+    else:
+        normalized.pop("metadata", None)
+    kv = dict(normalized.get("kv_transfer_params") or {})
+    for key in (
+        "transfer_id",
+        "remote_engine_id",
+        "remote_bootstrap_addr",
+        "remote_block_ids",
+        "do_remote_prefill",
+        "do_remote_decode",
+    ):
+        kv.pop(key, None)
+    if kv:
+        normalized["kv_transfer_params"] = kv
+    else:
+        normalized.pop("kv_transfer_params", None)
+    for index, item in enumerate(_iter_mutable_mm_url_items(normalized)):
+        if index < len(mm_hashes):
+            _set_canonical_mm_cache_url(
+                item,
+                f"mm-hash://{mm_hashes[index]}",
+            )
+    canonical = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+async def _get_or_render_prompt_only_prefill(
+    *,
+    app: FastAPI,
+    api: str,
+    prefill_client: Dict[str, Any],
+    prefill_headers: Dict[str, str],
+    request_body: Dict[str, Any],
+    mm_hashes: Sequence[str],
+) -> Dict[str, Any]:
+    cache: _PrefillRenderCache = app.state.prefill_render_cache
+    digest = _prefill_render_cache_digest(request_body, mm_hashes=mm_hashes)
+    worker_id = str(prefill_client.get("worker_id") or "")
+    worker_incarnation = str(
+        app.state.direct_feature_handle_cache.worker_incarnation(worker_id) or ""
+    )
+    key = (worker_id, worker_incarnation, str(api), digest)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    if _request_has_compact_mm_uuid_references(request_body):
+        _record_client_mm_uuid_cold_miss(app, "prefill_render")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "multimodal UUID reference missed the Prefill render cache; "
+                "resend the full media payload to warm the EPD path"
+            ),
+        )
+    if not cache.enabled:
+        return await _render_prompt_only_prefill(
+            api=api,
+            prefill_client=prefill_client,
+            prefill_headers=prefill_headers,
+            request_body=request_body,
+        )
+
+    inflight: Dict[Tuple[str, str, str, str], asyncio.Task] = (
+        app.state.prefill_render_inflight
+    )
+    task = inflight.get(key)
+    if task is None:
+        async def _create() -> Dict[str, Any]:
+            payload = await _render_prompt_only_prefill(
+                api=api,
+                prefill_client=prefill_client,
+                prefill_headers=prefill_headers,
+                request_body=request_body,
+            )
+            cache.put(key, payload)
+            return payload
+
+        task = asyncio.create_task(
+            _create(),
+            name=(
+                f"epd-prefill-render-{key[0]}-"
+                f"{hashlib.sha256(key[1].encode()).hexdigest()[:8]}-{digest[:12]}"
+            ),
+        )
+        inflight[key] = task
+
+        def _release(done: asyncio.Task, *, flight_key=key) -> None:
+            if inflight.get(flight_key) is done:
+                inflight.pop(flight_key, None)
+
+        task.add_done_callback(_release)
+    return dict(await asyncio.shield(task))
+
+
+async def _render_prompt_only_prefill(
+    *,
+    api: str,
+    prefill_client: Dict[str, Any],
+    prefill_headers: Dict[str, str],
+    request_body: Dict[str, Any],
+) -> Dict[str, Any]:
     render_response = await prefill_client["client"].post(
         _render_api_for(api),
         json=request_body,
@@ -2529,14 +5077,22 @@ async def _dispatch_prompt_only_prefill(
         )
     finally:
         await render_response.aclose()
-    timings["prefill_render_ms"] = (time.perf_counter() - started) * 1000.0
+    return rendered_payload
 
+
+async def _dispatch_rendered_prompt_only_prefill(
+    *,
+    prefill_client: Dict[str, Any],
+    prefill_headers: Dict[str, str],
+    request_id: str,
+    rendered_payload: Dict[str, Any],
+    kv_transfer_params: Dict[str, Any],
+) -> Dict[str, Any]:
     prefill_payload = _inject_prefill_kv_into_rendered_request(
         rendered_payload,
         request_id=request_id,
         kv_transfer_params=kv_transfer_params,
     )
-    started = time.perf_counter()
     generate_response = await prefill_client["client"].post(
         "/inference/v1/generate",
         json=prefill_payload,
@@ -2547,108 +5103,8 @@ async def _dispatch_prompt_only_prefill(
         payload = dict(generate_response.json())
     finally:
         await generate_response.aclose()
-    timings["prefill_generate_ms"] = (time.perf_counter() - started) * 1000.0
-    timings["prefill_render_generate_ms"] = timings["prefill_render_ms"] + timings["prefill_generate_ms"]
-    payload["_mooncake_epd_proxy_timings_ms"] = timings
     payload.setdefault("kv_transfer_params", dict(kv_transfer_params))
     return payload
-
-
-async def _dispatch_openai_prompt_only_prefill(
-    *,
-    api: str,
-    prefill_client: Dict[str, Any],
-    prefill_headers: Dict[str, str],
-    request_id: str,
-    request_body: Dict[str, Any],
-    kv_transfer_params: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Run Prefill through one OpenAI request with max_tokens=0.
-
-    vLLM's OpenAI chat/completion protocol accepts ``kv_transfer_params`` and
-    returns ``kv_transfer_params`` on the final response when a KV connector is
-    configured.  With the repo-local prompt-only scheduler patch, max_tokens=0
-    finishes immediately after prompt forward, so this path avoids the previous
-    render + internal generate double HTTP/double scheduling overhead.
-    """
-
-    started = time.perf_counter()
-    # The prompt-only leg changes only top-level request controls and metadata.
-    # A deep JSON clone here previously reserialized large data URLs before the
-    # actual Prefill HTTP request, directly reducing high-QPS MM throughput.
-    prefill_payload = dict(request_body)
-    prefill_payload["stream"] = False
-    prefill_payload["max_tokens"] = 0
-    if "max_completion_tokens" in prefill_payload:
-        prefill_payload["max_completion_tokens"] = 0
-    # The local prompt-only patch may receive the sampled token produced by
-    # the final prompt forward.  Ask vLLM to retain its id for observability;
-    # the proxy does not expose it to clients or alter Decode semantics here.
-    prefill_payload["return_token_ids"] = True
-    prefill_payload.pop("stream_options", None)
-    prefill_payload["kv_transfer_params"] = dict(kv_transfer_params)
-    metadata = dict(prefill_payload.get("metadata") or {})
-    metadata["mooncake_epd_prompt_only_prefill"] = True
-    metadata["mooncake_epd_prefill_dispatch_mode"] = "openai_prompt_only"
-    prefill_payload["metadata"] = metadata
-
-    response = await prefill_client["client"].post(
-        api,
-        json=prefill_payload,
-        headers=prefill_headers,
-    )
-    try:
-        response.raise_for_status()
-        payload = dict(response.json())
-    finally:
-        await response.aclose()
-    timings = {
-        "prefill_openai_prompt_only_ms": (time.perf_counter() - started) * 1000.0,
-        "prefill_render_ms": 0.0,
-        "prefill_generate_ms": 0.0,
-    }
-    timings["prefill_render_generate_ms"] = timings["prefill_openai_prompt_only_ms"]
-    observed = _extract_prompt_only_sample_observation(api, payload)
-    timings["prefill_sampled_token_count"] = float(len(observed["token_ids"]))
-    payload["_mooncake_epd_prompt_only_sample"] = observed
-    payload["_mooncake_epd_proxy_timings_ms"] = timings
-    returned_kv = payload.get("kv_transfer_params")
-    if not isinstance(returned_kv, dict) or not returned_kv:
-        raise RuntimeError(
-            "openai_prompt_only prefill returned no kv_transfer_params; "
-            "this vLLM build/path cannot be used for EPD prompt-only prefill"
-        )
-    return payload
-
-
-def _extract_prompt_only_sample_observation(
-    api: str,
-    payload: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Capture, but do not consume, the prompt-forward sampled token.
-
-    This is deliberately an internal observation.  It lets real serving prove
-    whether vLLM already sampled a first token during ``max_tokens=0`` before
-    enabling any producer-first-token optimization that could affect output
-    semantics.
-    """
-
-    choices = list(payload.get("choices") or [])
-    choice = dict(choices[0] or {}) if choices else {}
-    token_ids: List[int] = []
-    for token_id in list(choice.get("token_ids") or []):
-        try:
-            token_ids.append(int(token_id))
-        except (TypeError, ValueError):
-            continue
-    return {
-        "token_ids": token_ids,
-        "text": _extract_choice_text(api, choice),
-        "completion_tokens": int(
-            dict(payload.get("usage") or {}).get("completion_tokens", 0) or 0
-        ),
-        "finish_reason": choice.get("finish_reason"),
-    }
 
 
 def _forward_headers(request: Request, request_id: str) -> Dict[str, str]:
@@ -2661,6 +5117,84 @@ def _forward_headers(request: Request, request_id: str) -> Dict[str, str]:
     if workflow_id:
         headers["X-Workflow-Id"] = workflow_id
     return headers
+
+
+def _prefill_request_headers(
+    *,
+    app: FastAPI,
+    request: Request,
+    request_id: str,
+    prefill_client: Dict[str, Any],
+) -> Dict[str, str]:
+    headers = _forward_headers(request, request_id)
+    if not app.state.proxy_config.enable_prefill_incarnation_guard:
+        return headers
+    cache: _DirectFeatureHandleCache = app.state.direct_feature_handle_cache
+    expected_incarnation = _bounded_epoch_token(
+        cache.worker_incarnation(str(prefill_client.get("worker_id") or ""))
+    )
+    if expected_incarnation is None:
+        return headers
+    headers[VLLM_EXPECTED_INCARNATION_HEADER] = expected_incarnation
+    cache.record_incarnation_guarded_request()
+    return headers
+
+
+def _decode_request_headers(
+    *,
+    app: FastAPI,
+    request: Request,
+    request_id: str,
+    mm_hash_lease: Optional[_DecodeMMHashLease],
+) -> Dict[str, str]:
+    headers = _forward_headers(request, request_id)
+    if (
+        mm_hash_lease is None
+        or mm_hash_lease.mode != "hash-only"
+        or not app.state.proxy_config.enable_decode_mm_hash_epoch_guard
+    ):
+        return headers
+    expected_epoch = _bounded_epoch_token(mm_hash_lease.expected_worker_epoch)
+    if expected_epoch is None:
+        raise RuntimeError(
+            "hash-only Decode epoch guard requires a confirmed worker incarnation"
+        )
+    headers[VLLM_EXPECTED_INCARNATION_HEADER] = expected_epoch
+    if not mm_hash_lease.epoch_guard_attached:
+        mm_hash_lease.cache.record_epoch_guarded_hash_only_request()
+        mm_hash_lease.epoch_guard_attached = True
+    return headers
+
+
+def _is_decode_epoch_guard_rejection(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    if response is None or int(getattr(response, "status_code", 0) or 0) != 409:
+        return False
+    return str(
+        getattr(response, "headers", {}).get(
+            VLLM_INCARNATION_MISMATCH_HEADER,
+            "",
+        )
+    ) == "1"
+
+
+def _decode_epoch_guard_rejection_epoch(
+    exc: BaseException,
+) -> Optional[str]:
+    """Return the authoritative Decode incarnation carried by a guard 409.
+
+    A guarded hash-only request is intentionally failed rather than retried.
+    The middleware response still provides a safe control-plane observation:
+    learning it here prevents a full rewarm from being followed by another
+    request carrying an already-known stale epoch.
+    """
+
+    if not _is_decode_epoch_guard_rejection(exc):
+        return None
+    response = getattr(exc, "response", None)
+    return _bounded_epoch_token(
+        getattr(response, "headers", {}).get(VLLM_INCARNATION_HEADER)
+    )
 
 
 def _extract_prefill_continuation(api: str, payload: Dict[str, Any]) -> _PrefillContinuation:
@@ -2821,9 +5355,59 @@ def _build_prefill_decode_semantic_hints(
     return hints
 
 
+def _decode_prerendered_choice_text(
+    choice: Dict[str, Any],
+    *,
+    context: _PrerenderedDecodeContext,
+) -> str:
+    token_ids = choice.get("token_ids")
+    if not isinstance(token_ids, list):
+        raise TypeError("prerendered Decode choice is missing token_ids")
+    if any(not isinstance(token_id, int) for token_id in token_ids):
+        raise TypeError("prerendered Decode choice token_ids must be integers")
+    decoder = _IncrementalTokenDecoder(
+        context.tokenizer,
+        prompt_token_ids=context.prompt_token_ids,
+        skip_special_tokens=context.skip_special_tokens,
+    )
+    return decoder.push(token_ids)
+
+
+def _adapt_prerendered_non_stream_payload(
+    payload: Dict[str, Any],
+    *,
+    request_id: str,
+    context: _PrerenderedDecodeContext,
+) -> Dict[str, Any]:
+    choices = list(payload.get("choices") or [])
+    if len(choices) != 1 or not isinstance(choices[0], dict):
+        raise ValueError(
+            "strict prerendered Decode requires exactly one response choice"
+        )
+    source_choice = dict(choices[0])
+    text = _decode_prerendered_choice_text(source_choice, context=context)
+    return {
+        "id": f"chatcmpl-{request_id}",
+        "object": "chat.completion",
+        "created": int(payload.get("created") or time.time()),
+        "model": str(payload.get("model") or context.model),
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "logprobs": None,
+                "finish_reason": source_choice.get("finish_reason") or "stop",
+                "stop_reason": None,
+            }
+        ],
+        "usage": dict(payload.get("usage") or {}),
+    }
+
+
 async def _dispatch_non_streaming_decode(
     *,
     api: str,
+    decode_api: str,
     control_plane: ServingControlPlane,
     ctx,
     decode_client: Dict[str, Any],
@@ -2831,20 +5415,39 @@ async def _dispatch_non_streaming_decode(
     decode_headers: Dict[str, str],
     response_headers: Dict[str, str],
     continuation: _PrefillContinuation,
+    prerendered_context: Optional[_PrerenderedDecodeContext] = None,
+    mm_hash_lease: Optional[_DecodeMMHashLease] = None,
 ) -> Response:
-    decode_start = time.perf_counter()
+    decode_start = time.monotonic()
     decode_response = None
     success = False
     try:
-        decode_response = await decode_client["client"].post(api, json=decode_payload, headers=decode_headers)
-        decode_http_ms = (time.perf_counter() - decode_start) * 1000.0
+        decode_response = await decode_client["client"].post(
+            decode_api,
+            json=decode_payload,
+            headers=decode_headers,
+        )
         decode_response.raise_for_status()
         decode_json = decode_response.json()
-        patched_json = _patch_non_stream_payload(api, decode_json, continuation)
-        decode_total_ms = (time.perf_counter() - decode_start) * 1000.0
-        _merge_timing_header(response_headers, "decode_http_ms", decode_http_ms)
-        _merge_timing_header(response_headers, "decode_total_ms", decode_total_ms)
+        if prerendered_context is not None:
+            patched_json = _adapt_prerendered_non_stream_payload(
+                decode_json,
+                request_id=ctx.request_id,
+                context=prerendered_context,
+            )
+        else:
+            patched_json = _patch_non_stream_payload(api, decode_json, continuation)
+        decode_ready = time.monotonic()
+        control_plane.record_stage_span(
+            ctx,
+            "decode_first_response",
+            started_at=decode_start,
+            ended_at=decode_ready,
+        )
         control_plane.commit_handoff(ctx)
+        control_plane.mark_first_token(ctx)
+        if mm_hash_lease is not None:
+            mm_hash_lease.succeed()
         success = True
         return JSONResponse(
             patched_json,
@@ -2852,46 +5455,62 @@ async def _dispatch_non_streaming_decode(
             headers=response_headers,
         )
     except Exception as exc:
+        if mm_hash_lease is not None:
+            if _is_decode_epoch_guard_rejection(exc):
+                mm_hash_lease.record_epoch_guard_rejection(
+                    _decode_epoch_guard_rejection_epoch(exc)
+                )
+            mm_hash_lease.fail()
+        logger.exception(
+            "decode non-streaming dispatch failed request_id=%s worker_id=%s exc_type=%s",
+            ctx.request_id,
+            decode_client.get("worker_id"),
+            type(exc).__name__,
+        )
         control_plane.rollback_handoff(ctx)
-        raise HTTPException(status_code=502, detail=f"decode request failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"decode request failed: {type(exc).__name__}: {exc}",
+        ) from exc
     finally:
         if decode_response is not None:
             await decode_response.aclose()
         control_plane.mark_stage_complete(
             "decode",
             decode_client["worker_id"],
-            latency_ms=(time.perf_counter() - decode_start) * 1000.0,
+            latency_ms=(time.monotonic() - decode_start) * 1000.0,
             success=success,
         )
         control_plane.finish_request(ctx.request_id)
 
 
-async def _dispatch_streaming_decode(
+async def _open_decode_stream(
     *,
     api: str,
-    control_plane: ServingControlPlane,
-    ctx,
     decode_client: Dict[str, Any],
     decode_payload: Dict[str, Any],
     decode_headers: Dict[str, str],
-    response_headers: Dict[str, str],
-    continuation: _PrefillContinuation,
-) -> StreamingResponse:
-    decode_start = time.perf_counter()
-    stream_ctx = decode_client["client"].stream("POST", api, json=decode_payload, headers=decode_headers)
+) -> _OpenedDecodeStream:
+    started_at = time.monotonic()
+    stream_ctx = decode_client["client"].stream(
+        "POST",
+        api,
+        json=decode_payload,
+        headers=decode_headers,
+    )
     decode_response = None
     stream_entered = False
     try:
         decode_response = await stream_ctx.__aenter__()
         stream_entered = True
         decode_response.raise_for_status()
-        _merge_timing_header(
-            response_headers,
-            "decode_stream_open_ms",
-            (time.perf_counter() - decode_start) * 1000.0,
+        return _OpenedDecodeStream(
+            stream_ctx=stream_ctx,
+            response=decode_response,
+            started_at=started_at,
+            opened_at=time.monotonic(),
         )
-    except Exception as exc:
-        control_plane.rollback_handoff(ctx)
+    except BaseException as exc:
         if decode_response is not None:
             try:
                 await decode_response.aclose()
@@ -2902,19 +5521,332 @@ async def _dispatch_streaming_decode(
                 await stream_ctx.__aexit__(type(exc), exc, exc.__traceback__)
             except Exception:
                 logger.exception("failed to close decode stream context after startup error")
+        raise
+
+
+async def _close_opened_decode_stream(opened: _OpenedDecodeStream) -> None:
+    try:
+        await opened.response.aclose()
+    except Exception:
+        logger.exception("failed to close opened decode response")
+    try:
+        await opened.stream_ctx.__aexit__(None, None, None)
+    except Exception:
+        logger.exception("failed to close opened decode stream context")
+
+
+def _openai_chat_stream_packet(
+    *,
+    request_id: str,
+    created: int,
+    model: str,
+    choice: Optional[Dict[str, Any]] = None,
+    usage: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    packet: Dict[str, Any] = {
+        "id": f"chatcmpl-{request_id}",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [choice] if choice is not None else [],
+    }
+    if usage is not None:
+        packet["usage"] = dict(usage)
+        packet["system_fingerprint"] = "mooncake-epd-prerendered"
+    return packet
+
+
+def _encode_sse_packet(packet: Dict[str, Any]) -> bytes:
+    return (
+        f"data: {json.dumps(packet, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    ).encode("utf-8")
+
+
+def _dispatch_prerendered_streaming_response(
+    *,
+    opened: _OpenedDecodeStream,
+    control_plane: ServingControlPlane,
+    ctx,
+    decode_client: Dict[str, Any],
+    response_headers: Dict[str, str],
+    context: _PrerenderedDecodeContext,
+    mm_hash_lease: Optional[_DecodeMMHashLease] = None,
+) -> StreamingResponse:
+    decode_response = opened.response
+    decode_start = opened.started_at
+
+    async def generate_stream():
+        success = True
+        handoff_committed = False
+        first_token_seen = False
+        role_emitted = False
+        done_seen = False
+        created = int(time.time())
+        decoder = _IncrementalTokenDecoder(
+            context.tokenizer,
+            prompt_token_ids=context.prompt_token_ids,
+            skip_special_tokens=context.skip_special_tokens,
+        )
+        try:
+            async for raw_line in decode_response.aiter_lines():
+                if raw_line is None or raw_line == "":
+                    continue
+                if not raw_line.startswith("data:"):
+                    raise RuntimeError(
+                        "strict prerendered Decode received a non-SSE response line"
+                    )
+                payload_text = raw_line[5:].strip()
+                if payload_text == "[DONE]":
+                    if not handoff_committed:
+                        raise RuntimeError(
+                            "strict prerendered Decode completed without a response packet"
+                        )
+                    done_seen = True
+                    yield b"data: [DONE]\n\n"
+                    continue
+                try:
+                    packet = json.loads(payload_text)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "strict prerendered Decode received malformed SSE JSON"
+                    ) from exc
+                if not isinstance(packet, dict):
+                    raise TypeError(
+                        "strict prerendered Decode SSE payload must be an object"
+                    )
+                if packet.get("error") is not None:
+                    raise RuntimeError(
+                        f"prerendered Decode generation error: {packet['error']}"
+                    )
+                usage = packet.get("usage")
+                choices = list(packet.get("choices") or [])
+                decoded_choices: List[Tuple[Dict[str, Any], str]] = []
+                for source in choices:
+                    if not isinstance(source, dict):
+                        raise ValueError(
+                            "strict prerendered Decode received an invalid choice"
+                        )
+                    try:
+                        choice_index = int(source.get("index", 0))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            "strict prerendered Decode received an invalid choice index"
+                        ) from exc
+                    if choice_index != 0:
+                        raise ValueError(
+                            "strict prerendered Decode received an invalid choice"
+                        )
+                    token_ids = source.get("token_ids")
+                    if not isinstance(token_ids, list) or any(
+                        not isinstance(token_id, int) for token_id in token_ids
+                    ):
+                        raise TypeError(
+                            "strict prerendered Decode stream choice is missing "
+                            "integer token_ids"
+                        )
+                    decoded_choices.append((source, decoder.push(token_ids)))
+                if not decoded_choices and not isinstance(usage, dict):
+                    raise ValueError(
+                        "strict prerendered Decode packet has neither choices nor usage"
+                    )
+                if not handoff_committed:
+                    control_plane.commit_handoff(ctx)
+                    handoff_committed = True
+                if not role_emitted:
+                    yield _encode_sse_packet(
+                        _openai_chat_stream_packet(
+                            request_id=ctx.request_id,
+                            created=created,
+                            model=context.model,
+                            choice={
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": ""},
+                                "logprobs": None,
+                                "finish_reason": None,
+                            },
+                        )
+                    )
+                    role_emitted = True
+
+                for source, delta in decoded_choices:
+                    if delta:
+                        first_chunk_ready = time.monotonic()
+                        if not first_token_seen:
+                            control_plane.record_stage_span(
+                                ctx,
+                                "decode_first_chunk_wait",
+                                started_at=decode_start,
+                                ended_at=first_chunk_ready,
+                            )
+                            control_plane.mark_first_token(
+                                ctx,
+                                emitted_at=first_chunk_ready,
+                            )
+                            first_token_seen = True
+                        yield _encode_sse_packet(
+                            _openai_chat_stream_packet(
+                                request_id=ctx.request_id,
+                                created=created,
+                                model=context.model,
+                                choice={
+                                    "index": 0,
+                                    "delta": {"content": delta},
+                                    "logprobs": None,
+                                    "finish_reason": None,
+                                },
+                            )
+                        )
+                    finish_reason = source.get("finish_reason")
+                    if finish_reason is not None:
+                        yield _encode_sse_packet(
+                            _openai_chat_stream_packet(
+                                request_id=ctx.request_id,
+                                created=created,
+                                model=context.model,
+                                choice={
+                                    "index": 0,
+                                    "delta": {"content": ""},
+                                    "logprobs": None,
+                                    "finish_reason": finish_reason,
+                                    "stop_reason": None,
+                                },
+                            )
+                        )
+                if isinstance(usage, dict):
+                    yield _encode_sse_packet(
+                        _openai_chat_stream_packet(
+                            request_id=ctx.request_id,
+                            created=created,
+                            model=context.model,
+                            usage=usage,
+                        )
+                    )
+            if not done_seen:
+                raise RuntimeError(
+                    "strict prerendered Decode stream closed without [DONE]"
+                )
+            if mm_hash_lease is not None:
+                mm_hash_lease.succeed()
+        except BaseException:
+            success = False
+            if mm_hash_lease is not None:
+                mm_hash_lease.fail()
+            if not handoff_committed:
+                control_plane.rollback_handoff(ctx)
+            raise
+        finally:
+            if success and not handoff_committed:
+                success = False
+                if mm_hash_lease is not None:
+                    mm_hash_lease.fail()
+                control_plane.rollback_handoff(ctx)
+            await _close_opened_decode_stream(opened)
+            control_plane.mark_stage_complete(
+                "decode",
+                decode_client["worker_id"],
+                latency_ms=(time.monotonic() - decode_start) * 1000.0,
+                success=success,
+            )
+            control_plane.finish_request(ctx.request_id)
+
+    return StreamingResponse(
+        generate_stream(),
+        status_code=decode_response.status_code,
+        headers=response_headers,
+        media_type="text/event-stream",
+    )
+
+
+async def _dispatch_streaming_decode(
+    *,
+    api: str,
+    decode_api: str,
+    control_plane: ServingControlPlane,
+    ctx,
+    decode_client: Dict[str, Any],
+    decode_payload: Dict[str, Any],
+    decode_headers: Dict[str, str],
+    response_headers: Dict[str, str],
+    continuation: _PrefillContinuation,
+    pipelined_dispatch: Optional[_PipelinedDecodeDispatch] = None,
+    prerendered_context: Optional[_PrerenderedDecodeContext] = None,
+    mm_hash_lease: Optional[_DecodeMMHashLease] = None,
+) -> StreamingResponse:
+    decode_start = (
+        pipelined_dispatch.started_at
+        if pipelined_dispatch is not None
+        else time.monotonic()
+    )
+    try:
+        if pipelined_dispatch is None:
+            opened = await _open_decode_stream(
+                api=decode_api,
+                decode_client=decode_client,
+                decode_payload=decode_payload,
+                decode_headers=decode_headers,
+            )
+        else:
+            opened = await pipelined_dispatch.open_task
+        decode_start = opened.started_at
+        control_plane.record_stage_span(
+            ctx,
+            "decode_stream_open",
+            started_at=decode_start,
+            ended_at=opened.opened_at,
+        )
+    except asyncio.CancelledError:
+        if mm_hash_lease is not None:
+            mm_hash_lease.fail()
+        control_plane.rollback_handoff(ctx)
         control_plane.mark_stage_complete(
             "decode",
             decode_client["worker_id"],
-            latency_ms=(time.perf_counter() - decode_start) * 1000.0,
+            latency_ms=(time.monotonic() - decode_start) * 1000.0,
             success=False,
         )
         control_plane.finish_request(ctx.request_id)
-        raise HTTPException(status_code=502, detail=f"decode request failed: {exc}") from exc
+        raise
+    except Exception as exc:
+        if mm_hash_lease is not None:
+            if _is_decode_epoch_guard_rejection(exc):
+                mm_hash_lease.record_epoch_guard_rejection()
+            mm_hash_lease.fail()
+        logger.exception(
+            "decode streaming startup failed request_id=%s worker_id=%s exc_type=%s",
+            ctx.request_id,
+            decode_client.get("worker_id"),
+            type(exc).__name__,
+        )
+        control_plane.rollback_handoff(ctx)
+        control_plane.mark_stage_complete(
+            "decode",
+            decode_client["worker_id"],
+            latency_ms=(time.monotonic() - decode_start) * 1000.0,
+            success=False,
+        )
+        control_plane.finish_request(ctx.request_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"decode request failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    decode_response = opened.response
+
+    if prerendered_context is not None:
+        return _dispatch_prerendered_streaming_response(
+            opened=opened,
+            control_plane=control_plane,
+            ctx=ctx,
+            decode_client=decode_client,
+            response_headers=response_headers,
+            context=prerendered_context,
+            mm_hash_lease=mm_hash_lease,
+        )
 
     async def generate_stream():
         success = True
         first_line_seen = False
-        first_content_seen = False
+        first_token_seen = False
         pending_prefix = continuation.text if continuation.active else ""
         try:
             async for raw_line in decode_response.aiter_lines():
@@ -2923,16 +5855,11 @@ async def _dispatch_streaming_decode(
                 if raw_line == "":
                     continue
                 line_out = raw_line
+                packet = None
                 if raw_line.startswith("data:"):
                     payload = raw_line[5:].strip()
                     if payload == "[DONE]":
                         line_out = "data: [DONE]"
-                    elif not continuation.active and first_content_seen:
-                        # Prompt-only EPD has no semantic continuation to
-                        # merge. After first-content timing is recorded, pass
-                        # subsequent SSE packets through unchanged instead of
-                        # JSON parsing and reserializing every decoded token.
-                        line_out = raw_line
                     else:
                         try:
                             packet = json.loads(payload)
@@ -2945,21 +5872,26 @@ async def _dispatch_streaming_decode(
                                 continuation=continuation,
                                 pending_prefix=pending_prefix,
                             )
-                            packet_timings: Dict[str, float] = {}
-                            now_ms = (time.perf_counter() - decode_start) * 1000.0
-                            if not first_line_seen:
-                                packet_timings["decode_first_event_ms"] = now_ms
-                            if (not first_content_seen) and _packet_content_delta(packet):
-                                packet_timings["decode_first_content_ms"] = now_ms
-                                first_content_seen = True
-                            if packet_timings:
-                                packet = _attach_packet_timings(packet, packet_timings)
                             line_out = f"data: {json.dumps(packet, ensure_ascii=False)}"
                 if not first_line_seen:
                     control_plane.commit_handoff(ctx)
                     first_line_seen = True
+                if (
+                    not first_token_seen
+                    and isinstance(packet, dict)
+                    and _stream_packet_has_visible_token(api, packet)
+                ):
+                    first_chunk_ready = time.monotonic()
+                    control_plane.record_stage_span(
+                        ctx,
+                        "decode_first_chunk_wait",
+                        started_at=decode_start,
+                        ended_at=first_chunk_ready,
+                    )
+                    control_plane.mark_first_token(ctx, emitted_at=first_chunk_ready)
+                    first_token_seen = True
                 yield (line_out + "\n\n").encode("utf-8")
-        except Exception:
+        except BaseException:
             success = False
             if not first_line_seen:
                 control_plane.rollback_handoff(ctx)
@@ -2968,17 +5900,14 @@ async def _dispatch_streaming_decode(
             if success and not first_line_seen:
                 success = False
                 control_plane.rollback_handoff(ctx)
-            try:
-                await decode_response.aclose()
-            finally:
-                await stream_ctx.__aexit__(None, None, None)
-                control_plane.mark_stage_complete(
-                    "decode",
-                    decode_client["worker_id"],
-                    latency_ms=(time.perf_counter() - decode_start) * 1000.0,
-                    success=success,
-                )
-                control_plane.finish_request(ctx.request_id)
+            await _close_opened_decode_stream(opened)
+            control_plane.mark_stage_complete(
+                "decode",
+                decode_client["worker_id"],
+                latency_ms=(time.monotonic() - decode_start) * 1000.0,
+                success=success,
+            )
+            control_plane.finish_request(ctx.request_id)
 
     media_type = decode_response.headers.get("content-type", "text/event-stream")
     return StreamingResponse(
@@ -3007,6 +5936,26 @@ def _patch_stream_packet(
     if "usage" in packet:
         packet["usage"] = _patch_usage(dict(packet.get("usage") or {}), continuation)
     return packet, pending_prefix
+
+
+def _stream_packet_has_visible_token(api: str, packet: Dict[str, Any]) -> bool:
+    for choice in list(packet.get("choices") or []):
+        if not isinstance(choice, dict):
+            continue
+        if api == "/v1/chat/completions":
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                return True
+            if isinstance(content, list) and content:
+                return True
+            continue
+        text = choice.get("text")
+        if isinstance(text, str) and text:
+            return True
+    return False
 
 
 def _patch_non_stream_payload(

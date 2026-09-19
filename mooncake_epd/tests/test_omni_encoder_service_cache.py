@@ -89,8 +89,38 @@ def test_qwen25_omni_worker_exact_hidden_segment_cache_hits_on_repeat():
     assert len(second.outputs) == 2
     assert second.cache_stats["full_hit_batches"] >= 1
     assert second.cache_stats["image_encoder_calls"] == 1
+    assert second.cache_stats["stable_key_lookups"] == 2
+    assert second.cache_stats["tensor_key_lookups"] == 0
     assert torch.equal(first.outputs[0].bundle.last_hidden, second.outputs[0].bundle.last_hidden)
     assert first.outputs[0].bundle.metadata["kind"] == "qwen2_5_omni_image_hidden_state"
+
+
+def test_qwen25_omni_worker_cache_keys_bypass_full_tensor_hash(monkeypatch):
+    model = _FakeOmniModel()
+    worker = Qwen25OmniImageEncoderWorker(model, _FakeProcessor(), torch.device("cpu"))
+    images = [_image((10, 20, 30)), _image((40, 50, 60))]
+
+    def _fail_full_tensor_hash(*_args, **_kwargs):
+        raise AssertionError("worker must propagate authoritative cache keys")
+
+    monkeypatch.setattr(worker.cache, "_hash_tensor_into", _fail_full_tensor_hash)
+    first = worker.encode_images(
+        images,
+        image_ids=["feature-a", "feature-b"],
+        cache_keys=["source-sha-a", "source-sha-b"],
+        prompt="describe",
+    )
+    second = worker.encode_images(
+        images,
+        image_ids=["feature-a", "feature-b"],
+        cache_keys=["source-sha-a", "source-sha-b"],
+        prompt="describe",
+    )
+
+    assert model.calls == 1
+    assert torch.equal(first.outputs[0].bundle.last_hidden, second.outputs[0].bundle.last_hidden)
+    assert second.cache_stats["stable_key_lookups"] == 2
+    assert second.cache_stats["tensor_key_lookups"] == 0
 
 
 def test_encoder_service_uses_omni_batch_cache_and_publishes_handles(tmp_path):
@@ -118,7 +148,9 @@ def test_encoder_service_uses_omni_batch_cache_and_publishes_handles(tmp_path):
     assert p1["count"] == 2
     assert p2["count"] == 2
     assert p2["encoder_family"] == "qwen2_5_omni"
-    assert p2["omni_hidden_prefix_cache"]["feature_bundle_cache"]["hits"] >= 2
+    assert p2["omni_hidden_prefix_cache"]["full_hit_batches"] >= 1
+    assert p2["omni_hidden_prefix_cache"]["stable_key_lookups"] == 2
+    assert p2["omni_hidden_prefix_cache"]["tensor_key_lookups"] == 0
     provider = FeatureHandleProvider(FeatureHandleProviderConfig(store_dirs=(tmp_path / "store",)))
     resolved = provider.resolve_from_sources({"mm_feature_handles": [p2["handles"][0]]}, device="cpu", dtype=torch.float32)
     assert resolved is not None

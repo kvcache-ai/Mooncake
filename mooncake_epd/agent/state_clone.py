@@ -41,7 +41,6 @@ class BranchState:
     created_at: float = field(default_factory=time.time)
     tokens_generated: int = 0
     score: float = 0.0
-    clone_semantics: str = "unknown"
 
 
 @dataclass
@@ -138,7 +137,6 @@ class AgentStateCloner:
             source_cache_id=descriptor.state_id,
             kv_state_id=descriptor.state_id,
             target_node_id=descriptor.owner_node_id,
-            clone_semantics="registered_owner_state",
         )
         return descriptor
 
@@ -166,7 +164,6 @@ class AgentStateCloner:
             branch_id=branch_id,
             parent_id=parent_branch_id,
             source_cache_id=source_id,
-            clone_semantics="same_node_tensor_zero_copy",
         )
         self._branches[branch_id] = branch
 
@@ -180,39 +177,6 @@ class AgentStateCloner:
         )
 
         return branch
-
-    def clone_same_node_zero_copy(
-        self,
-        source_id: str,
-        branch_id: str,
-        parent_branch_id: Optional[str] = None,
-    ) -> BranchState:
-        """Explicit same-node tensor KVCache zero-copy clone.
-
-        This method is a semantic alias for the legacy ``clone_state`` tensor path:
-        it only increments the local in-process refcount and never claims
-        cross-node physical sharing.
-        """
-
-        return self.clone_state(
-            source_id,
-            branch_id,
-            parent_branch_id=parent_branch_id,
-        )
-
-    def fork_same_node_zero_copy_branches(
-        self,
-        source_id: str,
-        num_branches: int,
-        source_branch_id: Optional[str] = None,
-    ) -> List[BranchState]:
-        """Fork local tensor KVCache branches with same-node zero-copy semantics."""
-
-        return self.fork_branches(
-            source_id,
-            num_branches,
-            source_branch_id=source_branch_id,
-        )
 
     def fork_branches(
         self,
@@ -269,19 +233,12 @@ class AgentStateCloner:
             share_remote_descriptor=share_remote_descriptor,
             metadata=metadata,
         )
-        if bool(child.metadata.get("remote_descriptor_shared")):
-            clone_semantics = "cross_node_descriptor_share"
-        elif child.owner_node_id == self.kv_state_store.node_id:
-            clone_semantics = "same_node_block_ref_zero_copy"
-        else:
-            clone_semantics = "cross_node_materialized_copy"
         branch = BranchState(
             branch_id=branch_id,
             parent_id=parent_branch_id,
             source_cache_id=source_state_id,
             kv_state_id=child.state_id,
             target_node_id=target_node_id or child.owner_node_id,
-            clone_semantics=clone_semantics,
         )
         self._branches[branch_id] = branch
         self._branch_to_kv_state[branch_id] = child.state_id
@@ -290,89 +247,15 @@ class AgentStateCloner:
         self._total_clone_time_ms += clone_time_ms
         logger.info(
             "Cloned KVState '%s' -> branch '%s' "
-            "(owner=%s, target=%s, semantics=%s, time=%.4fms)",
+            "(owner=%s, target=%s, zero-copy=%s, time=%.4fms)",
             source_state_id,
             branch_id,
             child.owner_node_id,
             branch.target_node_id,
-            clone_semantics,
+            bool(child.metadata.get("remote_descriptor_shared")) or child.owner_node_id == self.kv_state_store.node_id,
             clone_time_ms,
         )
         return branch
-
-    def clone_kv_same_node_zero_copy(
-        self,
-        source_state_id: str,
-        branch_id: str,
-        *,
-        parent_branch_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> BranchState:
-        """Explicit same-node BlockRef zero-copy clone.
-
-        The child descriptor owns no new physical pages; it increments the
-        authoritative local KV directory refcounts via ``PagedKVManager.fork_refs``.
-        """
-
-        if self.kv_state_store is None:
-            raise RuntimeError("clone_kv_same_node_zero_copy requires a MooncakeKVStateStore")
-        merged_metadata = {"clone_semantics": "same_node_block_ref_zero_copy"}
-        merged_metadata.update(metadata or {})
-        return self.clone_kv_state(
-            source_state_id,
-            branch_id,
-            parent_branch_id=parent_branch_id,
-            target_node_id=self.kv_state_store.node_id,
-            share_remote_descriptor=False,
-            metadata=merged_metadata,
-        )
-
-    def share_kv_state_descriptor_cross_node(
-        self,
-        source_state_id: str,
-        branch_id: str,
-        *,
-        target_node_id: str,
-        parent_branch_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> BranchState:
-        """Create a cross-node descriptor-share branch, not a physical zero-copy clone.
-
-        The branch points at owner-node blocks and must be materialized before any
-        target-node write.  This is the explicit API to use when Agent planning
-        wants cheap cross-node fan-out without pretending local physical IDs are
-        valid on the target node.
-        """
-
-        if not target_node_id:
-            raise ValueError("target_node_id is required for cross-node descriptor sharing")
-        if self.kv_state_store is None:
-            raise RuntimeError("share_kv_state_descriptor_cross_node requires a MooncakeKVStateStore")
-        if str(target_node_id) == str(self.kv_state_store.node_id):
-            raise ValueError("target_node_id must differ from the owner node for cross-node descriptor sharing")
-        merged_metadata = {"clone_semantics": "cross_node_descriptor_share"}
-        merged_metadata.update(metadata or {})
-        return self.clone_kv_state(
-            source_state_id,
-            branch_id,
-            parent_branch_id=parent_branch_id,
-            target_node_id=target_node_id,
-            share_remote_descriptor=True,
-            metadata=merged_metadata,
-        )
-
-    def materialize_cross_node_descriptor_for_write(
-        self,
-        branch_id: str,
-        *,
-        target_node_id: Optional[str] = None,
-    ) -> "KVStateDescriptor":
-        """Materialize a descriptor-shared branch before target-node writes."""
-
-        return self.materialize_branch_for_write(
-            branch_id,
-            target_node_id=target_node_id,
-        )
 
     def fork_kv_branches(
         self,
@@ -441,7 +324,6 @@ class AgentStateCloner:
         if branch is not None:
             branch.kv_state_id = descriptor.state_id
             branch.target_node_id = descriptor.owner_node_id
-            branch.clone_semantics = "cross_node_materialized_for_write"
         return descriptor
 
     def get_branch_kv_cache(

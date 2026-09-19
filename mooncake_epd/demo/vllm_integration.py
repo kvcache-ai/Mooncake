@@ -1,63 +1,51 @@
-"""Generate runnable vLLM + MooncakeConnector configs for this checkout.
+"""Generate runnable vLLM + MooncakeConnector configs for this repo.
 
-Model and Python-environment locations are resolved from deployment variables
-or repository-relative defaults. The generated commands opt into the repo-local
-MooncakeConnector so layered transfer scheduling and serving control-plane
-metadata are available on the real vLLM serving path.
+Targets the local real-model environment:
+- model: ``MOONCAKE_EPD_MODEL_PATH`` or /data01/LWX/Qwen3-VL-8B-Instruct
+- prefill GPU: 3
+- decode GPU: 4
+
+The generated commands opt into the repo-local external MooncakeConnector
+module so layered transfer scheduling and serving control-plane metadata are
+available on the real vLLM serving path.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
-import secrets
 import shlex
 import socket
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from urllib.parse import urlsplit
+
+from mooncake_epd.core.control.vllm_incarnation import (
+    VLLM_INCARNATION_ENDPOINT,
+    VLLM_INCARNATION_MIDDLEWARE,
+)
+from mooncake_epd.core.transfer.rdma import (
+    default_rdma_bind_address,
+    detect_rdma_capabilities,
+    resolve_rdma_protocol,
+)
 
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-def _resolve_venv_root() -> Path:
-    override = os.getenv("MOONCAKE_EPD_VENV_ROOT")
-    candidates = []
-    if override:
-        candidates.append(Path(override).expanduser())
-    if sys.prefix != sys.base_prefix:
-        candidates.append(Path(sys.prefix))
-    candidates.extend(
-        [
-            REPO_ROOT.parent / ".venv",
-            REPO_ROOT.parent.parent / "venv_mooncake",
-            REPO_ROOT.parent / "venv_mooncake",
-        ]
-    )
-    for candidate in candidates:
-        if (candidate / "bin" / "python").exists():
-            return candidate
-    return candidates[0]
-
-
-def _resolve_model_path() -> str:
-    raw = os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct")
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        path = REPO_ROOT.parent / path
-    return str(path.resolve(strict=False))
-
-
-# Backward-compatible snapshot for runners that build subprocess commands at
-# import time. Config generation resolves the deployment root again so an
-# explicit environment override remains authoritative.
-VENV_ROOT = _resolve_venv_root()
-MODEL_PATH = str(REPO_ROOT.parent / "models" / "Qwen3-VL-8B-Instruct")
+VENV_ROOT = REPO_ROOT.parent / "venv_mooncake"
+MODEL_PATH = os.getenv("MOONCAKE_EPD_MODEL_PATH", "/data01/LWX/Qwen3-VL-8B-Instruct")
 CONNECTOR_MODULE_PATH = "mooncake_epd.core.control.vllm_mooncake_connector"
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -76,7 +64,7 @@ def _pick_free_port(preferred: int, host: str = "127.0.0.1") -> int:
 
 @dataclass
 class VLLMDisaggConfig:
-    model: str = field(default_factory=_resolve_model_path)
+    model: str = MODEL_PATH
     prefill_port: int = 8100
     decode_port: int = 8200
     proxy_port: int = 8000
@@ -88,22 +76,11 @@ class VLLMDisaggConfig:
     tensor_parallel_size: int = 1
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.65
-    # Keep vLLM scheduler capacity explicit in benchmark artifacts. ``None``
-    # preserves upstream defaults; production tuning can raise these only after
-    # a real workload proves a gain.
-    max_num_batched_tokens: Optional[int] = None
-    max_num_seqs: Optional[int] = None
-    # Benchmark and correctness-sensitive deployments must not silently inherit
-    # a model repository's sampling defaults. ``None`` retains vLLM's default;
-    # runners opt into ``vllm`` explicitly and record it in their artifact.
-    generation_config: Optional[str] = None
     protocol: str = "tcp"
-    # E→P FeatureBundle and P→D KV can use different data-plane transports.
-    # On a host where an RDMA HCA cannot register the short-lived E→P buffers,
-    # retaining TCP for E→P still lets the persistent vLLM KV connector use
-    # RDMA.  None follows the main P→D protocol (except SHM, whose direct
-    # engine fallback remains TCP until CUDA-IPC registration is available).
-    direct_engine_protocol: Optional[str] = None
+    transport_backend: str = "auto"
+    rdmacm_bind_address: str = ""
+    rdmacm_remote_address: str = ""
+    rdmacm_port_offset: int = 2711
     prefill_gpu: int = 3
     decode_gpu: int = 4
     prefill_gpus: Tuple[int, ...] = ()
@@ -115,67 +92,72 @@ class VLLMDisaggConfig:
     local_hostname: str = "127.0.0.1"
     global_segment_size: int = 1073741824
     local_buffer_size: int = 268435456
-    # Qwen-VL real serving showed that larger layer groups reduce P→D
-    # peer-buffer handshakes and Decode first-token latency without fallback.
-    # lpg32/64MiB/512desc improved avg TTFT from ~315ms to ~258ms versus the
-    # earlier lpg16/32MiB/256desc default on the same 2P4D Qwen3-VL setup.
-    layers_per_group: int = 32
+    layers_per_group: int = 4
     group_delay_ms: float = 0.0
-    max_group_bytes: int = 64 * 1024 * 1024
-    max_transfer_descriptors: int = 512
-    max_transfer_bytes: int = 64 * 1024 * 1024
-    # ``0`` selects a protocol-aware sender topology. A small NVLink/CUDA-IPC
-    # sender pool overlaps host-side planning with P2P submission while
-    # avoiding the link contention observed with four independent streams.
-    # TCP/RDMA keep the established four-worker default for network progress.
-    transfer_workers: int = 0
+    max_group_bytes: int = 16 * 1024 * 1024
+    max_transfer_descriptors: int = 64
+    max_transfer_bytes: int = 16 * 1024 * 1024
+    enable_descriptor_coalescing: bool = field(
+        default_factory=lambda: _env_flag(
+            "MOONCAKE_EPD_ENABLE_DESCRIPTOR_COALESCING",
+            True,
+        )
+    )
+    connector_metrics_flush_interval_s: float = 0.25
+    connector_metrics_max_pending_records: int = 64
     allow_transfer_fallback: bool = False
     transfer_retry_attempts: int = 6
     transfer_retry_backoff_ms: float = 250.0
-    # Explicit P->D locality pairs. When empty, nvlink_intra deployments pair
-    # list-aligned Prefill/Decode workers so callers can order GPU lists by
-    # physical topology while retaining admission-time overload escape.
-    prefill_decode_affinity: Tuple[Tuple[str, str], ...] = ()
     proxy_warn_rho: float = 0.85
     proxy_critical_rho: float = 0.95
     proxy_max_backpressure_delay_ms: float = 150.0
     owner_shards: int = 1
     kv_directory_rpc_url: Optional[str] = None
     workflow_registry_wal_path: Optional[str] = None
+    workflow_registry_wal_fsync_interval_s: float = 0.25
+    workflow_registry_wal_max_pending_records: int = 64
+    enable_decode_pipeline: bool = False
+    decode_pipeline_max_inflight: int = 0
+    enable_prerendered_decode: bool = False
+    enable_decode_mm_hash_cache: bool = False
+    decode_mm_hash_cache_max_entries: int = 64
+    decode_mm_hash_cache_ttl_s: float = 120.0
+    decode_mm_hash_epoch_poll_s: float = 1.0
+    decode_mm_hash_epoch_probe_timeout_s: float = 0.5
+    decode_mm_hash_epoch_freshness_s: float = 0.0
+    decode_mm_hash_epoch_endpoint: str = "/metrics"
+    enable_decode_mm_hash_epoch_guard: bool = False
+    enable_decode_mm_hash_epoch_probe_singleflight: bool = True
     connector_metrics_dir: Optional[str] = None
-    # Group-level connector accounting is written periodically and at terminal
-    # boundaries; eager JSON snapshots are too expensive on the TCP P→D path.
-    connector_metrics_flush_interval_ms: float = 250.0
+    enable_mm_prefetch: bool = True
     mm_prefetch_mode: str = "asset_bytes"
     prefill_supports_feature_handles: bool = False
     encoder_service_url: Optional[str] = None
     prefill_direct_buffer_service_url: Optional[str] = None
-    prefill_direct_buffer_service_urls: Tuple[str, ...] = ()
     enable_prefill_direct_feature_buffer_routes: bool = False
-    enable_direct_feature_handle_cache: bool = False
-    direct_feature_handle_cache_max_entries: int = 4096
-    direct_feature_handle_cache_ttl_s: float = 600.0
-    direct_feature_buffer_root_routes: bool = False
-    direct_feature_target_mode: str = "registered_tensor"
-    direct_feature_register_memory: bool = True
-    direct_feature_persistent_cache: bool = False
-    direct_feature_cache_max_entries: int = 64
-    direct_feature_cache_max_bytes: int = 2 * 1024 * 1024 * 1024
-    direct_feature_buffer_auth_token: Optional[str] = None
+    direct_feature_buffer_root_routes: bool = True
     release_direct_feature_buffers_after_prefill: bool = True
+    enable_direct_feature_handle_cache: bool = False
+    direct_feature_handle_cache_max_entries: int = 64
+    direct_feature_handle_cache_max_bytes: int = 4 * 1024**3
+    direct_feature_handle_cache_ttl_s: float = 600.0
+    prefill_incarnation_poll_s: float = 0.0
+    prefill_incarnation_poll_jitter_ratio: float = 0.0
+    prefill_incarnation_failure_threshold: int = 3
+    prefill_incarnation_probe_timeout_s: float = 0.5
+    prefill_incarnation_freshness_s: float = 0.0
+    prefill_incarnation_endpoint: str = VLLM_INCARNATION_ENDPOINT
+    enable_prefill_incarnation_guard: bool = False
+    enable_prefill_incarnation_probe_singleflight: bool = True
+    enable_prefill_render_cache: bool = False
+    prefill_render_cache_max_entries: int = 128
+    prefill_render_cache_max_bytes: int = 512 * 1024**2
+    prefill_render_cache_ttl_s: float = 600.0
+    enable_client_mm_uuid_references: bool = False
+    upstream_max_connections: int = 32
+    upstream_max_keepalive_connections: int = 16
+    upstream_keepalive_expiry_s: float = 1.0
     strict_no_fallback: bool = False
-    # ``render_generate`` is the verified OpenAI-compatible continuation path.
-    # The one-call ``openai_prompt_only`` variant may be selected explicitly
-    # only for a vLLM version/workload pair that has passed output-equivalence
-    # validation; see the proxy's strict-serving gate.
-    prefill_dispatch_mode: str = "render_generate"
-    allow_unverified_openai_prompt_only: bool = False
-    feature_handle_store_url: Optional[str] = None
-    feature_handle_store_id: Optional[str] = None
-    feature_handle_store_config: Optional[str] = None
-    feature_handle_store_timeout_s: float = 30.0
-    feature_handle_require_checksum: bool = False
-    feature_handle_http_binary_payload: bool = False
 
     @property
     def metadata_server(self) -> str:
@@ -185,38 +167,84 @@ class VLLMDisaggConfig:
     def master_server(self) -> str:
         return f"{self.local_hostname}:{self.master_port}"
 
+    @property
+    def data_protocol(self) -> str:
+        caps = detect_rdma_capabilities()
+        # An RNIC is not useful for two workers on the same host: the kernel
+        # resolves the destination as a local route and rdma_cm cannot create a
+        # hardware iWARP path. A remote RDMA address explicitly marks a
+        # cross-host deployment.
+        return resolve_rdma_protocol(
+            self.protocol,
+            caps,
+            same_host=(
+                self.protocol == "auto"
+                and not bool(self.rdmacm_remote_address)
+            ),
+        )
+
+    @property
+    def mooncake_protocol(self) -> str:
+        return "rdma" if self.data_protocol == "rdma" else "tcp"
+
+    @property
+    def selected_transport_backend(self) -> str:
+        requested = str(self.transport_backend).strip().lower()
+        if requested and requested != "auto":
+            return requested
+        if self.data_protocol == "rdmacm":
+            return "rdmacm_staged"
+        return "mooncake_engine_direct"
+
+    @property
+    def selected_rdmacm_bind_address(self) -> str:
+        if self.rdmacm_bind_address:
+            return self.rdmacm_bind_address
+        return default_rdma_bind_address(detect_rdma_capabilities())
+
     def to_mooncake_json(self) -> Dict[str, object]:
         return {
             "local_hostname": self.local_hostname,
             "metadata_server": self.metadata_server,
             "global_segment_size": self.global_segment_size,
             "local_buffer_size": self.local_buffer_size,
-            "protocol": self.protocol,
+            "protocol": self.mooncake_protocol,
             "device_name": "",
             "master_server_address": self.master_server,
         }
 
     def kv_transfer_config(self, role: str, engine_id: str) -> Dict[str, object]:
         extra_config: Dict[str, object] = {
-            "mooncake_protocol": self.protocol,
-            "num_workers": self.effective_transfer_workers,
+            "mooncake_protocol": self.mooncake_protocol,
+            "num_workers": 4,
             "layered_kv_transfer": True,
             "layers_per_group": self.layers_per_group,
             "group_delay_ms": self.group_delay_ms,
             "max_group_bytes": self.max_group_bytes,
             "max_transfer_descriptors": self.max_transfer_descriptors,
             "max_transfer_bytes": self.max_transfer_bytes,
+            "enable_descriptor_coalescing": self.enable_descriptor_coalescing,
+            "connector_metrics_flush_interval_s": (
+                self.connector_metrics_flush_interval_s
+            ),
+            "connector_metrics_max_pending_records": (
+                self.connector_metrics_max_pending_records
+            ),
             "allow_transfer_fallback": self.allow_transfer_fallback,
             "transfer_retry_attempts": self.transfer_retry_attempts,
             "transfer_retry_backoff_ms": self.transfer_retry_backoff_ms,
-            "transport_backend": "mooncake_engine_direct",
+            "transport_backend": self.selected_transport_backend,
         }
+        if self.selected_transport_backend in {"rdmacm", "rdmacm_staged", "iwarp"}:
+            extra_config.update(
+                {
+                    "rdmacm_bind_address": self.selected_rdmacm_bind_address,
+                    "rdmacm_remote_address": self.rdmacm_remote_address,
+                    "rdmacm_port_offset": self.rdmacm_port_offset,
+                }
+            )
         if self.connector_metrics_dir:
             extra_config["connector_metrics_dir"] = self.connector_metrics_dir
-            extra_config["connector_metrics_flush_interval_ms"] = max(
-                0.0,
-                float(self.connector_metrics_flush_interval_ms),
-            )
         return {
             "kv_connector": "MooncakeConnector",
             "kv_role": role,
@@ -224,32 +252,6 @@ class VLLMDisaggConfig:
             "kv_connector_module_path": CONNECTOR_MODULE_PATH,
             "kv_connector_extra_config": extra_config,
         }
-
-    @property
-    def effective_transfer_workers(self) -> int:
-        configured = int(self.transfer_workers or 0)
-        if configured > 0:
-            return configured
-        if str(self.protocol).strip().lower() == "nvlink_intra":
-            return 2
-        return 4
-
-    @property
-    def resolved_prefill_decode_affinity(self) -> Tuple[Tuple[str, str], ...]:
-        if self.prefill_decode_affinity:
-            return tuple(
-                (str(prefill).strip(), str(decode).strip())
-                for prefill, decode in self.prefill_decode_affinity
-                if str(prefill).strip() and str(decode).strip()
-            )
-        if str(self.protocol).strip().lower() != "nvlink_intra":
-            return ()
-        prefill_count = len(self.prefill_gpus or (self.prefill_gpu,))
-        decode_count = len(self.decode_gpus or (self.decode_gpu,))
-        return tuple(
-            (f"prefill-{idx}", f"decode-{idx}")
-            for idx in range(min(prefill_count, decode_count))
-        )
 
 
 def _expand_ints(primary: int, values: Tuple[int, ...], count: int, *, fill: int = 0) -> list[int]:
@@ -264,20 +266,21 @@ def _expand_ints(primary: int, values: Tuple[int, ...], count: int, *, fill: int
 
 def validate_environment(config: Optional[VLLMDisaggConfig] = None) -> Dict[str, object]:
     config = config or VLLMDisaggConfig()
-    venv_root = _resolve_venv_root()
     checks = {
         "model_exists": Path(config.model).exists(),
-        "venv_exists": venv_root.exists(),
-        "vllm_bin": str(venv_root / "bin" / "vllm"),
-        "mooncake_master_bin": str(venv_root / "bin" / "mooncake_master"),
-        "python_bin": str(venv_root / "bin" / "python"),
+        "venv_exists": VENV_ROOT.exists(),
+        "vllm_bin": str(VENV_ROOT / "bin" / "vllm"),
+        "mooncake_master_bin": str(VENV_ROOT / "bin" / "mooncake_master"),
+        "python_bin": str(VENV_ROOT / "bin" / "python"),
         "proxy_script": str(REPO_ROOT / "scripts" / "vllm_disagg_proxy.py"),
         "connector_module": CONNECTOR_MODULE_PATH,
     }
-    checks["vllm_bin_exists"] = Path(checks["vllm_bin"]).exists()
-    checks["mooncake_master_exists"] = Path(checks["mooncake_master_bin"]).exists()
-    checks["python_bin_exists"] = Path(checks["python_bin"]).exists()
-    checks["proxy_script_exists"] = Path(checks["proxy_script"]).exists()
+    checks["vllm_bin_exists"] = Path(str(checks["vllm_bin"])).exists()
+    checks["mooncake_master_exists"] = Path(
+        str(checks["mooncake_master_bin"])
+    ).exists()
+    checks["python_bin_exists"] = Path(str(checks["python_bin"])).exists()
+    checks["proxy_script_exists"] = Path(str(checks["proxy_script"])).exists()
     return checks
 
 
@@ -287,38 +290,17 @@ def _common_env_block(
     *,
     bootstrap_port: Optional[int] = None,
 ) -> str:
-    # ``REPO_ROOT`` is the package root (``.../mooncake_epd``); importing the
-    # package requires the containing Mooncake checkout on PYTHONPATH.  Keep this
-    # explicit so generated scripts are portable between the standalone tree and
-    # the merged Mooncake repository.
     parent_path = str(REPO_ROOT.parent)
-    protocol = str(config.protocol).lower()
-    direct_engine_protocol = str(
-        config.direct_engine_protocol
-        or ("tcp" if protocol == "shm" else protocol)
-    ).lower()
-    venv_root = _resolve_venv_root()
     lines = [
         "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY",
         "export NO_PROXY=127.0.0.1,localhost",
         f"export PYTHONPATH={parent_path}:${{PYTHONPATH:-}}",
-        "export MOONCAKE_EPD_ENABLE_VLLM_PATCHES=1",
-        f"source {shlex.quote(str(venv_root / 'bin' / 'activate'))}",
+        f"source {VENV_ROOT}/bin/activate",
         f"export MOONCAKE_CONFIG_PATH={mooncake_json}",
         f"export MOONCAKE_MASTER={config.master_server}",
         f"export MOONCAKE_TE_META_DATA_SERVER={config.metadata_server}",
-        f"export MOONCAKE_PROTOCOL={protocol}",
-        f"export MOONCAKE_EPD_DIRECT_ENGINE_PROTOCOL={direct_engine_protocol}",
-        (
-            "export MC_FORCE_TCP=1"
-            if protocol == "tcp"
-            else "unset MC_FORCE_TCP"
-        ),
-        (
-            "export MC_INTRANODE_NVLINK=1"
-            if protocol == "nvlink_intra"
-            else "unset MC_INTRANODE_NVLINK"
-        ),
+        f"export MOONCAKE_PROTOCOL={config.mooncake_protocol}",
+        f"export MOONCAKE_EPD_DATA_PROTOCOL={config.data_protocol}",
         f"export MOONCAKE_LOCAL_HOSTNAME={config.local_hostname}",
         f"export VLLM_HOST_IP={config.local_hostname}",
         f"export MOONCAKE_GLOBAL_SEGMENT_SIZE={config.global_segment_size}",
@@ -327,16 +309,13 @@ def _common_env_block(
         "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE=${MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE:-1}",
         "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_ENTRIES=${MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_ENTRIES:-64}",
         "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_BYTES=${MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_BYTES:-2147483648}",
-        f"export MOONCAKE_EPD_REPO_ROOT={REPO_ROOT.parent}",
     ]
-    if protocol == "rdma":
-        # libibverbs must enable fork safety before vLLM initializes CUDA or
-        # starts EngineCore workers.  Without this, CUDA memory registration
-        # can fail with `fork compatibility: Invalid argument` on irdma.
+    if config.selected_transport_backend in {"rdmacm", "rdmacm_staged", "iwarp"}:
         lines.extend(
             [
-                "export RDMAV_FORK_SAFE=1",
-                "export IBV_FORK_SAFE=1",
+                f"export MOONCAKE_EPD_RDMACM_BIND_ADDRESS={config.selected_rdmacm_bind_address}",
+                f"export MOONCAKE_EPD_RDMACM_REMOTE_ADDRESS={config.rdmacm_remote_address}",
+                f"export MOONCAKE_EPD_RDMACM_PORT_OFFSET={config.rdmacm_port_offset}",
             ]
         )
     if config.strict_no_fallback:
@@ -347,34 +326,6 @@ def _common_env_block(
                 "export MOONCAKE_EPD_ALLOW_TRANSFER_FALLBACK=0",
             ]
         )
-    if config.feature_handle_store_url:
-        lines.extend(
-            [
-                f"export MOONCAKE_EPD_FEATURE_HANDLE_STORE_URL={config.feature_handle_store_url}",
-                f"export MOONCAKE_STORE_URL={config.feature_handle_store_url}",
-            ]
-        )
-    if config.feature_handle_store_id:
-        lines.append(
-            f"export MOONCAKE_EPD_FEATURE_HANDLE_STORE_ID={config.feature_handle_store_id}"
-        )
-    if config.feature_handle_store_config:
-        lines.append(
-            f"export MOONCAKE_EPD_FEATURE_HANDLE_STORE_CONFIG={config.feature_handle_store_config}"
-        )
-    if config.feature_handle_store_timeout_s > 0:
-        lines.append(
-            "export MOONCAKE_EPD_FEATURE_HANDLE_STORE_TIMEOUT_S="
-            f"{float(config.feature_handle_store_timeout_s):.3f}"
-        )
-        lines.append(
-            "export MOONCAKE_EPD_FEATURE_HANDLE_TIMEOUT_S="
-            f"{float(config.feature_handle_store_timeout_s):.3f}"
-        )
-    if config.feature_handle_require_checksum:
-        lines.append("export MOONCAKE_EPD_FEATURE_HANDLE_REQUIRE_CHECKSUM=1")
-    if config.feature_handle_http_binary_payload:
-        lines.append("export MOONCAKE_EPD_FEATURE_HANDLE_HTTP_BINARY=1")
     if bootstrap_port is not None:
         lines.append(f"export VLLM_MOONCAKE_BOOTSTRAP_PORT={bootstrap_port}")
     if config.connector_metrics_dir:
@@ -388,17 +339,58 @@ def _json_flag(payload: Dict[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _vllm_scheduler_flags(config: VLLMDisaggConfig) -> str:
-    flags: list[str] = []
-    if config.max_num_batched_tokens is not None and int(config.max_num_batched_tokens) > 0:
-        flags.append(f"--max-num-batched-tokens {int(config.max_num_batched_tokens)}")
-    if config.max_num_seqs is not None and int(config.max_num_seqs) > 0:
-        flags.append(f"--max-num-seqs {int(config.max_num_seqs)}")
-    return (" ".join(flags) + " ") if flags else ""
-
-
 def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None) -> Dict[str, object]:
     config = config or VLLMDisaggConfig()
+    if config.enable_decode_mm_hash_cache and not config.enable_prerendered_decode:
+        raise ValueError("Decode MM hash cache requires prerendered Decode")
+    if config.decode_mm_hash_cache_max_entries < 1:
+        raise ValueError("Decode MM hash cache max entries must be positive")
+    if config.decode_mm_hash_cache_ttl_s < 0:
+        raise ValueError("Decode MM hash cache TTL must be non-negative")
+    if (
+        config.enable_decode_mm_hash_epoch_guard
+        and config.decode_mm_hash_epoch_endpoint.rstrip("/")
+        != VLLM_INCARNATION_ENDPOINT
+    ):
+        raise ValueError(
+            "Decode MM hash epoch guard requires the repo incarnation endpoint"
+        )
+    if config.prefill_incarnation_poll_s < 0:
+        raise ValueError("Prefill incarnation poll interval must be non-negative")
+    if not 0 <= config.prefill_incarnation_poll_jitter_ratio <= 1:
+        raise ValueError(
+            "Prefill incarnation poll jitter ratio must be between 0 and 1"
+        )
+    if config.prefill_incarnation_probe_timeout_s <= 0:
+        raise ValueError("Prefill incarnation probe timeout must be positive")
+    if config.prefill_incarnation_failure_threshold < 1:
+        raise ValueError("Prefill incarnation failure threshold must be positive")
+    if config.prefill_incarnation_freshness_s < 0:
+        raise ValueError("Prefill incarnation freshness must be non-negative")
+    prefill_incarnation_endpoint_parts = urlsplit(
+        str(config.prefill_incarnation_endpoint)
+    )
+    if (
+        not prefill_incarnation_endpoint_parts.path.startswith("/")
+        or prefill_incarnation_endpoint_parts.scheme
+        or prefill_incarnation_endpoint_parts.netloc
+        or prefill_incarnation_endpoint_parts.query
+        or prefill_incarnation_endpoint_parts.fragment
+    ):
+        raise ValueError(
+            "Prefill incarnation endpoint must be an absolute URL path without "
+            "scheme, host, query, or fragment"
+        )
+    if (
+        config.enable_prefill_incarnation_guard
+        and config.prefill_incarnation_endpoint.rstrip("/")
+        != VLLM_INCARNATION_ENDPOINT
+    ):
+        raise ValueError(
+            "Prefill incarnation guard requires the repo incarnation endpoint"
+        )
+    if config.decode_pipeline_max_inflight < 0:
+        raise ValueError("Decode pipeline max inflight must be non-negative")
     prefill_gpus = list(config.prefill_gpus or (config.prefill_gpu,))
     decode_gpus = list(config.decode_gpus or (config.decode_gpu,))
     if not prefill_gpus:
@@ -444,33 +436,16 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
     config.metadata_port = _pick_free_port(config.metadata_port, config.local_hostname)
     config.master_port = _pick_free_port(config.master_port, config.local_hostname)
     config.master_metrics_port = _pick_free_port(config.master_metrics_port, config.local_hostname)
-    if config.enable_prefill_direct_feature_buffer_routes:
-        if not str(config.direct_feature_buffer_auth_token or "").strip():
-            config.direct_feature_buffer_auth_token = secrets.token_urlsafe(32)
-        if not config.prefill_direct_buffer_service_urls and config.prefill_direct_buffer_service_url:
-            config.prefill_direct_buffer_service_urls = (str(config.prefill_direct_buffer_service_url),)
-        if not config.prefill_direct_buffer_service_urls:
-            config.prefill_direct_buffer_service_urls = tuple(
-                f"http://{config.local_hostname}:{port}" for port in prefill_ports
-            )
-        if len(config.prefill_direct_buffer_service_urls) == 1:
-            config.prefill_direct_buffer_service_url = str(config.prefill_direct_buffer_service_urls[0])
-        elif len(config.prefill_direct_buffer_service_urls) != len(prefill_ports):
-            raise ValueError(
-                "prefill_direct_buffer_service_urls must have one URL or match prefill worker count: "
-                f"urls={len(config.prefill_direct_buffer_service_urls)} prefill={len(prefill_ports)}"
-            )
+    if (
+        config.enable_prefill_direct_feature_buffer_routes
+        and not config.prefill_direct_buffer_service_url
+        and len(prefill_ports) == 1
+    ):
+        config.prefill_direct_buffer_service_url = f"http://{config.local_hostname}:{prefill_ports[0]}"
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     files: Dict[str, object] = {}
-    scheduler_flags = _vllm_scheduler_flags(config)
-    generation_config = str(config.generation_config or "").strip()
-    generation_config_flag = (
-        f"--generation-config {shlex.quote(generation_config)} "
-        if generation_config
-        else ""
-    )
     config.workflow_registry_wal_path = (
         config.workflow_registry_wal_path
         or str(out_dir / "proxy_workflow_registry.jsonl")
@@ -522,22 +497,14 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
             + "\n"
             + f"export MOONCAKE_EPD_ENGINE_ID={engine_id}\n"
             + "export MOONCAKE_EPD_KV_ROLE=kv_producer\n"
-            + "export MOONCAKE_EPD_VLLM_ROLE=prefill\n"
-            + f"export MOONCAKE_EPD_WORKER_ID=prefill-{idx}\n"
             + (
                 "export MOONCAKE_EPD_ENABLE_DIRECT_FEATURE_BUFFER=1\n"
                 f"export MOONCAKE_EPD_DIRECT_BUFFER_WORKER_ID=prefill-{idx}\n"
                 f"export MOONCAKE_EPD_FEATURE_HANDLE_WORKER_ID=prefill-{idx}\n"
                 "export MOONCAKE_EPD_DIRECT_BUFFER_DEVICE=cuda\n"
-                "export MOONCAKE_EPD_DIRECT_READ_MODE=registered_tensor\n"
                 f"export MOONCAKE_EPD_DIRECT_LOCAL_HOSTNAME={config.local_hostname}:{18000 + idx}\n"
-                f"export MOONCAKE_EPD_DIRECT_TARGET_MODE={config.direct_feature_target_mode}\n"
-                f"export MOONCAKE_EPD_DIRECT_REGISTER_MEMORY={1 if config.direct_feature_register_memory else 0}\n"
-                f"export MOONCAKE_EPD_DIRECT_BUFFER_PERSISTENT_CACHE={1 if config.direct_feature_persistent_cache else 0}\n"
-                f"export MOONCAKE_EPD_DIRECT_BUFFER_CACHE_MAX_ENTRIES={int(config.direct_feature_cache_max_entries)}\n"
-                f"export MOONCAKE_EPD_DIRECT_BUFFER_CACHE_MAX_BYTES={int(config.direct_feature_cache_max_bytes)}\n"
-                "export MOONCAKE_EPD_DIRECT_BUFFER_AUTH_TOKEN="
-                f"{shlex.quote(str(config.direct_feature_buffer_auth_token))}\n"
+                "export MOONCAKE_EPD_DIRECT_TARGET_MODE=managed_buffer\n"
+                "export MOONCAKE_EPD_DIRECT_REGISTER_MEMORY=0\n"
                 f"export MOONCAKE_EPD_DIRECT_BUFFER_ROOT_ROUTES={1 if config.direct_feature_buffer_root_routes else 0}\n"
                 if config.enable_prefill_direct_feature_buffer_routes
                 else ""
@@ -547,8 +514,16 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
             + f"--tensor-parallel-size {config.tensor_parallel_size} "
             + f"--max-model-len {config.max_model_len} "
             + f"--gpu-memory-utilization {config.gpu_memory_utilization} "
-            + generation_config_flag
-            + scheduler_flags
+            + (
+                f"--middleware {VLLM_INCARNATION_MIDDLEWARE} "
+                if config.prefill_incarnation_endpoint.rstrip("/")
+                == VLLM_INCARNATION_ENDPOINT
+                and (
+                    config.enable_prefill_incarnation_guard
+                    or config.prefill_incarnation_poll_s > 0
+                )
+                else ""
+            )
             + "--kv-transfer-config "
             + f"'{prefill_kv_cfg}'\n",
             encoding="utf-8",
@@ -577,15 +552,17 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
             + "\n"
             + f"export MOONCAKE_EPD_ENGINE_ID={engine_id}\n"
             + "export MOONCAKE_EPD_KV_ROLE=kv_consumer\n"
-            + "export MOONCAKE_EPD_VLLM_ROLE=decode\n"
-            + f"export MOONCAKE_EPD_WORKER_ID=decode-{idx}\n"
             + f"CUDA_VISIBLE_DEVICES={gpu} vllm serve {config.model} "
             + f"--port {port} "
             + f"--tensor-parallel-size {config.tensor_parallel_size} "
             + f"--max-model-len {config.max_model_len} "
             + f"--gpu-memory-utilization {config.gpu_memory_utilization} "
-            + generation_config_flag
-            + scheduler_flags
+            + (
+                f"--middleware {VLLM_INCARNATION_MIDDLEWARE} "
+                if config.decode_mm_hash_epoch_endpoint.rstrip("/")
+                == VLLM_INCARNATION_ENDPOINT
+                else ""
+            )
             + "--kv-transfer-config "
             + f"'{decode_kv_cfg}'\n",
             encoding="utf-8",
@@ -606,20 +583,10 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
     standard_prefill_ids = " ".join(f"prefill-{idx}" for idx in range(1, len(prefill_ports)))
     low_decode_ids = " ".join(["decode-0"]) if decode_ports else ""
     standard_decode_ids = " ".join(f"decode-{idx}" for idx in range(1, len(decode_ports)))
-    prefill_decode_affinity_flag = " ".join(
-        shlex.quote(f"{prefill}={decode}")
-        for prefill, decode in config.resolved_prefill_decode_affinity
-    )
     proxy_script.write_text(
         "#!/bin/bash\n"
         + _common_env_block(config, mooncake_path)
         + "\n"
-        + (
-            "export MOONCAKE_EPD_DIRECT_BUFFER_AUTH_TOKEN="
-            f"{shlex.quote(str(config.direct_feature_buffer_auth_token))}\n"
-            if config.enable_prefill_direct_feature_buffer_routes
-            else ""
-        )
         + f"python {REPO_ROOT / 'scripts' / 'vllm_disagg_proxy.py'} "
         + f"--prefiller-hosts {prefill_hosts_flag} --prefiller-ports {prefill_ports_flag} "
         + f"--decoder-hosts {decode_hosts_flag} --decoder-ports {decode_ports_flag} "
@@ -629,8 +596,12 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
         + f"--warn-rho {config.proxy_warn_rho} "
         + f"--critical-rho {config.proxy_critical_rho} "
         + f"--max-backpressure-delay-ms {config.proxy_max_backpressure_delay_ms} "
-        + f"--transport-backend mooncake_engine_direct "
-        + f"--mooncake-protocol {config.protocol} "
+        + f"--transport-backend {config.selected_transport_backend} "
+        + (
+            "--enable-mm-prefetch "
+            if config.enable_mm_prefetch
+            else "--no-enable-mm-prefetch "
+        )
         + f"--mm-prefetch-mode {config.mm_prefetch_mode} "
         + ("--prefill-supports-feature-handles " if config.prefill_supports_feature_handles else "")
         + f"--owner-shards {config.owner_shards} "
@@ -641,43 +612,144 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
         )
         + f"--connector-metrics-dir {config.connector_metrics_dir} "
         + f"--workflow-registry-wal {config.workflow_registry_wal_path} "
+        + (
+            "--workflow-registry-wal-fsync-interval-s "
+            f"{config.workflow_registry_wal_fsync_interval_s} "
+        )
+        + (
+            "--workflow-registry-wal-max-pending "
+            f"{config.workflow_registry_wal_max_pending_records} "
+        )
+        + (
+            "--enable-decode-pipeline "
+            if config.enable_decode_pipeline
+            else "--no-enable-decode-pipeline "
+        )
+        + f"--decode-pipeline-max-inflight {config.decode_pipeline_max_inflight} "
+        + (
+            "--enable-prerendered-decode "
+            if config.enable_prerendered_decode
+            else "--no-enable-prerendered-decode "
+        )
+        + f"--prerendered-decode-model {config.model} "
+        + (
+            "--enable-decode-mm-hash-cache "
+            if config.enable_decode_mm_hash_cache
+            else "--no-enable-decode-mm-hash-cache "
+        )
+        + (
+            "--decode-mm-hash-cache-max-entries "
+            f"{config.decode_mm_hash_cache_max_entries} "
+        )
+        + (
+            "--decode-mm-hash-cache-ttl-s "
+            f"{config.decode_mm_hash_cache_ttl_s} "
+        )
+        + f"--decode-mm-hash-epoch-poll-s {config.decode_mm_hash_epoch_poll_s} "
+        + (
+            "--decode-mm-hash-epoch-probe-timeout-s "
+            f"{config.decode_mm_hash_epoch_probe_timeout_s} "
+        )
+        + (
+            "--decode-mm-hash-epoch-freshness-s "
+            f"{config.decode_mm_hash_epoch_freshness_s} "
+        )
+        + (
+            "--decode-mm-hash-epoch-endpoint "
+            f"{config.decode_mm_hash_epoch_endpoint} "
+        )
+        + (
+            "--decode-mm-hash-epoch-guard "
+            if config.enable_decode_mm_hash_epoch_guard
+            else "--no-decode-mm-hash-epoch-guard "
+        )
+        + (
+            "--decode-mm-hash-epoch-probe-singleflight "
+            if config.enable_decode_mm_hash_epoch_probe_singleflight
+            else "--no-decode-mm-hash-epoch-probe-singleflight "
+        )
         + (f"--high-prefill-worker-ids {high_prefill_ids} " if high_prefill_ids else "")
         + (f"--standard-prefill-worker-ids {standard_prefill_ids} " if standard_prefill_ids else "")
         + (f"--low-latency-decode-worker-ids {low_decode_ids} " if low_decode_ids else "")
         + (f"--standard-decode-worker-ids {standard_decode_ids} " if standard_decode_ids else "")
-        + (
-            f"--prefill-decode-affinity {prefill_decode_affinity_flag} "
-            if prefill_decode_affinity_flag
-            else ""
-        )
         + (f"--encoder-service-url {config.encoder_service_url} " if config.encoder_service_url else "")
         + (
-            f"--prefill-direct-buffer-service-urls {' '.join(str(u) for u in config.prefill_direct_buffer_service_urls)} "
-            if len(config.prefill_direct_buffer_service_urls) > 1
-            else (
-                f"--prefill-direct-buffer-service-url {config.prefill_direct_buffer_service_url or config.prefill_direct_buffer_service_urls[0]} "
-                if (config.prefill_direct_buffer_service_url or config.prefill_direct_buffer_service_urls)
-                else ""
-            )
-        )
-        + (
-            "--release-direct-feature-buffers-after-prefill "
-            if config.release_direct_feature_buffers_after_prefill
-            else "--no-release-direct-feature-buffers-after-prefill "
+            f"--prefill-direct-buffer-service-url {config.prefill_direct_buffer_service_url} "
+            if config.prefill_direct_buffer_service_url
+            else ""
         )
         + (
             "--enable-direct-feature-handle-cache "
             if config.enable_direct_feature_handle_cache
             else "--no-enable-direct-feature-handle-cache "
         )
-        + f"--direct-feature-handle-cache-max-entries {int(config.direct_feature_handle_cache_max_entries)} "
-        + f"--direct-feature-handle-cache-ttl-s {float(config.direct_feature_handle_cache_ttl_s)} "
-        + f"--prefill-dispatch-mode {config.prefill_dispatch_mode} "
         + (
-            "--allow-unverified-openai-prompt-only "
-            if config.allow_unverified_openai_prompt_only
-            else "--no-allow-unverified-openai-prompt-only "
+            "--direct-feature-handle-cache-max-entries "
+            f"{config.direct_feature_handle_cache_max_entries} "
         )
+        + (
+            "--direct-feature-handle-cache-max-bytes "
+            f"{config.direct_feature_handle_cache_max_bytes} "
+        )
+        + (
+            "--direct-feature-handle-cache-ttl-s "
+            f"{config.direct_feature_handle_cache_ttl_s} "
+        )
+        + f"--prefill-incarnation-poll-s {config.prefill_incarnation_poll_s} "
+        + (
+            "--prefill-incarnation-poll-jitter-ratio "
+            f"{config.prefill_incarnation_poll_jitter_ratio} "
+        )
+        + (
+            "--prefill-incarnation-probe-timeout-s "
+            f"{config.prefill_incarnation_probe_timeout_s} "
+        )
+        + (
+            "--prefill-incarnation-failure-threshold "
+            f"{config.prefill_incarnation_failure_threshold} "
+        )
+        + (
+            "--prefill-incarnation-freshness-s "
+            f"{config.prefill_incarnation_freshness_s} "
+        )
+        + (
+            "--prefill-incarnation-endpoint "
+            f"{shlex.quote(str(config.prefill_incarnation_endpoint))} "
+        )
+        + (
+            "--prefill-incarnation-guard "
+            if config.enable_prefill_incarnation_guard
+            else "--no-prefill-incarnation-guard "
+        )
+        + (
+            "--prefill-incarnation-probe-singleflight "
+            if config.enable_prefill_incarnation_probe_singleflight
+            else "--no-prefill-incarnation-probe-singleflight "
+        )
+        + (
+            "--enable-prefill-render-cache "
+            if config.enable_prefill_render_cache
+            else "--no-enable-prefill-render-cache "
+        )
+        + f"--prefill-render-cache-max-entries {config.prefill_render_cache_max_entries} "
+        + f"--prefill-render-cache-max-bytes {config.prefill_render_cache_max_bytes} "
+        + f"--prefill-render-cache-ttl-s {config.prefill_render_cache_ttl_s} "
+        + (
+            "--enable-client-mm-uuid-references "
+            if config.enable_client_mm_uuid_references
+            else "--no-enable-client-mm-uuid-references "
+        )
+        + (
+            "--release-direct-feature-buffers-after-prefill "
+            if config.release_direct_feature_buffers_after_prefill
+            else "--no-release-direct-feature-buffers-after-prefill "
+        )
+        + f"--upstream-max-connections {config.upstream_max_connections} "
+        + (
+            "--upstream-max-keepalive-connections "
+            f"{config.upstream_max_keepalive_connections} "
+        )
+        + f"--upstream-keepalive-expiry-s {config.upstream_keepalive_expiry_s} "
         + "--enable-agent-state-clone "
         + ("--strict-no-fallback " if config.strict_no_fallback else "--no-strict-no-fallback ")
         + f"--port {config.proxy_port}\n",
@@ -714,9 +786,229 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    config = VLLMDisaggConfig()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", default=str(REPO_ROOT / "config"))
+    parser.add_argument(
+        "--protocol",
+        default="tcp",
+        choices=["local", "tcp", "rdma", "rdmacm", "auto"],
+    )
+    parser.add_argument(
+        "--transport-backend",
+        default="auto",
+        choices=["auto", "mooncake_engine_direct", "rdmacm_staged"],
+    )
+    parser.add_argument("--rdmacm-bind-address", default="")
+    parser.add_argument("--rdmacm-remote-address", default="")
+    parser.add_argument("--rdmacm-port-offset", type=int, default=2711)
+    parser.add_argument("--prefill-gpu", type=int, default=3)
+    parser.add_argument("--decode-gpu", type=int, default=4)
+    parser.add_argument(
+        "--decode-pipeline",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--decode-pipeline-max-inflight", type=int, default=0)
+    parser.add_argument(
+        "--prerendered-decode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--decode-mm-hash-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--decode-mm-hash-cache-max-entries", type=int, default=64)
+    parser.add_argument("--decode-mm-hash-cache-ttl-s", type=float, default=120.0)
+    parser.add_argument("--decode-mm-hash-epoch-poll-s", type=float, default=1.0)
+    parser.add_argument(
+        "--decode-mm-hash-epoch-probe-timeout-s",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-freshness-s",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-endpoint",
+        default="/metrics",
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--decode-mm-hash-epoch-probe-singleflight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--prefill-incarnation-poll-s", type=float, default=0.0)
+    parser.add_argument(
+        "--prefill-incarnation-poll-jitter-ratio",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--prefill-incarnation-probe-timeout-s",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--prefill-incarnation-failure-threshold",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--prefill-incarnation-freshness-s",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--prefill-incarnation-endpoint",
+        default=VLLM_INCARNATION_ENDPOINT,
+    )
+    parser.add_argument(
+        "--prefill-incarnation-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--prefill-incarnation-probe-singleflight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--enable-mm-prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--client-mm-uuid-references",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--strict-no-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    args = parser.parse_args()
+    if args.decode_mm_hash_cache and not args.prerendered_decode:
+        parser.error("--decode-mm-hash-cache requires --prerendered-decode")
+    if args.decode_pipeline_max_inflight < 0:
+        parser.error("--decode-pipeline-max-inflight must be >= 0")
+    if args.decode_mm_hash_cache_max_entries < 1:
+        parser.error("--decode-mm-hash-cache-max-entries must be >= 1")
+    if args.decode_mm_hash_cache_ttl_s < 0:
+        parser.error("--decode-mm-hash-cache-ttl-s must be >= 0")
+    if args.decode_mm_hash_epoch_poll_s < 0:
+        parser.error("--decode-mm-hash-epoch-poll-s must be >= 0")
+    if args.decode_mm_hash_epoch_probe_timeout_s <= 0:
+        parser.error("--decode-mm-hash-epoch-probe-timeout-s must be > 0")
+    if args.decode_mm_hash_epoch_freshness_s < 0:
+        parser.error("--decode-mm-hash-epoch-freshness-s must be >= 0")
+    if not str(args.decode_mm_hash_epoch_endpoint).startswith("/"):
+        parser.error("--decode-mm-hash-epoch-endpoint must be an absolute path")
+    if (
+        args.decode_mm_hash_epoch_guard
+        and str(args.decode_mm_hash_epoch_endpoint).rstrip("/")
+        != VLLM_INCARNATION_ENDPOINT
+    ):
+        parser.error(
+            "--decode-mm-hash-epoch-guard requires the repo incarnation endpoint"
+        )
+    if args.prefill_incarnation_poll_s < 0:
+        parser.error("--prefill-incarnation-poll-s must be >= 0")
+    if not 0 <= args.prefill_incarnation_poll_jitter_ratio <= 1:
+        parser.error(
+            "--prefill-incarnation-poll-jitter-ratio must be between 0 and 1"
+        )
+    if args.prefill_incarnation_probe_timeout_s <= 0:
+        parser.error("--prefill-incarnation-probe-timeout-s must be > 0")
+    if args.prefill_incarnation_failure_threshold < 1:
+        parser.error("--prefill-incarnation-failure-threshold must be >= 1")
+    if args.prefill_incarnation_freshness_s < 0:
+        parser.error("--prefill-incarnation-freshness-s must be >= 0")
+    prefill_incarnation_endpoint_parts = urlsplit(
+        str(args.prefill_incarnation_endpoint)
+    )
+    if (
+        not prefill_incarnation_endpoint_parts.path.startswith("/")
+        or prefill_incarnation_endpoint_parts.scheme
+        or prefill_incarnation_endpoint_parts.netloc
+        or prefill_incarnation_endpoint_parts.query
+        or prefill_incarnation_endpoint_parts.fragment
+    ):
+        parser.error(
+            "--prefill-incarnation-endpoint must be an absolute URL path "
+            "without scheme, host, query, or fragment"
+        )
+    if (
+        args.prefill_incarnation_guard
+        and str(args.prefill_incarnation_endpoint).rstrip("/")
+        != VLLM_INCARNATION_ENDPOINT
+    ):
+        parser.error(
+            "--prefill-incarnation-guard requires the repo incarnation endpoint"
+        )
+    config = VLLMDisaggConfig(
+        protocol=args.protocol,
+        transport_backend=args.transport_backend,
+        rdmacm_bind_address=args.rdmacm_bind_address,
+        rdmacm_remote_address=args.rdmacm_remote_address,
+        rdmacm_port_offset=args.rdmacm_port_offset,
+        prefill_gpu=args.prefill_gpu,
+        decode_gpu=args.decode_gpu,
+        enable_decode_pipeline=bool(args.decode_pipeline),
+        decode_pipeline_max_inflight=int(args.decode_pipeline_max_inflight),
+        enable_prerendered_decode=bool(args.prerendered_decode),
+        enable_decode_mm_hash_cache=bool(args.decode_mm_hash_cache),
+        decode_mm_hash_cache_max_entries=int(args.decode_mm_hash_cache_max_entries),
+        decode_mm_hash_cache_ttl_s=float(args.decode_mm_hash_cache_ttl_s),
+        decode_mm_hash_epoch_poll_s=float(args.decode_mm_hash_epoch_poll_s),
+        decode_mm_hash_epoch_probe_timeout_s=float(
+            args.decode_mm_hash_epoch_probe_timeout_s
+        ),
+        decode_mm_hash_epoch_freshness_s=float(
+            args.decode_mm_hash_epoch_freshness_s
+        ),
+        decode_mm_hash_epoch_endpoint=str(args.decode_mm_hash_epoch_endpoint),
+        enable_decode_mm_hash_epoch_guard=bool(
+            args.decode_mm_hash_epoch_guard
+        ),
+        enable_decode_mm_hash_epoch_probe_singleflight=bool(
+            args.decode_mm_hash_epoch_probe_singleflight
+        ),
+        prefill_incarnation_poll_s=float(args.prefill_incarnation_poll_s),
+        prefill_incarnation_poll_jitter_ratio=float(
+            args.prefill_incarnation_poll_jitter_ratio
+        ),
+        prefill_incarnation_probe_timeout_s=float(
+            args.prefill_incarnation_probe_timeout_s
+        ),
+        prefill_incarnation_failure_threshold=int(
+            args.prefill_incarnation_failure_threshold
+        ),
+        prefill_incarnation_freshness_s=float(
+            args.prefill_incarnation_freshness_s
+        ),
+        prefill_incarnation_endpoint=str(args.prefill_incarnation_endpoint),
+        enable_prefill_incarnation_guard=bool(args.prefill_incarnation_guard),
+        enable_prefill_incarnation_probe_singleflight=bool(
+            args.prefill_incarnation_probe_singleflight
+        ),
+        enable_mm_prefetch=bool(args.enable_mm_prefetch),
+        enable_client_mm_uuid_references=bool(
+            args.client_mm_uuid_references
+        ),
+        strict_no_fallback=bool(args.strict_no_fallback),
+    )
     checks = validate_environment(config)
-    files = generate_configs(str(REPO_ROOT / "config"), config)
+    files = generate_configs(args.output_dir, config)
 
     print("Environment checks:")
     for k, v in checks.items():
@@ -725,6 +1017,12 @@ def main() -> None:
     print("\nGenerated files:")
     for k, v in files.items():
         print(f"  {k}: {v}")
+    print(
+        "\nTransport resolution: "
+        f"requested={config.protocol} data={config.data_protocol} "
+        f"mooncake={config.mooncake_protocol} "
+        f"backend={config.selected_transport_backend}"
+    )
 
     print("\nStartup order:")
     print(f"  1. bash {files['metadata']}")

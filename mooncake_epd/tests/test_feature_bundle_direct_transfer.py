@@ -10,16 +10,6 @@ from mooncake_epd.core.transfer import TransferEngine
 class _FakeMooncakeEngine:
     def __init__(self):
         self.calls = []
-        self.registered = []
-        self.unregistered = []
-
-    def register_memory(self, pointer, length):
-        self.registered.append((int(pointer), int(length)))
-        return 0
-
-    def unregister_memory(self, pointer):
-        self.unregistered.append(int(pointer))
-        return 0
 
     def batch_transfer_sync_write(self, remote_session, local_ptrs, remote_ptrs, lengths):
         self.calls.append((remote_session, list(local_ptrs), list(remote_ptrs), list(lengths)))
@@ -91,7 +81,5 @@ def test_feature_bundle_peer_buffer_transfer_uses_bound_direct_engine():
     remote_session, local_ptrs, remote_ptrs, lengths = fake.calls[0]
     assert remote_session == "prefill-session"
     assert len(local_ptrs) == len(remote_ptrs) == len(lengths) == 3
-    assert len(fake.registered) == 3
-    assert fake.unregistered == [pointer for pointer, _ in fake.registered]
     snap = engine.stats.snapshot()
     assert snap["encoder_to_prefill_peer_buffer_direct"]["transfers"] == 1

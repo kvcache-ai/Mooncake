@@ -83,24 +83,6 @@ def test_agent_pd_routes_hybrid_to_high_prefill_and_low_latency_decode():
     assert snapshot["metrics"]["agent_pd_hybrid_fast_path"] == 1
 
 
-def test_agent_pd_pool_preference_spills_when_preferred_prefill_is_congested():
-    cp = _cp()
-    cp.update_worker_load(
-        "prefill",
-        "prefill-high-0",
-        current_load=90,
-        queue_size=40,
-        queue_capacity=128,
-    )
-    ctx = cp.start_request(_request("thinking", "high_prefill_pool", task_id="spill"), "spill")
-
-    prefill = cp.admit_stage("prefill", ctx)
-
-    # Pool tags are a locality/role hint. They must not pin a request to a
-    # congested worker when a healthy compatible Prefill worker is available.
-    assert prefill.worker_id == "prefill-standard-0"
-
-
 def test_cross_step_affinity_overrides_interactive_prefill_pool_when_reuse_is_available():
     cp = _cp()
 

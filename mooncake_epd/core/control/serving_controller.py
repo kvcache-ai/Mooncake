@@ -17,7 +17,6 @@ real distributed control store.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import os
 import threading
@@ -36,8 +35,8 @@ from ...agent.coordination.scheduler import (
     WorkerLoad,
 )
 from ..state.workflow_registry import WorkflowStateRecord, WorkflowStateRegistry
+from ...multimodal_identity import stable_multimodal_identity_hash
 from .connector_metrics import ConnectorMetricsReader
-from .kv_directory import LocalKVDirectory
 from .kv_directory_rpc import RemoteKVDirectory, build_default_directory
 
 
@@ -84,6 +83,8 @@ class ServingControlPlaneConfig:
     target_agent_id: str = "decode"
     connector_metrics_dir: Optional[str] = None
     workflow_registry_wal_path: Optional[str] = None
+    workflow_registry_wal_fsync_interval_s: float = 0.0
+    workflow_registry_wal_max_pending_records: int = 1
     request_state_ttl_seconds: float = 900.0
     owner_shards: int = 1
     kv_directory_rpc_url: Optional[str] = None
@@ -97,9 +98,6 @@ class ServingControlPlaneConfig:
     low_latency_decode_worker_ids: Tuple[str, ...] = ()
     standard_prefill_worker_ids: Tuple[str, ...] = ()
     standard_decode_worker_ids: Tuple[str, ...] = ()
-    # Ordered Prefill -> Decode locality preferences. These remain soft so
-    # admission can bypass a saturated Decode worker.
-    prefill_decode_affinity: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -115,7 +113,7 @@ class RequestContext:
     transfer_id: str = ""
     prefill_worker_id: Optional[str] = None
     decode_worker_id: Optional[str] = None
-    decode_affinity_worker_id: Optional[str] = None
+    decode_worker_hint: Optional[str] = None
     handoff_id: Optional[str] = None
     block_ids: List[str] = field(default_factory=list)
     placeholder_block_ids: List[str] = field(default_factory=list)
@@ -135,7 +133,9 @@ class RequestContext:
     priority: int = 0
     expected_output_tokens: int = 0
     agent_pd_profile: Dict[str, Any] = field(default_factory=dict)
-    agent_state_id: Optional[str] = None
+    stage_spans: List[Dict[str, Any]] = field(default_factory=list)
+    first_token_at: Optional[float] = None
+    timing_finalized: bool = False
 
 
 @dataclass
@@ -165,14 +165,14 @@ class ServingControlPlane:
                 node_id=self.config.node_id,
             )
         self.workflow_registry = workflow_registry
-        if self.workflow_registry is None and (
-            self.config.workflow_registry_wal_path or self.config.enable_agent_state_clone
-        ):
-            # Agent-state lifecycle APIs need a durable/catalogued state id
-            # even when the caller did not explicitly configure a WAL.  A
-            # path-less registry remains process-local; a configured path keeps
-            # the same recovery semantics as the serving request registry.
-            self.workflow_registry = WorkflowStateRegistry(self.config.workflow_registry_wal_path)
+        self._owns_workflow_registry = False
+        if self.workflow_registry is None and self.config.workflow_registry_wal_path:
+            self.workflow_registry = WorkflowStateRegistry(
+                self.config.workflow_registry_wal_path,
+                wal_fsync_interval_s=self.config.workflow_registry_wal_fsync_interval_s,
+                wal_max_pending_records=self.config.workflow_registry_wal_max_pending_records,
+            )
+            self._owns_workflow_registry = True
         if self.config.connector_metrics_dir is None:
             self.config.connector_metrics_dir = (
                 str(os.getenv("MOONCAKE_EPD_CONNECTOR_METRICS_DIR", "")).strip() or None
@@ -180,13 +180,14 @@ class ServingControlPlane:
         self._lock = threading.RLock()
         self._prefill_scheduler = AgentScheduler([])
         self._decode_scheduler = AgentScheduler([])
+        self._unavailable_stage_workers: Dict[str, set[str]] = {
+            "prefill": set(),
+            "decode": set(),
+        }
         self._request_ctx: Dict[str, RequestContext] = {}
         self._worker_last_arrival: Dict[str, float] = {}
         self._workflow_latest: Dict[str, Dict[str, Any]] = {}
         self._workflow_affinity: Dict[str, Tuple[str, float]] = {}
-        self._prefill_decode_affinity = self._normalize_prefill_decode_affinity(
-            self.config.prefill_decode_affinity
-        )
         self._connector_metrics = ConnectorMetricsReader(self.config.connector_metrics_dir)
         self._metrics: Dict[str, Any] = {
             "requests_total": 0,
@@ -218,9 +219,6 @@ class ServingControlPlane:
             "serving_cross_step_reused_tokens": 0,
             "serving_workflow_state_commits": 0,
             "serving_workflow_affinity_hits": 0,
-            "pd_transport_affinity_candidates": 0,
-            "pd_transport_affinity_hits": 0,
-            "pd_transport_affinity_fallbacks": 0,
             "agent_pd_route_total": 0,
             "agent_pd_route_correct": 0,
             "agent_pd_route_incorrect": 0,
@@ -243,6 +241,9 @@ class ServingControlPlane:
             "agent_state_materialize_success": 0,
             "agent_state_materialize_failures": 0,
             "agent_state_expired_releases": 0,
+            "stage_timing_samples": [],
+            "first_token_ms": [],
+            "request_timing_summaries": [],
             "path_stats": {
                 "PD": self._new_path_stats(),
                 "EPD": self._new_path_stats(),
@@ -286,65 +287,60 @@ class ServingControlPlane:
     def stage_workers(self, stage: str) -> List[WorkerLoad]:
         return list(self._scheduler_for_stage(stage).workers)
 
-    @staticmethod
-    def _normalize_prefill_decode_affinity(
-        pairs: Sequence[Tuple[str, str]] | Sequence[str],
-    ) -> Dict[str, str]:
-        """Validate a stable Prefill -> Decode transport-affinity map.
-
-        A worker may have one preferred Decode peer. Keeping the map explicit
-        makes physical topology a deployment concern rather than an accidental
-        side effect of independent least-load scheduling.
-        """
-
-        normalized: Dict[str, str] = {}
-        for raw_pair in pairs or ():
-            if isinstance(raw_pair, str):
-                source, separator, target = raw_pair.partition("=")
-                if not separator:
-                    raise ValueError(
-                        "prefill/decode affinity entries must use prefill=decode"
-                    )
+    def set_stage_worker_available(
+        self,
+        stage: str,
+        worker_id: str,
+        *,
+        available: bool,
+    ) -> None:
+        normalized_stage = str(stage).strip().lower()
+        normalized_worker = str(worker_id).strip()
+        if normalized_stage not in self._unavailable_stage_workers:
+            raise ValueError(f"unsupported stage={stage}")
+        if not normalized_worker:
+            raise ValueError("worker_id is required")
+        if not any(
+            str(worker.worker_id) == normalized_worker
+            for worker in self._scheduler_for_stage(normalized_stage).workers
+        ):
+            raise ValueError(
+                f"worker is not registered for stage={normalized_stage}: "
+                f"{normalized_worker}"
+            )
+        with self._lock:
+            unavailable = self._unavailable_stage_workers[normalized_stage]
+            if available:
+                unavailable.discard(normalized_worker)
             else:
-                try:
-                    source, target = raw_pair
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        "prefill/decode affinity entries must contain two worker ids"
-                    ) from exc
-            source = str(source).strip()
-            target = str(target).strip()
-            if not source or not target:
-                raise ValueError(
-                    "prefill/decode affinity worker ids must be non-empty"
-                )
-            previous = normalized.get(source)
-            if previous is not None and previous != target:
-                raise ValueError(
-                    f"prefill worker {source!r} has conflicting decode affinity "
-                    f"targets {previous!r} and {target!r}"
-                )
-            normalized[source] = target
-        return normalized
+                unavailable.add(normalized_worker)
 
-    def preferred_decode_worker_for_prefill(
-        self, prefill_worker_id: Optional[str]
-    ) -> Optional[str]:
-        """Return the configured Decode peer only if it is registered."""
+    def stage_worker_availability(self, stage: str) -> Dict[str, bool]:
+        normalized_stage = str(stage).strip().lower()
+        scheduler = self._scheduler_for_stage(normalized_stage)
+        with self._lock:
+            unavailable = set(
+                self._unavailable_stage_workers.get(normalized_stage, set())
+            )
+        return {
+            str(worker.worker_id): str(worker.worker_id) not in unavailable
+            for worker in scheduler.workers
+        }
 
-        if not prefill_worker_id:
-            return None
-        target = self._prefill_decode_affinity.get(str(prefill_worker_id))
-        if not target:
-            return None
-        if any(worker.worker_id == target for worker in self._decode_scheduler.workers):
-            return target
-        return None
+    def close(self) -> None:
+        if self._owns_workflow_registry and self.workflow_registry is not None:
+            self.workflow_registry.close()
 
     # ------------------------------------------------------------------
     # Request classification / control metadata
     # ------------------------------------------------------------------
-    def start_request(self, req_data: Dict[str, Any], request_id: str) -> RequestContext:
+    def start_request(
+        self,
+        req_data: Dict[str, Any],
+        request_id: str,
+        *,
+        created_at: Optional[float] = None,
+    ) -> RequestContext:
         modality, mm_hashes = self.classify_request(req_data)
         workflow_id = self._workflow_id(req_data, request_id)
         routing_path = "EPD" if modality == "multimodal" else "PD"
@@ -358,9 +354,11 @@ class ServingControlPlane:
             deadline_at=self._extract_deadline(req_data),
             token_ids=self._request_token_ids(req_data),
             transfer_id=request_id,
+            decode_worker_hint=self._decode_worker_hint(req_data),
             agent_type_hint=self._agent_type_hint(req_data),
             priority=self._request_priority(req_data),
             expected_output_tokens=self._expected_output_tokens(req_data),
+            created_at=time.monotonic() if created_at is None else float(created_at),
         )
         ctx.agent_pd_profile = self._agent_pd_profile(req_data, ctx)
         self._prepare_cross_step_reuse(ctx)
@@ -388,6 +386,96 @@ class ServingControlPlane:
             step_index=0,
         )
         return ctx
+
+    def record_stage_span(
+        self,
+        ctx: RequestContext,
+        stage: str,
+        *,
+        started_at: float,
+        ended_at: Optional[float] = None,
+        clock_domain: str = "proxy",
+        include_in_critical_path: bool = True,
+    ) -> Dict[str, Any]:
+        """Record a monotonic stage interval without assuming cross-process clocks align."""
+
+        start = float(started_at)
+        end = time.monotonic() if ended_at is None else float(ended_at)
+        if end < start:
+            raise ValueError(f"stage end precedes start: stage={stage} start={start} end={end}")
+        normalized_stage = str(stage or "").strip()
+        if not normalized_stage:
+            raise ValueError("stage must be non-empty")
+        span = {
+            "stage": normalized_stage,
+            "start_mono": start,
+            "end_mono": end,
+            "duration_ms": (end - start) * 1000.0,
+            "clock_domain": str(clock_domain or "unknown"),
+            "include_in_critical_path": bool(include_in_critical_path),
+        }
+        sample = {
+            "request_id": ctx.request_id,
+            "workflow_id": ctx.workflow_id,
+            "routing_path": ctx.routing_path,
+            **span,
+        }
+        with self._lock:
+            ctx.stage_spans.append(span)
+            self._append_bounded(self._metrics["stage_timing_samples"], sample, limit=8192)
+        return dict(span)
+
+    def record_stage_duration(
+        self,
+        ctx: RequestContext,
+        stage: str,
+        *,
+        duration_ms: float,
+        clock_domain: str,
+    ) -> Dict[str, Any]:
+        """Record a duration from another clock domain without adding it to proxy conservation."""
+
+        duration = max(0.0, float(duration_ms))
+        now = time.monotonic()
+        return self.record_stage_span(
+            ctx,
+            stage,
+            started_at=now - duration / 1000.0,
+            ended_at=now,
+            clock_domain=clock_domain,
+            include_in_critical_path=False,
+        )
+
+    def mark_first_token(
+        self,
+        ctx: RequestContext,
+        *,
+        emitted_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Finalize proxy-clock TTFT and stage-conservation telemetry exactly once."""
+
+        end = time.monotonic() if emitted_at is None else float(emitted_at)
+        with self._lock:
+            if ctx.timing_finalized:
+                recent = self._metrics.get("request_timing_summaries", [])
+                for item in reversed(recent):
+                    if item.get("request_id") == ctx.request_id:
+                        return dict(item)
+                return {}
+            if end < ctx.created_at:
+                raise ValueError(
+                    f"first-token time precedes request start: request_id={ctx.request_id}"
+                )
+            ctx.first_token_at = end
+            ctx.timing_finalized = True
+            summary = self._request_timing_summary(ctx)
+            self._append_bounded(self._metrics["first_token_ms"], summary["critical_path_ms"], limit=8192)
+            self._append_bounded(
+                self._metrics["request_timing_summaries"],
+                summary,
+                limit=2048,
+            )
+            return dict(summary)
 
     def classify_request(self, req_data: Dict[str, Any]) -> Tuple[str, List[str]]:
         hashes: List[str] = []
@@ -435,17 +523,6 @@ class ServingControlPlane:
         base_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         ctx.prefill_worker_id = decision.worker_id
-        # Keep the producer-side target hint aligned with the Decode admission
-        # preference. Independent least-load choices can otherwise invert an
-        # explicitly configured GPU pair and bypass the fastest P2P link.
-        paired_decode = self.preferred_decode_worker_for_prefill(decision.worker_id)
-        if paired_decode:
-            decode_worker_id = paired_decode
-            ctx.decode_affinity_worker_id = paired_decode
-            with self._lock:
-                self._metrics["pd_transport_affinity_candidates"] += 1
-        else:
-            ctx.decode_affinity_worker_id = None
         ctx.admission_action = decision.decision.action
         ctx.degrade_level = decision.decision.degrade_level
         ctx.prefill_rho = decision.decision.rho
@@ -519,8 +596,8 @@ class ServingControlPlane:
             owner_shard=source_node_id,
             physical_node_id=source_node_id,
         )
-        started = time.perf_counter()
-        handoff_id = uuid.uuid4().hex
+        started = time.monotonic()
+        handoff_id = self.reserve_handoff_id(ctx)
         self.kv_directory.begin_handoff(
             handoff_id=handoff_id,
             state_id=ctx.request_id,
@@ -532,21 +609,19 @@ class ServingControlPlane:
             block_ids=block_ids,
             feature_hashes=list(ctx.mm_hashes),
         )
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        ended = time.monotonic()
+        elapsed_ms = (ended - started) * 1000.0
         ctx.handoff_id = handoff_id
         with self._lock:
             self._metrics["handoff_prepared"] += 1
             self._metrics["handoff_prepare_ms"].append(elapsed_ms)
             self._record_path_metric(ctx.routing_path, "handoff_prepared")
-        ctx.reuse_telemetry = {
-            **dict(ctx.reuse_telemetry),
-            "kv_handoff": self._kv_handoff_payload(
-                kv_transfer_params,
-                block_ids=block_ids,
-                source_node_id=source_node_id,
-                target_node_id=target_node_id,
-            ),
-        }
+        self.record_stage_span(
+            ctx,
+            "handoff_prepare",
+            started_at=started,
+            ended_at=ended,
+        )
         self._sync_request_registry(
             ctx,
             status="HANDING_OVER",
@@ -564,6 +639,19 @@ class ServingControlPlane:
         kv_transfer_params["workflow_id"] = ctx.workflow_id
         self._commit_workflow_latest(ctx)
         return kv_transfer_params
+
+    @staticmethod
+    def reserve_handoff_id(ctx: RequestContext) -> str:
+        """Reserve the stable transaction id needed by early Decode open.
+
+        Directory prepare still happens only after concrete Prefill block IDs
+        arrive.  Reserving the UUID earlier lets the provisional Decode request
+        and the later directory transaction refer to the same handoff.
+        """
+
+        if not ctx.handoff_id:
+            ctx.handoff_id = uuid.uuid4().hex
+        return ctx.handoff_id
 
     def build_decode_kv_params(
         self,
@@ -619,14 +707,30 @@ class ServingControlPlane:
         scheduler = self._scheduler_for_stage(stage)
         if not scheduler.workers:
             raise RuntimeError(f"no registered workers for stage={stage}")
+        required_worker_id = (
+            str(ctx.decode_worker_hint)
+            if stage == "decode" and ctx.decode_worker_hint
+            else None
+        )
+        if required_worker_id and not any(
+            str(worker.worker_id) == required_worker_id
+            for worker in scheduler.workers
+        ):
+            raise RuntimeError(
+                f"requested stage={stage} worker is not registered: "
+                f"{required_worker_id}"
+            )
+        with self._lock:
+            unavailable_worker_ids = set(
+                self._unavailable_stage_workers.get(str(stage).lower(), set())
+            )
+        if required_worker_id and required_worker_id in unavailable_worker_ids:
+            raise RuntimeError(
+                f"requested stage={stage} worker is unavailable: "
+                f"{required_worker_id}"
+            )
         self._decay_arrival_rates(scheduler)
         agent_type = self._agent_type_for(stage, ctx)
-        if stage == "prefill":
-            preferred_worker_id = self._preferred_worker_for(ctx.workflow_id)
-        elif stage == "decode":
-            preferred_worker_id = ctx.decode_affinity_worker_id
-        else:
-            preferred_worker_id = None
         req = AgentRequest(
             request_id=f"{ctx.request_id}:{stage}",
             agent_type=agent_type,
@@ -638,10 +742,24 @@ class ServingControlPlane:
                 "modality": ctx.modality,
                 "routing_path": ctx.routing_path,
                 "workflow_id": ctx.workflow_id,
-                "preferred_worker_id": preferred_worker_id,
+                "preferred_worker_id": (
+                    required_worker_id
+                    or (
+                        self._preferred_worker_for(ctx.workflow_id)
+                        if stage == "prefill"
+                        else None
+                    )
+                ),
                 "stage": stage,
                 "preferred_pool": self._preferred_pool_for_stage(stage, ctx),
                 "avoid_pool": self._avoid_pool_for_stage(stage, ctx),
+                "preferred_worker_ids": (
+                    [required_worker_id]
+                    if required_worker_id
+                    else self._preferred_workers_for_stage(stage, ctx)
+                ),
+                "excluded_worker_ids": self._excluded_workers_for_stage(stage, ctx),
+                "unavailable_worker_ids": sorted(unavailable_worker_ids),
                 "routing_target": ctx.agent_pd_profile.get("routing_target"),
                 "agent_pd_profile": dict(ctx.agent_pd_profile),
             },
@@ -657,6 +775,12 @@ class ServingControlPlane:
                     "stage_reject_events",
                 )
             raise RuntimeError(f"stage={stage} admission failed: no worker")
+        if required_worker_id and str(decision.worker.worker_id) != required_worker_id:
+            self._release_if_admitted(decision)
+            raise RuntimeError(
+                f"requested stage={stage} worker is unavailable: "
+                f"{required_worker_id}"
+            )
         if decision.action is AdmissionAction.REJECT:
             self._release_if_admitted(decision)
             with self._lock:
@@ -674,14 +798,8 @@ class ServingControlPlane:
         preferred_worker_id = req.metadata.get("preferred_worker_id") if isinstance(req.metadata, dict) else None
         if preferred_worker_id and decision.worker is not None and str(decision.worker.worker_id) == str(preferred_worker_id):
             with self._lock:
-                if stage == "prefill":
-                    self._metrics["serving_workflow_affinity_hits"] += 1
-                    self._record_path_metric(ctx.routing_path, "serving_workflow_affinity_hits")
-                elif stage == "decode" and ctx.decode_affinity_worker_id:
-                    self._metrics["pd_transport_affinity_hits"] += 1
-        elif stage == "decode" and ctx.decode_affinity_worker_id:
-            with self._lock:
-                self._metrics["pd_transport_affinity_fallbacks"] += 1
+                self._metrics["serving_workflow_affinity_hits"] += 1
+                self._record_path_metric(ctx.routing_path, "serving_workflow_affinity_hits")
         wait_ms = 0.0
         with self._lock:
             self._metrics["deadline_miss_risk"].append(
@@ -747,14 +865,21 @@ class ServingControlPlane:
     def commit_handoff(self, ctx: RequestContext) -> None:
         if not ctx.handoff_id or ctx.handoff_committed:
             return
-        started = time.perf_counter()
+        started = time.monotonic()
         self.kv_directory.commit_handoff(ctx.handoff_id)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        ended = time.monotonic()
+        elapsed_ms = (ended - started) * 1000.0
         ctx.handoff_committed = True
         with self._lock:
             self._metrics["handoff_committed"] += 1
             self._metrics["handoff_commit_ms"].append(elapsed_ms)
             self._record_path_metric(ctx.routing_path, "handoff_committed")
+        self.record_stage_span(
+            ctx,
+            "handoff_commit",
+            started_at=started,
+            ended_at=ended,
+        )
         self._sync_request_registry(
             ctx,
             status="ACTIVE",
@@ -769,13 +894,21 @@ class ServingControlPlane:
     def rollback_handoff(self, ctx: RequestContext) -> None:
         if not ctx.handoff_id or ctx.handoff_committed:
             return
-        started = time.perf_counter()
+        started = time.monotonic()
         self.kv_directory.rollback_handoff(ctx.handoff_id)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        ended = time.monotonic()
+        elapsed_ms = (ended - started) * 1000.0
         with self._lock:
             self._metrics["handoff_rolled_back"] += 1
             self._metrics["handoff_rollback_ms"].append(elapsed_ms)
             self._record_path_metric(ctx.routing_path, "handoff_rolled_back")
+        self.record_stage_span(
+            ctx,
+            "handoff_rollback",
+            started_at=started,
+            ended_at=ended,
+            include_in_critical_path=False,
+        )
         self._sync_request_registry(
             ctx,
             status="ROLLED_BACK",
@@ -823,9 +956,12 @@ class ServingControlPlane:
         now = time.monotonic()
         connector_aggregate = self._connector_metrics.aggregate()
         mm_hidden_cache = self._connector_metrics.aggregate_mm_hidden_cache()
-        decode_engine_timing = self._connector_metrics.aggregate_decode_engine_timing()
         connector_totals = connector_aggregate.totals
+        connector_totals_payload = connector_totals.to_dict()
         with self._lock:
+            stage_timing = self._stage_timing_snapshot()
+            first_token_stats = self._distribution(self._metrics["first_token_ms"])
+            conservation = self._stage_conservation_snapshot()
             handoff_records = (
                 self.kv_directory.handoff_states()
                 if hasattr(self.kv_directory, "handoff_states")
@@ -844,23 +980,23 @@ class ServingControlPlane:
                     "transport_backend": self.config.transport_backend,
                     "connector_metrics_dir": self.config.connector_metrics_dir,
                     "workflow_registry_wal_path": self.config.workflow_registry_wal_path,
+                    "workflow_registry_wal_fsync_interval_s": (
+                        self.config.workflow_registry_wal_fsync_interval_s
+                    ),
+                    "workflow_registry_wal_max_pending_records": (
+                        self.config.workflow_registry_wal_max_pending_records
+                    ),
                     "owner_shards": int(self.config.owner_shards),
                     "kv_directory_rpc_url": self.config.kv_directory_rpc_url,
                     "enable_workflow_affinity": self.config.enable_workflow_affinity,
                     "strict_no_fallback": self.config.strict_no_fallback,
                     "enable_agent_state_clone": self.config.enable_agent_state_clone,
-                    "agent_state_consume_requires_kv_handoff": self.config.agent_state_consume_requires_kv_handoff,
-                    "mooncake_protocol": self.config.mooncake_protocol,
                     "warn_rho": self.config.warn_rho,
                     "critical_rho": self.config.critical_rho,
                     "high_prefill_worker_ids": list(self.config.high_prefill_worker_ids),
                     "low_latency_decode_worker_ids": list(self.config.low_latency_decode_worker_ids),
                     "standard_prefill_worker_ids": list(self.config.standard_prefill_worker_ids),
                     "standard_decode_worker_ids": list(self.config.standard_decode_worker_ids),
-                    "prefill_decode_affinity": [
-                        [source, target]
-                        for source, target in sorted(self._prefill_decode_affinity.items())
-                    ],
                 },
                 "metrics": {
                     **{
@@ -873,6 +1009,13 @@ class ServingControlPlane:
                     "handoff_rollback_ms_avg": self._avg(self._metrics["handoff_rollback_ms"]),
                     "deadline_miss_risk_avg": self._avg(self._metrics["deadline_miss_risk"]),
                     "mm_prefetch_wait_ms_avg": self._avg(self._metrics["mm_prefetch_wait_ms"]),
+                    "request_stage_timing_ms": stage_timing,
+                    "first_token_ms": first_token_stats,
+                    "stage_conservation": conservation,
+                    "request_timing_recent": [
+                        dict(item)
+                        for item in self._metrics.get("request_timing_summaries", [])[-256:]
+                    ],
                     "agent_pd_route_decisions_recent": list(self._metrics.get("agent_pd_route_decisions", []))[-256:],
                     "path_stats": self._snapshot_path_stats(),
                     "connector_path_stats": {
@@ -887,35 +1030,6 @@ class ServingControlPlane:
                     "layered_transfer_failed_batches": connector_totals.failed_batches,
                     "peer_buffer_batches": connector_totals.peer_buffer_batches,
                     "peer_buffer_bytes": connector_totals.peer_buffer_bytes,
-                    "peer_buffer_dispatch_ms": connector_totals.peer_buffer_dispatch_ms,
-                    "peer_buffer_dispatch_ms_avg": (
-                        connector_totals.peer_buffer_dispatch_ms
-                        / connector_totals.peer_buffer_batches
-                        if connector_totals.peer_buffer_batches
-                        else 0.0
-                    ),
-                    "peer_buffer_prepare_ms": connector_totals.peer_buffer_prepare_ms,
-                    "peer_buffer_prepare_ms_avg": (
-                        connector_totals.peer_buffer_prepare_ms
-                        / connector_totals.peer_buffer_batches
-                        if connector_totals.peer_buffer_batches
-                        else 0.0
-                    ),
-                    "peer_buffer_write_ms": connector_totals.peer_buffer_write_ms,
-                    "peer_buffer_write_ms_avg": (
-                        connector_totals.peer_buffer_write_ms
-                        / connector_totals.peer_buffer_batches
-                        if connector_totals.peer_buffer_batches
-                        else 0.0
-                    ),
-                    "peer_buffer_write_bandwidth_gbps": (
-                        connector_totals.peer_buffer_bytes
-                        * 8.0
-                        / connector_totals.peer_buffer_write_ms
-                        / 1_000_000.0
-                        if connector_totals.peer_buffer_write_ms > 0.0
-                        else 0.0
-                    ),
                     "fallback_batches": connector_totals.fallback_batches,
                     "fallback_bytes": connector_totals.fallback_bytes,
                     "layered_transfer_delay_ms": connector_totals.accumulated_group_delay_ms,
@@ -924,57 +1038,46 @@ class ServingControlPlane:
                     "layer_load_wait_calls": connector_totals.layer_wait_calls,
                     "layer_load_wait_ms": connector_totals.layer_wait_ms,
                     "layered_receive_failures": connector_totals.receive_failures,
-                    "layered_receive_kv_requests": connector_totals.receive_kv_requests,
-                    "layered_receive_kv_worker_roundtrips": connector_totals.receive_kv_worker_roundtrips,
-                    "layered_receive_kv_worker_ms": connector_totals.receive_kv_worker_ms,
-                    "layered_receive_kv_worker_ms_avg": (
-                        connector_totals.receive_kv_worker_ms
-                        / connector_totals.receive_kv_worker_roundtrips
-                        if connector_totals.receive_kv_worker_roundtrips
-                        else 0.0
-                    ),
-                    "layered_receive_kv_response_messages": connector_totals.receive_kv_response_messages,
-                    "layered_receive_kv_first_response_count": connector_totals.receive_kv_first_response_count,
-                    "layered_receive_kv_first_response_ms": connector_totals.receive_kv_first_response_ms,
-                    "layered_receive_kv_first_response_ms_avg": (
-                        connector_totals.receive_kv_first_response_ms
-                        / connector_totals.receive_kv_first_response_count
-                        if connector_totals.receive_kv_first_response_count
-                        else 0.0
-                    ),
-                    "layered_receive_kv_last_response_count": connector_totals.receive_kv_last_response_count,
-                    "layered_receive_kv_last_response_ms": connector_totals.receive_kv_last_response_ms,
-                    "layered_receive_kv_last_response_ms_avg": (
-                        connector_totals.receive_kv_last_response_ms
-                        / connector_totals.receive_kv_last_response_count
-                        if connector_totals.receive_kv_last_response_count
-                        else 0.0
-                    ),
-                    "layered_receive_kv_response_process_count": connector_totals.receive_kv_response_process_count,
-                    "layered_receive_kv_response_process_ms": connector_totals.receive_kv_response_process_ms,
-                    "layered_receive_kv_response_process_ms_avg": (
-                        connector_totals.receive_kv_response_process_ms
-                        / connector_totals.receive_kv_response_process_count
-                        if connector_totals.receive_kv_response_process_count
-                        else 0.0
-                    ),
-                    "layered_receive_kv_first_group_count": connector_totals.receive_kv_first_group_count,
-                    "layered_receive_kv_first_group_ms": connector_totals.receive_kv_first_group_ms,
-                    "layered_receive_kv_first_group_ms_avg": (
-                        connector_totals.receive_kv_first_group_ms
-                        / connector_totals.receive_kv_first_group_count
-                        if connector_totals.receive_kv_first_group_count
-                        else 0.0
-                    ),
-                    "layered_receive_kv_finished_count": connector_totals.receive_kv_finished_count,
-                    "layered_receive_kv_finished_ms": connector_totals.receive_kv_finished_ms,
-                    "layered_receive_kv_finished_ms_avg": (
-                        connector_totals.receive_kv_finished_ms
-                        / connector_totals.receive_kv_finished_count
-                        if connector_totals.receive_kv_finished_count
-                        else 0.0
-                    ),
                     "remote_transfer_backend_counts": dict(connector_totals.backend_counts),
+                    "kv_transfer_attempts": connector_totals.transfer_attempts,
+                    "kv_transfer_successes": connector_totals.transfer_successes,
+                    "kv_transfer_bytes": connector_totals.transfer_bytes,
+                    "kv_transfer_elapsed_ms": connector_totals.transfer_elapsed_ms,
+                    "kv_transfer_attempt_elapsed_ms": connector_totals.transfer_attempt_elapsed_ms,
+                    "kv_transfer_elapsed_ms_avg": connector_totals_payload.get(
+                        "transfer_elapsed_ms_avg"
+                    ),
+                    "descriptor_build_calls": connector_totals.descriptor_build_calls,
+                    "descriptor_build_input_descriptors": (
+                        connector_totals.descriptor_build_input_descriptors
+                    ),
+                    "descriptor_build_output_descriptors": (
+                        connector_totals.descriptor_build_output_descriptors
+                    ),
+                    "coalesced_descriptors": connector_totals.coalesced_descriptors,
+                    "descriptor_build_ms": connector_totals.descriptor_build_ms,
+                    "descriptor_build_ms_avg": connector_totals_payload.get(
+                        "descriptor_build_ms_avg"
+                    ),
+                    "descriptor_reduction_ratio": connector_totals_payload.get(
+                        "descriptor_reduction_ratio"
+                    ),
+                    "descriptors_per_mb": connector_totals_payload.get(
+                        "descriptors_per_mb"
+                    ),
+                    "kv_transfer_gbps": connector_totals_payload.get(
+                        "transfer_bandwidth_gbps"
+                    ),
+                    "remote_transfer_backend_bytes": dict(connector_totals.backend_bytes),
+                    "remote_transfer_backend_elapsed_ms": dict(
+                        connector_totals.backend_elapsed_ms
+                    ),
+                    "remote_transfer_backend_failures": dict(
+                        connector_totals.backend_failures
+                    ),
+                    "remote_transfer_backend_gbps": dict(
+                        connector_totals_payload.get("backend_bandwidth_gbps") or {}
+                    ),
                     "mm_hidden_cache_workers": int(mm_hidden_cache.get("workers", 0) or 0),
                     "mm_hidden_cache_enabled_workers": int(mm_hidden_cache.get("enabled_workers", 0) or 0),
                     "mm_hidden_cache_lookups": int(mm_hidden_cache.get("lookups", 0) or 0),
@@ -1000,35 +1103,6 @@ class ServingControlPlane:
                         mm_hidden_cache.get("cache_load_ms_avg", 0.0) or 0.0
                     ),
                     "mm_hidden_cache_errors": int(mm_hidden_cache.get("errors", 0) or 0),
-                    "decode_engine_timing_workers": int(decode_engine_timing.get("workers", 0) or 0),
-                    "decode_engine_first_token_requests": int(
-                        decode_engine_timing.get("first_token_requests", 0) or 0
-                    ),
-                    "decode_engine_first_token_latency_ms_total": float(
-                        decode_engine_timing.get("first_token_latency_ms_total", 0.0) or 0.0
-                    ),
-                    "decode_engine_first_token_latency_ms_avg": float(
-                        decode_engine_timing.get("first_token_latency_ms_avg", 0.0) or 0.0
-                    ),
-                    "decode_engine_kv_first_token_requests": int(
-                        decode_engine_timing.get("kv_first_token_requests", 0) or 0
-                    ),
-                    "decode_engine_kv_first_token_latency_ms_total": float(
-                        decode_engine_timing.get("kv_first_token_latency_ms_total", 0.0)
-                        or 0.0
-                    ),
-                    "decode_engine_kv_first_token_latency_ms_avg": float(
-                        decode_engine_timing.get("kv_first_token_latency_ms_avg", 0.0) or 0.0
-                    ),
-                    "decode_engine_kv_first_token_output_tokens": int(
-                        decode_engine_timing.get("kv_first_token_output_tokens", 0) or 0
-                    ),
-                    "decode_engine_scheduler_update_calls": int(
-                        decode_engine_timing.get("scheduler_update_calls", 0) or 0
-                    ),
-                    "decode_engine_timing_updated_at": float(
-                        decode_engine_timing.get("updated_at_max", 0.0) or 0.0
-                    ),
                 },
                 "workers": {
                     "prefill": [
@@ -1053,6 +1127,10 @@ class ServingControlPlane:
                         )
                         for w in self._decode_scheduler.workers
                     ],
+                },
+                "worker_health": {
+                    "prefill": self.stage_worker_availability("prefill"),
+                    "decode": self.stage_worker_availability("decode"),
                 },
                 "active_requests": sorted(self._request_ctx.keys()),
                 "handoffs": handoff_states,
@@ -1798,6 +1876,7 @@ class ServingControlPlane:
             ),
             "kv_directory": self.kv_directory.stats(),
             "orphans_swept": swept,
+            "expired_states_released": expired_released,
             "clone_semantics": {
                 "same_node": "block_ref_zero_copy",
                 "cross_node": "descriptor_share_then_materialize",
@@ -1936,7 +2015,6 @@ class ServingControlPlane:
             "block_ids": list(ctx.block_ids),
             "prefill_worker_id": ctx.prefill_worker_id,
             "decode_worker_id": ctx.decode_worker_id,
-            "kv_handoff": dict(ctx.reuse_telemetry.get("kv_handoff") or {}),
             "updated_at": time.monotonic(),
         }
         if ctx.prefill_worker_id:
@@ -1978,7 +2056,6 @@ class ServingControlPlane:
                         "mm_hashes": list(record.feature_hashes or record.image_ids),
                         "block_ids": list(record.kv_block_ids),
                         "decode_worker_id": record.target_node_id or record.agent_id,
-                        "kv_handoff": self._extract_kv_handoff_from_record(record),
                         "snapshot_epoch": record.snapshot_epoch,
                         "step_index": record.step_index,
                     }
@@ -1996,7 +2073,6 @@ class ServingControlPlane:
                     "mm_hashes": list(record.feature_hashes or record.image_ids),
                     "block_ids": list(record.kv_block_ids),
                     "decode_worker_id": record.target_node_id or record.agent_id,
-                    "kv_handoff": self._extract_kv_handoff_from_record(record),
                     "snapshot_epoch": record.snapshot_epoch,
                     "step_index": record.step_index,
                 }
@@ -2047,7 +2123,6 @@ class ServingControlPlane:
             "group_delay_ms": self.config.group_delay_ms,
             "max_group_bytes": self.config.max_group_bytes,
             "transport_backend": self.config.transport_backend,
-            "mooncake_protocol": self.config.mooncake_protocol,
             "handoff_id": ctx.handoff_id,
             "mm_prefetch_image_hashes": list(ctx.mm_hashes),
             "mm_prefetch_policy": (
@@ -2211,13 +2286,20 @@ class ServingControlPlane:
 
     @staticmethod
     def _stable_mm_hash(item: Dict[str, Any]) -> str:
-        payload = {
-            k: item.get(k)
-            for k in sorted(item)
-            if k not in {"detail"}
-        }
-        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()[:16]
+        return stable_multimodal_identity_hash(item)
+
+    @staticmethod
+    def _decode_worker_hint(req_data: Dict[str, Any]) -> Optional[str]:
+        metadata = (
+            req_data.get("metadata")
+            if isinstance(req_data.get("metadata"), dict)
+            else {}
+        )
+        raw = metadata.get("mooncake_epd_decode_worker_id")
+        if raw is None:
+            return None
+        normalized = str(raw).strip()
+        return normalized or None
 
     @staticmethod
     def _workflow_id(req_data: Dict[str, Any], request_id: str) -> str:
@@ -2358,6 +2440,7 @@ class ServingControlPlane:
             or req_data.get("routing_target")
             or ""
         ).strip().lower()
+        routing_target_explicit = bool(routing_target)
         if enabled and not routing_target:
             if agent_type is AgentType.THINKING:
                 routing_target = "high_prefill_pool"
@@ -2386,6 +2469,7 @@ class ServingControlPlane:
             "enabled": bool(enabled),
             "agent_type": agent_type.value,
             "routing_target": (route_label if routing_target in {"", "hybrid"} else routing_target) if enabled else "",
+            "routing_target_explicit": routing_target_explicit,
             "prefill_pool": prefill_pool,
             "decode_pool": decode_pool,
             "input_tokens": max(
@@ -2472,6 +2556,12 @@ class ServingControlPlane:
     def _preferred_pool_for_stage(self, stage: str, ctx: RequestContext) -> str:
         if not bool(ctx.agent_pd_profile.get("enabled")):
             return ""
+        # ``agent_type`` alone selects the type-aware scheduler weights, but it
+        # is not a strict pool-placement request. Otherwise an inferred pool
+        # bonus can override a clearly idle worker, defeating load-aware
+        # routing. Explicit ``routing_target`` keeps the stronger pool policy.
+        if not bool(ctx.agent_pd_profile.get("routing_target_explicit")):
+            return ""
         if stage == "prefill":
             return str(ctx.agent_pd_profile.get("prefill_pool") or "")
         if stage == "decode":
@@ -2486,6 +2576,34 @@ class ServingControlPlane:
         if stage == "decode" and ctx.agent_type_hint is AgentType.THINKING:
             return "low_latency_decode_pool"
         return ""
+
+    def _preferred_workers_for_stage(self, stage: str, ctx: RequestContext) -> List[str]:
+        preferred_pool = self._preferred_pool_for_stage(stage, ctx)
+        return [
+            worker.worker_id
+            for worker in self._scheduler_for_stage(stage).workers
+            if preferred_pool and preferred_pool in set(getattr(worker, "pool_tags", []) or [])
+        ]
+
+    def _excluded_workers_for_stage(self, stage: str, ctx: RequestContext) -> List[str]:
+        avoid_pool = self._avoid_pool_for_stage(stage, ctx)
+        affinity_worker = (
+            self._preferred_worker_for(ctx.workflow_id)
+            if stage == "prefill" and ctx.reuse_candidate_block_ids
+            else None
+        )
+        excluded: List[str] = []
+        for worker in self._scheduler_for_stage(stage).workers:
+            worker_id = str(worker.worker_id)
+            if affinity_worker and worker_id == str(affinity_worker):
+                # A confirmed cross-step reuse candidate is stronger than the
+                # generic Agent-PD avoid-pool hint: keeping the request on the
+                # same prefill worker preserves vLLM prefix/MM cache locality.
+                # Admission still protects capacity/rho before the dispatch.
+                continue
+            if avoid_pool and avoid_pool in set(getattr(worker, "pool_tags", []) or []):
+                excluded.append(worker.worker_id)
+        return excluded
 
     def _record_agent_pd_decision(
         self,
@@ -2720,12 +2838,146 @@ class ServingControlPlane:
         reuse_summary = self.workflow_registry.reuse_telemetry_summary(rows)
         return {
             "enabled": True,
+            "wal_io": self.workflow_registry.wal_stats(),
             "tracked_states": len(rows),
             "active_state_ids": self.workflow_registry.active_state_ids(),
             "status_counts": status_counts,
             "workflow_status": workflow_status,
             "active_request_status": active_request_status,
             "reuse_summary": reuse_summary,
+        }
+
+    def _request_timing_summary(self, ctx: RequestContext) -> Dict[str, Any]:
+        assert ctx.first_token_at is not None
+        request_start = float(ctx.created_at)
+        first_token_at = float(ctx.first_token_at)
+        critical_path_ms = max(0.0, (first_token_at - request_start) * 1000.0)
+        intervals: List[Tuple[float, float]] = []
+        raw_sum_ms = 0.0
+        stage_ms: Dict[str, float] = {}
+        for span in ctx.stage_spans:
+            duration_ms = max(0.0, float(span.get("duration_ms", 0.0) or 0.0))
+            stage = str(span.get("stage") or "unknown")
+            stage_ms[stage] = float(stage_ms.get(stage, 0.0)) + duration_ms
+            if (
+                str(span.get("clock_domain") or "") != "proxy"
+                or not bool(span.get("include_in_critical_path", False))
+            ):
+                continue
+            start = max(request_start, float(span.get("start_mono", request_start)))
+            end = min(first_token_at, float(span.get("end_mono", first_token_at)))
+            if end <= start:
+                continue
+            intervals.append((start, end))
+            raw_sum_ms += (end - start) * 1000.0
+        accounted_union_ms = self._interval_union_ms(intervals)
+        unattributed_ms = max(0.0, critical_path_ms - accounted_union_ms)
+        tolerance_ms = max(2.0, critical_path_ms * 0.02)
+        return {
+            "request_id": ctx.request_id,
+            "workflow_id": ctx.workflow_id,
+            "routing_path": ctx.routing_path,
+            "critical_path_ms": critical_path_ms,
+            "raw_sum_ms": raw_sum_ms,
+            "accounted_union_ms": accounted_union_ms,
+            "unattributed_ms": unattributed_ms,
+            "tolerance_ms": tolerance_ms,
+            "stage_conservation_ok": unattributed_ms <= tolerance_ms,
+            "overlap_ms": max(0.0, raw_sum_ms - accounted_union_ms),
+            "stage_ms": stage_ms,
+            "span_count": len(ctx.stage_spans),
+        }
+
+    def _stage_timing_snapshot(self) -> Dict[str, Dict[str, Optional[float]]]:
+        grouped: Dict[str, List[float]] = {}
+        for sample in self._metrics.get("stage_timing_samples", []):
+            stage = str(sample.get("stage") or "unknown")
+            grouped.setdefault(stage, []).append(
+                max(0.0, float(sample.get("duration_ms", 0.0) or 0.0))
+            )
+        return {
+            stage: self._distribution(values)
+            for stage, values in sorted(grouped.items())
+        }
+
+    def _stage_conservation_snapshot(self) -> Dict[str, Any]:
+        rows = list(self._metrics.get("request_timing_summaries", []))
+        ok_count = sum(1 for row in rows if bool(row.get("stage_conservation_ok")))
+        return {
+            "count": len(rows),
+            "ok_count": ok_count,
+            "failed_count": len(rows) - ok_count,
+            "ok_rate": (ok_count / len(rows)) if rows else None,
+            "critical_path_ms": self._distribution(
+                [float(row.get("critical_path_ms", 0.0) or 0.0) for row in rows]
+            ),
+            "accounted_union_ms": self._distribution(
+                [float(row.get("accounted_union_ms", 0.0) or 0.0) for row in rows]
+            ),
+            "unattributed_ms": self._distribution(
+                [float(row.get("unattributed_ms", 0.0) or 0.0) for row in rows]
+            ),
+            "overlap_ms": self._distribution(
+                [float(row.get("overlap_ms", 0.0) or 0.0) for row in rows]
+            ),
+        }
+
+    @staticmethod
+    def _interval_union_ms(intervals: Sequence[Tuple[float, float]]) -> float:
+        if not intervals:
+            return 0.0
+        ordered = sorted((float(start), float(end)) for start, end in intervals if end > start)
+        if not ordered:
+            return 0.0
+        merged_start, merged_end = ordered[0]
+        total = 0.0
+        for start, end in ordered[1:]:
+            if start <= merged_end:
+                merged_end = max(merged_end, end)
+                continue
+            total += merged_end - merged_start
+            merged_start, merged_end = start, end
+        total += merged_end - merged_start
+        return max(0.0, total * 1000.0)
+
+    @staticmethod
+    def _append_bounded(values: List[Any], value: Any, *, limit: int) -> None:
+        values.append(value)
+        overflow = len(values) - max(1, int(limit))
+        if overflow > 0:
+            del values[:overflow]
+
+    @staticmethod
+    def _distribution(values: Sequence[float]) -> Dict[str, Optional[float]]:
+        ordered = sorted(float(value) for value in values)
+        if not ordered:
+            return {
+                "count": 0,
+                "avg": None,
+                "p50": None,
+                "p95": None,
+                "p99": None,
+                "max": None,
+            }
+
+        def percentile(q: float) -> float:
+            if len(ordered) == 1:
+                return ordered[0]
+            rank = (len(ordered) - 1) * q
+            low = int(math.floor(rank))
+            high = int(math.ceil(rank))
+            if low == high:
+                return ordered[low]
+            weight = rank - low
+            return ordered[low] * (1.0 - weight) + ordered[high] * weight
+
+        return {
+            "count": len(ordered),
+            "avg": float(sum(ordered) / len(ordered)),
+            "p50": percentile(0.50),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+            "max": ordered[-1],
         }
 
     @staticmethod

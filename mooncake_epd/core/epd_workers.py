@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -94,7 +94,8 @@ class EncoderWorker:
         image_grid_thw = image_grid_thw.to(self.device)
         t0 = time.perf_counter()
         with torch.no_grad():
-            vision_output = self.model.model.get_image_features(
+            feature_model = getattr(self.model, "model", self.model)
+            vision_output = feature_model.get_image_features(
                 pixel_values, image_grid_thw=image_grid_thw
             )
 
@@ -144,10 +145,119 @@ class EncoderWorker:
                 "deepstack_layers": [int(idx) for idx, _ in intermediates],
                 "deepstack_shapes": [tuple(int(dim) for dim in feat.shape) for _, feat in intermediates],
                 "grid_thw_shape": tuple(int(dim) for dim in image_grid_thw.shape),
+                "spatial_merge_size": int(
+                    getattr(self.model.config.vision_config, "spatial_merge_size", 1)
+                ),
             },
         )
         encode_ms = (time.perf_counter() - t0) * 1000
         return EncoderOutput(bundle=bundle, encode_time_ms=encode_ms, image_id=image_hash)
+
+    def encode_many(
+        self,
+        items: Sequence[Tuple[torch.Tensor, torch.Tensor, str]],
+    ) -> List[EncoderOutput]:
+        """Encode independent Qwen3-VL images in one packed vision invocation.
+
+        Qwen3-VL already accepts flattened patches plus one ``grid_thw`` row
+        per image and splits its pooled output by those rows.  Packing here
+        reuses that upstream contract, then restores one FeatureBundle per
+        request so cache identity and E→P publication remain independent.
+        """
+
+        normalized = list(items)
+        if not normalized:
+            return []
+        if len(normalized) == 1:
+            pixel_values, grid_thw, image_id = normalized[0]
+            return [
+                self.encode(
+                    pixel_values=pixel_values,
+                    image_grid_thw=grid_thw,
+                    image_id=image_id,
+                )
+            ]
+        for _pixels, grid_thw, image_id in normalized:
+            if grid_thw.ndim != 2 or tuple(grid_thw.shape) != (1, 3):
+                raise ValueError(
+                    "EncoderWorker.encode_many requires exactly one grid_thw row "
+                    f"per item; image_id={image_id} shape={tuple(grid_thw.shape)}"
+                )
+
+        packed_pixels = torch.cat([item[0] for item in normalized], dim=0)
+        packed_grid = torch.cat([item[1] for item in normalized], dim=0)
+        batch = self.encode(
+            pixel_values=packed_pixels,
+            image_grid_thw=packed_grid,
+            image_id="qwen3-vl-dynamic-batch",
+        )
+        raw_split_sizes = batch.bundle.metadata.get("split_sizes")
+        try:
+            split_sizes = [int(size) for size in list(raw_split_sizes or [])]
+        except Exception as exc:
+            raise ValueError("batched Qwen3-VL output has invalid split_sizes") from exc
+        if len(split_sizes) != len(normalized) or any(size <= 0 for size in split_sizes):
+            raise ValueError(
+                "batched Qwen3-VL output split count mismatch: "
+                f"items={len(normalized)} split_sizes={split_sizes}"
+            )
+        if sum(split_sizes) != int(batch.bundle.last_hidden.shape[0]):
+            raise ValueError(
+                "batched Qwen3-VL output does not cover last_hidden rows: "
+                f"sum={sum(split_sizes)} rows={int(batch.bundle.last_hidden.shape[0])}"
+            )
+
+        main_parts = torch.split(batch.bundle.last_hidden, split_sizes, dim=0)
+        intermediate_parts: List[Tuple[int, Tuple[torch.Tensor, ...]]] = []
+        for layer, tensor in batch.bundle.intermediates:
+            if int(tensor.shape[0]) != sum(split_sizes):
+                raise ValueError(
+                    "batched Qwen3-VL deepstack rows do not match main output: "
+                    f"layer={layer} rows={int(tensor.shape[0])} expected={sum(split_sizes)}"
+                )
+            intermediate_parts.append(
+                (int(layer), torch.split(tensor, split_sizes, dim=0))
+            )
+
+        outputs: List[EncoderOutput] = []
+        for ordinal, ((_pixels, _grid, image_id), rows, main) in enumerate(
+            zip(normalized, split_sizes, main_parts)
+        ):
+            intermediates = [
+                (layer, parts[ordinal])
+                for layer, parts in intermediate_parts
+            ]
+            grid = batch.bundle.grid_thw[ordinal : ordinal + 1]
+            metadata = dict(batch.bundle.metadata)
+            metadata.update(
+                {
+                    "num_images": 1,
+                    "split_sizes": [int(rows)],
+                    "last_hidden_shape": tuple(int(dim) for dim in main.shape),
+                    "deepstack_layers": [int(layer) for layer, _ in intermediates],
+                    "deepstack_shapes": [
+                        tuple(int(dim) for dim in tensor.shape)
+                        for _, tensor in intermediates
+                    ],
+                    "grid_thw_shape": tuple(int(dim) for dim in grid.shape),
+                    "dynamic_batch_size": len(normalized),
+                    "dynamic_batch_ordinal": ordinal,
+                }
+            )
+            outputs.append(
+                EncoderOutput(
+                    bundle=FeatureBundle(
+                        image_hash=str(image_id),
+                        last_hidden=main,
+                        intermediates=intermediates,
+                        grid_thw=grid,
+                        metadata=metadata,
+                    ),
+                    encode_time_ms=float(batch.encode_time_ms),
+                    image_id=str(image_id),
+                )
+            )
+        return outputs
 
     def encode_and_prefetch(
         self,

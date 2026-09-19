@@ -33,14 +33,17 @@ def _tensor_cache_hash(tensor: torch.Tensor, *, fast_sample: bool = False) -> st
 
     Production cache keys must not sample tensor bytes: two images differing
     outside the sample window would alias and reuse the wrong hidden state.
-    Sampling remains as an explicit opt-in diagnostic mode only.
+    Sampling remains as an explicit opt-in diagnostic candidate only. The
+    final key always includes a full SHA-256 verification digest.
     """
     meta = f"{tuple(tensor.shape)}|{tensor.dtype}|{tuple(tensor.stride())}".encode()
     flat = tensor.detach().contiguous().view(torch.uint8).cpu()
     if fast_sample and flat.numel() > 4096:
         step = max(1, flat.numel() // 4096)
-        payload = flat[::step].numpy().tobytes()
-        prefix = b"sampled"
+        full_payload = flat.numpy().tobytes()
+        sampled_payload = flat[::step].numpy().tobytes()
+        payload = hashlib.sha256(sampled_payload).digest() + hashlib.sha256(full_payload).digest()
+        prefix = b"sampled-candidate+full-verify"
     else:
         payload = flat.numpy().tobytes()
         prefix = b"full"

@@ -10,7 +10,6 @@ experiments, but a separate process cannot expose pointers owned by vLLM.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
 import os
 import sys
@@ -32,6 +31,9 @@ from mooncake_epd.core.state import (  # noqa: E402
     register_direct_feature_buffer_registry,
     unregister_direct_feature_buffer_registry,
 )
+from mooncake_epd.core.control.vllm_incarnation import (  # noqa: E402
+    VLLM_PROCESS_INCARNATION,
+)
 from mooncake_epd.core.transfer import TransferEngine  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -49,13 +51,8 @@ class DirectFeatureBufferServiceConfig:
     mooncake_device_name: str = ""
     remote_session: Optional[str] = None
     register_memory: bool = True
-    # Every direct publish covers the full descriptor before ``mark_ready``.
-    # Clearing the destination first is therefore pure write amplification.
-    zero_fill: bool = False
+    zero_fill: bool = True
     target_memory_mode: str = "registered_tensor"
-    persistent_cache: bool = False
-    max_cache_entries: int = 64
-    max_cache_bytes: int = 2 * 1024 * 1024 * 1024
 
 
 def create_app(
@@ -77,11 +74,9 @@ def create_app(
             device=config.device,
             transfer_engine=engine if config.register_memory or config.remote_session is None else transfer_engine,
             remote_session=config.remote_session,
+            remote_incarnation=VLLM_PROCESS_INCARNATION,
             register_memory=bool(config.register_memory),
             target_memory_mode=config.target_memory_mode,
-            persistent_cache=bool(config.persistent_cache),
-            max_cache_entries=int(config.max_cache_entries),
-            max_cache_bytes=int(config.max_cache_bytes),
         )
     register_direct_feature_buffer_registry(registry)
 
@@ -98,43 +93,6 @@ def create_app(
     )
     app.state.config = config
     app.state.registry = registry
-
-    def _allocate_targets(
-        raw_descriptors: List[Any],
-        *,
-        zero_fill: bool,
-        reuse_ready: bool,
-    ) -> List[Dict[str, Any]]:
-        targets: List[Dict[str, Any]] = []
-        for raw in raw_descriptors:
-            descriptor = FeatureBundleDescriptor.from_dict(dict(raw or {}))
-            if not descriptor.feature_id:
-                raise FeatureHandleError("descriptor.feature_id is required")
-            allocation = registry.allocate_for_descriptor(
-                descriptor,
-                zero_fill=zero_fill,
-                reuse_ready=reuse_ready,
-            )
-            should_publish = False
-            with registry._lock:  # noqa: SLF001 - atomic publish reservation
-                if not allocation.ready and not allocation.publish_started:
-                    allocation.publish_started = True
-                    should_publish = True
-            target = allocation.as_direct_target()
-            target["cache_hit"] = bool(allocation.ready)
-            target["publish_required"] = bool(should_publish)
-            target["publish_pending"] = bool(not allocation.ready and not should_publish)
-            target["ref_count"] = int(allocation.ref_count)
-            targets.append(target)
-        return targets
-
-    def _wait_for_ready(feature_ids: List[str], timeout_s: float) -> None:
-        for feature_id in feature_ids:
-            registry.wait_ready(feature_id, timeout_s=timeout_s)
-
-    def _release_features(feature_ids: List[str]) -> None:
-        for feature_id in feature_ids:
-            registry.release(feature_id)
 
     @app.get("/health")
     async def health() -> Dict[str, Any]:
@@ -156,84 +114,24 @@ def create_app(
             raw_descriptors = [payload.get("descriptor")]
         if not isinstance(raw_descriptors, list) or not raw_descriptors:
             raise HTTPException(status_code=400, detail="allocate requires descriptors[]")
+        targets: List[Dict[str, Any]] = []
+        allocated_feature_ids: List[str] = []
         try:
-            # CUDA allocation and Mooncake registration may block, so keep them
-            # off the API loop. The registry single-flights identical feature
-            # ids and serializes only engine registration, allowing unrelated
-            # FeatureBundles to allocate concurrently.
-            targets = await asyncio.to_thread(
-                _allocate_targets,
-                list(raw_descriptors),
-                zero_fill=bool(payload.get("zero_fill", config.zero_fill)),
-                reuse_ready=bool(payload.get("reuse_ready", True)),
-            )
+            for raw in raw_descriptors:
+                descriptor = FeatureBundleDescriptor.from_dict(dict(raw or {}))
+                if not descriptor.feature_id:
+                    raise FeatureHandleError("descriptor.feature_id is required")
+                allocation = registry.allocate_for_descriptor(
+                    descriptor,
+                    zero_fill=bool(payload.get("zero_fill", config.zero_fill)),
+                )
+                allocated_feature_ids.append(allocation.feature_id)
+                targets.append(allocation.as_direct_target())
         except Exception as exc:
+            for feature_id in allocated_feature_ids:
+                registry.release(feature_id)
             raise HTTPException(status_code=400, detail=f"direct buffer allocation failed: {exc}") from exc
         return {"targets": targets, "count": len(targets), "worker_id": registry.worker_id}
-
-    @app.post("/lookup")
-    async def lookup(payload: Dict[str, Any]) -> Dict[str, Any]:
-        raw = payload.get("feature_ids") or payload.get("features") or []
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list) or not raw:
-            raise HTTPException(status_code=400, detail="lookup requires feature_ids[]")
-        hits: List[Dict[str, Any]] = []
-        misses: List[str] = []
-        for feature_id in raw:
-            allocation = registry.lookup_ready(str(feature_id))
-            if allocation is None:
-                misses.append(str(feature_id))
-                continue
-            target = allocation.as_direct_target()
-            target["cache_hit"] = True
-            target["publish_required"] = False
-            target["ref_count"] = int(allocation.ref_count)
-            hits.append(
-                {
-                    "feature_id": str(feature_id),
-                    "descriptor": allocation.descriptor.to_dict(),
-                    "target": target,
-                }
-            )
-        return {
-            "hits": hits,
-            "misses": misses,
-            "count": len(hits),
-            "all_hit": len(hits) == len(raw),
-            "worker_id": registry.worker_id,
-        }
-
-    @app.post("/mark_ready")
-    async def mark_ready(payload: Dict[str, Any]) -> Dict[str, Any]:
-        raw = payload.get("feature_ids") or payload.get("features") or []
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list) or not raw:
-            raise HTTPException(status_code=400, detail="mark_ready requires feature_ids[]")
-        for feature_id in raw:
-            registry.mark_ready(str(feature_id))
-        return {"ready": len(raw), "stats": dict(registry.stats())}
-
-    @app.post("/wait_ready")
-    async def wait_ready(payload: Dict[str, Any]) -> Dict[str, Any]:
-        raw = payload.get("feature_ids") or payload.get("features") or []
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list) or not raw:
-            raise HTTPException(status_code=400, detail="wait_ready requires feature_ids[]")
-        timeout_s = float(payload.get("timeout_s", 30.0) or 30.0)
-        try:
-            await asyncio.to_thread(
-                _wait_for_ready,
-                [str(feature_id) for feature_id in raw],
-                timeout_s,
-            )
-        except TimeoutError as exc:
-            raise HTTPException(status_code=504, detail=str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return {"ready": len(raw), "stats": dict(registry.stats())}
 
     @app.post("/release")
     async def release(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -242,21 +140,9 @@ def create_app(
             raw = [raw]
         if not isinstance(raw, list):
             raise HTTPException(status_code=400, detail="release requires feature_ids[]")
-        try:
-            await asyncio.to_thread(_release_features, [str(feature_id) for feature_id in raw])
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"direct buffer release failed: {exc}") from exc
+        for feature_id in raw:
+            registry.release(str(feature_id))
         return {"released": len(raw), "stats": dict(registry.stats())}
-
-    # Match the embedded vLLM route namespace used by production sitecustomize.
-    # The root routes remain for standalone diagnostics and older tests.
-    prefix = "/mooncake_epd/direct_feature_buffer"
-    app.get(f"{prefix}/stats")(stats)
-    app.post(f"{prefix}/allocate")(allocate)
-    app.post(f"{prefix}/lookup")(lookup)
-    app.post(f"{prefix}/mark_ready")(mark_ready)
-    app.post(f"{prefix}/wait_ready")(wait_ready)
-    app.post(f"{prefix}/release")(release)
 
     return app
 
@@ -273,11 +159,8 @@ def parse_args() -> DirectFeatureBufferServiceConfig:
     ap.add_argument("--mooncake-device-name", default=os.getenv("MOONCAKE_DEVICE_NAME", ""))
     ap.add_argument("--remote-session", default=os.getenv("MOONCAKE_EPD_DIRECT_REMOTE_SESSION"))
     ap.add_argument("--register-memory", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--zero-fill", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--zero-fill", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--target-memory-mode", choices=["registered_tensor", "managed_buffer", "auto"], default=os.getenv("MOONCAKE_EPD_DIRECT_TARGET_MODE", "registered_tensor"))
-    ap.add_argument("--persistent-cache", action=argparse.BooleanOptionalAction, default=os.getenv("MOONCAKE_EPD_DIRECT_BUFFER_PERSISTENT_CACHE", "0").lower() in {"1", "true", "yes", "on"})
-    ap.add_argument("--max-cache-entries", type=int, default=int(os.getenv("MOONCAKE_EPD_DIRECT_BUFFER_CACHE_MAX_ENTRIES", "64")))
-    ap.add_argument("--max-cache-bytes", type=int, default=int(os.getenv("MOONCAKE_EPD_DIRECT_BUFFER_CACHE_MAX_BYTES", str(2 * 1024 * 1024 * 1024))))
     args = ap.parse_args()
     return DirectFeatureBufferServiceConfig(**vars(args))
 

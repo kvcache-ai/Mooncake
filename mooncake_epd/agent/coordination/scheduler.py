@@ -117,6 +117,12 @@ class AgentScheduler:
     # ------------------------------------------------------------------
     def score(self, request: AgentRequest, worker: WorkerLoad) -> float:
         """Higher score = better fit. Returns -inf if worker is at capacity."""
+        unavailable_worker_ids = {
+            str(x)
+            for x in request.metadata.get("unavailable_worker_ids", [])
+        } if isinstance(request.metadata, dict) else set()
+        if str(worker.worker_id) in unavailable_worker_ids:
+            return float("-inf")
         if worker.current_load >= worker.max_capacity:
             return float("-inf")
         remaining = max(1, worker.max_capacity - worker.current_load)
@@ -167,25 +173,17 @@ class AgentScheduler:
         excluded_worker_ids = {
             str(x) for x in request.metadata.get("excluded_worker_ids", [])
         } if isinstance(request.metadata, dict) else set()
-        # Pool/worker preferences are soft locality hints. Their influence
-        # decays as the target fills up so they cannot pin traffic to one
-        # instance and erase the throughput benefit of a multi-worker pool.
-        load_pressure = max(
-            float(worker.current_load) / max(1, int(worker.max_capacity)),
-            float(worker.queue_size) / max(1, int(worker.queue_capacity)),
-        )
-        healthy_headroom = max(0.0, 1.0 - min(1.0, load_pressure))
         if str(worker.worker_id) in preferred_worker_ids:
-            pool_score += 0.30 * healthy_headroom
+            pool_score += 1.25
         if str(worker.worker_id) in excluded_worker_ids:
-            pool_score -= 0.30 * healthy_headroom
+            pool_score -= 1.25
         preferred_pool = str(request.metadata.get("preferred_pool") or "") if isinstance(request.metadata, dict) else ""
         avoid_pool = str(request.metadata.get("avoid_pool") or "") if isinstance(request.metadata, dict) else ""
         tags = {str(tag) for tag in getattr(worker, "pool_tags", []) or []}
         if preferred_pool and preferred_pool in tags:
-            pool_score += 0.20 * healthy_headroom
+            pool_score += 1.0
         if avoid_pool and avoid_pool in tags:
-            pool_score -= 0.16 * healthy_headroom
+            pool_score -= 0.85
 
         return (
             w_cap * capacity_score

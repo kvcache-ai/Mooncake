@@ -38,6 +38,13 @@ from .policy import (
     Precision,
     TransferPolicy,
 )
+from .rdma import (
+    RdmaCapabilities,
+    default_rdma_bind_address,
+    detect_rdma_capabilities,
+    resolve_rdma_protocol,
+)
+from .rdmacm import RdmaStagedClient, RdmaStagedServer, RegisteredRegion
 from .cachegen import _compress_cachegen, _decompress_cachegen
 from ..strict_mode import strict_no_fallback_enabled
 
@@ -164,10 +171,20 @@ class DirectPeerBuffer:
     pointer: int
     size_bytes: int
     registered: bool = False
-    # ``register_memory`` returns ``-600`` when another owner has already
-    # registered the same region.  Such a handle is usable for a transfer but
-    # must never unregister memory it did not register itself.
+    registration_id: Optional[str] = None
+    borrowed: bool = False
     owns_registration: bool = False
+    released: bool = False
+
+
+@dataclass
+class _RegistrationRecord:
+    registration_id: str
+    pointer: int
+    size_bytes: int
+    owned_by_engine: bool
+    references: int = 1
+    in_flight: int = 0
 
 
 @dataclass
@@ -194,7 +211,6 @@ class PeerTransferResult:
     nbytes: int
     descriptor_count: int
     mirrored_tensors: List[Optional[torch.Tensor]] = field(default_factory=list)
-    timings_ms: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -225,7 +241,6 @@ class FeatureBundlePeerBufferResult:
     tensor_count: int
     descriptor_count: int
     backend_label: str = "feature_peer_buffer_direct"
-    timings_ms: Dict[str, float] = field(default_factory=dict)
 
 
 def _tensor_raw_bytes(tensor: torch.Tensor) -> bytes:
@@ -259,7 +274,13 @@ class TransferEngine:
         device_name: str = "",
         max_workers: int = 4,
     ):
-        self.protocol = str(protocol).lower()
+        self.requested_protocol = str(protocol).strip().lower()
+        self.rdma_capabilities: RdmaCapabilities = detect_rdma_capabilities()
+        self.protocol = resolve_rdma_protocol(
+            self.requested_protocol,
+            self.rdma_capabilities,
+            same_host=self.requested_protocol == "local",
+        )
         self.hw = hw_caps or HwCaps.detect()
         self.local_hostname = local_hostname
         self.metadata_server = metadata_server
@@ -268,8 +289,20 @@ class TransferEngine:
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._mooncake = None
         self._store = None
+        self._rdmacm_client: Optional[RdmaStagedClient] = None
+        self._rdmacm_server: Optional[RdmaStagedServer] = None
         self._initialized = False
         self._owns_mooncake_backend = True
+        self._registration_lock = threading.RLock()
+        self._registrations: Dict[str, _RegistrationRecord] = {}
+        self._registration_by_pointer: Dict[int, str] = {}
+        self._registration_metrics: Dict[str, int] = {
+            "owned_registrations": 0,
+            "borrowed_registrations": 0,
+            "unregister_calls": 0,
+            "illegal_unregisters": 0,
+            "registration_leaks_on_shutdown": 0,
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -289,13 +322,14 @@ class TransferEngine:
                     # only before it snapshots environment settings.
                     os.environ.setdefault("MC_FORCE_TCP", "1")
                 from mooncake.engine import TransferEngine as _MTE
-                self._mooncake = _MTE()
-                self._mooncake.initialize(
+                mooncake_backend = _MTE()
+                mooncake_backend.initialize(
                     self.local_hostname,
                     self.metadata_server,
                     self.protocol,
                     self.device_name,
                 )
+                self._mooncake = mooncake_backend
             except Exception as e:
                 raise RuntimeError(f"Mooncake Transfer Engine init failed: {e}") from e
             if os.getenv("MOONCAKE_EPD_INIT_PYTHON_STORE_ON_ENGINE_INIT", "0").lower() in {
@@ -305,9 +339,14 @@ class TransferEngine:
                 "on",
             }:
                 self._maybe_initialize_store()
+        elif self.protocol == "rdmacm":
+            self._rdmacm_client = RdmaStagedClient(
+                capabilities=self.rdma_capabilities,
+            )
         self._initialized = True
 
     def shutdown(self) -> None:
+        self._shutdown_registrations()
         if self._mooncake is not None and self._owns_mooncake_backend:
             try:
                 self._mooncake.shutdown()
@@ -320,6 +359,11 @@ class TransferEngine:
             with contextlib.suppress(Exception):
                 self._store.close()
             self._store = None
+        if self._rdmacm_server is not None:
+            with contextlib.suppress(Exception):
+                self._rdmacm_server.close()
+            self._rdmacm_server = None
+        self._rdmacm_client = None
         self._executor.shutdown(wait=False)
         self._initialized = False
         self._owns_mooncake_backend = True
@@ -352,6 +396,10 @@ class TransferEngine:
         """
 
         self.initialize()
+        if self.protocol == "rdmacm":
+            if self._rdmacm_server is None:
+                raise RuntimeError("rdmacm server is not started")
+            return f"{self._rdmacm_server.bind_address}:{self._rdmacm_server.port}"
         if self._mooncake is None:
             raise RuntimeError("Mooncake direct engine is not initialized")
         if os.getenv("MOONCAKE_EPD_DIRECT_SESSION_INCLUDES_RPC_PORT", "0").lower() in {
@@ -365,6 +413,59 @@ class TransferEngine:
                 raise RuntimeError(f"Mooncake direct engine returned invalid rpc port: {rpc_port}")
             return f"{self.local_hostname}:{rpc_port}"
         return str(self.local_hostname)
+
+    # ------------------------------------------------------------------
+    # rdma_cm/iWARP staged endpoint helpers
+    # ------------------------------------------------------------------
+    def start_rdmacm_server(
+        self,
+        *,
+        bind_address: str = "",
+        port: int,
+        regions: Optional[Sequence[RegisteredRegion]] = None,
+    ) -> RdmaStagedServer:
+        """Start the receiver-side iWARP endpoint.
+
+        The endpoint is only needed on the target worker.  Destination pointer
+        ranges must be registered before a producer may write them.
+        """
+
+        if self.protocol != "rdmacm":
+            raise RuntimeError(
+                f"rdmacm server requested for resolved protocol {self.protocol!r}"
+            )
+        if self._rdmacm_server is not None:
+            return self._rdmacm_server
+        server = RdmaStagedServer(
+            bind_address=(
+                bind_address
+                or os.getenv("MOONCAKE_EPD_RDMACM_BIND_ADDRESS", "")
+                or default_rdma_bind_address(self.rdma_capabilities)
+            ),
+            port=int(port),
+            capabilities=self.rdma_capabilities,
+        )
+        if regions:
+            server.register_regions(regions)
+        server.start()
+        self._rdmacm_server = server
+        self._initialized = True
+        return server
+
+    def register_rdmacm_region(
+        self,
+        base_address: int,
+        size_bytes: int,
+        *,
+        memory_kind: str = "cuda",
+    ) -> None:
+        if self._rdmacm_server is None:
+            raise RuntimeError("rdmacm server is not started")
+        self._rdmacm_server.register_region(
+            int(base_address),
+            int(size_bytes),
+            memory_kind=memory_kind,
+        )
 
     # ------------------------------------------------------------------
     # Direct engine peer-buffer helpers
@@ -421,26 +522,128 @@ class TransferEngine:
             raise RuntimeError("Mooncake direct engine is not initialized")
         nbytes = int(tensor.nelement() * tensor.element_size())
         ptr = int(tensor.data_ptr())
-        rc = self._mooncake.register_memory(ptr, nbytes)
-        if rc not in (0, -600):
-            raise RuntimeError(f"register_memory failed: rc={rc}, ptr={ptr}, nbytes={nbytes}")
-        return DirectPeerBuffer(
-            pointer=ptr,
-            size_bytes=nbytes,
-            registered=True,
-            owns_registration=(rc == 0),
-        )
+        with self._registration_lock:
+            existing_id = self._registration_by_pointer.get(ptr)
+            if existing_id is not None:
+                record = self._registrations[existing_id]
+                if record.size_bytes != nbytes:
+                    raise RuntimeError(
+                        "registered pointer size mismatch: "
+                        f"ptr={ptr} existing={record.size_bytes} requested={nbytes}"
+                    )
+                record.references += 1
+                self._registration_metrics["borrowed_registrations"] += 1
+                return DirectPeerBuffer(
+                    pointer=ptr,
+                    size_bytes=nbytes,
+                    registered=True,
+                    registration_id=record.registration_id,
+                    borrowed=True,
+                    owns_registration=False,
+                )
+
+            rc = self._mooncake.register_memory(ptr, nbytes)
+            if rc not in (0, -600):
+                raise RuntimeError(f"register_memory failed: rc={rc}, ptr={ptr}, nbytes={nbytes}")
+            registration_id = uuid.uuid4().hex
+            owned = rc == 0
+            record = _RegistrationRecord(
+                registration_id=registration_id,
+                pointer=ptr,
+                size_bytes=nbytes,
+                owned_by_engine=owned,
+            )
+            self._registrations[registration_id] = record
+            self._registration_by_pointer[ptr] = registration_id
+            metric = "owned_registrations" if owned else "borrowed_registrations"
+            self._registration_metrics[metric] += 1
+            return DirectPeerBuffer(
+                pointer=ptr,
+                size_bytes=nbytes,
+                registered=True,
+                registration_id=registration_id,
+                borrowed=not owned,
+                owns_registration=owned,
+            )
 
     def unregister_tensor_memory(self, handle: DirectPeerBuffer) -> None:
-        if (
-            not handle.registered
-            or not handle.owns_registration
-            or self._mooncake is None
-        ):
+        if not handle.registered or handle.released:
             return
-        rc = self._mooncake.unregister_memory(int(handle.pointer))
-        if rc not in (0, -601):
-            raise RuntimeError(f"unregister_memory failed: rc={rc}, ptr={handle.pointer}")
+        with self._registration_lock:
+            handle.released = True
+            registration_id = handle.registration_id
+            if registration_id is None:
+                # Pointer-only descriptors are declared registered by their
+                # external owner. This facade has no unregister authority.
+                return
+            record = self._registrations.get(registration_id)
+            if record is None:
+                return
+            record.references = max(0, record.references - 1)
+            self._maybe_finalize_registration_locked(record)
+
+    def _retain_registration_for_transfer(self, handle: DirectPeerBuffer) -> None:
+        registration_id = handle.registration_id
+        if registration_id is None:
+            return
+        with self._registration_lock:
+            record = self._registrations.get(registration_id)
+            if record is None or handle.released:
+                raise RuntimeError(
+                    f"registration is not active for transfer: ptr={handle.pointer}"
+                )
+            record.in_flight += 1
+
+    def _release_registration_from_transfer(self, handle: DirectPeerBuffer) -> None:
+        registration_id = handle.registration_id
+        if registration_id is None:
+            return
+        with self._registration_lock:
+            record = self._registrations.get(registration_id)
+            if record is None:
+                return
+            record.in_flight = max(0, record.in_flight - 1)
+            self._maybe_finalize_registration_locked(record)
+
+    def _maybe_finalize_registration_locked(self, record: _RegistrationRecord) -> None:
+        if record.references > 0 or record.in_flight > 0:
+            return
+        if record.owned_by_engine:
+            if self._mooncake is None:
+                self._registration_metrics["registration_leaks_on_shutdown"] += 1
+                return
+            rc = self._mooncake.unregister_memory(int(record.pointer))
+            if rc not in (0, -601):
+                raise RuntimeError(
+                    f"unregister_memory failed: rc={rc}, ptr={record.pointer}"
+                )
+            self._registration_metrics["unregister_calls"] += 1
+        self._registrations.pop(record.registration_id, None)
+        self._registration_by_pointer.pop(record.pointer, None)
+
+    def _shutdown_registrations(self) -> None:
+        with self._registration_lock:
+            for record in list(self._registrations.values()):
+                if record.in_flight > 0:
+                    self._registration_metrics["registration_leaks_on_shutdown"] += 1
+                    continue
+                record.references = 0
+                self._maybe_finalize_registration_locked(record)
+
+    def registration_stats(self) -> Dict[str, int]:
+        with self._registration_lock:
+            out = dict(self._registration_metrics)
+            out["active_registrations"] = len(self._registrations)
+            out["active_registration_refs"] = sum(
+                record.references for record in self._registrations.values()
+            )
+            out["inflight_registrations"] = sum(
+                1 for record in self._registrations.values() if record.in_flight > 0
+            )
+            out["borrowed_active_registrations"] = sum(
+                1 for record in self._registrations.values() if not record.owned_by_engine
+            )
+            return out
 
     def build_peer_transfer_plan(
         self,
@@ -512,195 +715,117 @@ class TransferEngine:
             target_device=None,
         )
 
-    def transfer_registered_pointer_batch(
-        self,
-        *,
-        remote_session: str,
-        local_pointers: Sequence[int],
-        remote_pointers: Sequence[int],
-        lengths: Sequence[int],
-    ) -> PeerTransferResult:
-        """Transfer already-registered pointers without descriptor allocation.
-
-        The vLLM P->D KV path already owns persistent, Mooncake-registered KV
-        cache regions.  Constructing a ``PeerTransferPlan`` for every layer
-        group adds Python descriptor and wrapper allocation but cannot improve
-        safety or data movement.  This narrow fast path retains the same direct
-        Mooncake engine calls while accepting the native pointer arrays.
-
-        Callers are responsible for the registration lifetime of every local
-        pointer.  No tensor registration, unregister, mirror copy, staging, or
-        payload copy is performed here.
-        """
-
-        if not (len(local_pointers) == len(remote_pointers) == len(lengths)):
-            raise ValueError(
-                "local_pointers, remote_pointers and lengths must have identical lengths"
-            )
-        if not remote_session:
-            raise ValueError("remote_session is required for peer-buffer transfer")
-
-        total_started = time.perf_counter()
-        self.initialize()
-        if self._mooncake is None:
-            raise RuntimeError("Mooncake direct engine is unavailable")
-        if not local_pointers:
-            return PeerTransferResult(
-                nbytes=0,
-                descriptor_count=0,
-                timings_ms={
-                    "total_ms": (time.perf_counter() - total_started) * 1000.0,
-                    "prepare_ms": 0.0,
-                    "write_ms": 0.0,
-                    "descriptor_count": 0.0,
-                    "nbytes": 0.0,
-                    "registered_pointer_fast_path": 1.0,
-                },
-            )
-
-        prepare_started = time.perf_counter()
-        # vLLM supplies lists on the hot path. Keep those lists intact so the
-        # Python binding can consume them directly; normalize only foreign
-        # sequences passed by diagnostics or tests.
-        src_ptrs = (
-            local_pointers
-            if isinstance(local_pointers, list)
-            else [int(pointer) for pointer in local_pointers]
-        )
-        dst_ptrs = (
-            remote_pointers
-            if isinstance(remote_pointers, list)
-            else [int(pointer) for pointer in remote_pointers]
-        )
-        transfer_lengths = (
-            lengths if isinstance(lengths, list) else [int(length) for length in lengths]
-        )
-        total_bytes = 0
-        for length in transfer_lengths:
-            if int(length) < 0:
-                raise ValueError(f"negative peer-buffer transfer length: {length}")
-            total_bytes += int(length)
-        prepare_ms = (time.perf_counter() - prepare_started) * 1000.0
-
-        write_started = time.perf_counter()
-        if len(src_ptrs) == 1:
-            rc = self._mooncake.transfer_sync_write(
-                str(remote_session),
-                int(src_ptrs[0]),
-                int(dst_ptrs[0]),
-                int(transfer_lengths[0]),
-            )
-        else:
-            rc = self._mooncake.batch_transfer_sync_write(
-                str(remote_session),
-                src_ptrs,
-                dst_ptrs,
-                transfer_lengths,
-            )
-        write_ms = (time.perf_counter() - write_started) * 1000.0
-        if rc != 0:
-            raise RuntimeError(f"registered peer-buffer transfer failed: rc={rc}")
-
-        return PeerTransferResult(
-            nbytes=total_bytes,
-            descriptor_count=len(src_ptrs),
-            timings_ms={
-                "total_ms": (time.perf_counter() - total_started) * 1000.0,
-                "prepare_ms": prepare_ms,
-                "write_ms": write_ms,
-                "descriptor_count": float(len(src_ptrs)),
-                "nbytes": float(total_bytes),
-                "registered_pointer_fast_path": 1.0,
-            },
-        )
-
     def transfer_registered_descriptors(
         self,
         plan: PeerTransferPlan,
     ) -> PeerTransferResult:
-        total_started = time.perf_counter()
         self.initialize()
-        if self._mooncake is None:
+        if self.protocol != "rdmacm" and self._mooncake is None:
             raise RuntimeError("Mooncake direct engine is unavailable")
         if not plan.descriptors:
             return PeerTransferResult(nbytes=0, descriptor_count=0)
 
         cleanup_handles: List[DirectPeerBuffer] = []
+        transfer_handles: List[DirectPeerBuffer] = []
         local_ptrs: List[int] = []
         remote_ptrs: List[int] = []
         lengths: List[int] = []
         mirrored: List[Optional[torch.Tensor]] = []
         total_bytes = 0
 
-        prepare_started = time.perf_counter()
-        register_ms = 0.0
         for desc in plan.descriptors:
-            if desc.local_buffer is not None:
-                if not desc.local_buffer.registered and desc.tensor is None:
-                    raise ValueError(
-                        "pointer-only peer-buffer descriptors must reference registered memory"
-                    )
-                local_ptr = int(desc.local_buffer.pointer)
-            elif desc.local_pointer:
-                local_ptr = int(desc.local_pointer)
-            elif desc.tensor is not None:
-                reg_started = time.perf_counter()
-                handle = self.register_tensor_memory(desc.tensor.detach())
-                register_ms += (time.perf_counter() - reg_started) * 1000.0
-                cleanup_handles.append(handle)
-                local_ptr = int(handle.pointer)
-                desc.needs_unregister = True
-            else:
-                raise ValueError("descriptor must provide tensor, local_pointer or local_buffer")
+            try:
+                if desc.local_buffer is not None:
+                    if not desc.local_buffer.registered and desc.tensor is None:
+                        raise ValueError(
+                            "pointer-only peer-buffer descriptors must reference registered memory"
+                        )
+                    local_ptr = int(desc.local_buffer.pointer)
+                    if desc.local_buffer.registration_id is not None:
+                        self._retain_registration_for_transfer(desc.local_buffer)
+                        transfer_handles.append(desc.local_buffer)
+                elif desc.local_pointer:
+                    local_ptr = int(desc.local_pointer)
+                elif desc.tensor is not None:
+                    handle = self.register_tensor_memory(desc.tensor.detach())
+                    cleanup_handles.append(handle)
+                    self._retain_registration_for_transfer(handle)
+                    transfer_handles.append(handle)
+                    local_ptr = int(handle.pointer)
+                    desc.needs_unregister = True
+                else:
+                    raise ValueError("descriptor must provide tensor, local_pointer or local_buffer")
 
-            if (
-                desc.tensor is not None
-                and desc.local_buffer is None
-                and not desc.needs_unregister
-            ):
-                reg_started = time.perf_counter()
-                handle = self.register_tensor_memory(desc.tensor.detach())
-                register_ms += (time.perf_counter() - reg_started) * 1000.0
-                cleanup_handles.append(handle)
-                local_ptr = int(handle.pointer)
-                desc.needs_unregister = True
+                if (
+                    desc.tensor is not None
+                    and desc.local_buffer is None
+                    and not desc.needs_unregister
+                ):
+                    handle = self.register_tensor_memory(desc.tensor.detach())
+                    cleanup_handles.append(handle)
+                    self._retain_registration_for_transfer(handle)
+                    transfer_handles.append(handle)
+                    local_ptr = int(handle.pointer)
+                    desc.needs_unregister = True
 
-            local_ptrs.append(local_ptr)
-            remote_ptrs.append(int(desc.remote_pointer))
-            lengths.append(int(desc.size_bytes))
-            total_bytes += int(desc.size_bytes)
-        prepare_ms = (time.perf_counter() - prepare_started) * 1000.0
+                local_ptrs.append(local_ptr)
+                remote_ptrs.append(int(desc.remote_pointer))
+                lengths.append(int(desc.size_bytes))
+                total_bytes += int(desc.size_bytes)
+            except BaseException:
+                for handle in transfer_handles:
+                    with contextlib.suppress(Exception):
+                        self._release_registration_from_transfer(handle)
+                for handle in cleanup_handles:
+                    with contextlib.suppress(Exception):
+                        self.unregister_tensor_memory(handle)
+                raise
 
-        write_ms = 0.0
-        unregister_ms = 0.0
         try:
-            write_started = time.perf_counter()
-            if len(local_ptrs) == 1:
-                rc = self._mooncake.transfer_sync_write(
-                    str(plan.remote_session),
-                    int(local_ptrs[0]),
-                    int(remote_ptrs[0]),
-                    int(lengths[0]),
+            if self.protocol == "rdmacm":
+                if self._rdmacm_client is None:
+                    raise RuntimeError("rdmacm client is unavailable")
+                host, separator, raw_port = str(plan.remote_session).rpartition(":")
+                if not separator or not host:
+                    raise ValueError(
+                        "rdmacm remote_session must be '<IPv4-address>:<port>'"
+                    )
+                self._rdmacm_client.write_descriptors(
+                    remote_address=host,
+                    remote_port=int(raw_port),
+                    source_pointers=local_ptrs,
+                    destination_pointers=remote_ptrs,
+                    lengths=lengths,
+                    source_memory="cuda",
+                    destination_memory="cuda",
                 )
             else:
-                rc = self._mooncake.batch_transfer_sync_write(
-                    str(plan.remote_session),
-                    local_ptrs,
-                    remote_ptrs,
-                    lengths,
-                )
-            write_ms = (time.perf_counter() - write_started) * 1000.0
-            if rc != 0:
-                raise RuntimeError(f"peer-buffer transfer failed: rc={rc}")
+                assert self._mooncake is not None
+                if len(local_ptrs) == 1:
+                    rc = self._mooncake.transfer_sync_write(
+                        str(plan.remote_session),
+                        int(local_ptrs[0]),
+                        int(remote_ptrs[0]),
+                        int(lengths[0]),
+                    )
+                else:
+                    rc = self._mooncake.batch_transfer_sync_write(
+                        str(plan.remote_session),
+                        local_ptrs,
+                        remote_ptrs,
+                        lengths,
+                    )
+                if rc != 0:
+                    raise RuntimeError(f"peer-buffer transfer failed: rc={rc}")
         finally:
+            for handle in transfer_handles:
+                with contextlib.suppress(Exception):
+                    self._release_registration_from_transfer(handle)
             for handle in cleanup_handles:
                 with contextlib.suppress(Exception):
-                    unreg_started = time.perf_counter()
                     self.unregister_tensor_memory(handle)
-                    unregister_ms += (time.perf_counter() - unreg_started) * 1000.0
 
         target_device = plan.target_device
-        mirror_started = time.perf_counter()
         for desc in plan.descriptors:
             if isinstance(desc.mirror_tensor, torch.Tensor):
                 mirrored.append(
@@ -712,22 +837,11 @@ class TransferEngine:
                 )
             else:
                 mirrored.append(None)
-        mirror_ms = (time.perf_counter() - mirror_started) * 1000.0
 
         return PeerTransferResult(
             nbytes=total_bytes,
             descriptor_count=len(plan.descriptors),
             mirrored_tensors=mirrored,
-            timings_ms={
-                "total_ms": (time.perf_counter() - total_started) * 1000.0,
-                "prepare_ms": prepare_ms,
-                "register_memory_ms": register_ms,
-                "write_ms": write_ms,
-                "unregister_memory_ms": unregister_ms,
-                "mirror_ms": mirror_ms,
-                "descriptor_count": float(len(plan.descriptors)),
-                "nbytes": float(total_bytes),
-            },
         )
 
     def transfer_peer_buffer_plan(self, plan: PeerTransferPlan) -> PeerTransferResult:
@@ -802,13 +916,14 @@ class TransferEngine:
         remote_pointers: Sequence[int],
         tensors: Sequence[torch.Tensor],
     ) -> Dict[str, float]:
-        """Read remote peer buffers directly into caller-owned tensors.
+        """Read peer buffers directly into caller-owned contiguous tensors.
 
-        This is the zero-copy receive-side hot path for ``epd-direct://``:
-        EngineCore allocates final hidden-state tensors on its target device,
-        registers those tensor pointers with Mooncake, and the direct engine
-        writes bytes into those tensors. It avoids managed-buffer staging,
-        Python ``bytes`` materialization, and CPU→GPU tensor copies.
+        The receive tensor is the final materialization target.  Compared with
+        :meth:`read_remote_peer_buffers`, this avoids a managed-buffer staging
+        allocation, Python ``bytes`` creation, and a subsequent CPU-to-device
+        copy.  Registration ownership is delegated to the existing reference-
+        counted registration layer, so buffers already registered by another
+        component are borrowed and never unregistered by this call.
         """
 
         total_started = time.perf_counter()
@@ -819,32 +934,40 @@ class TransferEngine:
             raise ValueError("remote_session is required for peer-buffer read")
         if len(remote_pointers) != len(tensors):
             raise ValueError("remote_pointers and tensors must have identical lengths")
+
         handles: List[DirectPeerBuffer] = []
         local_pointers: List[int] = []
         lengths: List[int] = []
         register_ms = 0.0
         transfer_ms = 0.0
+        visibility_sync_ms = 0.0
         unregister_ms = 0.0
         completed = False
         try:
             for tensor in tensors:
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError("direct peer-buffer read targets must be torch.Tensor instances")
                 if not tensor.is_contiguous():
                     raise ValueError("direct peer-buffer read target tensors must be contiguous")
-                reg_started = time.perf_counter()
+                register_started = time.perf_counter()
                 handle = self.register_tensor_memory(tensor)
-                register_ms += (time.perf_counter() - reg_started) * 1000.0
+                register_ms += (time.perf_counter() - register_started) * 1000.0
                 handles.append(handle)
                 local_pointers.append(int(handle.pointer))
                 lengths.append(int(handle.size_bytes))
+
             if not handles:
+                completed = True
                 return {
                     "total_ms": (time.perf_counter() - total_started) * 1000.0,
                     "register_memory_ms": 0.0,
                     "read_ms": 0.0,
+                    "visibility_sync_ms": 0.0,
                     "unregister_memory_ms": 0.0,
                     "descriptor_count": 0.0,
                     "nbytes": 0.0,
                 }
+
             transfer_started = time.perf_counter()
             if len(handles) == 1:
                 rc = self._mooncake.transfer_sync_read(
@@ -863,19 +986,35 @@ class TransferEngine:
             transfer_ms = (time.perf_counter() - transfer_started) * 1000.0
             if rc != 0:
                 raise RuntimeError(f"peer-buffer read failed: rc={rc}")
+            # Mooncake's synchronous return establishes transport completion,
+            # but an external DMA into CUDA memory is not associated with a
+            # PyTorch stream. Establish device visibility before the target
+            # tensors are consumed or their registrations are released.
+            cuda_devices = {
+                tensor.device
+                for tensor in tensors
+                if isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda"
+            }
+            if cuda_devices:
+                sync_started = time.perf_counter()
+                for device in sorted(cuda_devices, key=str):
+                    torch.cuda.synchronize(device)
+                visibility_sync_ms = (time.perf_counter() - sync_started) * 1000.0
             completed = True
         finally:
             for handle in handles:
                 with contextlib.suppress(Exception):
-                    unreg_started = time.perf_counter()
+                    unregister_started = time.perf_counter()
                     self.unregister_tensor_memory(handle)
-                    unregister_ms += (time.perf_counter() - unreg_started) * 1000.0
+                    unregister_ms += (time.perf_counter() - unregister_started) * 1000.0
+
         if not completed:
             raise RuntimeError("peer-buffer read did not complete")
         return {
             "total_ms": (time.perf_counter() - total_started) * 1000.0,
             "register_memory_ms": register_ms,
             "read_ms": transfer_ms,
+            "visibility_sync_ms": visibility_sync_ms,
             "unregister_memory_ms": unregister_ms,
             "descriptor_count": float(len(handles)),
             "nbytes": float(sum(lengths)),
@@ -988,47 +1127,6 @@ class TransferEngine:
             raise ValueError(f"unsupported FeatureBundle direct source_memory_mode: {mode}")
 
         tensors_by_name = {name: tensor for name, tensor in self.feature_bundle_tensor_items(bundle)}
-        if mode == "registered_tensor":
-            total_started = time.perf_counter()
-            tensors: List[torch.Tensor] = []
-            remote_pointers: List[int] = []
-            for target in plan.targets:
-                tensor = tensors_by_name.get(target.name)
-                if tensor is None:
-                    raise ValueError(f"plan references tensor not present in bundle: {target.name}")
-                nbytes = int(tensor.nelement() * tensor.element_size())
-                if nbytes != int(target.nbytes):
-                    raise ValueError(
-                        f"tensor byte size changed before transfer: {target.name} "
-                        f"plan={target.nbytes} actual={nbytes}"
-                    )
-                tensors.append(tensor)
-                remote_pointers.append(int(target.remote_pointer))
-            build_started = time.perf_counter()
-            peer_plan = self.build_peer_transfer_plan(
-                tensors=tensors,
-                remote_session=plan.remote_session,
-                remote_pointers=remote_pointers,
-                mirror_local_copy=False,
-            )
-            build_plan_ms = (time.perf_counter() - build_started) * 1000.0
-            result = self.transfer_peer_buffer_plan(peer_plan)
-            elapsed_ms = (time.perf_counter() - total_started) * 1000.0
-            self.stats.record("encoder_to_prefill_peer_buffer_direct", result.nbytes, elapsed_ms)
-            return FeatureBundlePeerBufferResult(
-                feature_id=plan.feature_id,
-                nbytes=int(result.nbytes),
-                tensor_count=len(plan.targets),
-                descriptor_count=int(result.descriptor_count),
-                timings_ms={
-                    "total_ms": elapsed_ms,
-                    "build_peer_plan_ms": build_plan_ms,
-                    **dict(result.timings_ms or {}),
-                },
-            )
-
-        total_started = time.perf_counter()
-        staging_ms = 0.0
         local_pointers: List[int] = []
         remote_pointers: List[int] = []
         lengths: List[int] = []
@@ -1044,19 +1142,17 @@ class TransferEngine:
                     f"plan={target.nbytes} actual={nbytes}"
                 )
             if mode == "managed_buffer":
-                stage_started = time.perf_counter()
                 handle = self.allocate_peer_buffer(nbytes)
                 staged_buffers.append(handle)
                 self.write_peer_buffer(handle, _tensor_raw_bytes(tensor))
-                staging_ms += (time.perf_counter() - stage_started) * 1000.0
                 local_pointers.append(int(handle.pointer))
             else:
                 local_pointers.append(int(tensor.data_ptr()))
             remote_pointers.append(int(target.remote_pointer))
             lengths.append(nbytes)
 
+        started = time.perf_counter()
         try:
-            build_started = time.perf_counter()
             pointer_plan = self.build_pointer_transfer_plan(
                 remote_session=plan.remote_session,
                 local_pointers=local_pointers,
@@ -1064,25 +1160,18 @@ class TransferEngine:
                 lengths=lengths,
                 registered=True,
             )
-            build_plan_ms = (time.perf_counter() - build_started) * 1000.0
             result = self.transfer_peer_buffer_plan(pointer_plan)
         finally:
             for handle in staged_buffers:
                 with contextlib.suppress(Exception):
                     self.free_peer_buffer(handle)
-        elapsed_ms = (time.perf_counter() - total_started) * 1000.0
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.stats.record("encoder_to_prefill_peer_buffer_direct", result.nbytes, elapsed_ms)
         return FeatureBundlePeerBufferResult(
             feature_id=plan.feature_id,
             nbytes=int(result.nbytes),
             tensor_count=len(plan.targets),
             descriptor_count=int(result.descriptor_count),
-            timings_ms={
-                "total_ms": elapsed_ms,
-                "staging_ms": staging_ms,
-                "build_peer_plan_ms": build_plan_ms,
-                **dict(result.timings_ms or {}),
-            },
         )
 
     def probe_direct_engine(self, buffer_bytes: int = 4096) -> Dict[str, Any]:
@@ -1137,7 +1226,7 @@ class TransferEngine:
             # Real deployments would ship `compressed` over TCP/RDMA.
             reconstructed = _decompress_cachegen(compressed, meta).to(target_device)
             result = reconstructed
-        elif self.protocol in ("local", "shm") or (tensor.device == target_device):
+        elif self.protocol == "local" or (tensor.device == target_device):
             copy_flag = bool(getattr(policy, "extra", {}).get("force_copy", False))
             result = payload.to(
                 target_device,
@@ -1544,15 +1633,18 @@ class TransferEngine:
             )
         key = str(key).replace("/", "__")
         cleanup = bool(extra.get("store_cleanup", True))
-        rc = self._store.put_tensor(key, tensor.detach())
+        store = self._store
+        if store is None:
+            raise RuntimeError("Mooncake Python store is unavailable")
+        rc = store.put_tensor(key, tensor.detach())
         if rc != 0:
             raise RuntimeError(f"MooncakeDistributedStore.put_tensor failed: rc={rc}")
-        restored = self._store.get_tensor(key)
+        restored = store.get_tensor(key)
         if restored is None:
             raise RuntimeError(f"MooncakeDistributedStore.get_tensor returned None for key={key}")
         if cleanup:
             with contextlib.suppress(Exception):
-                self._store.remove(key, True)
+                store.remove(key, True)
         return restored.to(target_device, copy=True)
 
     def _remote_transfer_via_engine_buffer(

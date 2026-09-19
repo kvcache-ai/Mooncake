@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
-import pytest
-
 from mooncake_epd.benchmarks.metrics_suite import (
     MetricsCollector,
     build_rfc_eval_report,
@@ -57,6 +52,11 @@ def test_build_rfc_eval_report():
                         "pipeline_overhead_ms": 12.0,
                         "relay_segments": 3,
                         "relay_recompute_segments": 2,
+                        "cost_gate_decision": "relay",
+                        "fallback_reason": "",
+                        "predicted_saved_prefill_ms": 24.0,
+                        "predicted_relay_overhead_ms": 4.0,
+                        "predicted_net_benefit_ms": 20.0,
                     }
                 ],
             },
@@ -93,6 +93,14 @@ def test_build_rfc_eval_report():
                 "requests_total": 2,
                 "peer_buffer_batches": 18,
                 "peer_buffer_bytes": 8388608,
+                "kv_transfer_attempts": 18,
+                "kv_transfer_successes": 18,
+                "kv_transfer_bytes": 8388608,
+                "kv_transfer_elapsed_ms": 8.0,
+                "kv_transfer_gbps": 8.388608,
+                "remote_transfer_backend_gbps": {
+                    "peer_buffer_direct": 8.388608,
+                },
                 "path_stats": {
                     "PD": {
                         "requests_total": 1,
@@ -182,6 +190,14 @@ def test_build_rfc_eval_report():
     assert report["main_results_table"]["ttft_gain_b2_vs_b1_ms"] == 40.0
     assert report["main_results_table"]["ttft_gain_b7_vs_b3_ms"] == 30.0
     assert report["main_results_table"]["ttft_penalty_b8_vs_b7_ms"] == 90.0
+    assert report["transport_table"]["kv_transfer_source"] == "serving_connector"
+    assert report["transport_table"]["kv_transfer_count"] == 18
+    assert report["transport_table"]["kv_transfer_bytes"] == 8388608
+    assert report["transport_table"]["kv_transfer_elapsed_ms"] == 8.0
+    assert report["transport_table"]["kv_transfer_gbps"] == 8.388608
+    assert report["transport_table"]["remote_transfer_backend_gbps"] == {
+        "peer_buffer_direct": 8.388608,
+    }
     assert report["cache_reuse_table"]["by_scenario"]["multi_turn"] == 0.75
     assert report["dataset_table"]["workflow_traces"] == 2
     assert report["serving_e2e_table"]["pd_route_ok"] is True
@@ -203,6 +219,9 @@ def test_build_rfc_eval_report():
     assert report["b8_penalty_table"]["delta_prefill_ms_avg"] == 18.0
     assert report["b8_penalty_table"]["pipeline_overhead_ms_avg"] == 12.0
     assert report["b8_penalty_table"]["dominant_cost_bucket"] == "delta_prefill_ms"
+    assert report["b8_penalty_table"]["cost_gate_decision_counts"] == {"relay": 1}
+    assert report["b8_penalty_table"]["fallback_reason_counts"] == {}
+    assert report["b8_penalty_table"]["predicted_net_benefit_ms_avg"] == 20.0
     assert report["b8_penalty_table"]["tier2_reused_tokens_constant"] is True
     assert report["ablation_ordering_table"]["ordering_pass"] is True
     assert "baseline_matrix_table" in report
@@ -564,6 +583,9 @@ def test_metrics_collector_ingest_serving_snapshot():
                 "handoff_prepare_ms_avg": 1.0,
                 "handoff_commit_ms_avg": 2.0,
                 "layered_transfer_grouped_batches": 4,
+                "kv_transfer_successes": 4,
+                "kv_transfer_bytes": 1_000_000,
+                "kv_transfer_elapsed_ms": 4.0,
                 "remote_transfer_backend_counts": {
                     "peer_buffer_direct": 3,
                     "batch_transfer_fallback": 1,
@@ -579,21 +601,29 @@ def test_metrics_collector_ingest_serving_snapshot():
     assert report["handoff_prepare_ms"] == 1.0
     assert report["handoff_commit_ms"] == 2.0
     assert report["layered_transfer_batches_avg"] == 4.0
+    assert report["kv_transfer_count"] == 1
+    assert report["kv_transfer_total_bytes"] == 1_000_000
+    assert report["kv_transfer_total_sec"] == 0.004
+    assert report["kv_transfer_gbps"] == 2.0
     assert report["remote_transfer_backend_counts"] == {
         "peer_buffer_direct": 3,
         "batch_transfer_fallback": 1,
     }
 
 
+def test_metrics_collector_marks_missing_transfer_bandwidth_unavailable():
+    report = MetricsCollector().report()
+
+    assert report["kv_transfer_count"] == 0
+    assert report["kv_transfer_total_bytes"] == 0
+    assert report["kv_transfer_total_sec"] == 0
+    assert report["kv_transfer_gbps"] is None
+
+
 def test_rfc_matrix_loads_real_mooncake_dataset_manifest(tmp_path):
     from mooncake_epd.benchmarks.rfc_eval_matrix import write_rfc_eval_matrix_artifacts
 
-    dataset_root = os.getenv(
-        "MOONCAKE_EPD_DATASET_ROOT",
-        "datasets/mooncake_test_dataset",
-    )
-    if not Path(dataset_root).exists():
-        pytest.skip("set MOONCAKE_EPD_DATASET_ROOT to run the real dataset test")
+    dataset_root = "/data/songbinbin/Proj/Proj_LWX/mooncake_test_dataset"
     matrix = write_rfc_eval_matrix_artifacts(
         phase6_path="artifacts/phase6_metrics.json",
         soak_path="artifacts/real_soak_report_post_kvdir.json",

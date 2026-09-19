@@ -379,17 +379,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Real Qwen2.5-Omni hidden cache dataset benchmark")
-    ap.add_argument(
-        "--model",
-        default=os.getenv("MOONCAKE_EPD_OMNI_MODEL", "models/Qwen2.5-Omni-7B"),
-    )
-    ap.add_argument(
-        "--dataset-root",
-        default=os.getenv(
-            "MOONCAKE_EPD_DATASET_ROOT",
-            "datasets/mooncake_test_dataset",
-        ),
-    )
+    ap.add_argument("--model", default="/home/songbinbin/Qwen2.5-Omni-7B")
+    ap.add_argument("--dataset-root", default="/data/songbinbin/Proj/Proj_LWX/mooncake_test_dataset")
     ap.add_argument("--split", default="test")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--device", default="cuda:0")

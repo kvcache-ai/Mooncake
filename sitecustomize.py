@@ -11,12 +11,14 @@ Patch scope:
 3. Install safe Mooncake FeatureHandle helpers for vLLM Qwen-VL multimodal
    hidden-state reuse.  The helper is fail-open by default for compatibility,
    but re-raises in MOONCAKE_EPD_STRICT / strict-no-fallback evaluation mode.
+4. Discard only late KV-completion notifications whose scheduler request was
+   already reclaimed, rather than allowing vLLM's invariant assertion to kill
+   a long-running Prefill process.
 """
 
 from __future__ import annotations
 
 import atexit
-import asyncio
 import inspect
 import json
 import logging
@@ -24,10 +26,78 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Callable
 
 
 logger = logging.getLogger("mooncake_epd.sitecustomize")
+
+
+def _filter_stale_kv_completions(
+    kv_connector_output: Any,
+    active_request_ids: Any,
+) -> dict[str, list[str]]:
+    """Remove only completions that cannot refer to a live scheduler request."""
+
+    active = set(active_request_ids)
+    stale_by_direction: dict[str, list[str]] = {}
+    for field_name in ("finished_recving", "finished_sending"):
+        completed = set(getattr(kv_connector_output, field_name, None) or ())
+        if not completed:
+            continue
+        stale = sorted(req_id for req_id in completed if req_id not in active)
+        if not stale:
+            continue
+        setattr(kv_connector_output, field_name, completed.difference(stale))
+        stale_by_direction[field_name] = stale
+    return stale_by_direction
+
+
+def _patch_vllm_cuda_platform_detection_without_nvml() -> None:
+    """Opt into vLLM's built-in non-NVML CUDA platform.
+
+    vLLM 0.23 normally detects NVIDIA GPUs through NVML before it builds the
+    CLI parser.  A host driver/userspace NVML version mismatch therefore makes
+    vLLM select ``UnspecifiedPlatform`` even when the real CUDA runtime and
+    PyTorch can use the GPUs.  vLLM already ships ``NonNvmlCudaPlatform`` for
+    CUDA systems without working NVML; this opt-in only directs the existing
+    CUDA plugin to that implementation.  It does not emulate a device or
+    change CUDA kernels, model execution, or memory accounting.
+
+    The override is deliberately process-local and disabled by default.  The
+    generated Mooncake EPD processes inherit it only when
+    ``MOONCAKE_EPD_VLLM_FORCE_CUDA_PLATFORM=1`` is explicitly set.
+    """
+
+    import os
+
+    enabled = str(
+        os.getenv("MOONCAKE_EPD_VLLM_FORCE_CUDA_PLATFORM", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return
+
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() <= 0:
+        raise RuntimeError(
+            "MOONCAKE_EPD_VLLM_FORCE_CUDA_PLATFORM=1 but the real PyTorch "
+            "CUDA runtime reports no available GPU"
+        )
+
+    import vllm.platforms as platforms
+
+    def _cuda_platform_from_runtime() -> str:
+        return "vllm.platforms.cuda.CudaPlatform"
+
+    platforms.builtin_platform_plugins["cuda"] = _cuda_platform_from_runtime
+    logger.warning(
+        "enabled vLLM non-NVML CUDA platform detection: visible_cuda_devices=%s",
+        torch.cuda.device_count(),
+    )
+
+
+_patch_vllm_cuda_platform_detection_without_nvml()
 
 
 def _strict_no_fallback() -> bool:
@@ -37,18 +107,6 @@ def _strict_no_fallback() -> bool:
         return strict_no_fallback_enabled()
     except Exception:
         return False
-
-
-def _vllm_patches_enabled() -> bool:
-    """Keep workspace import side effects opt-in for generated EPD workers."""
-
-    return str(os.getenv("MOONCAKE_EPD_ENABLE_VLLM_PATCHES", "0")).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
 
 
 # ---------------------------------------------------------------------------
@@ -313,15 +371,32 @@ def _patch_vllm_prompt_only_prefill() -> None:
     SamplingParams._verify_args = _patched_verify_args  # type: ignore[method-assign]
 
     original_update_from_output = Scheduler.update_from_output
+    original_update_from_kv_xfer_finished = Scheduler._update_from_kv_xfer_finished
+
+    def _patched_update_from_kv_xfer_finished(
+        self: Scheduler,
+        kv_connector_output: Any,
+    ) -> None:
+        stale_by_direction = _filter_stale_kv_completions(
+            kv_connector_output,
+            self.requests,
+        )
+        if stale_by_direction:
+            logger.warning(
+                "discarded late KV completion notifications for reclaimed requests: %s",
+                stale_by_direction,
+            )
+        original_update_from_kv_xfer_finished(self, kv_connector_output)
+
+    Scheduler._update_from_kv_xfer_finished = (  # type: ignore[method-assign]
+        _patched_update_from_kv_xfer_finished
+    )
 
     def _patched_update_from_output(
         self: Scheduler,
         scheduler_output: Any,
         model_runner_output: Any,
     ) -> dict[int, EngineCoreOutputs]:
-        # Snapshot request timing metadata before upstream mutates/free's request
-        # state.  This lets the proxy expose the true Decode Engine request->first
-        # token segment separately from P->D receive and HTTP streaming overhead.
         timing_enabled = _decode_engine_timing_enabled()
         timing_info: dict[str, tuple[float | None, object]] = {}
         if timing_enabled:
@@ -516,33 +591,16 @@ def _patch_vllm_feature_handle_injection() -> None:
                 patched.append(f"{module_name}.{class_name}.{method_name}")
     if patched:
         logger.info("enabled Mooncake EPD FeatureHandle vLLM hooks: %s", ", ".join(patched))
-    elif _strict_no_fallback():
-        raise RuntimeError(
-            "Mooncake EPD strict mode requires a compatible Qwen-VL multimodal image_embeds hook"
-        )
 
 
 def _patch_vllm_gpu_model_runner_feature_handles() -> None:
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except Exception as exc:
-        if _strict_no_fallback():
-            raise RuntimeError("Mooncake EPD strict mode requires vLLM GPUModelRunner") from exc
+    except Exception:
         return
     original = getattr(GPUModelRunner, "_batch_mm_inputs_from_scheduler", None)
-    if original is None:
-        if _strict_no_fallback():
-            raise RuntimeError("Mooncake EPD strict mode requires GPUModelRunner._batch_mm_inputs_from_scheduler")
+    if original is None or getattr(original, "_mooncake_epd_feature_handle_patch", False):
         return
-    if getattr(original, "_mooncake_epd_feature_handle_patch", False):
-        return
-    try:
-        sig = inspect.signature(original)
-        if "scheduler_output" not in sig.parameters and len(sig.parameters) < 2:
-            raise TypeError(f"unexpected signature: {sig}")
-    except Exception as exc:
-        if _strict_no_fallback():
-            raise RuntimeError("Mooncake EPD FeatureHandle hook is incompatible with this vLLM GPUModelRunner") from exc
 
     def _patched_batch_mm_inputs_from_scheduler(self: Any, scheduler_output: Any) -> Any:
         result = original(self, scheduler_output)
@@ -574,24 +632,11 @@ def _patch_vllm_gpu_model_runner_feature_handles() -> None:
 def _patch_vllm_gpu_model_runner_kv_params() -> None:
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except Exception as exc:
-        if _strict_no_fallback():
-            raise RuntimeError("Mooncake EPD strict mode requires vLLM GPUModelRunner") from exc
+    except Exception:
         return
     original = getattr(GPUModelRunner, "_update_states", None)
-    if original is None:
-        if _strict_no_fallback():
-            raise RuntimeError("Mooncake EPD strict mode requires GPUModelRunner._update_states")
+    if original is None or getattr(original, "_mooncake_epd_kv_params_patch", False):
         return
-    if getattr(original, "_mooncake_epd_kv_params_patch", False):
-        return
-    try:
-        sig = inspect.signature(original)
-        if "scheduler_output" not in sig.parameters and len(sig.parameters) < 2:
-            raise TypeError(f"unexpected signature: {sig}")
-    except Exception as exc:
-        if _strict_no_fallback():
-            raise RuntimeError("Mooncake EPD kv_transfer_params hook is incompatible with this vLLM GPUModelRunner") from exc
 
     def _patched_update_states(self: Any, scheduler_output: Any) -> Any:
         result = original(self, scheduler_output)
@@ -631,11 +676,10 @@ def _patch_vllm_gpu_model_runner_kv_params() -> None:
     logger.info("enabled Mooncake EPD GPUModelRunner kv_transfer_params attach hook")
 
 
-if _vllm_patches_enabled():
-    _patch_vllm_prompt_only_prefill()
-    _patch_vllm_feature_handle_injection()
-    _patch_vllm_gpu_model_runner_kv_params()
-    _patch_vllm_gpu_model_runner_feature_handles()
+_patch_vllm_prompt_only_prefill()
+_patch_vllm_feature_handle_injection()
+_patch_vllm_gpu_model_runner_kv_params()
+_patch_vllm_gpu_model_runner_feature_handles()
 
 # ---------------------------------------------------------------------------
 # Prefill-owned E→P direct FeatureBundle allocation routes
@@ -664,12 +708,14 @@ def _install_direct_feature_buffer_routes(app: Any) -> None:
         return
     try:
         import os
-        import hmac
-        from fastapi import Depends, Header, HTTPException
+        from fastapi import HTTPException
         from mooncake_epd.core.state import (
             DirectFeatureBufferRegistry,
             FeatureBundleDescriptor,
             register_direct_feature_buffer_registry,
+        )
+        from mooncake_epd.core.control.vllm_incarnation import (
+            VLLM_PROCESS_INCARNATION,
         )
         from mooncake_epd.core.transfer import TransferEngine
     except Exception as exc:
@@ -686,22 +732,8 @@ def _install_direct_feature_buffer_routes(app: Any) -> None:
         "MOONCAKE_EPD_DIRECT_BUFFER_DEVICE",
         os.getenv("MOONCAKE_EPD_FEATURE_HANDLE_DEVICE", "cuda"),
     )
-    auth_token = str(os.getenv("MOONCAKE_EPD_DIRECT_BUFFER_AUTH_TOKEN", "")).strip()
-    if not auth_token:
-        raise RuntimeError(
-            "MOONCAKE_EPD_DIRECT_BUFFER_AUTH_TOKEN is required when direct "
-            "FeatureBuffer routes are enabled"
-        )
-
-    def _authorize_direct_buffer(
-        presented: str = Header(default="", alias="X-Mooncake-EPD-Token"),
-    ) -> None:
-        if not hmac.compare_digest(auth_token, str(presented or "")):
-            raise HTTPException(status_code=403, detail="invalid direct FeatureBuffer token")
-
-    route_dependencies = [Depends(_authorize_direct_buffer)]
     engine = TransferEngine(
-        protocol=os.getenv("MOONCAKE_EPD_DIRECT_ENGINE_PROTOCOL", os.getenv("MOONCAKE_PROTOCOL", "tcp")),
+        protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
         local_hostname=os.getenv(
             "MOONCAKE_EPD_DIRECT_LOCAL_HOSTNAME",
             os.getenv("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
@@ -714,70 +746,12 @@ def _install_direct_feature_buffer_routes(app: Any) -> None:
         device=device,
         transfer_engine=engine,
         remote_session=os.getenv("MOONCAKE_EPD_DIRECT_REMOTE_SESSION"),
+        remote_incarnation=VLLM_PROCESS_INCARNATION,
         register_memory=_env_bool("MOONCAKE_EPD_DIRECT_REGISTER_MEMORY", True),
         target_memory_mode=os.getenv("MOONCAKE_EPD_DIRECT_TARGET_MODE", "auto"),
-        persistent_cache=_env_bool("MOONCAKE_EPD_DIRECT_BUFFER_PERSISTENT_CACHE", False),
-        max_cache_entries=int(os.getenv("MOONCAKE_EPD_DIRECT_BUFFER_CACHE_MAX_ENTRIES", "64")),
-        max_cache_bytes=int(os.getenv("MOONCAKE_EPD_DIRECT_BUFFER_CACHE_MAX_BYTES", str(2 * 1024 * 1024 * 1024))),
     )
-    try:
-        # Warm up Mooncake direct engine during vLLM app construction rather
-        # than during the first Prefill /allocate call.  In real serving this
-        # removes topology discovery/RPC setup from the user-visible TTFT path.
-        engine.initialize()
-        try:
-            import torch
-
-            warmup_tensor = torch.empty((1,), dtype=torch.uint8, device=device)
-            if registry.register_memory:
-                warmup_handle = engine.register_tensor_memory(warmup_tensor)
-                engine.unregister_tensor_memory(warmup_handle)
-            del warmup_tensor
-        except Exception:
-            if _strict_no_fallback():
-                raise
-            logger.exception("Mooncake direct FeatureBuffer tensor/register warmup failed")
-    except Exception:
-        if _strict_no_fallback():
-            raise
-        logger.exception("Mooncake direct FeatureBuffer engine warmup failed")
     register_direct_feature_buffer_registry(registry)
     setattr(app, "_mooncake_epd_direct_feature_buffer_registry", registry)
-
-    def _allocate_targets(
-        raw_descriptors: list[object],
-        *,
-        zero_fill: bool,
-        reuse_ready: bool,
-    ) -> list[dict[str, Any]]:
-        targets: list[dict[str, Any]] = []
-        for raw in raw_descriptors:
-            descriptor = FeatureBundleDescriptor.from_dict(dict(raw or {}))
-            allocation = registry.allocate_for_descriptor(
-                descriptor,
-                zero_fill=zero_fill,
-                reuse_ready=reuse_ready,
-            )
-            should_publish = False
-            with registry._lock:  # noqa: SLF001 - atomic publish reservation
-                if not allocation.ready and not allocation.publish_started:
-                    allocation.publish_started = True
-                    should_publish = True
-            target = allocation.as_direct_target()
-            target["cache_hit"] = bool(allocation.ready)
-            target["publish_required"] = bool(should_publish)
-            target["publish_pending"] = bool(not allocation.ready and not should_publish)
-            target["ref_count"] = int(allocation.ref_count)
-            targets.append(target)
-        return targets
-
-    def _wait_for_ready(feature_ids: list[str], timeout_s: float) -> None:
-        for feature_id in feature_ids:
-            registry.wait_ready(feature_id, timeout_s=timeout_s)
-
-    def _release_features(feature_ids: list[str]) -> None:
-        for feature_id in feature_ids:
-            registry.release(feature_id)
 
     async def _allocate(payload: dict[str, Any]) -> dict[str, Any]:
         raw_descriptors = payload.get("descriptors")
@@ -785,81 +759,18 @@ def _install_direct_feature_buffer_routes(app: Any) -> None:
             raw_descriptors = [payload.get("descriptor")]
         if not isinstance(raw_descriptors, list) or not raw_descriptors:
             raise HTTPException(status_code=400, detail="allocate requires descriptors[]")
+        targets = []
         try:
-            # Native registration remains serialized by the registry's narrow
-            # registration lock. Do not serialize independent tensor allocation
-            # and HTTP requests here: doing so turns concurrent E->P publishes
-            # into a proxy-side TTFT queue.
-            targets = await asyncio.to_thread(
-                _allocate_targets,
-                list(raw_descriptors),
-                zero_fill=bool(payload.get("zero_fill", False)),
-                reuse_ready=bool(payload.get("reuse_ready", True)),
-            )
+            for raw in raw_descriptors:
+                descriptor = FeatureBundleDescriptor.from_dict(dict(raw or {}))
+                allocation = registry.allocate_for_descriptor(
+                    descriptor,
+                    zero_fill=bool(payload.get("zero_fill", False)),
+                )
+                targets.append(allocation.as_direct_target())
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"direct buffer allocation failed: {exc}") from exc
         return {"targets": targets, "count": len(targets), "worker_id": registry.worker_id}
-
-    async def _lookup(payload: dict[str, Any]) -> dict[str, Any]:
-        raw = payload.get("feature_ids") or payload.get("features") or []
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list) or not raw:
-            raise HTTPException(status_code=400, detail="lookup requires feature_ids[]")
-        hits = []
-        misses = []
-        for feature_id in raw:
-            allocation = registry.lookup_ready(str(feature_id))
-            if allocation is None:
-                misses.append(str(feature_id))
-                continue
-            target = allocation.as_direct_target()
-            target["cache_hit"] = True
-            target["publish_required"] = False
-            target["ref_count"] = int(allocation.ref_count)
-            hits.append(
-                {
-                    "feature_id": str(feature_id),
-                    "descriptor": allocation.descriptor.to_dict(),
-                    "target": target,
-                }
-            )
-        return {
-            "hits": hits,
-            "misses": misses,
-            "count": len(hits),
-            "all_hit": len(hits) == len(raw),
-            "worker_id": registry.worker_id,
-        }
-
-    async def _mark_ready(payload: dict[str, Any]) -> dict[str, Any]:
-        raw = payload.get("feature_ids") or payload.get("features") or []
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list) or not raw:
-            raise HTTPException(status_code=400, detail="mark_ready requires feature_ids[]")
-        for feature_id in raw:
-            registry.mark_ready(str(feature_id))
-        return {"ready": len(raw), "stats": dict(registry.stats())}
-
-    async def _wait_ready(payload: dict[str, Any]) -> dict[str, Any]:
-        raw = payload.get("feature_ids") or payload.get("features") or []
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list) or not raw:
-            raise HTTPException(status_code=400, detail="wait_ready requires feature_ids[]")
-        timeout_s = float(payload.get("timeout_s", 30.0) or 30.0)
-        try:
-            await asyncio.to_thread(
-                _wait_for_ready,
-                [str(feature_id) for feature_id in raw],
-                timeout_s,
-            )
-        except TimeoutError as exc:
-            raise HTTPException(status_code=504, detail=str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return {"ready": len(raw), "stats": dict(registry.stats())}
 
     async def _release(payload: dict[str, Any]) -> dict[str, Any]:
         raw = payload.get("feature_ids") or payload.get("features") or []
@@ -867,29 +778,21 @@ def _install_direct_feature_buffer_routes(app: Any) -> None:
             raw = [raw]
         if not isinstance(raw, list):
             raise HTTPException(status_code=400, detail="release requires feature_ids[]")
-        try:
-            await asyncio.to_thread(_release_features, [str(feature_id) for feature_id in raw])
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"direct buffer release failed: {exc}") from exc
+        for feature_id in raw:
+            registry.release(str(feature_id))
         return {"released": len(raw), "stats": dict(registry.stats())}
 
     async def _stats() -> dict[str, Any]:
         return dict(registry.stats())
 
     prefix = "/mooncake_epd/direct_feature_buffer"
-    app.post(f"{prefix}/allocate", dependencies=route_dependencies)(_allocate)
-    app.post(f"{prefix}/lookup", dependencies=route_dependencies)(_lookup)
-    app.post(f"{prefix}/mark_ready", dependencies=route_dependencies)(_mark_ready)
-    app.post(f"{prefix}/wait_ready", dependencies=route_dependencies)(_wait_ready)
-    app.post(f"{prefix}/release", dependencies=route_dependencies)(_release)
-    app.get(f"{prefix}/stats", dependencies=route_dependencies)(_stats)
-    if _env_bool("MOONCAKE_EPD_DIRECT_BUFFER_ROOT_ROUTES", False):
-        app.post("/allocate", dependencies=route_dependencies)(_allocate)
-        app.post("/lookup", dependencies=route_dependencies)(_lookup)
-        app.post("/mark_ready", dependencies=route_dependencies)(_mark_ready)
-        app.post("/wait_ready", dependencies=route_dependencies)(_wait_ready)
-        app.post("/release", dependencies=route_dependencies)(_release)
-        app.get("/direct_feature_buffer_stats", dependencies=route_dependencies)(_stats)
+    app.post(f"{prefix}/allocate")(_allocate)
+    app.post(f"{prefix}/release")(_release)
+    app.get(f"{prefix}/stats")(_stats)
+    if _env_bool("MOONCAKE_EPD_DIRECT_BUFFER_ROOT_ROUTES", True):
+        app.post("/allocate")(_allocate)
+        app.post("/release")(_release)
+        app.get("/direct_feature_buffer_stats")(_stats)
     setattr(app, "_mooncake_epd_direct_feature_buffer_routes", True)
     logger.info(
         "enabled Mooncake EPD direct FeatureBuffer routes in vLLM process: worker=%s device=%s",
@@ -922,5 +825,4 @@ def _patch_vllm_openai_app_direct_feature_buffer_routes() -> None:
     logger.info("enabled Mooncake EPD vLLM build_app direct FeatureBuffer hook")
 
 
-if _vllm_patches_enabled():
-    _patch_vllm_openai_app_direct_feature_buffer_routes()
+_patch_vllm_openai_app_direct_feature_buffer_routes()

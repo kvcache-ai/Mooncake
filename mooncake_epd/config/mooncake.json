@@ -1,0 +1,9 @@
+{
+  "local_hostname": "127.0.0.1",
+  "metadata_server": "http://127.0.0.1:8090/metadata",
+  "global_segment_size": 1073741824,
+  "local_buffer_size": 268435456,
+  "protocol": "tcp",
+  "device_name": "",
+  "master_server_address": "127.0.0.1:50061"
+}

@@ -24,7 +24,7 @@ from mooncake_epd.benchmarks.workflow_trace import build_workflow_traces
 from mooncake_epd.tests.dataset import WorkflowExample, build_dataset, make_image, summarize
 
 
-MODEL_PATH = os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct")
+MODEL_PATH = os.getenv("MOONCAKE_EPD_MODEL_PATH", "/data01/LWX/Qwen3-VL-8B-Instruct")
 GPU_ENC = torch.device("cuda:3")
 GPU_PRE = torch.device("cuda:4")
 GPU_DEC = torch.device("cuda:5")

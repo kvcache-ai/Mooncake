@@ -16,6 +16,21 @@ from .policy import (
     TransferPolicy,
     default_policy_for,
 )
+from .rdma import (
+    RdmaCapabilities,
+    RdmaDeviceInfo,
+    default_rdma_bind_address,
+    detect_rdma_capabilities,
+    resolve_rdma_protocol,
+)
+from .rdmacm import (
+    RdmaStagedClient,
+    RdmaStagedServer,
+    RdmaTransportError,
+    RegisteredRegion,
+    rdmacm_cuda_staging_smoke,
+    rdmacm_listener_smoke,
+)
 from .engine import (
     DirectPeerBuffer,
     FeatureBundlePeerBufferPlan,
@@ -50,4 +65,15 @@ __all__ = [
     "TransferPolicy",
     "TransferStats",
     "default_policy_for",
+    "RdmaCapabilities",
+    "RdmaDeviceInfo",
+    "detect_rdma_capabilities",
+    "resolve_rdma_protocol",
+    "default_rdma_bind_address",
+    "RdmaStagedClient",
+    "RdmaStagedServer",
+    "RdmaTransportError",
+    "RegisteredRegion",
+    "rdmacm_cuda_staging_smoke",
+    "rdmacm_listener_smoke",
 ]

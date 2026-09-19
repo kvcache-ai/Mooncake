@@ -11,10 +11,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import io
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -29,13 +27,13 @@ if str(REPO_ROOT.parent) not in sys.path:
 
 from mooncake_epd.core.epd_workers import EncoderWorker  # noqa: E402
 from mooncake_epd.core.state import MooncakeFeatureBundleStore, MooncakeFeatureBundleStoreConfig  # noqa: E402
-from mooncake_epd.scripts.run_vllm_serving_e2e import _convert_dataset_messages, _load_dataset_requests  # noqa: E402
+from mooncake_epd.demo.vllm_integration import MODEL_PATH  # noqa: E402
+from mooncake_epd.multimodal_identity import stable_multimodal_identity_hash  # noqa: E402
+from mooncake_epd.scripts.run_vllm_serving_e2e import _load_dataset_requests  # noqa: E402
 
 
 def _stable_mm_hash(item: Dict[str, Any]) -> str:
-    payload = {k: item.get(k) for k in sorted(item) if k not in {"detail"}}
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()[:16]
+    return stable_multimodal_identity_hash(item)
 
 
 def _pil_to_data_url(image: Image.Image, *, fmt: str = "PNG") -> str:
@@ -302,10 +300,7 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--model",
-        default=os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct"),
-    )
+    ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--dataset-root", required=True)
     ap.add_argument("--dataset-chat-split", default="dev-small")
     ap.add_argument("--max-dataset-requests", type=int, default=5)

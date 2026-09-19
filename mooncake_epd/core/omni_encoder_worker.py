@@ -8,6 +8,7 @@ item-independent for `[A,B] -> [A,C]` partial reuse.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -21,6 +22,7 @@ from .state.omni_hidden_prefix_cache import (
     OmniHiddenPrefixCache,
     OmniHiddenPrefixCacheConfig,
     install_qwen2_5_omni_hidden_prefix_cache,
+    use_omni_hidden_cache_keys,
 )
 
 
@@ -78,10 +80,13 @@ class Qwen25OmniImageEncoderWorker:
         images: Sequence[Image.Image],
         *,
         image_ids: Sequence[str],
+        cache_keys: Optional[Sequence[str]] = None,
         prompt: str = "Describe the image.",
     ) -> OmniBatchEncoderOutput:
         if len(images) != len(image_ids):
             raise ValueError(f"images/image_ids length mismatch: {len(images)} != {len(image_ids)}")
+        if cache_keys is not None and len(images) != len(cache_keys):
+            raise ValueError(f"images/cache_keys length mismatch: {len(images)} != {len(cache_keys)}")
         if not images:
             return OmniBatchEncoderOutput(outputs=[], encode_time_ms=0.0, cache_stats=self.cache_stats)
         inputs = self._processor_inputs(images, prompt)
@@ -95,13 +100,15 @@ class Qwen25OmniImageEncoderWorker:
             )
 
         t0 = time.perf_counter()
-        with torch.no_grad():
-            encoded = self.model.get_image_features(
-                pixel_values,
-                image_grid_thw=image_grid_thw,
-                return_dict=True,
-            )
-            hidden = getattr(encoded, "pooler_output", None)
+        stable_keys = self._stable_cache_keys(cache_keys if cache_keys is not None else image_ids)
+        with use_omni_hidden_cache_keys(stable_keys):
+            with torch.no_grad():
+                encoded = self.model.get_image_features(
+                    pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    return_dict=True,
+                )
+                hidden = getattr(encoded, "pooler_output", None)
         if hidden is None:
             raise RuntimeError("Qwen2.5-Omni get_image_features did not return pooler_output")
         encode_ms = (time.perf_counter() - t0) * 1000.0
@@ -141,19 +148,23 @@ class Qwen25OmniImageEncoderWorker:
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
         image_id: Optional[str] = None,
+        cache_key: Optional[str] = None,
     ) -> OmniEncoderOutput:
         """Compatibility path for single preprocessed-image callers."""
 
         pixel_values = pixel_values.to(self.device)
         image_grid_thw = image_grid_thw.to(self.device)
         t0 = time.perf_counter()
-        with torch.no_grad():
-            encoded = self.model.get_image_features(
-                pixel_values,
-                image_grid_thw=image_grid_thw,
-                return_dict=True,
-            )
-            hidden = getattr(encoded, "pooler_output", None)
+        source_key = cache_key if cache_key is not None else image_id
+        stable_keys = self._stable_cache_keys([source_key]) if source_key else None
+        with use_omni_hidden_cache_keys(stable_keys):
+            with torch.no_grad():
+                encoded = self.model.get_image_features(
+                    pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    return_dict=True,
+                )
+                hidden = getattr(encoded, "pooler_output", None)
         if hidden is None:
             raise RuntimeError("Qwen2.5-Omni get_image_features did not return pooler_output")
         encode_ms = (time.perf_counter() - t0) * 1000.0
@@ -173,6 +184,23 @@ class Qwen25OmniImageEncoderWorker:
             },
         )
         return OmniEncoderOutput(bundle=bundle, encode_time_ms=encode_ms, image_id=feature_id)
+
+    def _stable_cache_keys(self, source_keys: Sequence[str]) -> List[str]:
+        """Namespace authoritative source digests by processor behavior."""
+
+        return [
+            json.dumps(
+                {
+                    "content_id": str(source_key),
+                    "model": self.model_fingerprint,
+                    "processor": self.processor_fingerprint,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for source_key in source_keys
+        ]
 
     def _processor_inputs(self, images: Sequence[Image.Image], prompt: str) -> Dict[str, torch.Tensor]:
         content: List[Dict[str, Any]] = [{"type": "image", "image": image.convert("RGB")} for image in images]

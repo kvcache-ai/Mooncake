@@ -19,6 +19,11 @@ def test_feature_bundle_descriptor_validates_shape_dtype_and_checksum():
             "model_fingerprint": "model-a",
             "processor_fingerprint": "processor-a",
             "non_json": object(),
+            "finite_float": 1.25,
+            "nan_value": float("nan"),
+            "positive_infinity": float("inf"),
+            "negative_infinity": float("-inf"),
+            "nested_nonfinite": {"value": float("nan")},
         },
     )
 
@@ -33,9 +38,16 @@ def test_feature_bundle_descriptor_validates_shape_dtype_and_checksum():
     assert descriptor.last_hidden.shape == (3, 4)
     assert descriptor.nbytes == bundle.nbytes()
     assert "non_json" not in descriptor.metadata
+    assert descriptor.metadata["finite_float"] == 1.25
+    assert "nan_value" not in descriptor.metadata
+    assert "positive_infinity" not in descriptor.metadata
+    assert "negative_infinity" not in descriptor.metadata
+    assert "nested_nonfinite" not in descriptor.metadata
+    assert descriptor.metadata["grid_thw_values"] == [[1, 2, 3]]
     payload = descriptor.to_dict()
     json.dumps(payload)
     restored = type(descriptor).from_dict(payload)
+    assert restored.metadata["grid_thw_values"] == [[1, 2, 3]]
     restored.validate_bundle(bundle, require_checksum=True)
 
     corrupted = FeatureBundle(

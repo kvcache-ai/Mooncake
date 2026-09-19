@@ -30,7 +30,7 @@ pytestmark = [pytest.mark.mooncake, pytest.mark.gpu, pytest.mark.slow]
 
 GPU_SRC = torch.device("cuda:3")
 GPU_DST = torch.device("cuda:4")
-VENV_ROOT = Path(os.getenv("MOONCAKE_EPD_VENV_ROOT", ".venv"))
+VENV_ROOT = Path("/data/songbinbin/Proj/Proj_LWX/venv_mooncake")
 VENV_PYTHON = VENV_ROOT / "bin" / "python"
 MOONCAKE_MASTER = VENV_ROOT / "bin" / "mooncake_master"
 

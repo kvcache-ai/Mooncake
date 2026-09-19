@@ -219,3 +219,17 @@ def test_p5_prefix_cache_uses_full_hash_and_stable_keys():
     assert got is not None
     assert torch.equal(got[0], torch.tensor([2.0]))
     assert got[1]["cache_key_mode"] == "stable"
+
+
+def test_p5_diagnostic_sampled_prefix_key_keeps_full_collision_verify(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_EPD_PREFIX_CACHE_FAST_HASH", "1")
+    cache = HiddenStatePrefixCache(max_cache_size_bytes=1024 * 1024, max_entries=8)
+    first = torch.zeros(5000, dtype=torch.float32)
+    second = first.clone()
+    # Choose adjacent values so at least one is outside the stride-sampled
+    # candidate while the full verification digest always sees the change.
+    second[2501] = 1.0
+
+    cache.put(first, torch.tensor([1.0]), {"id": "first"})
+
+    assert cache.get(second) is None

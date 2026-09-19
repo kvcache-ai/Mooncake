@@ -17,7 +17,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT.parent))
 
-from mooncake_epd.demo.vllm_integration import VLLMDisaggConfig, generate_configs  # noqa: E402
+from mooncake_epd.demo.vllm_integration import (  # noqa: E402
+    MODEL_PATH as DEFAULT_MODEL_PATH,
+    VLLMDisaggConfig,
+    generate_configs,
+)
 from mooncake_epd.scripts.run_vllm_serving_e2e import (  # noqa: E402
     _cleanup_previous_run_artifacts,
     _convert_dataset_messages,
@@ -34,9 +38,7 @@ from mooncake_epd.scripts.run_vllm_serving_e2e import (  # noqa: E402
     _wait_ready,
 )
 
-MODEL_PATH = Path(
-    os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct")
-)
+MODEL_PATH = Path(DEFAULT_MODEL_PATH)
 DEFAULT_BASELINE_GPU = 2
 DEFAULT_HIGH_OVERLAP_THRESHOLD = 0.70
 DEFAULT_MIN_PASS_RATE = 0.80
@@ -59,10 +61,17 @@ def _percentile(values: List[float], pct: float) -> float:
     return xs[lo] + (xs[hi] - xs[lo]) * (rank - lo)
 
 
-def _latency_stats(values: List[float]) -> Dict[str, float]:
+def _latency_stats(values: List[float]) -> Dict[str, Any]:
     clean = [float(v) for v in values if v is not None]
     if not clean:
-        return {"count": 0, "avg": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+        return {
+            "count": 0,
+            "avg": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        }
     return {
         "count": len(clean),
         "avg": float(statistics.fmean(clean)),
@@ -91,7 +100,24 @@ def _summarize_serving_metrics(metrics_payload: Dict[str, Any]) -> Dict[str, Any
         "peer_buffer_bytes": int(metrics.get("peer_buffer_bytes", 0) or 0),
         "fallback_batches": int(metrics.get("fallback_batches", 0) or 0),
         "fallback_bytes": int(metrics.get("fallback_bytes", 0) or 0),
+        "kv_transfer_attempts": int(metrics.get("kv_transfer_attempts", 0) or 0),
+        "kv_transfer_successes": int(metrics.get("kv_transfer_successes", 0) or 0),
+        "kv_transfer_bytes": int(metrics.get("kv_transfer_bytes", 0) or 0),
+        "kv_transfer_elapsed_ms": float(
+            metrics.get("kv_transfer_elapsed_ms", 0.0) or 0.0
+        ),
+        "kv_transfer_gbps": (
+            float(metrics["kv_transfer_gbps"])
+            if metrics.get("kv_transfer_gbps") is not None
+            else None
+        ),
+        "remote_transfer_backend_gbps": dict(
+            metrics.get("remote_transfer_backend_gbps") or {}
+        ),
         "remote_transfer_backend_counts": dict(metrics.get("remote_transfer_backend_counts") or {}),
+        "request_stage_timing_ms": dict(metrics.get("request_stage_timing_ms") or {}),
+        "first_token_ms": dict(metrics.get("first_token_ms") or {}),
+        "stage_conservation": dict(metrics.get("stage_conservation") or {}),
         "workflow_registry": dict(metrics_payload.get("workflow_registry") or {}),
         "connector_path_stats": dict(metrics.get("connector_path_stats") or {}),
     }
@@ -539,6 +565,7 @@ def _start_serving_stack(
         kv_directory_rpc_url=kv_directory_rpc_url,
         workflow_registry_wal_path=str(workdir / "proxy_workflow_registry.jsonl"),
         connector_metrics_dir=str(workdir / "connector_metrics"),
+        strict_no_fallback=True,
     )
     files = generate_configs(str(workdir), cfg)
     prefill_port = _extract_port(Path(files["prefill"]))

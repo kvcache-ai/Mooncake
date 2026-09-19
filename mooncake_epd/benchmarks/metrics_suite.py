@@ -574,6 +574,17 @@ def _build_b8_penalty_table(phase6_metrics: Dict) -> Dict:
                 "pipeline_overhead_ms": pipeline_overhead_ms,
                 "relay_segments": relay_segments,
                 "relay_recompute_segments": relay_recompute_segments,
+                "cost_gate_decision": str(row.get("cost_gate_decision", "not_reported")),
+                "fallback_reason": str(row.get("fallback_reason", "")),
+                "predicted_reusable_tokens": int(
+                    row.get("predicted_reusable_tokens", 0) or 0
+                ),
+                "predicted_recompute_tokens": int(
+                    row.get("predicted_recompute_tokens", 0) or 0
+                ),
+                "predicted_saved_prefill_ms": row.get("predicted_saved_prefill_ms"),
+                "predicted_relay_overhead_ms": row.get("predicted_relay_overhead_ms"),
+                "predicted_net_benefit_ms": row.get("predicted_net_benefit_ms"),
             }
         )
 
@@ -594,6 +605,25 @@ def _build_b8_penalty_table(phase6_metrics: Dict) -> Dict:
     def _avg_from_rows(key: str) -> float:
         values = [float(row.get(key, 0.0) or 0.0) for row in b8_rows if isinstance(row, dict)]
         return (sum(values) / len(values)) if values else 0.0
+
+    def _avg_optional_from_rows(key: str) -> Optional[float]:
+        values = [
+            float(row[key])
+            for row in b8_rows
+            if isinstance(row, dict) and row.get(key) is not None
+        ]
+        return (sum(values) / len(values)) if values else None
+
+    cost_gate_decision_counts: Dict[str, int] = {}
+    fallback_reason_counts: Dict[str, int] = {}
+    for row in b8_rows:
+        if not isinstance(row, dict):
+            continue
+        decision = str(row.get("cost_gate_decision", "not_reported"))
+        cost_gate_decision_counts[decision] = cost_gate_decision_counts.get(decision, 0) + 1
+        reason = str(row.get("fallback_reason", "")).strip()
+        if reason:
+            fallback_reason_counts[reason] = fallback_reason_counts.get(reason, 0) + 1
 
     avg_delta_prefill_ms = _avg_from_rows("delta_prefill_ms")
     avg_pipeline_overhead_ms = _avg_from_rows("pipeline_overhead_ms")
@@ -628,6 +658,17 @@ def _build_b8_penalty_table(phase6_metrics: Dict) -> Dict:
         "pipeline_overhead_ms_avg": avg_pipeline_overhead_ms,
         "reuse_pipeline_ms_avg": avg_reuse_pipeline_ms,
         "dominant_cost_bucket": dominant_cost_bucket,
+        "cost_gate_decision_counts": cost_gate_decision_counts,
+        "fallback_reason_counts": fallback_reason_counts,
+        "predicted_saved_prefill_ms_avg": _avg_optional_from_rows(
+            "predicted_saved_prefill_ms"
+        ),
+        "predicted_relay_overhead_ms_avg": _avg_optional_from_rows(
+            "predicted_relay_overhead_ms"
+        ),
+        "predicted_net_benefit_ms_avg": _avg_optional_from_rows(
+            "predicted_net_benefit_ms"
+        ),
         "delta_prefill_share_of_b8_ttft": (
             avg_delta_prefill_ms / b8_ttft if b8_ttft > 0 else 0.0
         ),
@@ -880,6 +921,13 @@ class MetricsCollector:
             grouped_batches = int(metrics.get("layered_transfer_grouped_batches", 0) or 0)
             if grouped_batches > 0:
                 self._layered_transfer_batches.append(grouped_batches)
+            transfer_successes = int(metrics.get("kv_transfer_successes", 0) or 0)
+            transfer_bytes = int(metrics.get("kv_transfer_bytes", 0) or 0)
+            transfer_elapsed_ms = float(metrics.get("kv_transfer_elapsed_ms", 0.0) or 0.0)
+            if transfer_successes > 0 and transfer_bytes > 0 and transfer_elapsed_ms > 0.0:
+                self._kv_transfers.append(
+                    (float(transfer_bytes), transfer_elapsed_ms / 1000.0)
+                )
             backend_counts = dict(metrics.get("remote_transfer_backend_counts") or {})
             for backend, count in backend_counts.items():
                 self._remote_transfer_backend_counts[str(backend)] = (
@@ -888,7 +936,7 @@ class MetricsCollector:
                 )
 
     # -- readers --------------------------------------------------------
-    def report(self) -> Dict[str, float]:
+    def report(self) -> Dict[str, Any]:
         with self._lock:
             total = self._prefix_hits + self._prefix_misses
             enc_total = self._encoder_calls or 1
@@ -926,8 +974,12 @@ class MetricsCollector:
                 ),
                 "kv_transfer_gbps": (
                     (kv_total_bytes * 8) / kv_total_sec / 1e9
-                    if kv_total_sec > 0 else 0.0
+                    if self._kv_transfers and kv_total_bytes > 0 and kv_total_sec > 0
+                    else None
                 ),
+                "kv_transfer_count": len(self._kv_transfers),
+                "kv_transfer_total_bytes": kv_total_bytes,
+                "kv_transfer_total_sec": kv_total_sec,
                 "gpu_peak_gb": max(self._gpu_peak_gb) if self._gpu_peak_gb else 0.0,
                 "quality_accuracy": (
                     sum(self._quality) / len(self._quality)
@@ -980,6 +1032,36 @@ class MetricsCollector:
             self._handoff_prepare.clear(); self._handoff_commit.clear(); self._handoff_rollback.clear()
             self._remote_transfer_backend_counts.clear()
             self._start_time = time.monotonic()
+
+
+def _transfer_observation(payload: Dict[str, Any], *, source: str) -> Optional[Dict[str, Any]]:
+    count = int(
+        payload.get(
+            "kv_transfer_successes",
+            payload.get("kv_transfer_count", 0),
+        )
+        or 0
+    )
+    byte_count = int(
+        payload.get(
+            "kv_transfer_bytes",
+            payload.get("kv_transfer_total_bytes", 0),
+        )
+        or 0
+    )
+    if payload.get("kv_transfer_elapsed_ms") is not None:
+        elapsed_ms = float(payload.get("kv_transfer_elapsed_ms") or 0.0)
+    else:
+        elapsed_ms = float(payload.get("kv_transfer_total_sec", 0.0) or 0.0) * 1000.0
+    if count <= 0 or byte_count <= 0 or elapsed_ms <= 0.0:
+        return None
+    return {
+        "source": source,
+        "count": count,
+        "bytes": byte_count,
+        "elapsed_ms": elapsed_ms,
+        "gbps": byte_count * 8.0 / (elapsed_ms * 1_000_000.0),
+    }
 
 
 def build_rfc_eval_report(
@@ -1098,10 +1180,27 @@ def build_rfc_eval_report(
         ),
     }
 
+    serving_metrics = dict((serving_e2e_summary.get("metrics") or {}).get("metrics") or {})
+    transfer_observation = (
+        _transfer_observation(serving_metrics, source="serving_connector")
+        or _transfer_observation(soak_summary, source="soak")
+        or _transfer_observation(phase6_summary, source="phase6")
+    )
     transport_table = {
-        "kv_transfer_gbps": soak_summary.get(
-            "kv_transfer_gbps",
-            phase6_summary.get("kv_transfer_gbps", 0.0),
+        "kv_transfer_gbps": (
+            transfer_observation["gbps"] if transfer_observation is not None else None
+        ),
+        "kv_transfer_count": (
+            transfer_observation["count"] if transfer_observation is not None else 0
+        ),
+        "kv_transfer_bytes": (
+            transfer_observation["bytes"] if transfer_observation is not None else 0
+        ),
+        "kv_transfer_elapsed_ms": (
+            transfer_observation["elapsed_ms"] if transfer_observation is not None else None
+        ),
+        "kv_transfer_source": (
+            transfer_observation["source"] if transfer_observation is not None else "unavailable"
         ),
         "layered_transfer_batches_avg": soak_summary.get(
             "layered_transfer_batches_avg",
@@ -1115,12 +1214,15 @@ def build_rfc_eval_report(
             "mm_recompute_fallbacks",
             phase6_summary.get("mm_recompute_fallbacks", 0),
         ),
-        "remote_transfer_backend_counts": soak_summary.get(
-            "remote_transfer_backend_counts",
-            phase6_summary.get("remote_transfer_backend_counts", {}),
+        "remote_transfer_backend_counts": (
+            dict(serving_metrics.get("remote_transfer_backend_counts") or {})
+            or dict(soak_summary.get("remote_transfer_backend_counts") or {})
+            or dict(phase6_summary.get("remote_transfer_backend_counts") or {})
+        ),
+        "remote_transfer_backend_gbps": dict(
+            serving_metrics.get("remote_transfer_backend_gbps") or {}
         ),
     }
-    serving_metrics = dict((serving_e2e_summary.get("metrics") or {}).get("metrics") or {})
     serving_path_stats = dict(serving_metrics.get("path_stats") or {})
     connector_path_stats = dict(serving_metrics.get("connector_path_stats") or {})
     pd_path_stats = dict(serving_path_stats.get("PD") or {})
@@ -1388,6 +1490,12 @@ def build_rfc_eval_report(
     }
 
 
+def _format_optional_number(value: Any, digits: int) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.{int(digits)}f}"
+
+
 def render_rfc_eval_report_markdown(report: Dict) -> str:
     """Render ``build_rfc_eval_report`` output to Markdown."""
     main = report["main_results_table"]
@@ -1523,13 +1631,21 @@ def render_rfc_eval_report_markdown(report: Dict) -> str:
         "",
         "| Metric | Value |",
         "| --- | ---: |",
-        f"| kv_transfer_gbps | {transport.get('kv_transfer_gbps', 0.0):.2f} |",
+        f"| kv_transfer_gbps | {_format_optional_number(transport.get('kv_transfer_gbps'), 2)} |",
+        f"| kv_transfer_count | {transport.get('kv_transfer_count', 0)} |",
+        f"| kv_transfer_bytes | {transport.get('kv_transfer_bytes', 0)} |",
+        f"| kv_transfer_elapsed_ms | {_format_optional_number(transport.get('kv_transfer_elapsed_ms'), 3)} |",
+        f"| kv_transfer_source | {transport.get('kv_transfer_source', 'unavailable')} |",
         f"| layered_transfer_batches_avg | {transport.get('layered_transfer_batches_avg', 0.0):.2f} |",
         f"| mm_prefetch_hit_rate | {transport.get('mm_prefetch_hit_rate', 0.0):.4f} |",
         f"| mm_recompute_fallbacks | {transport.get('mm_recompute_fallbacks', 0)} |",
     ])
     for backend, count in sorted(transport.get("remote_transfer_backend_counts", {}).items()):
         lines.append(f"| backend:{backend} | {count} |")
+    for backend, gbps in sorted(transport.get("remote_transfer_backend_gbps", {}).items()):
+        lines.append(
+            f"| backend_gbps:{backend} | {_format_optional_number(gbps, 3)} |"
+        )
 
     if serving_e2e:
         lines.extend([
@@ -1741,10 +1857,16 @@ def render_rfc_eval_report_markdown(report: Dict) -> str:
         if per_scenario:
             lines.extend([
                 "",
-                "| Scenario | Image | B7 TTFT ms | B8 TTFT ms | Penalty ms | Penalty % | reuse_ratio | delta_reuse_ratio | tier2_tokens | tier2_recomputed | tier3_pages | delta_prefill_ms | overhead_ms | relay_segments | relay_recompute_segments |",
-                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| Scenario | Image | B7 TTFT ms | B8 TTFT ms | Penalty ms | Penalty % | reuse_ratio | delta_reuse_ratio | tier2_tokens | tier2_recomputed | tier3_pages | delta_prefill_ms | overhead_ms | relay_segments | relay_recompute_segments | gate | fallback | predicted_net_ms |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |",
             ])
             for row in per_scenario:
+                predicted_net = row.get("predicted_net_benefit_ms")
+                predicted_net_text = (
+                    f"{float(predicted_net):.2f}"
+                    if predicted_net is not None
+                    else "unavailable"
+                )
                 lines.append(
                     f"| {row['scenario']} | {row['image']} | {row['b7_ttft_ms']:.2f} | {row['b8_ttft_ms']:.2f} | "
                     f"{row['penalty_ms']:.2f} | {row['penalty_pct']:.2f} | {row['reuse_ratio']:.4f} | "
@@ -1753,7 +1875,10 @@ def render_rfc_eval_report_markdown(report: Dict) -> str:
                     f"{row['tier3_accepted_pages']:.2f} | {float(row.get('delta_prefill_ms', 0.0) or 0.0):.2f} | "
                     f"{float(row.get('pipeline_overhead_ms', 0.0) or 0.0):.2f} | "
                     f"{float(row.get('relay_segments', 0.0) or 0.0):.2f} | "
-                    f"{float(row.get('relay_recompute_segments', 0.0) or 0.0):.2f} |"
+                    f"{float(row.get('relay_recompute_segments', 0.0) or 0.0):.2f} | "
+                    f"{row.get('cost_gate_decision', 'not_reported')} | "
+                    f"{row.get('fallback_reason', '') or '-'} | "
+                    f"{predicted_net_text} |"
                 )
 
     lines.extend([

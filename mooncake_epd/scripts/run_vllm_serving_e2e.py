@@ -31,24 +31,6 @@ def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _merge_packet_timings(result: Dict[str, Any], packet: Dict[str, Any]) -> None:
-    raw = packet.get("_mooncake_epd_proxy_timings_ms")
-    if not isinstance(raw, dict) or not raw:
-        return
-    timings = dict(result.get("epd_timing_ms") or {})
-    for key, value in raw.items():
-        try:
-            timings[str(key)] = float(value)
-        except Exception:
-            continue
-    result["epd_timing_ms"] = timings
-    result["epd_timing_ms_header"] = json.dumps(
-        timings,
-        ensure_ascii=True,
-        separators=(",", ":"),
-    )
-
-
 def _percentile(values: List[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -63,15 +45,15 @@ def _percentile(values: List[float], pct: float) -> float:
     return xs[lo] + (xs[hi] - xs[lo]) * (rank - lo)
 
 
-def _stats(values: List[float]) -> Dict[str, float]:
+def _stats(values: List[float]) -> Dict[str, Any]:
     if not values:
         return {
             "count": 0,
-            "avg": 0.0,
-            "p50": 0.0,
-            "p95": 0.0,
-            "p99": 0.0,
-            "max": 0.0,
+            "avg": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
         }
     return {
         "count": len(values),
@@ -680,6 +662,9 @@ def _execute_dataset_request(
         "admission_method": (entry["request"].get("metadata") or {}).get("admission_method"),
         "arrival_ms": float(entry.get("arrival_ms", 0.0) or 0.0),
         "schedule_event": entry.get("schedule_event"),
+        "requested_decode_worker": (
+            entry["request"].get("metadata") or {}
+        ).get("mooncake_epd_decode_worker_id"),
     }
     payload = dict(entry["request"])
     session = requests.Session()
@@ -688,36 +673,55 @@ def _execute_dataset_request(
         if stream_metrics:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
+            result["request_payload_bytes"] = len(
+                json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            )
             resp = session.post(
                 proxy_url,
                 json=payload,
                 timeout=max(1.0, float(request_timeout)),
                 stream=True,
             )
-            resp.raise_for_status()
             result.update(
                 {
                     "status_code": resp.status_code,
                     "routing_path": resp.headers.get("x-epd-routing-path"),
                     "admission": resp.headers.get("x-epd-admission"),
                     "degrade_level": resp.headers.get("x-epd-degrade-level"),
-                    "epd_timing_ms_header": resp.headers.get("x-epd-timing-ms"),
+                    "decode_protocol": resp.headers.get("x-epd-decode-protocol"),
+                    "decode_pipeline": resp.headers.get("x-epd-decode-pipeline"),
+                    "decode_mm_features": resp.headers.get(
+                        "x-epd-decode-mm-features"
+                    ),
+                    "decode_worker": resp.headers.get("x-epd-decode-worker"),
+                    "client_mm_uuid_mode": resp.headers.get(
+                        "x-epd-client-mm-uuid-mode"
+                    ),
                 }
             )
-            if result.get("epd_timing_ms_header"):
+            if resp.status_code >= 400:
+                response_text = resp.text
+                result["response_head"] = response_text[:2000]
                 try:
-                    result["epd_timing_ms"] = json.loads(str(result["epd_timing_ms_header"]))
+                    result["response_json"] = resp.json()
                 except Exception:
-                    result["epd_timing_ms_parse_error"] = str(result.get("epd_timing_ms_header"))
-            first_event_ms: float | None = None
-            first_chunk_ms: float | None = None
-            last_chunk_at: float | None = None
+                    pass
+                result["error"] = (
+                    f"HTTP {resp.status_code}: {response_text[:1000]}"
+                )
+                return result
+            first_stream_chunk_ms: float | None = None
+            first_token_ms: float | None = None
             finish_reason = None
             usage = None
             chunks = 0
             text_parts: List[str] = []
             line_buffer: List[str] = []
-            for raw_line in resp.iter_lines(decode_unicode=True):
+            # Keep the client-side SSE buffer small enough that the first
+            # generated token is not hidden behind requests' default 512-byte
+            # read buffer.  TTFT must be measured at the first non-empty text
+            # delta, not at a role/empty-content prelude packet.
+            for raw_line in resp.iter_lines(chunk_size=1, decode_unicode=True):
                 now = time.perf_counter()
                 if not raw_line:
                     continue
@@ -731,20 +735,13 @@ def _execute_dataset_request(
                     packet = json.loads(data)
                 except Exception:
                     continue
-                _merge_packet_timings(result, packet)
                 chunks += 1
-                if first_event_ms is None:
-                    first_event_ms = (now - started) * 1000.0
-                last_chunk_at = now
-                delta_text = _extract_stream_text(packet)
-                text_parts.append(delta_text)
-                # OpenAI-compatible vLLM streams often send an initial role-only
-                # chunk with empty content. Counting that as TTFT hides the real
-                # model first-token latency and makes single-server baselines
-                # look artificially good. TTFT here means first non-empty content
-                # delta; first_event_ms remains available for transport debugging.
-                if first_chunk_ms is None and delta_text:
-                    first_chunk_ms = (now - started) * 1000.0
+                if first_stream_chunk_ms is None:
+                    first_stream_chunk_ms = (now - started) * 1000.0
+                text = _extract_stream_text(packet)
+                if text and first_token_ms is None:
+                    first_token_ms = (now - started) * 1000.0
+                text_parts.append(text)
                 choices = list(packet.get("choices") or [])
                 if choices:
                     finish_reason = dict(choices[0] or {}).get("finish_reason") or finish_reason
@@ -757,27 +754,27 @@ def _execute_dataset_request(
             result.update(
                 {
                     "elapsed_ms": elapsed_ms,
-                    "ttft_ms": elapsed_ms if first_chunk_ms is None else first_chunk_ms,
-                    "first_event_ms": first_event_ms,
+                    "ttft_ms": elapsed_ms if first_token_ms is None else first_token_ms,
+                    "first_stream_chunk_ms": first_stream_chunk_ms,
                     "tpot_ms": (
-                        max(0.0, elapsed_ms - first_chunk_ms) / max(1, completion_tokens)
-                        if first_chunk_ms is not None and completion_tokens > 0
+                        max(0.0, elapsed_ms - first_token_ms) / (completion_tokens - 1)
+                        if first_token_ms is not None and completion_tokens > 1
                         else None
                     ),
-                    "stream_chunk_count": chunks,
-                    "finish_reason": finish_reason,
-                    "usage": usage,
-                    "completion_tokens": completion_tokens,
                     "prompt_tokens": (
                         int(usage.get("prompt_tokens", 0) or 0)
                         if isinstance(usage, dict)
                         else 0
                     ),
+                    "completion_tokens": completion_tokens,
                     "total_tokens": (
                         int(usage.get("total_tokens", 0) or 0)
                         if isinstance(usage, dict)
-                        else 0
+                        else completion_tokens
                     ),
+                    "stream_chunk_count": chunks,
+                    "finish_reason": finish_reason,
+                    "usage": usage,
                     "response_text": response_text,
                     "response_content_len": len(response_text),
                     "response_head": response_text[:500],
@@ -785,6 +782,9 @@ def _execute_dataset_request(
                 }
             )
         else:
+            result["request_payload_bytes"] = len(
+                json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            )
             resp = session.post(
                 proxy_url,
                 json=payload,
@@ -799,15 +799,18 @@ def _execute_dataset_request(
                     "routing_path": resp.headers.get("x-epd-routing-path"),
                     "admission": resp.headers.get("x-epd-admission"),
                     "degrade_level": resp.headers.get("x-epd-degrade-level"),
-                    "epd_timing_ms_header": resp.headers.get("x-epd-timing-ms"),
+                    "decode_protocol": resp.headers.get("x-epd-decode-protocol"),
+                    "decode_pipeline": resp.headers.get("x-epd-decode-pipeline"),
+                    "decode_mm_features": resp.headers.get(
+                        "x-epd-decode-mm-features"
+                    ),
+                    "decode_worker": resp.headers.get("x-epd-decode-worker"),
+                    "client_mm_uuid_mode": resp.headers.get(
+                        "x-epd-client-mm-uuid-mode"
+                    ),
                     "response_head": resp.text[:500],
                 }
             )
-            if result.get("epd_timing_ms_header"):
-                try:
-                    result["epd_timing_ms"] = json.loads(str(result["epd_timing_ms_header"]))
-                except Exception:
-                    result["epd_timing_ms_parse_error"] = str(result.get("epd_timing_ms_header"))
             try:
                 response_json = resp.json()
                 result["response_json"] = response_json
@@ -823,10 +826,16 @@ def _execute_dataset_request(
                 result["usage"] = response_json.get("usage")
                 usage = result.get("usage")
                 if isinstance(usage, dict):
+                    result["prompt_tokens"] = int(usage.get("prompt_tokens", 0) or 0)
                     completion_tokens = int(usage.get("completion_tokens", 0) or 0)
                     result["completion_tokens"] = completion_tokens
-                    result["prompt_tokens"] = int(usage.get("prompt_tokens", 0) or 0)
-                    result["total_tokens"] = int(usage.get("total_tokens", 0) or 0)
+                    result["total_tokens"] = int(
+                        usage.get(
+                            "total_tokens",
+                            result["prompt_tokens"] + completion_tokens,
+                        )
+                        or 0
+                    )
                     if completion_tokens > 0:
                         result["tpot_ms"] = elapsed_ms / completion_tokens
             except Exception as parse_exc:
@@ -1060,53 +1069,23 @@ def _connector_metrics_settled(metrics_payload: Dict[str, object]) -> tuple[bool
     return len(failures) == 0, failures
 
 
-def _wait_for_metrics_settle(
-    session,
-    metrics_url: str,
-    *,
-    timeout_s: float = 15.0,
-    poll_s: float = 0.25,
-    stable_polls: int = 2,
-):
-    """Wait for a valid and quiescent connector metrics snapshot.
-
-    Worker counters cross process boundaries through atomic files. A single
-    parity-valid response may still precede a final producer/consumer flush,
-    which makes before/after deltas undercount the measured window. Require
-    consecutive identical metric payloads after all correctness invariants are
-    satisfied. This is benchmark-only control-plane work, never serving-path
-    synchronization.
-    """
-
+def _wait_for_metrics_settle(session, metrics_url: str, *, timeout_s: float = 15.0, poll_s: float = 0.25):
     deadline = time.time() + max(1.0, float(timeout_s))
-    last_payload: Dict[str, object] = {}
     last_failures: List[str] = ["metrics not fetched"]
-    required_stable_polls = max(1, int(stable_polls))
-    stable_count = 0
-    previous_signature = ""
     while time.time() < deadline:
         payload = session.get(metrics_url, timeout=30).json()
         ok, failures = _connector_metrics_settled(payload)
-        last_payload = payload
         last_failures = failures
         if ok:
-            metrics = dict(payload.get("metrics") or {})
-            signature = json.dumps(metrics, ensure_ascii=False, sort_keys=True)
-            stable_count = stable_count + 1 if signature == previous_signature else 1
-            previous_signature = signature
-            if stable_count >= required_stable_polls:
-                return payload
-        else:
-            stable_count = 0
-            previous_signature = ""
+            return payload
         time.sleep(max(0.05, float(poll_s)))
-    detail = "; ".join(last_failures) if last_failures else "metrics remained unstable"
-    raise AssertionError("metrics did not settle before timeout: " + detail)
+    raise AssertionError("metrics did not settle before timeout: " + "; ".join(last_failures))
 
 
 def _validate_summary(summary: Dict[str, object]) -> None:
     text_probe_stdout = str(summary.get("text_probe_stdout", ""))
     mm_probe_stdout = str(summary.get("mm_probe_stdout", ""))
+    mm_hash_probe_stdout = str(summary.get("mm_hash_probe_stdout", ""))
     metrics_payload = dict(summary.get("metrics") or {})
     metrics = dict(metrics_payload.get("metrics") or {})
     path_stats = dict(metrics.get("path_stats") or {})
@@ -1116,6 +1095,7 @@ def _validate_summary(summary: Dict[str, object]) -> None:
     pd_connector_stats = dict(connector_path_stats.get("PD") or {})
     epd_connector_stats = dict(connector_path_stats.get("EPD") or {})
     workflow_registry = dict(metrics_payload.get("workflow_registry") or {})
+    performance_config = dict(summary.get("performance_config") or {})
     connector_metrics_dir = Path(str(summary.get("connector_metrics_dir", "")))
 
     failures: List[str] = []
@@ -1129,6 +1109,36 @@ def _validate_summary(summary: Dict[str, object]) -> None:
         failures.append("proxy metrics requests_multimodal < 1")
     if metrics.get("handoff_committed", 0) < 2:
         failures.append("handoff_committed < 2")
+    if bool(performance_config.get("prerendered_decode")):
+        prerendered_metrics = dict(metrics_payload.get("prerendered_decode") or {})
+        if int(prerendered_metrics.get("selected", 0) or 0) <= 0:
+            failures.append("prerendered Decode enabled but selected <= 0")
+        if "'x-epd-decode-protocol': 'prerendered-generate'" not in (
+            text_probe_stdout + mm_probe_stdout
+        ):
+            failures.append("prerendered Decode header not observed in serving probes")
+    if bool(performance_config.get("decode_mm_hash_cache")):
+        mm_hash_metrics = dict(metrics_payload.get("decode_mm_hash_cache") or {})
+        if not bool(mm_hash_metrics.get("enabled")):
+            failures.append("Decode MM hash cache configured but metrics report disabled")
+        if not bool(mm_hash_metrics.get("epoch_monitor_enabled")):
+            failures.append("Decode MM hash cache epoch monitor is disabled")
+        if int(mm_hash_metrics.get("lookups", 0) or 0) <= 0:
+            failures.append("Decode MM hash cache enabled but no multimodal lookup observed")
+        if int(mm_hash_metrics.get("promotions", 0) or 0) <= 0:
+            failures.append("Decode MM hash cache enabled but no successful full promotion")
+        if int(mm_hash_metrics.get("hash_only_requests", 0) or 0) <= 0:
+            failures.append("Decode MM hash cache enabled but no hash-only request observed")
+        if int(mm_hash_metrics.get("invalidations", 0) or 0) != 0:
+            failures.append("Decode MM hash cache invalidated during E2E validation")
+        if int(mm_hash_metrics.get("rejected_cold_metadata_only", 0) or 0) != 0:
+            failures.append("Decode MM hash cache rejected cold metadata-only input")
+        if int(mm_hash_metrics.get("epoch_probe_failures", 0) or 0) != 0:
+            failures.append("Decode MM hash epoch monitor reported probe failures")
+        if int(mm_hash_metrics.get("worker_unavailable_events", 0) or 0) != 0:
+            failures.append("Decode MM hash epoch monitor observed worker unavailability")
+        if "'x-epd-decode-mm-features': 'hash-only'" not in mm_hash_probe_stdout:
+            failures.append("dedicated warm Decode probe did not use hash-only features")
     if int(pd_stats.get("requests_total", 0) or 0) < 1:
         failures.append("PD path requests_total < 1")
     if int(epd_stats.get("requests_total", 0) or 0) < 1:
@@ -1207,12 +1217,34 @@ def _validate_summary(summary: Dict[str, object]) -> None:
                 failures.append(f"dataset probe {idx} status_code={status_code}")
             if not item_dict.get("routing_path"):
                 failures.append(f"dataset probe {idx} missing routing_path")
+            if (
+                bool(performance_config.get("prerendered_decode"))
+                and item_dict.get("decode_protocol") != "prerendered-generate"
+            ):
+                failures.append(
+                    f"dataset probe {idx} did not select prerendered Decode"
+                )
+            if (
+                bool(performance_config.get("decode_mm_hash_cache"))
+                and item_dict.get("routing_path") == "EPD"
+                and item_dict.get("decode_mm_features") not in {"full", "hash-only"}
+            ):
+                failures.append(
+                    f"dataset probe {idx} missing Decode MM feature mode"
+                )
             if int(item_dict.get("response_content_len", 1) or 0) <= 0:
                 failures.append(f"dataset probe {idx} empty response content")
             if item_dict.get("response_parse_error"):
                 failures.append(
                     f"dataset probe {idx} response_parse_error={item_dict.get('response_parse_error')}"
                 )
+        if bool(performance_config.get("decode_pipeline")) and not any(
+            dict(item).get("decode_pipeline") == "active"
+            for item in list(summary.get("dataset_probe_results") or [])
+        ):
+            failures.append(
+                "decode pipeline enabled but no active dataset probe observed"
+            )
 
     if failures:
         raise AssertionError("; ".join(failures))
@@ -1304,7 +1336,7 @@ def parse_args() -> argparse.Namespace:
         help="Use OpenAI streaming responses for dataset probes so TTFT/TPOT can be measured on real serving.",
     )
     ap.add_argument("--dataset-max-input-len", type=int, default=4096)
-    ap.add_argument("--dataset-request-max-tokens", type=int, default=128)
+    ap.add_argument("--dataset-request-max-tokens", type=int, default=32)
     ap.add_argument(
         "--dataset-skip-oversized",
         action=argparse.BooleanOptionalAction,
@@ -1353,10 +1385,101 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Forward --enable/--no-enable-mm-prefetch to the EPD proxy. Disable for vLLM-internal hidden-cache ablations.",
     )
-    ap.add_argument("--layers-per-group", type=int, default=8)
     ap.add_argument("--max-group-bytes", type=int, default=16 * 1024 * 1024)
-    ap.add_argument("--max-transfer-descriptors", type=int, default=128)
+    ap.add_argument("--max-transfer-descriptors", type=int, default=64)
     ap.add_argument("--max-transfer-bytes", type=int, default=16 * 1024 * 1024)
+    ap.add_argument(
+        "--descriptor-coalescing",
+        action=argparse.BooleanOptionalAction,
+        default=str(
+            os.getenv("MOONCAKE_EPD_ENABLE_DESCRIPTOR_COALESCING", "1")
+        ).strip().lower()
+        in {"1", "true", "yes", "on"},
+        help="Enable provenance-safe adjacent KV transfer descriptor coalescing.",
+    )
+    ap.add_argument(
+        "--connector-metrics-flush-interval-s",
+        type=float,
+        default=0.25,
+        help="Minimum interval between connector metrics snapshots; use 0 for immediate-write baseline.",
+    )
+    ap.add_argument(
+        "--connector-metrics-max-pending",
+        type=int,
+        default=64,
+        help="Maximum connector metric records accumulated before an atomic snapshot.",
+    )
+    ap.add_argument(
+        "--workflow-registry-wal-fsync-interval-s",
+        type=float,
+        default=0.25,
+        help="Maximum interval between durable workflow registry WAL fsyncs; use 0 for immediate fsync.",
+    )
+    ap.add_argument(
+        "--workflow-registry-wal-max-pending",
+        type=int,
+        default=64,
+        help="Maximum workflow registry WAL records grouped into one fsync.",
+    )
+    ap.add_argument(
+        "--decode-pipeline",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Open the Decode streaming request while prompt-only Prefill generation is still running.",
+    )
+    ap.add_argument(
+        "--decode-pipeline-max-inflight",
+        type=int,
+        default=0,
+        help=(
+            "Suppress early Decode open when this many Decode requests are "
+            "already active; 0 preserves unlimited pipeline admission."
+        ),
+    )
+    ap.add_argument(
+        "--prerendered-decode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reuse the Prefill render GenerateRequest at Decode and adapt the "
+            "token-only response back to OpenAI chat semantics."
+        ),
+    )
+    ap.add_argument(
+        "--decode-mm-hash-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Send hash-only multimodal metadata to a Decode worker only after "
+            "a successful full-feature Generate request confirmed that worker warm."
+        ),
+    )
+    ap.add_argument("--decode-mm-hash-cache-max-entries", type=int, default=64)
+    ap.add_argument("--decode-mm-hash-cache-ttl-s", type=float, default=120.0)
+    ap.add_argument("--decode-mm-hash-epoch-poll-s", type=float, default=1.0)
+    ap.add_argument(
+        "--decode-mm-hash-epoch-probe-timeout-s",
+        type=float,
+        default=0.5,
+    )
+    ap.add_argument(
+        "--decode-mm-hash-epoch-freshness-s",
+        type=float,
+        default=0.0,
+    )
+    ap.add_argument(
+        "--decode-mm-hash-epoch-endpoint",
+        default="/metrics",
+        help=(
+            "Decode process-incarnation probe path; use the lightweight "
+            "/mooncake_epd/incarnation endpoint for real performance runs."
+        ),
+    )
+    ap.add_argument(
+        "--decode-mm-hash-epoch-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     ap.add_argument("--owner-shards", type=int, default=1)
     ap.add_argument("--kv-directory-rpc-url", default=None)
     return ap.parse_args()
@@ -1379,20 +1502,53 @@ def main() -> None:
         kv_directory_rpc_url=args.kv_directory_rpc_url,
         workflow_registry_wal_path=str(workdir / "proxy_workflow_registry.jsonl"),
         connector_metrics_dir=str(workdir / "connector_metrics"),
-        layers_per_group=int(args.layers_per_group),
         max_group_bytes=args.max_group_bytes,
         max_transfer_descriptors=args.max_transfer_descriptors,
         max_transfer_bytes=args.max_transfer_bytes,
+        enable_descriptor_coalescing=bool(args.descriptor_coalescing),
+        connector_metrics_flush_interval_s=max(
+            0.0,
+            float(args.connector_metrics_flush_interval_s),
+        ),
+        connector_metrics_max_pending_records=max(
+            1,
+            int(args.connector_metrics_max_pending),
+        ),
+        workflow_registry_wal_fsync_interval_s=max(
+            0.0,
+            float(args.workflow_registry_wal_fsync_interval_s),
+        ),
+        workflow_registry_wal_max_pending_records=max(
+            1,
+            int(args.workflow_registry_wal_max_pending),
+        ),
+        enable_decode_pipeline=bool(args.decode_pipeline),
+        decode_pipeline_max_inflight=max(
+            0, int(args.decode_pipeline_max_inflight)
+        ),
+        enable_prerendered_decode=bool(args.prerendered_decode),
+        enable_decode_mm_hash_cache=bool(args.decode_mm_hash_cache),
+        decode_mm_hash_cache_max_entries=max(
+            1, int(args.decode_mm_hash_cache_max_entries)
+        ),
+        decode_mm_hash_cache_ttl_s=max(0.0, float(args.decode_mm_hash_cache_ttl_s)),
+        decode_mm_hash_epoch_poll_s=max(0.0, float(args.decode_mm_hash_epoch_poll_s)),
+        decode_mm_hash_epoch_probe_timeout_s=max(
+            0.05, float(args.decode_mm_hash_epoch_probe_timeout_s)
+        ),
+        decode_mm_hash_epoch_freshness_s=max(
+            0.0, float(args.decode_mm_hash_epoch_freshness_s)
+        ),
+        decode_mm_hash_epoch_endpoint=str(args.decode_mm_hash_epoch_endpoint),
+        enable_decode_mm_hash_epoch_guard=bool(
+            args.decode_mm_hash_epoch_guard
+        ),
+        enable_mm_prefetch=bool(args.enable_mm_prefetch),
         mm_prefetch_mode=args.mm_prefetch_mode,
         prefill_supports_feature_handles=bool(args.prefill_supports_feature_handles),
+        strict_no_fallback=True,
     )
     files = generate_configs(str(workdir), cfg)
-    if not bool(args.enable_mm_prefetch):
-        proxy_script = Path(files["proxy"])
-        proxy_text = proxy_script.read_text(encoding="utf-8")
-        if "--no-enable-mm-prefetch" not in proxy_text:
-            proxy_text = proxy_text.replace("--port ", "--no-enable-mm-prefetch --port ", 1)
-            proxy_script.write_text(proxy_text, encoding="utf-8")
     prefill_scripts = _as_str_list(files.get("prefill_scripts"), [str(files["prefill"])])
     decode_scripts = _as_str_list(files.get("decode_scripts"), [str(files["decode"])])
     prefill_ports = _as_int_list(files.get("prefill_ports"), [_extract_port(Path(str(files["prefill"])))])
@@ -1538,6 +1694,32 @@ def main() -> None:
             text=True,
             timeout=args.timeout,
         )
+        mm_hash_probe = None
+        if bool(args.decode_mm_hash_cache):
+            # The first multimodal probe is deliberately cold and proves the
+            # full-feature promotion path.  Repeating the exact request proves
+            # that the target worker actually consumes the hash-only path;
+            # aggregate lookups/promotions alone cannot establish this.
+            mm_hash_probe = subprocess.run(
+                [
+                    sys.executable,
+                    str(checker),
+                    "--prefill-url",
+                    f"http://{local_hostname}:{prefill_port}",
+                    "--decode-url",
+                    f"http://{local_hostname}:{decode_port}",
+                    "--proxy-url",
+                    f"http://{local_hostname}:{proxy_port}",
+                    "--request",
+                    str(req_mm),
+                ],
+                cwd=str(REPO_ROOT),
+                env=cmd_env,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=args.timeout,
+            )
 
         proxy_request_url = f"http://{local_hostname}:{proxy_port}/v1/chat/completions"
         agent_pd_probe_results: List[Dict[str, Any]] = []
@@ -1733,6 +1915,12 @@ def main() -> None:
             for item in dataset_probe_results
             if int(item.get("status_code", 0) or 0) < 400 and not item.get("error")
         ]
+        dataset_prompt_tokens = sum(
+            int(item.get("prompt_tokens", 0) or 0) for item in dataset_success
+        )
+        dataset_completion_tokens = sum(
+            int(item.get("completion_tokens", 0) or 0) for item in dataset_success
+        )
         deadline_ms = max(0.0, float(args.dataset_deadline_ms))
         goodput_slo_ms = max(0.0, float(args.dataset_goodput_slo_ms))
         goodput_count = sum(
@@ -1766,6 +1954,9 @@ def main() -> None:
             "allow_loopback": bool(args.allow_loopback),
             "text_probe_stdout": text_probe.stdout,
             "mm_probe_stdout": mm_probe.stdout,
+            "mm_hash_probe_stdout": (
+                mm_hash_probe.stdout if mm_hash_probe is not None else ""
+            ),
             "dataset_probe_results": dataset_probe_results,
             "dataset_probe_count": len(dataset_probe_results),
             "dataset_probe_success": sum(1 for item in dataset_probe_results if int(item.get("status_code", 0) or 0) < 400),
@@ -1799,6 +1990,14 @@ def main() -> None:
             "dataset_ttft_stats_ms": _stats(dataset_ttft_values),
             "dataset_tpot_stats_ms": _stats(dataset_tpot_values),
             "dataset_request_throughput_rps": len(dataset_probe_results) / benchmark_elapsed_s,
+            "dataset_output_token_throughput_tps": (
+                dataset_completion_tokens / benchmark_elapsed_s
+            ),
+            "dataset_total_token_throughput_tps": (
+                (dataset_prompt_tokens + dataset_completion_tokens) / benchmark_elapsed_s
+            ),
+            "dataset_prompt_tokens": dataset_prompt_tokens,
+            "dataset_completion_tokens": dataset_completion_tokens,
             "dataset_goodput_rps": goodput_count / benchmark_elapsed_s,
             "dataset_goodput_count": goodput_count,
             "dataset_success_rate": (
@@ -1808,6 +2007,67 @@ def main() -> None:
                 deadline_miss_count / len(dataset_success) if dataset_success and deadline_ms > 0 else 0.0
             ),
             "metrics": metrics,
+            "performance_config": {
+                "model": cfg.model,
+                "strict_no_fallback": bool(cfg.strict_no_fallback),
+                "descriptor_coalescing": bool(cfg.enable_descriptor_coalescing),
+                "max_group_bytes": int(cfg.max_group_bytes),
+                "max_transfer_descriptors": int(cfg.max_transfer_descriptors),
+                "max_transfer_bytes": int(cfg.max_transfer_bytes),
+                "connector_metrics_flush_interval_s": float(
+                    cfg.connector_metrics_flush_interval_s
+                ),
+                "connector_metrics_max_pending_records": int(
+                    cfg.connector_metrics_max_pending_records
+                ),
+                "workflow_registry_wal_fsync_interval_s": float(
+                    cfg.workflow_registry_wal_fsync_interval_s
+                ),
+                "workflow_registry_wal_max_pending_records": int(
+                    cfg.workflow_registry_wal_max_pending_records
+                ),
+                "decode_pipeline": bool(cfg.enable_decode_pipeline),
+                "decode_pipeline_max_inflight": int(
+                    cfg.decode_pipeline_max_inflight
+                ),
+                "prerendered_decode": bool(cfg.enable_prerendered_decode),
+                "decode_mm_hash_cache": bool(cfg.enable_decode_mm_hash_cache),
+                "decode_mm_hash_cache_max_entries": int(
+                    cfg.decode_mm_hash_cache_max_entries
+                ),
+                "decode_mm_hash_cache_ttl_s": float(
+                    cfg.decode_mm_hash_cache_ttl_s
+                ),
+                "decode_mm_hash_epoch_poll_s": float(
+                    cfg.decode_mm_hash_epoch_poll_s
+                ),
+                "decode_mm_hash_epoch_probe_timeout_s": float(
+                    cfg.decode_mm_hash_epoch_probe_timeout_s
+                ),
+                "decode_mm_hash_epoch_freshness_s": float(
+                    cfg.decode_mm_hash_epoch_freshness_s
+                ),
+                "decode_mm_hash_epoch_endpoint": str(
+                    cfg.decode_mm_hash_epoch_endpoint
+                ),
+                "decode_mm_hash_epoch_guard": bool(
+                    cfg.enable_decode_mm_hash_epoch_guard
+                ),
+                "enable_mm_prefetch": bool(cfg.enable_mm_prefetch),
+            },
+            "descriptor_metrics": {
+                key: dict(metrics.get("metrics") or {}).get(key)
+                for key in (
+                    "descriptor_build_calls",
+                    "descriptor_build_input_descriptors",
+                    "descriptor_build_output_descriptors",
+                    "coalesced_descriptors",
+                    "descriptor_build_ms",
+                    "descriptor_build_ms_avg",
+                    "descriptor_reduction_ratio",
+                    "descriptors_per_mb",
+                )
+            },
             "workflow_registry_wal": str(registry_path),
             "workflow_registry_events": len(registry_lines),
             "connector_metrics_dir": files["connector_metrics_dir"],

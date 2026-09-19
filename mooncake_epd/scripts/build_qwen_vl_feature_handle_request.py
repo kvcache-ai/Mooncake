@@ -12,10 +12,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import io
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -29,6 +27,8 @@ if str(REPO_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT.parent))
 
 from mooncake_epd.core.epd_workers import EncoderWorker  # noqa: E402
+from mooncake_epd.demo.vllm_integration import MODEL_PATH  # noqa: E402
+from mooncake_epd.multimodal_identity import stable_multimodal_identity_hash  # noqa: E402
 from mooncake_epd.core.state import (  # noqa: E402
     MooncakeFeatureBundleStore,
     MooncakeFeatureBundleStoreConfig,
@@ -45,9 +45,7 @@ def _data_url_for_image(image: Image.Image) -> str:
 
 
 def _stable_mm_hash(item: Dict[str, Any]) -> str:
-    payload = {k: item.get(k) for k in sorted(item) if k not in {"detail"}}
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()[:16]
+    return stable_multimodal_identity_hash(item)
 
 
 def _load_image(args: argparse.Namespace) -> Tuple[Image.Image, str]:
@@ -176,10 +174,7 @@ def build_request(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--model",
-        default=os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct"),
-    )
+    ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--device", default="cuda:5")
     ap.add_argument("--store-dir", default="/tmp/mooncake_epd_feature_handle_store")
     ap.add_argument("--publish-backend", choices=["file", "mooncake"], default="file")

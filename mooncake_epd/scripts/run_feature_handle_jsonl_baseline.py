@@ -12,7 +12,6 @@ import argparse
 import base64
 import io
 import json
-import os
 import statistics
 import sys
 import time
@@ -25,6 +24,8 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT.parent))
+
+from mooncake_epd.demo.vllm_integration import MODEL_PATH  # noqa: E402
 
 
 def _percentile(values: List[float], pct: float) -> float:
@@ -190,10 +191,7 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--requests-jsonl", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument(
-        "--model",
-        default=os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct"),
-    )
+    ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--device", default="cuda:2")
     ap.add_argument("--max-requests", type=int, default=0)
     ap.add_argument("--warmup-requests", type=int, default=5)

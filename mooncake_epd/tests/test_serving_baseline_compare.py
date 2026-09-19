@@ -3,7 +3,9 @@ from __future__ import annotations
 from mooncake_epd.scripts.run_serving_baseline_compare import (
     _build_compare_gate,
     _comparison_flags,
+    _latency_stats,
     _normalize_text,
+    _summarize_serving_metrics,
     _string_metrics,
 )
 from mooncake_epd.scripts.run_vllm_serving_e2e import _extract_choice_text
@@ -11,6 +13,39 @@ from mooncake_epd.scripts.run_vllm_serving_e2e import _extract_choice_text
 
 def test_normalize_text_collapses_case_punctuation_and_spaces():
     assert _normalize_text(" Hello,\nMooncake-EPD!!  ") == "hello mooncake epd"
+
+
+def test_latency_stats_marks_empty_samples_unavailable():
+    assert _latency_stats([]) == {
+        "count": 0,
+        "avg": None,
+        "p50": None,
+        "p95": None,
+        "p99": None,
+        "max": None,
+    }
+
+
+def test_serving_metric_summary_preserves_real_transfer_observation():
+    summary = _summarize_serving_metrics(
+        {
+            "metrics": {
+                "kv_transfer_attempts": 3,
+                "kv_transfer_successes": 2,
+                "kv_transfer_bytes": 1_000_000,
+                "kv_transfer_elapsed_ms": 4.0,
+                "kv_transfer_gbps": 2.0,
+                "remote_transfer_backend_gbps": {"peer_buffer_direct": 2.0},
+            }
+        }
+    )
+
+    assert summary["kv_transfer_attempts"] == 3
+    assert summary["kv_transfer_successes"] == 2
+    assert summary["kv_transfer_bytes"] == 1_000_000
+    assert summary["kv_transfer_elapsed_ms"] == 4.0
+    assert summary["kv_transfer_gbps"] == 2.0
+    assert summary["remote_transfer_backend_gbps"] == {"peer_buffer_direct": 2.0}
 
 
 def test_string_metrics_reports_normalized_match_and_overlap():

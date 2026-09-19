@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-MODEL_PATH = os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct")
+MODEL_PATH = os.getenv("MOONCAKE_EPD_MODEL_PATH", "/data01/LWX/Qwen3-VL-8B-Instruct")
 # With CUDA_VISIBLE_DEVICES=6,7: cuda:0=GPU6, cuda:1=GPU7
 ENCODER_GPU = 0
 PREFILL_GPU = 0

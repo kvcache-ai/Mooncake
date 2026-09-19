@@ -1,256 +1,420 @@
-# Mooncake EPD: Multimodal and Agent-State Disaggregation
+# Mooncake EPD Disaggregation Framework
 
-Mooncake EPD is a production-oriented **Encoder-Prefill-Decode (EPD)
-disaggregation** implementation integrated directly into the Mooncake source
-tree. It extends Mooncake and vLLM for multimodal serving and stateful Agent
-workflows through three coordinated data paths:
+## 赛题四：Agent 与多模态推理场景下的 KVCache 分离与协同调度
 
-1. **E→P hidden-state transfer**: a dedicated Encoder stage produces Qwen-VL visual hidden states and transfers them to Prefill through FeatureHandle/direct peer-buffer paths.
-2. **P→D layered KV transfer**: Prefill generates paged KV cache and hands it to Decode through a repo-local vLLM `MooncakeConnector` with grouped/layered transfer metadata.
-3. **Agent state reuse**: workflow state, KV page descriptors, feature handles, clone/release lifecycle, and scheduler metadata are tracked as first-class control-plane objects.
+基于 [Mooncake](https://github.com/kvcache-ai/Mooncake) 的 EPD 三阶段分离与 Agent 状态协同调度框架，面向下一代 AI 多模态推理工作负载。
 
-The implementation reuses Mooncake Transfer Engine, Mooncake Store, vLLM's KV
-connector lifecycle, and repository-native tests. Public performance summaries
-are backed by
-[`artifacts/2026-07-10/benchmark_summary.json`](artifacts/2026-07-10/benchmark_summary.json).
+## 真实验证现状
 
-## Public links
+本仓库当前已经完成一轮**真模型 / 真 GPU / 真 Mooncake / 真 vLLM** 的落地验证，核心结论：
 
-- Upstream Mooncake repository: <https://github.com/kvcache-ai/Mooncake>
-- Public submission repository: <https://github.com/Pinoeer-kingxi/Mooncake>
-- EPD branch: <https://github.com/Pinoeer-kingxi/Mooncake/tree/feature/epd-vllm-multimodal-agent>
-- Main upstream PR: [Mooncake EPD: Multimodal and Agent-State Disaggregation](https://github.com/kvcache-ai/Mooncake/pull/2836)
+- `Qwen3-VL-8B-Instruct` 已完成 EPD 真机测试
+- Mooncake store-backed 远程传输测试已通过
+- vLLM `MooncakeConnector` 分离式 prefill/decode 已真实启动成功
+- proxy 的 `POST /v1/chat/completions` 已真实返回 200
+- `scripts/vllm_disagg_proxy.py` 已真实修复 proxy 首跳缺失 `transfer_id` 的告警
+- GPU3-6 soak 已完成，结果见 `artifacts/real_soak_report.json`
+- 本地 `KV Directory / owner-shard` 接入后已完成二次真机回归，结果见 `artifacts/real_soak_report_post_kvdir.json`
 
-The subsystem-oriented review guide for the single integration PR is
-documented in `PR_DESCRIPTION.md`.
+推荐先看：
 
-## Task coverage
+- `coding_plan/真实测试经验.md`
+- `artifacts/phase6_metrics.json`
+- `artifacts/real_soak_report.json`
+- `artifacts/real_soak_report_post_kvdir.json`
+- `artifacts/rfc_eval_report.md`
 
-### Foundation tasks
+## 项目概述
 
-| Task | Delivered capability |
-| --- | --- |
-| vLLM EPD three-stage serving | A real Encoder service transfers Vision Hidden State to Prefill through Mooncake; Prefill transfers paged KV cache to Decode through the vLLM save/load connector path. |
-| Agent State Cloning | Agent branches share immutable KV page descriptors with reference counting and page-level Copy-on-Write instead of deep-copying complete state. |
-| Qwen-VL end-to-end demo | Real-model launchers, strict direct-path gates, baseline runners, and benchmark artifacts cover Qwen3-VL serving. |
+本框架将多模态大模型推理拆分为三个独立阶段（EPD），通过 Mooncake Transfer Engine 实现跨节点高性能数据传输：
 
-### Advanced tasks
+```
+Image → [Encoder GPU] → Hidden States → [Transfer E→P] →
+        [Prefill GPU] → KV Cache → [Transfer P→D] →
+        [Decode GPU] → Text
+```
 
-| Task | Delivered capability |
-| --- | --- |
-| Worker-level stage transfer | Reusable registered-pointer, peer-buffer, grouped-transfer, and topology-affinity primitives support low-latency stage handoff and provide an integration base for AR/Generation/Diffusion pipelines. |
-| Agent PD scheduling | Thinking, interactive, and hybrid tasks are routed with stage-specific pools, deadline/rho-aware admission, topology affinity, and measurable backpressure. |
-| Hidden State Prefix Caching | Stable multimodal keys, FeatureHandles, vLLM hidden-state cache integration, event-driven prefetch, and precomputed `image_embeds` injection enable Vision Encoder skip on cache hits. |
-| Upstream contribution | The implementation follows Mooncake's tree layout and is packaged as reviewable Transfer Engine, FeatureHandle, serving/control-plane, and benchmark/documentation changes. |
+同时实现了 Agent 状态克隆、PD 调度策略和 Hidden State 前缀缓存等进阶功能。
 
-## What is implemented
+## 环境要求
 
-| Area | Current implementation evidence |
-| --- | --- |
-| EPD pipeline | `core/epd_pipeline.py`, `core/epd_workers.py`, `scripts/run_real_qwenvl_epd_demo.py`, `scripts/run_vllm_online_direct_e2e.py` |
-| Qwen-VL Encoder FeatureBundle | `core/epd_workers.py`, `core/state/feature_store.py`, `core/state/direct_feature_buffer.py`, `scripts/epd_encoder_service.py`, `scripts/direct_feature_buffer_service.py` |
-| P→D layered KV transfer | `core/control/vllm_mooncake_connector.py`, `core/control/vllm_transfer_primitives.py`, `demo/vllm_integration.py` |
-| Direct peer-buffer transport planning | `core/transfer/engine.py`, `tests/test_transfer_engine_peerbuffer_plan.py` |
-| Serving control plane | `core/control/serving_controller.py`, `core/control/kv_directory.py`, `core/state/workflow_registry.py` |
-| Agent PD routing/backpressure | `agent/coordination/scheduler.py`, serving metrics in `ServingControlPlane` |
-| Agent state clone / CoW descriptors | `agent/state_clone.py`, `core/state/kv_state_store.py`, `core/state/page_manager.py` |
-| MM cache and event prefetch | `core/state/mm_store.py`, `core/state/vllm_mm_hidden_cache.py`, `core/state/vllm_feature_handle_provider.py` |
-| Artifact gates | `scripts/check_real_epd_gate.py`, `scripts/check_epd_artifact_gates.py` |
+| 项目 | 要求 |
+|------|------|
+| GPU | RTX A6000 48GB x 8 (或同等) |
+| CPU | 64 cores |
+| RAM | 503 GB |
+| CUDA | 12.9 |
+| Python | 3.10+ |
+| Mooncake | 0.3.11+ |
+| vLLM | latest (V1 backend) |
 
-## Core contributions
+### 硬件说明
 
-- **Multimodal EPD serving path**: separates visual encoding, LLM prefill, and decode for Qwen3-VL-style workloads while preserving OpenAI-compatible vLLM request handling.
-- **Direct FeatureHandle path for E→P**: Prefill allocates destination feature buffers; Encoder publishes hidden-state tensor bytes through Mooncake direct peer-buffer metadata; Prefill validates descriptors before skipping vision recompute.
-- **Layered P→D KV transfer**: vLLM `MooncakeConnector` extension batches KV descriptors by layer group, records peer-buffer backend metrics, and enforces strict no-fallback gates for measured runs.
-- **State-centric Agent runtime**: versioned workflow records, KV directory entries, handoff IDs, and WAL-backed registry events make Agent fork/handoff/release observable.
-- **Zero-copy Agent clone semantics**: same-node KV clone increments page references instead of copying tensor bytes; CoW materializes only modified pages.
-- **Type-aware scheduler and backpressure**: thinking, interactive, and hybrid Agent hints influence Prefill/Decode routing; rho/deadline backpressure and reject counters are exposed in metrics.
+当前环境为 RTX A6000 工作站，已探测到 ACTIVE 的 Intel `irdma0`
+RNIC（`eno2=192.168.100.1`）。它的 verbs transport 是 **iWARP**，不能
+使用 Mooncake legacy IB/RoCE 手工 QP 路径。仓库现已增加两级适配：
 
-## Dependencies
+1. `core/transfer/rdma.py` 区分 IB、RoCE、iWARP、`rdma_cm` 与
+   GPUDirect，不再用“存在 verbs 设备”误判 GPUDirect。
+2. `core/transfer/rdmacm.py` 提供 `rdma_cm/rsocket` 硬件数据面；对
+   Intel X722 使用 GPU→Host staging→iWARP→Host staging→GPU，并对远端
+   CUDA 指针做注册范围校验。
 
-Minimal Python dependencies from `requirements.txt`:
+本机真实 `rbind/rlisten` 已通过，artifact：
+`artifacts/rdmacm_iwarp_diagnostics_20260723_173449.json`。诊断结论为
+本地 endpoint `ready=true`、`data_plane_validated=false`、
+`gpudirect_ready=false`。由于 iWARP 连接必须到另一台
+RDMA 主机，单机 EPD 进程不能把流量绕回本机 RNIC；单机自动选择
+CUDA P2P/SHM，跨机配置远端 RDMA IPv4 后选择 `rdmacm_staged`。Mooncake
+继续作为 TCP 控制面与内存区域元数据面，RDMA 仍不作为 correctness
+依赖。
+
+本机 RDMA 诊断 artifacts：
+
+- `artifacts/ibv_devinfo_after_install_20260709.txt`
+- `artifacts/ibv_devices_after_install_20260709.txt`
+- `artifacts/mooncake_rdma_diagnostics_after_ibverbs_20260709.json`
+
+复测入口：
+
+```bash
+PYTHONPATH=/home/songbinbin/Proj/Proj_LWX \
+WITH_NVIDIA_PEERMEM=1 \
+MC_RDMA_BIND_ADDRESS=192.168.100.1 \
+MC_GID_INDEX=0 \
+MC_MTU=1024 \
+MC_NUM_QP_PER_EP=1 \
+MC_MAX_INLINE=0 \
+MC_MAX_SGE=1 \
+MC_MAX_WR=16 \
+python scripts/diagnose_mooncake_rdma.py \
+  --device-name irdma0 \
+  --local-hostname 192.168.100.1 \
+  --cuda-device cuda:0
+```
+
+生成跨机 iWARP EPD 配置：
+
+```bash
+PYTHONPATH=/data/songbinbin/Proj/Proj_LWX \
+/data/songbinbin/Proj/Proj_LWX/venv_mooncake/bin/python \
+  demo/vllm_integration.py \
+  --output-dir config-rdmacm \
+  --protocol rdmacm \
+  --rdmacm-bind-address 192.168.100.1 \
+  --rdmacm-remote-address <decode节点RDMA_IP>
+```
+
+生成结果中 Mooncake protocol 仍为 `tcp`，KV 数据面 backend 为
+`rdmacm_staged`；这是 Intel iWARP 的预期组合，不是降级伪装。
+
+## 快速开始
+
+### 1. 环境安装
+
+```bash
+# 创建虚拟环境
+python3.10 -m venv venv_mooncake
+source venv_mooncake/bin/activate
+
+# 安装 Mooncake
+pip install mooncake-transfer-engine
+
+# 安装 vLLM
+pip install vllm
+
+# 安装其他依赖
+pip install torch numpy Pillow pyyaml requests aiohttp
+```
+
+### 2. 运行 EPD Demo
+
+```bash
+cd mooncake_epd
+python demo/run_qwenvl_epd.py
+```
+
+### 3. 运行性能基准测试
+
+```bash
+python benchmarks/benchmark.py
+```
+
+### 4. 启动 Mooncake 基础服务
+
+```bash
+bash scripts/start_mooncake.sh
+```
+
+### 5. 启动 vLLM EPD 分离推理
+
+```bash
+bash scripts/start_vllm_disagg.sh
+```
+
+## 项目结构
+
+```
+mooncake_epd/
+├── __init__.py
+├── config/
+│   ├── config.yaml              # 总配置文件
+│   └── mooncake.json            # Mooncake Transfer Engine 配置
+├── core/
+│   ├── __init__.py
+│   ├── transfer_engine.py       # Mooncake Transfer Engine 封装
+│   ├── encoder_worker.py        # Vision Encoder Worker
+│   ├── prefill_worker.py        # Prefill Worker
+│   ├── decode_worker.py         # Decode Worker
+│   └── epd_pipeline.py          # EPD 流水线编排
+├── agent/
+│   ├── __init__.py
+│   ├── state_clone.py           # Agent KVCache 零拷贝克隆
+│   ├── scheduler.py             # Agent PD 调度策略
+│   └── prefix_cache.py          # Hidden State 前缀缓存
+├── demo/
+│   ├── run_qwenvl_epd.py        # Qwen3-VL EPD 端到端 Demo
+│   └── vllm_integration.py      # vLLM 集成配置生成
+├── benchmarks/
+│   └── benchmark.py             # 性能基准测试
+├── scripts/
+│   ├── start_mooncake.sh        # 启动 Mooncake 服务
+│   ├── start_vllm_disagg.sh     # 启动 vLLM EPD 分离
+│   └── setup_mooncake.py        # Mooncake 环境管理
+└── requirements.txt
+```
+
+## 基础任务实现
+
+### 1. EPD 三阶段分离原型
+
+**文件**: `core/encoder_worker.py`, `core/prefill_worker.py`, `core/decode_worker.py`, `core/epd_pipeline.py`
+
+**实现要点**:
+- Vision Encoder (ViT) 在独立 GPU 上运行，输出 Hidden States
+- Prefill Worker 接收视觉特征 + 文本 token，生成 KV Cache
+- Decode Worker 接收 KV Cache，执行自回归解码
+- 通过 Mooncake Transfer Engine 实现 E→P (Hidden States) 和 P→D (KV Cache) 传输
+- 支持 TCP 和 RDMA 协议
+
+### 2. Agent State Cloning
+
+**文件**: `agent/state_clone.py`
+
+**实现要点**:
+- 零拷贝克隆：通过引用计数共享 KV Cache 物理内存
+- 写时复制 (CoW)：仅在修改时才分配新内存
+- 生命周期管理：引用计数为 0 时自动回收
+- 支持 Tree-of-Thought 剪枝（保留 top-k 分支）
+
+**性能数据**:
+- 2 分支克隆: 0.098 ms (0.049 ms/branch)
+- 4 分支克隆: 0.142 ms (0.036 ms/branch)
+- 8 分支克隆: 0.248 ms (0.031 ms/branch)
+- 16 分支克隆: 0.471 ms (0.029 ms/branch)
+
+### 3. Qwen-VL 端到端 Demo
+
+**文件**: `demo/run_qwenvl_epd.py`
+
+四个 Demo 模块：
+1. **Basic EPD**: 多模态输入经过 E→P→D 三阶段处理
+2. **Agent Cloning**: Tree-of-Thought 思考分支 fork 与剪枝
+3. **Prefix Caching**: 图像编码结果缓存，避免重复计算
+4. **PD Scheduling**: 思考型/交互型 Agent 动态路由
+
+## 进阶任务实现
+
+### 1. Agent PD Disaggregation 调度策略
+
+**文件**: `agent/scheduler.py`
+
+- 思考型 Agent → 高算力 Prefill Worker（选择 GPU utilization 最低的）
+- 交互型 Agent → 低延迟 Decode Worker（选择 avg_latency 最低的）
+- 支持优先级调度和动态负载均衡
+
+### 2. Hidden State Prefix Caching
+
+**文件**: `agent/prefix_cache.py`
+
+- 基于 SHA-256 图像 hash 的精确匹配
+- LRU 淘汰策略
+- 可配置缓存大小 (默认 4GB) 和 TTL (默认 1 小时)
+- 相同图像命中率 100%
+
+### 3. vLLM MooncakeConnector 集成
+
+**文件**: `demo/vllm_integration.py`, `scripts/start_vllm_disagg.sh`
+
+- 使用 vLLM V1 后端的 `MooncakeConnector`
+- Prefill (kv_producer) 和 Decode (kv_consumer) 分离部署
+- Proxy Server 路由请求
+
+## 性能数据
+
+### Benchmark 结果 (Mock 模型, A6000, TCP)
+
+| 指标 | 数值 |
+|------|------|
+| **EPD Pipeline** | |
+| Avg Latency | 167.31 ms |
+| P50 Latency | 160.26 ms |
+| P99 Latency | 207.98 ms |
+| Avg TTFT | 2.54 ms |
+| Throughput | 204.59 tokens/s |
+| **Transfer Bandwidth (Local CUDA)** | |
+| 4KB Tensor | 1.284 Gbps |
+| 40KB Tensor | 13.417 Gbps |
+| 400KB Tensor | 120.452 Gbps |
+| 4MB Tensor | 1240.088 Gbps |
+| **Agent Cloning** | |
+| 2 branches | 0.049 ms/branch |
+| 16 branches | 0.029 ms/branch |
+| **Prefix Caching** | |
+| Cache Hit Rate | 100% |
+
+> 注：以上数据基于 Mock 模型的演示性测试。实际模型（如 Qwen3-VL-8B）的数据会有所不同。
+
+## vLLM 集成指南
+
+### 使用 MooncakeConnector 实现 PD 分离
+
+1. **配置 mooncake.json**:
+```json
+{
+  "prefill_url": "127.0.0.1:9100",
+  "decode_url": "127.0.0.1:9200",
+  "metadata_server": "http://127.0.0.1:8080/metadata",
+  "protocol": "tcp",
+  "device_name": ""
+}
+```
+
+2. **启动 Prefill**:
+```bash
+MOONCAKE_CONFIG_PATH=mooncake.json \
+vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
+  --port 8100 \
+  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}'
+```
+
+3. **启动 Decode**:
+```bash
+MOONCAKE_CONFIG_PATH=mooncake.json \
+vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
+  --port 8200 \
+  --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer"}'
+```
+
+4. **启动 Proxy**:
+```bash
+python mooncake/vllm_v1_proxy_server.py \
+  --prefiller-host 127.0.0.1 --prefiller-port 8100 \
+  --decoder-host 127.0.0.1 --decoder-port 8200 \
+  --port 8000
+```
+
+## 已知限制
+
+1. **RDMA 硬件口径**: 当前工作站有 Intel `irdma0` iWARP RNIC，但 Mooncake RDMA direct path 的 IB/RoCE RC QP smoke 未通过；真实可用路径是 TCP direct 与 SHM。若需要真 RDMA/GPU Direct，请使用 Mellanox/兼容 RoCEv2 或 IB HCA，或先让 `scripts/diagnose_mooncake_rdma.py` 返回 `ready=true`。
+2. **Mock 模型**: Demo 使用模拟模型验证架构，实际 Qwen3-VL 需要 vLLM 集成
+3. **跨节点**: 当前仅验证单节点多 GPU 场景，跨节点需要网络配置
+4. **MooncakeConnector Proxy**: 当前使用 vLLM 自带的 toy_proxy_server，生产环境需要更健壮的方案
+
+## 模型依赖
+
+| 模型 | 用途 | VRAM 需求 |
+|------|------|-----------|
+| Qwen2.5-VL-7B-Instruct | 多模态推理 | ~16 GB (FP16) |
+| Qwen2.5-VL-32B-Instruct | 高性能推理 | ~64 GB (FP16) |
+| Qwen3-VL-8B (预期) | 最新模型 | ~18 GB (FP16) |
+
+## 框架版本
+
+| 组件 | 版本 |
+|------|------|
+| Mooncake | 0.3.11.post1 |
+| vLLM | latest (V1) |
+| PyTorch | 2.x |
+| CUDA | 12.9 |
+| Python | 3.10 |
+
+## 部署拓扑
+
+### 单机三 GPU EPD 分离
+```
+GPU 0: Vision Encoder (E)
+GPU 1: LLM Prefill (P)
+GPU 2: LLM Decode (D)
+```
+
+### 多机 EPD 分离
+```
+Node 1 (GPU 0,1): Encoder + Prefill
+Node 2 (GPU 2,3): Decode
+Transfer: Mooncake (TCP/RDMA)
+```
+
+### 生产环境建议
+```
+Node 1-2: Vision Encoder Pool
+Node 3-6: Prefill Pool (high compute)
+Node 7-8: Decode Pool (low latency)
+Load Balancer: Agent PD Scheduler
+```
+
+## Omni Pipeline AR → Generation → Diffusion SHM 验证状态（2026-07-09）
+
+`scripts/run_omni_stage_transfer_e2e.py` 现在提供三种可复现路径：
+
+- `--stage-impl tensor --runtime thread`：真实 Qwen2.5-Omni Thinker image hidden-state + 轻量 tensor Generation/Diffusion，用于快速验证 CUDA stage 间 SHM/同机搬运。
+- `--stage-impl semantic --runtime thread`：完整语义级 Qwen2.5-Omni 拆分，`Thinker/AR -> Talker speech-code Generation -> Token2Wav diffusion/vocoder`，模型按 `thinker/talker/token2wav` 分布到三张 GPU。
+- `--stage-impl dataset_tensor --runtime process`：真实数据集图片派生 CPU tensor，三段分别运行在独立 OS process，通过 POSIX SHM 验证跨进程 stage 搬运与聚合统计。
+
+已验证 artifacts：
 
 ```text
-torch>=2.0
-mooncake-transfer-engine
-numpy
-Pillow
-pyyaml
-requests
-aiohttp
+artifacts/qwen25_omni_stage_transfer_dataset_e2e_shm_semantic_20260709.json
+artifacts/qwen25_omni_stage_transfer_dataset_e2e_shm_process_dataset_tensor_20260709.json
 ```
 
-The artifact-backed real serving run used this environment (`benchmark_summary.json`):
-
-| Component | Version / value |
-| --- | --- |
-| GPU host | 8 × NVIDIA RTX A6000, 49140 MiB each |
-| CPU / RAM | 2 × Intel Xeon Gold 6226R, 64 logical CPUs; 503 GiB RAM |
-| Python | 3.10.12 |
-| PyTorch | 2.11.0 |
-| vLLM | 0.23.0 |
-| Transformers | 5.12.1 |
-| CUDA runtime / driver | CUDA 13.0 / NVIDIA 580.159.03 |
-| Mooncake Python package | 0.3.11.post1 |
-| Model | Qwen3-VL-8B-Instruct |
-
-Real multimodal serving additionally requires the artifact-compatible vLLM,
-Transformers, and `qwen-vl-utils` versions listed in `EVALUATION.md`.
-
-## Build, start, and test commands
-
-Run commands from the Mooncake repository root unless noted otherwise.
-
-### Install / build the Python environment
+语义级真实模型命令：
 
 ```bash
-python3.10 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r mooncake_epd/requirements.txt
+source /home/songbinbin/Proj/Proj_LWX/venv_mooncake/bin/activate
+cd /home/songbinbin/Proj/Proj_LWX/mooncake_epd
+PYTHONPATH=/home/songbinbin/Proj/Proj_LWX python scripts/run_omni_stage_transfer_e2e.py \
+  --model /home/songbinbin/Qwen2.5-Omni-7B \
+  --stage-devices cuda:0 cuda:1 cuda:2 \
+  --transport-backend shm \
+  --protocol local \
+  --dtype bf16 \
+  --runtime thread \
+  --stage-impl semantic \
+  --dataset-root /home/songbinbin/Proj/Proj_LWX/mooncake_test_dataset \
+  --dataset-jsonl chat_splits/dev-small.jsonl \
+  --limit 1 \
+  --thinker-max-new-tokens 8 \
+  --talker-max-new-tokens 24 \
+  --token2wav-num-steps 1 \
+  --output artifacts/qwen25_omni_stage_transfer_dataset_e2e_shm_semantic_20260709.json
 ```
 
-`mooncake_epd` is a Python module inside this repository. For local development and tests, use `PYTHONPATH=$PWD` from the repository root.
+本机结果：`status=ok`，`AR->Generation` 与 `Generation->Diffusion` 均为 `backend_counts.shm`、`fallback_count=0`；语义质量断言包含 non-empty text、talker codes、non-zero waveform。
 
-### Generate vLLM/Mooncake launch scripts
+进程隔离 SHM 命令：
 
 ```bash
-export PYTHONPATH=$PWD
-export MOONCAKE_EPD_VENV_ROOT="${MOONCAKE_EPD_VENV_ROOT:-$VIRTUAL_ENV}"
-export MOONCAKE_EPD_MODEL="${MOONCAKE_EPD_MODEL:-models/Qwen3-VL-8B-Instruct}"
-python mooncake_epd/demo/vllm_integration.py
+PYTHONPATH=/home/songbinbin/Proj/Proj_LWX python scripts/run_omni_stage_transfer_e2e.py \
+  --runtime process \
+  --process-start-method fork \
+  --stage-impl dataset_tensor \
+  --transport-backend shm \
+  --protocol local \
+  --dataset-root /home/songbinbin/Proj/Proj_LWX/mooncake_test_dataset \
+  --dataset-jsonl chat_splits/dev-small.jsonl \
+  --limit 3 \
+  --output artifacts/qwen25_omni_stage_transfer_dataset_e2e_shm_process_dataset_tensor_20260709.json
 ```
 
-This generates or refreshes scripts under `mooncake_epd/config/` for metadata, master, Prefill, Decode, and proxy processes.
-
-### Start vLLM EPD services
-
-```bash
-bash mooncake_epd/scripts/start_vllm_disagg.sh
-```
-
-The command above regenerates the local configuration and prints the startup
-order. Start each generated process in its own terminal:
-
-```bash
-bash mooncake_epd/config/start_metadata.sh
-bash mooncake_epd/config/start_master.sh
-bash mooncake_epd/config/start_prefill.sh
-bash mooncake_epd/config/start_decode.sh
-bash mooncake_epd/config/start_proxy.sh
-```
-
-For Store API or standalone Store integration, use
-`mooncake_epd/scripts/start_mooncake.sh` instead of separately starting the
-generated metadata and master processes. Do not start both variants on the
-same ports. The real EPD benchmark artifacts used the self-contained strict
-runners `scripts/run_real_qwenvl_epd_demo.py` and
-`scripts/run_vllm_online_direct_e2e.py`.
-
-### Run regression tests
-
-```bash
-PYTHONPATH=$PWD \
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-MOONCAKE_EPD_ENABLE_VLLM_PATCHES=0 \
-python -m pytest -q mooncake_epd/tests
-
-PYTHONPATH=$PWD/mooncake-wheel \
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-python -m pytest -q mooncake-wheel/tests/test_mooncake_store_service_api.py
-```
-
-Current local verification: EPD `371 passed, 1 skipped`; Mooncake Store API
-`72 passed`.
-
-### Check real artifact gates
-
-On the evaluation host where raw `/tmp` artifacts are present:
-
-```bash
-export ARTIFACT_ROOT="${ARTIFACT_ROOT:-.epd-eval}"
-export SERVING_SUMMARY="$ARTIFACT_ROOT/real-multimodal-epd/online_direct_e2e_summary.json"
-export AGENT_CLONE_SUMMARY="$ARTIFACT_ROOT/agent_state_clone.json"
-
-PYTHONPATH=$PWD python mooncake_epd/scripts/check_real_epd_gate.py \
-  --summary "$SERVING_SUMMARY" \
-  --json
-
-PYTHONPATH=$PWD python mooncake_epd/scripts/check_epd_artifact_gates.py \
-  --serving-summary "$SERVING_SUMMARY" \
-  --agent-clone-summary "$AGENT_CLONE_SUMMARY"
-```
-
-Recorded gate results: `{"ok": true}` and `{"ok": true, "failures": []}`.
-
-## Results summary
-
-### Real multimodal EPD serving
-
-Source: [`artifacts/2026-07-10/benchmark_summary.json`](artifacts/2026-07-10/benchmark_summary.json).
-
-| Metric | Value |
-| --- | ---: |
-| Model | Qwen3-VL-8B-Instruct |
-| Topology | 1 Encoder + 1 Prefill + 2 Decode GPUs |
-| Transport | Mooncake direct peer-buffer over TCP |
-| Measured requests | 16 |
-| HTTP 200 responses | 16/16 |
-| Request throughput | 8.143 RPS |
-| Output throughput | 232.08 tok/s |
-| Mean latency | 953.08 ms |
-| Mean TTFT | 288.82 ms |
-| p95 TTFT | 344.01 ms |
-| P→D peer-buffer batches | 46 |
-| Transfer fallback batches | 0 |
-| Layered transfer failures | 0 |
-| Layered receive failures | 0 |
-
-### Scale-out capacity comparison
-
-Source: [`artifacts/2026-07-10/benchmark_summary.json`](artifacts/2026-07-10/benchmark_summary.json).
-
-This is a **4-GPU EPD scale-out capacity comparison against a 1-GPU colocated baseline**. It is **not** an equal-resource efficiency comparison.
-
-| Metric | 1-GPU baseline | 2P2D EPD, 4 GPUs | Change |
-| --- | ---: | ---: | ---: |
-| Request throughput | 2.580 RPS | 3.685 RPS | +42.8% |
-| Output throughput | 74.83 tok/s | 108.24 tok/s | +44.6% |
-| Mean latency | 2917.69 ms | 2143.09 ms | -26.5% |
-| Mean TTFT | 1271.71 ms | 1413.93 ms | +11.2% |
-| p95 TTFT | 2006.39 ms | 1481.26 ms | -26.2% |
-| P→D fallback / failure | N/A | 0 / 0 | pass |
-
-### Agent state clone
-
-Source: [`artifacts/2026-07-10/benchmark_summary.json`](artifacts/2026-07-10/benchmark_summary.json).
-
-| Metric | Value |
-| --- | ---: |
-| Device | CPU |
-| Pages / branches | 32 / 8 |
-| Deep-copy mean | 1.6996 ms |
-| Page-reference clone mean | 0.1694 ms |
-| Mean speedup | 10.03× |
-| Deep-copy bytes | 67,108,864 |
-| Zero-copy clone bytes | 0 |
-| CoW upper-bound bytes | 262,144 |
-| States after release | 0 |
-| Directory orphans after release | 0 |
-
-## Evaluation scope
-
-- The published comparison demonstrates EPD scale-out capacity: the 2P2D
-  deployment uses four GPUs and the colocated baseline uses one GPU.
-- Published transport measurements cover TCP direct peer-buffer and same-host
-  `nvlink_intra`. The transport abstraction also exposes SHM and RDMA selection
-  for environments with the required topology.
-- Agent clone measurements isolate descriptor/page-reference cloning and
-  release correctness. Full methodology is documented in
-  [`EVALUATION.md`](EVALUATION.md).
-
-## Key evidence files
-
-- [`DESIGN.md`](DESIGN.md) — architecture, interfaces, data flow, and lifecycle semantics.
-- [`EVALUATION.md`](EVALUATION.md) — environment, methodology, baseline, metrics, and conclusions.
-- [`artifacts/2026-07-10/benchmark_summary.json`](artifacts/2026-07-10/benchmark_summary.json) — compact public claim record with source digests.
-- [`tests/`](tests/) — regression coverage for connectors, control plane, direct buffers, and artifact gates.
+进程模式使用 CPU SHM 作为可靠验证面。不要用 fork 继承已加载 CUDA 大模型做生产承诺；完整语义级 CUDA 模型路径当前使用单进程多 worker-thread + sharded modules，避免 CUDA fork 风险。

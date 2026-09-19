@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import builtins
 import threading
 import time
 from types import SimpleNamespace
@@ -10,7 +11,9 @@ import torch
 from mooncake_epd.core.state.omni_hidden_prefix_cache import (
     OmniHiddenPrefixCache,
     OmniHiddenPrefixCacheConfig,
+    get_current_omni_hidden_cache_keys,
     install_qwen2_5_omni_hidden_prefix_cache,
+    use_omni_hidden_cache_keys,
 )
 
 
@@ -133,6 +136,85 @@ def test_default_image_cache_uses_exact_batch_reuse_for_qwen25_safety():
     assert stats["partial_hit_batches"] == 0
 
 
+def test_exact_batch_stable_content_ids_avoid_full_pixel_hash(monkeypatch):
+    model = _FakeOmniThinker()
+    cache = OmniHiddenPrefixCache(
+        OmniHiddenPrefixCacheConfig(enabled=True, max_entries=16, max_bytes=1024 * 1024)
+    )
+    install_qwen2_5_omni_hidden_prefix_cache(model, cache)
+
+    def _fail_full_tensor_hash(*_args, **_kwargs):
+        raise AssertionError("stable content-ID path must not hash the full pixel tensor")
+
+    monkeypatch.setattr(cache, "_hash_tensor_into", _fail_full_tensor_hash)
+    grid = torch.tensor([[1, 2, 2], [1, 1, 2]], dtype=torch.long)
+    pixels = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+    with use_omni_hidden_cache_keys(["sha256:image-a", "sha256:image-b"]):
+        first = model.get_image_features(pixels, image_grid_thw=grid, return_dict=True).pooler_output
+    with use_omni_hidden_cache_keys(["sha256:image-a", "sha256:image-b"]):
+        second = model.get_image_features(pixels, image_grid_thw=grid, return_dict=True).pooler_output
+
+    assert model.image_calls == [6]
+    assert torch.equal(first, second)
+    stats = cache.stats
+    assert stats["stable_key_lookups"] == 2
+    assert stats["stable_key_batches"] == 2
+    assert stats["tensor_key_lookups"] == 0
+
+
+def test_stable_content_key_changes_for_identity_or_grid():
+    model = _FakeOmniThinker()
+    cache = OmniHiddenPrefixCache(
+        OmniHiddenPrefixCacheConfig(enabled=True, max_entries=16, max_bytes=1024 * 1024)
+    )
+    install_qwen2_5_omni_hidden_prefix_cache(model, cache)
+    pixels = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    grid_a = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    grid_b = torch.tensor([[2, 1, 2]], dtype=torch.long)
+
+    with use_omni_hidden_cache_keys(["sha256:a"]):
+        model.get_image_features(pixels, image_grid_thw=grid_a, return_dict=True)
+    with use_omni_hidden_cache_keys(["sha256:b"]):
+        model.get_image_features(pixels, image_grid_thw=grid_a, return_dict=True)
+    with use_omni_hidden_cache_keys(["sha256:b"]):
+        model.get_image_features(pixels, image_grid_thw=grid_b, return_dict=True)
+    with use_omni_hidden_cache_keys(["sha256:b"]):
+        model.get_image_features(pixels, image_grid_thw=grid_b, return_dict=True)
+
+    assert model.image_calls == [4, 4, 4]
+    assert cache.stats["full_miss_batches"] == 3
+    assert cache.stats["full_hit_batches"] == 1
+
+
+def test_invalid_stable_key_count_falls_back_to_full_tensor_hash():
+    model = _FakeOmniThinker()
+    cache = OmniHiddenPrefixCache(
+        OmniHiddenPrefixCacheConfig(enabled=True, max_entries=16, max_bytes=1024 * 1024)
+    )
+    install_qwen2_5_omni_hidden_prefix_cache(model, cache)
+    grid = torch.tensor([[1, 2, 2], [1, 1, 2]], dtype=torch.long)
+    pixels = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+    with use_omni_hidden_cache_keys(["only-one-key"]):
+        model.get_image_features(pixels, image_grid_thw=grid, return_dict=True)
+
+    stats = cache.stats
+    assert stats["stable_key_fallbacks"] == 1
+    assert stats["stable_key_lookups"] == 0
+    assert stats["tensor_key_lookups"] == 1
+
+
+def test_stable_key_context_is_nested_and_reset():
+    assert get_current_omni_hidden_cache_keys() is None
+    with use_omni_hidden_cache_keys(["outer"]):
+        assert get_current_omni_hidden_cache_keys() == ("outer",)
+        with use_omni_hidden_cache_keys(["inner"]):
+            assert get_current_omni_hidden_cache_keys() == ("inner",)
+        assert get_current_omni_hidden_cache_keys() == ("outer",)
+    assert get_current_omni_hidden_cache_keys() is None
+
+
 def test_install_prefix_cache_is_idempotent():
     model = _FakeOmniThinker()
     cache = _cache()
@@ -197,7 +279,40 @@ def test_metrics_path_can_be_relative_filename(tmp_path, monkeypatch):
     grid = torch.tensor([[1, 1, 2]], dtype=torch.long)
     pixels = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     model.get_image_features(pixels, image_grid_thw=grid, return_dict=True)
+    model.get_image_features(pixels, image_grid_thw=grid, return_dict=True)
 
     payload = json.loads((tmp_path / path).read_text(encoding="utf-8"))
     assert payload["kind"] == "omni_hidden_prefix_cache"
     assert payload["stores"] == 1
+    assert payload["lookup_lock_hold_p95_ms"] is not None
+    assert payload["cache_load_p95_ms"] is not None
+
+
+def test_metrics_file_write_occurs_outside_cache_lock(tmp_path, monkeypatch):
+    path = tmp_path / "omni_metrics.json"
+    cache = OmniHiddenPrefixCache(
+        OmniHiddenPrefixCacheConfig(
+            enabled=True,
+            max_entries=16,
+            max_bytes=1024 * 1024,
+            metrics_path=str(path),
+            metrics_flush_interval_s=0.0,
+        )
+    )
+    original_open = builtins.open
+    observed_lock_ownership = []
+
+    def _checked_open(*args, **kwargs):
+        if str(args[0]).startswith(str(path)):
+            observed_lock_ownership.append(cache._lock._is_owned())
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _checked_open)
+    model = _FakeOmniThinker()
+    install_qwen2_5_omni_hidden_prefix_cache(model, cache)
+    grid = torch.tensor([[1, 1, 2]], dtype=torch.long)
+    pixels = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    model.get_image_features(pixels, image_grid_thw=grid, return_dict=True)
+
+    assert observed_lock_ownership
+    assert observed_lock_ownership == [False]

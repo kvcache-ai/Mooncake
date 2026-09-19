@@ -102,6 +102,7 @@ def test_workflow_relay_commit_registers_full_path_for_future_exact_prefix_match
         state_layer=sl,
         prefill_fn=prefill_fn,
         enable_relay=True,
+        force_relay=True,
         relay_min_match_run=4,
     )
 
@@ -159,6 +160,7 @@ def test_workflow_uses_tier3_reuse_pipeline_for_approximate_reuse():
         state_layer=sl,
         prefill_fn=None,
         enable_relay=True,
+        force_relay=True,
         enable_tier3=True,
         relay_min_match_run=4,
     )
@@ -661,6 +663,156 @@ def test_reuse_pipeline_reports_relay_breakdown_for_approximate_reuse():
     assert sl.pm.stats()["total_pages"] == 0
 
 
+def test_reuse_cost_gate_falls_back_to_exact_when_predicted_gain_is_too_small():
+    sl = _make_state_layer()
+    prev_tokens = list(range(1, 9))
+    state0 = sl.register(
+        kv_refs=_build_refs(sl, prev_tokens),
+        feature_hash=None,
+        meta=StateMeta(
+            token_ids=prev_tokens,
+            workflow_id="wf-b8-cost-reject",
+            agent_id="agent-a",
+        ),
+    )
+    calls = []
+
+    def delta_prefill(delta_tokens, prefix_kv_refs=None, **kwargs):
+        del kwargs
+        calls.append((list(delta_tokens), len(prefix_kv_refs or [])))
+        return _build_refs(sl, list(delta_tokens)), None
+
+    reuse = ReusePipeline(
+        sl,
+        delta_prefill,
+        relay_threshold=0.95,
+        enable_tier2=True,
+        enable_tier3=False,
+        enable_cost_gate=True,
+        estimated_prefill_ms_per_token=0.05,
+        min_net_benefit_ms=0.5,
+    )
+    refs, _, stats = reuse.run(
+        new_tokens=[5, 6, 7, 8, 99, 100],
+        prev_tokens=prev_tokens,
+        prev_refs=state0.kv_refs,
+        workflow_id=state0.workflow_id,
+    )
+
+    assert calls == [([5, 6, 7, 8, 99, 100], 2)]
+    assert stats.cost_gate_decision == "exact_fallback"
+    assert stats.fallback_reason == "predicted_net_benefit_below_margin"
+    assert stats.predicted_reusable_tokens == 4
+    assert stats.predicted_recompute_tokens == 2
+    assert stats.predicted_net_benefit_ms is not None
+    assert stats.predicted_net_benefit_ms < 0.5
+    assert stats.tier2_reused_tokens == 0
+
+    sl.pm.release_refs(refs)
+    sl.release(state0)
+    sl.radix.clear()
+    assert sl.pm.stats()["total_pages"] == 0
+
+
+def test_reuse_cost_gate_allows_relay_when_predicted_gain_clears_margin():
+    sl = _make_state_layer()
+    prev_tokens = list(range(1, 9))
+    state0 = sl.register(
+        kv_refs=_build_refs(sl, prev_tokens),
+        feature_hash=None,
+        meta=StateMeta(
+            token_ids=prev_tokens,
+            workflow_id="wf-b8-cost-accept",
+            agent_id="agent-a",
+        ),
+    )
+
+    def delta_prefill(delta_tokens, prefix_kv_refs=None, **kwargs):
+        del prefix_kv_refs, kwargs
+        return _build_refs(sl, list(delta_tokens)), None
+
+    reuse = ReusePipeline(
+        sl,
+        delta_prefill,
+        relay_threshold=0.95,
+        enable_tier2=True,
+        enable_tier3=False,
+        enable_cost_gate=True,
+        estimated_prefill_ms_per_token=2.0,
+        min_net_benefit_ms=0.5,
+    )
+    refs, _, stats = reuse.run(
+        new_tokens=[5, 6, 7, 8, 99, 100],
+        prev_tokens=prev_tokens,
+        prev_refs=state0.kv_refs,
+        workflow_id=state0.workflow_id,
+    )
+
+    assert stats.cost_gate_decision == "relay"
+    assert stats.fallback_reason == ""
+    assert stats.predicted_net_benefit_ms is not None
+    assert stats.predicted_net_benefit_ms >= 0.5
+    assert stats.tier2_reused_tokens == 4
+    assert stats.delta_prefill_tokens == 2
+
+    sl.pm.release_refs(refs)
+    sl.release(state0)
+    sl.radix.clear()
+    assert sl.pm.stats()["total_pages"] == 0
+
+
+def test_workflow_cost_gate_without_calibration_uses_exact_fallback():
+    sl = _make_state_layer()
+
+    def prefill_fn(delta_tokens, prefix_kv_refs=None, **kwargs):
+        del kwargs
+        return list(prefix_kv_refs or []) + _build_refs(sl, list(delta_tokens)), None
+
+    wf = Workflow(
+        workflow_id="wf-b8-no-calibration",
+        agent_id="agent-x",
+        state_layer=sl,
+        prefill_fn=prefill_fn,
+        enable_relay=True,
+        relay_min_match_run=4,
+    )
+    base_tokens = list(range(10, 18))
+    base_state = sl.register(
+        kv_refs=_build_refs(sl, base_tokens),
+        feature_hash=None,
+        meta=StateMeta(
+            token_ids=base_tokens,
+            workflow_id=wf.workflow_id,
+            agent_id="agent-x",
+            step=0,
+        ),
+    )
+    wf.steps.append(
+        WorkflowStep(
+            step_index=0,
+            state=base_state,
+            added_tokens=base_tokens,
+            total_tokens=len(base_tokens),
+        )
+    )
+
+    step1 = wf.advance(
+        [14, 15, 16, 17, 50, 51, 52, 53],
+        divergence_threshold=0.95,
+    )
+
+    assert step1.approximate is False
+    assert step1.relay_stats["cost_gate_decision"] == "exact_fallback"
+    assert step1.relay_stats["fallback_reason"] == "no_calibrated_prefill_cost"
+    assert step1.state.reuse_telemetry["cost_gate_decision"] == "exact_fallback"
+    assert step1.state.reuse_telemetry["fallback_reason"] == "no_calibrated_prefill_cost"
+    assert step1.state.num_kv_tokens == len(base_tokens) + 8
+
+    wf.release()
+    sl.radix.clear()
+    assert sl.pm.stats()["total_pages"] == 0
+
+
 def test_reuse_pipeline_tier3_reuses_recomputed_partial_page_when_similarity_passes():
     sl = _make_state_layer()
     prev_tokens = list(range(1, 9))
@@ -820,3 +972,106 @@ def test_encoder_worker_reads_upstream_qwen3vl_deepstack_features():
 
     assert out.bundle.last_hidden.shape == (2, 8)
     assert [layer for layer, _ in out.bundle.intermediates] == [8, 16, 24]
+
+
+def test_encoder_worker_accepts_direct_vision_only_feature_model():
+    class _VisionOutput:
+        pooler_output = [torch.ones((3, 8))]
+        deepstack_features = [torch.full((3, 8), 2.0)]
+
+    class _VisionOnlyModel:
+        class config:
+            class vision_config:
+                deepstack_visual_indexes = [8]
+                spatial_merge_size = 2
+
+        calls = 0
+
+        @classmethod
+        def get_image_features(cls, pixel_values, image_grid_thw=None):
+            cls.calls += 1
+            del pixel_values, image_grid_thw
+            return _VisionOutput()
+
+    from mooncake_epd.core.epd_workers import EncoderWorker
+
+    worker = EncoderWorker(
+        _VisionOnlyModel(),
+        processor=None,
+        device=torch.device("cpu"),
+    )
+    output = worker.encode(
+        pixel_values=torch.randn(3, 6),
+        image_grid_thw=torch.tensor([[1, 2, 6]], dtype=torch.long),
+        image_id="vision-only",
+    )
+
+    assert _VisionOnlyModel.calls == 1
+    assert output.bundle.last_hidden.shape == (3, 8)
+    assert output.bundle.intermediates[0][0] == 8
+    assert torch.all(output.bundle.intermediates[0][1] == 2.0)
+
+
+def test_encoder_worker_encode_many_restores_per_image_feature_bundles():
+    class _VisionOutput:
+        def __init__(self, split_sizes):
+            self.pooler_output = [
+                torch.full((rows, 8), float(index + 1))
+                for index, rows in enumerate(split_sizes)
+            ]
+            total = sum(split_sizes)
+            self.deepstack_features = [
+                torch.arange(total * 8, dtype=torch.float32).reshape(total, 8),
+                torch.arange(total * 8, dtype=torch.float32).reshape(total, 8) + 100,
+            ]
+
+    class _VisionModel:
+        class config:
+            class vision_config:
+                deepstack_visual_indexes = [8, 16]
+                spatial_merge_size = 2
+
+        class model:
+            calls = 0
+
+            @classmethod
+            def get_image_features(cls, pixel_values, image_grid_thw=None):
+                cls.calls += 1
+                del pixel_values
+                split_sizes = [
+                    int(row.prod().item()) // 4 for row in image_grid_thw
+                ]
+                return _VisionOutput(split_sizes)
+
+    from mooncake_epd.core.epd_workers import EncoderWorker
+
+    worker = EncoderWorker(_VisionModel(), processor=None, device=torch.device("cpu"))
+    outputs = worker.encode_many(
+        [
+            (
+                torch.randn(4, 6),
+                torch.tensor([[1, 4, 4]], dtype=torch.long),
+                "image-a",
+            ),
+            (
+                torch.randn(9, 6),
+                torch.tensor([[1, 6, 6]], dtype=torch.long),
+                "image-b",
+            ),
+        ]
+    )
+
+    assert _VisionModel.model.calls == 1
+    assert [output.image_id for output in outputs] == ["image-a", "image-b"]
+    assert [tuple(output.bundle.last_hidden.shape) for output in outputs] == [
+        (4, 8),
+        (9, 8),
+    ]
+    assert [output.bundle.grid_thw.tolist() for output in outputs] == [
+        [[1, 4, 4]],
+        [[1, 6, 6]],
+    ]
+    assert outputs[0].bundle.metadata["split_sizes"] == [4]
+    assert outputs[1].bundle.metadata["split_sizes"] == [9]
+    assert outputs[0].bundle.metadata["dynamic_batch_size"] == 2
+    assert outputs[1].bundle.intermediates[0][1].shape == (9, 8)

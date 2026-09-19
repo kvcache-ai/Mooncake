@@ -14,66 +14,22 @@ import sys
 import time
 import json
 import logging
-import argparse
-from pathlib import Path
 from typing import Dict, Any, Optional
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+import torch
+import numpy as np
 
-torch = None
-np = None
-MooncakeTransferWrapper = None
-create_encoder_worker = None
-create_prefill_worker = None
-create_decode_worker = None
-EPDPipeline = None
-AgentStateCloner = None
-AgentPDScheduler = None
-AgentRequest = None
-AgentType = None
-HiddenStatePrefixCache = None
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-
-def _ensure_demo_dependencies():
-    global torch, np
-    global MooncakeTransferWrapper, create_encoder_worker, create_prefill_worker
-    global create_decode_worker, EPDPipeline
-    global AgentStateCloner, AgentPDScheduler, AgentRequest, AgentType, HiddenStatePrefixCache
-    if torch is not None:
-        return
-    import torch as _torch
-    import numpy as _np
-    from mooncake_epd.core import (
-        MooncakeTransferWrapper as _MooncakeTransferWrapper,
-        create_encoder_worker as _create_encoder_worker,
-        create_prefill_worker as _create_prefill_worker,
-        create_decode_worker as _create_decode_worker,
-        EPDPipeline as _EPDPipeline,
-    )
-    from mooncake_epd.agent import (
-        AgentPDScheduler as _AgentPDScheduler,
-        AgentRequest as _AgentRequest,
-        AgentStateCloner as _AgentStateCloner,
-        AgentType as _AgentType,
-    )
-    from mooncake_epd.agent.prefix_cache import (
-        HiddenStatePrefixCache as _HiddenStatePrefixCache,
-    )
-
-    torch = _torch
-    np = _np
-    MooncakeTransferWrapper = _MooncakeTransferWrapper
-    create_encoder_worker = _create_encoder_worker
-    create_prefill_worker = _create_prefill_worker
-    create_decode_worker = _create_decode_worker
-    EPDPipeline = _EPDPipeline
-    AgentStateCloner = _AgentStateCloner
-    AgentPDScheduler = _AgentPDScheduler
-    AgentRequest = _AgentRequest
-    AgentType = _AgentType
-    HiddenStatePrefixCache = _HiddenStatePrefixCache
+from core import (
+    MooncakeTransferWrapper,
+    create_encoder_worker,
+    create_prefill_worker,
+    create_decode_worker,
+    EPDPipeline,
+)
+from agent import AgentStateCloner, AgentPDScheduler, AgentRequest, AgentType
+from agent.prefix_cache import HiddenStatePrefixCache
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +53,6 @@ class Qwen3VLEPDDemo:
         prefill_device: str = "cuda:1",
         decode_device: str = "cuda:2",
     ):
-        _ensure_demo_dependencies()
         self.model_name = model_name
         self.use_mock = use_mock
 
@@ -424,33 +379,6 @@ def main():
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
-    parser = argparse.ArgumentParser(
-        description=(
-            "Legacy mock EPD smoke demo. For the real vLLM/Qwen-VL hot path use "
-            "mooncake_epd/scripts/run_real_qwenvl_epd_demo.py."
-        )
-    )
-    parser.add_argument(
-        "--mock",
-        action="store_true",
-        help="Run the old mock-only smoke demo explicitly.",
-    )
-    args = parser.parse_args()
-
-    if not args.mock:
-        print(
-            json.dumps(
-                {
-                    "status": "not_run",
-                    "reason": "mock demo is no longer the default real EPD demo",
-                    "real_demo_command": "python mooncake_epd/scripts/run_real_qwenvl_epd_demo.py --model /path/to/Qwen-VL --encoder-device cuda:0 --prefill-gpu 1 --decode-gpu 2",
-                    "mock_smoke_command": "python mooncake_epd/demo/run_qwenvl_epd.py --mock",
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        return
 
     demo = Qwen3VLEPDDemo(use_mock=True)
     demo.run_all_demos()

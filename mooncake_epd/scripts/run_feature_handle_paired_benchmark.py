@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import os
 import statistics
 import subprocess
 import sys
@@ -34,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT.parent))
 
-from mooncake_epd.demo.vllm_integration import VLLMDisaggConfig, generate_configs  # noqa: E402
+from mooncake_epd.demo.vllm_integration import MODEL_PATH, VLLMDisaggConfig, generate_configs  # noqa: E402
 from mooncake_epd.scripts.run_vllm_feature_handle_e2e import (  # noqa: E402
     summarize_feature_handle_metrics,
 )
@@ -121,16 +120,7 @@ def _start_stack(args: argparse.Namespace, *, mode: str, workdir: Path) -> Dict[
         decode_gpu=int(args.decode_gpu),
         gpu_memory_utilization=float(args.gpu_memory_utilization),
         max_model_len=int(args.max_model_len),
-        strict_no_fallback=(mode == "feature_handle" and bool(args.strict_no_fallback)),
-        feature_handle_store_url=(
-            args.mooncake_store_url
-            or os.getenv("MOONCAKE_EPD_FEATURE_HANDLE_STORE_URL")
-            or os.getenv("MOONCAKE_STORE_URL")
-        ),
-        feature_handle_store_id=args.mooncake_store_id,
-        feature_handle_store_config=args.mooncake_config,
-        feature_handle_store_timeout_s=float(args.mooncake_timeout_s),
-        feature_handle_require_checksum=bool(args.require_checksum),
+        strict_no_fallback=True,
     )
     files = generate_configs(str(workdir), cfg)
     ports = {
@@ -377,10 +367,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--workdir", default="/tmp/mooncake_epd_feature_handle_paired")
     ap.add_argument("--output", default=None)
     ap.add_argument("--request", required=True, help="FeatureHandle-backed OpenAI request JSON.")
-    ap.add_argument(
-        "--model",
-        default=os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct"),
-    )
+    ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--local-hostname", default="127.0.0.1")
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--request-timeout", type=float, default=300.0)
@@ -389,17 +376,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.65)
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--max-group-bytes", type=int, default=16 * 1024 * 1024)
-    ap.add_argument("--max-transfer-descriptors", type=int, default=128)
+    ap.add_argument("--max-transfer-descriptors", type=int, default=64)
     ap.add_argument("--max-transfer-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--owner-shards", type=int, default=1)
     ap.add_argument("--kv-directory-rpc-url", default=None)
     ap.add_argument("--between-mode-sleep-s", type=float, default=8.0)
-    ap.add_argument("--mooncake-store-url", default=None)
-    ap.add_argument("--mooncake-store-id", default=None)
-    ap.add_argument("--mooncake-config", default=None)
-    ap.add_argument("--mooncake-timeout-s", type=float, default=30.0)
-    ap.add_argument("--require-checksum", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--strict-no-fallback", action=argparse.BooleanOptionalAction, default=True)
     return ap.parse_args()
 
 

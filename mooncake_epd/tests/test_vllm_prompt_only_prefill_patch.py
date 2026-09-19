@@ -4,10 +4,6 @@ import pytest
 
 pytest.importorskip("vllm")
 
-import sitecustomize  # noqa: E402
-
-sitecustomize._patch_vllm_prompt_only_prefill()
-
 from vllm.sampling_params import SamplingParams  # noqa: E402
 
 

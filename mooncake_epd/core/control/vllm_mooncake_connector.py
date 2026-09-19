@@ -8,9 +8,8 @@ three production-facing directions:
    ``wait_for_layer_load`` / ``save_kv_layer`` hooks;
 3. expose grouped-transfer worker metadata for observability.
 
-When a Decode pull arrives while Prefill is still executing, the layered path
-below avoids waiting for every request in that pull batch before it can send
-the first ready KV group. The producer:
+Unlike the earlier repo version, the layered path below does not wait until
+prefill fully finishes before pushing all descriptors. The producer now:
 
 - learns request block ids during ``update_state_after_alloc``;
 - marks layer groups ready from ``save_kv_layer`` as the forward progresses;
@@ -22,6 +21,8 @@ the first ready KV group. The producer:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import math
 import os
 import threading
@@ -61,8 +62,11 @@ from vllm.v1.request import RequestStatus
 from .vllm_transfer_primitives import (
     LayeredTransferWorkerMeta,
     chunk_transfer_descriptors,
+    coalesce_transfer_descriptors,
+    is_retryable_transfer_failure,
 )
 from .connector_metrics import ConnectorMetricsSink
+from .vllm_incarnation import VLLM_PROCESS_INCARNATION
 from ..transfer import TransferEngine as PeerTransferEngine
 
 if TYPE_CHECKING:
@@ -83,9 +87,6 @@ class _TransferDispatchResult:
     backend_label: str
     used_fallback: bool = False
     error_message: str | None = None
-    dispatch_ms: float = 0.0
-    prepare_ms: float = 0.0
-    write_ms: float = 0.0
 
 
 @dataclass
@@ -95,15 +96,6 @@ class _LayeredSendState:
     group_ready_events: list[threading.Event]
     announced_groups: set[int] = field(default_factory=set)
     failed: str | None = None
-    highest_announced_group: int = -1
-    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
-    # ``save_kv_layer`` may run outside the sender loop.  Keep a loop-local
-    # async event mirror so ready callbacks wake coroutines directly instead of
-    # consuming a default-executor thread for every pending request/group.
-    _async_group_events: dict[int, tuple[asyncio.AbstractEventLoop, list[asyncio.Event]]] = field(
-        default_factory=dict,
-        repr=False,
-    )
 
     @classmethod
     def create(cls, transfer_id: str, total_groups: int) -> "_LayeredSendState":
@@ -114,80 +106,14 @@ class _LayeredSendState:
         )
 
     def mark_group_ready(self, group_idx: int) -> None:
-        with self._lock:
-            if group_idx < 0 or group_idx >= len(self.group_ready_events):
-                return
-            if not self.group_ready_events[group_idx].is_set():
-                self.group_ready_events[group_idx].set()
-                self._wake_async_group_locked(group_idx)
+        if 0 <= group_idx < len(self.group_ready_events):
+            self.group_ready_events[group_idx].set()
             self.announced_groups.add(group_idx)
-            self.highest_announced_group = max(self.highest_announced_group, group_idx)
-
-    def mark_groups_ready_through(self, group_idx: int, *, floor: int = 0) -> None:
-        """Mark a contiguous ready range and wake async waiters once per group."""
-
-        with self._lock:
-            stop = min(len(self.group_ready_events) - 1, int(group_idx))
-            start = max(0, int(floor), self.highest_announced_group + 1)
-            if stop < start:
-                return
-            for ready_group_idx in range(start, stop + 1):
-                self.group_ready_events[ready_group_idx].set()
-                self.announced_groups.add(ready_group_idx)
-                self._wake_async_group_locked(ready_group_idx)
-            self.highest_announced_group = max(self.highest_announced_group, stop)
-
-    def async_group_event(
-        self,
-        group_idx: int,
-        loop: asyncio.AbstractEventLoop,
-    ) -> asyncio.Event:
-        """Return a sender-loop event mirrored from the thread-safe state."""
-
-        if group_idx < 0 or group_idx >= len(self.group_ready_events):
-            raise IndexError(f"layered KV group out of range: {group_idx}")
-        with self._lock:
-            loop_key = id(loop)
-            entry = self._async_group_events.get(loop_key)
-            if entry is None or entry[0] is not loop:
-                entry = (loop, [asyncio.Event() for _ in self.group_ready_events])
-                self._async_group_events[loop_key] = entry
-            event = entry[1][group_idx]
-            # This method is invoked by the owning sender loop, so setting the
-            # event inline is safe and avoids a needless loop turn for already
-            # completed Prefill requests.
-            if self.failed is not None or self.group_ready_events[group_idx].is_set():
-                event.set()
-            return event
-
-    def _wake_async_group_locked(self, group_idx: int) -> None:
-        stale: list[int] = []
-        for loop_key, (loop, events) in self._async_group_events.items():
-            if loop.is_closed():
-                stale.append(loop_key)
-                continue
-            if 0 <= group_idx < len(events):
-                loop.call_soon_threadsafe(events[group_idx].set)
-        for loop_key in stale:
-            self._async_group_events.pop(loop_key, None)
-
-    def _wake_all_async_locked(self) -> None:
-        stale: list[int] = []
-        for loop_key, (loop, events) in self._async_group_events.items():
-            if loop.is_closed():
-                stale.append(loop_key)
-                continue
-            for event in events:
-                loop.call_soon_threadsafe(event.set)
-        for loop_key in stale:
-            self._async_group_events.pop(loop_key, None)
 
     def fail(self, message: str) -> None:
-        with self._lock:
-            self.failed = str(message)
-            for event in self.group_ready_events:
-                event.set()
-            self._wake_all_async_locked()
+        self.failed = str(message)
+        for event in self.group_ready_events:
+            event.set()
 
 
 @dataclass
@@ -199,9 +125,6 @@ class _LayeredReceiveState:
     group_events: list[threading.Event]
     remaining_by_group: list[int]
     failure: str | None = None
-    started_at: float | None = None
-    first_group_at: float | None = None
-    finished_at: float | None = None
 
     @classmethod
     def create(
@@ -250,43 +173,14 @@ class _LayeredReceiveState:
         self.group_events = new_events
         self.remaining_by_group = new_remaining
 
-    def mark_started(self, now: float | None = None) -> bool:
-        if self.started_at is not None:
-            return False
-        self.started_at = time.perf_counter() if now is None else float(now)
-        return True
-
-    def ack_group(self, group_idx: int, now: float | None = None) -> bool:
+    def ack_group(self, group_idx: int) -> None:
         if self.failure is not None:
-            return False
+            return
         if group_idx < 0 or group_idx >= self.total_groups:
-            return False
-        was_set = self.group_events[group_idx].is_set()
+            return
         self.remaining_by_group[group_idx] = max(0, self.remaining_by_group[group_idx] - 1)
         if self.remaining_by_group[group_idx] == 0:
             self.group_events[group_idx].set()
-            if not was_set:
-                event_time = time.perf_counter() if now is None else float(now)
-                if self.first_group_at is None:
-                    self.first_group_at = event_time
-                    return True
-        return False
-
-    def mark_finished_if_complete(self, now: float | None = None) -> bool:
-        if self.finished_at is not None or not self.complete():
-            return False
-        self.finished_at = time.perf_counter() if now is None else float(now)
-        return True
-
-    def first_group_latency_ms(self) -> float:
-        if self.started_at is None or self.first_group_at is None:
-            return 0.0
-        return max(0.0, (self.first_group_at - self.started_at) * 1000.0)
-
-    def finished_latency_ms(self) -> float:
-        if self.started_at is None or self.finished_at is None:
-            return 0.0
-        return max(0.0, (self.finished_at - self.started_at) * 1000.0)
 
     def fail(self, message: str) -> None:
         self.failure = str(message)
@@ -433,10 +327,30 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
             self.layered_kv_transfer
             and params.get("do_remote_decode")
             and not self.is_kv_consumer
-            and hasattr(blocks, "get_unhashed_block_ids_all_groups")
         ):
+            # The Decode engine owns a distinct KV cache and can allocate the
+            # full prompt even when Prefill reuses hashed prefix-cache blocks.
+            # Sending only Prefill's unhashed suffix makes the producer expose
+            # fewer blocks than Decode requested (for example 1 vs 64), which
+            # is fatal inside vLLM's connector path.  All allocated Prefill
+            # blocks already contain valid KV, so transfer the complete set.
+            if hasattr(blocks, "blocks"):
+                allocated_block_ids = tuple(
+                    [
+                        block.block_id
+                        for block in group
+                        if not bool(getattr(block, "is_null", False))
+                    ]
+                    for group in blocks.blocks
+                )
+            elif hasattr(blocks, "get_block_ids"):
+                allocated_block_ids = blocks.get_block_ids()
+            elif hasattr(blocks, "get_unhashed_block_ids_all_groups"):
+                allocated_block_ids = blocks.get_unhashed_block_ids_all_groups()
+            else:
+                allocated_block_ids = ()
             local_block_ids = self.get_sw_clipped_blocks(
-                blocks.get_unhashed_block_ids_all_groups()
+                allocated_block_ids or ()
             )
             self._reqs_need_send[request.request_id] = (request, local_block_ids)
         return result
@@ -449,6 +363,11 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
         params = dict(getattr(request, "kv_transfer_params", None) or {})
         delay_free_blocks, upstream_params = super().request_finished(request, block_ids)
         if upstream_params is not None:
+            upstream_params = dict(upstream_params)
+            if upstream_params.get("do_remote_prefill"):
+                upstream_params.setdefault(
+                    "remote_engine_incarnation", VLLM_PROCESS_INCARNATION
+                )
             return delay_free_blocks, upstream_params
         if not params or not params.get("transfer_id"):
             return delay_free_blocks, None
@@ -463,6 +382,7 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
             "do_remote_decode": False,
             "remote_block_ids": self.get_sw_clipped_blocks(block_ids),
             "remote_engine_id": self.engine_id,
+            "remote_engine_incarnation": VLLM_PROCESS_INCARNATION,
             "remote_bootstrap_addr": self.remote_bootstrap_addr,
             "tp_size": self.tp_size,
             "transfer_id": params["transfer_id"],
@@ -473,6 +393,7 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
         meta = MooncakeConnectorMetadata()
         request_routing_paths: dict[str, str] = {}
         transfer_routing_paths: dict[str, str] = {}
+        remote_engine_incarnations: dict[str, str] = {}
 
         if not self.is_kv_producer:
             for req_id, (req, block_ids) in self._reqs_need_recv.items():
@@ -483,6 +404,19 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
                     local_block_ids=block_ids,
                     kv_transfer_params=params,
                 )
+                remote_engine_id = str(params.get("remote_engine_id") or "").strip()
+                remote_engine_incarnation = str(
+                    params.get("remote_engine_incarnation") or ""
+                ).strip()
+                if remote_engine_id and remote_engine_incarnation:
+                    previous = remote_engine_incarnations.setdefault(
+                        remote_engine_id, remote_engine_incarnation
+                    )
+                    if previous != remote_engine_incarnation:
+                        raise RuntimeError(
+                            "conflicting process incarnations for remote engine "
+                            f"{remote_engine_id!r} in one connector metadata batch"
+                        )
                 routing_path = str(params.get("routing_path") or "UNKNOWN").strip().upper() or "UNKNOWN"
                 request_routing_paths[str(req_id)] = routing_path
                 transfer_routing_paths[str(params["transfer_id"])] = routing_path
@@ -507,6 +441,7 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
 
         meta.request_routing_paths = request_routing_paths
         meta.transfer_routing_paths = transfer_routing_paths
+        meta.remote_engine_incarnations = remote_engine_incarnations
         return meta
 
 
@@ -633,17 +568,30 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         self.layered_kv_transfer = bool(extra.get("layered_kv_transfer", False))
         self.mooncake_protocol = protocol or str(os.getenv("MOONCAKE_PROTOCOL", "tcp"))
+        self.transport_backend = str(
+            extra.get("transport_backend", "mooncake_engine_direct")
+        )
         self.layers_per_group = max(1, int(extra.get("layers_per_group", 4)))
         self.group_delay_ms = max(0.0, float(extra.get("group_delay_ms", 0.0)))
         self.max_group_bytes = max(0, int(extra.get("max_group_bytes", 0) or 0))
+        backend_key = self.transport_backend.strip().lower()
+        default_max_transfer_descriptors = (
+            128
+            if protocol == "rdma"
+            or backend_key in {"rdmacm", "rdmacm_staged", "iwarp"}
+            else 64
+        )
         self.max_transfer_descriptors = max(
             1,
             int(
                 extra.get(
                     "max_transfer_descriptors",
-                    os.getenv("MOONCAKE_EPD_MAX_TRANSFER_DESCRIPTORS", 128),
+                    os.getenv(
+                        "MOONCAKE_EPD_MAX_TRANSFER_DESCRIPTORS",
+                        default_max_transfer_descriptors,
+                    ),
                 )
-                or 128
+                or default_max_transfer_descriptors
             ),
         )
         self.max_transfer_bytes = max(
@@ -656,7 +604,30 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 or 0
             ),
         )
-        self.transport_backend = str(extra.get("transport_backend", "mooncake_engine_direct"))
+        self.enable_descriptor_coalescing = str(
+            extra.get(
+                "enable_descriptor_coalescing",
+                os.getenv("MOONCAKE_EPD_ENABLE_DESCRIPTOR_COALESCING", "1"),
+            )
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.rdmacm_bind_address = str(
+            extra.get(
+                "rdmacm_bind_address",
+                os.getenv("MOONCAKE_EPD_RDMACM_BIND_ADDRESS", ""),
+            )
+        ).strip()
+        self.rdmacm_remote_address = str(
+            extra.get(
+                "rdmacm_remote_address",
+                os.getenv("MOONCAKE_EPD_RDMACM_REMOTE_ADDRESS", ""),
+            )
+        ).strip()
+        self.rdmacm_port_offset = int(
+            extra.get(
+                "rdmacm_port_offset",
+                os.getenv("MOONCAKE_EPD_RDMACM_PORT_OFFSET", 2711),
+            )
+        )
         self.allow_transfer_fallback = str(
             extra.get(
                 "allow_transfer_fallback",
@@ -708,30 +679,29 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 os.getenv("MOONCAKE_EPD_CONNECTOR_METRICS_DIR", ""),
             )
         ).strip()
-        connector_metrics_flush_interval_ms = max(
+        connector_metrics_flush_interval_s = max(
             0.0,
             float(
                 extra.get(
-                    "connector_metrics_flush_interval_ms",
-                    os.getenv(
-                        "MOONCAKE_EPD_CONNECTOR_METRICS_FLUSH_INTERVAL_MS",
-                        250.0,
-                    ),
+                    "connector_metrics_flush_interval_s",
+                    os.getenv("MOONCAKE_EPD_CONNECTOR_METRICS_FLUSH_INTERVAL_S", 0.25),
                 )
                 or 0.0
             ),
         )
-        self._connector_metrics_flush_interval_s = (
-            connector_metrics_flush_interval_ms / 1000.0
+        connector_metrics_max_pending_records = max(
+            1,
+            int(
+                extra.get(
+                    "connector_metrics_max_pending_records",
+                    os.getenv("MOONCAKE_EPD_CONNECTOR_METRICS_MAX_PENDING", 64),
+                )
+                or 1
+            ),
         )
-        # Do not move every layered-KV group through the cross-process metrics
-        # sink. The counters remain in a bounded in-memory aggregate and are
-        # persisted on a timer or at a terminal request boundary.
-        self._connector_metrics_next_publish_monotonic = 0.0
         self._worker_meta = LayeredTransferWorkerMeta()
         self._connector_metrics_pending = LayeredTransferWorkerMeta()
         self._connector_metrics_pending_by_path: dict[str, LayeredTransferWorkerMeta] = {}
-        self._connector_metrics_lock = threading.RLock()
         self._connector_metrics_sink = ConnectorMetricsSink(
             connector_metrics_dir or None,
             engine_id=self.engine_id,
@@ -739,14 +709,18 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             hostname=getattr(self, "hostname", ""),
             rpc_port=getattr(self, "rpc_port", None),
             tp_rank=getattr(self, "tp_rank", None),
-            flush_interval_s=self._connector_metrics_flush_interval_s,
+            flush_interval_s=connector_metrics_flush_interval_s,
+            max_pending_records=connector_metrics_max_pending_records,
         )
         self._peer_transfer_engine: PeerTransferEngine | None = None
+        self._rdmacm_transfer_engine: PeerTransferEngine | None = None
         self._registered_region_count = 1
         self._send_request_routing_paths: dict[str, str] = {}
         self._send_transfer_routing_paths: dict[str, str] = {}
         self._recv_request_routing_paths: dict[str, str] = {}
         self._recv_transfer_routing_paths: dict[str, str] = {}
+        self._remote_engine_incarnations: dict[str, str] = {}
+        self._remote_incarnation_lock = asyncio.Lock()
         self._layer_names: list[str] = []
         self._layer_base_counts: list[int] = []
         self._layer_to_index: dict[str, int] = {}
@@ -863,14 +837,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 self._layered_recv_states[req_id]
                 for req_id in req_ids
                 if req_id in self._layered_recv_states
-                # vLLM reaps a finished receive state later through
-                # get_finished(). Until then it must not be polled once per
-                # Decode layer/token. Failed states remain visible so the
-                # failure still aborts the forward path.
-                and (
-                    self._layered_recv_states[req_id].failure is not None
-                    or self._layered_recv_states[req_id].finished_at is None
-                )
             ]
         return states
 
@@ -916,23 +882,8 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             state.mark_group_ready(group_idx)
 
     def _mark_ready_groups_up_to(self, group_idx: int) -> None:
-        with self._layered_send_lock:
-            active_transfer_ids = set(
-                getattr(self, "_current_send_transfer_ids", set()) or set()
-            )
-            if active_transfer_ids:
-                states = [
-                    state
-                    for transfer_id, state in self._layered_send_states.items()
-                    if transfer_id in active_transfer_ids
-                ]
-            else:
-                states = list(self._layered_send_states.values())
-        for state in states:
-            # Each state remembers its highest completed group. This preserves
-            # the conservative earlier-group guarantee while avoiding the
-            # previous O(groups^2 * active_transfers) repeated event scans.
-            state.mark_groups_ready_through(group_idx)
+        for ready_group_idx in range(0, max(0, int(group_idx)) + 1):
+            self._mark_group_ready(ready_group_idx)
 
     def _fail_all_send_states(self, message: str) -> None:
         with self._layered_send_lock:
@@ -1021,8 +972,63 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         self._collect_layer_base_counts(kv_caches)
         super().register_kv_caches(kv_caches)
         self._rebuild_layer_group_mappings()
+        if (
+            self.transport_backend.strip().lower()
+            in {"rdmacm", "rdmacm_staged", "iwarp"}
+            and self.is_kv_consumer
+        ):
+            engine = self._get_rdmacm_transfer_engine()
+            server = engine.start_rdmacm_server(
+                bind_address=self.rdmacm_bind_address,
+                port=self._rdmacm_port(self.rpc_port),
+            )
+            for base_address, block_len in zip(
+                self.kv_caches_base_addr,
+                self.block_len_per_layer,
+            ):
+                server.register_region(
+                    int(base_address),
+                    int(self.num_blocks) * int(block_len),
+                    memory_kind="cuda",
+                )
+            logger.info(
+                "EPD rdmacm staged receiver listening address=%s port=%d regions=%d",
+                server.bind_address,
+                server.port,
+                len(self.kv_caches_base_addr),
+            )
+
+    def shutdown(self):
+        with contextlib.suppress(Exception):
+            self._publish_connector_metrics(force=True)
+        sink = getattr(self, "_connector_metrics_sink", None)
+        if sink is not None:
+            with contextlib.suppress(Exception):
+                sink.close()
+        rdmacm_engine = getattr(self, "_rdmacm_transfer_engine", None)
+        if rdmacm_engine is not None:
+            with contextlib.suppress(Exception):
+                rdmacm_engine.shutdown()
+            self._rdmacm_transfer_engine = None
+        return super().shutdown()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+        remote_engine_incarnations = dict(
+            getattr(metadata, "remote_engine_incarnations", {}) or {}
+        )
+        if remote_engine_incarnations:
+            for remote_engine_id, pull_metas in metadata.reqs_to_recv.items():
+                incarnation = str(
+                    remote_engine_incarnations.get(str(remote_engine_id)) or ""
+                ).strip()
+                if not incarnation:
+                    continue
+                for pull_meta in pull_metas.values():
+                    # PullReqMeta is an upstream non-slotted dataclass.  Attach
+                    # the process token before upstream schedules _start_load_kv
+                    # so the receiver event loop can fence its own topology
+                    # cache without cross-thread mutation.
+                    pull_meta.remote_engine_incarnation = incarnation
         if self.layered_kv_transfer and not self.is_kv_producer and metadata.reqs_to_recv:
             self._record_recv_routing_paths(metadata)
             with self._layered_recv_lock:
@@ -1061,14 +1067,124 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             )
         super().start_load_kv(metadata)
 
+    async def _start_load_kv(
+        self,
+        reqs_to_recv: dict[str, dict[str, PullReqMeta]],
+    ):
+        remote_engine_incarnations: dict[str, str] = {}
+        remote_bootstrap_addrs: dict[str, str] = {}
+        for remote_engine_id, pull_metas in reqs_to_recv.items():
+            incarnations = {
+                str(getattr(pull_meta, "remote_engine_incarnation", "") or "").strip()
+                for pull_meta in pull_metas.values()
+            }
+            incarnations.discard("")
+            if len(incarnations) > 1:
+                raise RuntimeError(
+                    "conflicting process incarnations for remote engine "
+                    f"{remote_engine_id!r} in one receive batch"
+                )
+            if incarnations:
+                remote_engine_incarnations[str(remote_engine_id)] = incarnations.pop()
+            if pull_metas:
+                remote_bootstrap_addrs[str(remote_engine_id)] = str(
+                    next(iter(pull_metas.values())).remote_bootstrap_addr
+                ).rstrip("/")
+
+        await self._fence_remote_engine_incarnations(
+            remote_engine_incarnations,
+            remote_bootstrap_addrs,
+        )
+        await super()._start_load_kv(reqs_to_recv)
+
+    async def _fence_remote_engine_incarnations(
+        self,
+        remote_engine_incarnations: dict[str, str],
+        remote_bootstrap_addrs: dict[str, str],
+    ) -> list[str]:
+        """Invalidate only stale Prefill bootstrap topology on its event loop.
+
+        The upstream Mooncake connector caches bootstrap worker addresses by
+        stable ``engine_id``.  A restarted Prefill intentionally keeps that
+        ID, so a long-lived Decode otherwise keeps sending ZMQ pull requests
+        to the dead process.  Process incarnation is an explicit cache epoch:
+        first observation and repeats are free; a change drains any bootstrap
+        query already in flight, removes only that engine's topology, and lets
+        upstream singleflight rediscover the new worker address.
+        """
+
+        if not remote_engine_incarnations:
+            return []
+
+        refreshed: list[str] = []
+        observations = 0
+        pending_waits = 0
+        pending_wait_ms = 0.0
+        lock = getattr(self, "_remote_incarnation_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._remote_incarnation_lock = lock
+
+        async with lock:
+            for remote_engine_id in sorted(remote_engine_incarnations):
+                incarnation = str(
+                    remote_engine_incarnations[remote_engine_id] or ""
+                ).strip()
+                if not incarnation:
+                    continue
+                observations += 1
+                previous = self._remote_engine_incarnations.get(remote_engine_id)
+                if previous is None:
+                    self._remote_engine_incarnations[remote_engine_id] = incarnation
+                    logger.info(
+                        "EPD observed Prefill topology incarnation engine=%s epoch=%s",
+                        remote_engine_id,
+                        hashlib.sha256(incarnation.encode("utf-8")).hexdigest()[:16],
+                    )
+                    continue
+                if previous == incarnation:
+                    continue
+
+                remote_bootstrap_addr = str(
+                    remote_bootstrap_addrs.get(remote_engine_id) or ""
+                ).rstrip("/")
+                pending = self._pending_bootstrap_queries.get(remote_bootstrap_addr)
+                if pending is not None:
+                    wait_started = time.perf_counter()
+                    pending_waits += 1
+                    await pending.wait()
+                    pending_wait_ms += (time.perf_counter() - wait_started) * 1000.0
+
+                had_cached_topology = remote_engine_id in self._remote_agents
+                self._remote_agents.pop(remote_engine_id, None)
+                self._tp_size.pop(remote_engine_id, None)
+                self._remote_engine_incarnations[remote_engine_id] = incarnation
+                refreshed.append(remote_engine_id)
+                logger.warning(
+                    "EPD invalidated stale Prefill topology engine=%s old_epoch=%s "
+                    "new_epoch=%s cached=%s bootstrap=%s",
+                    remote_engine_id,
+                    hashlib.sha256(previous.encode("utf-8")).hexdigest()[:16],
+                    hashlib.sha256(incarnation.encode("utf-8")).hexdigest()[:16],
+                    had_cached_topology,
+                    remote_bootstrap_addr,
+                )
+
+        self._accumulate_worker_meta(
+            LayeredTransferWorkerMeta(
+                topology_incarnation_observations=observations,
+                topology_incarnation_refreshes=len(refreshed),
+                topology_incarnation_pending_waits=pending_waits,
+                topology_incarnation_wait_ms=pending_wait_ms,
+            )
+        )
+        return refreshed
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.layered_kv_transfer or self.is_kv_producer:
             return
         group_idx = self._group_for_layer(layer_name)
         if group_idx is None:
-            return
-        states = list(self._iter_current_recv_states())
-        if not states:
             return
         start_time = time.perf_counter()
         self._trace(
@@ -1078,7 +1194,7 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             list(self._current_recv_req_ids),
         )
         try:
-            for state in states:
+            for state in self._iter_current_recv_states():
                 state.wait_group(group_idx, self.layer_load_timeout_seconds)
         finally:
             self._accumulate_worker_meta(
@@ -1141,16 +1257,19 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                             str(state.transfer_id), None
                         )
         if finished_sending or finished_recving:
+            # Normal metadata publication remains batched, but a completed
+            # request is a durability/observability boundary: force the final
+            # cumulative snapshot so the proxy can settle metrics without
+            # turning every scheduler metadata build into atomic file I/O.
             self._publish_connector_metrics(force=True)
         return finished_sending, finished_recving
 
     def build_connector_worker_meta(self):
-        with self._connector_metrics_guard():
-            meta = self._worker_meta
-            self._worker_meta = LayeredTransferWorkerMeta()
-        self._publish_connector_metrics(force=True)
+        meta = self._worker_meta
+        self._publish_connector_metrics(force=False)
         if meta.is_empty():
             return None
+        self._worker_meta = LayeredTransferWorkerMeta()
         return meta
 
     @staticmethod
@@ -1158,25 +1277,17 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         normalized = str(path or "UNKNOWN").strip().upper()
         return normalized or "UNKNOWN"
 
-    def _connector_metrics_guard(self) -> threading.RLock:
-        lock = getattr(self, "_connector_metrics_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._connector_metrics_lock = lock
-        return lock
-
     def _accumulate_worker_meta(self, delta: LayeredTransferWorkerMeta | None) -> None:
         if delta is None or delta.is_empty():
             return
-        with self._connector_metrics_guard():
-            if not hasattr(self, "_worker_meta"):
-                self._worker_meta = LayeredTransferWorkerMeta()
-            if not hasattr(self, "_connector_metrics_pending"):
-                self._connector_metrics_pending = LayeredTransferWorkerMeta()
-            self._worker_meta = self._worker_meta.aggregate(delta)
-            self._connector_metrics_pending = self._connector_metrics_pending.aggregate(
-                delta
-            )
+        if not hasattr(self, "_worker_meta"):
+            self._worker_meta = LayeredTransferWorkerMeta()
+        if not hasattr(self, "_connector_metrics_pending"):
+            self._connector_metrics_pending = LayeredTransferWorkerMeta()
+        self._worker_meta = self._worker_meta.aggregate(delta)
+        self._connector_metrics_pending = self._connector_metrics_pending.aggregate(
+            delta
+        )
 
     def _accumulate_worker_meta_by_path(
         self,
@@ -1184,55 +1295,33 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
     ) -> None:
         if not path_deltas:
             return
-        with self._connector_metrics_guard():
-            if not hasattr(self, "_connector_metrics_pending_by_path"):
-                self._connector_metrics_pending_by_path = {}
-            for path, delta in dict(path_deltas).items():
-                if delta is None or delta.is_empty():
-                    continue
-                bucket = self._normalize_routing_path(path)
-                existing = self._connector_metrics_pending_by_path.get(
-                    bucket, LayeredTransferWorkerMeta()
-                )
-                self._connector_metrics_pending_by_path[bucket] = existing.aggregate(delta)
+        if not hasattr(self, "_connector_metrics_pending_by_path"):
+            self._connector_metrics_pending_by_path = {}
+        for path, delta in dict(path_deltas).items():
+            if delta is None or delta.is_empty():
+                continue
+            bucket = self._normalize_routing_path(path)
+            existing = self._connector_metrics_pending_by_path.get(
+                bucket, LayeredTransferWorkerMeta()
+            )
+            self._connector_metrics_pending_by_path[bucket] = existing.aggregate(delta)
 
     def _publish_connector_metrics(self, *, force: bool = False) -> None:
         sink = getattr(self, "_connector_metrics_sink", None)
         if sink is None:
             return
-        if not bool(getattr(sink, "enabled", True)):
-            return
-        interval_s = max(
-            0.0,
-            float(getattr(self, "_connector_metrics_flush_interval_s", 0.0) or 0.0),
+        pending = getattr(self, "_connector_metrics_pending", None)
+        pending_by_path = dict(
+            getattr(self, "_connector_metrics_pending_by_path", {}) or {}
         )
-        now = time.monotonic()
-        if (
-            not force
-            and interval_s > 0.0
-            and now < float(
-                getattr(self, "_connector_metrics_next_publish_monotonic", 0.0)
-                or 0.0
-            )
-        ):
+        has_path_pending = any(not meta.is_empty() for meta in pending_by_path.values())
+        if (pending is None or pending.is_empty()) and not has_path_pending:
+            if force:
+                sink.flush()
             return
-        with self._connector_metrics_guard():
-            pending = getattr(self, "_connector_metrics_pending", None)
-            pending_by_path = dict(
-                getattr(self, "_connector_metrics_pending_by_path", {}) or {}
-            )
-            has_path_pending = any(not meta.is_empty() for meta in pending_by_path.values())
-            if (pending is None or pending.is_empty()) and not has_path_pending:
-                if force:
-                    sink.flush(force=True)
-                return
-            self._connector_metrics_pending = LayeredTransferWorkerMeta()
-            self._connector_metrics_pending_by_path = {}
         sink.record(pending, path_totals=pending_by_path, force=force)
-        if interval_s > 0.0 and not force:
-            self._connector_metrics_next_publish_monotonic = (
-                time.monotonic() + interval_s
-            )
+        self._connector_metrics_pending = LayeredTransferWorkerMeta()
+        self._connector_metrics_pending_by_path = {}
 
     # ------------------------------------------------------------------
     # Consumer receive path
@@ -1250,23 +1339,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 pull_metas,
                 expected_tasks=len(remote_tp_ranks),
             )
-            started_paths: dict[str, LayeredTransferWorkerMeta] = {}
-            with self._layered_recv_lock:
-                now = time.perf_counter()
-                for req_id in pull_metas:
-                    state = self._layered_recv_states.get(req_id)
-                    if state is not None:
-                        state.mark_started(now)
-                    path = self._routing_path_for_recv(req_id=req_id)
-                    existing = started_paths.get(path, LayeredTransferWorkerMeta())
-                    started_paths[path] = existing.aggregate(
-                        LayeredTransferWorkerMeta(receive_kv_requests=1)
-                    )
-            self._accumulate_worker_meta(
-                LayeredTransferWorkerMeta(receive_kv_requests=len(pull_metas))
-            )
-            self._accumulate_worker_meta_by_path(started_paths)
-            self._publish_connector_metrics()
             self._trace(
                 "receive_kv remote_engine=%s reqs=%s expected_tasks=%d",
                 remote_engine_id,
@@ -1313,12 +1385,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             self._sender_group_count,
         )
 
-        roundtrip_start = time.perf_counter()
-        first_response_ms: float | None = None
-        last_response_ms: float | None = None
-        response_messages = 0
-        processed_response_messages = 0
-        response_process_ms = 0.0
         try:
             from vllm import envs
             from vllm.utils.network_utils import make_zmq_socket
@@ -1334,11 +1400,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 while True:
                     ret_msg = await sock.recv()
                     response = self._xfer_resp_decoder.decode(ret_msg)
-                    response_arrival_ms = (time.perf_counter() - roundtrip_start) * 1000.0
-                    if first_response_ms is None:
-                        first_response_ms = response_arrival_ms
-                    last_response_ms = response_arrival_ms
-                    response_messages += 1
                     if response.status == MooncakeXferResponseStatus.ERROR:
                         logger.error(
                             "Error happens during layered transferring kvcache for %s: %s",
@@ -1358,10 +1419,7 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                                 if state is not None:
                                     state.fail(response.err_msg or "layered transfer failed")
                         return
-                    process_start = time.perf_counter()
                     self.process_pulling_result(response, pull_metas)
-                    response_process_ms += (time.perf_counter() - process_start) * 1000.0
-                    processed_response_messages += 1
                     if response.status == MooncakeXferResponseStatus.FINISH:
                         self._trace(
                             "receive_kv_from_single_worker finished reqs=%s worker=%s",
@@ -1384,29 +1442,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                     if state is not None:
                         state.fail(str(exc))
             return
-        finally:
-            elapsed_ms = (time.perf_counter() - roundtrip_start) * 1000.0
-            delta = LayeredTransferWorkerMeta(
-                receive_kv_worker_roundtrips=1,
-                receive_kv_worker_ms=elapsed_ms,
-                receive_kv_response_messages=response_messages,
-                receive_kv_first_response_count=1 if first_response_ms is not None else 0,
-                receive_kv_first_response_ms=float(first_response_ms or 0.0),
-                receive_kv_last_response_count=1 if last_response_ms is not None else 0,
-                receive_kv_last_response_ms=float(last_response_ms or 0.0),
-                receive_kv_response_process_count=processed_response_messages,
-                receive_kv_response_process_ms=response_process_ms,
-            )
-            path_deltas: dict[str, LayeredTransferWorkerMeta] = {}
-            for req_id in req_ids:
-                path = self._routing_path_for_recv(req_id=req_id)
-                existing = path_deltas.get(path, LayeredTransferWorkerMeta())
-                if existing.receive_kv_worker_roundtrips == 0:
-                    existing = existing.aggregate(delta)
-                path_deltas[path] = existing
-            self._accumulate_worker_meta(delta)
-            self._accumulate_worker_meta_by_path(path_deltas)
-            self._publish_connector_metrics()
 
     def process_pulling_result(
         self,
@@ -1421,25 +1456,16 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         response_total_groups = int(getattr(response, "total_groups", 0) or 0)
         finished_reqs: list[str] = []
         finished_paths: list[str] = []
-        first_group_paths: list[str] = []
-        first_group_latencies_ms: list[float] = []
-        finished_latencies_ms: list[float] = []
         with self._layered_recv_lock:
-            now = time.perf_counter()
             for req_id in ok_reqs:
                 state = self._layered_recv_states.get(req_id)
                 if state is None:
                     continue
-                state.mark_started(now)
                 if response_total_groups > 0:
                     state.ensure_total_groups(response_total_groups)
-                group_became_ready = False
                 if group_idx >= 0:
-                    group_became_ready = state.ack_group(group_idx, now)
-                if group_became_ready:
-                    first_group_paths.append(self._routing_path_for_recv(req_id=req_id))
-                    first_group_latencies_ms.append(state.first_group_latency_ms())
-                if state.mark_finished_if_complete(now):
+                    state.ack_group(group_idx)
+                if state.complete():
                     pull_meta = pull_metas.get(req_id)
                     finished_req_id = (
                         pull_meta.d_req_id
@@ -1450,7 +1476,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                         self.finished_recving_reqs.add(finished_req_id)
                         finished_reqs.append(finished_req_id)
                         finished_paths.append(self._routing_path_for_recv(req_id=req_id))
-                        finished_latencies_ms.append(state.finished_latency_ms())
 
             if response.err_reqs:
                 for req_id in response.err_reqs:
@@ -1462,10 +1487,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             received_group_batches=1 if ok_reqs and group_idx >= 0 else 0,
             received_finished_reqs=len(finished_reqs),
             receive_failures=len(response.err_reqs or []),
-            receive_kv_first_group_count=len(first_group_latencies_ms),
-            receive_kv_first_group_ms=sum(first_group_latencies_ms),
-            receive_kv_finished_count=len(finished_latencies_ms),
-            receive_kv_finished_ms=sum(finished_latencies_ms),
         )
         path_deltas: dict[str, LayeredTransferWorkerMeta] = {}
         if ok_reqs and group_idx >= 0:
@@ -1477,22 +1498,10 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                         LayeredTransferWorkerMeta(received_group_batches=1)
                     )
                 path_deltas[path] = existing
-        for path, latency_ms in zip(first_group_paths, first_group_latencies_ms):
+        for path in finished_paths:
             existing = path_deltas.get(path, LayeredTransferWorkerMeta())
             path_deltas[path] = existing.aggregate(
-                LayeredTransferWorkerMeta(
-                    receive_kv_first_group_count=1,
-                    receive_kv_first_group_ms=latency_ms,
-                )
-            )
-        for path, latency_ms in zip(finished_paths, finished_latencies_ms):
-            existing = path_deltas.get(path, LayeredTransferWorkerMeta())
-            path_deltas[path] = existing.aggregate(
-                LayeredTransferWorkerMeta(
-                    received_finished_reqs=1,
-                    receive_kv_finished_count=1,
-                    receive_kv_finished_ms=latency_ms,
-                )
+                LayeredTransferWorkerMeta(received_finished_reqs=1)
             )
         for req_id in response.err_reqs or []:
             path = self._routing_path_for_recv(req_id=req_id)
@@ -1671,256 +1680,185 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             meta.remote_tp_rank,
         )
 
+        wait_tasks = [
+            asyncio.create_task(self._wait_send_meta_ready(send_meta))
+            for send_meta in pending_reqs.values()
+        ]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*wait_tasks),
+                timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+            )
+            self._trace(
+                "send_kv_to_decode ready reqs=%s transfer_ids=%s",
+                list(pending_reqs),
+                [send_meta.transfer_id for send_meta in pending_reqs.values()],
+            )
+        except Exception as exc:
+            for task in wait_tasks:
+                task.cancel()
+            message = f"Timeout waiting for P side ready: {exc}"
+            logger.warning(message)
+            with self._layered_send_lock:
+                for send_meta in pending_reqs.values():
+                    state = self._layered_send_states.get(send_meta.transfer_id)
+                    if state is not None:
+                        state.fail(message)
+            response = LayeredMooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH,
+                err_reqs=list(pending_reqs),
+                err_msg=message,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
+
+        for send_meta in pending_reqs.values():
+            if not send_meta.need_send:
+                self.resolve_need_send(send_meta, remote_tp_ranks)
+
         remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-        # A Decode worker can batch requests that reached Prefill at very
-        # different times. Waiting for all of their SendBlockMeta objects here
-        # turns the slowest request into a head-of-line barrier for every fast
-        # one. Drive the transfer as an event graph instead: a request enters
-        # group 0 as soon as its metadata is ready, then advances group by
-        # group. Ready requests for the same group are still sent together.
-        wait_tasks: dict[asyncio.Task[Any], tuple[str, int]] = {}
-        active_req_ids = set(pending_reqs)
-        sending_req_ids: set[str] = set()
 
-        def _schedule_meta_wait(d_req_id: str, send_meta: SendBlockMeta) -> None:
-            task = asyncio.create_task(self._wait_send_meta_ready(send_meta))
-            wait_tasks[task] = (d_req_id, -1)
+        for group_idx in range(total_groups):
+            for send_meta in pending_reqs.values():
+                send_meta.sending += 1
 
-        def _schedule_group_wait(
-            d_req_id: str,
-            send_meta: SendBlockMeta,
-            group_idx: int,
-        ) -> None:
-            task = asyncio.create_task(self._wait_group_ready((send_meta,), group_idx))
-            wait_tasks[task] = (d_req_id, group_idx)
+            try:
+                self._trace(
+                    "send_kv_to_decode waiting group=%d/%d reqs=%s",
+                    group_idx,
+                    total_groups,
+                    list(pending_reqs),
+                )
+                await self._wait_group_ready(pending_reqs.values(), group_idx)
+                self._trace(
+                    "send_kv_to_decode group_ready group=%d/%d reqs=%s",
+                    group_idx,
+                    total_groups,
+                    list(pending_reqs),
+                )
+                (
+                    src_ptrs,
+                    dst_ptrs,
+                    lengths,
+                    err_reqs,
+                    err_msg,
+                    path_stats,
+                    descriptor_paths,
+                ) = await self._build_transfer_params_for_group(
+                    ready_reqs=list(pending_reqs.items()),
+                    agent_meta=meta,
+                    local_regions=local_regions,
+                    remote_regions=remote_regions,
+                    group_idx=group_idx,
+                )
+                self._trace(
+                    "send_kv_to_decode params group=%d desc=%d bytes=%d err_reqs=%s",
+                    group_idx,
+                    len(src_ptrs),
+                    sum(lengths),
+                    err_reqs,
+                )
+                err_req_set = set(err_reqs)
+                ok_reqs = [req_id for req_id in pending_reqs if req_id not in err_req_set]
+                if src_ptrs:
+                    dispatch_ret = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._send_blocks,
+                        remote_session,
+                        src_ptrs,
+                        dst_ptrs,
+                        lengths,
+                        descriptor_paths,
+                    )
+                    if dispatch_ret != 0:
+                        transfer_err_msg = (
+                            f"Mooncake transfer engine returned {dispatch_ret}"
+                        )
+                        err_msg = (
+                            transfer_err_msg if err_msg is None else f"{err_msg}; {transfer_err_msg}"
+                        )
+                        err_reqs = list(err_reqs)
+                        for req_id in ok_reqs:
+                            err_reqs.append(req_id)
+                            err_req_set.add(req_id)
+                        ok_reqs = []
+                self._trace(
+                    "send_kv_to_decode response group=%d status=%s ok=%s err=%s",
+                    group_idx,
+                    (
+                        "FINISH"
+                        if group_idx + 1 == total_groups or not [
+                            req_id for req_id in pending_reqs if req_id not in err_req_set
+                        ]
+                        else "CONTINUE"
+                    ),
+                    ok_reqs,
+                    err_reqs,
+                )
+                remaining_req_ids = [
+                    req_id for req_id in pending_reqs if req_id not in err_req_set
+                ]
+                response = LayeredMooncakeXferResponse(
+                    status=(
+                        MooncakeXferResponseStatus.FINISH
+                        if group_idx + 1 == total_groups or not remaining_req_ids
+                        else MooncakeXferResponseStatus.CONTINUE
+                    ),
+                    ok_reqs=ok_reqs or None,
+                    err_reqs=err_reqs or None,
+                    err_msg=err_msg,
+                    group_index=group_idx,
+                    total_groups=total_groups,
+                )
+                await sock.send_multipart((identity, self._encoder.encode(response)))
+                if err_req_set:
+                    with self._layered_send_lock:
+                        for req_id in err_req_set:
+                            transfer_id = meta.req_blocks[req_id][0]
+                            state = self._layered_send_states.get(transfer_id)
+                            if state is not None:
+                                state.fail(err_msg or "layered transfer failed")
+                    for req_id in list(err_req_set):
+                        failed_meta = pending_reqs.pop(req_id, None)
+                        if failed_meta is not None:
+                            self.reqs_need_send.pop(failed_meta.transfer_id, None)
+                            failed_req_id = (
+                                str(failed_meta.p_req_id)
+                                if getattr(failed_meta, "p_req_id", "")
+                                else str(req_id)
+                            )
+                            self._send_request_routing_paths.pop(failed_req_id, None)
+                            self._send_transfer_routing_paths.pop(
+                                str(failed_meta.transfer_id), None
+                            )
+                            with self._layered_send_lock:
+                                self._layered_send_states.pop(failed_meta.transfer_id, None)
+                                self._current_send_transfer_ids.discard(str(failed_meta.transfer_id))
+                    if not pending_reqs:
+                        break
+            finally:
+                for send_meta in pending_reqs.values():
+                    send_meta.sending = max(0, send_meta.sending - 1)
 
-        def _finish_success(d_req_id: str, send_meta: SendBlockMeta) -> None:
-            active_req_ids.discard(d_req_id)
-            if d_req_id in sending_req_ids:
-                send_meta.sending = max(0, send_meta.sending - 1)
-                sending_req_ids.discard(d_req_id)
+        for d_req_id, send_meta in pending_reqs.items():
             send_meta.sent += 1
             if (
                 send_meta.sent == send_meta.need_send
                 and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
             ):
                 self.finished_sending_reqs.add(send_meta.p_req_id)
-                self._send_request_routing_paths.pop(str(send_meta.p_req_id), None)
-                self._send_transfer_routing_paths.pop(str(send_meta.transfer_id), None)
-                with self._layered_send_lock:
-                    self._layered_send_states.pop(send_meta.transfer_id, None)
-                    self._current_send_transfer_ids.discard(str(send_meta.transfer_id))
-
-        def _finish_failure(
-            d_req_id: str,
-            send_meta: SendBlockMeta,
-            message: str,
-        ) -> None:
-            active_req_ids.discard(d_req_id)
-            if d_req_id in sending_req_ids:
-                send_meta.sending = max(0, send_meta.sending - 1)
-                sending_req_ids.discard(d_req_id)
-            with self._layered_send_lock:
-                state = self._layered_send_states.get(send_meta.transfer_id)
-                if state is not None:
-                    state.fail(message)
-                self._layered_send_states.pop(send_meta.transfer_id, None)
-                self._current_send_transfer_ids.discard(str(send_meta.transfer_id))
-            self.reqs_need_send.pop(send_meta.transfer_id, None)
-            failed_req_id = (
-                str(send_meta.p_req_id)
-                if getattr(send_meta, "p_req_id", "")
-                else str(d_req_id)
-            )
-            self._send_request_routing_paths.pop(failed_req_id, None)
+            self._send_request_routing_paths.pop(str(send_meta.p_req_id), None)
             self._send_transfer_routing_paths.pop(str(send_meta.transfer_id), None)
-
-        async def _send_response(
-            *,
-            group_idx: int,
-            ok_reqs: list[str],
-            err_reqs: list[str],
-            err_msg: str | None,
-        ) -> None:
-            response = LayeredMooncakeXferResponse(
-                status=(
-                    MooncakeXferResponseStatus.FINISH
-                    if not active_req_ids
-                    else MooncakeXferResponseStatus.CONTINUE
-                ),
-                ok_reqs=ok_reqs or None,
-                err_reqs=err_reqs or None,
-                err_msg=err_msg,
-                group_index=group_idx,
-                total_groups=total_groups,
+            with self._layered_send_lock:
+                self._layered_send_states.pop(send_meta.transfer_id, None)
+            logger.debug(
+                "layered kv send finished for request %s transfer_id=%s",
+                d_req_id,
+                send_meta.transfer_id,
             )
-            await sock.send_multipart((identity, self._encoder.encode(response)))
-
-        for d_req_id, send_meta in pending_reqs.items():
-            _schedule_meta_wait(d_req_id, send_meta)
-
-        try:
-            while active_req_ids:
-                if not wait_tasks:
-                    message = "layered KV transfer lost all readiness waiters"
-                    failed = list(active_req_ids)
-                    for d_req_id in failed:
-                        _finish_failure(d_req_id, pending_reqs[d_req_id], message)
-                    await _send_response(
-                        group_idx=-1,
-                        ok_reqs=[],
-                        err_reqs=failed,
-                        err_msg=message,
-                    )
-                    break
-
-                done, _ = await asyncio.wait(
-                    tuple(wait_tasks),
-                    timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if not done:
-                    message = "Timeout waiting for P side ready or layered KV group."
-                    logger.warning("%s reqs=%s", message, sorted(active_req_ids))
-                    failed = list(active_req_ids)
-                    for task in wait_tasks:
-                        task.cancel()
-                    wait_tasks.clear()
-                    for d_req_id in failed:
-                        _finish_failure(d_req_id, pending_reqs[d_req_id], message)
-                    await _send_response(
-                        group_idx=-1,
-                        ok_reqs=[],
-                        err_reqs=failed,
-                        err_msg=message,
-                    )
-                    break
-
-                ready_by_group: dict[int, list[tuple[str, SendBlockMeta]]] = {}
-                failed_by_message: dict[str, list[str]] = {}
-                for task in done:
-                    d_req_id, group_idx = wait_tasks.pop(task)
-                    if d_req_id not in active_req_ids:
-                        continue
-                    send_meta = pending_reqs[d_req_id]
-                    try:
-                        task.result()
-                    except Exception as exc:
-                        failed_by_message.setdefault(str(exc), []).append(d_req_id)
-                        continue
-                    if group_idx < 0:
-                        if send_meta.transfer_id not in self.reqs_need_send:
-                            failed_by_message.setdefault(
-                                "request expired before layered KV send",
-                                [],
-                            ).append(d_req_id)
-                            continue
-                        if not send_meta.need_send:
-                            self.resolve_need_send(send_meta, remote_tp_ranks)
-                        send_meta.sending += 1
-                        sending_req_ids.add(d_req_id)
-                        _schedule_group_wait(d_req_id, send_meta, 0)
-                    else:
-                        ready_by_group.setdefault(group_idx, []).append(
-                            (d_req_id, send_meta)
-                        )
-
-                for message, failed in failed_by_message.items():
-                    for d_req_id in failed:
-                        _finish_failure(d_req_id, pending_reqs[d_req_id], message)
-                    await _send_response(
-                        group_idx=-1,
-                        ok_reqs=[],
-                        err_reqs=failed,
-                        err_msg=message,
-                    )
-
-                for group_idx in sorted(ready_by_group):
-                    ready_reqs = [
-                        item
-                        for item in ready_by_group[group_idx]
-                        if item[0] in active_req_ids
-                    ]
-                    if not ready_reqs:
-                        continue
-                    (
-                        src_ptrs,
-                        dst_ptrs,
-                        lengths,
-                        err_reqs,
-                        err_msg,
-                        _path_stats,
-                        descriptor_paths,
-                    ) = await self._build_transfer_params_for_group(
-                        ready_reqs=ready_reqs,
-                        agent_meta=meta,
-                        local_regions=local_regions,
-                        remote_regions=remote_regions,
-                        group_idx=group_idx,
-                    )
-                    err_req_set = set(err_reqs)
-                    ok_reqs = [
-                        d_req_id
-                        for d_req_id, _ in ready_reqs
-                        if d_req_id not in err_req_set
-                    ]
-                    if src_ptrs:
-                        dispatch_ret = await self.sender_loop.run_in_executor(
-                            self._sender_executor,
-                            self._send_blocks,
-                            remote_session,
-                            src_ptrs,
-                            dst_ptrs,
-                            lengths,
-                            descriptor_paths,
-                            group_idx + 1 < total_groups,
-                        )
-                        if dispatch_ret != 0:
-                            transfer_err_msg = (
-                                f"Mooncake transfer engine returned {dispatch_ret}"
-                            )
-                            err_msg = (
-                                transfer_err_msg
-                                if err_msg is None
-                                else f"{err_msg}; {transfer_err_msg}"
-                            )
-                            err_req_set.update(ok_reqs)
-                            err_reqs = list(err_req_set)
-                            ok_reqs = []
-
-                    for d_req_id in err_req_set:
-                        _finish_failure(
-                            d_req_id,
-                            pending_reqs[d_req_id],
-                            err_msg or "layered transfer failed",
-                        )
-                    for d_req_id in ok_reqs:
-                        send_meta = pending_reqs[d_req_id]
-                        if group_idx + 1 >= total_groups:
-                            _finish_success(d_req_id, send_meta)
-                        else:
-                            _schedule_group_wait(
-                                d_req_id,
-                                send_meta,
-                                group_idx + 1,
-                            )
-                    await _send_response(
-                        group_idx=group_idx,
-                        ok_reqs=ok_reqs,
-                        err_reqs=list(err_req_set),
-                        err_msg=err_msg,
-                    )
-        finally:
-            pending_tasks = list(wait_tasks)
-            for task in pending_tasks:
-                task.cancel()
-            if pending_tasks:
-                await asyncio.gather(*pending_tasks, return_exceptions=True)
-            for d_req_id in list(sending_req_ids):
-                send_meta = pending_reqs.get(d_req_id)
-                if send_meta is not None:
-                    send_meta.sending = max(0, send_meta.sending - 1)
-            self._publish_connector_metrics(force=True)
+        with self._layered_send_lock:
+            for send_meta in pending_reqs.values():
+                self._current_send_transfer_ids.discard(str(send_meta.transfer_id))
 
     async def _send_kv_to_decode_nonlayered(
         self,
@@ -2130,25 +2068,15 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
 
         for send_meta in send_metas:
             state = self._ensure_layered_send_state(send_meta.transfer_id)
-            if state.failed is not None:
-                raise RuntimeError(state.failed)
-            event = state.async_group_event(group_idx, asyncio.get_running_loop())
-            if event.is_set():
-                # Finished Prefill requests commonly reach this path with every
-                # group ready. No executor work is needed for the fast path.
-                if state.failed is not None:
-                    raise RuntimeError(state.failed)
-                continue
-            try:
-                await asyncio.wait_for(
-                    event.wait(),
-                    timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
-                )
-            except asyncio.TimeoutError as exc:
+            wait_ok = await asyncio.wait_for(
+                asyncio.to_thread(state.group_ready_events[group_idx].wait),
+                timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+            )
+            if not wait_ok:
                 raise TimeoutError(
                     f"timed out waiting for group {group_idx} "
                     f"transfer_id={send_meta.transfer_id}"
-                ) from exc
+                )
             if state.failed is not None:
                 raise RuntimeError(state.failed)
 
@@ -2185,7 +2113,7 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         list[str],
         str | None,
         dict[str, tuple[int, int]],
-        list[str] | str | None,
+        list[str],
     ]:
         if not self._group_region_slices:
             return await self._build_transfer_params_with_path_stats(
@@ -2217,8 +2145,9 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         list[str],
         str | None,
         dict[str, tuple[int, int]],
-        list[str] | str | None,
+        list[str],
     ]:
+        build_started = time.perf_counter()
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
             _can_coalesce_block_transfers,
             group_concurrent_contiguous,
@@ -2229,11 +2158,8 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         lengths: list[int] = []
         err_reqs: list[str] = []
         err_msg: str | None = None
-        # Homogeneous PD/EPD requests are the normal serving case. Retain one
-        # path label for the whole descriptor vector and only allocate a label
-        # list when a batch actually mixes routing paths.
-        descriptor_paths: list[str] | str | None = None
-        descriptor_path_count = 0
+        descriptor_paths: list[str] = []
+        coalesce_keys: list[tuple[Any, ...]] = []
 
         for d_req_id, send_meta in ready_reqs:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
@@ -2291,9 +2217,10 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 req_id=d_req_id,
                 transfer_id=send_meta.transfer_id,
             )
-            path_descs = 0
 
-            for local_region, remote_region in zip(local_regions, remote_regions):
+            for region_idx, (local_region, remote_region) in enumerate(
+                zip(local_regions, remote_regions)
+            ):
                 should_transfer, src_region_offset, dst_region_offset, transfer_len = (
                     self._get_sender_transfer_plan(
                         local_kv_block_len=local_region.kv_block_len,
@@ -2314,6 +2241,18 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                     dst_region_offset=dst_region_offset,
                     transfer_len=transfer_len,
                 )
+                provenance_key = (
+                    int(region_idx),
+                    int(local_region.base_addr),
+                    int(local_region.block_len),
+                    int(local_region.kv_block_len),
+                    int(remote_region.base_addr),
+                    int(remote_region.block_len),
+                    int(remote_region.kv_block_len),
+                    int(src_region_offset),
+                    int(dst_region_offset),
+                    int(transfer_len),
+                )
 
                 for group_local_block_id, group_remote_block_id in zip(
                     group_local_block_ids, group_remote_block_ids
@@ -2331,7 +2270,8 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                             + dst_region_offset
                         )
                         lengths.append(transfer_size)
-                        path_descs += 1
+                        descriptor_paths.append(routing_path)
+                        coalesce_keys.append(provenance_key)
                     else:
                         for local_block_id, remote_block_id in zip(
                             group_local_block_id,
@@ -2348,39 +2288,44 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                                 + dst_region_offset
                             )
                             lengths.append(transfer_len)
-                            path_descs += 1
-            if path_descs <= 0:
-                continue
-            if descriptor_paths is None:
-                descriptor_paths = routing_path
-            elif isinstance(descriptor_paths, str):
-                if descriptor_paths != routing_path:
-                    descriptor_paths = [descriptor_paths] * descriptor_path_count
-                    descriptor_paths.extend([routing_path] * path_descs)
-            else:
-                descriptor_paths.extend([routing_path] * path_descs)
-            descriptor_path_count += path_descs
+                            descriptor_paths.append(routing_path)
+                            coalesce_keys.append(provenance_key)
 
-        # Metrics are derived where descriptors become actual transport
-        # batches. The former request-level aggregate was not consumed and
-        # duplicated a full descriptor traversal on the hot path.
-        return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg, {}, descriptor_paths
+        input_descriptors = len(src_ptrs)
+        coalesced = coalesce_transfer_descriptors(
+            src_ptrs,
+            dst_ptrs,
+            lengths,
+            coalesce_keys=(
+                coalesce_keys
+                if getattr(self, "enable_descriptor_coalescing", False)
+                else None
+            ),
+            descriptor_paths=descriptor_paths,
+        )
+        src_ptrs = coalesced.src_ptrs
+        dst_ptrs = coalesced.dst_ptrs
+        lengths = coalesced.lengths
+        descriptor_paths = coalesced.descriptor_paths
+        path_stats = self._path_stats_from_descriptor_paths(descriptor_paths, lengths)
+        self._accumulate_worker_meta(
+            LayeredTransferWorkerMeta(
+                descriptor_build_calls=1,
+                descriptor_build_input_descriptors=input_descriptors,
+                descriptor_build_output_descriptors=len(src_ptrs),
+                coalesced_descriptors=coalesced.coalesced_descriptors,
+                descriptor_build_ms=(time.perf_counter() - build_started) * 1000.0,
+            )
+        )
+
+        return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg, path_stats, descriptor_paths
 
     @staticmethod
     def _path_stats_from_descriptor_paths(
-        descriptor_paths: list[str] | tuple[str, ...] | str | None,
+        descriptor_paths: list[str] | tuple[str, ...] | None,
         lengths: list[int],
     ) -> dict[str, tuple[int, int]]:
-        if not descriptor_paths:
-            return {}
-        if isinstance(descriptor_paths, str):
-            return {
-                EPDMooncakeConnectorWorker._normalize_routing_path(descriptor_paths): (
-                    len(lengths),
-                    sum(int(size) for size in lengths),
-                )
-            }
-        if len(descriptor_paths) != len(lengths):
+        if not descriptor_paths or len(descriptor_paths) != len(lengths):
             return {}
         aggregated: dict[str, tuple[int, int]] = {}
         for path, size in zip(descriptor_paths, lengths):
@@ -2394,20 +2339,44 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         path_stats: dict[str, tuple[int, int]] | None,
         *,
         backend_label: str,
+        duration_ms: float = 0.0,
+        success: bool = True,
     ) -> dict[str, LayeredTransferWorkerMeta]:
         deltas: dict[str, LayeredTransferWorkerMeta] = {}
+        total_path_bytes = sum(
+            max(0, int(stats[1]))
+            for stats in dict(path_stats or {}).values()
+        )
+        path_count = sum(
+            1
+            for stats in dict(path_stats or {}).values()
+            if int(stats[0]) > 0 or int(stats[1]) > 0
+        )
         for path, stats in dict(path_stats or {}).items():
             desc_count, byte_count = int(stats[0]), int(stats[1])
             if desc_count <= 0 and byte_count <= 0:
                 continue
-            deltas[self._normalize_routing_path(path)] = LayeredTransferWorkerMeta(
-                grouped_batches=1,
-                grouped_bytes=byte_count,
-                grouped_descriptors=desc_count,
-            ).aggregate(
+            if total_path_bytes > 0:
+                path_duration_ms = max(0.0, float(duration_ms)) * (
+                    max(0, byte_count) / total_path_bytes
+                )
+            else:
+                path_duration_ms = max(0.0, float(duration_ms)) / max(1, path_count)
+            grouped_delta = (
+                LayeredTransferWorkerMeta(
+                    grouped_batches=1,
+                    grouped_bytes=byte_count,
+                    grouped_descriptors=desc_count,
+                )
+                if success
+                else LayeredTransferWorkerMeta()
+            )
+            deltas[self._normalize_routing_path(path)] = grouped_delta.aggregate(
                 self._transfer_backend_delta(
                     backend_label,
                     total_bytes=byte_count,
+                    duration_ms=path_duration_ms,
+                    success=success,
                 )
             )
         return deltas
@@ -2420,38 +2389,82 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             self._peer_transfer_engine = engine
         return engine
 
+    def _get_rdmacm_transfer_engine(self) -> PeerTransferEngine:
+        engine = self._rdmacm_transfer_engine
+        if engine is None:
+            engine = PeerTransferEngine(protocol="rdmacm")
+            engine.initialize()
+            self._rdmacm_transfer_engine = engine
+        return engine
+
+    def _rdmacm_port(self, mooncake_rpc_port: int) -> int:
+        # Keep the endpoint deterministic from the Mooncake-advertised port so
+        # no additional control-plane field is required. Wrap inside the
+        # non-privileged port range rather than overflowing at high ephemeral
+        # Mooncake ports.
+        return 1024 + (
+            (int(mooncake_rpc_port) - 1024 + int(self.rdmacm_port_offset))
+            % (65535 - 1024)
+        )
+
+    def _rdmacm_remote_session(self, mooncake_remote_session: str) -> str:
+        hostname, separator, raw_port = str(mooncake_remote_session).rpartition(":")
+        if not separator or not hostname:
+            raise ValueError(
+                f"invalid Mooncake remote session for rdmacm: {mooncake_remote_session!r}"
+            )
+        address = self.rdmacm_remote_address or hostname
+        return f"{address}:{self._rdmacm_port(int(raw_port))}"
+
+    def _transfer_region_descriptors_via_rdmacm(
+        self,
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+    ) -> int:
+        engine = self._get_rdmacm_transfer_engine()
+        rdmacm_session = self._rdmacm_remote_session(remote_session)
+        self._trace(
+            "rdmacm staged plan remote=%s desc=%d bytes=%d",
+            rdmacm_session,
+            len(src_ptrs),
+            sum(int(value) for value in lengths),
+        )
+        plan = engine.build_pointer_transfer_plan(
+            remote_session=rdmacm_session,
+            local_pointers=src_ptrs,
+            remote_pointers=dst_ptrs,
+            lengths=lengths,
+            registered=True,
+        )
+        engine.transfer_peer_buffer_plan(plan)
+        return 0
+
     def _transfer_region_descriptors_via_peer_engine(
         self,
         remote_session: str,
         src_ptrs: list[int],
         dst_ptrs: list[int],
         lengths: list[int],
-    ) -> _TransferDispatchResult:
-        # Avoid scanning a large descriptor list solely to format a disabled
-        # trace message. The direct engine computes the byte total for result
-        # accounting below.
-        if self.trace_layered_kv:
-            self._trace(
-                "peer_buffer plan remote=%s desc=%d bytes=%d",
-                remote_session,
-                len(src_ptrs),
-                sum(int(length) for length in lengths),
-            )
+    ) -> int:
+        total_bytes = sum(int(length) for length in lengths)
+        self._trace(
+            "peer_buffer plan remote=%s desc=%d bytes=%d",
+            remote_session,
+            len(src_ptrs),
+            total_bytes,
+        )
         engine = self._get_peer_transfer_engine()
-        result = engine.transfer_registered_pointer_batch(
+        plan = engine.build_pointer_transfer_plan(
             remote_session=remote_session,
             local_pointers=src_ptrs,
             remote_pointers=dst_ptrs,
             lengths=lengths,
+            registered=True,
         )
-        timings = dict(result.timings_ms or {})
-        return _TransferDispatchResult(
-            ret_code=0,
-            backend_label="peer_buffer_direct",
-            dispatch_ms=float(timings.get("total_ms", 0.0) or 0.0),
-            prepare_ms=float(timings.get("prepare_ms", 0.0) or 0.0),
-            write_ms=float(timings.get("write_ms", 0.0) or 0.0),
-        )
+        engine.transfer_peer_buffer_plan(plan)
+        return 0
 
     def _batched_transfer_regions(
         self,
@@ -2461,22 +2474,62 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         lengths: list[int],
     ) -> _TransferDispatchResult:
         backend = self.transport_backend.strip().lower()
-        if backend in {"mooncake_engine_direct", "engine_direct", "direct_engine"}:
+        if backend in {"rdmacm", "rdmacm_staged", "iwarp"}:
             try:
-                dispatch = self._transfer_region_descriptors_via_peer_engine(
+                ret_code = self._transfer_region_descriptors_via_rdmacm(
                     remote_session,
                     src_ptrs,
                     dst_ptrs,
                     lengths,
                 )
-                if self.trace_layered_kv:
-                    self._trace(
-                        "peer_buffer committed remote=%s desc=%d bytes=%d",
-                        remote_session,
-                        len(src_ptrs),
-                        sum(lengths),
+                return _TransferDispatchResult(
+                    ret_code=ret_code,
+                    backend_label="rdmacm_staged",
+                )
+            except Exception as exc:
+                message = str(exc)
+                if not getattr(self, "allow_transfer_fallback", True):
+                    logger.exception(
+                        "rdmacm staged transfer failed and fallback is disabled"
                     )
-                return dispatch
+                    return _TransferDispatchResult(
+                        ret_code=-1,
+                        backend_label="rdmacm_staged",
+                        error_message=message,
+                    )
+                logger.exception(
+                    "rdmacm staged transfer failed; falling back to Mooncake TCP"
+                )
+                ret_code = self.engine.batch_transfer_sync_write(
+                    remote_session,
+                    src_ptrs,
+                    dst_ptrs,
+                    lengths,
+                )
+                return _TransferDispatchResult(
+                    ret_code=ret_code,
+                    backend_label="rdmacm_to_tcp_fallback",
+                    used_fallback=True,
+                    error_message=message,
+                )
+        if backend in {"mooncake_engine_direct", "engine_direct", "direct_engine"}:
+            try:
+                ret_code = self._transfer_region_descriptors_via_peer_engine(
+                    remote_session,
+                    src_ptrs,
+                    dst_ptrs,
+                    lengths,
+                )
+                self._trace(
+                    "peer_buffer committed remote=%s desc=%d bytes=%d",
+                    remote_session,
+                    len(src_ptrs),
+                    sum(lengths),
+                )
+                return _TransferDispatchResult(
+                    ret_code=ret_code,
+                    backend_label="peer_buffer_direct",
+                )
             except Exception as exc:
                 message = str(exc)
                 if not getattr(self, "allow_transfer_fallback", True):
@@ -2496,7 +2549,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                     sum(lengths),
                     message,
                 )
-                fallback_started = time.perf_counter()
                 ret_code = self.engine.batch_transfer_sync_write(
                     remote_session,
                     src_ptrs,
@@ -2508,9 +2560,7 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                     backend_label="batch_transfer_fallback",
                     used_fallback=True,
                     error_message=message,
-                    dispatch_ms=(time.perf_counter() - fallback_started) * 1000.0,
                 )
-        start_time = time.perf_counter()
         ret_code = self.engine.batch_transfer_sync_write(
             remote_session,
             src_ptrs,
@@ -2520,7 +2570,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         return _TransferDispatchResult(
             ret_code=ret_code,
             backend_label="batch_transfer_native",
-            dispatch_ms=(time.perf_counter() - start_time) * 1000.0,
         )
 
     def _transfer_backend_delta(
@@ -2528,25 +2577,34 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         backend_label: str,
         *,
         total_bytes: int,
-        dispatch: _TransferDispatchResult | None = None,
+        duration_ms: float = 0.0,
+        success: bool = True,
     ) -> LayeredTransferWorkerMeta:
+        duration_ms = max(0.0, float(duration_ms))
+        total_bytes = max(0, int(total_bytes))
+        if not success:
+            return LayeredTransferWorkerMeta(
+                transfer_attempts=1,
+                transfer_attempt_elapsed_ms=duration_ms,
+                backend_failures={backend_label: 1},
+            )
         delta = LayeredTransferWorkerMeta(
+            transfer_attempts=1,
+            transfer_successes=1,
+            transfer_bytes=total_bytes,
+            transfer_elapsed_ms=duration_ms,
+            transfer_attempt_elapsed_ms=duration_ms,
             backend_counts={backend_label: 1},
+            backend_bytes={backend_label: total_bytes},
+            backend_elapsed_ms={backend_label: duration_ms},
         )
         if backend_label == "peer_buffer_direct":
             delta.peer_buffer_batches = 1
             delta.peer_buffer_bytes = total_bytes
-            if dispatch is not None:
-                delta.peer_buffer_dispatch_ms = max(
-                    0.0, float(getattr(dispatch, "dispatch_ms", 0.0) or 0.0)
-                )
-                delta.peer_buffer_prepare_ms = max(
-                    0.0, float(getattr(dispatch, "prepare_ms", 0.0) or 0.0)
-                )
-                delta.peer_buffer_write_ms = max(
-                    0.0, float(getattr(dispatch, "write_ms", 0.0) or 0.0)
-                )
-        elif backend_label == "batch_transfer_fallback":
+        elif backend_label in {
+            "batch_transfer_fallback",
+            "rdmacm_to_tcp_fallback",
+        }:
             delta.fallback_batches = 1
             delta.fallback_bytes = total_bytes
         return delta
@@ -2556,6 +2614,9 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             "mooncake_engine_direct",
             "engine_direct",
             "direct_engine",
+            "rdmacm",
+            "rdmacm_staged",
+            "iwarp",
         }
 
     # ------------------------------------------------------------------
@@ -2567,23 +2628,28 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         src_ptrs: list[int],
         dst_ptrs: list[int],
         lengths: list[int],
-        descriptor_paths: list[str] | str | None = None,
-        apply_logical_group_delay: bool = False,
+        descriptor_paths: list[str] | None = None,
     ) -> int:
         if not src_ptrs:
             return 0
 
+        full_path_stats = self._path_stats_from_descriptor_paths(descriptor_paths, lengths)
         single_batch_desc_limit = max(1, int(getattr(self, "max_transfer_descriptors", 128)))
         single_batch_byte_limit = max(0, int(getattr(self, "max_transfer_bytes", 0)))
-        total_bytes = sum(int(v) for v in lengths)
         must_chunk_for_transport = (
             len(src_ptrs) > single_batch_desc_limit
-            or (single_batch_byte_limit > 0 and total_bytes > single_batch_byte_limit)
+            or (single_batch_byte_limit > 0 and sum(int(v) for v in lengths) > single_batch_byte_limit)
         )
         if not must_chunk_for_transport:
-            full_path_stats = self._path_stats_from_descriptor_paths(
-                descriptor_paths, lengths
-            )
+            if self.layered_kv_transfer and len(src_ptrs) > 1:
+                return self._send_region_group_with_retry(
+                    remote_session,
+                    src_ptrs,
+                    dst_ptrs,
+                    lengths,
+                    full_path_stats,
+                    descriptor_paths,
+                ).ret_code
             return self._send_region_group(
                 remote_session,
                 src_ptrs,
@@ -2592,13 +2658,10 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 path_stats=full_path_stats,
             )
 
-        # ``_send_blocks`` is already invoked with one logical layered-KV group
-        # by ``send_kv_to_decode``.  Re-slicing that group by the model-wide
-        # layer count created dozens of tiny peer-buffer submissions per
-        # request and made Decode TTFT dominated by control-plane handshakes.
-        # Chunk here only for real transport safety limits (descriptor count or
-        # bytes), so the direct peer-buffer path stays zero-copy while avoiding
-        # unnecessary per-chunk round trips.
+        # Layered callers already pass one completed layer-group slice.  The
+        # previous code divided that slice again by the total registered layer
+        # count, multiplying synchronous dispatches.  Only transport safety
+        # limits should split this already-scoped descriptor batch.
         descriptors_per_group = single_batch_desc_limit
         effective_max_group_bytes = self.max_group_bytes
         if single_batch_byte_limit > 0:
@@ -2614,7 +2677,7 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             descriptors_per_group=descriptors_per_group,
             max_group_bytes=effective_max_group_bytes,
         )
-        logger.debug(
+        logger.info(
             "EPD Mooncake grouped transfer: remote=%s groups=%d descriptors=%d layers_per_group=%d max_group_bytes=%d max_transfer_descriptors=%d max_transfer_bytes=%d delay_ms=%.3f",
             remote_session,
             len(groups),
@@ -2628,10 +2691,8 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
 
         path_cursor = 0
         for group_idx, (src_group, dst_group, len_group) in enumerate(groups):
-            group_paths: list[str] | str | None = None
-            if isinstance(descriptor_paths, str):
-                group_paths = descriptor_paths
-            elif descriptor_paths is not None:
+            group_paths: list[str] | None = None
+            if descriptor_paths is not None:
                 next_cursor = path_cursor + len(src_group)
                 group_paths = descriptor_paths[path_cursor:next_cursor]
                 path_cursor = next_cursor
@@ -2656,17 +2717,14 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                     len(src_group),
                 )
                 return dispatch.ret_code
-        # The chunks above are transport safety chunks within one logical layer
-        # group.  Sleeping between them serialized an otherwise contiguous
-        # peer-buffer write and inflated TTFT.  If a caller explicitly requests
-        # a scheduling delay, apply it once at the logical group boundary.
-        if apply_logical_group_delay and self.group_delay_ms > 0:
-            self._accumulate_worker_meta(
-                LayeredTransferWorkerMeta(
-                    accumulated_group_delay_ms=self.group_delay_ms
+            if self.group_delay_ms > 0 and group_idx + 1 < len(groups):
+                self._accumulate_worker_meta(
+                    LayeredTransferWorkerMeta(
+                        accumulated_group_delay_ms=self.group_delay_ms
+                    )
                 )
-            )
-            time.sleep(self.group_delay_ms / 1000.0)
+                time.sleep(self.group_delay_ms / 1000.0)
+            self._publish_connector_metrics()
         return 0
 
 
@@ -2677,24 +2735,43 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         dst_ptrs: list[int],
         lengths: list[int],
         path_stats: dict[str, tuple[int, int]] | None = None,
-        descriptor_paths: list[str] | str | None = None,
+        descriptor_paths: list[str] | None = None,
         *,
         attempt: int = 0,
     ) -> _TransferDispatchResult:
         max_attempts = max(0, int(getattr(self, "transfer_retry_attempts", 0)))
-        can_retry = len(src_ptrs) > 1 and attempt < max_attempts
+        has_retry_budget = len(src_ptrs) > 1 and attempt < max_attempts
         dispatch = self._send_region_group_dispatch(
             remote_session,
             src_ptrs,
             dst_ptrs,
             lengths,
             path_stats,
-            record_failure_metrics=not can_retry,
+            record_failure_metrics=False,
         )
         if dispatch.ret_code == 0:
             return dispatch
 
+        retryable = is_retryable_transfer_failure(
+            dispatch.ret_code,
+            dispatch.error_message,
+        )
+        can_retry = has_retry_budget and retryable
         if not can_retry:
+            # The speculative dispatch above suppressed terminal failure
+            # accounting because retryability was not known until it returned.
+            self._record_terminal_transfer_failure(
+                dispatch,
+                path_stats=path_stats,
+            )
+            if has_retry_budget and not retryable:
+                logger.warning(
+                    "Not retrying non-retryable Mooncake transfer remote=%s ret=%s desc=%d err=%s",
+                    remote_session,
+                    dispatch.ret_code,
+                    len(src_ptrs),
+                    dispatch.error_message or "",
+                )
             return dispatch
 
         backoff_ms = max(0.0, float(getattr(self, "transfer_retry_backoff_ms", 0.0)))
@@ -2726,12 +2803,8 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             dispatch.ret_code,
         )
 
-        if isinstance(descriptor_paths, list):
-            left_paths: list[str] | str | None = descriptor_paths[:mid]
-            right_paths: list[str] | str | None = descriptor_paths[mid:]
-        else:
-            left_paths = descriptor_paths
-            right_paths = descriptor_paths
+        left_paths = descriptor_paths[:mid] if descriptor_paths is not None else None
+        right_paths = descriptor_paths[mid:] if descriptor_paths is not None else None
         left = self._send_region_group_with_retry(
             remote_session,
             src_ptrs[:mid],
@@ -2760,6 +2833,26 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             used_fallback=left.used_fallback or right.used_fallback,
         )
 
+    def _record_terminal_transfer_failure(
+        self,
+        dispatch: _TransferDispatchResult,
+        *,
+        path_stats: dict[str, tuple[int, int]] | None,
+    ) -> None:
+        failure_delta = LayeredTransferWorkerMeta(failed_batches=1)
+        self._accumulate_worker_meta(failure_delta)
+        path_failure_deltas = {
+            self._normalize_routing_path(path): LayeredTransferWorkerMeta(
+                failed_batches=1
+            )
+            for path, stats in dict(path_stats or {}).items()
+            if int(stats[0]) > 0 or int(stats[1]) > 0
+        }
+        if path_failure_deltas:
+            self._accumulate_worker_meta_by_path(path_failure_deltas)
+        self.xfer_stats.record_failed_transfer()
+        self._publish_connector_metrics()
+
     def _send_region_group_dispatch(
         self,
         remote_session: str,
@@ -2783,13 +2876,14 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 self._transfer_backend_delta(
                     dispatch.backend_label,
                     total_bytes=total_bytes,
-                    dispatch=dispatch,
+                    duration_ms=duration * 1000.0,
                 )
             )
             self._accumulate_worker_meta(delta)
             path_deltas = self._path_deltas_for_batch(
                 path_stats,
                 backend_label=dispatch.backend_label,
+                duration_ms=duration * 1000.0,
             )
             if path_deltas:
                 self._accumulate_worker_meta_by_path(path_deltas)
@@ -2808,18 +2902,32 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 self.group_delay_ms,
             )
         else:
+            failure_delta = self._transfer_backend_delta(
+                dispatch.backend_label,
+                total_bytes=total_bytes,
+                duration_ms=duration * 1000.0,
+                success=False,
+            )
             if record_failure_metrics:
-                self._accumulate_worker_meta(
+                failure_delta = failure_delta.aggregate(
                     LayeredTransferWorkerMeta(failed_batches=1)
                 )
-                path_failure_deltas = {
-                    self._normalize_routing_path(path): LayeredTransferWorkerMeta(failed_batches=1)
-                    for path in dict(path_stats or {})
-                }
-                if path_failure_deltas:
-                    self._accumulate_worker_meta_by_path(path_failure_deltas)
-                self._publish_connector_metrics()
                 self.xfer_stats.record_failed_transfer()
+            self._accumulate_worker_meta(failure_delta)
+            path_failure_deltas = self._path_deltas_for_batch(
+                path_stats,
+                backend_label=dispatch.backend_label,
+                duration_ms=duration * 1000.0,
+                success=False,
+            )
+            if record_failure_metrics:
+                path_failure_deltas = {
+                    path: delta.aggregate(LayeredTransferWorkerMeta(failed_batches=1))
+                    for path, delta in path_failure_deltas.items()
+                }
+            if path_failure_deltas:
+                self._accumulate_worker_meta_by_path(path_failure_deltas)
+            self._publish_connector_metrics()
             logger.warning(
                 "Layered Mooncake group send failed remote=%s ret=%s bytes=%d desc=%d path=%s",
                 remote_session,

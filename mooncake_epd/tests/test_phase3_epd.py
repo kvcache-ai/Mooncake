@@ -93,6 +93,7 @@ def model_proc_enc():
 
 @pytest.fixture(scope="module")
 def model_proc_pre():
+    require_real_model_and_gpus(GPU_PRE_ID)
     model, proc = load_model(GPU_PRE)
     try:
         yield model, proc
@@ -102,6 +103,7 @@ def model_proc_pre():
 
 @pytest.fixture(scope="module")
 def model_proc_dec():
+    require_real_model_and_gpus(GPU_DEC_ID)
     model, proc = load_model(GPU_DEC)
     try:
         yield model, proc
@@ -111,6 +113,7 @@ def model_proc_dec():
 
 @pytest.fixture(scope="module")
 def model_proc_single():
+    require_real_model_and_gpus(GPU_SINGLE_ID)
     model, proc = load_model(GPU_SINGLE)
     try:
         yield model, proc

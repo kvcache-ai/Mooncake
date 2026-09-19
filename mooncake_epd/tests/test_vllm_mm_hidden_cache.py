@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import torch
@@ -54,6 +56,8 @@ def test_vllm_mm_hidden_cache_skips_second_vision_compute(monkeypatch, tmp_path)
     assert stats["hits"] == 1
     assert stats["misses"] == 1
     assert stats["stores"] == 1
+    assert stats["lookup_lock_hold_p95_ms"] is not None
+    assert stats["cache_load_p95_ms"] is not None
 
     payloads = [json.loads(path.read_text()) for path in tmp_path.glob("*.mm_hidden.json")]
     assert len(payloads) == 1
@@ -176,6 +180,229 @@ def test_qwen3vl_hidden_cache_uses_stable_vllm_keys_per_image(monkeypatch, tmp_p
     assert stats["stores"] == 3
     assert stats["full_hit_batches"] == 1
     assert stats["partial_hit_batches"] == 1
+
+
+def test_qwen3vl_stable_key_path_does_not_read_full_pixel_bytes(monkeypatch, tmp_path):
+    monkeypatch.setenv("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE", "1")
+    monkeypatch.setenv("MOONCAKE_EPD_CONNECTOR_METRICS_DIR", str(tmp_path))
+    cache = VLLMMMHiddenStateCache()
+
+    class Visual(_Visual):
+        def __call__(self, pixel_values, *, grid_thw):
+            return torch.ones((int(grid_thw.shape[0]), 2), device=pixel_values.device)
+
+    visual = Visual()
+    grid = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    pixels = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    original = cache._tensor_raw_bytes
+
+    def _guard(tensor):
+        if tensor.data_ptr() == pixels.data_ptr():
+            raise AssertionError("stable key path read full pixel bytes")
+        return original(tensor)
+
+    monkeypatch.setattr(cache, "_tensor_raw_bytes", _guard)
+    output = cache.get_or_compute_qwen3vl_items(
+        pixel_values=pixels,
+        grid_thw=grid,
+        visual=visual,
+        compute_fn=lambda: torch.ones((1, 2)),
+        namespace="qwen3vl-test",
+        stable_keys=["source-sha256"],
+    )
+
+    assert tuple(output.shape) == (1, 2)
+    assert cache.stats["stable_key_lookups"] == 1
+    assert cache.stats["tensor_key_lookups"] == 0
+
+
+def test_sampled_tensor_candidate_collision_is_full_verified(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_HASH_SAMPLE_BYTES", "16")
+    cache = VLLMMMHiddenStateCache()
+    grid = torch.tensor([[1, 10, 10]], dtype=torch.long)
+    first = torch.zeros(100, dtype=torch.float32)
+    second = first.clone()
+    second[50] = 1.0
+
+    key_a = cache._tensor_key(pixel_values=first, grid_thw=grid, namespace="test")
+    key_b = cache._tensor_key(pixel_values=second, grid_thw=grid, namespace="test")
+
+    assert key_a != key_b
+    assert cache.stats["collision_full_verifies"] == 2
+    assert cache.stats["sampled_candidate_collisions"] == 1
+
+
+def test_qwen3vl_hidden_cache_coalesces_concurrent_stable_key_misses(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE", "1")
+    cache = VLLMMMHiddenStateCache()
+    barrier = threading.Barrier(4)
+    call_lock = threading.Lock()
+
+    class SlowVisual(_Visual):
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, pixel_values, *, grid_thw):
+            with call_lock:
+                self.calls += 1
+            time.sleep(0.05)
+            return torch.ones((int(grid_thw.shape[0]), 2))
+
+    visual = SlowVisual()
+    grid = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    pixels = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    outputs = []
+    errors = []
+
+    def _call():
+        try:
+            barrier.wait()
+            outputs.append(
+                cache.get_or_compute_qwen3vl_items(
+                    pixel_values=pixels,
+                    grid_thw=grid,
+                    visual=visual,
+                    compute_fn=lambda: visual(pixels, grid_thw=grid),
+                    namespace="qwen3vl-test",
+                    stable_keys=["same-source"],
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_call) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert errors == []
+    assert len(outputs) == 4
+    assert visual.calls == 1
+    assert all(torch.equal(output, outputs[0]) for output in outputs)
+    stats = cache.stats
+    assert stats["vision_encoder_calls"] == 1
+    assert stats["coalesced_waits"] >= 1
+    assert stats["coalesced_hits"] >= 1
+
+
+def test_qwen3vl_singleflight_releases_waiters_when_owner_compute_fails(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE", "1")
+    cache = VLLMMMHiddenStateCache()
+    barrier = threading.Barrier(2)
+    call_lock = threading.Lock()
+
+    class FailOnceVisual(_Visual):
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, pixel_values, *, grid_thw):
+            with call_lock:
+                self.calls += 1
+                call_number = self.calls
+            time.sleep(0.03)
+            if call_number == 1:
+                raise RuntimeError("injected vision failure")
+            return torch.ones((int(grid_thw.shape[0]), 2))
+
+    visual = FailOnceVisual()
+    grid = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    pixels = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    outputs = []
+    errors = []
+
+    def _call():
+        try:
+            barrier.wait()
+            outputs.append(
+                cache.get_or_compute_qwen3vl_items(
+                    pixel_values=pixels,
+                    grid_thw=grid,
+                    visual=visual,
+                    compute_fn=lambda: visual(pixels, grid_thw=grid),
+                    namespace="qwen3vl-test",
+                    stable_keys=["same-source"],
+                )
+            )
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=_call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert len(errors) == 1
+    assert len(outputs) == 1
+    assert visual.calls == 2
+    assert cache._inflight == {}
+    retry = cache.get_or_compute_qwen3vl_items(
+        pixel_values=pixels,
+        grid_thw=grid,
+        visual=visual,
+        compute_fn=lambda: visual(pixels, grid_thw=grid),
+        namespace="qwen3vl-test",
+        stable_keys=["same-source"],
+    )
+    assert torch.equal(retry, outputs[0])
+    assert visual.calls == 2
+
+
+def test_qwen3vl_singleflight_opposite_item_order_does_not_deadlock(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE", "1")
+    cache = VLLMMMHiddenStateCache()
+    barrier = threading.Barrier(2)
+    call_lock = threading.Lock()
+
+    class SlowVisual(_Visual):
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, pixel_values, *, grid_thw):
+            with call_lock:
+                self.calls += 1
+            time.sleep(0.04)
+            return torch.arange(int(grid_thw.shape[0]) * 2, dtype=torch.float32).reshape(-1, 2)
+
+    visual = SlowVisual()
+    grid = torch.tensor([[1, 2, 2], [1, 2, 2]], dtype=torch.long)
+    pixels = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+    outputs = []
+    errors = []
+
+    def _call(keys):
+        try:
+            barrier.wait()
+            outputs.append(
+                cache.get_or_compute_qwen3vl_items(
+                    pixel_values=pixels,
+                    grid_thw=grid,
+                    visual=visual,
+                    compute_fn=lambda: visual(pixels, grid_thw=grid),
+                    namespace="qwen3vl-test",
+                    stable_keys=keys,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_call, args=(["a", "b"],)),
+        threading.Thread(target=_call, args=(["b", "a"],)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert errors == []
+    assert len(outputs) == 2
+    assert visual.calls == 1
+    assert cache._inflight == {}
 
 
 def test_native_vllm_encoder_cache_hit_is_counted(monkeypatch, tmp_path):

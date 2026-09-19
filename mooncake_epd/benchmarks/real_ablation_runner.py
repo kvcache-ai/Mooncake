@@ -31,7 +31,7 @@ from mooncake_epd.core.transfer import Channel, Mode, TransferEngine, TransferPo
 from mooncake_epd.tests.dataset import WorkflowExample, build_dataset, make_image, summarize
 
 
-MODEL_PATH = os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct")
+MODEL_PATH = os.getenv("MOONCAKE_EPD_MODEL_PATH", "/data01/LWX/Qwen3-VL-8B-Instruct")
 DEFAULT_GPU_ENC = 3
 DEFAULT_GPU_PRE = 4
 DEFAULT_GPU_DEC = 5
@@ -579,7 +579,16 @@ def run_b8_approx_reuse(stack: RuntimeStack, examples: List[WorkflowExample], *,
                 )
                 return pout.kv_refs, pout.first_logits
 
-            reuse = ReusePipeline(sl, delta_prefill, relay_threshold=0.95, attention_threshold=0.90, enable_tier2=True, enable_tier3=True)
+            reuse = ReusePipeline(
+                sl,
+                delta_prefill,
+                relay_threshold=0.95,
+                attention_threshold=0.90,
+                enable_tier2=True,
+                enable_tier3=True,
+                enable_cost_gate=True,
+                force_approximate=True,
+            )
             prev_tokens = state0.meta.token_ids
             new_suffix = inputs1["input_ids"][0].tolist()[len(prev_tokens):]
             t0 = time.perf_counter()
@@ -636,6 +645,13 @@ def run_b8_approx_reuse(stack: RuntimeStack, examples: List[WorkflowExample], *,
                     "relay_recompute_segments": int(stats.relay_recompute_segments),
                     "relay_substring_hits": int(stats.relay_substring_hits),
                     "relay_substring_misses": int(stats.relay_substring_misses),
+                    "cost_gate_decision": str(stats.cost_gate_decision),
+                    "fallback_reason": str(stats.fallback_reason),
+                    "predicted_reusable_tokens": int(stats.predicted_reusable_tokens),
+                    "predicted_recompute_tokens": int(stats.predicted_recompute_tokens),
+                    "predicted_saved_prefill_ms": stats.predicted_saved_prefill_ms,
+                    "predicted_relay_overhead_ms": stats.predicted_relay_overhead_ms,
+                    "predicted_net_benefit_ms": stats.predicted_net_benefit_ms,
                 }
             )
             stack.pm_pre.release_refs(combined)

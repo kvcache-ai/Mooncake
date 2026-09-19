@@ -3,25 +3,24 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("vllm")
+from vllm.v1.request import RequestStatus  # noqa: E402
 
 from mooncake_epd.core.control.vllm_mooncake_connector import (  # noqa: E402
-    LayeredMooncakeXferMetadata,
     LayeredMooncakeXferResponse,
     MooncakeConnector,
     MooncakeConnectorMetadata,
     MooncakeXferResponseStatus,
     EPDMooncakeConnectorScheduler,
+    UpstreamMooncakeConnectorScheduler,
     UpstreamMooncakeConnectorWorker,
     _LayeredReceiveState,
     _LayeredSendState,
     EPDMooncakeConnectorWorker,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (  # noqa: E402
-    SendBlockMeta,
 )
 from mooncake_epd.core.control.connector_metrics import (  # noqa: E402
     ConnectorMetricsReader,
@@ -55,6 +54,11 @@ def _make_consumer_worker() -> EPDMooncakeConnectorWorker:
     worker._recv_transfer_routing_paths = {}
     worker._send_request_routing_paths = {}
     worker._send_transfer_routing_paths = {}
+    worker._remote_engine_incarnations = {}
+    worker._remote_incarnation_lock = asyncio.Lock()
+    worker._remote_agents = {}
+    worker._tp_size = {"decode-engine": 1}
+    worker._pending_bootstrap_queries = {}
     worker.async_zmq_ctx = type("Ctx", (), {"term": lambda self: None})()
     worker.receiver_loop = type(
         "Loop",
@@ -136,53 +140,6 @@ def test_wait_for_layer_load_blocks_until_group_event_arrives():
     assert worker._worker_meta.layer_wait_ms > 0.0  # noqa: SLF001
 
 
-def test_wait_for_layer_load_skips_terminal_receive_state():
-    worker = _make_consumer_worker()
-    state = worker._layered_recv_states["req-0"]  # noqa: SLF001
-    state.ack_group(0)
-    state.ack_group(1)
-    assert state.mark_finished_if_complete() is True
-
-    worker.wait_for_layer_load("layer0")
-
-    # A completed remote KV handoff must leave the layer callback entirely;
-    # continuing to poll it once per model layer slows Decode token throughput.
-    assert worker._worker_meta.layer_wait_calls == 0  # noqa: SLF001
-
-
-def test_connector_metrics_are_batched_until_terminal_boundary():
-    worker = _make_producer_worker()
-
-    class Sink:
-        enabled = True
-
-        def __init__(self):
-            self.records = []
-            self.flushes = 0
-
-        def record(self, meta, *, path_totals=None, force=False):
-            self.records.append((meta, dict(path_totals or {}), force))
-
-        def flush(self, *, force=True):
-            self.flushes += 1
-
-    sink = Sink()
-    worker._connector_metrics_sink = sink  # noqa: SLF001
-    worker._connector_metrics_flush_interval_s = 60.0  # noqa: SLF001
-    worker._connector_metrics_next_publish_monotonic = time.monotonic() + 60.0  # noqa: SLF001
-    worker._connector_metrics_lock = threading.RLock()  # noqa: SLF001
-    worker._connector_metrics_pending = LayeredTransferWorkerMeta()  # noqa: SLF001
-
-    worker._accumulate_worker_meta(LayeredTransferWorkerMeta(grouped_batches=1))  # noqa: SLF001
-    worker._publish_connector_metrics()  # noqa: SLF001
-    assert sink.records == []
-
-    worker._publish_connector_metrics(force=True)  # noqa: SLF001
-    assert len(sink.records) == 1
-    assert sink.records[0][0].grouped_batches == 1
-    assert sink.records[0][2] is True
-
-
 def test_save_kv_layer_only_announces_group_tail():
     worker = _make_producer_worker()
     state = worker._layered_send_states["xfer-0"]  # noqa: SLF001
@@ -195,29 +152,6 @@ def test_save_kv_layer_only_announces_group_tail():
 
     worker.save_kv_layer("layer2", None, None)
     assert state.group_ready_events[1].is_set() is True
-
-
-def test_layered_group_wait_uses_sender_loop_event_not_executor_threads(monkeypatch):
-    worker = _make_producer_worker()
-    state = worker._layered_send_states["xfer-0"]  # noqa: SLF001
-    send_meta = SendBlockMeta(
-        p_req_id="prefill-0",
-        transfer_id="xfer-0",
-        local_block_ids=[],
-        ready=asyncio.Event(),
-    )
-
-    async def _run() -> None:
-        async def _unexpected_to_thread(*args, **kwargs):
-            raise AssertionError("layered group wait must not consume asyncio.to_thread")
-
-        monkeypatch.setattr(asyncio, "to_thread", _unexpected_to_thread)
-        task = asyncio.create_task(worker._wait_group_ready((send_meta,), 0))
-        await asyncio.sleep(0)
-        state.mark_group_ready(0)
-        await task
-
-    asyncio.run(_run())
 
 
 def test_layered_receive_state_can_resize_groups_without_losing_progress():
@@ -308,38 +242,6 @@ def test_process_pulling_result_does_not_double_count_finished_request():
     assert worker._worker_meta.received_finished_reqs == 1  # noqa: SLF001
 
 
-def test_process_pulling_result_records_receive_kv_latency_breakdown():
-    worker = _make_consumer_worker()
-    state = worker._layered_recv_states["req-0"]  # noqa: SLF001
-    state.mark_started(time.perf_counter() - 0.01)
-    worker._recv_request_routing_paths = {"req-0": "EPD"}  # noqa: SLF001
-
-    response0 = LayeredMooncakeXferResponse(
-        status=MooncakeXferResponseStatus.CONTINUE,
-        ok_reqs=["req-0"],
-        group_index=0,
-        total_groups=2,
-    )
-    response1 = LayeredMooncakeXferResponse(
-        status=MooncakeXferResponseStatus.FINISH,
-        ok_reqs=["req-0"],
-        group_index=1,
-        total_groups=2,
-    )
-
-    worker.process_pulling_result(response0, {"req-0": None})  # type: ignore[arg-type]
-    worker.process_pulling_result(response1, {"req-0": None})  # type: ignore[arg-type]
-    worker.process_pulling_result(response1, {"req-0": None})  # type: ignore[arg-type]
-
-    assert worker._worker_meta.receive_kv_first_group_count == 1  # noqa: SLF001
-    assert worker._worker_meta.receive_kv_first_group_ms > 0  # noqa: SLF001
-    assert worker._worker_meta.receive_kv_finished_count == 1  # noqa: SLF001
-    assert worker._worker_meta.receive_kv_finished_ms >= worker._worker_meta.receive_kv_first_group_ms  # noqa: SLF001
-    epd_meta = worker._connector_metrics_pending_by_path["EPD"]  # noqa: SLF001
-    assert epd_meta.receive_kv_first_group_count == 1
-    assert epd_meta.receive_kv_finished_count == 1
-
-
 def test_record_send_reqs_creates_ready_placeholder_for_early_layered_send():
     worker = _make_producer_worker()
     metadata = MooncakeConnectorMetadata()
@@ -392,100 +294,6 @@ def test_record_send_reqs_does_not_drop_ready_transfer_without_matching_not_proc
     assert worker.reqs_need_send.get("xfer-other") is None
 
 
-def test_layered_send_dispatches_ready_subset_without_waiting_for_slow_batch_peer():
-    class _Sock:
-        def __init__(self):
-            self.responses = []
-
-        async def send_multipart(self, parts):
-            self.responses.append(parts[1])
-
-    class _Loop:
-        async def run_in_executor(self, _executor, fn, *args):
-            return fn(*args)
-
-    async def run_case():
-        worker = _make_producer_worker()
-        worker.sender_loop = _Loop()
-        worker.transfer_topo = type("Topo", (), {"handshake_target_ranks": lambda self, _size: [0]})()
-        worker.tp_size = 1
-        worker.kv_caches_base_addr = []
-        worker.block_len_per_layer = []
-        worker._get_transfer_regions = lambda *args: []  # noqa: SLF001
-        worker._validate_regions = lambda *args: None  # noqa: SLF001
-        worker._encoder = type("Encoder", (), {"encode": lambda self, value: value})()
-        worker.resolve_need_send = lambda send_meta, _ranks: setattr(send_meta, "need_send", 1)
-        worker._publish_connector_metrics = lambda *args, **kwargs: None  # noqa: SLF001
-        worker.finished_sending_reqs = set()
-
-        async def build_params(*, ready_reqs, group_idx, **kwargs):
-            return (
-                [1000 + group_idx + idx for idx, _ in enumerate(ready_reqs)],
-                [2000 + group_idx + idx for idx, _ in enumerate(ready_reqs)],
-                [64 for _ in ready_reqs],
-                [],
-                None,
-                {},
-                ["EPD" for _ in ready_reqs],
-            )
-
-        worker._build_transfer_params_for_group = build_params  # type: ignore[method-assign]
-        worker._send_blocks = lambda *args: 0  # noqa: SLF001
-
-        first = SendBlockMeta(
-            p_req_id="prefill-fast",
-            transfer_id="xfer-fast",
-            local_block_ids=[[1]],
-            ready=asyncio.Event(),
-        )
-        slow = SendBlockMeta(
-            p_req_id="prefill-slow",
-            transfer_id="xfer-slow",
-            local_block_ids=[[2]],
-            ready=asyncio.Event(),
-        )
-        first.ready.set()
-        worker.reqs_need_send = {"xfer-fast": first, "xfer-slow": slow}
-        worker._layered_send_states = {  # noqa: SLF001
-            "xfer-fast": _LayeredSendState.create("xfer-fast", 2),
-            "xfer-slow": _LayeredSendState.create("xfer-slow", 2),
-        }
-        for event in worker._layered_send_states["xfer-fast"].group_ready_events:  # noqa: SLF001
-            event.set()
-
-        meta = LayeredMooncakeXferMetadata(
-            remote_hostname="127.0.0.1",
-            remote_port=9000,
-            remote_tp_size=1,
-            remote_tp_rank=0,
-            req_blocks={
-                "decode-fast": ("xfer-fast", [[11]]),
-                "decode-slow": ("xfer-slow", [[12]]),
-            },
-            kv_caches_base_addr=[],
-            block_lens=[],
-            layered=True,
-            total_groups=2,
-        )
-        sock = _Sock()
-        task = asyncio.create_task(worker.send_kv_to_decode(b"peer", sock, meta))
-        await asyncio.sleep(0.05)
-
-        assert sock.responses
-        assert all(response.ok_reqs == ["decode-fast"] for response in sock.responses)
-        assert all(response.status is MooncakeXferResponseStatus.CONTINUE for response in sock.responses)
-
-        slow.ready.set()
-        for event in worker._layered_send_states["xfer-slow"].group_ready_events:  # noqa: SLF001
-            event.set()
-        await task
-
-        assert sock.responses[-1].status is MooncakeXferResponseStatus.FINISH
-        assert sock.responses[-1].ok_reqs == ["decode-slow"]
-
-    asyncio.run(run_case())
-
-
 def test_scheduler_build_connector_meta_captures_routing_paths():
     scheduler = object.__new__(EPDMooncakeConnectorScheduler)
     scheduler.is_kv_producer = True
@@ -514,20 +322,200 @@ def test_scheduler_build_connector_meta_captures_routing_paths():
     assert meta.transfer_routing_paths["xfer-epd"] == "EPD"
 
 
+def test_scheduler_request_finished_exports_prefill_process_incarnation(monkeypatch):
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.engine_id = "prefill-engine"
+    scheduler.remote_bootstrap_addr = "http://prefill-bootstrap:8998"
+    scheduler.tp_size = 1
+    scheduler.get_sw_clipped_blocks = lambda block_ids: list(block_ids)
+    monkeypatch.setattr(
+        UpstreamMooncakeConnectorScheduler,
+        "request_finished",
+        lambda *_args, **_kwargs: (True, None),
+    )
+    request = SimpleNamespace(
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        kv_transfer_params={
+            "transfer_id": "xfer-incarnation",
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+        },
+    )
+
+    _, params = scheduler.request_finished(request, ([1, 2],))
+
+    assert params is not None
+    assert params["remote_engine_id"] == "prefill-engine"
+    assert params["remote_engine_incarnation"]
+
+
+def test_scheduler_build_connector_meta_captures_remote_engine_incarnation():
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.is_kv_producer = False
+    scheduler.is_kv_consumer = True
+    scheduler._reqs_need_send = {}
+    scheduler._reqs_need_recv = {
+        "req-incarnation": (
+            SimpleNamespace(
+                kv_transfer_params={
+                    "transfer_id": "xfer-incarnation",
+                    "remote_engine_id": "prefill-engine",
+                    "remote_engine_incarnation": "prefill-token-a",
+                    "remote_bootstrap_addr": "http://prefill-bootstrap:8998",
+                    "routing_path": "EPD",
+                }
+            ),
+            [[1, 2]],
+        )
+    }
+    scheduler._reqs_not_processed = set()
+
+    meta = scheduler.build_connector_meta(None)
+
+    assert meta.remote_engine_incarnations == {
+        "prefill-engine": "prefill-token-a"
+    }
+
+
+def test_consumer_prefill_incarnation_fence_invalidates_only_changed_engine():
+    worker = _make_consumer_worker()
+    worker._remote_engine_incarnations = {
+        "prefill-a": "token-a-old",
+        "prefill-b": "token-b",
+    }
+    worker._remote_agents = {
+        "prefill-a": {0: {0: "tcp://old-a"}},
+        "prefill-b": {0: {0: "tcp://stable-b"}},
+    }
+    worker._tp_size = {
+        "decode-engine": 1,
+        "prefill-a": 1,
+        "prefill-b": 1,
+    }
+
+    refreshed = asyncio.run(
+        worker._fence_remote_engine_incarnations(
+            {
+                "prefill-a": "token-a-new",
+                "prefill-b": "token-b",
+            },
+            {
+                "prefill-a": "http://prefill-a:8998",
+                "prefill-b": "http://prefill-b:8998",
+            },
+        )
+    )
+
+    assert refreshed == ["prefill-a"]
+    assert worker._remote_engine_incarnations["prefill-a"] == "token-a-new"
+    assert "prefill-a" not in worker._remote_agents
+    assert "prefill-a" not in worker._tp_size
+    assert worker._remote_agents["prefill-b"][0][0] == "tcp://stable-b"
+    assert worker._tp_size["prefill-b"] == 1
+    assert worker._worker_meta.topology_incarnation_observations == 2
+    assert worker._worker_meta.topology_incarnation_refreshes == 1
+
+
+def test_consumer_prefill_incarnation_fence_waits_for_inflight_bootstrap():
+    async def scenario():
+        worker = _make_consumer_worker()
+        worker._remote_engine_incarnations = {"prefill-a": "token-old"}
+        worker._remote_agents = {"prefill-a": {0: {0: "tcp://stale"}}}
+        worker._tp_size["prefill-a"] = 1
+        pending = asyncio.Event()
+        worker._pending_bootstrap_queries = {"http://prefill-a:8998": pending}
+
+        task = asyncio.create_task(
+            worker._fence_remote_engine_incarnations(
+                {"prefill-a": "token-new"},
+                {"prefill-a": "http://prefill-a:8998"},
+            )
+        )
+        await asyncio.sleep(0)
+        assert task.done() is False
+        assert "prefill-a" in worker._remote_agents
+
+        pending.set()
+        refreshed = await task
+        return worker, refreshed
+
+    worker, refreshed = asyncio.run(scenario())
+
+    assert refreshed == ["prefill-a"]
+    assert "prefill-a" not in worker._remote_agents
+    assert worker._worker_meta.topology_incarnation_pending_waits == 1
+
+
+def test_layered_producer_sends_full_allocated_prefix_cache_blocks(monkeypatch):
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.layered_kv_transfer = True
+    scheduler.is_kv_producer = True
+    scheduler.is_kv_consumer = False
+    scheduler._reqs_need_send = {}
+    scheduler.get_sw_clipped_blocks = lambda block_ids: list(block_ids)
+    monkeypatch.setattr(
+        UpstreamMooncakeConnectorScheduler,
+        "update_state_after_alloc",
+        lambda *_args, **_kwargs: None,
+    )
+
+    full_blocks = list(range(64))
+    blocks = SimpleNamespace(
+        get_block_ids=lambda: (full_blocks,),
+        get_unhashed_block_ids_all_groups=lambda: [[63]],
+    )
+    request = SimpleNamespace(
+        request_id="req-prefix-hit",
+        kv_transfer_params={
+            "transfer_id": "xfer-prefix-hit",
+            "do_remote_decode": True,
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    _, local_block_ids = scheduler._reqs_need_send["req-prefix-hit"]
+    assert local_block_ids == [full_blocks]
+
+
+def test_layered_producer_excludes_hybrid_cache_null_padding_blocks(monkeypatch):
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.layered_kv_transfer = True
+    scheduler.is_kv_producer = True
+    scheduler.is_kv_consumer = False
+    scheduler._reqs_need_send = {}
+    scheduler.get_sw_clipped_blocks = lambda block_ids: list(block_ids)
+    monkeypatch.setattr(
+        UpstreamMooncakeConnectorScheduler,
+        "update_state_after_alloc",
+        lambda *_args, **_kwargs: None,
+    )
+    blocks = SimpleNamespace(
+        blocks=(
+            [
+                SimpleNamespace(block_id=10, is_null=False),
+                SimpleNamespace(block_id=11, is_null=True),
+                SimpleNamespace(block_id=12, is_null=False),
+            ],
+        ),
+    )
+    request = SimpleNamespace(
+        request_id="req-hybrid-padding",
+        kv_transfer_params={
+            "transfer_id": "xfer-hybrid-padding",
+            "do_remote_decode": True,
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    _, local_block_ids = scheduler._reqs_need_send["req-hybrid-padding"]
+    assert local_block_ids == [[10, 12]]
+
+
 def test_batched_transfer_regions_uses_peer_buffer_direct_path():
     worker = _make_producer_worker()
-    worker._transfer_region_descriptors_via_peer_engine = lambda *args, **kwargs: type(  # noqa: SLF001
-        "Dispatch",
-        (),
-        {
-            "ret_code": 0,
-            "backend_label": "peer_buffer_direct",
-            "used_fallback": False,
-            "dispatch_ms": 1.0,
-            "prepare_ms": 0.1,
-            "write_ms": 0.8,
-        },
-    )()
+    worker._transfer_region_descriptors_via_peer_engine = lambda *args, **kwargs: 0
     worker.engine = type(
         "Engine",
         (),
@@ -578,17 +566,7 @@ def test_batched_transfer_regions_falls_back_to_raw_batch_write_on_peer_failure(
 
 def test_send_region_group_records_peer_buffer_path_metrics():
     worker = _make_producer_worker()
-    worker._transfer_region_descriptors_via_peer_engine = lambda *args, **kwargs: type(  # noqa: SLF001
-        "Dispatch",
-        (),
-        {
-            "ret_code": 0,
-            "backend_label": "peer_buffer_direct",
-            "dispatch_ms": 1.0,
-            "prepare_ms": 0.1,
-            "write_ms": 0.8,
-        },
-    )()
+    worker._transfer_region_descriptors_via_peer_engine = lambda *args, **kwargs: 0
     worker.engine = type(
         "Engine",
         (),
@@ -606,9 +584,13 @@ def test_send_region_group_records_peer_buffer_path_metrics():
     assert worker._worker_meta.grouped_batches == 1  # noqa: SLF001
     assert worker._worker_meta.peer_buffer_batches == 1  # noqa: SLF001
     assert worker._worker_meta.peer_buffer_bytes == 64  # noqa: SLF001
-    assert worker._worker_meta.peer_buffer_dispatch_ms == 1.0  # noqa: SLF001
-    assert worker._worker_meta.peer_buffer_write_ms == 0.8  # noqa: SLF001
     assert worker._worker_meta.backend_counts["peer_buffer_direct"] == 1  # noqa: SLF001
+    assert worker._worker_meta.transfer_attempts == 1  # noqa: SLF001
+    assert worker._worker_meta.transfer_successes == 1  # noqa: SLF001
+    assert worker._worker_meta.transfer_bytes == 64  # noqa: SLF001
+    assert worker._worker_meta.transfer_elapsed_ms > 0.0  # noqa: SLF001
+    assert worker._worker_meta.to_dict()["transfer_bandwidth_gbps"] > 0.0  # noqa: SLF001
+    assert worker._worker_meta.backend_bytes["peer_buffer_direct"] == 64  # noqa: SLF001
 
 
 def test_send_blocks_uses_direct_dispatch_even_when_not_layered(monkeypatch):
@@ -641,7 +623,6 @@ def test_send_blocks_with_descriptor_paths_preserves_path_totals(tmp_path):
         tp_rank=0,
     )
     worker.layers_per_group = 1
-    worker.max_transfer_descriptors = 2
     worker._batched_transfer_regions = lambda *args, **kwargs: type(  # noqa: SLF001
         "Dispatch",
         (),
@@ -660,14 +641,17 @@ def test_send_blocks_with_descriptor_paths_preserves_path_totals(tmp_path):
     aggregate = ConnectorMetricsReader(tmp_path).aggregate()
     totals = aggregate.totals
     path_totals = aggregate.path_totals
-    assert totals.grouped_batches == 3
-    assert sum(meta.grouped_batches for meta in path_totals.values()) == totals.grouped_batches
+    assert totals.grouped_batches == 1
+    # One physical batch may carry descriptors from multiple routing paths;
+    # path-local batch counters therefore count path touches, not disjoint
+    # physical submissions.
+    assert sum(meta.grouped_batches for meta in path_totals.values()) == 2
     assert sum(meta.grouped_bytes for meta in path_totals.values()) == totals.grouped_bytes
     assert sum(meta.grouped_descriptors for meta in path_totals.values()) == totals.grouped_descriptors
-    assert sum(meta.peer_buffer_batches for meta in path_totals.values()) == totals.peer_buffer_batches
+    assert sum(meta.peer_buffer_batches for meta in path_totals.values()) == 2
     assert sum(meta.peer_buffer_bytes for meta in path_totals.values()) == totals.peer_buffer_bytes
     assert path_totals["PD"].grouped_batches == 1
-    assert path_totals["EPD"].grouped_batches == 2
+    assert path_totals["EPD"].grouped_batches == 1
 
 
 def test_build_connector_worker_meta_flushes_shared_metrics(tmp_path):
@@ -705,6 +689,102 @@ def test_build_connector_worker_meta_flushes_shared_metrics(tmp_path):
     assert '"peer_buffer_direct": 2' in payload
     assert '"path_totals"' in payload
     assert '"EPD"' in payload
+
+
+def test_build_connector_worker_meta_defers_batched_io_until_request_finishes(
+    tmp_path,
+    monkeypatch,
+):
+    worker = _make_producer_worker()
+    worker.layered_kv_transfer = False
+    worker._connector_metrics_sink = ConnectorMetricsSink(  # noqa: SLF001
+        tmp_path,
+        engine_id="engine-deferred-build",
+        role="producer",
+        hostname="host-deferred",
+        rpc_port=9011,
+        tp_rank=0,
+        flush_interval_s=60.0,
+        max_pending_records=100,
+    )
+    delta = LayeredTransferWorkerMeta(
+        grouped_batches=1,
+        grouped_bytes=64,
+        grouped_descriptors=2,
+    )
+    worker._worker_meta = delta  # noqa: SLF001
+    worker._connector_metrics_pending = delta  # noqa: SLF001
+    worker._send_request_routing_paths = {"req-0": "EPD"}  # noqa: SLF001
+
+    meta = worker.build_connector_worker_meta()
+
+    assert meta is not None
+    assert worker._connector_metrics_sink.path is not None  # noqa: SLF001
+    assert worker._connector_metrics_sink.path.exists() is False  # noqa: SLF001
+    assert worker._connector_metrics_sink.io_stats["flushes"] == 0  # noqa: SLF001
+
+    monkeypatch.setattr(
+        UpstreamMooncakeConnectorWorker,
+        "get_finished",
+        lambda self: ({"req-0"}, set()),
+    )
+    finished_sending, finished_recving = worker.get_finished()
+
+    assert finished_sending == {"req-0"}
+    assert finished_recving == set()
+    assert worker._connector_metrics_sink.path.exists() is True  # noqa: SLF001
+    aggregate = ConnectorMetricsReader(tmp_path).aggregate()
+    assert aggregate.totals.grouped_batches == 1
+    assert worker._connector_metrics_sink.io_stats["flushes"] == 1  # noqa: SLF001
+
+
+def test_connector_metrics_sink_batches_atomic_file_updates(tmp_path):
+    sink = ConnectorMetricsSink(
+        tmp_path,
+        engine_id="engine-batched",
+        role="producer",
+        hostname="host-batched",
+        rpc_port=9010,
+        tp_rank=0,
+        flush_interval_s=60.0,
+        max_pending_records=3,
+    )
+    delta = LayeredTransferWorkerMeta(
+        grouped_batches=1,
+        grouped_bytes=32,
+        grouped_descriptors=1,
+    )
+
+    sink.record(delta)
+    sink.record(delta)
+    assert sink.path is not None
+    assert sink.path.exists() is False
+
+    sink.record(delta)
+    assert sink.path.exists() is True
+    aggregate = ConnectorMetricsReader(tmp_path).aggregate()
+    assert aggregate.totals.grouped_batches == 3
+    assert sink.io_stats["flushes"] == 1
+    assert sink.io_stats["deferred_records"] == 2
+
+
+def test_connector_metrics_sink_force_flushes_deferred_snapshot(tmp_path):
+    sink = ConnectorMetricsSink(
+        tmp_path,
+        engine_id="engine-forced",
+        role="producer",
+        flush_interval_s=60.0,
+        max_pending_records=100,
+    )
+    sink.record(LayeredTransferWorkerMeta(grouped_batches=1, grouped_bytes=16))
+
+    assert sink.path is not None
+    assert sink.path.exists() is False
+    sink.flush()
+
+    assert sink.path.exists() is True
+    assert ConnectorMetricsReader(tmp_path).aggregate().totals.grouped_batches == 1
+    assert sink.io_stats["flushes"] == 1
 
 
 def test_consumer_build_connector_worker_meta_flushes_receive_metrics(tmp_path):
@@ -783,62 +863,6 @@ def test_send_region_group_publishes_shared_metrics_immediately(tmp_path):
     assert '"peer_buffer_direct": 1' in payload
 
 
-
-def test_send_blocks_does_not_overchunk_layered_group_that_fits_transport_limits():
-    worker = _make_producer_worker()
-    worker.layered_kv_transfer = True
-    worker.layers_per_group = 1
-    worker._registered_region_count = 128
-    worker.max_group_bytes = 0
-    worker.max_transfer_descriptors = 128
-    worker.max_transfer_bytes = 0
-    calls = []
-
-    def _dispatch(remote, src, dst, lengths, path_stats=None, **kwargs):
-        calls.append((list(src), list(dst), list(lengths), dict(path_stats or {})))
-        return type("Dispatch", (), {"ret_code": 0, "backend_label": "peer_buffer_direct"})()
-
-    worker._send_region_group_dispatch = _dispatch  # type: ignore[method-assign]
-
-    ret = worker._send_blocks(
-        "peer-no-overchunk",
-        list(range(24)),
-        list(range(100, 124)),
-        [16] * 24,
-        ["EPD"] * 24,
-    )
-
-    assert ret == 0
-    assert [len(src) for src, _, _, _ in calls] == [24]
-
-
-def test_send_blocks_uses_constant_path_label_without_per_descriptor_list():
-    worker = _make_producer_worker()
-    worker.max_transfer_descriptors = 2
-    worker.max_transfer_bytes = 0
-    calls = []
-
-    def _dispatch(remote, src, dst, lengths, path_stats=None, **kwargs):
-        calls.append(dict(path_stats or {}))
-        return type("Dispatch", (), {"ret_code": 0, "backend_label": "peer_buffer_direct"})()
-
-    worker._send_region_group_dispatch = _dispatch  # type: ignore[method-assign]
-
-    ret = worker._send_blocks(
-        "peer-constant-path",
-        [1, 2, 3, 4, 5],
-        [11, 12, 13, 14, 15],
-        [8, 8, 8, 8, 8],
-        "PD",
-    )
-
-    assert ret == 0
-    assert calls == [
-        {"PD": (2, 16)},
-        {"PD": (2, 16)},
-        {"PD": (1, 8)},
-    ]
-
 def test_send_blocks_applies_transport_safety_chunking_for_large_descriptor_burst():
     worker = _make_producer_worker()
     worker.layered_kv_transfer = True
@@ -887,6 +911,185 @@ def test_send_blocks_applies_transport_safety_chunking_even_without_layered_mode
     assert [len(src) for src, _, _ in calls] == [2, 1]
 
 
+def test_send_blocks_does_not_resplit_already_layer_scoped_batch():
+    worker = _make_producer_worker()
+    worker.layered_kv_transfer = True
+    worker.layers_per_group = 2
+    worker._registered_region_count = 64
+    worker.max_group_bytes = 0
+    worker.max_transfer_descriptors = 32
+    worker.max_transfer_bytes = 16 * 1024 * 1024
+    calls = []
+
+    def _dispatch(remote, src, dst, lengths, path_stats=None, descriptor_paths=None, **kwargs):
+        calls.append((list(src), list(dst), list(lengths), list(descriptor_paths or [])))
+        return SimpleNamespace(
+            ret_code=0,
+            backend_label="peer_buffer_direct",
+            used_fallback=False,
+            error_message=None,
+        )
+
+    worker._send_region_group_with_retry = _dispatch  # type: ignore[method-assign]
+
+    ret = worker._send_blocks(
+        "peer-layer-scoped",
+        list(range(8)),
+        list(range(100, 108)),
+        [32] * 8,
+        ["EPD"] * 8,
+    )
+
+    assert ret == 0
+    assert [len(src) for src, _, _, _ in calls] == [8]
+
+
+def test_send_blocks_applies_group_delay_only_between_transport_chunks(monkeypatch):
+    worker = _make_producer_worker()
+    worker.layered_kv_transfer = True
+    worker.layers_per_group = 2
+    worker._registered_region_count = 4
+    worker.max_group_bytes = 0
+    worker.max_transfer_descriptors = 2
+    worker.max_transfer_bytes = 0
+    worker.transfer_retry_attempts = 0
+    worker.group_delay_ms = 1.5
+    sleeps = []
+
+    worker._batched_transfer_regions = lambda *args, **kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        ret_code=0,
+        backend_label="peer_buffer_direct",
+        used_fallback=False,
+        error_message=None,
+    )
+    monkeypatch.setattr(
+        "mooncake_epd.core.control.vllm_mooncake_connector.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    ret = worker._send_blocks(
+        "peer-delayed",
+        [1, 2, 3, 4, 5],
+        [11, 12, 13, 14, 15],
+        [8, 8, 8, 8, 8],
+    )
+
+    assert ret == 0
+    assert sleeps == [0.0015, 0.0015]
+    assert worker._worker_meta.accumulated_group_delay_ms == 3.0  # noqa: SLF001
+
+
+def test_send_region_group_does_not_retry_non_retryable_memory_error():
+    worker = _make_producer_worker()
+    worker.transfer_retry_attempts = 6
+    worker.transfer_retry_backoff_ms = 0.0
+    calls = []
+
+    def _dispatch(*args, **kwargs):
+        calls.append(len(args[1]))
+        return SimpleNamespace(
+            ret_code=-1,
+            backend_label="peer_buffer_direct",
+            used_fallback=False,
+            error_message="destination MR is out of bounds",
+        )
+
+    worker._send_region_group_dispatch = _dispatch  # type: ignore[method-assign]
+
+    result = worker._send_region_group_with_retry(
+        "peer-invalid-mr",
+        [1, 2, 3, 4],
+        [11, 12, 13, 14],
+        [8, 8, 8, 8],
+    )
+
+    assert result.ret_code == -1
+    assert calls == [4]
+
+
+def test_build_transfer_params_coalesces_adjacent_requests_within_same_registered_region():
+    worker = _make_producer_worker()
+    worker.enable_descriptor_coalescing = True
+    worker._send_request_routing_paths = {"req-0": "EPD", "req-1": "EPD"}  # noqa: SLF001
+    worker._get_sender_transfer_plan = lambda **_kwargs: (True, 0, 0, 32)  # type: ignore[method-assign]
+    ready_reqs = [
+        (
+            "req-0",
+            SimpleNamespace(transfer_id="xfer-0", local_block_ids=[[0]]),
+        ),
+        (
+            "req-1",
+            SimpleNamespace(transfer_id="xfer-1", local_block_ids=[[1]]),
+        ),
+    ]
+    agent_meta = SimpleNamespace(
+        req_blocks={
+            "req-0": ("xfer-0", [[10]]),
+            "req-1": ("xfer-1", [[11]]),
+        },
+        remote_tp_rank=0,
+        remote_tp_size=1,
+    )
+    local_regions = [SimpleNamespace(base_addr=1000, block_len=32, kv_block_len=32)]
+    remote_regions = [SimpleNamespace(base_addr=2000, block_len=32, kv_block_len=32)]
+
+    src, dst, lengths, errors, message, path_stats, paths = asyncio.run(
+        worker._build_transfer_params_with_path_stats(  # noqa: SLF001
+            ready_reqs,
+            agent_meta,
+            local_regions,
+            remote_regions,
+        )
+    )
+
+    assert errors == []
+    assert message is None
+    assert src == [1000]
+    assert dst == [2320]
+    assert lengths == [64]
+    assert paths == ["EPD"]
+    assert path_stats == {"EPD": (1, 64)}
+    assert worker._worker_meta.descriptor_build_calls == 1  # noqa: SLF001
+    assert worker._worker_meta.descriptor_build_input_descriptors == 2  # noqa: SLF001
+    assert worker._worker_meta.descriptor_build_output_descriptors == 1  # noqa: SLF001
+    assert worker._worker_meta.coalesced_descriptors == 1  # noqa: SLF001
+
+
+def test_build_transfer_params_can_disable_descriptor_coalescing():
+    worker = _make_producer_worker()
+    worker.enable_descriptor_coalescing = False
+    worker._send_request_routing_paths = {"req-0": "EPD", "req-1": "EPD"}  # noqa: SLF001
+    worker._get_sender_transfer_plan = lambda **_kwargs: (True, 0, 0, 32)  # type: ignore[method-assign]
+    ready_reqs = [
+        ("req-0", SimpleNamespace(transfer_id="xfer-0", local_block_ids=[[0]])),
+        ("req-1", SimpleNamespace(transfer_id="xfer-1", local_block_ids=[[1]])),
+    ]
+    agent_meta = SimpleNamespace(
+        req_blocks={
+            "req-0": ("xfer-0", [[10]]),
+            "req-1": ("xfer-1", [[11]]),
+        },
+        remote_tp_rank=0,
+        remote_tp_size=1,
+    )
+
+    src, dst, lengths, *_ = asyncio.run(
+        worker._build_transfer_params_with_path_stats(  # noqa: SLF001
+            ready_reqs,
+            agent_meta,
+            [SimpleNamespace(base_addr=1000, block_len=32, kv_block_len=32)],
+            [SimpleNamespace(base_addr=2000, block_len=32, kv_block_len=32)],
+        )
+    )
+
+    assert src == [1000, 1032]
+    assert dst == [2320, 2352]
+    assert lengths == [32, 32]
+    assert worker._worker_meta.descriptor_build_input_descriptors == 2  # noqa: SLF001
+    assert worker._worker_meta.descriptor_build_output_descriptors == 2  # noqa: SLF001
+    assert worker._worker_meta.coalesced_descriptors == 0  # noqa: SLF001
+
+
 def test_direct_peer_failure_can_be_fail_fast_when_fallback_disabled():
     worker = _make_producer_worker()
     worker.allow_transfer_fallback = False
@@ -904,6 +1107,28 @@ def test_direct_peer_failure_can_be_fail_fast_when_fallback_disabled():
     assert result.ret_code != 0
     assert result.backend_label == "peer_buffer_direct"
     assert "direct path failed" in (result.error_message or "")
+
+
+def test_send_region_group_records_failed_transfer_timing_without_fake_bandwidth():
+    worker = _make_producer_worker()
+    worker._batched_transfer_regions = lambda *args, **kwargs: type(  # noqa: SLF001
+        "Dispatch",
+        (),
+        {"ret_code": -1, "backend_label": "peer_buffer_direct"},
+    )()
+
+    ret = worker._send_region_group("peer-fail", [1], [2], [64])
+
+    assert ret == -1
+    meta = worker._worker_meta  # noqa: SLF001
+    payload = meta.to_dict()
+    assert meta.failed_batches == 1
+    assert meta.transfer_attempts == 1
+    assert meta.transfer_successes == 0
+    assert meta.transfer_bytes == 0
+    assert meta.transfer_attempt_elapsed_ms > 0.0
+    assert meta.backend_failures["peer_buffer_direct"] == 1
+    assert payload["transfer_bandwidth_gbps"] is None
 
 
 def test_save_kv_layer_only_marks_active_transfer_scope():

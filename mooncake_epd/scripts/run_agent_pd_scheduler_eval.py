@@ -13,14 +13,9 @@ import argparse
 import json
 import math
 import statistics
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT.parent))
 
 from mooncake_epd.core.control import ServingControlPlane, ServingControlPlaneConfig
 

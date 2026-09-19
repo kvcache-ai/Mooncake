@@ -9,11 +9,12 @@ build/
 *.log
 venv/
 .env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.omx/
+.omo/
+artifacts/
 .epd-eval/
-config/
-coding_plan/
 benchmarks/benchmark_results.json
 benchmarks/*_results.json
-artifacts/phase6_metrics.json
-artifacts/rfc_*.json
-artifacts/rfc_*.md
