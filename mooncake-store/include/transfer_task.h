@@ -318,6 +318,11 @@ class TransferFuture {
     std::shared_ptr<OperationState> state_;
 };
 
+/// Scatter transfer operation returned by TransferSubmitter::submitScatter().
+///
+/// Thread safety: NOT thread-safe. Only one thread may call wait(),
+/// waitFor(), or destroy this object at a time. The caller that received
+/// the operation from submitScatter() owns it for its entire lifetime.
 class StoreScatterTransferOperation {
    public:
     StoreScatterTransferOperation(StoreScatterTransferOperation&&) noexcept;

@@ -1434,28 +1434,9 @@ std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
-    int intent_value = 0;
-    switch (intent) {
-        case TransferIntent::kUnspecified:
-            intent_value = 0;
-            break;
-        case TransferIntent::kForegroundGet:
-            intent_value = 1;
-            break;
-        case TransferIntent::kBackgroundPrefetch:
-            intent_value = 2;
-            break;
-        case TransferIntent::kMigration:
-            intent_value = 3;
-            break;
-        default:
-            LOG(ERROR) << "Invalid transfer intent: "
-                       << static_cast<int>(intent);
-            return std::nullopt;
-    }
     auto mutable_transfers = transfers;
     for (auto& transfer : mutable_transfers)
-        transfer.intent_type = intent_value;
+        transfer.intent_type = static_cast<int>(intent);
     return transfer_engine_->submitScatter(mutable_transfers);
 }
 

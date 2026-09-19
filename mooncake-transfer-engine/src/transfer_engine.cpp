@@ -1152,6 +1152,10 @@ std::optional<tent::Request::OpCode> toTentOpcode(
     }
 }
 
+// NOTE: This handles raw int values 0-6 including CHECKPOINT (4),
+// WEIGHT_LOADING (5), STAGING_INTERNAL (6) for forward compatibility.
+// The store-layer ToTentIntent in transfer_task.cpp only handles
+// TransferIntent enum values (0-3).
 std::optional<tent::IntentType> toTentIntent(int intent_type) {
     switch (intent_type) {
         case transfer_intent_values::kUnspecified:

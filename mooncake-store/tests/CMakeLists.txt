@@ -161,6 +161,8 @@ add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 if(USE_TENT)
+  target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
+  target_link_libraries(transfer_task_test PRIVATE tent)
   add_test(
     NAME transfer_task_tent_completion_test
     COMMAND transfer_task_test

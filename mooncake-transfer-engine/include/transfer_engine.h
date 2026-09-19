@@ -35,7 +35,7 @@ class TransferEngineImpl;
 namespace tent {
 class Config;
 class TransferEngine;
-};
+};  // namespace tent
 
 namespace transfer_intent_values {
 inline constexpr int kUnspecified = 0;

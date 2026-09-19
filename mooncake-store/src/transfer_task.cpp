@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <chrono>
 #include <cerrno>
@@ -158,6 +159,22 @@ namespace mooncake {
 namespace {
 
 #ifdef USE_TENT
+int GetTentPositiveEnvOrDefault(const char* name, int default_value) {
+    const char* raw_value = std::getenv(name);
+    if (!raw_value || raw_value[0] == '\0') return default_value;
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    long parsed = std::strtol(raw_value, &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value || *end_ptr != '\0' || parsed <= 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+        LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
+                     << ", using default " << default_value;
+        return default_value;
+    }
+    return static_cast<int>(parsed);
+}
+
 std::optional<tent::Request::OpCode> ToTentOpCode(
     TransferRequest::OpCode op_code) {
     switch (op_code) {
@@ -170,6 +187,9 @@ std::optional<tent::Request::OpCode> ToTentOpCode(
     }
 }
 
+// NOTE: This only handles TransferIntent values (0-3). The compat-layer
+// toTentIntent in transfer_engine.cpp also handles raw int values 4-6
+// (CHECKPOINT, WEIGHT_LOADING, STAGING_INTERNAL) for forward compatibility.
 std::optional<tent::IntentType> ToTentIntent(TransferIntent intent) {
     switch (intent) {
         case TransferIntent::kUnspecified:
@@ -833,7 +853,15 @@ void TransferEngineOperationState::check_task_status() {
                 set_result_internal(ErrorCode::TRANSFER_FAIL);
                 return;
             }
-            status.s = static_cast<TransferStatusEnum>(tent_status.s);
+            auto classic_status = ToClassicTransferStatus(tent_status.s);
+            if (!classic_status) {
+                LOG(ERROR) << "Unknown TENT transfer status for batch "
+                           << batch_id_ << " task " << i << " with status "
+                           << static_cast<int>(tent_status.s);
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            status.s = *classic_status;
             status.transferred_bytes = tent_status.transferred_bytes;
             s = Status::OK();
         } else
@@ -1225,13 +1253,34 @@ class StoreScatterTransferOperation::Impl {
         build(ranges, intent);
     }
 #endif
-    ~Impl() { wait(); }
+    ~Impl() {
+        if (classic_operation_) {
+            classic_operation_->wait();
+            return;
+        }
+#ifdef USE_TENT
+        if (completed_) {
+            retryCloseSegments();
+            return;
+        }
+        // Destructor path: use a shorter timeout than wait() to avoid
+        // blocking too long when the caller didn't explicitly wait.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                                  "MC_TENT_DESTRUCTOR_TIMEOUT_S", 5));
+        while (!completed_ && std::chrono::steady_clock::now() < deadline) {
+            poll();
+            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+        }
+        if (!completed_) forceCleanup();
+#endif
+    }
 
     Status wait() {
         if (classic_operation_) return classic_operation_->wait();
 #ifdef USE_TENT
         const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(GetPositiveEnvOrDefault(
+                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
                                   "MC_TENT_TRANSFER_TIMEOUT_S", 60));
         while (!completed_) {
             poll();
@@ -1240,8 +1289,8 @@ class StoreScatterTransferOperation::Impl {
                 requestAbort(Status::Socket("TENT scatter transfer timed out"));
                 const auto cleanup_deadline =
                     std::chrono::steady_clock::now() +
-                    std::chrono::seconds(
-                        GetPositiveEnvOrDefault("MC_TENT_CANCEL_GRACE_S", 1));
+                    std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                        "MC_TENT_CANCEL_GRACE_S", 1));
                 while (!completed_ &&
                        std::chrono::steady_clock::now() < cleanup_deadline) {
                     poll();
@@ -1261,8 +1310,10 @@ class StoreScatterTransferOperation::Impl {
         while (!completed_) {
             poll();
             if (completed_) break;
-            if (std::chrono::steady_clock::now() >= deadline)
-                return Status::Clock("scatter transfer wait timed out");
+            if (std::chrono::steady_clock::now() >= deadline) {
+                requestAbort(Status::Clock("scatter transfer wait timed out"));
+                return aggregate_status_;
+            }
             std::this_thread::sleep_for(kPollInterval);
         }
 #else
@@ -1293,12 +1344,24 @@ class StoreScatterTransferOperation::Impl {
         }
     }
 
-    void finish() {
-        for (const auto& entry : segments_) {
-            auto status = tent_engine_->closeSegment(entry.second);
-            if (!status.ok()) remember(Status::Context(status.ToString()));
+    void retryCloseSegments() {
+        for (int attempt = 0; attempt < 3 && !segments_.empty(); ++attempt) {
+            for (auto it = segments_.begin(); it != segments_.end();) {
+                auto status = tent_engine_->closeSegment(it->second);
+                if (status.ok()) {
+                    it = segments_.erase(it);
+                } else {
+                    remember(Status::Context(status.ToString()));
+                    ++it;
+                }
+            }
+            if (!segments_.empty())
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        segments_.clear();
+    }
+
+    void finish() {
+        retryCloseSegments();
         completed_ = true;
     }
 
@@ -1311,7 +1374,7 @@ class StoreScatterTransferOperation::Impl {
         if (abort_requested_ || batch_id_ == 0) return;
         abort_requested_ = true;
         abort_deadline_ = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(GetPositiveEnvOrDefault(
+                          std::chrono::seconds(GetTentPositiveEnvOrDefault(
                               "MC_TENT_CANCEL_GRACE_S", 1));
         for (size_t task = 0; task < tent_requests_.size(); ++task) {
             const size_t index = native_indexes_[task];
@@ -1420,6 +1483,8 @@ class StoreScatterTransferOperation::Impl {
                     range.remote_base_offset + remote_offset;
                 request.length = length;
                 request.intent_type = *request_intent;
+                // transport_hint left at default (0 = auto-select);
+                // ScatterTransferRange does not carry per-fragment hints.
                 tent_requests_.push_back(request);
                 native_indexes_.push_back(done_.size() - 1);
             }
@@ -1458,6 +1523,7 @@ class StoreScatterTransferOperation::Impl {
                 if (!abort_requested_ ||
                     std::chrono::steady_clock::now() >= abort_deadline_) {
                     complete(index, Status::Context(status.ToString()));
+                    assert(remaining_ > 0);
                     --remaining_;
                 }
                 continue;
@@ -1476,6 +1542,7 @@ class StoreScatterTransferOperation::Impl {
                                     : Status::Socket(
                                           "scatter transfer fragment failed"));
             }
+            assert(remaining_ > 0);
             --remaining_;
         }
         if (remaining_ != 0) return;
@@ -1488,6 +1555,8 @@ class StoreScatterTransferOperation::Impl {
 #endif
 
     std::optional<TransferEngine::ScatterTransferOperation> classic_operation_;
+    Status aggregate_status_;
+    bool completed_ = false;
 #ifdef USE_TENT
     std::shared_ptr<tent::TransferEngine> tent_engine_;
     std::vector<tent::Request> tent_requests_;
@@ -1498,8 +1567,6 @@ class StoreScatterTransferOperation::Impl {
     std::vector<std::pair<std::string, tent::SegmentID>> segments_;
     BatchID batch_id_ = 0;
     size_t remaining_ = 0;
-    Status aggregate_status_;
-    bool completed_ = false;
     bool abort_requested_ = false;
     std::chrono::steady_clock::time_point abort_deadline_ =
         std::chrono::steady_clock::time_point::max();
