@@ -24,8 +24,8 @@ class WeightReconciliationTest : public MasterServiceTest {
     }
 
     static std::string ManifestKey(const WeightRevisionIdentity& identity) {
-        return "weights/" + identity.name_space + "/" +
-               identity.resource_id + "/" + identity.revision + "/" +
+        return "weights/" + identity.name_space + "/" + identity.resource_id +
+               "/" + identity.revision + "/" +
                std::to_string(identity.weight_generation) + "/manifest";
     }
 
@@ -75,8 +75,8 @@ TEST_F(WeightReconciliationTest, ExpiresLeasesAndAbortsAbandonedImports) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
     auto ready = PublishReady(service, client_id, "step-ready");
-    auto lease = service.AcquireWeightRevisionLease(
-        AcquireWeightRevisionLeaseRequest{
+    auto lease =
+        service.AcquireWeightRevisionLease(AcquireWeightRevisionLeaseRequest{
             .identity = ready.identity,
             .expected_metadata_generation = ready.metadata_generation,
             .holder = "worker-0",
@@ -90,9 +90,8 @@ TEST_F(WeightReconciliationTest, ExpiresLeasesAndAbortsAbandonedImports) {
         .expected_logical_bytes = 1024,
     });
     ASSERT_TRUE(importing.has_value());
-    const uint64_t now_ms =
-        std::max(lease->expires_at_ms + 1,
-                 importing->updated_at_ms + 5 * 60 * 1000 + 1);
+    const uint64_t now_ms = std::max(
+        lease->expires_at_ms + 1, importing->updated_at_ms + 5 * 60 * 1000 + 1);
 
     MasterServiceTestPeer(service).RunWeightReconciliationForTesting(now_ms,
                                                                      32);
@@ -142,16 +141,14 @@ TEST_F(WeightReconciliationTest, WorkLimitBoundsAbandonedImportTransitions) {
         GetWeightRevisionRequest{.identity = second->identity});
     ASSERT_TRUE(first_view.has_value());
     ASSERT_TRUE(second_view.has_value());
-    const int deleting =
-        (first_view->metadata.availability ==
-         WeightAvailabilityState::DELETING) +
-        (second_view->metadata.availability ==
-         WeightAvailabilityState::DELETING);
-    const int importing =
-        (first_view->metadata.availability ==
-         WeightAvailabilityState::IMPORTING) +
-        (second_view->metadata.availability ==
-         WeightAvailabilityState::IMPORTING);
+    const int deleting = (first_view->metadata.availability ==
+                          WeightAvailabilityState::DELETING) +
+                         (second_view->metadata.availability ==
+                          WeightAvailabilityState::DELETING);
+    const int importing = (first_view->metadata.availability ==
+                           WeightAvailabilityState::IMPORTING) +
+                          (second_view->metadata.availability ==
+                           WeightAvailabilityState::IMPORTING);
     EXPECT_EQ(1, deleting);
     EXPECT_EQ(1, importing);
 }
@@ -180,8 +177,8 @@ TEST_F(WeightReconciliationTest, MissingPayloadOrManifestBecomesDegraded) {
     }
     EXPECT_EQ(2, MasterMetricManager::instance().get_weight_revision_count(
                      "degraded"));
-    EXPECT_EQ(2, MasterMetricManager::instance().get_weight_residency_count(
-                     "mixed"));
+    EXPECT_EQ(
+        2, MasterMetricManager::instance().get_weight_residency_count("mixed"));
 }
 
 TEST_F(WeightReconciliationTest, ProjectsLeaseAndOperationMetrics) {
@@ -190,8 +187,8 @@ TEST_F(WeightReconciliationTest, ProjectsLeaseAndOperationMetrics) {
     const UUID client_id = generate_uuid();
     auto ready = PublishReady(service, client_id, "step-metrics");
     auto leased = PublishReady(service, client_id, "step-leased-metrics");
-    auto lease = service.AcquireWeightRevisionLease(
-        AcquireWeightRevisionLeaseRequest{
+    auto lease =
+        service.AcquireWeightRevisionLease(AcquireWeightRevisionLeaseRequest{
             .identity = leased.identity,
             .expected_metadata_generation = leased.metadata_generation,
             .holder = "worker-metrics",

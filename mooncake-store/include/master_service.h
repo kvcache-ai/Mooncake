@@ -1132,9 +1132,10 @@ class MasterService {
     };
     GroupDomain group_domain_;
     MasterStoreBackend weight_backend_{*this};
-    tl::expected<void, ErrorCode> RemoveObject(
-        const std::string& key, const TenantId& tenant_id,
-        bool force, bool allow_managed_weight);
+    tl::expected<void, ErrorCode> RemoveObject(const std::string& key,
+                                               const TenantId& tenant_id,
+                                               bool force,
+                                               bool allow_managed_weight);
     WeightStoreManager weight_manager_{weight_backend_};
 
     class SoftPinDeadlineIndex {

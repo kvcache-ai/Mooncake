@@ -81,8 +81,8 @@ TEST_F(WeightGroupLifecycleTest, LeaseBlocksOperationAndDelete) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
     auto ready = PublishReady(service, client_id);
-    auto lease = service.AcquireWeightRevisionLease(
-        AcquireWeightRevisionLeaseRequest{
+    auto lease =
+        service.AcquireWeightRevisionLease(AcquireWeightRevisionLeaseRequest{
             .identity = ready.identity,
             .expected_metadata_generation = ready.metadata_generation,
             .holder = "worker-0",
@@ -289,7 +289,8 @@ TEST_F(WeightGroupLifecycleTest, PendingOperationReflectsLostReadableMembers) {
     EXPECT_EQ(*reconciled, *retry);
 }
 
-TEST_F(WeightGroupLifecycleTest, DeleteRemovesPayloadAndManifestThenTombstones) {
+TEST_F(WeightGroupLifecycleTest,
+       DeleteRemovesPayloadAndManifestThenTombstones) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
@@ -302,10 +303,10 @@ TEST_F(WeightGroupLifecycleTest, DeleteRemovesPayloadAndManifestThenTombstones) 
     ASSERT_TRUE(deleted.has_value());
     EXPECT_EQ(WeightAvailabilityState::DELETED, deleted->availability);
     EXPECT_EQ(WeightResidencyState::ABSENT, deleted->residency);
-    EXPECT_FALSE(service.ExistKey("payload-a", TenantId::Default())
-                     .value_or(false));
-    EXPECT_FALSE(service.ExistKey(ManifestKey(), TenantId::Default())
-                     .value_or(false));
+    EXPECT_FALSE(
+        service.ExistKey("payload-a", TenantId::Default()).value_or(false));
+    EXPECT_FALSE(
+        service.ExistKey(ManifestKey(), TenantId::Default()).value_or(false));
 }
 
 }  // namespace

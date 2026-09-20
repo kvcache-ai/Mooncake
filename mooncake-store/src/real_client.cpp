@@ -2539,14 +2539,14 @@ std::vector<int> RealClient::batchProbeKey(
     return results;
 }
 
-#define DEFINE_REAL_WEIGHT_METHOD(method, client_method, request_type,       \
-                                  result_type)                              \
-    WeightRpcResult<result_type> RealClient::method(                        \
-        const request_type &request) {                                      \
-        if (!client_) {                                                     \
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);          \
-        }                                                                   \
-        return client_->client_method(request);                             \
+#define DEFINE_REAL_WEIGHT_METHOD(method, client_method, request_type, \
+                                  result_type)                         \
+    WeightRpcResult<result_type> RealClient::method(                   \
+        const request_type &request) {                                 \
+        if (!client_) {                                                \
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);     \
+        }                                                              \
+        return client_->client_method(request);                        \
     }
 
 DEFINE_REAL_WEIGHT_METHOD(begin_weight_import, BeginWeightImport,
@@ -2564,23 +2564,19 @@ DEFINE_REAL_WEIGHT_METHOD(acquire_weight_revision_lease,
                           AcquireWeightRevisionLease,
                           AcquireWeightRevisionLeaseRequest,
                           WeightRevisionLease)
-DEFINE_REAL_WEIGHT_METHOD(renew_weight_revision_lease,
-                          RenewWeightRevisionLease,
-                          RenewWeightRevisionLeaseRequest,
-                          WeightRevisionLease)
+DEFINE_REAL_WEIGHT_METHOD(renew_weight_revision_lease, RenewWeightRevisionLease,
+                          RenewWeightRevisionLeaseRequest, WeightRevisionLease)
 DEFINE_REAL_WEIGHT_METHOD(start_weight_residency_operation,
                           StartWeightResidencyOperation,
                           StartWeightResidencyOperationRequest,
                           WeightResidencyOperation)
 DEFINE_REAL_WEIGHT_METHOD(query_weight_operation, QueryWeightOperation,
-                          QueryWeightOperationRequest,
-                          WeightResidencyOperation)
+                          QueryWeightOperationRequest, WeightResidencyOperation)
 DEFINE_REAL_WEIGHT_METHOD(reconcile_weight_revision, ReconcileWeightRevision,
                           ReconcileWeightRevisionRequest,
                           WeightRevisionMetadata)
 DEFINE_REAL_WEIGHT_METHOD(delete_weight_revision, DeleteWeightRevision,
-                          DeleteWeightRevisionRequest,
-                          WeightRevisionMetadata)
+                          DeleteWeightRevisionRequest, WeightRevisionMetadata)
 
 #undef DEFINE_REAL_WEIGHT_METHOD
 

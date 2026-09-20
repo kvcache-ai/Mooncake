@@ -368,8 +368,8 @@ TEST_F(MasterServiceWeightManagementTest,
     auto ready = service.CommitWeightImport(
         CommitRequest(importing, {"payload-a"}, 1024));
     ASSERT_TRUE(ready.has_value());
-    auto acquired = service.AcquireWeightRevisionLease(
-        AcquireWeightRevisionLeaseRequest{
+    auto acquired =
+        service.AcquireWeightRevisionLease(AcquireWeightRevisionLeaseRequest{
             .identity = ready->identity,
             .expected_metadata_generation = ready->metadata_generation,
             .holder = "worker-0",
@@ -381,11 +381,10 @@ TEST_F(MasterServiceWeightManagementTest,
         service, TenantId(ready->identity.tenant_id),
         ready->manifest.payload_group_id);
     auto renewing = std::async(std::launch::async, [&] {
-        return service.RenewWeightRevisionLease(
-            RenewWeightRevisionLeaseRequest{
-                .lease_id = acquired->lease_id,
-                .ttl_ms = 120'000,
-            });
+        return service.RenewWeightRevisionLease(RenewWeightRevisionLeaseRequest{
+            .lease_id = acquired->lease_id,
+            .ttl_ms = 120'000,
+        });
     });
     EXPECT_EQ(std::future_status::timeout,
               renewing.wait_for(std::chrono::milliseconds(250)));

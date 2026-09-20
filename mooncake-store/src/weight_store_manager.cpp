@@ -386,8 +386,7 @@ WeightStoreManager::StartWeightResidencyOperation(
     if (canonical_group.empty()) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
     }
-    [[maybe_unused]] auto group_operation_lock =
-        LockGroup(request.identity);
+    [[maybe_unused]] auto group_operation_lock = LockGroup(request.identity);
     const auto now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
@@ -400,9 +399,9 @@ WeightStoreManager::StartWeightResidencyOperation(
         auto members = backend_.SnapshotWeightGroup(
             request.identity,
             mutation->metadata.next->manifest.payload_group_id);
-        if (!members || members->size() !=
-                            mutation->metadata.next->manifest.payload_count +
-                                1) {
+        if (!members ||
+            members->size() !=
+                mutation->metadata.next->manifest.payload_count + 1) {
             return tl::make_unexpected(WeightManagementError::NOT_READY);
         }
         mutation->next->total_members = members->size();
@@ -422,7 +421,6 @@ WeightStoreManager::QueryWeightOperation(
     }
     return tl::make_unexpected(WeightManagementError::NOT_FOUND);
 }
-
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
 WeightStoreManager::ReconcileWeightRevision(
@@ -452,10 +450,10 @@ WeightStoreManager::ReconcileWeightRevision(
         }
     }
 
-    auto members = backend_.SnapshotWeightGroup(request.identity,
-                                       current.manifest.payload_group_id);
-    const bool absent = !members &&
-                        members.error() == WeightManagementError::NOT_FOUND;
+    auto members = backend_.SnapshotWeightGroup(
+        request.identity, current.manifest.payload_group_id);
+    const bool absent =
+        !members && members.error() == WeightManagementError::NOT_FOUND;
     if (!members && !absent) {
         return tl::make_unexpected(members.error());
     }
@@ -472,8 +470,8 @@ WeightStoreManager::ReconcileWeightRevision(
         return PersistAndPublishWeightMutation(*mutation);
     }
 
-    bool complete = !absent &&
-                    members->size() == current.manifest.payload_count + 1;
+    bool complete =
+        !absent && members->size() == current.manifest.payload_count + 1;
     bool manifest_found = false;
     bool all_memory = complete;
     bool all_cold = complete;
@@ -608,16 +606,17 @@ WeightStoreManager::DeleteWeightRevision(
         return tl::make_unexpected(deleting.error());
     }
 
-    auto keys = backend_.GetGroupMemberKeys(TenantId(request.identity.tenant_id),
-                                   deleting->manifest.payload_group_id);
-    std::stable_sort(keys.begin(), keys.end(), [&](const auto& lhs,
-                                                   const auto& rhs) {
-        return lhs != deleting->manifest.manifest_key &&
-               rhs == deleting->manifest.manifest_key;
-    });
+    auto keys =
+        backend_.GetGroupMemberKeys(TenantId(request.identity.tenant_id),
+                                    deleting->manifest.payload_group_id);
+    std::stable_sort(keys.begin(), keys.end(),
+                     [&](const auto& lhs, const auto& rhs) {
+                         return lhs != deleting->manifest.manifest_key &&
+                                rhs == deleting->manifest.manifest_key;
+                     });
     for (const auto& key : keys) {
-        auto removed = backend_.RemoveObject(key, TenantId(request.identity.tenant_id),
-                                    true, true);
+        auto removed = backend_.RemoveObject(
+            key, TenantId(request.identity.tenant_id), true, true);
         if (!removed && removed.error() != ErrorCode::OBJECT_NOT_FOUND) {
             return tl::make_unexpected(WeightManagementError::BUSY);
         }
@@ -664,10 +663,8 @@ WeightStoreManager::PersistAndPublishWeightOperationMutation(
         });
 }
 
-
-
 size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
-                                                 size_t limit) {
+                                                            size_t limit) {
     if (limit == 0) {
         return 0;
     }
@@ -704,8 +701,8 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
                              : weight_reconciliation_offset_.fetch_add(
                                    std::max<size_t>(limit, 1)) %
                                    revision_count;
-    for (size_t examined = 0;
-         examined < revision_count && actions < limit; ++examined) {
+    for (size_t examined = 0; examined < revision_count && actions < limit;
+         ++examined) {
         const auto& metadata =
             snapshot.metadata[(start + examined) % revision_count];
         if (metadata.availability == WeightAvailabilityState::DELETED) {
@@ -746,13 +743,13 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
                       .expected_metadata_generation =
                           metadata.metadata_generation,
                   })
-                : ReconcileWeightRevision(
-                      ReconcileWeightRevisionRequest{
-                          .identity = metadata.identity,
-                      });
+                : ReconcileWeightRevision(ReconcileWeightRevisionRequest{
+                      .identity = metadata.identity,
+                  });
         if (reconciled) {
             ++actions;
-        } else if (reconciled.error() != WeightManagementError::STALE_GENERATION) {
+        } else if (reconciled.error() !=
+                   WeightManagementError::STALE_GENERATION) {
             MasterMetricManager::instance()
                 .inc_weight_reconciliation_failures();
         }
@@ -762,6 +759,5 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
         weight_metadata_.ExportSnapshot(), now_ms);
     return actions;
 }
-
 
 }  // namespace mooncake
