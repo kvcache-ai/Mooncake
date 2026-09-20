@@ -560,6 +560,11 @@ MasterService::~MasterService() {
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
     http_metadata_cleanup_running_ = false;
+    // Resolve durability waits while every callback target is still alive,
+    // before joining workers that may be waiting for an OpLog publication.
+    if (ordered_oplog_writer_) {
+        ordered_oplog_writer_->Stop();
+    }
     graceful_unmount_scheduler_.Stop();
     replica_cleanup_worker_.Stop();
 #ifdef USE_NOF
@@ -593,9 +598,6 @@ MasterService::~MasterService() {
     dynamic_replication_.Stop();
 
     client_offboarding_worker_.Stop();
-    if (ordered_oplog_writer_) {
-        ordered_oplog_writer_->Stop();
-    }
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
@@ -2841,6 +2843,12 @@ void MasterService::TaskCleanupThreadFunc() {
         }
         CleanupExpiredSoftPins(std::chrono::system_clock::now());
         CleanupExpiredDynamicReplicationState();
+        shared_lock.unlock();
+        const auto now_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        weight_manager_.ReconcileWeightMetadataStoreOnce(now_ms, 32);
     }
     LOG(INFO) << "Task cleanup thread stopped";
 }

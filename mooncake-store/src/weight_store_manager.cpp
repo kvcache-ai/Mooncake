@@ -1,4 +1,5 @@
 #include "weight_store_manager.h"
+#include "master_metric_manager.h"
 
 #include <chrono>
 #include <algorithm>
@@ -648,6 +649,104 @@ WeightStoreManager::PersistAndPublishWeightOperationMutation(
         });
 }
 
+
+
+size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
+                                                 size_t limit) {
+    if (limit == 0) {
+        return 0;
+    }
+    constexpr uint64_t kImportAbandonTimeoutMs = 5 * 60 * 1000;
+    size_t actions = 0;
+
+    for (const auto& mutation : weight_metadata_.PrepareExpireLeases(now_ms)) {
+        if (actions == limit) {
+            break;
+        }
+        auto group_lock = LockGroup(mutation.previous->identity);
+        auto current = weight_metadata_.PrepareReleaseLease(
+            ReleaseWeightRevisionLeaseRequest{
+                .tenant_id = mutation.previous->identity.tenant_id,
+                .lease_id = mutation.lease_id,
+            });
+        if (!current || current->no_op || !current->previous.has_value() ||
+            current->previous->identity != mutation.previous->identity ||
+            current->previous->expires_at_ms > now_ms) {
+            continue;
+        }
+        if (PersistAndPublishWeightLeaseMutation(*current)) {
+            ++actions;
+        } else {
+            MasterMetricManager::instance()
+                .inc_weight_reconciliation_failures();
+        }
+    }
+
+    const auto snapshot = weight_metadata_.ExportSnapshot();
+    const size_t revision_count = snapshot.metadata.size();
+    const size_t start = revision_count == 0
+                             ? 0
+                             : weight_reconciliation_offset_.fetch_add(
+                                   std::max<size_t>(limit, 1)) %
+                                   revision_count;
+    for (size_t examined = 0;
+         examined < revision_count && actions < limit; ++examined) {
+        const auto& metadata =
+            snapshot.metadata[(start + examined) % revision_count];
+        if (metadata.availability == WeightAvailabilityState::DELETED) {
+            continue;
+        }
+
+        if (metadata.availability == WeightAvailabilityState::IMPORTING) {
+            auto group_lock = LockGroup(metadata.identity);
+            auto current = weight_metadata_.Get(metadata.identity, now_ms);
+            if (!current ||
+                current->metadata.availability !=
+                    WeightAvailabilityState::IMPORTING ||
+                now_ms < current->metadata.updated_at_ms ||
+                now_ms - current->metadata.updated_at_ms <
+                    kImportAbandonTimeoutMs) {
+                continue;
+            }
+            auto mutation = weight_metadata_.PrepareAbortImport(
+                AbortWeightImportRequest{
+                    .identity = metadata.identity,
+                    .expected_metadata_generation =
+                        current->metadata.metadata_generation,
+                },
+                now_ms);
+            if (!mutation || !PersistAndPublishWeightMutation(*mutation)) {
+                MasterMetricManager::instance()
+                    .inc_weight_reconciliation_failures();
+                continue;
+            }
+            ++actions;
+            continue;
+        }
+
+        WeightMetadataStore::Result<WeightRevisionMetadata> reconciled =
+            metadata.availability == WeightAvailabilityState::DELETING
+                ? DeleteWeightRevision(DeleteWeightRevisionRequest{
+                      .identity = metadata.identity,
+                      .expected_metadata_generation =
+                          metadata.metadata_generation,
+                  })
+                : ReconcileWeightRevision(
+                      ReconcileWeightRevisionRequest{
+                          .identity = metadata.identity,
+                      });
+        if (reconciled) {
+            ++actions;
+        } else if (reconciled.error() != WeightManagementError::STALE_GENERATION) {
+            MasterMetricManager::instance()
+                .inc_weight_reconciliation_failures();
+        }
+    }
+
+    MasterMetricManager::instance().project_weight_metadata(
+        weight_metadata_.ExportSnapshot(), now_ms);
+    return actions;
+}
 
 
 }  // namespace mooncake
