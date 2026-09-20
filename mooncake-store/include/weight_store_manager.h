@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 
@@ -33,6 +34,7 @@ class WeightStoreManager {
         return weight_metadata_.RestoreSnapshot(snapshot);
     }
     void Clear() { weight_metadata_.Clear(); }
+    size_t ReconcileWeightMetadataStoreOnce(uint64_t now_ms, size_t limit);
     bool IsManagedGroup(const std::string& group) const {
         return weight_metadata_.IsManagedGroup(group);
     }
@@ -90,6 +92,7 @@ class WeightStoreManager {
     WeightMetadataStore weight_metadata_;
     std::shared_mutex mutation_mutex_;
     std::array<std::mutex, 4096> group_locks_;
+    std::atomic<size_t> weight_reconciliation_offset_{0};
 };
 
 }  // namespace mooncake
