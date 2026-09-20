@@ -239,23 +239,23 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(ready.has_value());
 
     auto extra_config = payload_config;
-    auto extra = service.PutStart(client_id, "managed-weight-extra",
-                                  TenantId::Default(), kObjectSize,
-                                  extra_config);
+    auto extra =
+        service.PutStart(client_id, "managed-weight-extra", TenantId::Default(),
+                         kObjectSize, extra_config);
     ASSERT_FALSE(extra.has_value());
     EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, extra.error());
 
     ReplicateConfig trigger_config;
     trigger_config.replica_num = 1;
-    auto trigger = service.PutStart(client_id, "managed-weight-pressure",
-                                    TenantId::Default(), 3 * kObjectSize,
-                                    trigger_config);
+    auto trigger =
+        service.PutStart(client_id, "managed-weight-pressure",
+                         TenantId::Default(), 3 * kObjectSize, trigger_config);
     ASSERT_FALSE(trigger.has_value());
     EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger.error());
-    EXPECT_TRUE(service.ExistKey(payload_key, TenantId::Default())
-                    .value_or(false));
-    EXPECT_TRUE(service.ExistKey(manifest_key, TenantId::Default())
-                    .value_or(false));
+    EXPECT_TRUE(
+        service.ExistKey(payload_key, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(
+        service.ExistKey(manifest_key, TenantId::Default()).value_or(false));
 
     auto remove =
         service.Remove(payload_key, TenantId::Default(), /*force=*/true);

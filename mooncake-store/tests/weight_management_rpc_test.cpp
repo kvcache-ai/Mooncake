@@ -84,11 +84,10 @@ TEST(WeightManagementRpcTest, RegistersEveryApiAndBindsTenant) {
     ASSERT_FALSE(Domain(commit).has_value());
     EXPECT_EQ(WeightManagementError::NOT_FOUND, Domain(commit).error());
 
-    auto acquire = client.AcquireWeightRevisionLease(
-        AcquireWeightRevisionLeaseRequest{
+    auto acquire =
+        client.AcquireWeightRevisionLease(AcquireWeightRevisionLeaseRequest{
             .identity = Identity(),
-            .expected_metadata_generation =
-                Domain(begin)->metadata_generation,
+            .expected_metadata_generation = Domain(begin)->metadata_generation,
             .holder = "worker-0",
             .ttl_ms = 1000,
         });
@@ -107,8 +106,7 @@ TEST(WeightManagementRpcTest, RegistersEveryApiAndBindsTenant) {
     auto start = client.StartWeightResidencyOperation(
         StartWeightResidencyOperationRequest{
             .identity = Identity(),
-            .expected_metadata_generation =
-                Domain(begin)->metadata_generation,
+            .expected_metadata_generation = Domain(begin)->metadata_generation,
             .target_residency = WeightResidencyState::COLD,
         });
     ASSERT_FALSE(Domain(start).has_value());
@@ -124,8 +122,7 @@ TEST(WeightManagementRpcTest, RegistersEveryApiAndBindsTenant) {
         .expected_metadata_generation = Domain(begin)->metadata_generation,
     });
     ASSERT_TRUE(Domain(abort).has_value());
-    EXPECT_EQ(WeightAvailabilityState::DELETING,
-              Domain(abort)->availability);
+    EXPECT_EQ(WeightAvailabilityState::DELETING, Domain(abort)->availability);
 
     auto reconcile = client.ReconcileWeightRevision(
         ReconcileWeightRevisionRequest{.identity = Identity()});
@@ -135,12 +132,10 @@ TEST(WeightManagementRpcTest, RegistersEveryApiAndBindsTenant) {
 
     auto deleted = client.DeleteWeightRevision(DeleteWeightRevisionRequest{
         .identity = Identity(),
-        .expected_metadata_generation =
-            Domain(reconcile)->metadata_generation,
+        .expected_metadata_generation = Domain(reconcile)->metadata_generation,
     });
     ASSERT_TRUE(Domain(deleted).has_value());
-    EXPECT_EQ(WeightAvailabilityState::DELETED,
-              Domain(deleted)->availability);
+    EXPECT_EQ(WeightAvailabilityState::DELETED, Domain(deleted)->availability);
 }
 
 TEST(WeightManagementRpcTest, RejectsUnboundedPaginationExactly) {

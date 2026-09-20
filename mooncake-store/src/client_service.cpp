@@ -4243,8 +4243,7 @@ WeightRpcResult<void> Client::ReleaseWeightRevisionLease(
     return master_client_.ReleaseWeightRevisionLease(request);
 }
 
-WeightRpcResult<WeightResidencyOperation>
-Client::StartWeightResidencyOperation(
+WeightRpcResult<WeightResidencyOperation> Client::StartWeightResidencyOperation(
     const StartWeightResidencyOperationRequest& request) {
     return master_client_.StartWeightResidencyOperation(request);
 }
