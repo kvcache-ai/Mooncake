@@ -7936,6 +7936,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
     if (bucket_allocator_ == nullptr) return false;
     const size_t retried = bucket_allocator_->RetryFailedEvictions();
     bool evicted = retried > 0;
+    if (force_one && retried > 0) return evicted;
 
     const TenantId tenant_id = TenantId::Default();
     std::set<int64_t> attempted;
