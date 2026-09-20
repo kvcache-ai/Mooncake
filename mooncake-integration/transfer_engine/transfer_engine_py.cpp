@@ -575,6 +575,10 @@ int TransferEnginePy::transferSync(const char* target_hostname,
             if (status.s == TransferStatusEnum::COMPLETED) {
                 engine_->freeBatchID(batch_id);
                 return 0;
+            } else if (status.s == TransferStatusEnum::CANCELED) {
+                // Cancellation is terminal; a fresh submission would undo it.
+                engine_->freeBatchID(batch_id);
+                return -1;
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
                 completed = true;
@@ -691,6 +695,10 @@ int TransferEnginePy::batchTransferSync(
             if (status.s == TransferStatusEnum::COMPLETED) {
                 engine_->freeBatchID(batch_id);
                 return 0;
+            } else if (status.s == TransferStatusEnum::CANCELED) {
+                // Cancellation is terminal; a fresh submission would undo it.
+                engine_->freeBatchID(batch_id);
+                return -1;
             } else if (status.s == TransferStatusEnum::FAILED) {
                 LOG(ERROR) << "batchTransferSync: transfer FAILED for "
                            << target_hostname << " (batch of " << batch_size

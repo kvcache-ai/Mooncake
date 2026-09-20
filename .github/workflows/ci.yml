@@ -542,6 +542,10 @@ jobs:
               - '.github/workflows/**'
             tent:
               - 'mooncake-transfer-engine/**'
+              - 'mooncake-integration/transfer_engine/**'
+              - 'mooncake-integration/tests/test_tent_sync_canceled.py'
+              - 'mooncake-integration/tests/tent_sync_cancel_injector.cpp'
+              - 'mooncake-integration/CMakeLists.txt'
               - 'mooncake-store/src/transfer_task.cpp'
               - 'mooncake-store/tests/transfer_task_test.cpp'
               - 'mooncake-store/tests/CMakeLists.txt'
@@ -687,6 +691,13 @@ jobs:
       run: |
         ctest --test-dir build-tent --output-on-failure --no-tests=error \
           -R '^transfer_task_tent_completion_test$'
+      shell: bash
+
+    - name: Test Python synchronous cancellation with TENT
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^tent_python_sync_canceled_test$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
