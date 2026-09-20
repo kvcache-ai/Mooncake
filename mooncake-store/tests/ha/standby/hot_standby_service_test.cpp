@@ -855,10 +855,14 @@ TEST_F(HotStandbyServiceTest, AppliesNewerWeightMetadataOpLogAfterSnapshot) {
     ready.residency = WeightResidencyState::HOT;
     ready.metadata_generation = 2;
     ready.updated_at_ms = 200;
-    const auto encoded = struct_pack::serialize(ready);
-    auto batch = MakeCaptureBatch(1, 2, OpType::WEIGHT_METADATA_UPSERT,
-                                  MakeWeightRevisionMetadataKey(ready.identity),
-                                  std::string(encoded.begin(), encoded.end()));
+    const auto encoded = struct_pack::serialize(WeightMetadataUpsertOp{
+        .metadata = ready,
+        .operation = std::nullopt,
+    });
+    auto batch = MakeCaptureBatch(
+        1, 2, OpType::WEIGHT_METADATA_UPSERT,
+        MakeWeightRevisionMetadataKey(ready.identity),
+        std::string(encoded.begin(), encoded.end()));
     batch.entries.front().tenant_id = ready.identity.tenant_id;
     ASSERT_EQ(ErrorCode::OK, backend->Put(BuildBatchRecordKey(cluster_id, 1),
                                           EncodeOpLogBatchRecord(batch)));

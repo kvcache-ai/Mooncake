@@ -237,17 +237,44 @@ void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
 }
 
 bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
-    WeightRevisionMetadata next;
-    if (struct_pack::deserialize_to(next, entry.payload) !=
+    WeightMetadataUpsertOp upsert;
+    if (struct_pack::deserialize_to(upsert, entry.payload) !=
             struct_pack::errc::ok ||
-        !ValidateWeightRevisionMetadata(next).ok() ||
-        next.operation != WeightOperationState::NONE ||
-        !MatchesWeightTenantAndKey(entry, next.identity)) {
+        !ValidateWeightRevisionMetadata(upsert.metadata).ok() ||
+        !MatchesWeightTenantAndKey(entry, upsert.metadata.identity)) {
         LOG(ERROR) << "OpLogApplier: invalid weight metadata upsert, key="
                    << entry.object_key << ", sequence_id=" << entry.sequence_id;
         return false;
     }
-
+    const auto& next = upsert.metadata;
+    if ((next.operation != WeightOperationState::NONE &&
+         (!upsert.operation.has_value() ||
+          upsert.operation->identity != next.identity ||
+          upsert.operation->operation_id != next.operation_id ||
+          upsert.operation->operation != next.operation ||
+          upsert.operation->fenced_metadata_generation !=
+              next.metadata_generation ||
+          upsert.operation->processed_members >
+              upsert.operation->total_members ||
+          (!upsert.operation->cursor.empty() &&
+           !IsValidWeightComponent(upsert.operation->cursor)))) ||
+        (next.operation == WeightOperationState::NONE &&
+         upsert.operation.has_value() &&
+         (upsert.operation->identity != next.identity ||
+          upsert.operation->message != "completed" ||
+          upsert.operation->target_residency != next.residency))) {
+        LOG(ERROR) << "OpLogApplier: inconsistent weight operation payload, "
+                      "key="
+                   << entry.object_key << ", sequence_id=" << entry.sequence_id;
+        return false;
+    }
+    auto publish = [&]() {
+        if (!metadata_store_->PutWeightMetadata(next)) {
+            return false;
+        }
+        return !upsert.operation.has_value() ||
+               metadata_store_->PutWeightOperation(*upsert.operation);
+    };
     const auto tombstone =
         metadata_store_->GetWeightMetadataTombstoneGeneration(next.identity);
     if (tombstone.has_value()) {
@@ -266,10 +293,13 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
                        << ", generation=" << next.metadata_generation;
             return false;
         }
-        return metadata_store_->PutWeightMetadata(next);
+        return publish();
     }
     if (*current == next) {
-        return true;
+        return !upsert.operation.has_value() ||
+               metadata_store_->GetWeightOperation(
+                   upsert.operation->operation_id) == upsert.operation ||
+               metadata_store_->PutWeightOperation(*upsert.operation);
     }
     if (!CanAdvanceWeightMetadataGeneration(current->metadata_generation) ||
         next.metadata_generation != current->metadata_generation + 1 ||
@@ -284,7 +314,7 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
                    << ", incoming_generation=" << next.metadata_generation;
         return false;
     }
-    return metadata_store_->PutWeightMetadata(next);
+    return publish();
 }
 
 bool OpLogApplier::ApplyWeightMetadataDelete(const OpLogEntry& entry) {
