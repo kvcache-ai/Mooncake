@@ -669,6 +669,25 @@ TEST(WeightMetadataStoreTest, RejectsUnknownSnapshotEnums) {
               restored.RestoreSnapshot(snapshot).error());
 }
 
+TEST(WeightMetadataStoreTest, ValidatesSnapshotsWithoutReplacingExistingState) {
+    WeightMetadataStore metadata_store;
+    PublishReady(metadata_store);
+    const auto baseline = metadata_store.ExportSnapshot();
+    EXPECT_TRUE(ValidateWeightMetadataSnapshot(baseline).has_value());
+
+    auto invalid = baseline;
+    invalid.metadata.push_back(invalid.metadata.front());
+    EXPECT_FALSE(ValidateWeightMetadataSnapshot(invalid).has_value());
+    EXPECT_FALSE(metadata_store.RestoreSnapshot(invalid).has_value());
+    EXPECT_EQ(baseline, metadata_store.ExportSnapshot());
+
+    invalid = baseline;
+    invalid.next_lease_id = 0;
+    EXPECT_FALSE(ValidateWeightMetadataSnapshot(invalid).has_value());
+    EXPECT_FALSE(metadata_store.RestoreSnapshot(invalid).has_value());
+    EXPECT_EQ(baseline, metadata_store.ExportSnapshot());
+}
+
 TEST(WeightMetadataStoreTest, DeleteRetainsAbsentTombstone) {
     WeightMetadataStore metadata_store;
     auto ready = PublishReady(metadata_store);

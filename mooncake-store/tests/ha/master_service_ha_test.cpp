@@ -298,6 +298,11 @@ class MasterServiceHATest : public ::testing::Test {
         MasterServiceTestPeer::EnableDfs(service) = true;
     }
 
+    static WeightMetadataSnapshot ExportWeightMetadataStore(
+        const MasterService& service) {
+        return MasterServiceTestPeer::WeightMetadata(service).ExportSnapshot();
+    }
+
     static void SetUpTestSuite() {
         google::InitGoogleLogging("MasterServiceHATest");
         FLAGS_logtostderr = 1;
@@ -2743,6 +2748,86 @@ TEST_F(MasterServiceHATest,
     const auto second_result = second.get();
     EXPECT_TRUE(first_result.has_value());
     EXPECT_FALSE(second_result.has_value());
+}
+
+TEST_F(MasterServiceHATest,
+       StandbyPromotionRestoresCompleteWeightMetadataStore) {
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    const WeightMetadataSnapshot snapshot{
+        .metadata = {WeightRevisionMetadata{
+            .identity = identity,
+            .manifest =
+                WeightManifestReference{
+                    .manifest_key =
+                        "weights/production/llama-70b/step-100/7/manifest",
+                    .manifest_sha256 = std::string(64, 'a'),
+                    .payload_group_id = MakeWeightPayloadGroupId(identity),
+                    .payload_keys_sha256 = std::string(64, 'b'),
+                    .payload_count = 1,
+                    .logical_bytes = 1024,
+                },
+            .availability = WeightAvailabilityState::READY,
+            .residency = WeightResidencyState::HOT,
+            .operation = WeightOperationState::EVICTING,
+            .operation_id = 3,
+            .metadata_generation = 4,
+            .created_at_ms = 100,
+            .updated_at_ms = 200,
+        }},
+        .leases = {WeightRevisionLease{
+            .lease_id = 5,
+            .identity = identity,
+            .holder = "worker-0",
+            .expires_at_ms = 300,
+            .fenced_metadata_generation = 2,
+        }},
+        .operations = {WeightResidencyOperation{
+            .operation_id = 3,
+            .identity = identity,
+            .operation = WeightOperationState::EVICTING,
+            .target_residency = WeightResidencyState::COLD,
+            .fenced_metadata_generation = 4,
+            .started_at_ms = 150,
+            .updated_at_ms = 200,
+            .cursor = {},
+            .message = {},
+        }},
+        .next_lease_id = 6,
+        .next_operation_id = 4,
+    };
+
+    MasterService service;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 7, {}, snapshot));
+    EXPECT_EQ(snapshot, ExportWeightMetadataStore(service));
+}
+
+TEST_F(MasterServiceHATest, OldStandbyPromotionClearsWeightMetadataStore) {
+    MasterService service;
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    ASSERT_TRUE(service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    }));
+
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 7, {}));
+    EXPECT_FALSE(
+        service
+            .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+            .has_value());
 }
 
 TEST_F(MasterServiceHATest, FencedWriterClaimsConfiguredProducerView) {

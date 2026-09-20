@@ -10,7 +10,7 @@
 
 #include "replica.h"
 #include "types.h"
-#include "weight_management.h"
+#include "weight_metadata_store.h"
 
 namespace mooncake {
 
@@ -86,8 +86,10 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
 
-    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
+    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
+             weight_metadata);
 };
 
 /**

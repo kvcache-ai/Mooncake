@@ -454,7 +454,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                       })
                 : wrapped_master_service->RestoreFromStandby(
                       promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                      promotion_ctx->segments);
+                      promotion_ctx->segments, promotion_ctx->weight_metadata);
         if (!restore_result) {
             LOG(ERROR) << "Standby restore failed: "
                        << toString(restore_result.error());

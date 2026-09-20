@@ -192,6 +192,8 @@ TEST_F(OpLogApplierTest, RejectsUnsupportedResidencyOperationPayload) {
                       SerializePayload(operating))));
         EXPECT_EQ(2u, applier.GetExpectedSequenceId());
         EXPECT_EQ(ready, standby.GetWeightMetadata(ready.identity));
+        EXPECT_TRUE(
+            ValidateWeightMetadataSnapshot(standby.SnapshotWeightMetadata()));
     }
 }
 

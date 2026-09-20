@@ -7,10 +7,25 @@
 
 namespace mooncake {
 
+namespace test {
+class MasterServiceTestPeer;
+}
+
 class WeightStoreManager {
+    friend class test::MasterServiceTestPeer;
+
    public:
     explicit WeightStoreManager(WeightStoreBackend& backend)
         : backend_(backend) {}
+
+    WeightMetadataSnapshot ExportSnapshot() const {
+        return weight_metadata_.ExportSnapshot();
+    }
+    WeightMetadataStore::Result<void> RestoreSnapshot(
+        const WeightMetadataSnapshot& snapshot) {
+        return weight_metadata_.RestoreSnapshot(snapshot);
+    }
+    void Clear() { weight_metadata_.Clear(); }
 
     WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);

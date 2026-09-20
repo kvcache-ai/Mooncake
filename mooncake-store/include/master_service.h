@@ -882,7 +882,8 @@ class MasterService {
     tl::expected<void, ErrorCode> RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const WeightMetadataSnapshot& weight_metadata = {});
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         BatchOpLogPromotionHandoff handoff,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
@@ -934,7 +935,8 @@ class MasterService {
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
-        std::optional<ReplicaID> expected_max_replica_id);
+        std::optional<ReplicaID> expected_max_replica_id,
+        const WeightMetadataSnapshot* legacy_weight_metadata);
 
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);

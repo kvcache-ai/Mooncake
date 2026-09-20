@@ -84,6 +84,9 @@ void StandbyMetadataStore::Clear() {
     weight_metadata_tombstones_.clear();
     weight_leases_.clear();
     weight_lease_tombstones_.clear();
+    weight_operations_.clear();
+    next_weight_lease_id_ = 1;
+    next_weight_operation_id_ = 1;
 }
 
 bool StandbyMetadataStore::PutWeightMetadata(
@@ -123,6 +126,10 @@ bool StandbyMetadataStore::RemoveWeightMetadata(
 bool StandbyMetadataStore::PutWeightLease(const WeightRevisionLease& lease) {
     std::lock_guard<std::mutex> lock(mutex_);
     weight_leases_[lease.lease_id] = lease;
+    if (lease.lease_id < std::numeric_limits<uint64_t>::max()) {
+        next_weight_lease_id_ =
+            std::max(next_weight_lease_id_, lease.lease_id + 1);
+    }
     return true;
 }
 
@@ -162,6 +169,72 @@ bool StandbyMetadataStore::RemoveWeightLease(
     }
     weight_lease_tombstones_[lease_id] = std::move(tombstone);
     return true;
+}
+
+bool StandbyMetadataStore::RestoreWeightMetadata(
+    const WeightMetadataSnapshot& snapshot) {
+    if (!ValidateWeightMetadataSnapshot(snapshot)) {
+        return false;
+    }
+
+    std::map<WeightRevisionIdentity, WeightRevisionMetadata> metadata;
+    std::unordered_map<uint64_t, WeightRevisionLease> leases;
+    std::unordered_map<uint64_t, WeightResidencyOperation> operations;
+    for (const auto& record : snapshot.metadata) {
+        metadata.emplace(record.identity, record);
+    }
+    for (const auto& lease : snapshot.leases) {
+        leases.emplace(lease.lease_id, lease);
+    }
+    for (const auto& operation : snapshot.operations) {
+        operations.emplace(operation.operation_id, operation);
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    weight_metadata_ = std::move(metadata);
+    weight_metadata_tombstones_.clear();
+    weight_leases_ = std::move(leases);
+    weight_lease_tombstones_.clear();
+    weight_operations_ = std::move(operations);
+    next_weight_lease_id_ = snapshot.next_lease_id;
+    next_weight_operation_id_ = snapshot.next_operation_id;
+    return true;
+}
+
+WeightMetadataSnapshot StandbyMetadataStore::SnapshotWeightMetadata() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    WeightMetadataSnapshot snapshot{
+        .schema_version = 1,
+        .metadata = {},
+        .leases = {},
+        .operations = {},
+        .next_lease_id = next_weight_lease_id_,
+        .next_operation_id = next_weight_operation_id_,
+    };
+    snapshot.metadata.reserve(weight_metadata_.size());
+    for (const auto& [identity, metadata] : weight_metadata_) {
+        (void)identity;
+        snapshot.metadata.push_back(metadata);
+    }
+    snapshot.leases.reserve(weight_leases_.size());
+    for (const auto& [lease_id, lease] : weight_leases_) {
+        (void)lease_id;
+        snapshot.leases.push_back(lease);
+    }
+    snapshot.operations.reserve(weight_operations_.size());
+    for (const auto& [operation_id, operation] : weight_operations_) {
+        (void)operation_id;
+        snapshot.operations.push_back(operation);
+    }
+    std::sort(snapshot.leases.begin(), snapshot.leases.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.lease_id < rhs.lease_id;
+              });
+    std::sort(snapshot.operations.begin(), snapshot.operations.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.operation_id < rhs.operation_id;
+              });
+    return snapshot;
 }
 
 void StandbyMetadataStore::Snapshot(

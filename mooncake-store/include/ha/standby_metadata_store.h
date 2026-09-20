@@ -81,6 +81,8 @@ class StandbyMetadataStore final : public MetadataStore {
     bool RemoveWeightLease(uint64_t lease_id,
                            const WeightRevisionIdentity& identity,
                            uint64_t fenced_metadata_generation) override;
+    bool RestoreWeightMetadata(const WeightMetadataSnapshot& snapshot);
+    WeightMetadataSnapshot SnapshotWeightMetadata() const;
 
     void Snapshot(std::vector<StandbyObjectEntry>& out) const;
     bool ValidateReplicaIds(ReplicaID& max_replica_id) const;
@@ -97,6 +99,9 @@ class StandbyMetadataStore final : public MetadataStore {
     std::map<WeightRevisionIdentity, uint64_t> weight_metadata_tombstones_;
     std::unordered_map<uint64_t, WeightRevisionLease> weight_leases_;
     std::unordered_map<uint64_t, WeightRevisionLease> weight_lease_tombstones_;
+    std::unordered_map<uint64_t, WeightResidencyOperation> weight_operations_;
+    uint64_t next_weight_lease_id_{1};
+    uint64_t next_weight_operation_id_{1};
 };
 
 }  // namespace mooncake
