@@ -33,12 +33,25 @@
 #include <thread>
 #include <unordered_map>
 
+#include "buffer_range_index.h"
 #include "common.h"
 #include "topology.h"
 
 namespace mooncake {
 struct MetadataStoragePlugin;
 struct HandShakePlugin;
+
+// Result of a metadata-backend lookup, distinguishing an authoritative
+// key absence (kNotFound — the master removed the segment key on peer
+// unmount/expiry) from a transient backend failure (kUnavailable — curl
+// timeout, etcd blip, connection drop). syncSegmentCache() advances its
+// invalidation streak only for kNotFound so a metadata-service outage
+// cannot purge the live cache.
+enum class GetResult {
+    kFound,
+    kNotFound,
+    kUnavailable,
+};
 
 #define P2PHANDSHAKE "P2PHANDSHAKE"
 
@@ -69,10 +82,10 @@ class TransferMetadata {
 #else
         using mr_key_t = uint32_t;
 #endif
-        std::vector<mr_key_t> lkey;         // for rdma/efa
-        std::vector<mr_key_t> rkey;         // for rdma/efa
-        std::string shm_name;               // for nvlink and hip
-        uint64_t offset;                    // for cxl
+        std::vector<mr_key_t> lkey;  // for rdma/efa
+        std::vector<mr_key_t> rkey;  // for rdma/efa
+        std::string shm_name;  // nvlink/hip IPC blob, or POSIX shm object name
+        uint64_t offset;       // for cxl
         std::vector<std::string> tseg;      // for ub/urma
         std::vector<uint32_t> l_seg_index;  // for ub/urma
 
@@ -112,6 +125,12 @@ class TransferMetadata {
         std::vector<DeviceDesc> devices;
         Topology topology;
         std::vector<BufferDesc> buffers;
+        // Derived from `buffers`. Rebuild after every mutation of that
+        // vector, before the descriptor is published through a shared_ptr.
+        // Copying a SegmentDesc copies this snapshot; a subsequent
+        // push_back/erase must call rebuildBufferRangeIndex() again.
+        BufferRangeIndex buffer_range_index;
+        void rebuildBufferRangeIndex() { buffer_range_index.rebuild(buffers); }
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // this is for cxl.
@@ -205,6 +224,16 @@ class TransferMetadata {
 
     ~TransferMetadata();
 
+   protected:
+    // Test-only seam: inject a storage plugin directly, bypassing the
+    // conn-string plugin factory (which LOG(FATAL)s without a real
+    // etcd/redis/http backend) and the P2P handshake daemon. Derived
+    // hardware-free unit tests substitute an in-memory
+    // MetadataStoragePlugin to exercise syncSegmentCache without RDMA/CUDA.
+    explicit TransferMetadata(
+        std::shared_ptr<MetadataStoragePlugin> storage_plugin);
+
+   public:
     std::shared_ptr<SegmentDesc> getSegmentDescByName(
         const std::string &segment_name, bool force_update = false);
 
@@ -216,8 +245,11 @@ class TransferMetadata {
     int updateSegmentDesc(const std::string &segment_name,
                           const SegmentDesc &desc);
 
-    std::shared_ptr<SegmentDesc> getSegmentDesc(
-        const std::string &segment_name);
+    // Fetch a segment descriptor from the metadata backend. When |status|
+    // is non-null it receives the GetResult so the caller (syncSegmentCache)
+    // can distinguish an authoritative key removal from a transient outage.
+    std::shared_ptr<SegmentDesc> getSegmentDesc(const std::string &segment_name,
+                                                GetResult *status = nullptr);
 
     SegmentID getSegmentID(const std::string &segment_name);
 
@@ -269,7 +301,8 @@ class TransferMetadata {
 
    private:
     std::shared_ptr<SegmentDesc> getSegmentDescInternal(
-        const std::string &segment_name, bool force_rpc_update);
+        const std::string &segment_name, bool force_rpc_update,
+        GetResult *status = nullptr);
     int getRpcMetaEntryInternal(const std::string &server_name,
                                 RpcMetaDesc &desc, bool force_update);
     int publishSegmentDesc(const std::string &segment_name,
@@ -295,6 +328,11 @@ class TransferMetadata {
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
         segment_id_to_desc_map_;
     std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
+    // Per-REMOTE-segment consecutive fetch-failure streak, guarded by
+    // segment_lock_. Bumped in syncSegmentCache's apply phase when a cached
+    // segment's backend fetch fails; reset to 0 on a successful fetch. Once it
+    // reaches kStaleSegmentFailureThreshold the cached entry is invalidated.
+    std::unordered_map<std::string, int> segment_failure_counts_;
 
     RWSpinlock notify_lock_;
     std::vector<NotifyDesc> notifys;

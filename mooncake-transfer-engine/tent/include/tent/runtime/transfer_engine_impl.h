@@ -37,6 +37,7 @@
 #include "tent/runtime/hp_tcp_transport_config.h"
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
 namespace tent {
 
 class Batch;
@@ -80,6 +81,7 @@ struct TaskInfo {
     uint64_t device_mask{~0ULL};  // Device mask for quota allocation
     std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
     Request request;
+    size_t public_length{0};  // Original API request; request may be merged.
     bool staging{false};
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
@@ -118,6 +120,7 @@ struct TaskInfo {
           device_mask(other.device_mask),
           qp_pool(other.qp_pool),
           request(other.request),
+          public_length(other.public_length),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -142,6 +145,7 @@ struct TaskInfo {
           device_mask(other.device_mask),
           qp_pool(std::move(other.qp_pool)),
           request(std::move(other.request)),
+          public_length(other.public_length),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -167,6 +171,7 @@ struct TaskInfo {
             device_mask = other.device_mask;
             qp_pool = other.qp_pool;
             request = other.request;
+            public_length = other.public_length;
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -197,6 +202,7 @@ struct TaskInfo {
             device_mask = other.device_mask;
             qp_pool = std::move(other.qp_pool);
             request = std::move(other.request);
+            public_length = other.public_length;
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -217,6 +223,7 @@ struct TaskInfo {
 
 class TransferEngineImpl {
     friend class ProxyManager;
+    friend class ::mooncake::TransferEngineImplTestPeer;
 
    public:
     TransferEngineImpl();
@@ -389,6 +396,8 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
+    void deregisterRemovedBuffer(BufferDesc& desc);
+
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
     // Submit-stage failover: recover a task whose synchronous
@@ -550,6 +559,11 @@ class TransferEngineImpl {
 
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;
+
+    // Self-targeted notifications (target == LOCAL_SEGMENT_ID) are delivered
+    // in-process rather than through a transport; see sendNotification().
+    std::mutex local_notifi_mutex_;
+    std::vector<Notification> local_notifi_list_;
 
     std::string hostname_;
     uint16_t port_;

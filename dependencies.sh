@@ -208,6 +208,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      liburing-devel \
                      jemalloc-devel \
                      msgpack-devel \
+                     zeromq-devel \
                      libzstd-devel \
                      pkgconf-pkg-config \
                      elfutils-libelf-devel \
@@ -402,6 +403,11 @@ fi
 if [ "$INSTALL_SPDK" = true ]; then
     print_section "Installing SPDK"
 
+    if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+        apt-get install -y libelf-dev
+        check_success "Failed to install NoF dependencies"
+    fi
+
     cd "${REPO_ROOT}/extern"
     check_success "Failed to change to extern directory"
 
@@ -432,8 +438,8 @@ if [ "$INSTALL_SPDK" = true ]; then
 
     # Install SPDK dependencies
     echo "Installing SPDK dependencies..."
-    ./scripts/pkgdep.sh
-    check_success "Failed to install SPDK dependencies"
+    ./scripts/pkgdep.sh --rdma
+    check_success "Failed to install SPDK RDMA dependencies"
 
     # Configure SPDK with RDMA support
     echo "Configuring SPDK with RDMA support..."

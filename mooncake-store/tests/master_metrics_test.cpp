@@ -136,6 +136,21 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_put_start_discarded_staging_size(), 0);
 }
 
+TEST_F(MasterMetricsTest, ClientOffboardingMetricsAreExported) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.inc_client_offboarding_alert();
+    const auto serialized = metrics.serialize_metrics();
+
+    EXPECT_NE(serialized.find("master_client_liveness_active_clients"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_client_offboarding_queue_depth"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_client_offboarding_retries_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_client_offboarding_alerts_total"),
+              std::string::npos);
+}
+
 TEST_F(MasterMetricsTest, BasicRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
@@ -320,9 +335,11 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     segment.base = 0x300000000;
     segment.size = 1024 * 1024 * 16;
     UUID client_id = generate_uuid();
-    ASSERT_EQ(
-        source_manager.getSegmentAccess().MountSegment(segment, client_id),
-        ErrorCode::OK);
+    ASSERT_EQ(source_manager.getSegmentAccess().MountSegment(
+                  segment, client_id,
+                  std::make_shared<ClientLivenessRecord>(
+                      ClientLivenessRecord::Clock::now())),
+              ErrorCode::OK);
     const int64_t capacity_after_mount = metrics.get_total_mem_capacity();
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               static_cast<int64_t>(segment.size));
@@ -1197,6 +1214,43 @@ TEST_F(MasterMetricsTest, BuildInfoMetricIsSerialized) {
                                              : line_end - brace_end - 1);
     EXPECT_NE(value_part.find('1'), std::string::npos)
         << "build info value should be 1, got:" << value_part;
+}
+
+// Verify the five SSD offload lifecycle counters increment per client_id
+// label. MasterMetricManager is a process-wide singleton without reset APIs,
+// so the test uses unique client_id labels whose values are determined solely
+// by this test, independent of cumulative singleton state from other tests.
+TEST_F(MasterMetricsTest, OffloadCountersIncrementByClient) {
+    auto& mm = MasterMetricManager::instance();
+    const std::string cid_a = "offload-metric-test-a";
+    const std::string cid_b = "offload-metric-test-b";
+
+    mm.inc_offload_enqueued(cid_a, 10);
+    mm.inc_offload_enqueued(cid_b, 5);
+    mm.inc_offload_completed(cid_a, 7);
+    mm.inc_offload_failed(cid_a, 2);
+    mm.inc_offload_cancelled(cid_a, 1);
+    mm.inc_offload_enqueue_rejected(cid_b, 3);
+
+    const std::string out = mm.serialize_metrics();
+    EXPECT_NE(out.find("master_offload_enqueued_total{client_id=\"offload-"
+                       "metric-test-a\"} 10"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_enqueued_total{client_id=\"offload-"
+                       "metric-test-b\"} 5"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_completed_total{client_id=\"offload-"
+                       "metric-test-a\"} 7"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_failed_total{client_id=\"offload-metric-"
+                       "test-a\"} 2"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_cancelled_total{client_id=\"offload-"
+                       "metric-test-a\"} 1"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_enqueue_rejected_total{client_id="
+                       "\"offload-metric-test-b\"} 3"),
+              std::string::npos);
 }
 
 }  // namespace mooncake::test

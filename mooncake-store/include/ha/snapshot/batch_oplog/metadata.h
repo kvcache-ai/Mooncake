@@ -65,6 +65,7 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value);
 
 std::string BuildBatchOpLogSnapshotId(uint64_t last_included_batch_id,
                                       int64_t maintenance_lease_id);
+std::string BuildBatchOpLogSnapshotRoot(const std::string& cluster_id);
 
 std::string BuildBatchOpLogSnapshotMaintenanceKey(
     const std::string& cluster_id);
