@@ -102,6 +102,35 @@ TEST(ToplogyTest, TestSelectDevice) {
     ASSERT_TRUE(items.empty());
 }
 
+TEST(ToplogyTest, TestSelectDeviceHonorsHintAndFallsBack) {
+    mooncake::Topology topology;
+    std::string json_str = "{\"cpu:0\" : [[\"mlx5_0\"],[\"mlx5_1\"]]}";
+    topology.clear();
+    ASSERT_EQ(topology.parse(json_str), 0);
+
+    const auto &hca_list = topology.getHcaList();
+    auto index_of = [&hca_list](const std::string &name) {
+        auto it = std::find(hca_list.begin(), hca_list.end(), name);
+        return it == hca_list.end()
+                   ? -1
+                   : static_cast<int>(std::distance(hca_list.begin(), it));
+    };
+    const int preferred = index_of("mlx5_0");
+    const int fallback = index_of("mlx5_1");
+    ASSERT_GE(preferred, 0);
+    ASSERT_GE(fallback, 0);
+
+    // An explicit hint may select either topology tier.
+    EXPECT_EQ(topology.selectDevice("cpu:0", "mlx5_0"), preferred);
+    EXPECT_EQ(topology.selectDevice("cpu:0", "mlx5_1"), fallback);
+
+    // An unknown or disabled hint remains advisory and falls back to the
+    // normal preferred-device policy rather than failing the transfer.
+    EXPECT_EQ(topology.selectDevice("cpu:0", "does_not_exist"), preferred);
+    ASSERT_EQ(topology.disableDevice("mlx5_1"), 0);
+    EXPECT_EQ(topology.selectDevice("cpu:0", "mlx5_1"), preferred);
+}
+
 TEST(ToplogyTest, TestSelectDeviceAny) {
     mooncake::Topology topology;
     std::string json_str = "{\"cpu:0\" : [[\"erdma_0\"],[\"erdma_1\"]]}";

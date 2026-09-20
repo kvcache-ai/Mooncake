@@ -931,9 +931,17 @@ Status RdmaTransport::submitTransferTask(
             last_remote_target_id = request.target_id;
         }
 
+        // Select once per request so all of its slices normally use the same
+        // local RNIC. A caller-provided hint takes precedence when it names an
+        // eligible device; Topology falls back to its normal policy when the
+        // hint is empty, unknown, or no longer available.
         auto request_buffer_id = -1, request_device_id = -1;
+        const std::string_view request_hint =
+            request.advise_retry_cnt == 0 ? std::string_view(request.nic_hint)
+                                          : std::string_view{};
         const int local_hint_device_id =
-            last_local_device_buffer_id == last_local_buffer_id
+            request_hint.empty() &&
+                    last_local_device_buffer_id == last_local_buffer_id
                 ? last_local_device_id
                 : -1;
         if (local_device_cache.select(
@@ -941,8 +949,9 @@ Status RdmaTransport::submitTransferTask(
                 request_buffer_id, request_device_id, [&] {
                     return selectDevice(
                         local_segment_desc.get(), (uint64_t)request.source,
-                        request.length, request_buffer_id, request_device_id, 0,
-                        last_local_buffer_id, local_hint_device_id);
+                        request.length, request_hint, request_buffer_id,
+                        request_device_id, 0, last_local_buffer_id,
+                        local_hint_device_id);
                 })) {
             request_buffer_id = -1;
             request_device_id = -1;
@@ -993,13 +1002,21 @@ Status RdmaTransport::submitTransferTask(
                 }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
+                // The request-level lookup above can fail when a request spans
+                // registered-memory boundaries even though each slice is
+                // valid. Honor the hint for the initial per-slice attempt too,
+                // then drop it so retries can fail over to another RNIC.
+                const std::string_view slice_hint =
+                    retry_cnt == 0 ? std::string_view(request.nic_hint)
+                                   : std::string_view{};
                 const int slice_hint_device_id =
-                    last_local_device_buffer_id == last_local_buffer_id
+                    slice_hint.empty() &&
+                            last_local_device_buffer_id == last_local_buffer_id
                         ? last_local_device_id
                         : -1;
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,
-                                 buffer_id, device_id, retry_cnt++,
+                                 slice_hint, buffer_id, device_id, retry_cnt++,
                                  last_local_buffer_id, slice_hint_device_id))
                     continue;
                 assert(device_id >= 0 &&

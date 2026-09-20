@@ -447,52 +447,60 @@ int TransferEnginePy::transferSyncWrite(const char* target_hostname,
                                         uintptr_t buffer,
                                         uintptr_t peer_buffer_address,
                                         size_t length,
-                                        const std::string& transport_hint) {
+                                        const std::string& transport_hint,
+                                        const std::string& nic_hint) {
     return transferSync(target_hostname, buffer, peer_buffer_address, length,
-                        TransferOpcode::WRITE, nullptr, transport_hint);
+                        TransferOpcode::WRITE, nullptr, transport_hint,
+                        nic_hint);
 }
 
 int TransferEnginePy::transferSyncRead(const char* target_hostname,
                                        uintptr_t buffer,
                                        uintptr_t peer_buffer_address,
                                        size_t length,
-                                       const std::string& transport_hint) {
+                                       const std::string& transport_hint,
+                                       const std::string& nic_hint) {
     return transferSync(target_hostname, buffer, peer_buffer_address, length,
-                        TransferOpcode::READ, nullptr, transport_hint);
+                        TransferOpcode::READ, nullptr, transport_hint,
+                        nic_hint);
 }
 
 int TransferEnginePy::batchTransferSyncWrite(
     const char* target_hostname, std::vector<uintptr_t> buffers,
     std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-    const std::string& transport_hint) {
+    const std::string& transport_hint, const std::string& nic_hint) {
     return batchTransferSync(target_hostname, buffers, peer_buffer_addresses,
                              lengths, TransferOpcode::WRITE, nullptr,
-                             transport_hint);
+                             transport_hint, nic_hint);
 }
 
 int TransferEnginePy::batchTransferSyncRead(
     const char* target_hostname, std::vector<uintptr_t> buffers,
     std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-    const std::string& transport_hint) {
+    const std::string& transport_hint, const std::string& nic_hint) {
     return batchTransferSync(target_hostname, buffers, peer_buffer_addresses,
                              lengths, TransferOpcode::READ, nullptr,
-                             transport_hint);
+                             transport_hint, nic_hint);
 }
 
 batch_id_t TransferEnginePy::batchTransferAsyncWrite(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
-    const std::vector<size_t>& lengths, const std::string& transport_hint) {
+    const std::vector<size_t>& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
     return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses,
-                              lengths, TransferOpcode::WRITE, transport_hint);
+                              lengths, TransferOpcode::WRITE, transport_hint,
+                              nic_hint);
 }
 
 batch_id_t TransferEnginePy::batchTransferAsyncRead(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
-    const std::vector<size_t>& lengths, const std::string& transport_hint) {
+    const std::vector<size_t>& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
     return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses,
-                              lengths, TransferOpcode::READ, transport_hint);
+                              lengths, TransferOpcode::READ, transport_hint,
+                              nic_hint);
 }
 
 int TransferEnginePy::transferSync(const char* target_hostname,
@@ -500,7 +508,8 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                                    uintptr_t peer_buffer_address, size_t length,
                                    TransferOpcode opcode,
                                    TransferNotify* notify,
-                                   const std::string& transport_hint) {
+                                   const std::string& transport_hint,
+                                   const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -539,6 +548,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         entry.target_offset = peer_buffer_address;
         entry.advise_retry_cnt = retry;
         entry.transport_hint = parseTransportHint(transport_hint);
+        entry.nic_hint = nic_hint;
 
         Status s =
             notify
@@ -604,7 +614,7 @@ int TransferEnginePy::batchTransferSync(
     const char* target_hostname, std::vector<uintptr_t> buffers,
     std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
     TransferOpcode opcode, TransferNotify* notify,
-    const std::string& transport_hint) {
+    const std::string& transport_hint, const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -647,10 +657,12 @@ int TransferEnginePy::batchTransferSync(
         entry.target_offset = peer_buffer_addresses[i];
         entry.advise_retry_cnt = 0;
         entry.transport_hint = parseTransportHint(transport_hint);
+        entry.nic_hint = nic_hint;
         entries.push_back(entry);
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
+        for (auto& entry : entries) entry.advise_retry_cnt = retry;
         auto batch_id = engine_->allocateBatchID(batch_size);
         Status s =
             notify
@@ -728,7 +740,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
     const std::vector<size_t>& lengths, TransferOpcode opcode,
-    const std::string& transport_hint) {
+    const std::string& transport_hint, const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -768,10 +780,12 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         entry.target_offset = peer_buffer_addresses[i];
         entry.advise_retry_cnt = 0;
         entry.transport_hint = parseTransportHint(transport_hint);
+        entry.nic_hint = nic_hint;
         entries.push_back(entry);
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
+        for (auto& entry : entries) entry.advise_retry_cnt = retry;
         batch_id = engine_->allocateBatchID(batch_size);
         auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
 
@@ -854,7 +868,7 @@ int TransferEnginePy::getBatchTransferStatus(
 batch_id_t TransferEnginePy::transferSubmitWrite(
     const char* target_hostname, uintptr_t buffer,
     uintptr_t peer_buffer_address, size_t length,
-    const std::string& transport_hint) {
+    const std::string& transport_hint, const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -878,6 +892,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     entry.target_id = handle;
     entry.target_offset = peer_buffer_address;
     entry.transport_hint = parseTransportHint(transport_hint);
+    entry.nic_hint = nic_hint;
 
     Status s = engine_->submitTransfer(batch_id, {entry});
     if (!s.ok()) {
@@ -1029,7 +1044,8 @@ void TransferEnginePy::batchTransferOnCuda(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
     const std::vector<size_t>& lengths, TransferOpcode opcode,
-    uintptr_t stream_ptr, const std::string& transport_hint) {
+    uintptr_t stream_ptr, const std::string& transport_hint,
+    const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -1065,6 +1081,7 @@ void TransferEnginePy::batchTransferOnCuda(
         entry.target_id = handle;
         entry.target_offset = peer_buffer_addresses[i];
         entry.transport_hint = parseTransportHint(transport_hint);
+        entry.nic_hint = nic_hint;
         entries.push_back(entry);
         total_bytes += lengths[i];
     }
@@ -1091,10 +1108,11 @@ void TransferEnginePy::transferWriteOnCuda(const char* target_hostname,
                                            uintptr_t buffer,
                                            uintptr_t peer_buffer_address,
                                            size_t length, uintptr_t stream_ptr,
-                                           const std::string& transport_hint) {
+                                           const std::string& transport_hint,
+                                           const std::string& nic_hint) {
     batchTransferOnCuda(target_hostname, {buffer}, {peer_buffer_address},
                         {length}, TransferOpcode::WRITE, stream_ptr,
-                        transport_hint);
+                        transport_hint, nic_hint);
 }
 
 /**
@@ -1104,10 +1122,11 @@ void TransferEnginePy::transferReadOnCuda(const char* target_hostname,
                                           uintptr_t buffer,
                                           uintptr_t peer_buffer_address,
                                           size_t length, uintptr_t stream_ptr,
-                                          const std::string& transport_hint) {
+                                          const std::string& transport_hint,
+                                          const std::string& nic_hint) {
     batchTransferOnCuda(target_hostname, {buffer}, {peer_buffer_address},
                         {length}, TransferOpcode::READ, stream_ptr,
-                        transport_hint);
+                        transport_hint, nic_hint);
 }
 
 /**
@@ -1117,10 +1136,10 @@ void TransferEnginePy::batchTransferWriteOnCuda(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
     const std::vector<size_t>& lengths, uintptr_t stream_ptr,
-    const std::string& transport_hint) {
+    const std::string& transport_hint, const std::string& nic_hint) {
     batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses,
                         lengths, TransferOpcode::WRITE, stream_ptr,
-                        transport_hint);
+                        transport_hint, nic_hint);
 }
 
 /**
@@ -1130,10 +1149,10 @@ void TransferEnginePy::batchTransferReadOnCuda(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
     const std::vector<size_t>& lengths, uintptr_t stream_ptr,
-    const std::string& transport_hint) {
+    const std::string& transport_hint, const std::string& nic_hint) {
     batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses,
                         lengths, TransferOpcode::READ, stream_ptr,
-                        transport_hint);
+                        transport_hint, nic_hint);
 }
 #endif
 
@@ -1311,65 +1330,70 @@ PYBIND11_MODULE(engine, m) {
             .def("transfer_sync_write", &TransferEnginePy::transferSyncWrite,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("transfer_sync_read", &TransferEnginePy::transferSyncRead,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("batch_transfer_sync_write",
                  &TransferEnginePy::batchTransferSyncWrite,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("batch_transfer_sync_read",
                  &TransferEnginePy::batchTransferSyncRead,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("batch_transfer_async_write",
                  &TransferEnginePy::batchTransferAsyncWrite,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("batch_transfer_async_read",
                  &TransferEnginePy::batchTransferAsyncRead,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("transfer_sync", &TransferEnginePy::transferSync,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
                  py::arg("opcode"), py::arg("notify") = nullptr,
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("opcode"), py::arg("notify") = nullptr,
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("opcode"), py::arg("transport_hint") = "")
+                 py::arg("opcode"), py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
 #ifdef USE_CUDA
             .def("transfer_write_on_cuda",
                  &TransferEnginePy::transferWriteOnCuda,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
-                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "")
+                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
             .def("transfer_read_on_cuda", &TransferEnginePy::transferReadOnCuda,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
-                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "")
+                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
             .def("batch_transfer_write_on_cuda",
                  &TransferEnginePy::batchTransferWriteOnCuda,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "")
+                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
             .def("batch_transfer_read_on_cuda",
                  &TransferEnginePy::batchTransferReadOnCuda,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "")
+                 py::arg("stream_ptr") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
 #endif
             .def("get_batch_transfer_status",
                  &TransferEnginePy::getBatchTransferStatus)
@@ -1377,7 +1401,7 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::transferSubmitWrite,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
             .def("transfer_check_status",
                  &TransferEnginePy::transferCheckStatus)
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)

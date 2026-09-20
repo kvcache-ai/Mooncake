@@ -107,6 +107,9 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
+DEFINE_string(nic_hint, "",
+              "Preferred local RNIC for each request, e.g. mlx5_3 "
+              "(classic RDMA only)");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
@@ -411,6 +414,7 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
             entry.target_offset =
                 remote_base +
                 FLAGS_block_size * (i * FLAGS_threads + thread_id);
+            entry.nic_hint = FLAGS_nic_hint;
             requests.emplace_back(entry);
         }
 

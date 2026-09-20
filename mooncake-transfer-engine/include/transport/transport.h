@@ -75,6 +75,10 @@ class Transport {
         uint64_t task_group_id = kNoTaskGroup;
         // TENT transport selection priority; ignored by classic TE.
         int priority = PRIO_MEDIUM;
+        // Optional local RNIC preference for the classic RDMA transport, e.g.
+        // "mlx5_3". The hint is advisory: an unknown or unavailable device
+        // falls back to normal topology-based selection.
+        std::string nic_hint = {};
     };
 
     enum TransferStatusEnum {
