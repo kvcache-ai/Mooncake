@@ -104,6 +104,7 @@ class MockMetadataStore : public MetadataStore {
         weight_metadata_tombstones_.clear();
         weight_leases_.clear();
         weight_lease_tombstones_.clear();
+        weight_operations_.clear();
     }
 
     size_t Size() const { return GetKeyCount(); }
@@ -180,6 +181,20 @@ class MockMetadataStore : public MetadataStore {
         return true;
     }
 
+    bool PutWeightOperation(
+        const WeightResidencyOperation& operation) override {
+        weight_operations_[operation.operation_id] = operation;
+        return true;
+    }
+
+    std::optional<WeightResidencyOperation> GetWeightOperation(
+        uint64_t operation_id) const override {
+        const auto it = weight_operations_.find(operation_id);
+        return it == weight_operations_.end()
+                   ? std::nullopt
+                   : std::optional<WeightResidencyOperation>(it->second);
+    }
+
    private:
     std::map<std::string, std::map<std::string, StandbyObjectMetadata>>
         metadata_map_;
@@ -187,6 +202,7 @@ class MockMetadataStore : public MetadataStore {
     std::map<WeightRevisionIdentity, uint64_t> weight_metadata_tombstones_;
     std::map<uint64_t, WeightRevisionLease> weight_leases_;
     std::map<uint64_t, WeightRevisionLease> weight_lease_tombstones_;
+    std::map<uint64_t, WeightResidencyOperation> weight_operations_;
 };
 
 }  // namespace mooncake::test
