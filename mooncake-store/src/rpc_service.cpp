@@ -74,6 +74,33 @@ auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
     return std::invoke(std::forward<Fn>(fn), tenant_id.value());
 }
 
+template <typename Request>
+void BindWeightRequestTenant(Request& request, const TenantId& tenant_id) {
+    if constexpr (requires { request.identity.tenant_id; }) {
+        request.identity.tenant_id = tenant_id.value();
+    } else {
+        request.tenant_id = tenant_id.value();
+    }
+}
+
+template <typename Request, typename Fn>
+auto WithWeightRequestTenant(Request request, std::string_view raw,
+                             bool enable_multi_tenants, bool write,
+                             Fn&& fn) {
+    using Result = std::invoke_result_t<Fn, const Request&>;
+    auto tenant_id = write
+                         ? ResolveTenantIdForWrite(raw, enable_multi_tenants)
+                         : ResolveRequestTenantId(
+                               enable_multi_tenants ? raw
+                                                    : TenantId::kDefaultValue);
+    if (!tenant_id) {
+        return Result(tl::make_unexpected(
+            WeightManagementError::INVALID_ARGUMENT));
+    }
+    BindWeightRequestTenant(request, *tenant_id);
+    return std::invoke(std::forward<Fn>(fn), request);
+}
+
 }  // namespace
 
 WrappedMasterService::WrappedMasterService(
@@ -1773,6 +1800,144 @@ WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
     return master_service_.QuerySegmentStatusById(segment_id);
 }
 
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::BeginWeightImport(
+    const BeginWeightImportRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager().BeginWeightImport(
+                bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::CommitWeightImport(
+    const CommitWeightImportRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager().CommitWeightImport(
+                bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::AbortWeightImport(
+    const AbortWeightImportRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager().AbortWeightImport(
+                bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionView>
+WrappedMasterService::GetWeightRevision(
+    const GetWeightRevisionRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager().GetWeightRevision(
+                bound);
+        });
+}
+
+WeightMetadataStore::Result<ListWeightRevisionsResponse>
+WrappedMasterService::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager().ListWeightRevisions(
+                bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+WrappedMasterService::AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager()
+                .AcquireWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+WrappedMasterService::RenewWeightRevisionLease(
+    const RenewWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager()
+                .RenewWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<void> WrappedMasterService::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager()
+                .ReleaseWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WrappedMasterService::StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager()
+                .StartWeightResidencyOperation(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WrappedMasterService::QueryWeightOperation(
+    const QueryWeightOperationRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager().QueryWeightOperation(
+                bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::ReconcileWeightRevision(
+    const ReconcileWeightRevisionRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager()
+                .ReconcileWeightRevision(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.GetWeightStoreManager().DeleteWeightRevision(
+                bound);
+        });
+}
+
 bool WrappedMasterService::KvEventsEnabled() const {
     return master_service_.KvEventsEnabled();
 }
@@ -1951,6 +2116,39 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BeginWeightImport>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::CommitWeightImport>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::AbortWeightImport>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetWeightRevision>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ListWeightRevisions>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::AcquireWeightRevisionLease>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RenewWeightRevisionLease>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReleaseWeightRevisionLease>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::StartWeightResidencyOperation>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::QueryWeightOperation>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReconcileWeightRevision>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::DeleteWeightRevision>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

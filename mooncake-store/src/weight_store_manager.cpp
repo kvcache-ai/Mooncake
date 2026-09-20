@@ -413,7 +413,14 @@ WeightStoreManager::StartWeightResidencyOperation(
 WeightMetadataStore::Result<WeightResidencyOperation>
 WeightStoreManager::QueryWeightOperation(
     const QueryWeightOperationRequest& request) const {
-    return weight_metadata_.QueryOperation(request.operation_id);
+    if (request.tenant_id.empty() || !TenantId(request.tenant_id).IsValid()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+    auto operation = weight_metadata_.QueryOperation(request.operation_id);
+    if (!operation || operation->identity.tenant_id == request.tenant_id) {
+        return operation;
+    }
+    return tl::make_unexpected(WeightManagementError::NOT_FOUND);
 }
 
 
