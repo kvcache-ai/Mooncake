@@ -1271,8 +1271,8 @@ std::vector<int> DummyClient::batchIsExist(
     return results;
 }
 
-std::vector<int> DummyClient::batchIsExist(
-    const std::vector<std::string>& keys, const ExistOptions& options) {
+std::vector<int> DummyClient::batchIsExist(const std::vector<std::string>& keys,
+                                           const ExistOptions& options) {
     if (options.prefetch_to_memory) {
         VLOG(1) << "SSD prefetch is not supported via DummyClient; "
                 << "prefetch_to_memory ignored";

@@ -113,8 +113,7 @@ TEST(PrefetchThrottleTest, AlreadyResidentClearsPromoteAttempted) {
 
     ASSERT_EQ(throttle.reserve({"a"}).size(), 1u);
     throttle.markAlreadyResident("a");
-    EXPECT_EQ(throttle.stateOf("a"),
-              PrefetchThrottle::State::kAlreadyResident);
+    EXPECT_EQ(throttle.stateOf("a"), PrefetchThrottle::State::kAlreadyResident);
     EXPECT_FALSE(throttle.promoteAttempted("a"));
 }
 
@@ -170,8 +169,7 @@ TEST(PrefetchThrottleTest, ConcurrentReserveGrantsEachKeyOnce) {
     for (int t = 0; t < 8; ++t) {
         threads.emplace_back([&] {
             auto granted = throttle.reserve(keys);
-            total_reserved.fetch_add(granted.size(),
-                                     std::memory_order_relaxed);
+            total_reserved.fetch_add(granted.size(), std::memory_order_relaxed);
         });
     }
     for (auto& thread : threads) {

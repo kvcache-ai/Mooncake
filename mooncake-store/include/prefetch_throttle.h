@@ -108,10 +108,9 @@ class PrefetchThrottle {
             if (it != shard.entries.end() && !EntryExpired(it->second, now)) {
                 continue;
             }
-            shard.entries[key] =
-                Entry{.trigger_ms = now,
-                      .completed_ms = -1,
-                      .state = State::kTriggered};
+            shard.entries[key] = Entry{.trigger_ms = now,
+                                       .completed_ms = -1,
+                                       .state = State::kTriggered};
             out.push_back(key);
         }
         return out;
@@ -201,7 +200,8 @@ class PrefetchThrottle {
         const Shard& shard = ShardFor(key);
         std::lock_guard<std::mutex> lock(shard.mutex);
         auto it = shard.entries.find(key);
-        if (it == shard.entries.end() || it->second.state != State::kCompleted) {
+        if (it == shard.entries.end() ||
+            it->second.state != State::kCompleted) {
             return -1;
         }
         return it->second.completed_ms;
@@ -275,8 +275,8 @@ class PrefetchThrottle {
             }
             return now - entry.trigger_ms > backoff_ms;
         }
-        const int64_t last_ms = entry.completed_ms >= 0 ? entry.completed_ms
-                                                        : entry.trigger_ms;
+        const int64_t last_ms =
+            entry.completed_ms >= 0 ? entry.completed_ms : entry.trigger_ms;
         return now - last_ms > ttl_ms;
     }
 
@@ -297,8 +297,7 @@ class PrefetchThrottle {
     }
 
     std::atomic<int64_t> cooldown_until_ms_{0};
-    std::atomic<int64_t> cooldown_ms_{DEFAULT_SSD_PREFETCH_COOLDOWN_SEC *
-                                     1000};
+    std::atomic<int64_t> cooldown_ms_{DEFAULT_SSD_PREFETCH_COOLDOWN_SEC * 1000};
     std::atomic<int64_t> dedup_ttl_ms_{DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC *
                                        1000};
     std::array<Shard, kNumShards> shards_;

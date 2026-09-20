@@ -428,8 +428,8 @@ class PyClient {
         return isExist(key);
     }
 
-    virtual std::vector<int> batchIsExist(
-        const std::vector<std::string> &keys, const ExistOptions &options) {
+    virtual std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                          const ExistOptions &options) {
         (void)options;
         return batchIsExist(keys);
     }

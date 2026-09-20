@@ -1014,8 +1014,8 @@ tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
         const auto& key = keys[i];
         const int64_t size = sizes[i];
         bool key_dram_pressure = false;
-        auto result =
-            PromoteOneKeyFromLocalDisk(key, tenant_id, size, &key_dram_pressure);
+        auto result = PromoteOneKeyFromLocalDisk(key, tenant_id, size,
+                                                 &key_dram_pressure);
         if (key_dram_pressure && dram_pressure != nullptr) {
             *dram_pressure = true;
         }

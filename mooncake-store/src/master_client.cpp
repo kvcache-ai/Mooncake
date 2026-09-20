@@ -654,9 +654,10 @@ MasterClient::BatchGetReplicaListReadOnly(
     timer.LogRequest("keys_count=", object_keys.size(),
                      ", tenant_id=", tenant_id);
 
-    auto result = invoke_batch_rpc<
-        &WrappedMasterService::BatchGetReplicaListForAdmin,
-        GetReplicaListResponse>(object_keys.size(), object_keys, tenant_id);
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListForAdmin,
+                         GetReplicaListResponse>(object_keys.size(),
+                                                 object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -1202,9 +1203,8 @@ tl::expected<void, ErrorCode> MasterClient::RegisterPrefetchTask(
     const UUID& client_id, const std::string& key) {
     ScopedVLogTimer timer(1, "MasterClient::RegisterPrefetchTask");
     timer.LogRequest("client_id=", client_id, ", key=", key);
-    auto result =
-        invoke_rpc<&WrappedMasterService::RegisterPrefetchTask, void>(
-            client_id, key, tenant_id_.value());
+    auto result = invoke_rpc<&WrappedMasterService::RegisterPrefetchTask, void>(
+        client_id, key, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }

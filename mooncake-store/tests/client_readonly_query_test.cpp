@@ -86,8 +86,7 @@ class ClientReadOnlyQueryTest : public ::testing::Test {
             {CONFIG_KEY_MASTER_SERVER_ADDR, master_.master_address()},
         };
         auto setup_result = client_->setup_internal(config);
-        ASSERT_TRUE(setup_result.has_value())
-            << toString(setup_result.error());
+        ASSERT_TRUE(setup_result.has_value()) << toString(setup_result.error());
 
         // One resident object to query.
         std::string value(kValueSize, 'x');
@@ -145,8 +144,7 @@ TEST_F(ClientReadOnlyQueryTest, MissingKeyReturnsObjectNotFound) {
 }
 
 TEST_F(ClientReadOnlyQueryTest, BatchPreservesOrderAndPerKeyErrors) {
-    const std::vector<std::string> keys = {kKey,
-                                           "readonly_query_missing_key"};
+    const std::vector<std::string> keys = {kKey, "readonly_query_missing_key"};
 
     auto leasing = client_->client_->BatchQuery(keys);
     ASSERT_EQ(leasing.size(), keys.size());

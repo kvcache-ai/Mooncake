@@ -328,8 +328,8 @@ int mooncake_store_batch_is_exist_with_options(
             key_vec.emplace_back(keys[i]);
         }
 
-        auto results = as_client(store)->batchIsExist(
-            key_vec, to_exist_options(options));
+        auto results =
+            as_client(store)->batchIsExist(key_vec, to_exist_options(options));
 
         for (size_t i = 0; i < count; ++i) {
             results_out[i] = (i < results.size()) ? results[i] : -1;

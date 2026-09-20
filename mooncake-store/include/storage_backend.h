@@ -288,8 +288,8 @@ class StorageBackendInterface {
      * prefetch to size the staging allocation from authoritative local
      * metadata instead of trusting a remote caller's hint.
      */
-    virtual std::optional<int64_t> GetObjectDataSize(const std::string& key)
-        const {
+    virtual std::optional<int64_t> GetObjectDataSize(
+        const std::string& key) const {
         (void)key;
         return std::nullopt;
     }
@@ -827,8 +827,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @brief Returns the data size recorded in the in-memory bucket index,
      * or std::nullopt when the key is unknown.
      */
-    std::optional<int64_t> GetObjectDataSize(const std::string& key) const
-        override;
+    std::optional<int64_t> GetObjectDataSize(
+        const std::string& key) const override;
 
     /**
      * @brief Scan existing object metadata from storage and report via handler.

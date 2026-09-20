@@ -60,10 +60,10 @@ std::optional<SsdPrefetchRoute> ClassifySsdPrefetchRoute(
 // Register a promotion task per key on the master (this node is the holder),
 // then run the shared promotion execution chain. PROMOTION_ALREADY_EXISTS is
 // the normal "already resident / already in flight" outcome: skip quietly.
-void RegisterAndPromote(
-    Client& client, FileStorage& file_storage,
-    const std::shared_ptr<PrefetchThrottle>& throttle,
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+void RegisterAndPromote(Client& client, FileStorage& file_storage,
+                        const std::shared_ptr<PrefetchThrottle>& throttle,
+                        const std::vector<std::string>& keys,
+                        const std::vector<int64_t>& sizes) {
     std::vector<std::string> promote_keys;
     std::vector<int64_t> promote_sizes;
     promote_keys.reserve(keys.size());
@@ -71,7 +71,8 @@ void RegisterAndPromote(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto register_result = client.RegisterPrefetchTask(keys[i]);
         if (!register_result) {
-            if (register_result.error() != ErrorCode::PROMOTION_ALREADY_EXISTS) {
+            if (register_result.error() !=
+                ErrorCode::PROMOTION_ALREADY_EXISTS) {
                 VLOG(1) << "SSD prefetch: RegisterPrefetchTask failed for key="
                         << keys[i] << ", error=" << register_result.error();
                 if (throttle) {
@@ -178,7 +179,8 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
     }
 
     const std::string local_rpc_addr = local_rpc_addr_;
-    SubmitJob([client = std::move(client), file_storage = std::move(file_storage),
+    SubmitJob([client = std::move(client),
+               file_storage = std::move(file_storage),
                client_requester = std::move(client_requester), throttle,
                local_rpc_addr, keys = std::move(reserved)]() {
         std::unordered_map<std::string, std::vector<std::string>> remote_keys;
@@ -192,10 +194,10 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
                                            keys.begin() + end);
             auto batch_results = client->BatchQueryReadOnly(chunk);
             if (batch_results.size() != chunk.size()) {
-                LOG(WARNING) << "SSD prefetch: BatchQueryReadOnly size "
-                                "mismatch, expected "
-                             << chunk.size() << ", got "
-                             << batch_results.size();
+                LOG(WARNING)
+                    << "SSD prefetch: BatchQueryReadOnly size "
+                       "mismatch, expected "
+                    << chunk.size() << ", got " << batch_results.size();
                 continue;
             }
 
@@ -203,14 +205,14 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
             std::vector<int64_t> local_sizes;
             for (size_t i = 0; i < chunk.size(); ++i) {
                 if (!batch_results[i]) {
-                    VLOG(1) << "SSD prefetch: metadata query failed for key="
-                            << chunk[i]
-                            << ", error=" << batch_results[i].error();
+                    VLOG(1)
+                        << "SSD prefetch: metadata query failed for key="
+                        << chunk[i] << ", error=" << batch_results[i].error();
                     throttle->markFailed(chunk[i]);
                     continue;
                 }
-                auto route = ClassifySsdPrefetchRoute(
-                    batch_results[i].value().replicas);
+                auto route =
+                    ClassifySsdPrefetchRoute(batch_results[i].value().replicas);
                 if (!route) {
                     throttle->markAlreadyResident(chunk[i]);
                     continue;
@@ -244,8 +246,8 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
             }
 
             if (file_storage && !local_keys.empty()) {
-                RegisterAndPromote(*client, *file_storage, throttle,
-                                   local_keys, local_sizes);
+                RegisterAndPromote(*client, *file_storage, throttle, local_keys,
+                                   local_sizes);
             }
         }
 
@@ -287,8 +289,9 @@ void SsdPrefetcher::RunLocalPrefetch(const std::vector<std::string>& keys,
     if (reserved.empty()) {
         return;
     }
-    SubmitJob([client = std::move(client), file_storage = std::move(file_storage),
-               throttle, keys = std::move(reserved)]() {
+    SubmitJob([client = std::move(client),
+               file_storage = std::move(file_storage), throttle,
+               keys = std::move(reserved)]() {
         std::vector<std::string> local_keys;
         std::vector<int64_t> local_sizes;
         local_keys.reserve(keys.size());
@@ -326,12 +329,12 @@ std::optional<QueryResult> SsdPrefetcher::WaitIfPromotionInFlight(
         if (!qr) {
             return std::nullopt;
         }
-        const bool has_memory = std::any_of(
-            qr->replicas.begin(), qr->replicas.end(),
-            [](const Replica::Descriptor& replica) {
-                return replica.is_memory_replica() &&
-                       replica.status == ReplicaStatus::COMPLETE;
-            });
+        const bool has_memory =
+            std::any_of(qr->replicas.begin(), qr->replicas.end(),
+                        [](const Replica::Descriptor& replica) {
+                            return replica.is_memory_replica() &&
+                                   replica.status == ReplicaStatus::COMPLETE;
+                        });
         if (!has_memory) {
             return std::nullopt;
         }
@@ -360,12 +363,12 @@ std::optional<QueryResult> SsdPrefetcher::WaitIfPromotionInFlight(
     if (!qr) {
         return std::nullopt;
     }
-    const bool promotion_in_flight = std::any_of(
-        qr->replicas.begin(), qr->replicas.end(),
-        [](const Replica::Descriptor& replica) {
-            return replica.is_memory_replica() &&
-                   replica.status == ReplicaStatus::PROCESSING;
-        });
+    const bool promotion_in_flight =
+        std::any_of(qr->replicas.begin(), qr->replicas.end(),
+                    [](const Replica::Descriptor& replica) {
+                        return replica.is_memory_replica() &&
+                               replica.status == ReplicaStatus::PROCESSING;
+                    });
     if (!promotion_in_flight) {
         return std::nullopt;
     }

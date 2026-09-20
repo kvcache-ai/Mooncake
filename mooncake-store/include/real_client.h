@@ -1007,7 +1007,8 @@ class RealClient : public PyClient {
 
     // SSD prefetch (best-effort SSD->DRAM promotion on exist probes). Off
     // unless enable_ssd_prefetch is set in the config; knobs are read from
-    // the config dict in setup_internal. See docs/source/design/ssd-prefetch.md.
+    // the config dict in setup_internal. See
+    // docs/source/design/ssd-prefetch.md.
     std::unique_ptr<SsdPrefetcher> prefetcher_;
     bool enable_ssd_prefetch_ = false;
     int64_t ssd_prefetch_cooldown_sec_ = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC;

@@ -76,8 +76,8 @@ class SsdPrefetcher {
     // in-flight promotion: a local throttle record that is still live, or a
     // read-only re-query showing a PROCESSING MEMORY replica. Fail / already
     // resident / delegated keys return immediately.
-    std::optional<QueryResult> WaitIfPromotionInFlight(
-        const std::string& key, int64_t budget_ms);
+    std::optional<QueryResult> WaitIfPromotionInFlight(const std::string& key,
+                                                       int64_t budget_ms);
 
    private:
     // Submit to the bounded pool; drop the job when the pool is unavailable

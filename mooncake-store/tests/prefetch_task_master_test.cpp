@@ -63,10 +63,10 @@ class PrefetchTaskMasterTest : public ::testing::Test {
     bool InjectLocalDiskOnlyKey(MasterService& service, const UUID& client_id,
                                 const std::string& key, int64_t size,
                                 const std::string& transport_endpoint) {
-        std::vector<OffloadTaskItem> tasks{OffloadTaskItem{
-            .tenant_id = std::string(TenantId::kDefaultValue),
-            .key = key,
-            .size = size}};
+        std::vector<OffloadTaskItem> tasks{
+            OffloadTaskItem{.tenant_id = std::string(TenantId::kDefaultValue),
+                            .key = key,
+                            .size = size}};
         StorageObjectMetadata sm;
         sm.bucket_id = 0;
         sm.offset = 0;
@@ -133,7 +133,8 @@ TEST_F(PrefetchTaskMasterTest, RegisterSuccessThenDuplicateSkips) {
 
     // Duplicate registration is a normal best-effort outcome, reported
     // distinctly so the caller skips silently.
-    auto dup = service->RegisterPrefetchTask(holder, "pk1", TenantId::Default());
+    auto dup =
+        service->RegisterPrefetchTask(holder, "pk1", TenantId::Default());
     ASSERT_FALSE(dup.has_value());
     EXPECT_EQ(dup.error(), ErrorCode::PROMOTION_ALREADY_EXISTS);
 
@@ -153,8 +154,8 @@ TEST_F(PrefetchTaskMasterTest, MissingKeyNotFound) {
     auto service = std::make_unique<MasterService>(config);
 
     UUID holder = PrepareHolderClient(*service, "prefetch_seg_2");
-    auto res =
-        service->RegisterPrefetchTask(holder, "no_such_key", TenantId::Default());
+    auto res = service->RegisterPrefetchTask(holder, "no_such_key",
+                                             TenantId::Default());
     ASSERT_FALSE(res.has_value());
     EXPECT_EQ(res.error(), ErrorCode::OBJECT_NOT_FOUND);
 
@@ -171,8 +172,7 @@ TEST_F(PrefetchTaskMasterTest, NonHolderRejected) {
     ASSERT_TRUE(InjectLocalDiskOnlyKey(*service, holder, "pk3", 1024,
                                        "prefetch_seg_3"));
 
-    auto res =
-        service->RegisterPrefetchTask(other, "pk3", TenantId::Default());
+    auto res = service->RegisterPrefetchTask(other, "pk3", TenantId::Default());
     ASSERT_FALSE(res.has_value());
     EXPECT_EQ(res.error(), ErrorCode::INVALID_PARAMS);
     EXPECT_FALSE(
@@ -213,8 +213,8 @@ TEST_F(PrefetchTaskMasterTest, NotifyPromotionSuccessGrantsLeaseForPrefetch) {
         service->RegisterPrefetchTask(holder, "pk5", TenantId::Default())
             .has_value());
     const std::vector<std::string> preferred_segments;
-    auto alloc = service->PromotionAllocStart(holder, "pk5", TenantId::Default(),
-                                              1024, preferred_segments);
+    auto alloc = service->PromotionAllocStart(
+        holder, "pk5", TenantId::Default(), 1024, preferred_segments);
     ASSERT_TRUE(alloc.has_value());
     auto commit =
         service->NotifyPromotionSuccess(holder, "pk5", TenantId::Default());

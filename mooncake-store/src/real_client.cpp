@@ -2377,8 +2377,8 @@ std::vector<int> RealClient::batchIsExist(
     return batchIsExist(keys, ExistOptions{});
 }
 
-std::vector<int> RealClient::batchIsExist(
-    const std::vector<std::string> &keys, const ExistOptions &options) {
+std::vector<int> RealClient::batchIsExist(const std::vector<std::string> &keys,
+                                          const ExistOptions &options) {
     auto internal_results = batchIsExist_internal(keys);
     std::vector<int> results;
     results.reserve(internal_results.size());
@@ -6633,15 +6633,15 @@ RealClient::batch_get_into_multi_buffers_internal(
             const int64_t remaining =
                 get_wait_deadline - PrefetchThrottle::NowMs();
             if (remaining > 0) {
-                if (auto waited = prefetcher_->WaitIfPromotionInFlight(
-                        key, remaining);
+                if (auto waited =
+                        prefetcher_->WaitIfPromotionInFlight(key, remaining);
                     waited.has_value()) {
-                    const auto *promoted = SelectBestReplica(
-                        waited->replicas, local_endpoints);
+                    const auto *promoted =
+                        SelectBestReplica(waited->replicas, local_endpoints);
                     if (promoted != nullptr && promoted->is_memory_replica()) {
                         refreshed_qr.emplace(*waited);
-                        best_replica = SelectBestReplica(
-                            refreshed_qr->replicas, local_endpoints);
+                        best_replica = SelectBestReplica(refreshed_qr->replicas,
+                                                         local_endpoints);
                     }
                 }
             }
@@ -6708,10 +6708,10 @@ RealClient::batch_get_into_multi_buffers_internal(
         valid_operations.push_back(
             {.key = key,
              .original_index = i,
-             .query_result = FilterQueryResult(
-                 refreshed_qr.has_value() ? refreshed_qr.value()
-                                          : query_result_values,
-                 replica),
+             .query_result = FilterQueryResult(refreshed_qr.has_value()
+                                                   ? refreshed_qr.value()
+                                                   : query_result_values,
+                                               replica),
              .slices = std::move(key_slices),
              .total_size = total_size});
         // Set success result (actual bytes transferred)
@@ -7336,8 +7336,8 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
     return file_storage_->ReleaseBuffer(batch_id);
 }
 
-bool RealClient::prefetch_offload_object(
-    const std::vector<std::string> &keys, const std::vector<int64_t> &sizes) {
+bool RealClient::prefetch_offload_object(const std::vector<std::string> &keys,
+                                         const std::vector<int64_t> &sizes) {
     if (!enable_ssd_prefetch_ || !prefetcher_ || !file_storage_) {
         VLOG(1) << "prefetch_offload_object called but SSD prefetch is "
                    "disabled or SSD offload is not set up";
