@@ -252,10 +252,10 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
                 importing.updated_at_ms = importing.created_at_ms;
                 append(OpType::WEIGHT_METADATA_UPSERT,
                        MakeWeightRevisionMetadataKey(importing.identity),
-                       importing);
+                       WeightMetadataUpsertOp{.metadata = importing});
                 append(OpType::WEIGHT_METADATA_UPSERT,
                        MakeWeightRevisionMetadataKey(metadata.identity),
-                       metadata);
+                       WeightMetadataUpsertOp{.metadata = metadata});
             }
             for (const auto& lease : weight_metadata->leases) {
                 append(OpType::WEIGHT_LEASE_UPSERT,
