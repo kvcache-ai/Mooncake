@@ -488,7 +488,14 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         return results;
     }
     const size_t block_count = chain->BlockCount();
-    const size_t queried_tokens = token_ids.size();
+    // Reusable logical KV positions carried by this query. The bigram chains
+    // hash token pairs, so n raw tokens cover n - 1 positions and the chain is
+    // built over that length. Capping at the raw count there would still let a
+    // full match report one position no indexed block holds.
+    const size_t queried_tokens =
+        (state->profile.strategy == "sglang_bigram" && !token_ids.empty())
+            ? token_ids.size() - 1
+            : token_ids.size();
 
     // Resolve the optional filter and copy rank sets before probing. The copies
     // remain valid while the probe releases and reacquires state.mutex.
