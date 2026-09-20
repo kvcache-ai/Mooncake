@@ -322,4 +322,19 @@ struct BatchGetOffloadObjectResponse {
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
          transfer_engine_addr, gc_ttl_ms);
 
+// Answer to a replica verify on the offload RPC server: per-key what the
+// owner found and did. 1 = backing file present (reader retries the same
+// replica), 0 = file proven gone and the owner has evicted its own replica
+// (reader re-queries), 2 = the owner could not determine (storage layer
+// trouble or the eviction did not go through) — a reader must never treat an
+// undetermined answer as gone.
+struct VerifyDiskReplicaResponse {
+    std::vector<uint8_t> states;
+
+    VerifyDiskReplicaResponse() = default;
+    explicit VerifyDiskReplicaResponse(std::vector<uint8_t> states_param)
+        : states(std::move(states_param)) {}
+};
+YLT_REFL(VerifyDiskReplicaResponse, states);
+
 }  // namespace mooncake

@@ -164,6 +164,18 @@ class ClientRequester {
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
 
+    /**
+     * @brief Asks a replica owner to verify the backing file of each key and
+     * evict its own replica when the file is proven gone.
+     * @param client_addr Network address of the replica owner's offload RPC
+     * service.
+     * @param keys The object keys to verify.
+     * @return Per-key tri-state in request order (present, evicted,
+     * undetermined), or an error when the owner could not answer at all.
+     */
+    tl::expected<VerifyDiskReplicaResponse, ErrorCode> verify_disk_replica(
+        const std::string &client_addr, const std::vector<std::string> &keys);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and

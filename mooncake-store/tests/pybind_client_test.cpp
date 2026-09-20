@@ -3080,6 +3080,180 @@ TEST_F(RealClientTest, BatchGetBufferTruncatedBucketFileSurfacesMiss) {
     EXPECT_EQ(py_client_->get_replica_desc(key).size(), 1u);
 }
 
+// fcczzz's review on #3889: the heal used to live only in the batch path and
+// refused to act unless every COMPLETE replica was the caller's own
+// LOCAL_DISK, so a remote reader could never evict the owner's dangling
+// replica. A second client with no SSD of its own reads the owner's wiped
+// replica through the single-key get path: the read misses, and the probe to
+// the owner must still evict the dead replica.
+TEST_F(RealClientTest,
+       GetBufferRemoteReaderHealsOwnersDanglingLocalDiskReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_remote_get_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    // The owner holds the SSD offload; the reader has no disk of its own and
+    // can only reach the replica over the owner's offload RPC. The reader
+    // joins after the offload completes, the way a second node would.
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "remote_reader_get_heal";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    const auto disk_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool disk_ready = false;
+    while (std::chrono::steady_clock::now() < disk_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) disk_ready = true;
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    auto reader = RealClient::create();
+    ASSERT_EQ(
+        reader->setup_real("localhost:17814", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                           16 * 1024 * 1024, "tcp", "", master_address_),
+        0);
+
+    // Sanity: the remote single-key read works while the file is there.
+    ASSERT_NE(reader->get_buffer(key), nullptr);
+
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    // Nothing about the wiped replica belongs to the reader, yet its miss
+    // must still get the dead replica evicted.
+    EXPECT_EQ(reader->get_buffer(key), nullptr);
+    EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
+
+    reader->tearDownAll();
+}
+
+// Same remote-reader shape through the batch path: the reader's failed batch
+// read must find the failed replica by the endpoint it actually read from and
+// have the owner evict it.
+TEST_F(RealClientTest,
+       BatchGetBufferRemoteReaderHealsOwnersDanglingLocalDiskReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_remote_batch_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "remote_reader_batch_heal";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    const auto disk_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool disk_ready = false;
+    while (std::chrono::steady_clock::now() < disk_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) disk_ready = true;
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    // The reader joins after the offload completed, like a second node would.
+    auto reader = RealClient::create();
+    ASSERT_EQ(
+        reader->setup_real("localhost:17814", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                           16 * 1024 * 1024, "tcp", "", master_address_),
+        0);
+
+    auto before = reader->batch_get_buffer({key});
+    ASSERT_EQ(before.size(), 1u);
+    ASSERT_NE(before[0], nullptr);
+
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    auto after = reader->batch_get_buffer({key});
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0], nullptr);
+    EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
+
+    reader->tearDownAll();
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

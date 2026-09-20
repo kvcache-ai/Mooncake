@@ -766,10 +766,25 @@ class RealClient : public PyClient {
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
 
+    // Whether a failed LOCAL_DISK read was healed: the owner proved the
+    // backing file gone and the replica was evicted (kEvicted), the file is
+    // actually present so the failure was transient (kPresent), or nothing
+    // could be determined (kUnknown).
+    enum class DiskReadHealResult { kEvicted, kPresent, kUnknown };
+
+    // Read-side counterpart of the Put-path heal: ask the (possibly remote)
+    // replica owner over the offload RPC to verify the backing file; the
+    // owner evicts its own replica when the file is proven gone (the master
+    // scopes LOCAL_DISK eviction to the owning client). A present or
+    // undetermined answer never evicts.
+    DiskReadHealResult heal_disk_replica_for_read(
+        const std::string &key, const Replica::Descriptor &local_disk_replica);
+
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        bool heal_dangling_disk_replica = true);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys,
@@ -804,6 +819,20 @@ class RealClient : public PyClient {
      * @return true if batch was found and released, false otherwise
      */
     bool release_offload_buffer(uint64_t batch_id);
+
+    /**
+     * @brief Verifies each key's backing offload file on this (the replica
+     * owner's) disk and evicts this client's own replica when the file is
+     * proven gone. Called by a reader over the offload RPC when a read failed
+     * against one of this client's LOCAL_DISK replicas; the eviction has to
+     * happen here because the master scopes replica eviction to the owning
+     * client.
+     * @param keys The object keys to verify
+     * @return Per-key tri-state in request order (present, evicted,
+     * undetermined)
+     */
+    async_simple::coro::Lazy<tl::expected<VerifyDiskReplicaResponse, ErrorCode>>
+    verify_disk_replica(const std::vector<std::string> &keys);
 
     /**
      * @brief Retrieves multiple stored objects from a remote service.
