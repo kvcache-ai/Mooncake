@@ -722,6 +722,13 @@ void Workers::asyncPostSend() {
                 LOG_EVERY_N(ERROR, 10000)
                     << "Failed to generate post path for slice " << slice
                     << ": " << status.ToString();
+                // generatePostPath may have armed a probe/trial via admit()
+                // before a later validation failed (e.g. rkey out of bounds).
+                // The slice never reaches the wire, so roll back the admission
+                // or the rail is permanently blocked (Half-Open).
+                if (auto* rail = slice->rail_monitor)
+                    rail->cancelProbe(slice->source_dev_id,
+                                      slice->target_dev_id);
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 // Count first: resolving the slice lets the batch be freed.
                 discountFromOwner(worker, slice);
@@ -730,6 +737,11 @@ void Workers::asyncPostSend() {
                                              ? CANCELED
                                              : FAILED);
             } else if (dropUnpostableSlice(worker, slice)) {
+                // Path generated OK (admit may have armed a probe), then the
+                // slice was canceled before posting: roll back the admission.
+                if (auto* rail = slice->rail_monitor)
+                    rail->cancelProbe(slice->source_dev_id,
+                                      slice->target_dev_id);
                 slice = slice->next;
                 continue;
             } else {
@@ -749,8 +761,17 @@ void Workers::asyncPostSend() {
         if (slices.empty()) continue;
         slices.erase(std::remove_if(slices.begin(), slices.end(),
                                     [&](RdmaSlice* slice) {
-                                        return dropUnpostableSlice(worker,
-                                                                   slice);
+                                        if (!dropUnpostableSlice(worker, slice))
+                                            return false;
+                                        // Canceled after admit() armed a
+                                        // probe/trial but before the endpoint
+                                        // was obtained: roll back the
+                                        // admission.
+                                        if (auto* rail = slice->rail_monitor)
+                                            rail->cancelProbe(
+                                                slice->source_dev_id,
+                                                slice->target_dev_id);
+                                        return true;
                                     }),
                      slices.end());
         if (slices.empty()) continue;
@@ -759,7 +780,13 @@ void Workers::asyncPostSend() {
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);
             for (auto slice : clone) {
-                if (dropUnpostableSlice(worker, slice)) continue;
+                if (dropUnpostableSlice(worker, slice)) {
+                    // Canceled after admit() armed a probe/trial: roll back.
+                    if (auto* rail = slice->rail_monitor)
+                        rail->cancelProbe(slice->source_dev_id,
+                                          slice->target_dev_id);
+                    continue;
+                }
                 slice->retry_count++;
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
@@ -814,6 +841,11 @@ void Workers::asyncPostSend() {
             worker.inflight_slice_set.erase(slice);
             releaseSliceQuota(slice, post_ts);
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
+                // Canceled after admit() armed a probe/trial and HW rejected
+                // the post: roll back the admission.
+                if (auto* rail = slice->rail_monitor)
+                    rail->cancelProbe(slice->source_dev_id,
+                                      slice->target_dev_id);
                 discountFromOwner(worker, slice);
                 updateSliceStatus(slice, CANCELED);
                 continue;

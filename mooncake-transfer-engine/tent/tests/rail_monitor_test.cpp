@@ -620,6 +620,48 @@ TEST(RailMonitorProbeTest, CancelProbeRevertsArmedTrial) {
     rail.cancelProbe(0, 0);
     EXPECT_TRUE(rail.isAvailable(0, 0)) << "cancelProbe no-op on a Closed rail";
 }
+// ---------------------------------------------------------------------------
+// Regression (alogfans): a Half-Open trial admitted by admit() can be aborted
+// before it reaches the wire (e.g. a post-path validation failure, or a cancel
+// after path generation but before submitSlices). The slice's completion
+// callback never fires, so without cancelProbe() the rail stays Half-Open
+// with probe_in_flight set forever and admit() keeps returning false.
+// cancelProbe() must roll the admission back so the rail re-admits a trial.
+// ---------------------------------------------------------------------------
+
+TEST(RailMonitorProbeTest, AbortedHalfOpenTrialDoesNotBlockRail) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote = makeSingleNicTopology("mlx5_1");
+
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
+    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
+    cfg.set(RailMonitor::kCfgCooldownSecs, 1);
+    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 60);  // disable probing
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
+
+    // Pause, let it expire, admit one Half-Open trial.
+    rail.markFailed(0, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_TRUE(rail.admit(0, 0)) << "Expiry -> trial admitted";
+    EXPECT_FALSE(rail.admit(0, 0)) << "Trial in flight blocks a second admit";
+
+    // The trial is aborted pre-wire (no completion callback ever fires).
+    // Without cancelProbe the rail would stay blocked here.
+    rail.cancelProbe(0, 0);
+
+    // The rail must re-admit a fresh trial -- not be permanently blocked.
+    EXPECT_TRUE(rail.admit(0, 0))
+        << "An aborted Half-Open trial must not permanently block the rail; "
+           "cancelProbe must let a fresh trial arm.";
+    EXPECT_FALSE(rail.admit(0, 0)) << "The fresh trial is in flight";
+
+    // And the fresh trial resolving (success) closes the rail normally.
+    rail.markRecovered(0, 0);
+    EXPECT_TRUE(rail.isAvailable(0, 0));
+}
 
 }  // namespace
 }  // namespace tent

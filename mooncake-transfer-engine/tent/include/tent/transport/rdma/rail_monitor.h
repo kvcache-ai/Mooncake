@@ -71,6 +71,17 @@ class RailMonitor {
 
     bool isAvailable(int local_nic, int remote_nic) const;
 
+    // Mutating admit: the ONLY path that arms a probe/trial. Returns true when
+    // a transfer may use this rail -- Closed (no-op), or an exploratory probe /
+    // Half-Open trial. Sets probe_in_flight for paused rails so a second probe
+    // cannot race the first while it is on the wire. Callers that select a rail
+    // but fail to post must call cancelProbe() to clear the flag.
+    //
+    // The check-then-set on probe_in_flight is not atomic, but each RailMonitor
+    // is owned by exactly one worker thread (WorkerContext::rails[machine_id]
+    // is per-worker, never shared -- see the class comment), so admit() and
+    // the completion-path mutators all run single-threaded on that worker; no
+    // two workers arm a probe on the same rail.
     bool admit(int local_nic, int remote_nic);
 
     void markFailed(int local_nic, int remote_nic);

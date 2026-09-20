@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <malloc.h>  // malloc_trim (spy forwards to the real impl)
 #include <functional>
 #include <map>
 #include <memory>
@@ -1794,6 +1795,121 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error())
             << "key=" << key;
     }
+}
+
+TEST_F(MasterServiceTest, ClearStaleHandlesTrimsMallocAfterLargeSweep) {
+    // Regression: erasing entry memory returns it to glibc's free list, which
+    // glibc does not proactively release to the OS, so RSS holds at high-water
+    // after a large stale-handle sweep. ClearStaleHandles must call
+    // malloc_trim(0) once the erased count crosses kMallocTrimThreshold.
+    auto service = std::make_unique<MasterService>();
+    PauseReplicaCleanup(*service);
+
+    // Spy that counts calls and forwards to the real malloc_trim so the
+    // process still reclaims memory (the test itself allocates a lot).
+    std::atomic<size_t> trim_calls{0};
+    auto prev = MasterServiceTestPeer(*service).SetMallocTrimFnForTesting(
+        [&trim_calls](size_t pad) {
+            ++trim_calls;
+            return ::malloc_trim(pad);
+        });
+
+    constexpr size_t kSegmentSize = 1024 * 1024 * 128;
+    const std::string stale_segment_name = "trim_stale_segment";
+    const auto stale_segment = PrepareSimpleSegment(
+        *service, stale_segment_name, 0x300000000, kSegmentSize);
+
+    // Erase just over the threshold so the trim fires exactly once. Keys
+    // scatter across kNumShards shards, so we generate enough candidates and
+    // keep those on any shard (we do not need them on one shard here — the
+    // trim decision is global, not per-shard).
+    constexpr size_t kErasedTarget = kMallocTrimThreshold + 1000;
+    std::vector<std::string> keys;
+    for (size_t i = 0; keys.size() < kErasedTarget; ++i) {
+        ASSERT_LT(i, 5000000u) << "could not generate enough keys";
+        const std::string key = "trim_key_" + std::to_string(i);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {stale_segment_name};
+        ASSERT_TRUE(service
+                        ->PutStart(stale_segment.client_id, key,
+                                   TenantId::Default(), 1024, config)
+                        .has_value())
+            << "key=" << key;
+        ASSERT_TRUE(service
+                        ->PutEnd(stale_segment.client_id, key,
+                                 TenantId::Default(), ReplicaType::MEMORY)
+                        .has_value())
+            << "key=" << key;
+        keys.push_back(key);
+    }
+
+    ASSERT_EQ(0u, trim_calls.load());
+    ASSERT_TRUE(service
+                    ->UnmountSegment(stale_segment.segment_id,
+                                     stale_segment.client_id)
+                    .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    // The sweep erased kErasedTarget (> kMallocTrimThreshold) entries, so
+    // malloc_trim must fire exactly once.
+    EXPECT_EQ(1u, trim_calls.load())
+        << "expected exactly one malloc_trim after erasing " << kErasedTarget
+        << " keys (threshold=" << kMallocTrimThreshold << ")";
+    EXPECT_EQ(0u, service->GetKeyCount());
+
+    MasterServiceTestPeer(*service).SetMallocTrimFnForTesting(std::move(prev));
+}
+
+TEST_F(MasterServiceTest, ClearStaleHandlesSkipsMallocTrimForSmallSweep) {
+    // A small unmount (well under kMallocTrimThreshold) must not pay for a
+    // malloc_trim arena scan.
+    auto service = std::make_unique<MasterService>();
+    PauseReplicaCleanup(*service);
+
+    std::atomic<size_t> trim_calls{0};
+    auto prev = MasterServiceTestPeer(*service).SetMallocTrimFnForTesting(
+        [&trim_calls](size_t pad) {
+            ++trim_calls;
+            return ::malloc_trim(pad);
+        });
+
+    constexpr size_t kSegmentSize = 1024 * 1024 * 128;
+    const auto stale_segment = PrepareSimpleSegment(
+        *service, "trim_small_stale", 0x300000000, kSegmentSize);
+
+    // Far below the threshold.
+    constexpr size_t kSmallCount = 100;
+    std::vector<std::string> keys;
+    for (size_t i = 0; i < kSmallCount; ++i) {
+        const std::string key = "trim_small_key_" + std::to_string(i);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {"trim_small_stale"};
+        ASSERT_TRUE(service
+                        ->PutStart(stale_segment.client_id, key,
+                                   TenantId::Default(), 1024, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        ->PutEnd(stale_segment.client_id, key,
+                                 TenantId::Default(), ReplicaType::MEMORY)
+                        .has_value());
+        keys.push_back(key);
+    }
+    ASSERT_LT(kSmallCount, kMallocTrimThreshold);
+
+    ASSERT_TRUE(service
+                    ->UnmountSegment(stale_segment.segment_id,
+                                     stale_segment.client_id)
+                    .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    EXPECT_EQ(0u, trim_calls.load())
+        << "malloc_trim must not fire for a sweep of " << kSmallCount
+        << " keys (below threshold " << kMallocTrimThreshold << ")";
+    EXPECT_EQ(0u, service->GetKeyCount());
+
+    MasterServiceTestPeer(*service).SetMallocTrimFnForTesting(std::move(prev));
 }
 
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {

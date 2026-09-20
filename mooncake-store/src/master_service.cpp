@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <malloc.h>  // malloc_trim
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
@@ -375,6 +376,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
             te_endpoint, timeout_ms, error_reason);
     };
 #endif
+
+    // Default trim implementation: release glibc free-list memory back to the
+    // OS. Tests inject a spy via MasterServiceTestPeer.
+    malloc_trim_fn_ = [](size_t pad) { return ::malloc_trim(pad); };
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     offload_on_evict_ = enable_offload_ && config.offload_on_evict;
@@ -2718,6 +2723,10 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     std::optional<ErrorCode> first_persist_error;
+    // Accumulate erased-entry count across shards; once it crosses
+    // kMallocTrimThreshold, glibc's free list holds enough freed entry memory
+    // that returning it to the OS is worth a malloc_trim(0).
+    size_t total_erased = 0;
     for (size_t i = 0; i < kNumShards; i++) {
         // Pass 1: pick out the keys that need work under the shard's shared
         // lock. A sweep normally finds nothing in most shards, and such a
@@ -2744,6 +2753,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         // size of the shard. The shard may have changed while the lock was
         // released, so every key is looked up and re-classified here.
         bool erased_in_shard = false;
+        size_t erased_in_pass = 0;
         for (size_t begin = 0; begin < stale_keys.size();
              begin += kStaleHandleCleanupBatchSize) {
             const size_t end = std::min(begin + kStaleHandleCleanupBatchSize,
@@ -2782,6 +2792,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                         EraseMetadata(tenant_state, it, tenant_it->first,
                                       QuotaEraseMode::kFull, &shard);
                         erased_in_shard = true;
+                        ++erased_in_pass;
                     } else {
                         continue;
                     }
@@ -2815,6 +2826,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     EraseMetadata(tenant_state, it, tenant_it->first,
                                   QuotaEraseMode::kFull, &shard);
                     erased_in_shard = true;
+                    ++erased_in_pass;
                 } else {
                     continue;
                 }
@@ -2841,6 +2853,17 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 ShrinkBucketsIfSparse(tenant.second.metadata);
             }
         }
+        total_erased += erased_in_pass;
+    }
+    // Erased entry memory returns to glibc's free list, which glibc does not
+    // proactively release to the OS (MALLOC_TRIM_THRESHOLD_ default is 128 KB,
+    // negligible against tens of GB of freed entries). On a large sweep
+    // (e.g. a full store node offline erasing millions of keys) RSS would
+    // hold at its high-water mark forever. A single malloc_trim(0) reclaims
+    // it. The threshold gate skips the arena scan for small unmounts where
+    // the cost exceeds the benefit.
+    if (total_erased >= kMallocTrimThreshold) {
+        malloc_trim_fn_(0);
     }
     if (first_persist_error) {
         return tl::make_unexpected(*first_persist_error);
