@@ -513,6 +513,8 @@ class FilereadWorkerPool {
      */
     void submitTask(FilereadTask task);
 
+    size_t worker_count() const { return workers_.size(); }
+
    private:
     void workerThread();
 
