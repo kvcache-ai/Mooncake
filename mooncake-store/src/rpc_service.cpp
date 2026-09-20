@@ -85,17 +85,15 @@ void BindWeightRequestTenant(Request& request, const TenantId& tenant_id) {
 
 template <typename Request, typename Fn>
 auto WithWeightRequestTenant(Request request, std::string_view raw,
-                             bool enable_multi_tenants, bool write,
-                             Fn&& fn) {
+                             bool enable_multi_tenants, bool write, Fn&& fn) {
     using Result = std::invoke_result_t<Fn, const Request&>;
-    auto tenant_id = write
-                         ? ResolveTenantIdForWrite(raw, enable_multi_tenants)
-                         : ResolveRequestTenantId(
-                               enable_multi_tenants ? raw
-                                                    : TenantId::kDefaultValue);
+    auto tenant_id =
+        write ? ResolveTenantIdForWrite(raw, enable_multi_tenants)
+              : ResolveRequestTenantId(
+                    enable_multi_tenants ? raw : TenantId::kDefaultValue);
     if (!tenant_id) {
-        return Result(tl::make_unexpected(
-            WeightManagementError::INVALID_ARGUMENT));
+        return Result(
+            tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT));
     }
     BindWeightRequestTenant(request, *tenant_id);
     return std::invoke(std::forward<Fn>(fn), request);
@@ -1806,8 +1804,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::SetSegmentStatus(
 }
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
-WrappedMasterService::BeginWeightImport(
-    const BeginWeightImportRequest& request, const std::string& tenant_id) {
+WrappedMasterService::BeginWeightImport(const BeginWeightImportRequest& request,
+                                        const std::string& tenant_id) {
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -1828,8 +1826,8 @@ WrappedMasterService::CommitWeightImport(
 }
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
-WrappedMasterService::AbortWeightImport(
-    const AbortWeightImportRequest& request, const std::string& tenant_id) {
+WrappedMasterService::AbortWeightImport(const AbortWeightImportRequest& request,
+                                        const std::string& tenant_id) {
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -1839,8 +1837,8 @@ WrappedMasterService::AbortWeightImport(
 }
 
 WeightMetadataStore::Result<WeightRevisionView>
-WrappedMasterService::GetWeightRevision(
-    const GetWeightRevisionRequest& request, const std::string& tenant_id) {
+WrappedMasterService::GetWeightRevision(const GetWeightRevisionRequest& request,
+                                        const std::string& tenant_id) {
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
         [this](const auto& bound) {
@@ -1884,7 +1882,8 @@ WrappedMasterService::RenewWeightRevisionLease(
         });
 }
 
-WeightMetadataStore::Result<void> WrappedMasterService::ReleaseWeightRevisionLease(
+WeightMetadataStore::Result<void>
+WrappedMasterService::ReleaseWeightRevisionLease(
     const ReleaseWeightRevisionLeaseRequest& request,
     const std::string& tenant_id) {
     return WithWeightRequestTenant(
@@ -1909,8 +1908,7 @@ WrappedMasterService::StartWeightResidencyOperation(
 
 WeightMetadataStore::Result<WeightResidencyOperation>
 WrappedMasterService::QueryWeightOperation(
-    const QueryWeightOperationRequest& request,
-    const std::string& tenant_id) {
+    const QueryWeightOperationRequest& request, const std::string& tenant_id) {
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
         [this](const auto& bound) {
@@ -1933,8 +1931,7 @@ WrappedMasterService::ReconcileWeightRevision(
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
 WrappedMasterService::DeleteWeightRevision(
-    const DeleteWeightRevisionRequest& request,
-    const std::string& tenant_id) {
+    const DeleteWeightRevisionRequest& request, const std::string& tenant_id) {
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
@@ -2123,16 +2120,16 @@ void RegisterRpcService(
             &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BeginWeightImport>(
         &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::CommitWeightImport>(
-        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::CommitWeightImport>(
+            &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::AbortWeightImport>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetWeightRevision>(
         &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::ListWeightRevisions>(
-        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::ListWeightRevisions>(
+            &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::AcquireWeightRevisionLease>(
         &wrapped_master_service);

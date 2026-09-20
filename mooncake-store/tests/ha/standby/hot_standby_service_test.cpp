@@ -329,6 +329,8 @@ WeightMetadataSnapshot MakeWeightMetadataSnapshot() {
             .fenced_metadata_generation = 4,
             .started_at_ms = 150,
             .updated_at_ms = 200,
+            .processed_members = 0,
+            .total_members = 2,
             .cursor = {},
             .message = {},
         }},
@@ -859,10 +861,9 @@ TEST_F(HotStandbyServiceTest, AppliesNewerWeightMetadataOpLogAfterSnapshot) {
         .metadata = ready,
         .operation = std::nullopt,
     });
-    auto batch = MakeCaptureBatch(
-        1, 2, OpType::WEIGHT_METADATA_UPSERT,
-        MakeWeightRevisionMetadataKey(ready.identity),
-        std::string(encoded.begin(), encoded.end()));
+    auto batch = MakeCaptureBatch(1, 2, OpType::WEIGHT_METADATA_UPSERT,
+                                  MakeWeightRevisionMetadataKey(ready.identity),
+                                  std::string(encoded.begin(), encoded.end()));
     batch.entries.front().tenant_id = ready.identity.tenant_id;
     ASSERT_EQ(ErrorCode::OK, backend->Put(BuildBatchRecordKey(cluster_id, 1),
                                           EncodeOpLogBatchRecord(batch)));

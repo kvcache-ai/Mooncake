@@ -51,8 +51,8 @@ class MasterStoreBackend final : public WeightStoreBackend {
    public:
     explicit MasterStoreBackend(MasterService& master) : master_(master) {}
     bool CanPublishWeightMutations() const override;
-    PromotionQueueResult PromoteWeightObject(
-        const TenantId& tenant_id, const std::string& key) override;
+    PromotionQueueResult PromoteWeightObject(const TenantId& tenant_id,
+                                             const std::string& key) override;
     std::vector<std::string> GetGroupMemberKeys(
         const TenantId& tenant_id, const std::string& group_id) const override;
     tl::expected<void, ErrorCode> RemoveObject(
