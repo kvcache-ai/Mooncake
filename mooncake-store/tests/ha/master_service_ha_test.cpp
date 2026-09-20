@@ -3914,7 +3914,8 @@ TEST_F(MasterServiceHATest,
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, rejected.error());
     EXPECT_FALSE(
-        service.GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+        service
+            .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
             .has_value());
 
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -4253,7 +4254,7 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(snapshot, ExportWeightMetadata(service));
 }
 
-TEST_F(MasterServiceHATest, OldStandbyPromotionClearsWeightMetadataStore) {
+TEST_F(MasterServiceHATest, OldStandbyPromotionClearsWeightMetadata) {
     MasterService service;
     const WeightRevisionIdentity identity{
         .tenant_id = "default",

@@ -160,12 +160,11 @@ TEST_F(OpLogApplierTest, AppliesImportingToReadyTransition) {
     ready.created_at_ms = importing.created_at_ms;
     const auto key = MakeWeightRevisionMetadataKey(importing.identity);
 
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(importing))));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
-        1, OpType::WEIGHT_METADATA_UPSERT, key,
-        SerializeWeightUpsert(importing))));
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
-        2, OpType::WEIGHT_METADATA_UPSERT, key,
-        SerializeWeightUpsert(ready))));
+        2, OpType::WEIGHT_METADATA_UPSERT, key, SerializeWeightUpsert(ready))));
     EXPECT_EQ(ready,
               mock_metadata_store_->GetWeightMetadata(importing.identity));
 }
@@ -186,8 +185,7 @@ TEST_F(OpLogApplierTest, ReplaysWeightOperationStartAndCompletion) {
     auto ready = MakeWeightMetadata(1);
     const auto key = MakeWeightRevisionMetadataKey(ready.identity);
     ASSERT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
-        1, OpType::WEIGHT_METADATA_UPSERT, key,
-        SerializeWeightUpsert(ready))));
+        1, OpType::WEIGHT_METADATA_UPSERT, key, SerializeWeightUpsert(ready))));
 
     auto evicting = ready;
     evicting.metadata_generation = 2;
@@ -202,12 +200,15 @@ TEST_F(OpLogApplierTest, ReplaysWeightOperationStartAndCompletion) {
         .fenced_metadata_generation = 2,
         .started_at_ms = 200,
         .updated_at_ms = 200,
+        .processed_members = 0,
+        .total_members = 2,
+        .cursor = {},
+        .message = {},
     };
-    ASSERT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
-        2, OpType::WEIGHT_METADATA_UPSERT, key,
-        SerializeWeightUpsert(evicting, operation))));
-    EXPECT_EQ(operation,
-              mock_metadata_store_->GetWeightOperation(9));
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(evicting, operation))));
+    EXPECT_EQ(operation, mock_metadata_store_->GetWeightOperation(9));
 
     auto cold = evicting;
     cold.metadata_generation = 3;

@@ -78,7 +78,8 @@ class WeightStoreManager {
 
    private:
     WeightMetadataStore::Result<WeightResidencyOperation>
-    PersistAndPublishWeightOperationMutation(const WeightOperationMutation& mutation);
+    PersistAndPublishWeightOperationMutation(
+        const WeightOperationMutation& mutation);
     WeightMetadataStore::Result<WeightRevisionLease>
     PersistAndPublishWeightLeaseMutation(const WeightLeaseMutation& mutation);
     WeightMetadataStore::Result<WeightRevisionMetadata>
