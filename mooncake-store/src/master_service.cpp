@@ -215,6 +215,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_offload_(config.enable_offload),
       enable_oplog_(config.enable_ha && config.enable_oplog &&
                     config.ha_backend_type == "etcd"),
+      weight_management_mutations_enabled_(
+          !enable_oplog_ ||
+          config.weight_management_oplog_capability_confirmed),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),

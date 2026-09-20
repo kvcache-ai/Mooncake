@@ -6,9 +6,40 @@
 
 namespace mooncake {
 
+bool MasterStoreBackend::IsOpLogEnabled() const {
+    return master_.enable_oplog_;
+}
+
+bool MasterStoreBackend::CanPublishWeightMutations() const {
+    return master_.weight_management_mutations_enabled_;
+}
+
 bool MasterStoreBackend::IsTenantSupported(const std::string& tenant_id) const {
     const TenantId tenant(tenant_id);
     return tenant.IsValid() && master_.ResolveRequestTenantId(tenant) == tenant;
+}
+
+tl::expected<OpLogEntry, ErrorCode>
+MasterStoreBackend::AppendOpLogWithDurableFinalize(OpType type,
+                                                   const std::string& tenant_id,
+                                                   const std::string& key,
+                                                   const std::string& payload,
+                                                   DurableFinalize finalize) {
+    auto appended = master_.AppendOpLogWithDurableFinalize(
+        type, tenant_id, key, payload,
+        [finalize](const OpLogEntry& entry) { finalize(entry); });
+    if (appended) {
+        // Durability success precedes callback completion; only failures may
+        // complete this operation through the durability waiter.
+        [[maybe_unused]] auto failure_notification =
+            master_.ordered_oplog_writer_->AwaitDurable(appended->sequence_id)
+                .thenValue([finalize = std::move(finalize)](ErrorCode error) {
+                    if (error != ErrorCode::OK) {
+                        finalize(tl::make_unexpected(error));
+                    }
+                });
+    }
+    return appended;
 }
 
 WeightMetadataStore::Result<std::vector<WeightGroupMemberSnapshot>>

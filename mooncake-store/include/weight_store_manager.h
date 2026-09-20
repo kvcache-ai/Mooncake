@@ -24,6 +24,8 @@ class WeightStoreManager {
     ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
    private:
+    WeightMetadataStore::Result<WeightRevisionMetadata>
+    PersistAndPublishWeightMutation(const WeightMetadataMutation& mutation);
     std::unique_lock<std::mutex> LockGroup(
         const WeightRevisionIdentity& identity);
     WeightMetadataStore::Result<void> ValidateWeightGroupForCommit(

@@ -2150,6 +2150,7 @@ class MasterService {
     static int64_t DynamicReplicationNowMs();
 
     const bool enable_oplog_;
+    const bool weight_management_mutations_enabled_;
     const uint32_t oplog_batch_max_entries_;
 
     // cluster id for persistent sub directory

@@ -1,7 +1,11 @@
 #include "weight_store_manager.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <limits>
+#include <memory>
+
+#include <glog/logging.h>
 
 namespace mooncake {
 
@@ -33,7 +37,7 @@ WeightStoreManager::BeginWeightImport(const BeginWeightImportRequest& request) {
     if (!mutation) {
         return tl::make_unexpected(mutation.error());
     }
-    return weight_metadata_.Publish(*mutation);
+    return PersistAndPublishWeightMutation(*mutation);
 }
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
@@ -55,14 +59,14 @@ WeightStoreManager::CommitWeightImport(
         return tl::make_unexpected(mutation.error());
     }
     if (mutation->no_op) {
-        return weight_metadata_.Publish(*mutation);
+        return PersistAndPublishWeightMutation(*mutation);
     }
     auto validation = ValidateWeightGroupForCommit(request);
     if (!validation) {
         return tl::make_unexpected(validation.error());
     }
 
-    return weight_metadata_.Publish(*mutation);
+    return PersistAndPublishWeightMutation(*mutation);
 }
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
@@ -76,7 +80,7 @@ WeightStoreManager::AbortWeightImport(const AbortWeightImportRequest& request) {
     if (!mutation) {
         return tl::make_unexpected(mutation.error());
     }
-    return weight_metadata_.Publish(*mutation);
+    return PersistAndPublishWeightMutation(*mutation);
 }
 
 WeightMetadataStore::Result<WeightRevisionView>
@@ -150,6 +154,80 @@ WeightStoreManager::ValidateWeightGroupForCommit(
         return tl::make_unexpected(WeightManagementError::CONFLICT);
     }
     return {};
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WeightStoreManager::PersistAndPublishWeightMutation(
+    const WeightMetadataMutation& mutation) {
+    if (!mutation.no_op && !backend_.CanPublishWeightMutations()) {
+        return tl::make_unexpected(WeightManagementError::DURABILITY_FAILED);
+    }
+    if (mutation.no_op || !backend_.IsOpLogEnabled()) {
+        return weight_metadata_.Publish(mutation);
+    }
+
+    OpType type;
+    std::string payload;
+    if (mutation.kind == WeightMetadataMutationKind::UPSERT &&
+        mutation.next.has_value()) {
+        type = OpType::WEIGHT_METADATA_UPSERT;
+        const auto encoded = struct_pack::serialize(*mutation.next);
+        payload.assign(encoded.begin(), encoded.end());
+    } else if (mutation.previous.has_value()) {
+        type = OpType::WEIGHT_METADATA_DELETE;
+        WeightMetadataDeleteOp deletion{
+            .identity = mutation.identity,
+            .metadata_generation = mutation.previous->metadata_generation,
+        };
+        const auto encoded = struct_pack::serialize(deletion);
+        payload.assign(encoded.begin(), encoded.end());
+    } else {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+
+    struct Completion {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::optional<WeightMetadataStore::Result<WeightRevisionMetadata>>
+            result;
+    };
+    auto completion = std::make_shared<Completion>();
+    auto persisted = backend_.AppendOpLogWithDurableFinalize(
+        type, mutation.identity.tenant_id,
+        MakeWeightRevisionMetadataKey(mutation.identity), payload,
+        [this, mutation,
+         completion](const WeightStoreBackend::DurableResult& durable_entry) {
+            std::lock_guard lock(completion->mutex);
+            if (completion->result.has_value()) {
+                return;
+            }
+            if (!durable_entry) {
+                completion->result = tl::make_unexpected(
+                    WeightManagementError::DURABILITY_FAILED);
+                completion->cv.notify_all();
+                return;
+            }
+            completion->result = weight_metadata_.Publish(mutation);
+            if (!*completion->result) {
+                LOG(ERROR) << "Failed to publish durable weight metadata "
+                              "mutation, sequence_id="
+                           << durable_entry->sequence_id
+                           << ", key=" << durable_entry->object_key
+                           << ", error="
+                           << static_cast<int>(completion->result->error());
+            }
+            completion->cv.notify_all();
+        });
+    if (!persisted) {
+        LOG(ERROR) << "Failed to persist weight metadata mutation, key="
+                   << MakeWeightRevisionMetadataKey(mutation.identity)
+                   << ", error=" << static_cast<int>(persisted.error());
+        return tl::make_unexpected(WeightManagementError::DURABILITY_FAILED);
+    }
+
+    std::unique_lock lock(completion->mutex);
+    completion->cv.wait(lock, [&] { return completion->result.has_value(); });
+    return std::move(*completion->result);
 }
 
 }  // namespace mooncake
