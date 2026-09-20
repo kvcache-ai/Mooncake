@@ -214,7 +214,10 @@ WeightStoreManager::PersistAndPublishWeightMutation(
     if (mutation.kind == WeightMetadataMutationKind::UPSERT &&
         mutation.next.has_value()) {
         type = OpType::WEIGHT_METADATA_UPSERT;
-        const auto encoded = struct_pack::serialize(*mutation.next);
+        const auto encoded = struct_pack::serialize(WeightMetadataUpsertOp{
+            .metadata = *mutation.next,
+            .operation = std::nullopt,
+        });
         payload.assign(encoded.begin(), encoded.end());
     } else if (mutation.previous.has_value()) {
         type = OpType::WEIGHT_METADATA_DELETE;

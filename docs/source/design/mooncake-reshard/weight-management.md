@@ -203,12 +203,6 @@ Disabling it does not remove existing weight state, including state loaded
 through snapshot restore or standby promotion. Such a cluster still requires
 readers that support its weight OpLog and snapshot formats.
 
-The metadata-only OpLog payload in this stage accepts revisions without an
-active residency operation (`operation=NONE`, `operation_id=0`). The applier
-rejects an active operation reference rather than accepting metadata whose
-operation record cannot be replicated. Residency operation publication and
-atomic replication of metadata with its operation record are follow-up work.
-
 ## Serving-System Boundary
 
 Store owns durable revision discovery, readable-residency state, leases, and
