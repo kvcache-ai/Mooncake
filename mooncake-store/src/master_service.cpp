@@ -1445,6 +1445,10 @@ WeightMetadataStore::Result<void> MasterService::ReleaseWeightRevisionLease(
     return weight_manager_.ReleaseWeightRevisionLease(request);
 }
 
+
+
+
+
 void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
                                           const std::string& key,
                                           const std::string& group_id) {
@@ -1478,10 +1482,16 @@ std::vector<std::string> MasterService::GetGroupMemberKeys(
 MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     const TenantId& tenant_id, const std::string& key,
     const std::string& group_id, bool allow_soft_pinned,
+    bool allow_managed_weight, bool allow_hard_pinned,
     std::chrono::system_clock::time_point now,
     const std::function<EvictMemberOutcome(MetadataAccessorRW& member)>&
         evict_one_member) {
     GroupEvictionResult result;
+
+    if (!allow_managed_weight && !group_id.empty() &&
+        weight_manager_.IsManagedGroup(group_id)) {
+        return result;
+    }
 
     // Group membership lives in group_domain_, keyed by scoped(tenant,
     // group_id) and read WITHOUT holding any key.
@@ -1503,11 +1513,15 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
             continue;
         }
         auto& member_metadata = member.Get();
+        if (!allow_managed_weight &&
+            weight_manager_.IsManagedGroup(member_metadata.group_id)) {
+            continue;
+        }
         // Re-validate under the member's own lock: the group/member lease
         // and pin state may have changed since the caller's snapshot. A
         // surviving shared group lease makes every member's lease not
         // expired, so the whole group is skipped here.
-        if (member_metadata.IsHardPinned() ||
+        if ((!allow_hard_pinned && member_metadata.IsHardPinned()) ||
             !member_metadata.IsLeaseExpired(now) ||
             (!allow_soft_pinned && IsSoftPinActive(member_metadata, now)) ||
             !member_metadata.HasReplica(is_evictable_memory_replica)) {
@@ -1525,6 +1539,108 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
         }
     }
     return result;
+}
+
+MasterService::GroupEvictionResult
+MasterService::EvictManagedWeightGroupToCold(
+    const WeightRevisionMetadata& revision) {
+    const TenantId tenant_id(revision.identity.tenant_id);
+    auto member_keys =
+        GetGroupMemberKeys(tenant_id, revision.manifest.payload_group_id);
+    if (member_keys.empty()) {
+        return {};
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    std::vector<std::vector<Replica>> deferred_replicas;
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    auto is_evictable_memory = [this](const Replica& replica) {
+        return IsEvictableMemoryReplica(replica);
+    };
+    auto evict_one =
+        [&, this](MetadataAccessorRW& member) -> EvictMemberOutcome {
+        const auto& member_key = member.GetKey();
+        auto& metadata = member.Get();
+        const bool has_cold =
+            metadata.HasReplica([this](const Replica& replica) {
+                return !replica.is_memory_replica() &&
+                       IsReplicaReadable(replica);
+            });
+        if (!has_cold) {
+            return {};
+        }
+
+        if (enable_oplog_) {
+            auto reservation = ReserveBatchOpLogSlot();
+            if (!reservation) {
+                return {.stop_scan = true, .error = reservation.error()};
+            }
+            auto remaining = BuildRemainingReplicaDescriptors(
+                metadata, is_evictable_memory);
+            std::vector<ReplicaID> removed_ids;
+            metadata.VisitReplicas(is_evictable_memory,
+                                   [&removed_ids](Replica& replica) {
+                                       removed_ids.push_back(replica.id());
+                                       replica.mark_removed();
+                                   });
+            if (removed_ids.empty()) {
+                return {};
+            }
+            auto persisted = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::PUT_END,
+                tenant_id.value(),
+                member_key,
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                 remaining),
+                [this, removed_ids](const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(
+                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                });
+            if (!persisted) {
+                for (const auto& id : removed_ids) {
+                    if (auto* replica = metadata.GetReplicaByID(id)) {
+                        replica->cancel_remove();
+                    }
+                }
+                return {.stop_scan = true, .error = persisted.error()};
+            }
+            PublishKvRemovedAfterEvict(member_key, removed_ids.size(), "cpu",
+                                       metadata, tenant_id);
+            return {.freed_bytes = metadata.TotalLength() * removed_ids.size(),
+                    .evicted_objects = 1};
+        }
+
+        const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
+        auto removed = PopReplicasWithCacheTotalAccounting(
+            metadata, is_evictable_memory);
+        const uint64_t removed_count = removed.size();
+        if (removed_count == 0) {
+            return {};
+        }
+        std::vector<ReplicaID> removed_ids;
+        removed_ids.reserve(removed.size());
+        for (const auto& replica : removed) {
+            removed_ids.push_back(replica.id());
+        }
+        RecordDynamicReplicaRemoval(metadata, removed_ids);
+        deferred_replicas.emplace_back(std::move(removed));
+        const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
+        if (enable_multi_tenants_ && before_charge > after_charge) {
+            auto released = metadata.quota_ledger.ReleaseCommitted(
+                member.QuotaAccount(),
+                before_charge - after_charge);
+            LogTenantQuotaLedgerError(released, "release_committed", tenant_id,
+                                      member_key);
+        }
+        PublishKvRemovedAfterEvict(member_key, removed_count, "cpu", metadata,
+                                   tenant_id);
+        return {.freed_bytes = metadata.TotalLength() * removed_count,
+                .evicted_objects = 1};
+    };
+
+    return EvictGroupOrObject(
+        tenant_id, member_keys.front(), revision.manifest.payload_group_id,
+        false, true, true, now, evict_one);
 }
 
 bool MasterService::HasCompletedMemoryCacheReplica(
@@ -5190,6 +5306,14 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     if (!plan) {
         return tl::make_unexpected(plan.error());
     }
+    std::optional<std::unique_lock<std::mutex>> weight_group_operation_lock;
+    if (!plan->group_id.empty() && weight_manager_.IsManagedGroup(plan->group_id)) {
+        weight_group_operation_lock.emplace(weight_manager_.LockGroup(
+            object_id.tenant_id, plan->group_id));
+        if (!weight_manager_.AllowsGroupMemberMutation(plan->group_id)) {
+            return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
 
     auto admit = [&](bool* dfs_allocation_failed)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -5748,6 +5872,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (!plan) {
         return tl::make_unexpected(plan.error());
     }
+    std::optional<std::unique_lock<std::mutex>> weight_group_operation_lock;
+    if (!plan->group_id.empty() && weight_manager_.IsManagedGroup(plan->group_id)) {
+        weight_group_operation_lock.emplace(weight_manager_.LockGroup(
+            object_id.tenant_id, plan->group_id));
+        if (!weight_manager_.AllowsGroupMemberMutation(plan->group_id)) {
+            return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
     const std::string& writer_host_id = plan->writer_host_id;
     const std::string& group_id = plan->group_id;
     const ResolvedSoftPinRequest& soft_pin_request = plan->soft_pin_request;
@@ -6273,6 +6405,9 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
     }
 
     auto& metadata = accessor.Get();
+    if (weight_manager_.IsManagedGroup(metadata.group_id)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     const auto previous_kv_media = KvMediaSnapshot(metadata);
 
     if (replica_type != ReplicaType::DISK &&
@@ -7301,6 +7436,13 @@ static void LogRemoveRefused(const std::string& key, ErrorCode error) {
 
 auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                            bool force) -> tl::expected<void, ErrorCode> {
+    return RemoveObject(key, tenant_id, force, false);
+}
+
+auto MasterService::RemoveObject(const std::string& key,
+                                 const TenantId& tenant_id, bool force,
+                                 bool allow_managed_weight)
+    -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -7310,6 +7452,10 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
     }
 
     auto& metadata = accessor.Get();
+    if (!allow_managed_weight &&
+        weight_manager_.IsManagedGroup(metadata.group_id)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     auto removable = CheckRemovable(metadata, accessor.GetState(), force,
                                     std::chrono::system_clock::now());
     if (!removable) {
@@ -7385,6 +7531,9 @@ MasterService::RemoveResult MasterService::RemoveTenantObjects(
     const auto removable = [&](const std::string& key,
                                const ObjectMetadata& metadata,
                                const route::ObjectState& state) {
+        if (weight_manager_.IsManagedGroup(metadata.group_id)) {
+            return false;
+        }
         auto checked = CheckRemovable(metadata, state, force, now);
         if (!checked) {
             VLOG(1) << "key=" << key << ", action=remove_skipped"
@@ -7482,12 +7631,7 @@ long MasterService::RemoveAll(bool force) {
     std::unordered_set<std::string> tenants_seen;
     std::unordered_set<std::string> tenants_with_remaining_objects;
 
-    // Since RemoveAll clears everything, signal ALL clients with a
-    // LocalSSD clients to physically clear their SSD immediately.
-    // This lets client cleanup overlap with master metadata deletion.
-    local_ssd_manager_.RequestRemoveAll();
-
-    // Delete metadata — runs concurrently with client SSD cleanup.
+    // Remove per object so managed weights and concurrent imports survive.
     VisitTenants([&](const TenantId& tenant_id) {
         const RemoveResult result =
             RemoveTenantObjects(tenant_id, force, now, nullptr, nullptr);
@@ -7537,34 +7681,16 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     // the scan starts rather than at first sight of an object.
     const uint64_t entry_epoch = ReadKvTenantEpoch(normalized_tenant.value());
 
-    // For the tenant-scoped overload, only signal clients that own LOCAL_DISK
-    // replicas of THIS tenant — clearing all clients would cross-delete other
-    // tenants' SSD data.
-    std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
-
     // A `cleared` event means "this tenant is now empty". Deciding that from
     // the tenant's remaining objects is wrong in both directions: a tenant
     // that never existed looks empty, and under HA+oplog the erase is deferred
     // to the durable callback so a full wipe still looks non-empty. Count what
     // the walk actually did instead.
     const RemoveResult result = RemoveTenantObjects(
-        normalized_tenant, force, now, nullptr,
-        [&clients_with_disk_replicas](const ObjectMetadata& metadata) {
-            metadata.VisitReplicas(
-                &Replica::fn_is_local_disk_replica,
-                [&clients_with_disk_replicas](const Replica& replica) {
-                    auto cid = replica.get_local_disk_client_id();
-                    if (cid) {
-                        clients_with_disk_replicas.insert(*cid);
-                    }
-                });
-        });
+        normalized_tenant, force, now, nullptr, nullptr);
     if (kv_remove_all_tenant_hook_) {
         kv_remove_all_tenant_hook_(normalized_tenant);
     }
-
-    local_ssd_manager_.RequestRemoveAll(std::vector<UUID>(
-        clients_with_disk_replicas.begin(), clients_with_disk_replicas.end()));
 
     if (result.saw_object && !result.skipped_object) {
         PublishKvClearedIfEpochUnchanged(normalized_tenant, entry_epoch);
@@ -7573,8 +7699,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     VLOG(1) << "action=remove_all_objects"
             << ", tenant_id=" << normalized_tenant.value()
             << ", removed_count=" << result.removed_count
-            << ", total_freed_size=" << result.freed_bytes
-            << ", signaled_clients=" << clients_with_disk_replicas.size();
+            << ", total_freed_size=" << result.freed_bytes;
     return result.removed_count;
 }
 
@@ -7600,6 +7725,12 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             VLOG(1) << "key=" << key << ", error=object_not_found";
             results[original_idx] =
                 tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+
+        if (weight_manager_.IsManagedGroup(accessor.Get().group_id)) {
+            results[original_idx] =
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
             continue;
         }
 
@@ -10052,7 +10183,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
 
         GroupEvictionResult group_result =
             EvictGroupOrObject(normalized_tenant, key, group_id,
-                               allow_soft_pinned, now, evict_one_member);
+                               allow_soft_pinned, false, false, now,
+                               evict_one_member);
         TenantQuotaEvictionResult result{
             .freed_bytes = group_result.freed_bytes,
             .evicted_objects =
@@ -10441,7 +10573,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         };
 
         GroupEvictionResult group_result = EvictGroupOrObject(
-            tenant_id, key, group_id, allow_soft_pinned, now, evict_one_member);
+            tenant_id, key, group_id, allow_soft_pinned, false, false, now,
+            evict_one_member);
         EvictionResult result{.freed_bytes = group_result.freed_bytes,
                               .evicted_objects = group_result.evicted_objects,
                               .stop_scan = group_result.stop_scan};
@@ -10968,7 +11101,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                replica.get_refcnt() == 0;
     };
     auto may_evict = [&](const ObjectMetadata& metadata) {
-        return !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
+        return !weight_manager_.IsManagedGroup(metadata.group_id) &&
+               !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
                !IsSoftPinActive(metadata, now) &&
                metadata.HasReplica(is_evictable_nof_replica);
     };

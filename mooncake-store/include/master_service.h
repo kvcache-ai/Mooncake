@@ -155,6 +155,16 @@ class MasterService {
     WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
         const ReleaseWeightRevisionLeaseRequest& request);
 
+    WeightMetadataStore::Result<WeightResidencyOperation>
+    StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request);
+    WeightMetadataStore::Result<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request) const;
+    WeightMetadataStore::Result<WeightRevisionMetadata> ReconcileWeightRevision(
+        const ReconcileWeightRevisionRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request);
+
     WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
@@ -1176,6 +1186,9 @@ class MasterService {
     };
     GroupDomain group_domain_;
     MasterStoreBackend weight_backend_{*this};
+    tl::expected<void, ErrorCode> RemoveObject(
+        const std::string& key, const TenantId& tenant_id,
+        bool force, bool allow_managed_weight);
     WeightStoreManager weight_manager_{weight_backend_};
 
     class SoftPinDeadlineIndex {
@@ -1400,6 +1413,8 @@ class MasterService {
         bool stop_scan{false};
         ErrorCode error{ErrorCode::OK};
     };
+    GroupEvictionResult EvictManagedWeightGroupToCold(
+        const WeightRevisionMetadata& metadata);
 
     class MetadataAccessorRW;
     // Evicts every member of `group_id`, one key at a time. MUST be called
@@ -1417,6 +1432,7 @@ class MasterService {
     GroupEvictionResult EvictGroupOrObject(
         const TenantId& tenant_id, const std::string& key,
         const std::string& group_id, bool allow_soft_pinned,
+        bool allow_managed_weight, bool allow_hard_pinned,
         std::chrono::system_clock::time_point now,
         const std::function<EvictMemberOutcome(MetadataAccessorRW& member)>&
             evict_one_member);
