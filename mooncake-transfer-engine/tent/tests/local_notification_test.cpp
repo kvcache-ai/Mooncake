@@ -30,6 +30,7 @@
 
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transfer_engine.h"
 
 namespace mooncake {
 namespace tent {
@@ -58,6 +59,8 @@ std::shared_ptr<Config> makeConfig(bool enable_tcp,
     config->set("transports/mpcomm/enable", false);
     config->set("transports/tpu/enable", false);
     config->set("transports/ub/enable", false);
+    config->set("topology/priority_matrix/cpu:0",
+                std::vector<std::vector<std::string>>{{}, {}});
     // The progress worker would fire submit hooks from its own thread while
     // the test reads the stand-in transport's counter, and the runtime queue
     // turns it on implicitly. Keep every poll on the calling thread.
@@ -112,6 +115,28 @@ TEST(LocalNotificationTest, SelfNotificationIsDeliveredInProcess) {
     // batch must not reappear just because the caller reused its buffer.
     ASSERT_TRUE(engine.receiveNotification(received).ok());
     EXPECT_TRUE(received.empty());
+}
+
+TEST(LocalNotificationTest, CApiResultCanBeReusedAfterFree) {
+    TransferEngineImpl engine(makeConfig(/*enable_tcp=*/true));
+    ASSERT_TRUE(engine.available());
+    auto handle = reinterpret_cast<tent_engine_t>(&engine);
+
+    ASSERT_EQ(
+        tent_send_notifs(handle, LOCAL_SEGMENT_ID, "name", "first message"), 0);
+    tent_notifi_info info{};
+    ASSERT_EQ(tent_recv_notifs(handle, &info), 0);
+    ASSERT_EQ(info.num_records, 1);
+    ASSERT_NE(info.records, nullptr);
+
+    tent_free_notifs(&info);
+    EXPECT_EQ(info.num_records, 0);
+    EXPECT_EQ(info.records, nullptr);
+
+    ASSERT_EQ(tent_recv_notifs(handle, &info), 0);
+    EXPECT_EQ(info.num_records, 0);
+    ASSERT_EQ(info.records, nullptr);
+    tent_free_notifs(&info);
 }
 
 // Self-delivery must not depend on any transport advertising notification
