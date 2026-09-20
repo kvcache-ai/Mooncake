@@ -525,6 +525,55 @@ class PyClient {
 
     virtual std::vector<int> batchProbeKey(
         const std::vector<std::string> &keys) = 0;
+    virtual WeightRpcResult<WeightRevisionMetadata> begin_weight_import(
+        const BeginWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> commit_weight_import(
+        const CommitWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> abort_weight_import(
+        const AbortWeightImportRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionView> get_weight_revision(
+        const GetWeightRevisionRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<ListWeightRevisionsResponse> list_weight_revisions(
+        const ListWeightRevisionsRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionLease> acquire_weight_revision_lease(
+        const AcquireWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionLease> renew_weight_revision_lease(
+        const RenewWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<void> release_weight_revision_lease(
+        const ReleaseWeightRevisionLeaseRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightResidencyOperation>
+    start_weight_residency_operation(
+        const StartWeightResidencyOperationRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightResidencyOperation> query_weight_operation(
+        const QueryWeightOperationRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> reconcile_weight_revision(
+        const ReconcileWeightRevisionRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    virtual WeightRpcResult<WeightRevisionMetadata> delete_weight_revision(
+        const DeleteWeightRevisionRequest &) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
 
     virtual int64_t getSize(const std::string &key) = 0;
 
