@@ -4050,6 +4050,67 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
     return response;
 }
 
+WeightRpcResult<WeightRevisionMetadata> Client::BeginWeightImport(
+    const BeginWeightImportRequest& request) {
+    return master_client_.BeginWeightImport(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::CommitWeightImport(
+    const CommitWeightImportRequest& request) {
+    return master_client_.CommitWeightImport(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::AbortWeightImport(
+    const AbortWeightImportRequest& request) {
+    return master_client_.AbortWeightImport(request);
+}
+
+WeightRpcResult<WeightRevisionView> Client::GetWeightRevision(
+    const GetWeightRevisionRequest& request) {
+    return master_client_.GetWeightRevision(request);
+}
+
+WeightRpcResult<ListWeightRevisionsResponse> Client::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request) {
+    return master_client_.ListWeightRevisions(request);
+}
+
+WeightRpcResult<WeightRevisionLease> Client::AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request) {
+    return master_client_.AcquireWeightRevisionLease(request);
+}
+
+WeightRpcResult<WeightRevisionLease> Client::RenewWeightRevisionLease(
+    const RenewWeightRevisionLeaseRequest& request) {
+    return master_client_.RenewWeightRevisionLease(request);
+}
+
+WeightRpcResult<void> Client::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request) {
+    return master_client_.ReleaseWeightRevisionLease(request);
+}
+
+WeightRpcResult<WeightResidencyOperation>
+Client::StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request) {
+    return master_client_.StartWeightResidencyOperation(request);
+}
+
+WeightRpcResult<WeightResidencyOperation> Client::QueryWeightOperation(
+    const QueryWeightOperationRequest& request) {
+    return master_client_.QueryWeightOperation(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::ReconcileWeightRevision(
+    const ReconcileWeightRevisionRequest& request) {
+    return master_client_.ReconcileWeightRevision(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request) {
+    return master_client_.DeleteWeightRevision(request);
+}
+
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(

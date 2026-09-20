@@ -431,6 +431,31 @@ class Client {
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
 
+    WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request);
+    WeightRpcResult<ListWeightRevisionsResponse> ListWeightRevisions(
+        const ListWeightRevisionsRequest& request);
+    WeightRpcResult<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightRpcResult<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightResidencyOperation> StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request);
+    WeightRpcResult<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> ReconcileWeightRevision(
+        const ReconcileWeightRevisionRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request);
+
     /**
      * @brief Point-in-time existence check for multiple objects, granting no
      *        read leases

@@ -1,7 +1,14 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <chrono>
+#include <cstring>
+#include <memory>
+#include <thread>
+#include <vector>
 
+#include "client_service.h"
+#include "common/client_buffer_allocation.h"
 #include "master_client.h"
 #include "test_server_helpers.h"
 
@@ -149,6 +156,192 @@ TEST(WeightManagementRpcTest, RejectsUnboundedPaginationExactly) {
     });
     ASSERT_FALSE(Domain(list).has_value());
     EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT, Domain(list).error());
+}
+
+class WeightManagementTcpTest : public ::testing::Test {
+   protected:
+    static constexpr size_t kSegmentSize = 4 * 1024 * 1024;
+    static constexpr size_t kPayloadSize = 1024 * 1024;
+
+    void SetUp() override {
+        ASSERT_TRUE(server_.Start(InProcMasterConfigBuilder()
+                                      .set_default_kv_lease_ttl(1000)
+                                      .build()));
+        const auto ports = getFreeTcpPorts(2);
+        ASSERT_EQ(2u, ports.size());
+        auto storage = Client::Create("127.0.0.1:" + std::to_string(ports[0]),
+                                      server_.metadata_url(), "tcp",
+                                      std::nullopt, server_.master_address());
+        ASSERT_TRUE(storage.has_value());
+        storage_ = *storage;
+        // The backing allocator requires 16 MiB, but only the mounted 4 MiB
+        // contributes to the master's allocation-pressure capacity.
+        segment_ = allocate_buffer_allocator_memory(16 * 1024 * 1024);
+        ASSERT_NE(nullptr, segment_);
+        ASSERT_TRUE(storage_->MountSegment(segment_, kSegmentSize, "tcp"));
+        mounted_ = true;
+
+        // Only the storage client owns a segment, so this client's transfers
+        // cross distinct TCP endpoints instead of using its local segment.
+        auto reader = Client::Create("127.0.0.1:" + std::to_string(ports[1]),
+                                     server_.metadata_url(), "tcp",
+                                     std::nullopt, server_.master_address());
+        ASSERT_TRUE(reader.has_value());
+        reader_ = *reader;
+        io_.resize(kPayloadSize);
+        ASSERT_TRUE(reader_->RegisterLocalMemory(io_.data(), io_.size(),
+                                                 "cpu:0", false, false));
+        registered_ = true;
+    }
+
+    void TearDown() override {
+        if (registered_) {
+            EXPECT_TRUE(reader_->unregisterLocalMemory(io_.data(), false));
+        }
+        reader_.reset();
+        if (mounted_) {
+            EXPECT_TRUE(storage_->UnmountSegment(segment_, kSegmentSize));
+        }
+        storage_.reset();
+        if (segment_) free_memory("", segment_);
+        server_.Stop();
+    }
+
+    void PutBytes(const std::string& key, const std::string& bytes,
+                  const ReplicateConfig& config) {
+        ASSERT_LE(bytes.size(), io_.size());
+        std::memcpy(io_.data(), bytes.data(), bytes.size());
+        std::vector<Slice> slices{{io_.data(), bytes.size()}};
+        ASSERT_TRUE(reader_->Put(key, slices, config));
+    }
+
+    void ExpectBytes(const std::string& key, const std::string& bytes) {
+        std::fill(io_.begin(), io_.end(), '\0');
+        std::vector<Slice> slices{{io_.data(), bytes.size()}};
+        ASSERT_TRUE(reader_->Get(key, slices));
+        EXPECT_EQ(bytes, std::string(io_.data(), bytes.size()));
+    }
+
+    InProcMaster server_;
+    std::shared_ptr<Client> storage_;
+    std::shared_ptr<Client> reader_;
+    void* segment_ = nullptr;
+    std::vector<char> io_;
+    bool mounted_ = false;
+    bool registered_ = false;
+};
+
+TEST_F(WeightManagementTcpTest, LeaseProtectsPublishedBytesUntilManagedDelete) {
+    const std::string payload_key = "managed-rpc-payload";
+    const std::string manifest_key =
+        "weights/production/llama-70b/step-100/7/manifest";
+    const std::string payload(kPayloadSize, 'w');
+    const std::string manifest = "{}";
+    auto begin = reader_->BeginWeightImport(BeginWeightImportRequest{
+        .identity = Identity(),
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = kPayloadSize,
+    });
+    ASSERT_TRUE(begin.has_value());
+    ASSERT_TRUE(begin->has_value());
+    EXPECT_EQ("default", (*begin)->identity.tenant_id);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.data_type = ObjectDataType::WEIGHT;
+    config.group_ids =
+        std::vector<std::string>{(*begin)->manifest.payload_group_id};
+    // No hard pin: protection must come from managed group membership.
+    ASSERT_FALSE(config.with_hard_pin);
+    ASSERT_NO_FATAL_FAILURE(PutBytes(payload_key, payload, config));
+    config.data_type = ObjectDataType::METADATA;
+    ASSERT_NO_FATAL_FAILURE(PutBytes(manifest_key, manifest, config));
+    auto ready = reader_->CommitWeightImport(CommitWeightImportRequest{
+        .identity = Identity(),
+        .expected_metadata_generation = (*begin)->metadata_generation,
+        .manifest =
+            WeightManifestReference{
+                .manifest_key = manifest_key,
+                .manifest_sha256 = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe"
+                                   "77e8310c060f61caaff8a",
+                .payload_group_id = (*begin)->manifest.payload_group_id,
+                .payload_keys_sha256 =
+                    ComputeWeightPayloadKeysSha256({payload_key}),
+                .payload_count = 1,
+                .logical_bytes = kPayloadSize,
+            },
+    });
+    ASSERT_TRUE(ready.has_value());
+    ASSERT_TRUE(ready->has_value());
+    EXPECT_EQ(WeightAvailabilityState::READY, (*ready)->availability);
+    EXPECT_EQ(WeightResidencyState::HOT, (*ready)->residency);
+    auto view = reader_->GetWeightRevision({.identity = Identity()});
+    ASSERT_TRUE(view.has_value());
+    ASSERT_TRUE(view->has_value());
+    EXPECT_EQ(**ready, (*view)->metadata);
+
+    auto lease = reader_->AcquireWeightRevisionLease({
+        .identity = Identity(),
+        .expected_metadata_generation = (*ready)->metadata_generation,
+        .holder = "tcp-reader",
+        .ttl_ms = 60'000,
+    });
+    ASSERT_TRUE(lease.has_value());
+    ASSERT_TRUE(lease->has_value());
+    auto remove = reader_->Remove(payload_key, true);
+    ASSERT_FALSE(remove.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, remove.error());
+    const auto batch = reader_->BatchRemove({payload_key, manifest_key}, true);
+    ASSERT_EQ(2u, batch.size());
+    for (const auto& result : batch) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    }
+
+    // Trigger the production allocation-pressure path through RPC. The
+    // requested allocation would fit only if the managed payload were evicted.
+    // Let any ordinary KV lease from publication expire before applying
+    // pressure.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    MasterClient pressure(generate_uuid());
+    ASSERT_EQ(ErrorCode::OK, pressure.Connect(server_.master_address()));
+    ReplicateConfig pressure_config;
+    pressure_config.replica_num = 1;
+    auto allocation = pressure.PutStart(
+        "pressure", {kSegmentSize - kPayloadSize}, pressure_config);
+    ASSERT_FALSE(allocation.has_value());
+    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, allocation.error());
+    // Allocation failure wakes the asynchronous eviction worker.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    auto blocked = reader_->DeleteWeightRevision({
+        .identity = Identity(),
+        .expected_metadata_generation = (*ready)->metadata_generation,
+    });
+    ASSERT_TRUE(blocked.has_value());
+    ASSERT_FALSE(blocked->has_value());
+    EXPECT_EQ(WeightManagementError::BUSY, blocked->error());
+    ASSERT_NO_FATAL_FAILURE(ExpectBytes(payload_key, payload));
+    ASSERT_NO_FATAL_FAILURE(ExpectBytes(manifest_key, manifest));
+
+    auto release =
+        reader_->ReleaseWeightRevisionLease({.lease_id = (*lease)->lease_id});
+    ASSERT_TRUE(release.has_value());
+    ASSERT_TRUE(release->has_value());
+    auto deleted = reader_->DeleteWeightRevision({
+        .identity = Identity(),
+        .expected_metadata_generation = (*ready)->metadata_generation,
+    });
+    ASSERT_TRUE(deleted.has_value());
+    ASSERT_TRUE(deleted->has_value());
+    EXPECT_EQ(WeightAvailabilityState::DELETED, (*deleted)->availability);
+    EXPECT_EQ(WeightResidencyState::ABSENT, (*deleted)->residency);
+    for (const auto& key : {payload_key, manifest_key}) {
+        std::vector<Slice> slices{{io_.data(), io_.size()}};
+        auto get = reader_->Get(key, slices);
+        ASSERT_FALSE(get.has_value());
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get.error());
+    }
 }
 
 }  // namespace

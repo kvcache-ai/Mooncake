@@ -74,6 +74,106 @@ class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
 
+    void RunManagedRemoveAllScenario() {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        const WeightRevisionIdentity identity{.tenant_id = "default",
+                                              .name_space = "production",
+                                              .resource_id = "ssd-weight",
+                                              .revision = "v1",
+                                              .weight_generation = 1};
+        auto begin = client->BeginWeightImport({.identity = identity,
+                                                .payload_group_id = {},
+                                                .expected_payload_count = 1,
+                                                .expected_logical_bytes = 128});
+        ASSERT_TRUE(begin && *begin);
+        const auto manifest_key = MakeWeightManifestKey(identity);
+        const std::vector<std::string> keys{"ordinary-ssd", "managed-payload",
+                                            manifest_key};
+        const std::vector<std::string> values{std::string(128, 'o'),
+                                              std::string(128, 'w'),
+                                              std::string(128, 'm')};
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto* buffer = allocator.allocate(values[i].size());
+            ASSERT_NE(buffer, nullptr);
+            std::memcpy(buffer, values[i].data(), values[i].size());
+            ReplicateConfig config;
+            config.replica_num = 1;
+            if (i != 0) {
+                config.group_ids = {(*begin)->manifest.payload_group_id};
+                config.data_type =
+                    i == 1 ? ObjectDataType::WEIGHT : ObjectDataType::METADATA;
+            }
+            std::vector<Slice> slices{{buffer, values[i].size()}};
+            ASSERT_TRUE(client->Put(keys[i], slices, config));
+            allocator.deallocate(buffer, values[i].size());
+        }
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(keys.size(), tasks.size());
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/managed_ssd";
+        config.local_buffer_size = 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = keys.size();
+        storage.storage_backend_ =
+            std::make_shared<BucketStorageBackend>(config, bucket_config);
+        ASSERT_TRUE(storage.storage_backend_->Init());
+        ASSERT_TRUE(storage.OffloadObjects(tasks));
+        auto ready = client->CommitWeightImport(
+            {.identity = identity,
+             .expected_metadata_generation = (*begin)->metadata_generation,
+             .manifest = {
+                 .manifest_key = manifest_key,
+                 .manifest_sha256 = std::string(64, 'a'),
+                 .payload_group_id = (*begin)->manifest.payload_group_id,
+                 .payload_keys_sha256 =
+                     ComputeWeightPayloadKeysSha256({keys[1]}),
+                 .payload_count = 1,
+                 .logical_bytes = 128}});
+        ASSERT_TRUE(ready && *ready);
+
+        auto check_payload = [&] {
+            std::string actual(values[1].size(), '\0');
+            std::unordered_map<std::string, Slice> read{
+                {TenantId::Default().MakeScopedKey(keys[1]),
+                 {actual.data(), actual.size()}}};
+            ASSERT_TRUE(storage.storage_backend_->BatchLoad(read));
+            EXPECT_EQ(values[1], actual);
+        };
+        ASSERT_NO_FATAL_FAILURE(check_payload());
+        auto removed = client->RemoveAll(true);
+        ASSERT_TRUE(removed);
+        EXPECT_EQ(1, *removed);
+        ASSERT_TRUE(storage.Heartbeat());
+        EXPECT_TRUE(client->Query(keys[1]));
+        EXPECT_TRUE(client->Query(manifest_key));
+        ASSERT_NO_FATAL_FAILURE(check_payload());
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
     void RunSkippedOffloadScenario(
         size_t duplicate_count, bool fail_write,
         StorageBackendType backend_type = StorageBackendType::kBucket) {
@@ -1343,6 +1443,10 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
 // for the same key must not report success while storing nothing: the client
 // evicts the dangling replica and retries PutStart, so the new data is
 // actually written.
+
+TEST_F(FileStorageTest, RemoveAllPreservesManagedSsdPayload) {
+    RunManagedRemoveAllScenario();
+}
 
 TEST_F(FileStorageTest, PutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
     // The per-key file backend reports the wiped file as OBJECT_NOT_FOUND /
