@@ -21,8 +21,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <thread>
 
 #include "tent/transport/rdma/bw_arbitration.h"
 #include "tent/transport/rdma/endpoint_store.h"
@@ -55,6 +58,7 @@ Workers::Workers(RdmaTransport* transport)
     : transport_(transport),
       num_workers_(0),
       running_(false),
+      accepting_submits_(true),
       worker_context_(nullptr) {
     device_selector_ = std::make_unique<DeviceSelector>();
     device_selector_->loadTopology(transport_->local_topology_);
@@ -248,6 +252,7 @@ Workers::~Workers() {
 Status Workers::start() {
     const static uint64_t kDefaultMaxTimeoutNs = 10000000000ull;
     if (!running_) {
+        accepting_submits_.store(true, std::memory_order_release);
         running_ = true;
         monitor_ = std::thread([this] { monitorThread(); });
         num_workers_ = transport_->params_->workers.num_workers;
@@ -264,6 +269,7 @@ Status Workers::start() {
 
 Status Workers::stop() {
     if (!running_) return Status::OK();
+    accepting_submits_.store(false, std::memory_order_release);
     running_ = false;
     for (size_t id = 0; id < num_workers_; ++id) {
         auto& worker = worker_context_[id];
@@ -279,7 +285,45 @@ Status Workers::stop() {
     return Status::OK();
 }
 
+Status Workers::quiesce(uint64_t timeout_ns) {
+    accepting_submits_.store(false, std::memory_order_release);
+    if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
+        num_workers_ == 0) {
+        return Status::OK();
+    }
+
+    for (size_t id = 0; id < num_workers_; ++id) {
+        auto& worker = worker_context_[id];
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        if (worker.in_suspend) worker.cv.notify_all();
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
+    while (true) {
+        int64_t inflight = 0;
+        for (size_t id = 0; id < num_workers_; ++id) {
+            inflight += worker_context_[id].inflight_slices.load(
+                std::memory_order_acquire);
+        }
+        if (inflight == 0) return Status::OK();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::InternalError("RDMA quiesce timed out with " +
+                                         std::to_string(inflight) +
+                                         " inflight slices" LOC_MARK);
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+
 Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
+    if (!accepting_submits_.load(std::memory_order_acquire)) {
+        return Status::InternalError("RDMA transport is quiescing" LOC_MARK);
+    }
+    if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
+        num_workers_ == 0) {
+        return Status::InternalError("RDMA workers are not running" LOC_MARK);
+    }
     if (worker_id < 0 || worker_id >= (int)num_workers_) {
         // If caller didn't specify the worker, find the least loaded one
         long min_inflight = INT64_MAX;
@@ -673,14 +717,18 @@ void Workers::asyncPostSend() {
             }
             auto status = generatePostPath(slice);
             if (!status.ok()) {
-                LOG(ERROR) << "Failed to generate post path for slice " << slice
-                           << ": " << status.ToString();
+                VLOG(1) << "Failed to generate post path for slice " << slice
+                        << ": " << status.ToString();
+                LOG_EVERY_N(ERROR, 10000)
+                    << "Failed to generate post path for slice " << slice
+                    << ": " << status.ToString();
                 releaseSliceQuota(slice, getCurrentTimeInNano());
+                // Count first: resolving the slice lets the batch be freed.
+                discountFromOwner(worker, slice);
                 updateSliceStatus(slice, slice->task->cancel_requested.load(
                                              std::memory_order_acquire)
                                              ? CANCELED
                                              : FAILED);
-                discountFromOwner(worker, slice);
             } else if (dropUnpostableSlice(worker, slice)) {
                 slice = slice->next;
                 continue;
@@ -716,11 +764,13 @@ void Workers::asyncPostSend() {
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
+                    VLOG(1)
+                        << "Slice " << slice << " failed: retry count exceeded";
+                    LOG_EVERY_N(WARNING, 100)
                         << "Slice " << slice << " failed: retry count exceeded";
                     disableEndpoint(slice);
-                    updateSliceStatus(slice, FAILED);
                     discountFromOwner(worker, slice);
+                    updateSliceStatus(slice, FAILED);
                 } else {
                     // The re-submit moves the count to the lane it lands on.
                     submitFromTick(worker, slice);
@@ -758,8 +808,8 @@ void Workers::asyncPostSend() {
             worker.inflight_slice_set.erase(slice);
             releaseSliceQuota(slice, post_ts);
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
-                updateSliceStatus(slice, CANCELED);
                 discountFromOwner(worker, slice);
+                updateSliceStatus(slice, CANCELED);
                 continue;
             }
             slice->retry_count++;
@@ -768,8 +818,8 @@ void Workers::asyncPostSend() {
                 LOG(WARNING)
                     << "Slice " << slice << " failed: retry count exceeded";
                 disableEndpoint(slice);
-                updateSliceStatus(slice, FAILED);
                 discountFromOwner(worker, slice);
+                updateSliceStatus(slice, FAILED);
             } else {
                 submitFromTick(worker, slice);
             }
@@ -906,6 +956,19 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                                const ibv_wc& wc, uint64_t poll_ts,
                                bool last_in_pass) {
     auto slice = (RdmaSlice*)wc.wr_id;
+    // The completion this post owed, paid back only once this handler is
+    // done with the slice. Paying it on entry is not enough: acknowledge()
+    // further down publishes the terminal status the caller is waiting for,
+    // so the batch can be freed, and the slice with it, while the lines
+    // after it still read the slice. Above zero, freeSubBatch() hands the
+    // slice to the orphan list instead of the slab and the reaper leaves it
+    // there.
+    struct CompletionPaid {
+        RdmaSlice* slice;
+        ~CompletionPaid() {
+            slice->completions_owed.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    } completion_paid{slice};
     // What the acknowledge callbacks below need, behind one reference so
     // the std::function stays in its small-buffer storage (no allocation
     // per completion).
@@ -1202,9 +1265,25 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
                 // flows.
                 device_selector_->setDeviceAvailable(dev_id, false);
                 LOG(WARNING) << "Action: " << context.name() << " down";
-            } else {
-                activateContext(dev_id, context);
+            } else if (activateContext(dev_id, context)) {
                 LOG(WARNING) << "Action: " << context.name() << " up";
+            }
+            break;
+        }
+        case IBV_EVENT_GID_CHANGE:
+        case IBV_EVENT_LID_CHANGE: {
+            if (event.element.port_num != context.portNum()) {
+                LOG(INFO) << context.name() << ": ignoring "
+                          << ibv_event_type_str(event.event_type)
+                          << " for port " << event.element.port_num
+                          << " (this context uses port "
+                          << static_cast<int>(context.portNum()) << ")";
+                break;
+            }
+            if (activateContext(dev_id, context)) {
+                LOG(WARNING)
+                    << "Action: " << context.name() << " refreshed after "
+                    << ibv_event_type_str(event.event_type);
             }
             break;
         }
@@ -1222,12 +1301,52 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
     }
 }
 
-void Workers::activateContext(int dev_id, RdmaContext& context) {
-    context.resume();
+RdmaAddressRefreshResult Workers::refreshAddress(RdmaContext& context) {
+    RdmaAddressSnapshot previous;
+    RdmaAddressSnapshot current;
+    auto result = context.refreshAddress(&previous, &current);
+    if (result == RdmaAddressRefreshResult::CHANGED) {
+        LOG(WARNING) << "Refreshed RDMA address for " << context.name()
+                     << ": LID " << previous.lid << " -> " << current.lid
+                     << ", GID[" << previous.gid_index << "] " << previous.gid
+                     << " -> GID[" << current.gid_index << "] " << current.gid;
+    } else if (result == RdmaAddressRefreshResult::UNCHANGED) {
+        VLOG(1) << "RDMA address for " << context.name() << " is unchanged";
+    }
+    return result;
+}
+
+bool Workers::activateContext(int dev_id, RdmaContext& context) {
+    // Stop new work from selecting this NIC while its address generation is
+    // being replaced. Incoming bootstrap also rejects paused contexts.
+    if (context.pause() != 0 ||
+        context.status() != RdmaContext::DEVICE_PAUSED) {
+        if (device_selector_)
+            device_selector_->setDeviceAvailable(dev_id, false);
+        LOG(WARNING) << "Action: " << context.name()
+                     << " cannot refresh RDMA address from context state "
+                     << context.status();
+        return false;
+    }
+    if (device_selector_) device_selector_->setDeviceAvailable(dev_id, false);
+
+    auto result = refreshAddress(context);
+    if (result == RdmaAddressRefreshResult::FAILED) {
+        LOG(WARNING) << "Action: " << context.name()
+                     << " remains down because its RDMA address could not be "
+                        "refreshed";
+        return false;
+    }
+
+    // resume() evicts every endpoint built with the previous address before
+    // the NIC becomes selectable again. This is deliberately conservative for
+    // a spurious change event whose queried value is unchanged.
+    if (context.resume() != 0) return false;
     // The link may have renegotiated while down: re-seed before the device
     // becomes selectable so no worker scores it on the old rate.
     refreshLinkSpeed(dev_id, context);
     if (device_selector_) device_selector_->setDeviceAvailable(dev_id, true);
+    return true;
 }
 
 void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {
@@ -1292,6 +1411,8 @@ void Workers::monitorThread() {
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
             reclaimEndpoints();
+            // An endpoint destroyed above settles its orphans right here.
+            transport_->reapOrphanSlices(/*on_tick=*/true);
             // Safety net for a recovery event that never reached us.
             resumePausedContexts();
             last_reclaim_time = current_time;
@@ -1462,9 +1583,13 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     if (gdr_excluded ||
         !rail.available(slice->source_dev_id, slice->target_dev_id)) {
-        LOG(INFO) << "Optimal device pair not available: source_dev_id "
-                  << slice->source_dev_id << ", target_dev_id "
-                  << slice->target_dev_id;
+        VLOG(1) << "Optimal device pair not available: source_dev_id "
+                << slice->source_dev_id << ", target_dev_id "
+                << slice->target_dev_id;
+        LOG_EVERY_N(WARNING, 10000)
+            << "Optimal device pair not available: source_dev_id "
+            << slice->source_dev_id << ", target_dev_id "
+            << slice->target_dev_id;
         return selectFallbackDevice(source, target, slice);
     }
 
@@ -1507,7 +1632,11 @@ bool Workers::gdrPairExcluded(const RouteHint& source, const RouteHint& target,
 
 Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
                                      RdmaSlice* slice) {
-    LOG_EVERY_N(INFO, 100) << "fallback device selection for slice " << slice;
+    // Mirrors selectOptimalDevice: a rare WARNING sample so a sustained
+    // fallback storm is visible without flooding; VLOG(1) for debugging.
+    VLOG(1) << "fallback device selection for slice " << slice;
+    LOG_EVERY_N(WARNING, 10000)
+        << "fallback device selection for slice " << slice;
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
 

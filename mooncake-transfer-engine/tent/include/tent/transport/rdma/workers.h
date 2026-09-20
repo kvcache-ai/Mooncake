@@ -53,6 +53,12 @@ class Workers {
 
     Status stop();
 
+    // Stop accepting new submits and wait until every worker's inflight
+    // count hits 0. Workers keep polling CQ so in-flight GPUDirect writes
+    // can complete. timeout_ns bounds the wait so teardown cannot hang.
+    static constexpr uint64_t kDefaultQuiesceTimeoutNs = 10000000000ull;
+    Status quiesce(uint64_t timeout_ns = kDefaultQuiesceTimeoutNs);
+
     Status submit(RdmaSlice* slice);
 
     Status submit(RdmaSliceList& slice_list, int worker_id = -1);
@@ -189,10 +195,14 @@ class Workers {
     void applyContextEvent(int dev_id, RdmaContext& context,
                            const ibv_async_event& event);
 
-    // Everything a recovered port needs: resume the context, re-seed its
-    // bandwidth and make it selectable again. Shared by the
-    // IBV_EVENT_PORT_ACTIVE path and by resumePausedContexts().
-    void activateContext(int dev_id, RdmaContext& context);
+    // Re-query and publish one context's GID/LID.
+    RdmaAddressRefreshResult refreshAddress(RdmaContext& context);
+
+    // Everything a recovered port needs: refresh its address, resume the
+    // context, re-seed its bandwidth and make it selectable again. Shared by
+    // the IBV_EVENT_PORT_ACTIVE path and by resumePausedContexts(). Returns
+    // false when the address cannot be refreshed, keeping the context paused.
+    bool activateContext(int dev_id, RdmaContext& context);
 
     // Re-read the link speed after a port event and re-seed the selector if
     // it changed; a link that returns at the same speed keeps what it
@@ -250,6 +260,7 @@ class Workers {
     std::thread monitor_;
 
     std::atomic<bool> running_;
+    std::atomic<bool> accepting_submits_{true};
 
     struct PostPath {
         int local_device_id;

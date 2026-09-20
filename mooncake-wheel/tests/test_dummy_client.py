@@ -12,6 +12,7 @@ except ModuleNotFoundError as error:
         raise
     torch = None
 
+import mooncake.store as mooncake_store
 from mooncake.store import MooncakeDistributedStore, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
@@ -446,6 +447,164 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(self.store.remove(key1), 0)
         self.assertEqual(self.store.remove(key2), 0)
 
+    def test_external_host_registered_tensor_roundtrip(self):
+        """Registered pageable CPU tensors support bounded raw transfers."""
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+        self._check_registered_cpu_tensor_roundtrip(pinned=False)
+
+    def test_external_host_registered_pinned_tensor_roundtrip(self):
+        """Pinned CPU tensors preserve data and guards across Dummy RPC."""
+        if torch is None or not torch.cuda.is_available():
+            self.skipTest("Pinned host allocation requires CUDA")
+        self._check_registered_cpu_tensor_roundtrip(pinned=True)
+
+    def _check_registered_cpu_tensor_roundtrip(self, pinned):
+        source = torch.empty(64, dtype=torch.int32, pin_memory=pinned)
+        source.copy_(torch.arange(64, dtype=torch.int32))
+        destination = torch.empty(80, dtype=torch.int32, pin_memory=pinned)
+        destination.fill_(-1)
+        self.assertEqual(source.is_pinned(), pinned)
+        self.assertEqual(destination.is_pinned(), pinned)
+        source_ptr = source.data_ptr()
+        destination_ptr = destination.data_ptr()
+        size = source.numel() * source.element_size()
+        capacity = destination.numel() * destination.element_size()
+        offset = 8 * destination.element_size()
+        key = f"test_dummy_registered_tensor_{os.getpid()}_{pinned}"
+        self.assertEqual(self.store.register_buffer(source_ptr, size), 0)
+        try:
+            self.assertEqual(self.store.register_buffer(destination_ptr, capacity), 0)
+            try:
+                self.assertEqual(self.store.put_from(key, source_ptr, size), 0)
+                self.assertEqual(
+                    self.store.get_into(key, destination_ptr + offset, size),
+                    size,
+                )
+                expected = torch.full((80,), -1, dtype=torch.int32)
+                expected[8:72] = source
+                self.assertTrue(torch.equal(destination, expected))
+
+                source.add_(100)
+                self.assertEqual(
+                    list(self.store.batch_upsert_from([key], [source_ptr], [size])),
+                    [0],
+                )
+                self.assertEqual(
+                    list(
+                        self.store.batch_get_into(
+                            [key], [destination_ptr + offset], [size]
+                        )
+                    ),
+                    [size],
+                )
+                expected[8:72] = source
+                self.assertTrue(torch.equal(destination, expected))
+
+                destination.fill_(-1)
+                self.assertEqual(
+                    self.store.get_into_ranges(
+                        [destination_ptr],
+                        [[key]],
+                        [[[offset]]],
+                        [[[source.element_size()]]],
+                        [[[16]]],
+                    ),
+                    [[[16]]],
+                )
+                expected.fill_(-1)
+                expected[8:12] = source[1:5]
+                self.assertTrue(torch.equal(destination, expected))
+                self.assertLess(
+                    self.store.get_into(key, destination_ptr + capacity - 4, size),
+                    0,
+                )
+                self.assertTrue(torch.equal(destination, expected))
+            finally:
+                self.assertEqual(self.store.unregister_buffer(destination_ptr), 0)
+            self.assertLess(self.store.get_into(key, destination_ptr, size), 0)
+            self.assertTrue(torch.equal(destination, expected))
+        finally:
+            self.assertEqual(self.store.unregister_buffer(source_ptr), 0)
+            self.store.remove(key, force=True)
+
+    def test_external_host_get_into_ranges_staging(self):
+        """Range reads stage a registered process-local host destination."""
+        import ctypes
+
+        keys = [
+            f"test_dummy_external_ranges_{os.getpid()}_0",
+            f"test_dummy_external_ranges_{os.getpid()}_1",
+        ]
+        values = [b"0123456789", b"abcdefghijklm"]
+        for key, value in zip(keys, values):
+            self.assertEqual(self.store.put(key, value), 0)
+
+        capacity = 64
+        destination = (ctypes.c_ubyte * capacity)()
+        destination_ptr = ctypes.addressof(destination)
+        self.assertEqual(self.store.register_buffer(destination_ptr, capacity), 0)
+        try:
+            ctypes.memset(destination_ptr, ord("_"), capacity)
+            range_results = self.store.get_into_ranges(
+                [destination_ptr],
+                [keys],
+                [[[1, 12], [24]]],
+                [[[2, 7], [3]]],
+                [[[4, 3], [5]]],
+            )
+            self.assertEqual(range_results, [[[4, 3], [5]]])
+            self.assertEqual(bytes(destination[1:5]), values[0][2:6])
+            self.assertEqual(bytes(destination[12:15]), values[0][7:10])
+            self.assertEqual(bytes(destination[24:29]), values[1][3:8])
+            self.assertEqual(destination[0], ord("_"))
+            self.assertEqual(bytes(destination[5:12]), b"_" * 7)
+        finally:
+            self.assertEqual(self.store.unregister_buffer(destination_ptr), 0)
+            for key in keys:
+                self.store.remove(key, force=True)
+
+    def test_external_host_multi_buffer_read_staging(self):
+        """Multi-buffer reads copy only returned bytes from host staging."""
+        import ctypes
+
+        keys = [
+            f"test_dummy_external_multi_read_{os.getpid()}_0",
+            f"test_dummy_external_multi_read_{os.getpid()}_1",
+        ]
+        values = [b"0123456789", b"abcdefghijklm"]
+        for key, value in zip(keys, values):
+            self.assertEqual(self.store.put(key, value), 0)
+
+        capacity = 64
+        destination = (ctypes.c_ubyte * capacity)()
+        destination_ptr = ctypes.addressof(destination)
+        self.assertEqual(self.store.register_buffer(destination_ptr, capacity), 0)
+        try:
+            ctypes.memset(destination_ptr, ord("_"), capacity)
+            multi_buffer_results = self.store.batch_get_into_multi_buffers(
+                keys,
+                [
+                    [
+                        destination_ptr + 50,
+                        destination_ptr,
+                        destination_ptr + 4,
+                    ],
+                    [destination_ptr + 20, destination_ptr + 25],
+                ],
+                [[0, 4, 6], [5, 8]],
+                False,
+            )
+            self.assertEqual(list(multi_buffer_results), [10, 13])
+            self.assertEqual(bytes(destination[0:10]), values[0])
+            self.assertEqual(bytes(destination[20:33]), values[1])
+            self.assertEqual(bytes(destination[10:20]), b"_" * 10)
+            self.assertEqual(bytes(destination[33:35]), b"__")
+        finally:
+            self.assertEqual(self.store.unregister_buffer(destination_ptr), 0)
+            for key in keys:
+                self.store.remove(key, force=True)
+
     def test_batch_get_into_operations(self):
         """Test batch_get_into operations for multiple keys."""
         import ctypes
@@ -735,6 +894,239 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
             self.store.unregister_buffer(buffer_ptr)
             for cleanup_key in cleanup_keys:
                 self.store.remove(cleanup_key)
+
+    def test_tensor_from_external_host_staging(self):
+        """Raw tensor *_from APIs accept a pageable host object buffer."""
+        import ctypes
+
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+
+        tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        metadata, _, payload_size, _ = mooncake_store._serialize_tensor(tensor)
+        metadata_size = len(metadata)
+        total_size = metadata_size + payload_size
+        raw = (ctypes.c_ubyte * total_size)()
+        raw_ptr = ctypes.addressof(raw)
+        ctypes.memmove(raw_ptr, metadata, metadata_size)
+        ctypes.memmove(raw_ptr + metadata_size, tensor.numpy().tobytes(), payload_size)
+
+        prefix = f"test_dummy_tensor_external_{os.getpid()}"
+        keys = [f"{prefix}_{i}" for i in range(3)]
+        try:
+            self.assertEqual(self.store.register_buffer(raw_ptr, total_size), 0)
+            self.assertEqual(
+                self.store.put_tensor_from(keys[0], raw_ptr, total_size), 0
+            )
+            self.assertTrue(torch.equal(self.store.get_tensor(keys[0]), tensor))
+
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_from(
+                        keys[1:], [raw_ptr, raw_ptr], [total_size, total_size]
+                    )
+                ),
+                [0, 0],
+            )
+            for key in keys[1:]:
+                self.assertTrue(torch.equal(self.store.get_tensor(key), tensor))
+
+            updated = tensor + 5
+            ctypes.memmove(
+                raw_ptr + metadata_size, updated.numpy().tobytes(), payload_size
+            )
+            self.assertEqual(
+                self.store.upsert_tensor_from(keys[0], raw_ptr, total_size), 0
+            )
+            self.assertTrue(torch.equal(self.store.get_tensor(keys[0]), updated))
+            self.assertEqual(
+                list(
+                    self.store.batch_upsert_tensor_from(
+                        keys[1:], [raw_ptr, raw_ptr], [total_size, total_size]
+                    )
+                ),
+                [0, 0],
+            )
+            for key in keys[1:]:
+                self.assertTrue(torch.equal(self.store.get_tensor(key), updated))
+        finally:
+            self.store.unregister_buffer(raw_ptr)
+            for key in keys:
+                self.store.remove(key, force=True)
+
+    def test_tensor_from_external_pinned_host_staging(self):
+        """Raw tensor *_from APIs accept a registered pinned host buffer."""
+        import ctypes
+
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+
+        try:
+            tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+            metadata, _, payload_size, _ = mooncake_store._serialize_tensor(tensor)
+            metadata_size = len(metadata)
+            total_size = metadata_size + payload_size
+            raw = torch.empty(total_size, dtype=torch.uint8, pin_memory=True)
+        except RuntimeError as error:
+            self.skipTest(f"Pinned host allocation is unavailable: {error}")
+
+        raw_ptr = raw.data_ptr()
+        ctypes.memmove(raw_ptr, metadata, metadata_size)
+        ctypes.memmove(raw_ptr + metadata_size, tensor.numpy().tobytes(), payload_size)
+
+        self.assertTrue(raw.is_pinned())
+        self._check_external_tensor_writes(raw, tensor, "pinned")
+
+    def _check_external_tensor_writes(self, raw, tensor, label):
+        raw_ptr = raw.data_ptr()
+        total_size = raw.numel()
+        keys = [f"test_dummy_{label}_tensor_{os.getpid()}_{i}" for i in range(3)]
+        self.assertEqual(self.store.register_buffer(raw_ptr, total_size), 0)
+        try:
+            self.assertEqual(
+                self.store.put_tensor_from(keys[0], raw_ptr, total_size), 0
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_from(
+                        keys[1:], [raw_ptr] * 2, [total_size] * 2
+                    )
+                ),
+                [0, 0],
+            )
+            for key in keys:
+                self.assertTrue(torch.equal(self.store.get_tensor(key), tensor))
+
+            updated = tensor + 7
+            metadata, _, _, _ = mooncake_store._serialize_tensor(updated)
+            serialized = torch.tensor(
+                list(metadata + updated.numpy().tobytes()), dtype=torch.uint8
+            )
+            raw.copy_(serialized)
+            if raw.is_cuda:
+                torch.cuda.synchronize(raw.device)
+            self.assertEqual(
+                self.store.upsert_tensor_from(keys[0], raw_ptr, total_size), 0
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_upsert_tensor_from(
+                        keys[1:], [raw_ptr] * 2, [total_size] * 2
+                    )
+                ),
+                [0, 0],
+            )
+            for key in keys:
+                self.assertTrue(torch.equal(self.store.get_tensor(key), updated))
+        finally:
+            self.assertEqual(self.store.unregister_buffer(raw_ptr), 0)
+            for key in keys:
+                self.store.remove(key, force=True)
+
+    def test_tensor_from_external_cuda_staging(self):
+        """Exercise all four raw APIs with a registered CUDA serialized object."""
+        if torch is None or not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+        tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        metadata, _, _, _ = mooncake_store._serialize_tensor(tensor)
+        raw = torch.tensor(
+            list(metadata + tensor.numpy().tobytes()), dtype=torch.uint8, device="cuda"
+        )
+        torch.cuda.synchronize(raw.device)
+        self._check_external_tensor_writes(raw, tensor, "cuda")
+
+    def test_tensor_from_invalid_object_ranges(self):
+        """Reject malformed objects and overflow before dereferencing the header."""
+        import ctypes
+
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+        tensor = torch.arange(4, dtype=torch.float32)
+        metadata, _, payload_size, _ = mooncake_store._serialize_tensor(tensor)
+        size = len(metadata) + payload_size
+        raw = (ctypes.c_ubyte * size)()
+        ptr = ctypes.addressof(raw)
+        ctypes.memmove(ptr, metadata, len(metadata))
+        max_address = (1 << (8 * ctypes.sizeof(ctypes.c_void_p))) - 1
+        key = f"test_dummy_invalid_tensor_{os.getpid()}"
+        self.assertEqual(self.store.register_buffer(ptr, size), 0)
+        try:
+            for address, length in [
+                (0, size),
+                (max_address - 8, size),
+                (ptr, len(metadata) - 1),
+                (ptr, size - 1),
+            ]:
+                with self.subTest(address=address, length=length):
+                    self.assertLess(self.store.put_tensor_from(key, address, length), 0)
+                    self.assertLess(
+                        self.store.upsert_tensor_from(key, address, length), 0
+                    )
+                    self.assertLess(
+                        self.store.batch_put_tensor_from([key], [address], [length])[0],
+                        0,
+                    )
+                    self.assertLess(
+                        self.store.batch_upsert_tensor_from([key], [address], [length])[
+                            0
+                        ],
+                        0,
+                    )
+                    self.assertEqual(self.store.is_exist(key), 0)
+        finally:
+            self.assertEqual(self.store.unregister_buffer(ptr), 0)
+            self.store.remove(key, force=True)
+
+    def test_tensor_from_external_zero_payload_staging(self):
+        """Dummy raw tensor writes preserve metadata-only tensor objects."""
+        import ctypes
+
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+
+        tensor = torch.empty((2, 0, 3), dtype=torch.float32)
+        metadata, _, payload_size, _ = mooncake_store._serialize_tensor(tensor)
+        self.assertEqual(payload_size, 0)
+        raw = (ctypes.c_ubyte * len(metadata))()
+        raw_ptr = ctypes.addressof(raw)
+        ctypes.memmove(raw_ptr, metadata, len(metadata))
+
+        prefix = f"test_dummy_zero_payload_tensor_{os.getpid()}"
+        keys = [f"{prefix}_{i}" for i in range(4)]
+        try:
+            self.assertEqual(self.store.register_buffer(raw_ptr, len(metadata)), 0)
+            self.assertEqual(
+                self.store.put_tensor_from(keys[0], raw_ptr, len(metadata)), 0
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_from(
+                        keys[1:3], [raw_ptr, raw_ptr], [len(metadata)] * 2
+                    )
+                ),
+                [0, 0],
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_upsert_tensor_from(
+                        keys[1:3], [raw_ptr, raw_ptr], [len(metadata)] * 2
+                    )
+                ),
+                [0, 0],
+            )
+            self.assertEqual(
+                self.store.upsert_tensor_from(keys[3], raw_ptr, len(metadata)), 0
+            )
+            for key in keys:
+                stored = self.store.get_tensor(key)
+                self.assertIsNotNone(stored)
+                self.assertEqual(tuple(stored.shape), tuple(tensor.shape))
+                self.assertEqual(stored.dtype, tensor.dtype)
+                self.assertEqual(stored.numel(), 0)
+        finally:
+            self.store.unregister_buffer(raw_ptr)
+            for key in keys:
+                self.store.remove(key, force=True)
 
     def _run_dummy_cuda_ipc_stream_readiness_regression(self, batch_width):
         skip_reason = _cuda_stream_readiness_skip_reason()

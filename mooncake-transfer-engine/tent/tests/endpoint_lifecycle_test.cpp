@@ -45,6 +45,16 @@ class EndpointTestAccess {
         endpoint.notify_connected_.store(true, std::memory_order_relaxed);
     }
 
+    static void beginDestroy(RdmaEndPoint& endpoint) {
+        endpoint.beginDestroy();
+    }
+
+    // Stands in for notification WRs posted on the notify QP whose
+    // completions the worker has not polled yet.
+    static void setNotifyInflight(RdmaEndPoint& endpoint, uint32_t count) {
+        endpoint.notify_inflight_.store(count, std::memory_order_release);
+    }
+
     static bool notifyConnected(const RdmaEndPoint& endpoint) {
         return endpoint.notify_connected_.load(std::memory_order_relaxed);
     }
@@ -209,6 +219,51 @@ TEST(EndpointLifecycleTest, NotifyPayloadRejectedWhenLargerThanSlot) {
                                                          too_big, &encoded));
 }
 
+// The notify QP must take its path and retry attributes from EndPointParams
+// like the data QPs do (setupOneQP), not from hard-coded tutorial values:
+// with timeout=0x12 and retry_cnt=7 a dead peer path took ~8.6 s to report
+// on the notify QP while the data QPs of the same endpoint gave up in ~0.5 s,
+// and no configuration could change that.
+TEST(EndpointLifecycleTest, NotifyQpAttrsFollowEndpointParams) {
+    EndPointParams params;
+    params.path_mtu = IBV_MTU_1024;
+    params.min_rnr_timer = 5;
+    params.send_timeout = 20;
+    params.send_retry_count = 3;
+    params.send_rnr_count = 2;
+
+    const NotifyQpRtrAttrs rtr = buildNotifyQpRtrAttrs(params);
+    EXPECT_EQ(rtr.path_mtu, IBV_MTU_1024);
+    EXPECT_EQ(rtr.min_rnr_timer, 5);
+    // SEND/RECV only: one outstanding read/atomic, independent of the
+    // data-QP setting.
+    EXPECT_EQ(rtr.max_dest_rd_atomic, 1);
+
+    const NotifyQpRtsAttrs rts = buildNotifyQpRtsAttrs(params);
+    EXPECT_EQ(rts.timeout, 20);
+    EXPECT_EQ(rts.retry_cnt, 3);
+    // rnr_retry is pinned: RNR NAKs are flow control on the notify QP, not
+    // a fault, so send_rnr_count (2 above) must not reach it.
+    EXPECT_EQ(rts.rnr_retry, 7);
+    EXPECT_EQ(rts.max_rd_atomic, 1);
+}
+
+// With default EndPointParams the notify QP gets the data QPs' budget:
+// timeout 14 (4.096us * 2^14 ~= 67 ms per attempt), 7 retries and the
+// 0.64 ms RNR timer, plus the pinned unbounded RNR retry. The notify QP
+// follows these defaults now, so a change to them must show up here as a
+// deliberate decision.
+TEST(EndpointLifecycleTest, NotifyQpAttrsDefaultsMatchDataQp) {
+    EndPointParams defaults;
+    const NotifyQpRtrAttrs rtr = buildNotifyQpRtrAttrs(defaults);
+    EXPECT_EQ(rtr.path_mtu, IBV_MTU_4096);
+    EXPECT_EQ(rtr.min_rnr_timer, 12);
+    const NotifyQpRtsAttrs rts = buildNotifyQpRtsAttrs(defaults);
+    EXPECT_EQ(rts.timeout, 14);
+    EXPECT_EQ(rts.retry_cnt, 7);
+    EXPECT_EQ(rts.rnr_retry, 7);
+}
+
 TEST(EndpointLifecycleTest, NotifyLocalFaultKeepsEndpointServingData) {
     // A fault confined to the notify QP must not retire the endpoint: doing so
     // moves every data QP to ERR and flushes in-flight transfers.
@@ -334,6 +389,60 @@ TEST(EndpointLifecycleTest, ExternalOwnerCanReleaseAfterExplicitDeconstruct) {
 
     endpoint.reset();
     EXPECT_TRUE(weak.expired());
+}
+
+// Destroying the notify QP takes its completions with it, so an endpoint
+// whose notify CQ has not caught up is not finished yet. The data QPs have
+// their own counters; this is the notify side of the same gate.
+TEST(EndpointLifecycleTest, FinishDestroyWaitsForNotifyCompletions) {
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+    EndpointTestAccess::setNotifyInflight(endpoint, 3);
+    EndpointTestAccess::beginDestroy(endpoint);
+
+    EXPECT_FALSE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
+    endpoint.noteNotifyCompletion();
+    endpoint.noteNotifyCompletion();
+    EXPECT_FALSE(endpoint.finishDestroy());
+
+    endpoint.noteNotifyCompletion();
+    EXPECT_EQ(endpoint.notifyInflight(), 0u);
+    // Never below zero, whatever order the completions arrive in.
+    endpoint.noteNotifyCompletion();
+    EXPECT_EQ(endpoint.notifyInflight(), 0u);
+
+    EXPECT_TRUE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+}
+
+// A consumed notify RECV slot is posted again only while the endpoint is
+// ready and its notify QP connected. Retirement moves the QP to ERR, and so
+// does the local fault that disables notifications, so neither may re-arm.
+TEST(EndpointLifecycleTest, NotifyRecvIsRearmedOnlyWhileReady) {
+    using S = RdmaEndPoint;
+    EXPECT_TRUE(S::shouldRearmNotifyRecv(S::EP_READY, true));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_READY, false));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_DESTROYING, true));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_DESTROYED, false));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_HANDSHAKING, true));
+
+    // The states the endpoint actually passes through.
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+    EXPECT_TRUE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                         endpoint.notifyConnected()));
+    endpoint.disableNotification("test");
+    EXPECT_EQ(endpoint.status(), S::EP_READY);
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                          endpoint.notifyConnected()));
+    EndpointTestAccess::beginDestroy(endpoint);
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                          endpoint.notifyConnected()));
 }
 
 }  // namespace

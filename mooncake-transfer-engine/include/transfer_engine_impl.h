@@ -428,6 +428,11 @@ class TransferEngineImpl {
 
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
 
+    void* allocateSharedMemory(size_t length);
+    void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
+
+    int freeSharedMemory(void* addr);
+
     void setWhitelistFilters(std::vector<std::string>&& filters) {
         filter_ = std::move(filters);
     }

@@ -740,6 +740,85 @@ TEST(AdmissionQueueTest, Step3QueueAheadWithinOnePickIsExact) {
     EXPECT_TRUE(dropped.empty());
 }
 
+// dispatching_bytes_ is the drop prediction's queue-ahead term, so after
+// every owner state transition it must equal the bytes of the eligible
+// owners currently Dispatching: nothing more, nothing less.
+TEST(AdmissionQueueTest,
+     Step3DispatchingBytesEqualsEligibleBytesInDispatching) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.0));
+    // now = 1e9 ns, bandwidth 1e9 B/s: 1 B per ns.
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    // Distinct loose deadlines: EDF order == admission order, nothing drops.
+    // 1: eligible 1000 B; 2: not eligible 20000 B; 3: eligible 300 B;
+    // 4: eligible 40 B, stays queued.
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(queue
+                  .tryAdmit(makeSubmit(
+                                1, 4,
+                                {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 1000, 5'000'000'000),
+                                 makeOwnerWithDeadline(1, 20000, 6'000'000'000),
+                                 makeDegradationEligibleOwnerWithDeadline(
+                                     2, 300, 7'000'000'000),
+                                 makeDegradationEligibleOwnerWithDeadline(
+                                     3, 40, 8'000'000'000)}),
+                            ids)
+                  .code(),
+              Status::Code::kOk);
+    EXPECT_EQ(queue.dispatchingBytes(), 0u);  // admitted is not dispatching
+
+    // pick: eligible owners charge their length, the other charges nothing.
+    ASSERT_EQ(queue.pickForDispatch(3, 1 << 20),
+              (std::vector<QueueOwnerId>{1, 2, 3}));
+    EXPECT_EQ(queue.dispatchingBytes(), 1300u);
+
+    // Refused calls and a queued owner's cancel move nothing.
+    EXPECT_NE(queue.cancel(1).code(), Status::Code::kOk);  // dispatching
+    ASSERT_EQ(queue.cancel(4).code(), Status::Code::kOk);  // queued
+    ASSERT_EQ(queue.cancel(4).code(), Status::Code::kOk);  // idempotent
+    EXPECT_NE(queue.complete(4, TransferStatusEnum::COMPLETED).code(),
+              Status::Code::kOk);  // not dispatching
+    EXPECT_EQ(queue.dispatchingBytes(), 1300u);
+
+    // complete: non-eligible returns nothing; eligible returns its length
+    // whatever the terminal status.
+    ASSERT_EQ(queue.complete(2, TransferStatusEnum::COMPLETED).code(),
+              Status::Code::kOk);
+    EXPECT_EQ(queue.dispatchingBytes(), 1300u);
+    ASSERT_EQ(queue.complete(1, TransferStatusEnum::FAILED).code(),
+              Status::Code::kOk);
+    EXPECT_EQ(queue.dispatchingBytes(), 300u);
+
+    // drop: 16 B, 10 ns window, 300 B ahead -> MLU 31.6. Queued -> Terminal
+    // without passing through Dispatching.
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(2, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, 1'000'000'010)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    std::vector<QueueOwnerId> dropped;
+    EXPECT_TRUE(queue.pickForDispatch(4, 1 << 20, &dropped).empty());
+    EXPECT_EQ(dropped, std::vector<QueueOwnerId>{5});
+    EXPECT_EQ(queue.dispatchingBytes(), 300u);
+
+    // retireBatch: erasing terminal owners (batch 2) or being refused for a
+    // dispatching one (batch 1, owner 3) moves nothing.
+    ASSERT_EQ(queue.retireBatch(2).code(), Status::Code::kOk);
+    EXPECT_NE(queue.retireBatch(1).code(), Status::Code::kOk);
+    EXPECT_EQ(queue.dispatchingBytes(), 300u);
+
+    ASSERT_EQ(queue.complete(3, TransferStatusEnum::COMPLETED).code(),
+              Status::Code::kOk);
+    EXPECT_EQ(queue.dispatchingBytes(), 0u);
+    ASSERT_EQ(queue.retireBatch(1).code(), Status::Code::kOk);
+    EXPECT_EQ(queue.dispatchingBytes(), 0u);
+}
+
 TEST(AdmissionQueueTest, Step3DropsAlreadyExpiredDeadline) {
     LocalTransferAdmissionQueue queue(step3Limits(1.5));
     queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},

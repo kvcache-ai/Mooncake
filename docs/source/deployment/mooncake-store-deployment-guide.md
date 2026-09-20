@@ -191,6 +191,53 @@ mooncake_master \
 
 ---
 
+### Batch OpLog Snapshot Metrics
+
+The master Prometheus endpoint exposes `ha_snapshot_*` metrics for
+`enable_oplog_snapshot`. They are available without the optional OpLog performance
+metrics build flag. Updates use existing scheduler, reader, and maintenance
+observations; scraping does not read etcd or the object store.
+
+All names in the table have the `ha_snapshot_` prefix:
+
+| Metric suffix | Meaning |
+| --- | --- |
+| `enabled` | Whether the runtime is configured for batch snapshots; legacy mode is 0. |
+| `active` | `enabled` and standby state is connecting, syncing, watching, recovering, or reconnecting. Filter snapshot freshness/capacity alerts on this gauge; it is 0 during promotion, after stop, and after fatal failure. Historical observations and in-flight operation counters remain available. |
+| `latest_present`, `fallback_present`, `count` | Decodable pointers observed locally (0–2); not proof that all referenced artifacts remain intact. |
+| `latest_age_seconds`, `fallback_age_seconds` | Time since the observed descriptor's creation, computed at scrape time. Missing pointers and future timestamps report 0; check `*_present` to distinguish absence. |
+| `bytes`, `chunk_bytes`, `chunk_count` | Size/count of the last fully verified upload or successful snapshot restore. Total bytes include segments, chunks, manifest, and descriptor; they do not measure the whole bucket or imply publication success. |
+| `capture_pause_us` | Last completed pause of standby apply for capture, including chunk encoding/upload while capture is held. |
+| `suffix_batches` | Applied batches in the most recent bootstrap suffix replay attempt. |
+| `catch_up_target_batch`, `catch_up_target_sequence` | Durable cursor observed when capture was released; zero after local apply reaches it. |
+| `applied_batch`, `latest_batch`, `fallback_batch` | Local applied cursor and last observed pointer cursors; compare with the catch-up target and durable batch. |
+| `durable_batch`, `compaction_floor`, `candidate_floor` | Last observed durable batch, reader-visible retention floor, and latest pruning candidate. The floor updates immediately after its CAS, before batch deletion. |
+| `uncompacted_batches` | `max(durable_batch - compaction_floor, 0)`: the logical retained suffix, not a physical etcd key count or database size. Failed deletion can retain additional keys below the floor. |
+| `floor_advances_total`, `lease_lost_total` | Successful floor advances and acquired maintenance leases observed lost before release. A failed publish CAS alone does not prove lease loss. |
+| `gc_orphan_prefixes`, `gc_deleted_prefixes` | Unprotected attempt prefixes found by the last completed GC listing, and how many that sweep deleted. A failure before listing leaves the previous observation. |
+| `operations_total{operation}`, `errors_total{operation}`, `duration_us_total{operation}` | Completed calls, failed calls (including exceptions), and total elapsed microseconds. Operations are `schedule`, `upload`, `bootstrap`, `replay`, `publish`, `gc`, `prune`, and `rebootstrap`. Scheduling decisions past the interval/lifecycle gates and no-op pruning calls are included in completed calls; inspect skip reasons and floor advances for its effect. |
+| `skip_reason{reason}`, `skips_total{reason}` | One-hot most recent skip reason and cumulative skipped decisions. Fixed reasons are `none`, `disabled`, `interval`, `in_flight`, `stopped`, `promotion`, `no_new_batch`, `catch_up`, `lease_busy`, `capture_unavailable`, `no_fallback`, `invalid_pair`, and `floor_ahead`. |
+
+Upload time includes encoding, uploads, and verification. Bootstrap time includes
+restore and suffix replay; rebootstrap also includes the floor recheck and state
+replacement. These durations overlap and should not be added together. For
+example, mean upload duration over five minutes in seconds is:
+
+```promql
+rate(ha_snapshot_duration_us_total{operation="upload"}[5m])
+/ rate(ha_snapshot_operations_total{operation="upload"}[5m]) / 1e6
+```
+
+Current gauges reset for a new standby runtime. Event counters remain cumulative
+for the process; in legacy mode they stop increasing and gauges report
+`enabled=0`, `skip_reason{reason="disabled"}=1`, and zero capacity values. Historical
+counters do not indicate activity in the current mode. Publication, GC, and pruning
+have independent error counters: a GC failure does not turn a committed publication
+into a failure. Pointer observations may lag changes made by another standby until
+the next scheduler/bootstrap read.
+
+---
+
 ### Tiered Storage with SSD Offload — Cost-Effective Capacity
 
 Extends the cache pool from DRAM to SSD while keeping normal reads and writes on the distributed memory path. With `--enable_offload=true`, completed memory writes are queued for asynchronous SSD persistence through the master control plane. Set `--offload_on_evict=true` to defer that SSD write until the memory eviction path selects an object for reclamation. When `--promotion_on_hit=true`, SSD-only objects can be promoted back to DRAM after repeated reads; admission is gated by `--promotion_admission_threshold`.
@@ -262,25 +309,47 @@ HA leadership and metadata replication are configured separately:
 
 - The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
 - The optional batch-record OpLog persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and requires `ha_backend_type=etcd` and a build with `STORE_USE_ETCD`.
+- The optional standby-generated batch OpLog snapshot path is enabled with `--enable_oplog_snapshot=true` together with `--enable_oplog=true`. It uses the batch snapshot provider/coordinator and does not use the legacy catalog snapshot manager. Startup fails when the required etcd, cluster ID, object-store, or chunk configuration is invalid; a temporary upload failure leaves OpLog apply running for a later attempt.
 
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
+- `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
+- With `enable_oplog_snapshot=true`, each successful publication also attempts batch OpLog pruning under the same maintenance lease. Pruning requires two independently validated snapshots: it publishes a monotonic `compaction_floor` at the fallback snapshot's batch ID before deleting covered batches. The first snapshot does not prune. GC or pruning failures keep the published snapshot successful; failed deletions can be retried after a later successful publication.
+- Before enabling this mode, every standby that may be promoted must support compaction-floor rebootstrap. Once pruning has started, rollback requires a binary that understands the batch snapshot and floor protocol. This maintenance does not perform etcd MVCC compaction/defragmentation or delete legacy snapshot/OpLog data.
+- `--snapshot_chunk_object_count`: Maximum objects written to one batch OpLog snapshot chunk. Defaults to `1000000`; must be greater than zero when `enable_oplog_snapshot=true`.
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
 - `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
 
-For snapshot-based standby bootstrap, also configure:
+For legacy catalog snapshot-based standby bootstrap, configure:
 
 - `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
 - `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
 - `--snapshot_catalog_store_type` (str): Snapshot catalog store type: `embedded` (default) or `redis`.
 
+For the new batch OpLog snapshot path, configure:
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+enable_oplog: true
+enable_oplog_snapshot: true
+snapshot_chunk_object_count: 1000000
+snapshot_interval_seconds: 600
+snapshot_object_store_type: "local"
+```
+
+The new path stores immutable artifacts below a cluster-specific batch OpLog
+snapshot root. It restores `latest`, then `fallback`, then a proven complete
+OpLog and replays only the suffix after the snapshot cursor. It remains
+non-serving if recovery cannot prove a complete state.
+
 ### Standby Bootstrap
 
 When a Standby starts, it follows this sequence:
 
-1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true`):
-   - Load the latest snapshot from the configured catalog and object store.
+1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true` for legacy catalog snapshots, or `enable_oplog_snapshot=true` for batch OpLog snapshots):
+   - Legacy mode loads the latest snapshot from the configured catalog and object store. Batch OpLog mode loads the latest/fallback descriptor and manifest directly from the batch snapshot control keys.
    - Rebuild object metadata and segment state from the snapshot baseline.
 2. **OpLog Catch-up**:
    - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
@@ -322,9 +391,10 @@ cluster_id: "mooncake_cluster"
 enable_oplog: true
 oplog_poll_interval_ms: 1000
 oplog_batch_max_entries: 1024
-enable_snapshot: true
+enable_oplog_snapshot: true
+snapshot_chunk_object_count: 1000000
+snapshot_interval_seconds: 600
 snapshot_object_store_type: "local"
-snapshot_catalog_store_type: "embedded"
 rpc_port: 50051
 ```
 
@@ -338,9 +408,10 @@ cluster_id: "mooncake_cluster"
 enable_oplog: true
 oplog_poll_interval_ms: 1000
 oplog_batch_max_entries: 1024
-enable_snapshot_restore: true
+enable_oplog_snapshot: true
+snapshot_chunk_object_count: 1000000
+snapshot_interval_seconds: 600
 snapshot_object_store_type: "local"
-snapshot_catalog_store_type: "embedded"
 rpc_port: 50052
 ```
 
@@ -612,6 +683,7 @@ mooncake_master \
 | `--enable_multi_tenants` | `false` | Enable strict tenant registration and per-tenant memory quota admission |
 | `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type: `file` or `etcd` when built with `STORE_USE_ETCD=ON` |
 | `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path; for `etcd`, the endpoints string |
+| `--tenant_eviction_high_watermark_ratio` | `0.90` | Usage ratio of a tenant's own effective quota that triggers background eviction for that tenant; `0` disables it |
 
 ### High Availability
 
@@ -624,6 +696,8 @@ mooncake_master \
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 | `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; currently requires `enable_ha=true` and `ha_backend_type=etcd` |
+| `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
+| `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
 | `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
@@ -814,7 +888,7 @@ is required.
 | `MOONCAKE_ENABLE_DFS` | Master | `false` | Enable master-side DFS allocation. `MOONCAKE_DFS_ENABLED` is accepted as a compatibility fallback. |
 | `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared shard root; use the same path string in every process. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
 | `MOONCAKE_DFS_FS_ADAPTER` | Master and clients | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. Falls back to `MOONCAKE_DISTRIBUTED_FS_TYPE`. |
-| `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Number of DFS shard files. |
+| `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Initial shard count. The master also discovers existing contiguous shard files at startup; running clients open added shards on demand. |
 | `MOONCAKE_DFS_SHARD_CAPACITY` | Master and clients | `4294967296` (4 GiB) | Logical file capacity of each shard in bytes. Each object is allocated wholly within one shard. |
 | `MOONCAKE_DFS_ALIGNMENT` | Master and clients | `4096` | Allocation alignment in bytes; must be a power of two and divide the shard capacity. |
 | `MOONCAKE_DFS_SINGLE_TENANT` | Master and clients | `true` | Currently must remain `true`. |
@@ -823,6 +897,51 @@ is required.
 | `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | Master | `0.7` | Usage ratio targeted by an eviction cycle. |
 | `MOONCAKE_DFS_DEFERRED_FREE_SECONDS` | Master | `30` | Delay before a freed shard range may be reused. |
 | `MOONCAKE_DFS_EVICTION_CHECK_INTERVAL` | Master | `5` | Eviction check interval in seconds. |
+
+#### Growing DFS capacity online
+
+The default shard allocator supports adding shard files while the master and
+clients remain running. Use the master's existing HTTP admin listener:
+
+```bash
+curl http://127.0.0.1:9003/api/v1/dfs/shard_count
+curl -X PUT http://127.0.0.1:9003/api/v1/dfs/shard_count \
+  -H 'Content-Type: application/json' -d '{"shard_count": 128}'
+```
+
+Both requests return the current count, for example
+`{"success":true,"shard_count":128}`. A PUT sets the desired **total** count,
+not the number to add. Repeating the current count succeeds without changing
+anything; shrinking, non-integer values, and non-positive counts return HTTP
+400. DFS-disabled masters and concurrent expansion requests return HTTP 409;
+unavailable or standby services return HTTP 503. Filesystem preparation runs
+off the HTTP I/O threads, so health checks and other administration remain
+available while an expansion is pending.
+
+Upgrade the master and every DFS client to a version supporting online shard
+expansion before increasing capacity. An already running upgraded client can
+open a new shard from its descriptor even when its initial
+`MOONCAKE_DFS_SHARD_COUNT` is smaller. Older binaries reject those descriptors.
+Every process must still use the same shared root, adapter, shard capacity, and
+alignment. Provision sufficient backing filesystem space before expanding;
+changing the root or per-shard capacity online is unsupported.
+
+Only one active master may manage a DFS root. Do not create, rename, truncate,
+or remove its shard files outside that master. Clients do not create shard
+files during initialization; they open them only from published descriptors.
+
+The allocator prepares new files and allocation state before publishing the
+expanded shard set. Existing paths and allocated ranges remain unchanged,
+including when the shard index gains another decimal digit. Allocation, reads,
+writes, deferred frees, and eviction continue to use ready shards. A failed
+expansion leaves the published shard count unchanged.
+
+On startup, the master discovers the contiguous existing shard layout and uses
+at least the configured count. Duplicate indices, missing intermediate shards,
+and unexpected file sizes are rejected rather than silently changing the
+layout. This preserves **capacity**, not cached key metadata or allocation
+ownership: DFS allocator recovery, snapshots, and HA remain subject to the
+limitations below. Do not treat online expansion as a data durability guarantee.
 
 #### Requesting and accessing DFS replicas
 
@@ -841,10 +960,11 @@ store.put("key", b"value", config)
 with at least one memory replica (`replica_num >= 1`), so DFS-only placement is
 not supported.
 
-Each key hashes to exactly one DFS shard. Allocation does not fall back to a
-different shard, so a request may return `NO_AVAILABLE_HANDLE` when its selected
-shard is full even if other shards have free space. A DFS object is never
-striped across shards. The selected shard must have room for the object rounded
+Allocation first tries the key's hash-selected DFS shard, then tries other
+ready shards if that shard has no suitable extent. This lets new shards accept
+writes even when older shards are full. `NO_AVAILABLE_HANDLE` means no ready
+shard could satisfy the allocation. A DFS object is never striped across shards.
+The selected shard must have room for the object rounded
 up to `MOONCAKE_DFS_ALIGNMENT`, plus up to one alignment unit of allocator
 padding (`MOONCAKE_DFS_ALIGNMENT - 1` bytes); usable object capacity is
 therefore lower than the shard file's
@@ -876,9 +996,8 @@ reads for that descriptor.
   their replication configuration does not expose `dfs_replica_num`, and their
   setup API cannot initialize the distributed `FileStorage` backend. Use the
   native C++ or Python/RealClient API.
-- A DFS object must fit in its key-selected shard after alignment and allocator
-  padding; objects are not striped and allocation does not fall back to another
-  shard.
+- A DFS object must fit in a single shard after alignment and allocator
+  padding; objects are not striped across shards.
 - DFS allocator state is currently in memory. A master restart or HA leader
   failover does not reconstruct existing DFS allocations, so DFS cannot provide
   continuity across those events.
@@ -1139,7 +1258,7 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 |----------|---------|-------------|
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp` or `rdma` |
 | `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for client→master RPCs and for store→store SSD offload reads. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
-| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
+| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` initially; `1000` during HA runtime | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. HA clients retain the normal retry budget during initial discovery and configuration, then use one bounded attempt per runtime reconnect because their monitor and heartbeat loops own the retry schedule. An explicit value overrides both defaults. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
 | `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
 | `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |
@@ -1211,6 +1330,7 @@ Do not run binaries from before and after checksum support was introduced in the
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `512MB`, `1GB` |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
+| `MC_STORE_REGISTER_SPDK` | unset | Set `1` to register `ShmHelper`-allocated shared memory (host pool, dummy local buffer) with SPDK for NoF zero-copy transfers. Forces HugeTLB backing for those allocations, defaulting to 2MB hugepages when `MC_STORE_USE_HUGEPAGE` is unset. Must be set on BOTH the dummy and the real process (SPDK registration is per-process) |
 
 RDMA Store segments backed by HugeTLB are populated in parallel immediately
 before transfer-engine registration. No additional population-mode setting is
@@ -1226,6 +1346,25 @@ NUMA-segmented mappings, each worker is scheduled on the NUMA node associated
 with its `mbind()` region before touching pages. The mmap arena retains its
 eager `MAP_POPULATE` behavior for DMA safety; set `MC_DISABLE_MMAP_ARENA=1` if
 the deferred direct-mmap path is desired while the arena is otherwise enabled.
+
+For NoF (NVMe-oF) zero-copy, `MC_STORE_REGISTER_SPDK=1` registers the shared
+memory allocated by `ShmHelper` (SGLang host pool, dummy local buffer) with
+SPDK (`spdk_mem_register`) so the NoF RDMA transport can DMA to/from it
+directly — without it those buffers fail with `No translation for ptr`.
+`spdk_mem_register` is per-process, so set this switch on BOTH the dummy
+(sender) and the real client (receiver): the dummy registers its own mapping
+in `ShmHelper::allocate`, and the real client registers its separate mapping
+of the same shared fd in `RealClient::map_shm_internal_with_device`. Setting
+it on only one process leaves the other without an SPDK translation and NoF
+transfers still fail with `No translation for ptr`. SPDK
+registration in iova=pa mode requires PHYSICALLY 2MB-aligned memory, which only
+HugeTLB pages satisfy, so this switch forces HugeTLB for the affected
+allocations even when `MC_STORE_USE_HUGEPAGE` is unset; it then defaults to 2MB
+hugepages (set `MC_STORE_USE_HUGEPAGE=1` and `MC_STORE_HUGEPAGE_SIZE=1GB` for
+1GB). Reserve enough HugeTLB pages (`/proc/sys/vm/nr_hugepages`) for the host
+pool plus any hugepage-backed segments; when the pool is exhausted the first
+allocation aborts with a clear error naming the hugepage size and count needed
+rather than silently degrading.
 
 #### yalantinglibs Log Level
 

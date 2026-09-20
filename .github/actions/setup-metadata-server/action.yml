@@ -1,0 +1,8 @@
+name: Start the CI HTTP metadata service
+description: Start the CI HTTP metadata service
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

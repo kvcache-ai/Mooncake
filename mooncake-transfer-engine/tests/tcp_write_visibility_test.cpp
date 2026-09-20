@@ -51,6 +51,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -652,6 +653,16 @@ class LocalHttpMetadataServer {
                 continue;
             }
             value["ip_or_host_name"] = new_host;
+            const int64_t now_ns = getCurrentTimeInNano();
+            uint64_t metadata_version =
+                now_ns > 0 ? static_cast<uint64_t>(now_ns / 1000) : 1;
+            if (value.isMember("metadata_version") &&
+                value["metadata_version"].isUInt64() &&
+                value["metadata_version"].asUInt64() >= metadata_version) {
+                metadata_version = value["metadata_version"].asUInt64() + 1;
+            }
+            value["metadata_version"] =
+                static_cast<Json::UInt64>(metadata_version);
             Json::StreamWriterBuilder writer_builder;
             writer_builder["indentation"] = "";
             encoded = Json::writeString(writer_builder, value);
@@ -1848,6 +1859,106 @@ TEST(TcpWriteVisibilityTest, V2ReadRoundTripAndRejectedRead) {
     // And the pool must still be usable afterwards.
     r.target_offset = h.remote_base;
     EXPECT_EQ(runOne(h.engine.get(), r), TransferStatusEnum::COMPLETED);
+}
+
+TEST(TcpWriteVisibilityTest, GroupedScatterReadWritePreservesEveryFragment) {
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.1:17941", 4ull << 20);
+    ASSERT_TRUE(h.ok);
+    auto descriptor = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    auto* local = static_cast<char*>(h.pool) + (2ull << 20);
+    auto* remote = static_cast<char*>(h.pool);
+    constexpr size_t count = 256;
+    constexpr size_t length = 128;
+    std::vector<size_t> local_offsets(count), remote_offsets(count);
+    std::vector<size_t> lengths(count, length);
+    for (size_t i = 0; i < count; ++i) {
+        local_offsets[i] = i * 256;
+        remote_offsets[i] = i * 384;
+    }
+    for (auto opcode : {TransferRequest::READ, TransferRequest::WRITE}) {
+        memset(local, 0, 1ull << 20);
+        memset(remote, 0, 1ull << 20);
+        for (size_t i = 0; i < count; ++i) {
+            auto* source = opcode == TransferRequest::READ
+                               ? remote + remote_offsets[i]
+                               : local + local_offsets[i];
+            memset(source, static_cast<int>(i % 251 + 1), length);
+        }
+        std::vector<size_t> completions(count);
+        TransferEngine::ScatterTransferRange range{
+            .opcode = opcode,
+            .remote_segment = descriptor->name,
+            .remote_base_offset = h.remote_base,
+            .remote_size = 1ull << 20,
+            .local_buffer = local,
+            .local_capacity = 1ull << 20,
+            .local_offsets = local_offsets,
+            .remote_offsets = remote_offsets,
+            .lengths = lengths,
+            .on_fragment_complete =
+                [&](size_t i, const Status& status) {
+                    EXPECT_TRUE(status.ok());
+                    ++completions[i];
+                },
+        };
+        auto operation = h.engine->submitScatter({range});
+        ASSERT_TRUE(operation.wait().ok());
+        for (size_t i = 0; i < count; ++i) {
+            EXPECT_EQ(completions[i], 1u);
+            EXPECT_EQ(memcmp(local + local_offsets[i],
+                             remote + remote_offsets[i], length),
+                      0);
+            EXPECT_EQ(local[local_offsets[i] + length], 0);
+            EXPECT_EQ(remote[remote_offsets[i] + length], 0);
+        }
+    }
+}
+
+TEST(TcpWriteVisibilityTest, GroupedScatterPreservesPartialFailureResults) {
+    EngineHandle h;
+    constexpr size_t pool_size = 4ull << 20;
+    h.init(P2PHANDSHAKE, "127.0.0.1:17942", pool_size);
+    ASSERT_TRUE(h.ok);
+    auto descriptor = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    auto* local = static_cast<char*>(h.pool) + (2ull << 20);
+    std::vector<size_t> local_offsets{0, 256, 512};
+    // The middle fragment passes the supplied descriptor bounds but is
+    // rejected by the peer's actual registration, exercising transport failure.
+    std::vector<size_t> remote_offsets{0, pool_size + 4096, 512};
+    std::vector<size_t> lengths(3, 128);
+    for (auto opcode : {TransferRequest::READ, TransferRequest::WRITE}) {
+        memset(h.pool, 37, 1024);
+        memset(local, 73, 1024);
+        std::vector<size_t> completions(3);
+        std::vector<bool> succeeded(3);
+        TransferEngine::ScatterTransferRange range{
+            .opcode = opcode,
+            .remote_segment = descriptor->name,
+            .remote_base_offset = h.remote_base,
+            .remote_size = pool_size + 8192,
+            .local_buffer = local,
+            .local_capacity = 1024,
+            .local_offsets = local_offsets,
+            .remote_offsets = remote_offsets,
+            .lengths = lengths,
+            .on_fragment_complete =
+                [&](size_t i, const Status& status) {
+                    ++completions[i];
+                    succeeded[i] = status.ok();
+                },
+        };
+        auto operation = h.engine->submitScatter({range});
+        EXPECT_FALSE(operation.wait().ok());
+        EXPECT_EQ(completions, (std::vector<size_t>{1, 1, 1}));
+        EXPECT_EQ(succeeded, (std::vector<bool>{true, false, true}));
+        EXPECT_EQ(local[256], 73);
+        for (size_t i : {0u, 2u})
+            EXPECT_EQ(memcmp(local + local_offsets[i],
+                             static_cast<char*>(h.pool) + remote_offsets[i],
+                             lengths[i]),
+                      0);
+    }
 }
 
 // Mixed-version quadrant: a pooled legacy (v1) initiator against the current

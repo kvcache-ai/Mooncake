@@ -117,6 +117,8 @@ class RocmPlatform : public Platform {
 
     virtual const std::string type() const { return kAmdGpuLocationType; }
 
+    Status synchronizeDevices(const Topology* topology) override;
+
     Status getStreamFromPool(HIPStreamHandle& outHandle,
                              int deviceId = HIPStreamPool::kCurrentDevice);
 

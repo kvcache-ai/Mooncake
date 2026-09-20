@@ -122,6 +122,8 @@ class CudaPlatform : public Platform {
 
     virtual const std::string type() const { return "cuda"; }
 
+    Status synchronizeDevices(const Topology* topology) override;
+
     Status getStreamFromPool(CUDAStreamHandle& outHandle,
                              int deviceId = CUDAStreamPool::kCurrentDevice);
 

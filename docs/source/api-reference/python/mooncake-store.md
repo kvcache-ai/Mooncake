@@ -277,6 +277,33 @@ Zero-copy operations require registered memory buffers. For repeated reads and w
 #### register_buffer()
 Register a memory buffer for direct RDMA access.
 
+For a contiguous PyTorch CPU tensor, including one created with
+`pin_memory=True`, pass its address and **byte size**:
+
+```python
+import torch
+
+# Assumes store.setup(...) or store.setup_dummy(...) has already succeeded.
+tensor = torch.empty(1024, dtype=torch.float32, pin_memory=True)
+tensor.fill_(1)
+ptr = tensor.data_ptr()
+size = tensor.numel() * tensor.element_size()
+assert store.register_buffer(ptr, size) == 0
+try:
+    assert store.put_from("pinned_tensor", ptr, size) == 0
+    tensor.zero_()
+    assert store.get_into("pinned_tensor", ptr, size) == size
+    assert torch.all(tensor == 1)
+finally:
+    assert store.unregister_buffer(ptr) == 0
+```
+
+Keep the tensor alive and its storage unchanged until all operations finish and
+the buffer is unregistered. `put_from` stores raw bytes; it does not serialize
+the tensor's shape or dtype. With `setup_dummy()`, external CPU buffers use
+shared-memory staging and read copy-back across the RealClient process boundary.
+Pinned allocation alone does not make this path zero-copy.
+
 #### unregister_buffer()
 Unregister a previously registered buffer.
 
@@ -733,6 +760,56 @@ store.put("key-a", b"value-a", config)
 
 ---
 
+(choosing-a-parallel-tensor-io-api)=
+## Choosing a Parallel Tensor IO API
+
+Use the API that matches the object being stored. The single-axis TP methods
+and the manifest-backed weight snapshot API have different storage contracts.
+
+| Requirement | Public API | Contract |
+| --- | --- | --- |
+| Store and retrieve a complete tensor | `put_tensor()` / `get_tensor()` | One ordinary Store tensor object. |
+| Split a full tensor and read a TP shard | `put_tensor_with_tp()` / `get_tensor_with_tp()` | Legacy single-axis TP tensor objects; batch and registered-buffer variants are also available. |
+| Save weights and restore into a different TP/DP/EP/PP placement | `begin_weight_snapshot()` and `WeightStore.load_manifest()` / `plan_load()` / `load()` | Immutable manifest-managed fragments, with framework-supplied placement and runtime bindings. |
+| Use `put/get_tensor_with_cp`, `*_with_dp`, `*_with_ep`, or `*_with_pp` | No such public convenience methods | DP/EP/PP weight placement is expressed through the manifest API; CP is not a supported axis. |
+| Supply an arbitrary parallel strategy through `*_with_config` | No such public tensor API | `ReplicateConfig` controls Store replication and placement policy, not tensor parallel topology. |
+
+For example, with an already initialized `MooncakeDistributedStore`, the
+legacy TP write accepts the **full** tensor and writes all shards. `tp_rank`
+on this write does not select a single shard to persist:
+
+```python
+import torch
+
+tensor = torch.linspace(0, 23, 24, dtype=torch.float32).reshape(4, 6)
+assert store.put_tensor_with_tp("tp-example", tensor, tp_size=2, split_dim=1) == 0
+shard = store.get_tensor_with_tp("tp-example", tp_rank=1, tp_size=2, split_dim=1)
+assert torch.equal(shard, tensor[:, 3:])
+```
+
+### Parallel configuration boundaries
+
+The model-weight API uses typed `ParallelTopology`, `WeightPlacementManifest`,
+and `WeightRuntimeBindingManifest` values supplied by the framework adapter.
+It does not provide a factory that generates a separate put/get method family
+for each axis, or accept an arbitrary strategy dictionary.
+
+- TP and EP can describe logical splits. EP splits the leading logical expert
+  dimension; TP names an explicit logical dimension.
+- DP describes replicas or ownership. PP describes framework-provided tensor
+  or layer ownership. Neither implies a tensor split dimension.
+- CP (context parallelism) is absent from the current topology and axis types.
+  A sequence-dimension slice through the TP API does not establish CP topology
+  support or CP-aware KV-cache resharding.
+- Combining supported axes still requires complete logical coverage and
+  compatible source/target tensor descriptors. The planner is copy-only; it
+  does not convert dtype, quantization, packing, or model semantics.
+
+See the [manifest contracts](../../design/mooncake-reshard/reshard-manifest.md),
+[weight reshard planner](../../design/mooncake-reshard/model-weight-reshard-planner.md), and
+[Store upload planning](../../design/mooncake-reshard/model-weight-store-upload-planning.md)
+for the configuration and execution boundaries.
+
 ## Model Weight Snapshot API
 
 Heterogeneous model-weight snapshots use the manifest-backed Reshard API.
@@ -760,7 +837,8 @@ placement and runtime binding manifests.
 
 ### Breaking Change and Migration
 
-This release removes the public `*_with_parallelism` API family and the
+PR [#3772](https://github.com/kvcache-ai/Mooncake/pull/3772) removed the public
+`*_with_parallelism` API family and the
 associated `ParallelAxis`, `TensorParallelism`, and `ReadTarget` helper types.
 Applications that create heterogeneous model-weight snapshots migrate their
 write path to `begin_weight_snapshot()`, `write_tensor()`, and `commit()`.
@@ -2817,15 +2895,21 @@ Typical flow:
 - Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
-Get sessions cache a filtered `QueryResult` (one complete replica chosen by
-`SelectBestReplica`, plus lease). Range calls only check the cached lease
-locally (zero Master RPCs). MEMORY replicas use `BatchTransferReadRanges`.
-LOCAL_DISK replicas restore on the owner then scatter object-byte ranges into
-already `register_buffer`'d destinations (the reader does not need a setup
-local buffer). DISK/DFS replicas `BatchGet` into a temporary host buffer and
-scatter by `src_offset`. NoF is not a session range type: a start that lands
-on a NoF replica fails the later range read with `INVALID_REPLICA`. Put
-sessions reserve object space via Master `BatchPutStart` and finalize with
+Get sessions cache a filtered `QueryResult` (one complete supported replica,
+plus lease). Range calls only check the cached lease locally (zero Master RPCs).
+The MEMORY path remains zero-copy via `BatchTransferReadRanges`. DFS replicas
+are read into request-scoped host staging and then scattered to host or device
+destinations; for device destinations, staging first uses the fixed-capacity
+pinned restore arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`
+and falls back to the regular client buffer allocator if it is unavailable or
+exhausted. LOCAL_DISK replicas are restored on the owner via the offload RPC
+and then scatter object-byte ranges into already `register_buffer`'d
+destinations (the reader does not need a setup local buffer). DISK replicas
+`BatchGet` into a temporary host buffer and scatter by `src_offset`. If a key
+has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
+it has only NOF replicas — `batch_get_session_start` returns
+`INVALID_REPLICA` for that key and does not open a session. Put sessions
+reserve object space via Master `BatchPutStart` and finalize with
 `BatchPutEnd`.
 
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
@@ -2835,8 +2919,9 @@ Reliable multi-replica NoF configs are rejected at session start. `end` / `revok
 seal the session (no further range writes) and wait for in-flight range transfers
 before talking to Master.
 
-⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed
-registered memory before ranged zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All destination buffers must resolve to
+Store-managed registered memory. DFS session reads use temporary staging; the
+staging allocation is released after the synchronous read and scatter finish.
 
 #### batch_get_session_start()
 
