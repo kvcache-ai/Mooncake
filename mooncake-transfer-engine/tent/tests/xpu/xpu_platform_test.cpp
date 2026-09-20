@@ -20,7 +20,9 @@
 // fails.
 
 #include <gtest/gtest.h>
+#include <fcntl.h>
 #include <sycl/sycl.hpp>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstring>
@@ -222,6 +224,96 @@ TEST_F(XpuPlatformTest, MalformedXpuOrdinalIsRejected) {
     Status alloc = platform_->allocate(&dev, 4096, options);
     EXPECT_FALSE(alloc.ok());
     EXPECT_EQ(dev, nullptr);
+}
+
+// Host memory is never exported: the RDMA layer registers it with ibv_reg_mr
+// instead, and relies on InvalidArgument (not a hard failure) to get there.
+TEST_F(XpuPlatformTest, HostPointerIsNotExportable) {
+    int host_value = 0;
+    DmabufExport out;
+    Status s = platform_->exportDmabuf(&host_value, sizeof(host_value), out);
+    EXPECT_TRUE(s.IsInvalidArgument()) << s;
+    EXPECT_EQ(out.fd, -1);
+}
+
+// Device USM exports as a dma-buf covering the whole allocation, so an
+// interior pointer maps to a non-zero offset and the fd is a live descriptor.
+// Level Zero owns that fd (it caches one per allocation and returns the same
+// number on every export), so the test must not close it. Skips (rather than
+// fails) on SYCL backends without Level Zero external-memory export, e.g. the
+// OpenCL CPU fallback device.
+TEST_F(XpuPlatformTest, DeviceAllocationExportsAsDmabuf) {
+    const size_t kSize = 1 << 20;
+    MemoryOptions options;
+    options.location = "xpu:0";
+    void *dev = nullptr;
+    ASSERT_TRUE(platform_->allocate(&dev, kSize, options).ok());
+
+    DmabufExport base;
+    Status s = platform_->exportDmabuf(dev, kSize, base);
+    if (s.IsInternalError()) {
+        EXPECT_TRUE(platform_->free(dev, kSize).ok());
+        GTEST_SKIP() << "SYCL backend has no dma-buf export: " << s;
+    }
+    ASSERT_TRUE(s.ok()) << s;
+    EXPECT_GE(base.fd, 0);
+    EXPECT_EQ(base.offset, 0u);
+    EXPECT_NE(fcntl(base.fd, F_GETFD), -1);
+
+    const size_t kInterior = 4096 * 3;
+    DmabufExport interior;
+    s = platform_->exportDmabuf(static_cast<char *>(dev) + kInterior,
+                                kSize - kInterior, interior);
+    ASSERT_TRUE(s.ok()) << s;
+    EXPECT_GE(interior.fd, 0);
+    EXPECT_EQ(interior.offset, kInterior);
+    // Both exports still refer to live descriptors; nothing was closed.
+    EXPECT_NE(fcntl(base.fd, F_GETFD), -1);
+    EXPECT_NE(fcntl(interior.fd, F_GETFD), -1);
+
+    // A range that runs past the allocation is refused rather than exported
+    // with an offset/length the dma-buf does not cover.
+    DmabufExport overrun;
+    s = platform_->exportDmabuf(static_cast<char *>(dev) + kInterior,
+                                kSize - kInterior + 1, overrun);
+    EXPECT_TRUE(s.IsInvalidArgument()) << s;
+    EXPECT_EQ(overrun.fd, -1);
+
+    EXPECT_TRUE(platform_->free(dev, kSize).ok());
+}
+
+// Small allocations made through the platform must not share a dma-buf. The
+// Intel compute runtime pools small USM device allocations into 2 MB / 16 MB
+// buffers; a pooled allocation exports the pool's fd with no way to recover
+// its offset inside, so the backend requests export at allocation time to
+// keep its own allocations out of the pool. Two 1 MB buffers therefore export
+// two distinct dma-bufs, each sized to its own allocation.
+TEST_F(XpuPlatformTest, SeparateAllocationsExportDistinctDmabufs) {
+    const size_t kSize = 1 << 20;
+    MemoryOptions options;
+    options.location = "xpu:0";
+    void *a = nullptr;
+    void *b = nullptr;
+    ASSERT_TRUE(platform_->allocate(&a, kSize, options).ok());
+    ASSERT_TRUE(platform_->allocate(&b, kSize, options).ok());
+
+    DmabufExport ea, eb;
+    Status s = platform_->exportDmabuf(a, kSize, ea);
+    if (s.IsInternalError()) {
+        EXPECT_TRUE(platform_->free(a, kSize).ok());
+        EXPECT_TRUE(platform_->free(b, kSize).ok());
+        GTEST_SKIP() << "SYCL backend has no dma-buf export: " << s;
+    }
+    ASSERT_TRUE(s.ok()) << s;
+    ASSERT_TRUE(platform_->exportDmabuf(b, kSize, eb).ok());
+    EXPECT_EQ(ea.offset, 0u);
+    EXPECT_EQ(eb.offset, 0u);
+    EXPECT_NE(ea.fd, eb.fd);
+    EXPECT_EQ(lseek(ea.fd, 0, SEEK_END), static_cast<off_t>(kSize));
+    EXPECT_EQ(lseek(eb.fd, 0, SEEK_END), static_cast<off_t>(kSize));
+
+    EXPECT_TRUE(platform_->free(a, kSize).ok());
+    EXPECT_TRUE(platform_->free(b, kSize).ok());
 }
 
 }  // namespace
