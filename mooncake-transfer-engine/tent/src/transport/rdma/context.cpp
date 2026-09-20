@@ -648,15 +648,16 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     // reading entry->addr/entry->length afterwards is a use-after-free.
     void* region_addr = entry->addr;
     size_t region_length = entry->length;
-    mr_set_mutex_.lock();
-    mr_set_.erase(entry);
-    mr_set_mutex_.unlock();
-
-    if (verbs_.ibv_dereg_mr(entry)) {
-        const void* end = static_cast<const char*>(region_addr) + region_length;
-        LOG(ERROR) << "Failed to unregister memory from " << region_addr
-                   << " to " << end << " in RDMA device " << device_name_;
-        return -1;
+    {
+        std::lock_guard<std::mutex> lock(mr_set_mutex_);
+        if (verbs_.ibv_dereg_mr(entry)) {
+            const void* end =
+                static_cast<const char*>(region_addr) + region_length;
+            LOG(ERROR) << "Failed to unregister memory from " << region_addr
+                       << " to " << end << " in RDMA device " << device_name_;
+            return -1;
+        }
+        mr_set_.erase(entry);
     }
     // Restore mergeability after ibv_dereg_mr. ibv_reg_mr calls
     // madvise(MADV_DONTFORK) on the registered range when fork protection

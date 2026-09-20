@@ -141,6 +141,21 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                 context->registerMemReg((void*)desc.addr, desc.length, access);
         }
     }
+    // If one rail fails, release every MR created for this buffer.
+    for (size_t id = 0; id < context_list_.size(); ++id) {
+        if (context_list_[id] && !mem_reg_list[id]) {
+            for (size_t rollback = 0; rollback < context_list_.size();
+                 ++rollback) {
+                if (mem_reg_list[rollback] &&
+                    context_list_[rollback]->unregisterMemReg(
+                        mem_reg_list[rollback])) {
+                    LOG(ERROR) << "Failed to roll back RDMA registration";
+                }
+            }
+            return Status::RdmaError(
+                "Unable to register buffer of local memory segment" LOC_MARK);
+        }
+    }
     // NicID-keyed like context_list_, not compacted: slice dispatch subscripts
     // these with a dev_id from the topology, so gaps must stay in place.
     // Devices with no context contribute a zero key that is never selected.
@@ -148,19 +163,26 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     desc.rkey.assign(context_list_.size(), 0);
     for (size_t id = 0; id < context_list_.size(); ++id) {
         if (!context_list_[id]) continue;
-        if (!mem_reg_list[id]) {
-            return Status::RdmaError(
-                "Unable to register buffer of local memory segment" LOC_MARK);
-        }
         staging.mem_reg_map[context_list_[id]] = mem_reg_list[id];
         auto keys = context_list_[id]->queryMemRegKey(mem_reg_list[id]);
         desc.lkey[id] = keys.first;
         desc.rkey[id] = keys.second;
     }
     staging.options = options;
-    RWSpinlock::WriteGuard guard(lock_);
-    buffer_list_[range] = staging;
-    return Status::OK();
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (buffer_list_.try_emplace(range, std::move(staging)).second)
+            return Status::OK();
+    }
+
+    for (auto& elem : staging.mem_reg_map) {
+        if (elem.first->unregisterMemReg(elem.second))
+            LOG(ERROR) << "Failed to roll back duplicate RDMA registration";
+    }
+    desc.lkey.clear();
+    desc.rkey.clear();
+    return Status::InvalidArgument(
+        "Address region already registered" LOC_MARK);
 }
 
 Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
@@ -179,22 +201,50 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
                 return addBufferInternal(*desc_ptr, options, true);
             }));
     }
-    for (auto& task : tasks) {
-        auto status = task.get();
-        if (!status.ok()) return status;
+    Status result = Status::OK();
+    std::vector<bool> registered(tasks.size(), false);
+    // Wait for every worker before rolling back successful registrations.
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        auto status = tasks[i].get();
+        registered[i] = status.ok();
+        if (!status.ok() && result.ok()) result = status;
     }
-    return Status::OK();
+    if (!result.ok()) {
+        for (size_t i = 0; i < desc_list.size(); ++i) {
+            if (!registered[i]) continue;
+            auto status = removeBuffer(desc_list[i]);
+            if (!status.ok())
+                LOG(ERROR) << "Failed to roll back RDMA buffer: "
+                           << status.ToString();
+        }
+    }
+    return result;
 }
 
 Status LocalBufferManager::removeBuffer(BufferDesc& desc) {
     RWSpinlock::WriteGuard guard(lock_);
     AddressRange range((void*)desc.addr, desc.length);
-    auto& item = buffer_list_[range];
-    for (auto& elem : item.mem_reg_map) {
-        elem.first->unregisterMemReg(elem.second);
+    auto buffer = buffer_list_.find(range);
+    if (buffer == buffer_list_.end()) return Status::OK();
+
+    auto& registrations = buffer->second.mem_reg_map;
+    Status result = Status::OK();
+    for (auto it = registrations.begin(); it != registrations.end();) {
+        if (it->first->unregisterMemReg(it->second)) {
+            if (result.ok())
+                result = Status::RdmaError(
+                    "Unable to unregister buffer of local memory "
+                    "segment" LOC_MARK);
+            ++it;
+        } else {
+            it = registrations.erase(it);
+        }
     }
+    if (!result.ok()) return result;
+
+    desc.lkey.clear();
     desc.rkey.clear();
-    buffer_list_.erase(range);
+    buffer_list_.erase(buffer);
     return Status::OK();
 }
 
