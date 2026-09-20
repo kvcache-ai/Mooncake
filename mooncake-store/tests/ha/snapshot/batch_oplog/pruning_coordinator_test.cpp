@@ -1,3 +1,4 @@
+#include "ha_metric_manager.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.h"
 
 #include <gtest/gtest.h>
@@ -206,6 +207,7 @@ std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
 class PruningTest : public ::testing::Test {
    protected:
     void SetUp() override {
+        HAMetricManager::instance().reset_snapshot_runtime(true);
         ASSERT_EQ(ErrorCode::OK, backend.Put(lock_key, "101"));
         latest = AddSnapshot(store, 20);
         fallback = AddSnapshot(store, 10);
@@ -235,6 +237,8 @@ TEST_F(PruningTest, FirstSnapshotDoesNotPublishFloor) {
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_FALSE(backend.values.contains(floor_key));
     EXPECT_EQ(0u, backend.txn_count);
+    EXPECT_EQ(HAMetricManager::SnapshotSkipReason::NoFallback,
+              HAMetricManager::instance().get_snapshot_runtime().skip_reason);
     EXPECT_EQ(0u, backend.delete_count);
 }
 
@@ -354,11 +358,28 @@ TEST_F(PruningTest, FailedOrUnknownTxnDoesNotDelete) {
 }
 
 TEST_F(PruningTest, DeleteFailureKeepsFloorAndRetries) {
+    auto& metrics = HAMetricManager::instance();
+    const auto before = metrics.get_snapshot_runtime().floor_advances_total;
+    const auto errors =
+        metrics
+            .get_snapshot_operation(HAMetricManager::SnapshotOperation::Prune)
+            .errors;
     backend.delete_error = ErrorCode::ETCD_OPERATION_ERROR;
     EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, Run());
     EXPECT_EQ("10", backend.values[floor_key]);
+    EXPECT_EQ(10u, metrics.get_snapshot_runtime().compaction_floor);
+    EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
+    EXPECT_EQ(errors + 1, metrics
+                              .get_snapshot_operation(
+                                  HAMetricManager::SnapshotOperation::Prune)
+                              .errors);
     backend.delete_error = ErrorCode::OK;
     EXPECT_EQ(ErrorCode::OK, Run());
+    EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
+    EXPECT_EQ(errors + 1, metrics
+                              .get_snapshot_operation(
+                                  HAMetricManager::SnapshotOperation::Prune)
+                              .errors);
     EXPECT_EQ(2u, backend.delete_count);
     EXPECT_EQ("10", backend.values[floor_key]);
 }

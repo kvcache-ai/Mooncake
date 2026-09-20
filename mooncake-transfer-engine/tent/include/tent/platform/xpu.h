@@ -33,11 +33,10 @@ namespace tent {
 // In the MVP, XPU VRAM cannot be reached by the NIC, so there is no direct
 // device transport. This platform provides the device-side building blocks:
 // USM allocation ("xpu:N"), pointer classification, and the VRAM<->host copy()
-// primitive. Wiring these into the transport-layer staging path (so getTypeEnum
-// / isGpuType / findStagingPolicy let ProxyManager chain the VRAM<->host and
-// host<->host hops end-to-end over the network) is not yet complete and is
-// tracked separately; today "xpu:N" memory is classified and copied locally but
-// is not routed over the network. Direct VRAM RDMA (dma-buf) and PCIe P2P are
+// primitive. These are wired into the transport-layer staging path so
+// getTypeEnum / isGpuType / findStagingPolicy let ProxyManager chain the
+// VRAM<->host hop (executed by XpuTransport via copy()) and the host<->host hop
+// end-to-end over the network. Direct VRAM RDMA (dma-buf) and PCIe P2P are
 // future work.
 class XpuPlatform : public CpuPlatform {
    public:

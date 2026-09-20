@@ -22,14 +22,17 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <future>
 #include <iomanip>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 
 #include "multi_transport.h"
@@ -531,6 +534,94 @@ class TransportTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+TEST_F(TransportTest, SegmentBuffersClassicSnapshotAndErrors) {
+#ifdef USE_TENT
+    ScopedUnsetEnvVar use_tent("MC_USE_TENT");
+    ScopedUnsetEnvVar use_tev1("MC_USE_TEV1");
+#endif
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"), 0);
+    auto metadata = engine.getMetadata();
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "buffers";
+    desc->protocol = "rdma";
+    desc->buffers.resize(2);
+    desc->buffers[0].name = "cpu:0";
+    desc->buffers[0].addr = 8192;
+    desc->buffers[0].length = 128;
+    desc->buffers[1].name = "cpu:1";
+    desc->buffers[1].addr = 4096;
+    desc->buffers[1].length = 256;
+    metadata->addLocalSegment(LOCAL_SEGMENT_ID, "buffers", std::move(desc));
+
+    std::vector<SegmentBufferInfo> buffers{{1, 1, "old"}};
+    ASSERT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    ASSERT_EQ(buffers.size(), 2);
+    EXPECT_EQ(buffers[0].addr, 8192);
+    EXPECT_EQ(buffers[0].length, 128);
+    EXPECT_EQ(buffers[0].location, "cpu:0");
+    EXPECT_EQ(buffers[1].addr, 4096);
+    EXPECT_EQ(buffers[1].length, 256);
+    EXPECT_EQ(buffers[1].location, "cpu:1");
+
+    // Replacing the descriptor leaves an already returned snapshot intact.
+    desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "buffers";
+    desc->protocol = "rdma";
+    metadata->addLocalSegment(LOCAL_SEGMENT_ID, "buffers", std::move(desc));
+    EXPECT_EQ(buffers[0].length, 128);
+    EXPECT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    EXPECT_TRUE(buffers.empty());
+
+    buffers.push_back({1, 1, "old"});
+    EXPECT_EQ(engine.getSegmentBuffers(
+                  static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT), buffers),
+              ERR_METADATA);
+    EXPECT_TRUE(buffers.empty());
+
+    desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "buffers";
+    desc->protocol = "nvmeof";
+    metadata->addLocalSegment(LOCAL_SEGMENT_ID, "buffers", std::move(desc));
+    buffers.push_back({1, 1, "old"});
+    EXPECT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers),
+              ERR_NOT_IMPLEMENTED);
+    EXPECT_TRUE(buffers.empty());
+}
+
+#ifdef USE_TENT
+TEST_F(TransportTest, SegmentBuffersTentMemoryAndInvalidHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar config(
+        "MC_TENT_CONF",
+        R"({"transports":{"rdma":{"enable":false},"tcp":{"enable":true},"gds":{"enable":false},"shm":{"enable":false}}})");
+    std::array<char, 128> memory{};
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, ""), 0);
+    std::vector<SegmentBufferInfo> buffers{{1, 1, "old"}};
+    ASSERT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    EXPECT_TRUE(buffers.empty());
+
+    ASSERT_EQ(engine.registerLocalMemory(memory.data(), memory.size()), 0);
+    ASSERT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    ASSERT_EQ(buffers.size(), 1);
+    EXPECT_EQ(buffers[0].addr, reinterpret_cast<uint64_t>(memory.data()));
+    EXPECT_EQ(buffers[0].length, memory.size());
+    EXPECT_FALSE(buffers[0].location.empty());
+    EXPECT_EQ(engine.unregisterLocalMemory(memory.data()), 0);
+    EXPECT_EQ(buffers[0].length, memory.size());
+    EXPECT_EQ(engine.getSegmentBuffers(LOCAL_SEGMENT_ID, buffers), 0);
+    EXPECT_TRUE(buffers.empty());
+
+    buffers.push_back({1, 1, "old"});
+    EXPECT_EQ(engine.getSegmentBuffers(
+                  static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT), buffers),
+              ERR_METADATA);
+    EXPECT_TRUE(buffers.empty());
+}
+#endif
+
 static int CreateTempFile() {
     char temp_filename[] = "/tmp/testfileXXXXXX";
     int fd = mkstemp(temp_filename);
@@ -996,6 +1087,95 @@ TEST_F(TransportTest, BatchCleanupRunsAfterBeforeDeleteCallback) {
     ASSERT_TRUE(status.ok());
     EXPECT_TRUE(cleanup_observed_callback);
 }
+
+#ifdef USE_TCP
+TEST_F(TransportTest, TcpScatterCombinesRequestsIntoOneTask) {
+    constexpr size_t kRequestCount = 256;
+    constexpr size_t kRequestBytes = 128;
+    constexpr size_t kBytes = kRequestCount * kRequestBytes;
+    // Keep request metadata and buffers alive until after engine shutdown,
+    // including when an unexpected transport failure aborts the test.
+    std::array<char, 2 * kBytes> buffer{};
+    std::vector<TransferRequest> requests;
+    requests.reserve(kRequestCount);
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
+              0);
+    auto segment = engine.openSegment(engine.getLocalIpAndPort());
+    ASSERT_NE(engine.getMetadata()->getSegmentDescByID(segment), nullptr);
+
+    for (auto opcode : {TransferRequest::READ, TransferRequest::WRITE}) {
+        SCOPED_TRACE(opcode == TransferRequest::READ ? "READ" : "WRITE");
+        auto* source = opcode == TransferRequest::READ ? buffer.data() + kBytes
+                                                       : buffer.data();
+        auto* destination = opcode == TransferRequest::READ
+                                ? buffer.data()
+                                : buffer.data() + kBytes;
+        std::fill(buffer.begin(), buffer.end(), 0);
+        std::fill_n(source, kBytes, 37);
+        requests.clear();
+        for (size_t i = 0; i < kRequestCount; ++i) {
+            requests.push_back(TransferRequest{
+                .opcode = opcode,
+                .source = buffer.data() + i * kRequestBytes,
+                .target_id = segment,
+                .target_offset =
+                    reinterpret_cast<uint64_t>(buffer.data() + kBytes) +
+                    i * kRequestBytes,
+                .length = kRequestBytes,
+                .task_group_id = 1,
+            });
+        }
+
+        MultiTransport::ScatterSubmission submission;
+        const auto submitted = engine.submitScatter(requests, submission);
+        ASSERT_NE(submission.batch_id, INVALID_BATCH_ID);
+        const auto& tasks =
+            Transport::toBatchDesc(submission.batch_id).task_list;
+        const size_t task_count = tasks.size();
+        std::vector<size_t> request_counts;
+        for (const auto& task : tasks)
+            request_counts.push_back(task.request_count);
+
+        // Drain every actual task before asserting grouping, so the regression
+        // case (one task per request) also releases its batch normally.
+        std::vector<bool> done(task_count, false);
+        bool successful = true;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        size_t remaining = task_count;
+        while (remaining != 0 && std::chrono::steady_clock::now() < deadline) {
+            for (size_t i = 0; i < task_count; ++i) {
+                if (done[i]) continue;
+                TransferStatus status;
+                auto result =
+                    engine.getTransferStatus(submission.batch_id, i, status);
+                if (!result.ok()) continue;
+                if (status.s == TransferStatusEnum::COMPLETED ||
+                    status.s == TransferStatusEnum::FAILED) {
+                    successful &= status.s == TransferStatusEnum::COMPLETED;
+                    done[i] = true;
+                    --remaining;
+                }
+            }
+            if (remaining != 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_EQ(remaining, 0u)
+            << "TCP scatter did not reach physical completion";
+        EXPECT_TRUE(engine.freeBatchID(submission.batch_id).ok());
+        EXPECT_TRUE(submitted.ok());
+        EXPECT_TRUE(successful);
+        EXPECT_EQ(memcmp(source, destination, kBytes), 0);
+        EXPECT_EQ(task_count, 1u);
+        EXPECT_EQ(request_counts, (std::vector<size_t>{kRequestCount}));
+        EXPECT_EQ(submission.task_sizes, (std::vector<size_t>{kRequestCount}));
+    }
+    EXPECT_EQ(engine.closeSegment(segment), 0);
+}
+#endif
 
 TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     TransferEngine engine(false);

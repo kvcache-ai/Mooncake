@@ -39,6 +39,8 @@ static_assert(static_cast<int>(TransportType::MPCOMM) == TRANSPORT_MPCOMM,
               "MPCOMM wire value must match the C API macro");
 static_assert(static_cast<int>(TransportType::HP_TCP) == TRANSPORT_HP_TCP,
               "HP_TCP wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::XPU) == TRANSPORT_XPU,
+              "XPU wire value must match the C API macro");
 
 // =============================================================================
 // Custom Exception Hierarchy
@@ -316,6 +318,7 @@ PYBIND11_MODULE(tent, m) {
         .value("UB", TransportType::UB)
         .value("MPCOMM", TransportType::MPCOMM)
         .value("HP_TCP", TransportType::HP_TCP)
+        .value("XPU", TransportType::XPU)
         .export_values();
 
     py::enum_<IntentType>(m, "IntentType")

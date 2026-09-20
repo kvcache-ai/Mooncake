@@ -982,7 +982,9 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
 
     // If multi-protocol scenario, use multi-protocol decoding
     if (is_multi_protocol) {
-        return decodeMultiProtocolSegmentDesc(segmentJSON, segment_name);
+        auto desc = decodeMultiProtocolSegmentDesc(segmentJSON, segment_name);
+        if (desc) desc->rebuildBufferRangeIndex();
+        return desc;
     }
 #endif
 
@@ -1251,6 +1253,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                    << " protocol " << desc->protocol;
         return nullptr;
     }
+    desc->rebuildBufferRangeIndex();
     return desc;
 }
 
@@ -1367,9 +1370,9 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
 }
 
 bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
-    // timestamp and metadata_version are intentionally excluded: metadata
-    // encoding/publication may refresh them even when the operational
-    // descriptor is unchanged.
+    // timestamp, metadata_version, and buffer_range_index are excluded:
+    // publication may refresh timestamps, and the index is derived from
+    // `buffers`.
     return name == other.name && protocol == other.protocol &&
            devices == other.devices && topology == other.topology &&
            buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&
@@ -1722,6 +1725,7 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
         segment_desc->buffers.push_back(buffer_desc);
+        segment_desc->rebuildBufferRangeIndex();
     }
     if (update_metadata) return updateLocalSegmentDesc();
     return 0;
@@ -1746,6 +1750,7 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
             ) {
                 segment_desc->buffers.erase(iter);
                 addr_exist = true;
+                segment_desc->rebuildBufferRangeIndex();
                 break;
             }
         }
