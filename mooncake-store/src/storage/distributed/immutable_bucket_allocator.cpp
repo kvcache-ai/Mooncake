@@ -1,6 +1,5 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
 
-#include <algorithm>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -198,7 +197,6 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     bucket.entries.insert_or_assign(key, entry);
     key_index_[key] = bucket.id;
     bucket.append_offset = layout->end();
-    bucket.live_bytes += layout->aligned_size;
     ++bucket.pending_entries;
     return MakeBucketDescriptor(BucketDataPath(bucket.id), *layout, bucket.id);
 }
@@ -321,7 +319,6 @@ void ImmutableBucketAllocator::TombstoneLocked(const std::string& key,
         --bucket.pending_entries;
     }
     entry.state = BucketEntryState::TOMBSTONE;
-    bucket.live_bytes -= std::min(bucket.live_bytes, entry.layout.aligned_size);
     const auto key_it = key_index_.find(key);
     if (key_it != key_index_.end() && key_it->second == bucket.id) {
         key_index_.erase(key_it);
@@ -372,12 +369,14 @@ void ImmutableBucketAllocator::TouchLruLocked(int64_t bucket_id) {
 }
 
 uint64_t ImmutableBucketAllocator::UsedBytesLocked() const {
+    // Append-only ranges remain consumed until their whole bucket is deleted.
     uint64_t used = 0;
     for (const auto& [id, bucket] : buckets_) {
         (void)id;
         const uint64_t contribution =
-            bucket->lifecycle == BucketLifecycle::EVICTING ? bucket->capacity
-                                                           : bucket->live_bytes;
+            bucket->lifecycle == BucketLifecycle::EVICTING
+                ? bucket->capacity
+                : bucket->append_offset;
         if (contribution > std::numeric_limits<uint64_t>::max() - used) {
             return std::numeric_limits<uint64_t>::max();
         }

@@ -145,7 +145,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         int64_t id = -1;
         uint64_t capacity = 0;
         uint64_t append_offset = 0;
-        uint64_t live_bytes = 0;
         uint64_t pending_entries = 0;
         BucketLifecycle lifecycle = BucketLifecycle::ACTIVE;
         std::unordered_map<std::string, BucketEntry> entries;

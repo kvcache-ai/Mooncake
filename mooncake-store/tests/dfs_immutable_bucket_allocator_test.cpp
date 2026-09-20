@@ -134,6 +134,35 @@ TEST(ImmutableBucketAllocatorTest, StaleFreeCannotTombstoneReplacement) {
     EXPECT_TRUE(allocator.MarkCommitted("key", *replacement));
 }
 
+TEST(ImmutableBucketAllocatorTest,
+     TombstonesPreserveConsumedBytesForEviction) {
+    TempDir dir;
+    auto config = BucketConfig(dir);
+    config.bucket_capacity = 4096;
+    config.max_bucket_count = 2;
+    config.eviction_high_watermark = 0.75;
+    config.eviction_low_watermark = 0.25;
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
+    auto stale = allocator.Allocate("stale", 100);
+    auto active = allocator.Allocate("active", 100);
+    ASSERT_TRUE(stale);
+    ASSERT_TRUE(active);
+    ASSERT_TRUE(allocator.MarkCommitted("stale", *stale));
+    ASSERT_TRUE(allocator.MarkCommitted("active", *active));
+    const uint64_t consumed = allocator.GetUsedBytes();
+    ASSERT_EQ(consumed, 2 * config.bucket_capacity);
+
+    allocator.Free("stale", *stale);
+    EXPECT_EQ(allocator.GetUsedBytes(), consumed);
+
+    auto eviction = allocator.PrepareEviction();
+    ASSERT_FALSE(eviction.Empty());
+    EXPECT_EQ(eviction.bucket_id(), stale->shard_idx);
+    allocator.AbortEviction(std::move(eviction));
+}
+
 TEST(ImmutableBucketAllocatorTest, PendingEntriesProtectSealedBucket) {
     TempDir dir;
     auto config = BucketConfig(dir);
