@@ -10,4 +10,5 @@ snapshots.
 reshard-manifest
 model-weight-reshard-planner
 model-weight-store-upload-planning
+weight-management
 :::
