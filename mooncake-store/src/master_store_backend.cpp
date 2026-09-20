@@ -6,6 +6,16 @@
 
 namespace mooncake {
 
+bool MasterStoreBackend::CanPublishWeightMutations() const {
+    return master_.weight_management_mutations_enabled_;
+}
+
+PromotionQueueResult MasterStoreBackend::PromoteWeightObject(
+    const TenantId& tenant_id, const std::string& key) {
+    return master_.TryPushPromotionQueue(
+        master_.MakeObjectIdentity(key, tenant_id), false, true);
+}
+
 std::vector<std::string> MasterStoreBackend::GetGroupMemberKeys(
     const TenantId& tenant_id, const std::string& group_id) const {
     return master_.GetGroupMemberKeys(tenant_id, group_id);
@@ -24,10 +34,6 @@ void MasterStoreBackend::EvictManagedWeightGroupToCold(
 
 bool MasterStoreBackend::IsOpLogEnabled() const {
     return master_.enable_oplog_;
-}
-
-bool MasterStoreBackend::CanPublishWeightMutations() const {
-    return master_.weight_management_mutations_enabled_;
 }
 
 bool MasterStoreBackend::IsTenantSupported(const std::string& tenant_id) const {
