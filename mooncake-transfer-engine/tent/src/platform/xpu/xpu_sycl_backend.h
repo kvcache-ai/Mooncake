@@ -30,6 +30,17 @@
 #define TENT_SRC_PLATFORM_XPU_SYCL_BACKEND_H_
 
 #include <sycl/sycl.hpp>
+// Level Zero interop: sycl::get_native<ext_oneapi_level_zero> hands back the
+// ze_context_handle_t behind a SYCL context, which is what the dma-buf export
+// below needs. <level_zero/ze_api.h> supplies the types (it ships with the
+// oneAPI toolchain / level-zero-dev); the functions themselves are resolved
+// from libze_loader at runtime (see ZeLoader), so platform_xpu adds no
+// link-time dependency beyond libsycl.
+#include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+
+#include <dlfcn.h>
+#include <unistd.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +50,76 @@
 
 namespace mooncake {
 namespace tent {
+
+// The Level Zero entry points the dma-buf path needs, resolved lazily from
+// the loader the SYCL runtime already has open (libze_loader.so.1). The SYCL
+// Level Zero adapter has called zeInit by the time a SYCL context exists, so
+// no separate initialisation is performed here.
+class ZeLoader {
+   public:
+    static ZeLoader &instance() {
+        static ZeLoader g;
+        return g;
+    }
+
+    // Export (zeMemGetAllocProperties + zeMemGetAddressRange) is available.
+    bool available() const { return get_alloc_properties_ && get_range_; }
+    // Exportable allocation (zeMemAllocDevice + zeMemFree) is available.
+    bool canAllocate() const { return alloc_device_ && mem_free_; }
+
+    ze_result_t memAllocDevice(ze_context_handle_t ctx,
+                               const ze_device_mem_alloc_desc_t *desc,
+                               size_t size, size_t alignment,
+                               ze_device_handle_t device, void **pptr) const {
+        return alloc_device_(ctx, desc, size, alignment, device, pptr);
+    }
+
+    ze_result_t memFree(ze_context_handle_t ctx, void *ptr) const {
+        return mem_free_(ctx, ptr);
+    }
+
+    ze_result_t memGetAllocProperties(ze_context_handle_t ctx, const void *ptr,
+                                      ze_memory_allocation_properties_t *props,
+                                      ze_device_handle_t *device) const {
+        return get_alloc_properties_(ctx, ptr, props, device);
+    }
+
+    ze_result_t memGetAddressRange(ze_context_handle_t ctx, const void *ptr,
+                                   void **base, size_t *size) const {
+        return get_range_(ctx, ptr, base, size);
+    }
+
+   private:
+    ZeLoader() {
+        handle_ = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (!handle_) return;
+        get_alloc_properties_ = reinterpret_cast<GetAllocProperties>(
+            dlsym(handle_, "zeMemGetAllocProperties"));
+        get_range_ = reinterpret_cast<GetAddressRange>(
+            dlsym(handle_, "zeMemGetAddressRange"));
+        alloc_device_ =
+            reinterpret_cast<AllocDevice>(dlsym(handle_, "zeMemAllocDevice"));
+        mem_free_ = reinterpret_cast<MemFree>(dlsym(handle_, "zeMemFree"));
+    }
+    ~ZeLoader() = default;  // Keep the loader mapped for the process lifetime.
+
+    using GetAllocProperties = ze_result_t (*)(
+        ze_context_handle_t, const void *, ze_memory_allocation_properties_t *,
+        ze_device_handle_t *);
+    using GetAddressRange = ze_result_t (*)(ze_context_handle_t, const void *,
+                                            void **, size_t *);
+    using AllocDevice = ze_result_t (*)(ze_context_handle_t,
+                                        const ze_device_mem_alloc_desc_t *,
+                                        size_t, size_t, ze_device_handle_t,
+                                        void **);
+    using MemFree = ze_result_t (*)(ze_context_handle_t, void *);
+
+    void *handle_ = nullptr;
+    GetAllocProperties get_alloc_properties_ = nullptr;
+    GetAddressRange get_range_ = nullptr;
+    AllocDevice alloc_device_ = nullptr;
+    MemFree mem_free_ = nullptr;
+};
 
 // Minimal USM-device backend with an interior-pointer registry.
 //
@@ -116,16 +197,57 @@ class XpuSyclBackend {
         }
     }
 
+    // Allocate USM device memory on `device_index`.
+    //
+    // On the Level Zero backend the allocation is made directly through
+    // zeMemAllocDevice with a ze_external_memory_export_desc_t(DMA_BUF) so
+    // that it is exportable as its own dma-buf. This matters because the
+    // Intel compute runtime pools small device allocations (below a few MB)
+    // into shared 2 MB / 16 MB buffers: a pooled allocation exports the
+    // *pool's* dma-buf, and there is no public API to learn the allocation's
+    // offset inside it, so it cannot be registered for direct RDMA (see
+    // exportDmabuf). Requesting export at allocation time makes the runtime
+    // skip the pool. The pointer is ordinary USM in the queue's context, so
+    // every other operation (queue::memcpy, get_pointer_type) works as
+    // usual; it must simply be released with zeMemFree, which freeDevice
+    // does. Everything else falls back to sycl::malloc_device.
     int allocDevice(void **pptr, size_t size, int device_index) {
         std::lock_guard<std::mutex> lock(mu_);
         if (!initialized_ || device_index < 0 ||
             device_index >= static_cast<int>(queues_.size()) || !pptr)
             return 1;
+        sycl::queue &q = queues_[device_index];
+        void *p = nullptr;
+        bool ze_owned = false;
         try {
-            void *p = sycl::malloc_device(size, queues_[device_index]);
+            auto &ze = ZeLoader::instance();
+            if (ze.canAllocate() && q.get_context().get_backend() ==
+                                        sycl::backend::ext_oneapi_level_zero) {
+                auto ze_ctx =
+                    sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                        q.get_context());
+                auto ze_dev =
+                    sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                        q.get_device());
+                ze_external_memory_export_desc_t export_desc{};
+                export_desc.stype =
+                    ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_DESC;
+                export_desc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
+                ze_device_mem_alloc_desc_t desc{};
+                desc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+                desc.pNext = &export_desc;
+                if (ze.memAllocDevice(ze_ctx, &desc, size, /*alignment=*/0,
+                                      ze_dev, &p) == ZE_RESULT_SUCCESS &&
+                    p) {
+                    ze_owned = true;
+                } else {
+                    p = nullptr;
+                }
+            }
+            if (!p) p = sycl::malloc_device(size, q);
             if (!p) return 1;
-            allocs_.push_back(
-                Alloc{reinterpret_cast<uintptr_t>(p), size, device_index});
+            allocs_.push_back(Alloc{reinterpret_cast<uintptr_t>(p), size,
+                                    device_index, ze_owned});
             *pptr = p;
             return 0;
         } catch (const sycl::exception &) {
@@ -138,15 +260,24 @@ class XpuSyclBackend {
         if (!ptr) return 1;
         const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
         for (size_t i = 0; i < allocs_.size(); ++i) {
-            if (allocs_[i].base == addr) {
-                try {
-                    sycl::free(ptr, queues_[allocs_[i].device]);
-                } catch (const sycl::exception &) {
-                    return 1;
+            if (allocs_[i].base != addr) continue;
+            sycl::queue &q = queues_[allocs_[i].device];
+            try {
+                if (allocs_[i].ze_owned) {
+                    auto ze_ctx =
+                        sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                            q.get_context());
+                    if (ZeLoader::instance().memFree(ze_ctx, ptr) !=
+                        ZE_RESULT_SUCCESS)
+                        return 1;
+                } else {
+                    sycl::free(ptr, q);
                 }
-                allocs_.erase(allocs_.begin() + i);
-                return 0;
+            } catch (const sycl::exception &) {
+                return 1;
             }
+            allocs_.erase(allocs_.begin() + i);
+            return 0;
         }
         return 1;  // not a base pointer we handed out
     }
@@ -169,6 +300,92 @@ class XpuSyclBackend {
         return copy(device_dst, host_src, len, /*to_host=*/false);
     }
 
+    enum ExportResult {
+        kExportOk = 0,
+        // Not device memory, not Level Zero, or the driver refused.
+        kExportUnavailable = 1,
+        // The allocation lives in a runtime-managed pool whose dma-buf it
+        // shares with other allocations; its offset inside is unknowable.
+        kExportPooled = 2,
+    };
+
+    // Export the USM device allocation containing `addr` as a dma-buf fd.
+    // This is the Level Zero external-memory export used by libfabric's ZE
+    // HMEM support: zeMemGetAllocProperties with a
+    // ze_external_memory_export_fd_t(DMA_BUF) extension returns an fd for the
+    // allocation, and zeMemGetAddressRange gives its base so the caller can
+    // compute the offset of `addr` inside it. Works for allocations made here
+    // and for foreign USM (e.g. PyTorch XPU tensors) alike, since the export
+    // is a property of the allocation, not of how it was created.
+    //
+    // One caveat for foreign memory: the compute runtime pools small device
+    // allocations into shared buffers, and for those the exported fd is the
+    // pool's dma-buf while zeMemGetAddressRange still describes the
+    // sub-allocation. The pool offset is not exposed through any public API,
+    // so such an allocation cannot be registered correctly -- registering it
+    // at offset 0 would silently alias whatever sits at the pool's start.
+    // Pooling is detected by comparing the dma-buf's size with the
+    // allocation's: a dedicated dma-buf is the allocation rounded up to the
+    // runtime's page granularity (64 KB below 2 MB, 2 MB above), anything
+    // larger is a shared pool. Allocations made by allocDevice() request
+    // export up front and therefore never land in a pool; users who need
+    // direct RDMA on pooled foreign memory can disable pooling with
+    // NEOReadDebugKeys=1 EnableDeviceUsmAllocationPool=0.
+    //
+    // Returns kExportOk and fills fd/offset on success. The fd is owned by
+    // the Level Zero runtime, which caches it per allocation and returns the
+    // same descriptor on every export; callers must not close it. Any other
+    // result means callers fall back to host staging.
+    int exportDmabuf(const void *addr, int *fd, uint64_t *offset) {
+        if (!fd || !offset) return kExportUnavailable;
+        std::optional<sycl::context> ctx;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            int device_index = classifyLocked(addr);
+            if (device_index < 0) return 1;
+            ctx = queues_[device_index].get_context();
+        }
+        auto &ze = ZeLoader::instance();
+        if (!ze.available()) return kExportUnavailable;
+        ze_context_handle_t ze_ctx = nullptr;
+        try {
+            if (ctx->get_backend() != sycl::backend::ext_oneapi_level_zero)
+                return kExportUnavailable;
+            ze_ctx =
+                sycl::get_native<sycl::backend::ext_oneapi_level_zero>(*ctx);
+        } catch (const sycl::exception &) {
+            return kExportUnavailable;
+        }
+        void *base = nullptr;
+        size_t size = 0;
+        if (ze.memGetAddressRange(ze_ctx, addr, &base, &size) !=
+                ZE_RESULT_SUCCESS ||
+            !base)
+            return kExportUnavailable;
+        ze_external_memory_export_fd_t export_fd{};
+        export_fd.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_FD;
+        export_fd.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_DMA_BUF;
+        export_fd.fd = -1;
+        ze_memory_allocation_properties_t props{};
+        props.stype = ZE_STRUCTURE_TYPE_MEMORY_ALLOCATION_PROPERTIES;
+        props.pNext = &export_fd;
+        ze_device_handle_t device = nullptr;
+        if (ze.memGetAllocProperties(ze_ctx, addr, &props, &device) !=
+                ZE_RESULT_SUCCESS ||
+            props.type != ZE_MEMORY_TYPE_DEVICE || export_fd.fd < 0)
+            return kExportUnavailable;
+        const off_t dmabuf_size = lseek(export_fd.fd, 0, SEEK_END);
+        if (dmabuf_size < 0) return kExportUnavailable;
+        const size_t granule =
+            size >= (size_t{2} << 20) ? (size_t{2} << 20) : (size_t{64} << 10);
+        const size_t rounded = (size + granule - 1) / granule * granule;
+        if (static_cast<size_t>(dmabuf_size) > rounded) return kExportPooled;
+        *fd = export_fd.fd;
+        *offset = reinterpret_cast<uintptr_t>(addr) -
+                  reinterpret_cast<uintptr_t>(base);
+        return kExportOk;
+    }
+
     int deviceCount() {
         std::lock_guard<std::mutex> lock(mu_);
         return static_cast<int>(queues_.size());
@@ -187,6 +404,7 @@ class XpuSyclBackend {
         uintptr_t base;
         size_t size;
         int device;
+        bool ze_owned;  // allocated with zeMemAllocDevice, freed with zeMemFree
     };
 
     // Resolve an address (base or interior) to its owning allocation.
