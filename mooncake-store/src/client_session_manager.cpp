@@ -145,17 +145,15 @@ ClientSessionManager::TryAcquireRetainingSession(const UUID& client_id) const {
     auto slot = FindSlot(client_id);
     auto operation = AcquireCurrentOperation(client_id, slot);
     if (!operation) return std::nullopt;
-    auto guard = slot->liveness->TryAcquireRetainingGuard();
-    if (!guard) return std::nullopt;
-    return SessionGuard(std::move(slot), std::move(*operation),
-                        std::move(*guard));
+    if (!slot->liveness->ShouldRetainResources()) return std::nullopt;
+    return SessionGuard(std::move(slot), std::move(*operation));
 }
 
 std::optional<ClientSessionManager::SessionGuard>
 ClientSessionManager::TryAcquireServingSession(const UUID& client_id) const {
     auto guard = TryAcquireRetainingSession(client_id);
-    // The transition lock is still held, so admission cannot change between
-    // this check and the caller's operation.
+    // The operation lock excludes Poll, so liveness cannot degrade between
+    // this check and the caller's operation. Ping may still recover it.
     if (guard && !guard->slot_->liveness->IsServing()) {
         return std::nullopt;
     }
@@ -163,7 +161,7 @@ ClientSessionManager::TryAcquireServingSession(const UUID& client_id) const {
 }
 
 bool ClientSessionManager::Remove(const UUID& client_id,
-                                  const Record& expected) {
+                                  const ClientSessionSharedPtr& expected) {
     std::shared_lock lifecycle_lock(lifecycle_mutex_);
     auto slot = FindSlot(client_id);
     if (!slot || slot->liveness != expected) return false;

@@ -48,7 +48,7 @@ struct PreparedSegmentOffboarding {
 // barrier until the residual work converges.
 struct ClientOffboardingJob {
     UUID client_id;
-    std::shared_ptr<ClientLivenessRecord> retired_session;
+    ClientSessionSharedPtr retired_session;
     std::vector<PendingSegmentOffboarding> pending_prepare_segments;
     std::vector<PreparedSegmentOffboarding> prepared_segments;
     bool metadata_cleanup_accepted{false};

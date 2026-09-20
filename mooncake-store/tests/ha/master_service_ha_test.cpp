@@ -899,10 +899,8 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService& service, const UUID& source_client,
         const TenantId& tenant_id, const std::string& key,
         CreateTask create_task) {
-        auto liveness =
-            MasterServiceTestPeer::ClientSessions(service).Find(source_client);
-        auto serving_guard =
-            liveness ? liveness->TryAcquireServingGuard() : std::nullopt;
+        auto serving_guard = MasterServiceTestPeer::ClientSessions(service)
+                                 .TryAcquireServingSession(source_client);
         if (!serving_guard) {
             return false;
         }
@@ -1781,7 +1779,8 @@ TEST_F(MasterServiceHATest,
                     .has_value());
     const auto record = ClientRecordForTesting(service, mounted.client_id);
     ASSERT_TRUE(record);
-    auto retaining_guard = record->TryAcquireRetainingGuard();
+    auto retaining_guard = MasterServiceTestPeer::ClientSessions(service)
+                               .TryAcquireRetainingSession(mounted.client_id);
     ASSERT_TRUE(retaining_guard);
 
     Replica replica(mounted.client_id, 1024, "retained_add_replica_endpoint",

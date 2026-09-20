@@ -32,7 +32,7 @@ struct ClientOffboardingJob;
 // be applied to a new registration with the same client ID.
 struct ClientSessionEvent {
     UUID client_id;
-    std::shared_ptr<ClientLivenessRecord> session;
+    ClientSessionSharedPtr session;
     ClientLivenessState previous;
     ClientLivenessState current;
 };
@@ -90,9 +90,11 @@ class ClientSessionManager {
     void UpdateHostId(const UUID& client_id, const std::string& host_id);
     std::string GetHostId(const UUID& client_id) const;
 
-    // Admission retains the slot and owns its operation lock plus the liveness
-    // transition lock, not the registry lock. An empty result means
-    // the client is missing or rejects admission (not lock contention).
+    // Admission retains the slot and owns its operation lock, not the registry
+    // or liveness transition lock. Poll is the only production expiry path and
+    // needs the same operation lock; Ping only refreshes/recovers liveness.
+    // Acquisition waits for other operations on this client. An empty result
+    // means the client is missing or rejects admission (not lock contention).
     // Serving accepts ACTIVE; retaining accepts ACTIVE and SUSPECTED.
     class SessionGuard;
     [[nodiscard]] std::optional<SessionGuard> TryAcquireServingSession(
@@ -102,7 +104,7 @@ class ClientSessionManager {
 
     // Waits for this incarnation's registration/resource scopes to exit.
     // Never call while holding one of those scopes for the same session.
-    bool Remove(const UUID& client_id, const Record& expected);
+    bool Remove(const UUID& client_id, const ClientSessionSharedPtr& expected);
 
     // Scopes serialize registration/remount for one incarnation only. Ping
     // remains independent; monitoring defers transitions for this incarnation
@@ -228,16 +230,12 @@ class ClientSessionManager::SessionGuard {
 
    private:
     friend class ClientSessionManager;
-    SessionGuard(Slot slot, std::unique_lock<std::mutex> operation,
-                 ClientLivenessRecord::RetainingGuard guard)
-        : slot_(std::move(slot)),
-          operation_(std::move(operation)),
-          guard_(std::move(guard)) {}
+    SessionGuard(Slot slot, std::unique_lock<std::mutex> operation)
+        : slot_(std::move(slot)), operation_(std::move(operation)) {}
 
-    // Destruction unlocks transition, then operation, before releasing slot.
+    // Destruction unlocks operation before releasing slot.
     Slot slot_;
     std::unique_lock<std::mutex> operation_;
-    ClientLivenessRecord::RetainingGuard guard_;
 };
 
 class ClientSessionManager::Registration {

@@ -381,28 +381,43 @@ TEST_F(ClientSessionManagerTest, SessionScopesExposeOnlyReadOnlyIdentity) {
 }
 
 TEST_F(ClientSessionManagerTest,
-       SessionAdmissionBlocksTransitionsUntilReleased) {
+       SessionAdmissionDefersExpiryWithoutBlockingHeartbeat) {
     const auto check = [](auto acquire) {
         ClientSessionManager manager(10s, 20s);
         auto record = Register(manager);
-        std::promise<void> attempted;
-        auto started = attempted.get_future();
-        std::future<ClientLivenessTransition> transition;
+        const UUID other{3, 4};
+        auto other_record = Register(manager, other);
+        {
+            auto remount = manager.BeginRemount(kClient);
+            remount->Commit();
+        }
         {
             auto guard = acquire(manager);
             ASSERT_TRUE(guard);
             auto moved = std::move(*guard);
             guard.reset();
-            transition = std::async(std::launch::async, [&] {
-                attempted.set_value();
-                return record->Evaluate(kInitial + 10s, 10s, 20s);
-            });
-            started.wait();
-            EXPECT_EQ(transition.wait_for(20ms), std::future_status::timeout);
+            // A long admitted operation must not stall monitoring other
+            // clients, nor prevent its own heartbeat from completing.
+            std::async(std::launch::async, [&] {
+                Poll(manager, kInitial + 10s);
+            }).get();
             EXPECT_EQ(moved.Session()->state(), State::ACTIVE);
+            EXPECT_EQ(other_record->state(), State::SUSPECTED);
+            auto ping = std::async(std::launch::async,
+                                   [&] { return manager.Ping(kClient); });
+            const auto status = ping.wait_for(1s);
+            EXPECT_EQ(status, std::future_status::ready);
+            // Release admission before joining even on failure.
+            std::optional<ClientSessionManager::SessionGuard> held(
+                std::move(moved));
+            held.reset();
+            EXPECT_EQ(ping.get(), ClientStatus::OK);
         }
-        EXPECT_EQ(transition.wait_for(1s), std::future_status::ready);
-        EXPECT_EQ(transition.get(), ClientLivenessTransition::BECAME_SUSPECTED);
+        const auto now = ClientSessionManager::Clock::now();
+        Poll(manager, now + 10s);
+        EXPECT_EQ(record->state(), State::SUSPECTED);
+        Poll(manager, now + 30s);
+        EXPECT_EQ(record->state(), State::OFFLINE);
     };
     check([](auto& manager) {
         return manager.TryAcquireServingSession(kClient);
@@ -410,6 +425,22 @@ TEST_F(ClientSessionManagerTest,
     check([](auto& manager) {
         return manager.TryAcquireRetainingSession(kClient);
     });
+}
+
+TEST_F(ClientSessionManagerTest, RetainedSuspectedSessionAllowsRecovery) {
+    ClientSessionManager manager(10s, 20s);
+    auto record = Register(manager);
+    Poll(manager, kInitial + 10s);
+    ASSERT_EQ(record->state(), State::SUSPECTED);
+    auto guard = manager.TryAcquireRetainingSession(kClient);
+    ASSERT_TRUE(guard);
+    auto ping =
+        std::async(std::launch::async, [&] { return manager.Ping(kClient); });
+    EXPECT_EQ(ping.wait_for(1s), std::future_status::ready);
+    // Release before joining so a regression fails rather than hanging.
+    guard.reset();
+    EXPECT_EQ(ping.get(), ClientStatus::NEED_REMOUNT);
+    EXPECT_EQ(record->state(), State::ACTIVE);
 }
 
 TEST_F(ClientSessionManagerTest,
