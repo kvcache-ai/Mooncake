@@ -78,6 +78,7 @@ import mooncake.transfer_engine_topology_dump
 
 assert "mooncake.engine" not in sys.modules
 
+import mooncake.async_store
 import mooncake.engine
 import mooncake.mooncake_store_service
 import mooncake.mooncake_config
@@ -90,6 +91,11 @@ assert not package_path.is_relative_to(repository_path), (package_path, reposito
 assert metadata.version("mooncake-transfer-engine") == {_project_version(project_file)!r}
 assert "administration" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
 assert mooncake.BufferPool is mooncake.store.BufferPool
+assert issubclass(
+    mooncake.async_store.MooncakeDistributedStoreAsync,
+    mooncake.store.MooncakeDistributedStore,
+)
+assert Path(mooncake.async_store.__file__).resolve().parent == package_path.parent
 assert mooncake.engine.TransferEngine is not None
 assert mooncake.mooncake_store_service.MooncakeStoreService is not None
 store_entry_points = metadata.entry_points(

@@ -94,7 +94,10 @@ else()
   message(STATUS "USE_NOF=OFF, NoF SSD pool support is disabled")
 endif()
 
-option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+# The matching STORE_USE_JEMALLOC compile definition is scoped to the master and
+# client executables in mooncake-store/src, since only they link the allocator.
+option(STORE_USE_JEMALLOC
+       "Use jemalloc in the mooncake store master and client binaries" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Dependencies.cmake)
 if(WITH_STORE)

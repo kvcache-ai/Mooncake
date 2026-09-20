@@ -7,6 +7,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "allocator_metric.h"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -564,6 +565,8 @@ class MasterMetricManager {
     std::mutex storage_projection_mutex_;
     std::set<std::string> projected_mem_segments_;
     std::set<std::string> projected_nof_segments_;
+
+    AllocatorMetric allocator_metric_;
 
     // Memory Storage Metrics
     ylt::metric::gauge_t

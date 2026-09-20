@@ -8,6 +8,7 @@ store:
     - any-glob-to-any-file:
       - 'mooncake-store/**/*'
       - 'python/mooncake/mooncake_store_service.py'
+      - 'python/mooncake/async_store.py'
       - 'python/mooncake/cli.py'
       - 'python/mooncake/cli_client.py'
       - 'python/mooncake/buffer_pool.py'

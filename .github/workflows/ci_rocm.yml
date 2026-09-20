@@ -134,6 +134,8 @@ jobs:
           -DPython3_EXECUTABLE="${PYTHON_BIN}"
 
     - name: Build project
+      env:
+        MAX_JOBS: "2"
       shell: bash
       run: |
         set -eo pipefail
@@ -142,7 +144,7 @@ jobs:
         # Retry to ride out transient Go module (proxy.golang.org) fetch errors
         # during the etcd-wrapper build; Go caches modules, so retries resume.
         n=0
-        until cmake --build . -j"$(nproc)"; do
+        until cmake --build . -j"${MAX_JOBS}"; do
           n=$((n+1))
           if [ "$n" -ge 3 ]; then echo "Build failed after $n attempts"; exit 1; fi
           echo "Build attempt $n failed; retrying in 15s..."; sleep 15

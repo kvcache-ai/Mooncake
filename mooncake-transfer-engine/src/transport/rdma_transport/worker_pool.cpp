@@ -250,6 +250,23 @@ int WorkerPool::cqIndexForPostingThread(int thread_id) const {
     return context_.cqIndexForPostingThread(thread_id);
 }
 
+void WorkerPool::enqueueSlicesToOwner(int owner_thread,
+                                      const SliceList &slices) {
+    if (slices.empty()) return;
+    std::lock_guard<std::mutex> lock(worker_slice_queue_lock_[owner_thread]);
+    auto &queues = worker_slice_queue_[owner_thread];
+    const std::string *last_path = nullptr;
+    SliceList *dst = nullptr;
+    for (auto *slice : slices) {
+        const std::string &path = slice->peer_nic_path;
+        if (dst == nullptr || *last_path != path) {
+            last_path = &path;
+            dst = &queues[path];
+        }
+        dst->push_back(slice);
+    }
+}
+
 void WorkerPool::enqueueSliceToOwner(Transport::Slice *slice) {
     const int owner_thread = postingThreadForPeer(slice->peer_nic_path);
     if (owner_thread < 0 || owner_thread >= worker_count_) {
@@ -423,7 +440,22 @@ int WorkerPool::submitPostSend(
 
 void WorkerPool::enqueuePreparedSlices(const SliceList &slice_list,
                                        uint64_t submitted_slice_count) {
-    for (auto &slice : slice_list) enqueueSliceToOwner(slice);
+    std::vector<SliceList> by_owner(static_cast<size_t>(worker_count_));
+    for (auto *slice : slice_list) {
+        const int owner_thread = postingThreadForPeer(slice->peer_nic_path);
+        if (owner_thread < 0 || owner_thread >= worker_count_) {
+            LOG(ERROR) << "Invalid RDMA worker owner " << owner_thread
+                       << " for peer " << slice->peer_nic_path;
+            slice->markFailed();
+            processed_slice_count_.fetch_add(1);
+            continue;
+        }
+        by_owner[static_cast<size_t>(owner_thread)].push_back(slice);
+    }
+    for (int owner_thread = 0; owner_thread < worker_count_; ++owner_thread) {
+        enqueueSlicesToOwner(owner_thread,
+                             by_owner[static_cast<size_t>(owner_thread)]);
+    }
 
     submitted_slice_count_.fetch_add(submitted_slice_count);
     if (submitted_slice_count &&
@@ -1600,7 +1632,11 @@ void WorkerPool::markRailFailed(const std::string &peer_nic_path,
     if (state.error_count >= kRailErrorThreshold) {
         const uint64_t rail_pause_ns =
             globalConfig().rdma_rail_pause_seconds * 1000000000ull;
+        const bool newly_paused = state.pause_until_ns == 0;
         state.pause_until_ns = now + rail_pause_ns;
+        if (newly_paused) {
+            paused_rail_count_.fetch_add(1, std::memory_order_release);
+        }
         LOG(WARNING) << "Rail paused: peer=" << peer_nic_path
                      << " error_count=" << state.error_count
                      << " pause_ms=" << rail_pause_ns / 1000000ull;
@@ -1608,19 +1644,27 @@ void WorkerPool::markRailFailed(const std::string &peer_nic_path,
 }
 
 bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
+    if (paused_rail_count_.load(std::memory_order_acquire) == 0) return true;
     std::lock_guard<std::mutex> lock(rail_state_lock_);
+    // Drop every expired pause while the lock is already held. Otherwise a
+    // dest that is never queried again would leave paused_rail_count_ > 0 and
+    // force every later healthy-path check through this lock.
+    const uint64_t now = getCurrentTimeInNano();
+    int expired = 0;
+    for (auto &entry : rail_states_) {
+        auto &state = entry.second;
+        if (state.pause_until_ns != 0 && now >= state.pause_until_ns) {
+            state.error_count = 0;
+            state.pause_until_ns = 0;
+            ++expired;
+        }
+    }
+    if (expired)
+        paused_rail_count_.fetch_sub(expired, std::memory_order_release);
+
     auto it = rail_states_.find(peer_nic_path);
     if (it == rail_states_.end()) return true;
-    auto &state = it->second;
-    if (state.pause_until_ns == 0) return true;
-    uint64_t now = getCurrentTimeInNano();
-    if (now >= state.pause_until_ns) {
-        // Auto-recover: pause expired
-        state.error_count = 0;
-        state.pause_until_ns = 0;
-        return true;
-    }
-    return false;
+    return it->second.pause_until_ns == 0;
 }
 
 // Unified retry logic: increment retry count and return whether retry is

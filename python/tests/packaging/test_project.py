@@ -109,6 +109,30 @@ def test_store_rest_service_has_one_authoritative_source() -> None:
     )
 
 
+def test_async_store_has_one_authoritative_source() -> None:
+    canonical_module = REPOSITORY_ROOT / "python" / "mooncake" / "async_store.py"
+    legacy_module = (
+        REPOSITORY_ROOT / "mooncake-integration" / "store" / "async_store.py"
+    )
+
+    assert canonical_module.is_file()
+    assert not legacy_module.exists()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "test_async_store.py"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "async_store_integration.py"
+    ).is_file()
+    assert not (REPOSITORY_ROOT / "scripts" / "test_async_store.py").exists()
+
+    cmake = (REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt").read_text()
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert '../python/mooncake/async_store.py"' in cmake
+    assert 'CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py"' not in cmake
+    assert "cp python/mooncake/async_store.py " in legacy_builder
+    assert "cp mooncake-integration/store/async_store.py " not in legacy_builder
+
+
 def test_ep_modules_have_one_authoritative_source() -> None:
     package_root = REPOSITORY_ROOT / "python" / "mooncake"
     legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
