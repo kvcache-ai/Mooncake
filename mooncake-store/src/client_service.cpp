@@ -2071,8 +2071,8 @@ bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
         !local_disk_probe_fn_) {
         return false;
     }
-    // RemoveAll wipes client SSD files while master keeps the metadata
-    // (issue #3709), leaving a completed entry whose backing file is gone.
+    // A physical SSD wipe can leave master metadata naming a completed entry
+    // whose backing file is gone (issue #3709).
     // Reporting success for a Put on top of it would store nothing. Ask the
     // installed probe (the offload file storage owned by RealClient) whether
     // the file is still there. Only a proven-gone answer evicts; present or
@@ -3665,11 +3665,8 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     }
 
     auto result = master_client_.RemoveAll(force);
-    if (result) {
-        if (storage_backend_) {
-            storage_backend_->RemoveAll();
-        }
-    }
+    // The master can retain protected objects. Local disk cleanup must use
+    // per-object eviction, not an unconditional wipe of this client's files.
     if (result && result.value() > 0 && hot_cache_) {
         hot_cache_->RemoveAllHotKeys();
     }
