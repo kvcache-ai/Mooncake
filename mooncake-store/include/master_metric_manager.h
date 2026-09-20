@@ -17,6 +17,7 @@
 namespace mooncake {
 
 struct TieredStorageUsageSnapshot;
+struct WeightMetadataSnapshot;
 
 class MasterMetricManager {
    public:
@@ -199,6 +200,16 @@ class MasterMetricManager {
     void inc_nof_heartbeat_timeout_total(int64_t val = 1);
     void inc_nof_segments_unmounted_by_heartbeat_total(int64_t val = 1);
     void observe_nof_heartbeat_probe_latency_ms(int64_t latency_ms);
+
+    void project_weight_metadata(const WeightMetadataSnapshot& snapshot,
+                                uint64_t now_ms);
+    void inc_weight_reconciliation_failures(int64_t val = 1);
+    int64_t get_weight_revision_count(const std::string& availability);
+    int64_t get_weight_residency_count(const std::string& residency);
+    int64_t get_weight_active_leases();
+    int64_t get_weight_pending_operations();
+    int64_t get_weight_oldest_operation_age_ms();
+    int64_t get_weight_reconciliation_failures();
 
     // Batch Operation Statistics (Counters)
     void inc_batch_exist_key_requests(int64_t items);
@@ -804,6 +815,13 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    ylt::metric::dynamic_gauge_1t weight_revisions_by_availability_;
+    ylt::metric::dynamic_gauge_1t weight_revisions_by_residency_;
+    ylt::metric::gauge_t weight_active_leases_;
+    ylt::metric::gauge_t weight_pending_operations_;
+    ylt::metric::gauge_t weight_oldest_operation_age_ms_;
+    ylt::metric::counter_t weight_reconciliation_failures_;
 
     // Build Info Metric
     // Prometheus "info" pattern: the value carries no meaning and is always 1,
