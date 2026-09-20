@@ -554,10 +554,26 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
     // shared lock here. If future modifications allow installTransport() to be
     // invoked concurrently, a std::shared_lock<std::shared_mutex> should be
     // added to ensure thread safety.
+    std::vector<MemoryRegion> registered_regions;
     for (auto& [_, entry] : local_memory_regions_) {
         int ret = transport->registerLocalMemory(
             entry.addr, entry.length, entry.location, entry.remote_accessible);
-        if (ret < 0) return nullptr;
+        if (ret < 0) {
+            transport->unregisterLocalMemory(entry.addr, true);
+            for (auto it = registered_regions.rbegin();
+                 it != registered_regions.rend(); ++it) {
+                transport->unregisterLocalMemory(it->addr, true);
+            }
+            multi_transports_->transport_map_.erase(proto);
+            return nullptr;
+        }
+        registered_regions.push_back(entry);
+    }
+    const auto installed_transport =
+        multi_transports_->transport_map_.at(proto);
+    for (const auto& entry : registered_regions) {
+        registered_transports_[reinterpret_cast<uintptr_t>(entry.addr)].insert(
+            installed_transport);
     }
     return transport;
 }
@@ -589,13 +605,22 @@ int TransferEngineImpl::freeSharedMemory(void* addr) {
     if (!shm) return ERR_INVALID_ARGUMENT;
     std::string shm_name;
     if (!shm->getShmName(addr, &shm_name)) return ERR_INVALID_ARGUMENT;
-    int uret = unregisterLocalMemory(addr, true);
-    if (uret && uret != ERR_ADDRESS_NOT_REGISTERED) {
-        LOG(WARNING) << "unregisterLocalMemory failed before freeSharedMemory, "
-                        "ret="
-                     << uret;
+    int uret = unregisterLocalMemoryInternal(addr, true,
+                                             /*keep_address_reserved=*/true);
+    if (uret) {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        const bool still_tracked =
+            local_memory_regions_.count(reinterpret_cast<uintptr_t>(addr)) != 0;
+        if (uret != ERR_ADDRESS_NOT_REGISTERED || still_tracked) {
+            LOG(WARNING)
+                << "unregisterLocalMemory failed before freeSharedMemory, ret="
+                << uret;
+            return uret;
+        }
     }
-    return shm->freeSharedMemory(addr);
+    int ret = shm->freeSharedMemory(addr);
+    releaseUnregisterReservation(addr);
+    return ret;
 }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
@@ -788,18 +813,75 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
-    // Best-effort: try every transport so one failure can't leave the region
-    // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
-    int first_error = 0;
-    for (auto& transport : multi_transports_->listTransports()) {
-        int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret && !first_error) first_error = ret;
-    }
-    if (first_error) return first_error;
+    return unregisterLocalMemoryInternal(addr, update_metadata,
+                                         /*keep_address_reserved=*/false);
+}
 
+int TransferEngineImpl::unregisterLocalMemoryInternal(
+    void* addr, bool update_metadata, bool keep_address_reserved) {
+    const auto address = reinterpret_cast<uintptr_t>(addr);
+    TransportSet registered_transports;
+    TransportSet completed_transports;
+    bool tracked = false;
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        if (unregistering_memory_regions_.count(address) != 0 ||
+            registering_memory_regions_.count(address) != 0) {
+            return ERR_TOO_MANY_REQUESTS;
+        }
+        auto region = local_memory_regions_.find(address);
+        tracked = region != local_memory_regions_.end();
+        if (tracked) {
+            unregistering_memory_regions_[address] = region->second;
+            registered_transports = registered_transports_[address];
+            completed_transports = unregistered_transports_[address];
+        } else {
+            unregistering_memory_regions_[address] = {addr, 0, "", false};
+            for (const auto& [_, transport] :
+                 multi_transports_->transport_map_) {
+                registered_transports.insert(transport);
+            }
+        }
+    }
+
+    // Preserve successful per-transport progress across retries. Calling an
+    // already-completed transport again can return ERR_ADDRESS_NOT_REGISTERED
+    // and permanently mask the recovery of a transport that failed earlier.
+    int first_error = 0;
+    std::vector<std::shared_ptr<Transport>> newly_completed;
+    for (const auto& transport : registered_transports) {
+        if (completed_transports.count(transport)) continue;
+        int ret = transport->unregisterLocalMemory(addr, update_metadata);
+        if (ret == 0)
+            newly_completed.push_back(transport);
+        else if (!first_error)
+            first_error = ret;
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        if (tracked) {
+            auto& completed = unregistered_transports_[address];
+            completed.insert(newly_completed.begin(), newly_completed.end());
+        }
+        const bool keep_reserved =
+            keep_address_reserved &&
+            (!first_error ||
+             (!tracked && first_error == ERR_ADDRESS_NOT_REGISTERED));
+        if (!keep_reserved) {
+            unregistering_memory_regions_.erase(address);
+        }
+        if (tracked && !first_error) {
+            eraseMemoryRegionLocked(addr);
+            unregistered_transports_.erase(address);
+        }
+    }
+    return first_error;
+}
+
+void TransferEngineImpl::releaseUnregisterReservation(void* addr) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    eraseMemoryRegionLocked(addr);
-    return 0;
+    unregistering_memory_regions_.erase(reinterpret_cast<uintptr_t>(addr));
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -809,23 +891,44 @@ int TransferEngineImpl::mp_registerLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
     // ========== Phase 1: Pre-check ==========
+    std::map<uintptr_t, MemoryRegion> unique_regions;
     for (const auto& entry : buffer_map) {
         for (const auto& buffer : entry.second) {
-            if (checkOverlap(buffer.addr, buffer.length)) {
-                LOG(ERROR) << "Transfer Engine does not support overlapped "
-                              "memory region";
-                return ERR_ADDRESS_OVERLAPPED;
-            }
             if (buffer.length == 0) {
                 LOG(ERROR) << "Transfer Engine does not support zero length "
                               "memory region";
+                return ERR_INVALID_ARGUMENT;
+            }
+            const auto address = reinterpret_cast<uintptr_t>(buffer.addr);
+            auto [it, inserted] = unique_regions.emplace(
+                address,
+                MemoryRegion{buffer.addr, buffer.length, buffer.location,
+                             buffer.remote_accessible});
+            if (!inserted &&
+                (it->second.length != buffer.length ||
+                 it->second.location != buffer.location ||
+                 it->second.remote_accessible != buffer.remote_accessible)) {
+                LOG(ERROR) << "Conflicting attributes for memory region "
+                           << buffer.addr;
                 return ERR_INVALID_ARGUMENT;
             }
         }
     }
 
     // ========== Phase 2: Prepare rollback records ==========
+    std::vector<MemoryRegion> regions;
+    regions.reserve(unique_regions.size());
+    for (const auto& [_, region] : unique_regions) {
+        regions.push_back(region);
+    }
+    if (!tryReserveMemoryRegions(regions)) {
+        LOG(ERROR)
+            << "Transfer Engine does not support overlapped memory region";
+        return ERR_ADDRESS_OVERLAPPED;
+    }
+
     std::vector<TransferEngineImpl::RegisteredRecord> success_records;
+    RegisteredTransportMap registered_transport_map;
 
     // Reserve space to reduce reallocations
     size_t total_buffers = 0;
@@ -839,12 +942,14 @@ int TransferEngineImpl::mp_registerLocalMemory(
         const std::string& protocol = entry.first;
         const auto& buffer_list = entry.second;
 
-        auto transport = multi_transports_->getTransport(protocol);
-        if (!transport) {
+        auto transport_it = multi_transports_->transport_map_.find(protocol);
+        if (transport_it == multi_transports_->transport_map_.end()) {
             LOG(ERROR) << "Transport " << protocol << " not found";
             rollbackAllRegistrations(success_records);
+            releaseMemoryRegions(regions);
             return -1;
         }
+        const auto& transport = transport_it->second;
 
         for (const auto& buffer : buffer_list) {
             int ret = transport->registerLocalMemory(
@@ -858,25 +963,21 @@ int TransferEngineImpl::mp_registerLocalMemory(
 
                 // ========== Phase 4: Rollback on failure ==========
                 rollbackAllRegistrations(success_records);
+                releaseMemoryRegions(regions);
                 return ret;
             }
 
             // Record successful registration for potential rollback
             success_records.push_back(TransferEngineImpl::RegisteredRecord{
-                transport, buffer.addr, buffer.length, buffer.location,
+                transport.get(), buffer.addr, buffer.length, buffer.location,
                 buffer.remote_accessible});
+            registered_transport_map[reinterpret_cast<uintptr_t>(buffer.addr)]
+                .insert(transport);
         }
     }
 
     // ========== Phase 5: Commit to system state ==========
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        for (const auto& record : success_records) {
-            insertMemoryRegionLocked({record.addr, record.length,
-                                      record.location,
-                                      record.remote_accessible});
-        }
-    }
+    commitMemoryRegions(regions, &registered_transport_map);
 
     return 0;
 }
@@ -895,30 +996,104 @@ void TransferEngineImpl::rollbackAllRegistrations(
 int TransferEngineImpl::mp_unregisterLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
+    std::unordered_map<uintptr_t, bool> tracked_addresses;
+    std::unordered_map<uintptr_t,
+                       std::unordered_set<std::shared_ptr<Transport>>>
+        completed_by_address;
+    RegisteredTransportMap registered_by_address;
+    std::unordered_map<uintptr_t, void*> unique_addresses;
+    for (const auto& [_, buffers] : buffer_map) {
+        for (const auto& buffer : buffers) {
+            unique_addresses[reinterpret_cast<uintptr_t>(buffer.addr)] =
+                buffer.addr;
+        }
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& [address, addr] : unique_addresses) {
+            if (registering_memory_regions_.count(address) != 0 ||
+                unregistering_memory_regions_.count(address) != 0) {
+                return ERR_TOO_MANY_REQUESTS;
+            }
+        }
+        for (const auto& [address, addr] : unique_addresses) {
+            auto region = local_memory_regions_.find(address);
+            const bool tracked = region != local_memory_regions_.end();
+            tracked_addresses[address] = tracked;
+            if (tracked) {
+                unregistering_memory_regions_[address] = region->second;
+                registered_by_address[address] =
+                    registered_transports_[address];
+                auto completed = unregistered_transports_.find(address);
+                if (completed != unregistered_transports_.end()) {
+                    completed_by_address[address] = completed->second;
+                }
+            } else {
+                unregistering_memory_regions_[address] = {addr, 0, "", false};
+            }
+        }
+    }
+
+    int first_error = 0;
+    std::unordered_map<uintptr_t,
+                       std::unordered_set<std::shared_ptr<Transport>>>
+        newly_completed;
     for (const auto& buffer_entry : buffer_map) {
         const std::string& protocol = buffer_entry.first;
         const std::vector<RegisteredBuffer>& buffer_list = buffer_entry.second;
 
-        auto transport = multi_transports_->getTransport(protocol);
-        if (!transport) {
+        auto transport_it = multi_transports_->transport_map_.find(protocol);
+        if (transport_it == multi_transports_->transport_map_.end()) {
             LOG(ERROR) << "Transport " << protocol << " not found";
-            return -1;
+            if (!first_error) first_error = -1;
+            continue;
         }
+        const auto& transport = transport_it->second;
 
         for (const auto& buffer : buffer_list) {
+            const auto address = reinterpret_cast<uintptr_t>(buffer.addr);
+            if (tracked_addresses[address] &&
+                registered_by_address[address].count(transport) == 0) {
+                if (!first_error) first_error = ERR_ADDRESS_NOT_REGISTERED;
+                continue;
+            }
+            if (completed_by_address[address].count(transport) != 0 ||
+                newly_completed[address].count(transport) != 0) {
+                continue;
+            }
             int ret = transport->unregisterLocalMemory(buffer.addr,
                                                        buffer.update_metadata);
-            if (ret) {
-                return ret;
-            }
-        }
-
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        for (const auto& buffer : buffer_list) {
-            eraseMemoryRegionLocked(buffer.addr);
+            if (ret == 0)
+                newly_completed[address].insert(transport);
+            else if (!first_error)
+                first_error = ret;
         }
     }
-    return 0;
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    bool all_complete = true;
+    for (const auto& [address, tracked] : tracked_addresses) {
+        if (tracked) {
+            auto& completed = unregistered_transports_[address];
+            const auto& additions = newly_completed[address];
+            completed.insert(additions.begin(), additions.end());
+            for (const auto& transport : registered_by_address[address]) {
+                if (completed.count(transport) == 0) {
+                    all_complete = false;
+                    break;
+                }
+            }
+        }
+        unregistering_memory_regions_.erase(address);
+    }
+    if (!first_error && all_complete) {
+        for (const auto& [address, _] : tracked_addresses) {
+            eraseMemoryRegionLocked(reinterpret_cast<void*>(address));
+        }
+    } else if (!first_error) {
+        first_error = ERR_TOO_MANY_REQUESTS;
+    }
+    return first_error;
 }
 #endif
 
@@ -991,18 +1166,77 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    int first_error = 0;
-    for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret && !first_error) first_error = ret;
+    std::unordered_map<uintptr_t, void*> unique_addresses;
+    for (auto* addr : addr_list) {
+        unique_addresses[reinterpret_cast<uintptr_t>(addr)] = addr;
     }
-    if (first_error) return first_error;
+    std::unordered_map<uintptr_t, bool> tracked_addresses;
+    RegisteredTransportMap registered_by_address;
+    RegisteredTransportMap completed_by_address;
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& [address, _] : unique_addresses) {
+            if (registering_memory_regions_.count(address) != 0 ||
+                unregistering_memory_regions_.count(address) != 0) {
+                return ERR_TOO_MANY_REQUESTS;
+            }
+        }
+        for (const auto& [address, addr] : unique_addresses) {
+            auto region = local_memory_regions_.find(address);
+            const bool tracked = region != local_memory_regions_.end();
+            tracked_addresses[address] = tracked;
+            if (tracked) {
+                unregistering_memory_regions_[address] = region->second;
+                registered_by_address[address] =
+                    registered_transports_[address];
+                completed_by_address[address] =
+                    unregistered_transports_[address];
+            } else {
+                unregistering_memory_regions_[address] = {addr, 0, "", false};
+                for (const auto& [_, transport] :
+                     multi_transports_->transport_map_) {
+                    registered_by_address[address].insert(transport);
+                }
+            }
+        }
+    }
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto& addr : addr_list) {
-        eraseMemoryRegionLocked(addr);
+    int first_error = 0;
+    RegisteredTransportMap newly_completed;
+    for (const auto& [address, addr] : unique_addresses) {
+        for (const auto& transport : registered_by_address[address]) {
+            if (completed_by_address[address].count(transport) != 0) continue;
+            int ret = transport->unregisterLocalMemory(addr, true);
+            if (ret == 0)
+                newly_completed[address].insert(transport);
+            else if (!first_error)
+                first_error = ret;
+        }
     }
-    return 0;
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    bool all_complete = true;
+    for (const auto& [address, tracked] : tracked_addresses) {
+        if (tracked) {
+            auto& completed = unregistered_transports_[address];
+            const auto& additions = newly_completed[address];
+            completed.insert(additions.begin(), additions.end());
+            for (const auto& transport : registered_by_address[address]) {
+                if (completed.count(transport) == 0) {
+                    all_complete = false;
+                    break;
+                }
+            }
+        }
+        unregistering_memory_regions_.erase(address);
+    }
+    if (!first_error && all_complete) {
+        for (const auto& [_, addr] : unique_addresses) {
+            eraseMemoryRegionLocked(addr);
+        }
+    } else if (!first_error) {
+        first_error = ERR_TOO_MANY_REQUESTS;
+    }
+    return first_error;
 }
 
 bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
@@ -1044,7 +1278,10 @@ bool TransferEngineImpl::tryReserveMemoryRegions(
 
     for (const auto& region : regions) {
         auto addr = reinterpret_cast<uintptr_t>(region.addr);
-        if (hasOverlapLocked(addr, region.length)) {
+        if (unregistering_memory_regions_.count(addr) != 0 ||
+            hasOverlapInMapLocked(unregistering_memory_regions_, addr,
+                                  region.length) ||
+            hasOverlapLocked(addr, region.length)) {
             for (auto reserved_addr : reserved) {
                 registering_memory_regions_.erase(reserved_addr);
             }
@@ -1057,12 +1294,27 @@ bool TransferEngineImpl::tryReserveMemoryRegions(
 }
 
 void TransferEngineImpl::commitMemoryRegions(
-    const std::vector<MemoryRegion>& regions) {
+    const std::vector<MemoryRegion>& regions,
+    const RegisteredTransportMap* registered_transport_map) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (const auto& region : regions) {
-        registering_memory_regions_.erase(
-            reinterpret_cast<uintptr_t>(region.addr));
+        const auto address = reinterpret_cast<uintptr_t>(region.addr);
+        registering_memory_regions_.erase(address);
         insertMemoryRegionLocked(region);
+        auto& registered = registered_transports_[address];
+        registered.clear();
+        if (registered_transport_map) {
+            auto transports = registered_transport_map->find(address);
+            if (transports != registered_transport_map->end()) {
+                registered = transports->second;
+            }
+        } else {
+            for (const auto& [_, transport] :
+                 multi_transports_->transport_map_) {
+                registered.insert(transport);
+            }
+        }
+        unregistered_transports_.erase(address);
     }
 }
 
@@ -1080,7 +1332,10 @@ void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {
 }
 
 void TransferEngineImpl::eraseMemoryRegionLocked(void* addr) {
-    local_memory_regions_.erase(reinterpret_cast<uintptr_t>(addr));
+    const auto address = reinterpret_cast<uintptr_t>(addr);
+    local_memory_regions_.erase(address);
+    registered_transports_.erase(address);
+    unregistered_transports_.erase(address);
 }
 
 #ifdef WITH_METRICS
