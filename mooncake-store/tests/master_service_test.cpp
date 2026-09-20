@@ -1845,10 +1845,10 @@ TEST_F(MasterServiceTest, ClearStaleHandlesTrimsMallocAfterLargeSweep) {
     }
 
     ASSERT_EQ(0u, trim_calls.load());
-    ASSERT_TRUE(service
-                    ->UnmountSegment(stale_segment.segment_id,
-                                     stale_segment.client_id)
-                    .has_value());
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
     ClearInvalidHandlesForTest(*service);
 
     // The sweep erased kErasedTarget (> kMallocTrimThreshold) entries, so
@@ -1898,10 +1898,10 @@ TEST_F(MasterServiceTest, ClearStaleHandlesSkipsMallocTrimForSmallSweep) {
     }
     ASSERT_LT(kSmallCount, kMallocTrimThreshold);
 
-    ASSERT_TRUE(service
-                    ->UnmountSegment(stale_segment.segment_id,
-                                     stale_segment.client_id)
-                    .has_value());
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
     ClearInvalidHandlesForTest(*service);
 
     EXPECT_EQ(0u, trim_calls.load())
