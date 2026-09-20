@@ -162,7 +162,14 @@ ImmutableBucketAllocator::EnsureActiveBucketLocked(uint64_t required) {
     const int64_t bucket_id = next_bucket_id_++;
     const std::string path = BucketDataPath(bucket_id);
     auto preallocated = fs_adapter_->PreallocateFile(path, bucket_capacity_);
-    if (!preallocated) return tl::make_unexpected(preallocated.error());
+    if (!preallocated) {
+        auto cleaned = fs_adapter_->DeleteFile(path);
+        if (!cleaned && cleaned.error() != ErrorCode::FILE_NOT_FOUND) {
+            LOG(WARNING) << "Failed to clean up unpublished DFS bucket " << path
+                         << ": " << cleaned.error();
+        }
+        return tl::make_unexpected(preallocated.error());
+    }
 
     auto bucket = std::make_shared<BucketState>();
     bucket->id = bucket_id;
