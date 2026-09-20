@@ -22,6 +22,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -34,6 +35,7 @@
 #include "ibv_loader.h"
 #include "rdma_transport.h"
 #include "tent/common/status.h"
+#include "tent/runtime/platform.h"
 
 namespace mooncake {
 namespace tent {
@@ -94,7 +96,23 @@ class RdmaContext {
    public:
     using MemReg = void *;
 
+    // Registers [addr, addr+length). Device memory that the platform can
+    // export as a dma-buf is registered with ibv_reg_dmabuf_mr when the verbs
+    // library provides it, so the NIC targets device memory directly;
+    // everything else goes through ibv_reg_mr. Returns nullptr on failure
+    // (including a failed dma-buf registration of an exportable buffer, which
+    // makes the caller drop RDMA for that buffer and stage instead).
     MemReg registerMemReg(void *addr, size_t length, int access);
+
+    // True when this context can register dma-buf exported device memory.
+    bool supportsDmabuf() const { return verbs_.ibv_reg_dmabuf_mr != nullptr; }
+
+    // Hook used by tests to replace Platform::getLoader().exportDmabuf.
+    using DmabufExporter =
+        std::function<Status(void *, size_t, DmabufExport &)>;
+    void setDmabufExporter(DmabufExporter exporter) {
+        dmabuf_exporter_ = std::move(exporter);
+    }
 
     // Warm up RDMA MR registration by temporarily registering/deregistering.
     // This targets RDMA driver-side pinning/metadata and differs from CPU
@@ -237,6 +255,11 @@ class RdmaContext {
 
     std::mutex mr_set_mutex_;
     std::unordered_set<ibv_mr *> mr_set_;
+    // MRs created via ibv_reg_dmabuf_mr. They map no host VMA, so
+    // unregisterMemReg must not madvise() their range. Guarded by
+    // mr_set_mutex_.
+    std::unordered_set<ibv_mr *> dmabuf_mr_set_;
+    DmabufExporter dmabuf_exporter_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
     std::vector<RdmaCQ *> cq_list_;
