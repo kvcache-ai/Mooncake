@@ -99,9 +99,12 @@ class CoroRpcAgent {
     using AsyncCallback = std::function<void(Status, std::string)>;
     void callAsync(const std::string &server_addr, int func_id,
                    const std::string &request, AsyncCallback callback);
+    void callAsyncRetryOnce(const std::string &server_addr, int func_id,
+                            const std::string &request, AsyncCallback callback);
 
     async_simple::coro::Lazy<std::pair<Status, std::string>> callCoroutine(
-        std::string server_addr, int func_id, std::string request);
+        std::string server_addr, int func_id, std::string request,
+        bool retry_rpc_error_once = false);
 
    private:
     async_simple::coro::Lazy<void> process(int func_id);

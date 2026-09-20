@@ -691,21 +691,10 @@ void ControlClient::notifySegmentUpdatedAsync(
     json j = segment_name;
     std::string request = j.dump();
     auto rpc_agent = tl_rpc_agent_owner;
-    rpc_agent->callAsync(
+    rpc_agent->callAsyncRetryOnce(
         server_addr, NotifySegmentUpdated, request,
-        [rpc_agent, server_addr, request, on_failure](const Status& status,
-                                                      const std::string&) {
-            if (status.ok()) return;
-            if (!status.IsRpcServiceError()) {
-                on_failure();
-                return;
-            }
-            rpc_agent->callAsync(
-                server_addr, NotifySegmentUpdated, request,
-                [rpc_agent, on_failure](const Status& retry_status,
-                                        const std::string&) {
-                    if (!retry_status.ok()) on_failure();
-                });
+        [on_failure](const Status& status, const std::string&) {
+            if (!status.ok()) on_failure();
         });
 }
 
