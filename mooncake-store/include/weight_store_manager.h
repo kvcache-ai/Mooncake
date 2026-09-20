@@ -27,6 +27,13 @@ class WeightStoreManager {
     }
     void Clear() { weight_metadata_.Clear(); }
 
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+
     WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
@@ -39,6 +46,8 @@ class WeightStoreManager {
     ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
    private:
+    WeightMetadataStore::Result<WeightRevisionLease>
+    PersistAndPublishWeightLeaseMutation(const WeightLeaseMutation& mutation);
     WeightMetadataStore::Result<WeightRevisionMetadata>
     PersistAndPublishWeightMutation(const WeightMetadataMutation& mutation);
     std::unique_lock<std::mutex> LockGroup(

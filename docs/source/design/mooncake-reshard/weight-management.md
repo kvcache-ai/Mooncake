@@ -123,6 +123,10 @@ reads and validates the manifest, plans ranges, and executes Store-to-runtime
 transfers. The caller renews short leases until all transfer work reaches a
 terminal state and releases the lease on both success and failure.
 
+Renewal never shortens an existing lease: the new expiry is the later of the
+current expiry and the renewal time plus the requested TTL. An expired lease
+cannot be renewed.
+
 A live revision lease blocks deletion and residency operations that could
 remove the last readable replica. Revision leases do not replace framework
 allocation guards, runtime binding generations, or Store's per-object read

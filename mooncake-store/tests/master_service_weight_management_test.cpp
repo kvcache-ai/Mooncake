@@ -301,5 +301,55 @@ TEST_F(MasterServiceWeightManagementTest, RejectsStaleGeneration) {
     EXPECT_EQ(WeightManagementError::STALE_GENERATION, result.error());
 }
 
+TEST_F(MasterServiceWeightManagementTest,
+       RevisionLeaseLifecycleUsesPublishedMetadataState) {
+    MasterService service;
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+    auto importing = Begin(service, 1, 1024);
+    PutObject(service, client_id, "payload-a",
+              importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
+              1024);
+    PutObject(service, client_id, ManifestKey(),
+              importing.manifest.payload_group_id, ObjectDataType::METADATA,
+              128);
+    auto ready = service.CommitWeightImport(
+        CommitRequest(importing, {"payload-a"}, 1024));
+    ASSERT_TRUE(ready.has_value());
+
+    const AcquireWeightRevisionLeaseRequest acquire_request{
+        .identity = ready->identity,
+        .expected_metadata_generation = ready->metadata_generation,
+        .holder = "worker-0",
+        .ttl_ms = 60'000,
+    };
+    auto acquired = service.AcquireWeightRevisionLease(acquire_request);
+    ASSERT_TRUE(acquired.has_value());
+    auto retry = service.AcquireWeightRevisionLease(acquire_request);
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(*acquired, *retry);
+
+    auto renewed =
+        service.RenewWeightRevisionLease(RenewWeightRevisionLeaseRequest{
+            .lease_id = acquired->lease_id,
+            .ttl_ms = 120'000,
+        });
+    ASSERT_TRUE(renewed.has_value());
+    EXPECT_GT(renewed->expires_at_ms, acquired->expires_at_ms);
+    auto view = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = ready->identity});
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(1u, view->active_lease_count);
+
+    ASSERT_TRUE(service.ReleaseWeightRevisionLease(
+        ReleaseWeightRevisionLeaseRequest{.lease_id = acquired->lease_id}));
+    ASSERT_TRUE(service.ReleaseWeightRevisionLease(
+        ReleaseWeightRevisionLeaseRequest{.lease_id = acquired->lease_id}));
+    view = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = ready->identity});
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(0u, view->active_lease_count);
+}
+
 }  // namespace
 }  // namespace mooncake::test

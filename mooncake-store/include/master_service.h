@@ -156,6 +156,13 @@ class MasterService {
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
 
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+
     WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(

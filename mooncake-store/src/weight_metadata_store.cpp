@@ -499,7 +499,9 @@ WeightMetadataStore::PrepareRenewLease(
         return tl::make_unexpected(WeightManagementError::LEASE_EXPIRED);
     }
     auto next = current->second;
-    next.expires_at_ms = AddTtl(now_ms, request.ttl_ms);
+    // Lease upserts must remain monotonic for standby replay.
+    next.expires_at_ms =
+        std::max(next.expires_at_ms, AddTtl(now_ms, request.ttl_ms));
     return WeightLeaseMutation{
         .lease_id = request.lease_id,
         .previous = current->second,

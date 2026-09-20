@@ -243,6 +243,76 @@ TEST(WeightMetadataStoreTest, LeaseExpiryIsGenerationFencedAndIdempotent) {
     EXPECT_TRUE(metadata_store.PrepareExpireLeases(350).empty());
 }
 
+TEST(WeightMetadataStoreTest, RenewalNeverShortensLeaseExpiry) {
+    WeightMetadataStore metadata_store;
+    const auto ready = PublishReady(metadata_store);
+    auto candidate = metadata_store.PrepareAcquireLease(
+        AcquireWeightRevisionLeaseRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = ready.metadata_generation,
+            .holder = "worker-1",
+            .ttl_ms = 100,
+        },
+        300);
+    ASSERT_TRUE(candidate.has_value());
+    auto lease = metadata_store.Publish(*candidate);
+    ASSERT_TRUE(lease.has_value());
+
+    for (const uint64_t ttl_ms : {10, 50, 100}) {
+        SCOPED_TRACE(ttl_ms);
+        auto renewed = metadata_store.PrepareRenewLease(
+            RenewWeightRevisionLeaseRequest{
+                .tenant_id = ready.identity.tenant_id,
+                .lease_id = lease->lease_id,
+                .ttl_ms = ttl_ms,
+            },
+            350);
+        ASSERT_TRUE(renewed.has_value());
+        auto published = metadata_store.Publish(*renewed);
+        ASSERT_TRUE(published.has_value());
+        EXPECT_EQ(ttl_ms == 100 ? 450u : 400u, published->expires_at_ms);
+        EXPECT_EQ(lease->fenced_metadata_generation,
+                  published->fenced_metadata_generation);
+    }
+    auto expired = metadata_store.PrepareRenewLease(
+        RenewWeightRevisionLeaseRequest{
+            .tenant_id = ready.identity.tenant_id,
+            .lease_id = lease->lease_id,
+            .ttl_ms = 100,
+        },
+        450);
+    ASSERT_FALSE(expired.has_value());
+    EXPECT_EQ(WeightManagementError::LEASE_EXPIRED, expired.error());
+}
+
+TEST(WeightMetadataStoreTest, RenewalSaturatesExpiryOnOverflow) {
+    WeightMetadataStore metadata_store;
+    const auto ready = PublishReady(metadata_store);
+    const auto maximum = std::numeric_limits<uint64_t>::max();
+    auto candidate = metadata_store.PrepareAcquireLease(
+        AcquireWeightRevisionLeaseRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = ready.metadata_generation,
+            .holder = "worker-1",
+            .ttl_ms = 50,
+        },
+        maximum - 100);
+    ASSERT_TRUE(candidate.has_value());
+    auto lease = metadata_store.Publish(*candidate);
+    ASSERT_TRUE(lease.has_value());
+    auto renewed = metadata_store.PrepareRenewLease(
+        RenewWeightRevisionLeaseRequest{
+            .tenant_id = ready.identity.tenant_id,
+            .lease_id = lease->lease_id,
+            .ttl_ms = 100,
+        },
+        maximum - 75);
+    ASSERT_TRUE(renewed.has_value());
+    auto published = metadata_store.Publish(*renewed);
+    ASSERT_TRUE(published.has_value());
+    EXPECT_EQ(maximum, published->expires_at_ms);
+}
+
 TEST(WeightMetadataStoreTest, LeaseReplayAdvancesAllocatorWatermark) {
     WeightMetadataStore source;
     WeightMetadataStore replay_target;
