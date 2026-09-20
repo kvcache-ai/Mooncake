@@ -1720,7 +1720,8 @@ class MasterService {
      * GetReplicaList's RO accessor has been released.
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
-                                               bool record_candidate = true);
+                                               bool record_candidate = true,
+                                               bool force = false);
     void EraseCandidate(const ObjectIdentity& object_id);
     void BackoffCandidate(const ObjectIdentity& object_id,
                           PromotionQueueResult result);
