@@ -442,6 +442,14 @@ WeightStoreManager::ReconcileWeightRevision(
     }
     if (current.operation == WeightOperationState::EVICTING) {
         backend_.EvictManagedWeightGroupToCold(current);
+    } else if (current.operation == WeightOperationState::REHYDRATING) {
+        const auto tenant_id = TenantId(current.identity.tenant_id);
+        for (const auto& key : backend_.GetGroupMemberKeys(
+                 tenant_id, current.manifest.payload_group_id)) {
+            const auto result = backend_.PromoteWeightObject(tenant_id, key);
+            VLOG(1) << "weight_rehydrate_promotion key=" << key
+                    << " result=" << static_cast<int>(result);
+        }
     }
 
     auto members = backend_.SnapshotWeightGroup(request.identity,
