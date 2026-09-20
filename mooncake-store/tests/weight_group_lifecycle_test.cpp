@@ -61,6 +61,19 @@ class WeightGroupLifecycleTest : public MasterServiceTest {
         EXPECT_TRUE(ready.has_value());
         return *ready;
     }
+
+    static void AddLocalDiskReplica(MasterService& service,
+                                    const UUID& client_id,
+                                    const std::string& key, int64_t size,
+                                    const std::string& endpoint) {
+        std::vector<OffloadTaskItem> tasks{
+            OffloadTaskItem{.tenant_id = "default", .key = key, .size = size}};
+        StorageObjectMetadata metadata;
+        metadata.key_size = key.size();
+        metadata.data_size = size;
+        metadata.transport_endpoint = endpoint;
+        ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, tasks, {metadata}));
+    }
 };
 
 TEST_F(WeightGroupLifecycleTest, LeaseBlocksOperationAndDelete) {
@@ -164,6 +177,74 @@ TEST_F(WeightGroupLifecycleTest, ColdOperationEvictsWholeManagedGroup) {
     EXPECT_EQ(completed->total_members, completed->processed_members);
 }
 
+TEST_F(WeightGroupLifecycleTest, RehydrateQueuesAndCompletesWholeManagedGroup) {
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(0)
+                      .set_enable_offload(true)
+                      .set_root_fs_dir("/mnt/ssd")
+                      .build();
+    MasterService service(config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true));
+    auto ready = PublishReady(service, client_id);
+    ASSERT_TRUE(service
+                    .PutEnd(client_id, "payload-a", TenantId::Default(),
+                            ReplicaType::DISK)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(client_id, ManifestKey(), TenantId::Default(),
+                            ReplicaType::DISK)
+                    .has_value());
+    AddLocalDiskReplica(service, client_id, "payload-a", 1024, "test_segment");
+    AddLocalDiskReplica(service, client_id, ManifestKey(), 128, "test_segment");
+    ASSERT_TRUE(service.StartWeightResidencyOperation(
+        StartWeightResidencyOperationRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = ready.metadata_generation,
+            .target_residency = WeightResidencyState::COLD,
+        }));
+    auto cold = service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = ready.identity});
+    ASSERT_TRUE(cold.has_value());
+    ASSERT_EQ(WeightResidencyState::COLD, cold->residency);
+
+    auto started = service.StartWeightResidencyOperation(
+        StartWeightResidencyOperationRequest{
+            .identity = cold->identity,
+            .expected_metadata_generation = cold->metadata_generation,
+            .target_residency = WeightResidencyState::HOT,
+        });
+    ASSERT_TRUE(started.has_value());
+    EXPECT_EQ(WeightOperationState::REHYDRATING, started->operation);
+    ASSERT_TRUE(service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = cold->identity}));
+
+    size_t promoted = 0;
+    while (promoted < 2) {
+        auto pending = service.PromotionObjectHeartbeat(client_id);
+        ASSERT_TRUE(pending.has_value());
+        ASSERT_FALSE(pending->empty());
+        for (const auto& task : *pending) {
+            ASSERT_TRUE(service.PromotionAllocStart(
+                client_id, task.key, TenantId(task.tenant_id), task.size, {}));
+            ASSERT_TRUE(service.NotifyPromotionSuccess(
+                client_id, task.key, TenantId(task.tenant_id)));
+            ++promoted;
+        }
+    }
+
+    auto hot = service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = cold->identity});
+    ASSERT_TRUE(hot.has_value());
+    EXPECT_EQ(WeightAvailabilityState::READY, hot->availability);
+    EXPECT_EQ(WeightResidencyState::HOT, hot->residency);
+    EXPECT_EQ(WeightOperationState::NONE, hot->operation);
+    auto completed = service.QueryWeightOperation(
+        QueryWeightOperationRequest{.operation_id = started->operation_id});
+    ASSERT_TRUE(completed.has_value());
+    EXPECT_EQ("completed", completed->message);
+}
 
 TEST_F(WeightGroupLifecycleTest, PendingOperationReflectsLostReadableMembers) {
     MasterService service;
@@ -208,8 +289,7 @@ TEST_F(WeightGroupLifecycleTest, PendingOperationReflectsLostReadableMembers) {
     EXPECT_EQ(*reconciled, *retry);
 }
 
-TEST_F(WeightGroupLifecycleTest,
-       DeleteRemovesPayloadAndManifestThenTombstones) {
+TEST_F(WeightGroupLifecycleTest, DeleteRemovesPayloadAndManifestThenTombstones) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();

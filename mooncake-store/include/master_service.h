@@ -1620,7 +1620,8 @@ class MasterService {
      * GetReplicaList's RO accessor has been released.
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
-                                               bool record_candidate = true);
+                                               bool record_candidate = true,
+                                               bool force = false);
     void RecordOrUpdateCandidate(TenantState& tenant_state,
                                  const std::string& key, uint8_t sketch_score,
                                  PromotionCandidateReason reason,

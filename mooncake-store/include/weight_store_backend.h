@@ -4,6 +4,7 @@
 
 #include "ha/oplog/oplog_types.h"
 #include "types.h"
+#include "object_runtime_state.h"
 #include "weight_metadata_store.h"
 
 namespace mooncake {
@@ -24,6 +25,9 @@ class WeightStoreBackend {
     // The consumer must arbitrate completion before publishing metadata.
     using DurableFinalize = std::function<void(const DurableResult&)>;
     virtual ~WeightStoreBackend() = default;
+    virtual bool CanPublishWeightMutations() const = 0;
+    virtual PromotionQueueResult PromoteWeightObject(
+        const TenantId& tenant_id, const std::string& key) = 0;
     virtual std::vector<std::string> GetGroupMemberKeys(
         const TenantId& tenant_id, const std::string& group_id) const = 0;
     virtual tl::expected<void, ErrorCode> RemoveObject(
@@ -32,7 +36,6 @@ class WeightStoreBackend {
     virtual void EvictManagedWeightGroupToCold(
         const WeightRevisionMetadata& revision) = 0;
     virtual bool IsOpLogEnabled() const = 0;
-    virtual bool CanPublishWeightMutations() const = 0;
     virtual bool IsTenantSupported(const std::string& tenant_id) const = 0;
     virtual tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
         OpType type, const std::string& tenant_id, const std::string& key,
@@ -47,6 +50,9 @@ class MasterService;
 class MasterStoreBackend final : public WeightStoreBackend {
    public:
     explicit MasterStoreBackend(MasterService& master) : master_(master) {}
+    bool CanPublishWeightMutations() const override;
+    PromotionQueueResult PromoteWeightObject(
+        const TenantId& tenant_id, const std::string& key) override;
     std::vector<std::string> GetGroupMemberKeys(
         const TenantId& tenant_id, const std::string& group_id) const override;
     tl::expected<void, ErrorCode> RemoveObject(
@@ -55,7 +61,6 @@ class MasterStoreBackend final : public WeightStoreBackend {
     void EvictManagedWeightGroupToCold(
         const WeightRevisionMetadata& revision) override;
     bool IsOpLogEnabled() const override;
-    bool CanPublishWeightMutations() const override;
     bool IsTenantSupported(const std::string& tenant_id) const override;
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
         OpType type, const std::string& tenant_id, const std::string& key,

@@ -2779,6 +2779,83 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(*result, visible->metadata);
 }
 
+TEST_F(MasterServiceHATest,
+       ImportingReconcileDoesNotAppendUnpublishableWeightMutation) {
+    const std::string cluster_id = "weight_importing_reconcile_rejected";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    ASSERT_TRUE(service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    }));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    auto reconciled = service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = identity});
+    EXPECT_FALSE(reconciled.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(2, batch));
+}
+
+TEST_F(MasterServiceHATest,
+       WeightMutationRequiresConfirmedStandbyOpLogCapability) {
+    const std::string cluster_id = "weight_metadata_capability_gate";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto rejected = service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 2,
+        .expected_logical_bytes = 2048,
+    });
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, rejected.error());
+    EXPECT_FALSE(
+        service.GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+            .has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, batch));
+}
+
 TEST_F(MasterServiceHATest, WeightMetadataRejectsOpLogSubmissionFailure) {
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto config = MasterServiceConfig::builder()
@@ -3096,6 +3173,8 @@ TEST_F(MasterServiceHATest,
             .fenced_metadata_generation = 4,
             .started_at_ms = 150,
             .updated_at_ms = 200,
+            .processed_members = 0,
+            .total_members = 2,
             .cursor = {},
             .message = {},
         }},
