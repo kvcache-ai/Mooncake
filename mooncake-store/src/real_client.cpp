@@ -462,6 +462,25 @@ inline bool is_object_range_overflow(size_t offset, size_t size, size_t limit) {
     return size > limit || offset > limit - size;
 }
 
+inline const Replica::Descriptor *SelectCompleteMemoryReplica(
+    const std::vector<Replica::Descriptor> &replicas,
+    const std::unordered_set<std::string> &local_endpoints) {
+    const Replica::Descriptor *first_memory = nullptr;
+    for (const auto &r : replicas) {
+        if (r.status != ReplicaStatus::COMPLETE || !r.is_memory_replica()) {
+            continue;
+        }
+        if (local_endpoints.count(r.get_memory_descriptor()
+                                      .buffer_descriptor.transport_endpoint_)) {
+            return &r;
+        }
+        if (!first_memory) {
+            first_memory = &r;
+        }
+    }
+    return first_memory;
+}
+
 inline const Replica::Descriptor *SelectSessionReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {

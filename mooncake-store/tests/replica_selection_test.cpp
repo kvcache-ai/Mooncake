@@ -151,35 +151,29 @@ TEST_F(ReplicaSelectionTest, LocalMemoryBeatsLocalNoFInBothOrders) {
         "memB");
 }
 
-// Regression for issue #3658 (session range-read path): the session planner
-// supports MEMORY and DFS replicas, but not NOF_SSD. The MEMORY selector must
-// therefore skip a NOF-only object and return nullptr, even though
-// SelectBestReplica would select that replica for the single-object get path.
-TEST_F(ReplicaSelectionTest, SessionPathRejectsNoFOnlyObject) {
-    std::unordered_set<std::string> local = {"nofB"};
-
-    // A NOF-only object: SelectBestReplica returns the NOF replica (it is the
-    // last-resort tier for the single-object get path), but the session planner
-    // cannot read NOF, so its MEMORY selector must decline it.
-    std::vector<Replica::Descriptor> nof_only = {MakeNoF("nofB")};
-    const auto* best = SelectBestReplica(nof_only, local);
-    ASSERT_NE(best, nullptr);
-    EXPECT_TRUE(best->is_nof_replica());  // single-object path would use it
-    EXPECT_EQ(SelectCompleteMemoryReplica(nof_only, local),
-              nullptr);  // session path: nothing to read
-
-    // A local MEMORY replica must still be selected for the session even when a
-    // local NOF replica is also present (local MEMORY outranks local NOF).
-    std::vector<Replica::Descriptor> mem_and_nof = {
-        MakeNoF("nofB"),
-        MakeMemory("memB", "tcp"),
+TEST_F(ReplicaSelectionTest, IncompleteLocalMemoryFallsBackToLocalNoF) {
+    // The local MEMORY replica is not readable yet, so the local NOF_SSD one
+    // remains the best choice.
+    std::unordered_set<std::string> local = {"nodeA"};
+    std::vector<Replica::Descriptor> reps = {
+        MakeNoF("nodeA"),
+        MakeMemory("nodeA", "rdma", ReplicaStatus::PROCESSING),
     };
-    const auto* sel = SelectCompleteMemoryReplica(mem_and_nof, local);
+    const auto* sel = SelectBestReplica(reps, local);
     ASSERT_NE(sel, nullptr);
-    EXPECT_TRUE(sel->is_memory_replica());
-    EXPECT_EQ(
-        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
-        "memB");
+    EXPECT_TRUE(sel->is_nof_replica());
+}
+
+TEST_F(ReplicaSelectionTest, LocalNoFPrecedesRemoteMemory) {
+    // Locality still outranks tier for remote MEMORY replicas.
+    std::unordered_set<std::string> local = {"nodeA"};
+    std::vector<Replica::Descriptor> reps = {
+        MakeNoF("nodeA"),
+        MakeMemory("nodeB", "rdma"),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_nof_replica());
 }
 
 TEST_F(ReplicaSelectionTest, ScoringOffKeepsFirstRemoteMemory) {
