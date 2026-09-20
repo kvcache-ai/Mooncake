@@ -3,12 +3,104 @@
 
 #include <glog/logging.h>
 
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace mooncake::test {
+
+TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
+    MasterService service;
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+    WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "concurrent-scan",
+        .revision = "step-1",
+        .weight_generation = 1,
+    };
+    std::string manifest_key = MakeWeightManifestKey(identity);
+    while (MetadataShardIndex(service, manifest_key) == 0) {
+        identity.revision += "x";
+        manifest_key = MakeWeightManifestKey(identity);
+    }
+    std::string payload_key = "concurrent-scan-payload";
+    while (MetadataShardIndex(service, payload_key) == 0) payload_key += "x";
+    const std::string ordinary_key = "concurrent-scan-ordinary";
+    ReplicateConfig ordinary;
+    ordinary.replica_num = 1;
+    PutCompletedObject(service, client_id, ordinary_key, ordinary, 1024);
+
+    std::promise<void> paused;
+    std::promise<void> resume;
+    auto paused_future = paused.get_future();
+    const auto resume_future = resume.get_future().share();
+    std::atomic<bool> gate_timed_out{false};
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
+        [&](size_t shard) {
+            if (shard != 0) return;
+            paused.set_value();
+            gate_timed_out = resume_future.wait_for(std::chrono::seconds(10)) !=
+                             std::future_status::ready;
+        });
+    auto sweep =
+        std::async(std::launch::async, [&] { return service.RemoveAll(true); });
+    const bool reached = paused_future.wait_for(std::chrono::seconds(3)) ==
+                         std::future_status::ready;
+    bool published = false;
+    if (reached) {
+        auto importing = service.BeginWeightImport(BeginWeightImportRequest{
+            .identity = identity,
+            .payload_group_id = {},
+            .expected_payload_count = 1,
+            .expected_logical_bytes = 1024,
+        });
+        if (importing) {
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.group_ids =
+                std::vector<std::string>{importing->manifest.payload_group_id};
+            config.data_type = ObjectDataType::WEIGHT;
+            PutCompletedObject(service, client_id, payload_key, config, 1024);
+            config.data_type = ObjectDataType::METADATA;
+            PutCompletedObject(service, client_id, manifest_key, config, 128);
+            auto ready = service.CommitWeightImport(CommitWeightImportRequest{
+                .identity = identity,
+                .expected_metadata_generation = importing->metadata_generation,
+                .manifest =
+                    WeightManifestReference{
+                        .manifest_key = manifest_key,
+                        .manifest_sha256 = std::string(64, 'a'),
+                        .payload_group_id =
+                            importing->manifest.payload_group_id,
+                        .payload_keys_sha256 =
+                            ComputeWeightPayloadKeysSha256({payload_key}),
+                        .payload_count = 1,
+                        .logical_bytes = 1024,
+                    },
+            });
+            published =
+                ready && ready->availability == WeightAvailabilityState::READY;
+        }
+    }
+    resume.set_value();
+    const auto removed = sweep.get();
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    ASSERT_TRUE(reached);
+    ASSERT_TRUE(published);
+    ASSERT_FALSE(gate_timed_out);
+    EXPECT_EQ(1, removed);
+    EXPECT_FALSE(
+        service.ExistKey(ordinary_key, TenantId::Default()).value_or(true));
+    EXPECT_TRUE(
+        service.ExistKey(payload_key, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(
+        service.ExistKey(manifest_key, TenantId::Default()).value_or(false));
+}
 
 TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
     auto service_config =
@@ -90,6 +182,92 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
     EXPECT_TRUE(
         service_->Remove(hard_pinned_key, TenantId::Default(), /*force=*/true)
             .has_value());
+}
+
+TEST_F(MasterServiceTest,
+       ManagedWeightGroupIsSkippedByEvictionAndGenericRemoval) {
+    constexpr size_t kSegmentSize = 4 * 1024 * 1024;
+    constexpr size_t kObjectSize = 1024 * 1024;
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    MasterService service(service_config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(
+        service, "managed_weight_segment", kDefaultSegmentBase, kSegmentSize);
+    const UUID client_id = generate_uuid();
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto importing = service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = kObjectSize,
+    });
+    ASSERT_TRUE(importing.has_value());
+    const std::string payload_key = "managed-weight-payload";
+    const std::string manifest_key =
+        "weights/production/llama-70b/step-100/7/manifest";
+    ReplicateConfig payload_config;
+    payload_config.replica_num = 1;
+    payload_config.data_type = ObjectDataType::WEIGHT;
+    payload_config.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    PutCompletedObject(service, client_id, payload_key, payload_config,
+                       kObjectSize);
+    auto manifest_config = payload_config;
+    manifest_config.data_type = ObjectDataType::METADATA;
+    PutCompletedObject(service, client_id, manifest_key, manifest_config,
+                       kObjectSize);
+    auto ready = service.CommitWeightImport(CommitWeightImportRequest{
+        .identity = identity,
+        .expected_metadata_generation = importing->metadata_generation,
+        .manifest =
+            WeightManifestReference{
+                .manifest_key = manifest_key,
+                .manifest_sha256 = std::string(64, 'a'),
+                .payload_group_id = importing->manifest.payload_group_id,
+                .payload_keys_sha256 =
+                    ComputeWeightPayloadKeysSha256({payload_key}),
+                .payload_count = 1,
+                .logical_bytes = kObjectSize,
+            },
+    });
+    ASSERT_TRUE(ready.has_value());
+
+    auto extra_config = payload_config;
+    auto extra = service.PutStart(client_id, "managed-weight-extra",
+                                  TenantId::Default(), kObjectSize,
+                                  extra_config);
+    ASSERT_FALSE(extra.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, extra.error());
+
+    ReplicateConfig trigger_config;
+    trigger_config.replica_num = 1;
+    auto trigger = service.PutStart(client_id, "managed-weight-pressure",
+                                    TenantId::Default(), 3 * kObjectSize,
+                                    trigger_config);
+    ASSERT_FALSE(trigger.has_value());
+    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger.error());
+    EXPECT_TRUE(service.ExistKey(payload_key, TenantId::Default())
+                    .value_or(false));
+    EXPECT_TRUE(service.ExistKey(manifest_key, TenantId::Default())
+                    .value_or(false));
+
+    auto remove =
+        service.Remove(payload_key, TenantId::Default(), /*force=*/true);
+    ASSERT_FALSE(remove.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, remove.error());
+    auto batch_remove = service.BatchRemove(
+        {payload_key, manifest_key}, TenantId::Default(), /*force=*/true);
+    ASSERT_EQ(2u, batch_remove.size());
+    for (const auto& result : batch_remove) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    }
 }
 
 TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
