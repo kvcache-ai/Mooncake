@@ -80,6 +80,88 @@ size_t StandbyMetadataStore::GetKeyCount() const {
 void StandbyMetadataStore::Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     store_.clear();
+    weight_metadata_.clear();
+    weight_metadata_tombstones_.clear();
+    weight_leases_.clear();
+    weight_lease_tombstones_.clear();
+}
+
+bool StandbyMetadataStore::PutWeightMetadata(
+    const WeightRevisionMetadata& metadata) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    weight_metadata_[metadata.identity] = metadata;
+    return true;
+}
+
+std::optional<WeightRevisionMetadata> StandbyMetadataStore::GetWeightMetadata(
+    const WeightRevisionIdentity& identity) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = weight_metadata_.find(identity);
+    return it == weight_metadata_.end()
+               ? std::nullopt
+               : std::optional<WeightRevisionMetadata>(it->second);
+}
+
+std::optional<uint64_t>
+StandbyMetadataStore::GetWeightMetadataTombstoneGeneration(
+    const WeightRevisionIdentity& identity) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = weight_metadata_tombstones_.find(identity);
+    return it == weight_metadata_tombstones_.end()
+               ? std::nullopt
+               : std::optional<uint64_t>(it->second);
+}
+
+bool StandbyMetadataStore::RemoveWeightMetadata(
+    const WeightRevisionIdentity& identity, uint64_t metadata_generation) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    weight_metadata_.erase(identity);
+    weight_metadata_tombstones_[identity] = metadata_generation;
+    return true;
+}
+
+bool StandbyMetadataStore::PutWeightLease(const WeightRevisionLease& lease) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    weight_leases_[lease.lease_id] = lease;
+    return true;
+}
+
+std::optional<WeightRevisionLease> StandbyMetadataStore::GetWeightLease(
+    uint64_t lease_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = weight_leases_.find(lease_id);
+    return it == weight_leases_.end()
+               ? std::nullopt
+               : std::optional<WeightRevisionLease>(it->second);
+}
+
+std::optional<WeightRevisionLease>
+StandbyMetadataStore::GetWeightLeaseTombstone(uint64_t lease_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = weight_lease_tombstones_.find(lease_id);
+    return it == weight_lease_tombstones_.end()
+               ? std::nullopt
+               : std::optional<WeightRevisionLease>(it->second);
+}
+
+bool StandbyMetadataStore::RemoveWeightLease(
+    uint64_t lease_id, const WeightRevisionIdentity& identity,
+    uint64_t fenced_metadata_generation) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = weight_leases_.find(lease_id);
+    WeightRevisionLease tombstone{
+        .lease_id = lease_id,
+        .identity = identity,
+        .holder = {},
+        .expires_at_ms = 0,
+        .fenced_metadata_generation = fenced_metadata_generation,
+    };
+    if (it != weight_leases_.end()) {
+        tombstone = it->second;
+        weight_leases_.erase(it);
+    }
+    weight_lease_tombstones_[lease_id] = std::move(tombstone);
+    return true;
 }
 
 void StandbyMetadataStore::Snapshot(

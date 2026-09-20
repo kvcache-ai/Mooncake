@@ -10,6 +10,7 @@
 
 #include "replica.h"
 #include "types.h"
+#include "weight_management.h"
 
 namespace mooncake {
 
@@ -191,6 +192,23 @@ class MetadataStore {
 
     // GetKeyCount semantics unchanged - returns total across ALL tenants
     virtual size_t GetKeyCount() const = 0;
+
+    virtual bool PutWeightMetadata(const WeightRevisionMetadata& metadata) = 0;
+    virtual std::optional<WeightRevisionMetadata> GetWeightMetadata(
+        const WeightRevisionIdentity& identity) const = 0;
+    virtual std::optional<uint64_t> GetWeightMetadataTombstoneGeneration(
+        const WeightRevisionIdentity& identity) const = 0;
+    virtual bool RemoveWeightMetadata(const WeightRevisionIdentity& identity,
+                                      uint64_t metadata_generation) = 0;
+
+    virtual bool PutWeightLease(const WeightRevisionLease& lease) = 0;
+    virtual std::optional<WeightRevisionLease> GetWeightLease(
+        uint64_t lease_id) const = 0;
+    virtual std::optional<WeightRevisionLease> GetWeightLeaseTombstone(
+        uint64_t lease_id) const = 0;
+    virtual bool RemoveWeightLease(uint64_t lease_id,
+                                   const WeightRevisionIdentity& identity,
+                                   uint64_t fenced_metadata_generation) = 0;
 };
 
 }  // namespace mooncake
