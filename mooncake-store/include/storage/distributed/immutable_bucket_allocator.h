@@ -101,9 +101,31 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         std::vector<EvictionCandidate> candidates_;
     };
 
+    class EvictedBucket {
+       public:
+        EvictedBucket() = default;
+        EvictedBucket(const EvictedBucket&) = delete;
+        EvictedBucket& operator=(const EvictedBucket&) = delete;
+        EvictedBucket(EvictedBucket&& other) noexcept;
+        EvictedBucket& operator=(EvictedBucket&& other) noexcept;
+
+        bool Empty() const { return bucket_id_ < 0; }
+        int64_t bucket_id() const { return bucket_id_; }
+
+       private:
+        friend class ImmutableBucketAllocator;
+        int64_t bucket_id_ = -1;
+        std::shared_ptr<void> identity_;
+    };
+
     PendingEviction PrepareEviction();
     PendingEviction PrepareEvictionForAllocationFailure();
-    tl::expected<void, ErrorCode> CommitEviction(PendingEviction&& pending);
+    // Callers coordinating external metadata must commit the allocator state
+    // while holding the same metadata locks, then delete the file after those
+    // locks are released.
+    tl::expected<EvictedBucket, ErrorCode> CommitEvictionLogical(
+        PendingEviction&& pending);
+    tl::expected<void, ErrorCode> DeleteEvictedBucket(EvictedBucket&& bucket);
     void AbortEviction(PendingEviction&& pending);
     size_t RetryFailedEvictions();
 

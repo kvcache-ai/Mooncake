@@ -48,6 +48,20 @@ ImmutableBucketAllocator::PendingEviction::operator=(
     return *this;
 }
 
+ImmutableBucketAllocator::EvictedBucket::EvictedBucket(
+    EvictedBucket&& other) noexcept
+    : bucket_id_(std::exchange(other.bucket_id_, -1)),
+      identity_(std::move(other.identity_)) {}
+
+ImmutableBucketAllocator::EvictedBucket&
+ImmutableBucketAllocator::EvictedBucket::operator=(
+    EvictedBucket&& other) noexcept {
+    if (this == &other) return *this;
+    bucket_id_ = std::exchange(other.bucket_id_, -1);
+    identity_ = std::move(other.identity_);
+    return *this;
+}
+
 ImmutableBucketAllocator::~ImmutableBucketAllocator() {
     initialized_.store(false, std::memory_order_release);
     if (fs_adapter_) fs_adapter_->Shutdown();
@@ -479,49 +493,54 @@ void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending) {
     AbortEvictionLocked(pending, true);
 }
 
-tl::expected<void, ErrorCode> ImmutableBucketAllocator::CommitEviction(
-    PendingEviction&& pending) {
-    BucketPtr bucket;
-    {
-        std::lock_guard lock(mutex_);
-        if (pending.owner_ != this) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        const auto it = buckets_.find(pending.bucket_id_);
-        if (it == buckets_.end() ||
-            it->second.get() != pending.identity_.get() ||
-            it->second->lifecycle != BucketLifecycle::FROZEN ||
-            it->second->pending_entries != 0) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        bucket = it->second;
-        // Logical commit: keys become re-allocatable now; capacity is
-        // released only when the physical delete succeeds.
-        for (const auto& [key, entry] : bucket->entries) {
-            (void)entry;
-            const auto indexed = key_index_.find(key);
-            if (indexed != key_index_.end() && indexed->second == bucket->id) {
-                key_index_.erase(indexed);
-            }
-        }
-        bucket->lifecycle = BucketLifecycle::EVICTING;
-        pending.owner_ = nullptr;
+tl::expected<ImmutableBucketAllocator::EvictedBucket, ErrorCode>
+ImmutableBucketAllocator::CommitEvictionLogical(PendingEviction&& pending) {
+    std::lock_guard lock(mutex_);
+    if (pending.owner_ != this) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    const auto it = buckets_.find(pending.bucket_id_);
+    if (it == buckets_.end() ||
+        it->second.get() != pending.identity_.get() ||
+        it->second->lifecycle != BucketLifecycle::FROZEN ||
+        it->second->pending_entries != 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const BucketPtr bucket = it->second;
+    for (const auto& [key, entry] : bucket->entries) {
+        (void)entry;
+        const auto indexed = key_index_.find(key);
+        if (indexed != key_index_.end() && indexed->second == bucket->id) {
+            key_index_.erase(indexed);
+        }
+    }
+    bucket->lifecycle = BucketLifecycle::EVICTING;
+    EvictedBucket evicted;
+    evicted.bucket_id_ = pending.bucket_id_;
+    evicted.identity_ = pending.identity_;
+    pending.owner_ = nullptr;
+    return evicted;
+}
 
-    auto deleted = fs_adapter_->DeleteFile(BucketDataPath(bucket->id));
+tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
+    EvictedBucket&& bucket) {
+    if (bucket.bucket_id_ < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto deleted = fs_adapter_->DeleteFile(BucketDataPath(bucket.bucket_id_));
     if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND) {
         std::lock_guard lock(mutex_);
-        failed_deletions_.insert(bucket->id);
+        failed_deletions_.insert(bucket.bucket_id_);
         return tl::make_unexpected(deleted.error());
     }
 
     std::lock_guard lock(mutex_);
-    const auto current = buckets_.find(bucket->id);
-    if (current != buckets_.end() && current->second == bucket) {
-        bucket->lifecycle = BucketLifecycle::RETIRED;
+    const auto current = buckets_.find(bucket.bucket_id_);
+    if (current != buckets_.end() && current->second == bucket.identity_) {
+        current->second->lifecycle = BucketLifecycle::RETIRED;
         buckets_.erase(current);
     }
-    failed_deletions_.erase(bucket->id);
+    failed_deletions_.erase(bucket.bucket_id_);
     return {};
 }
 

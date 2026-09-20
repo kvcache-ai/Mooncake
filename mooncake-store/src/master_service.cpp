@@ -7972,6 +7972,8 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
             };
 
         bool all_accepted = true;
+        ImmutableBucketAllocator::EvictedBucket evicted_bucket;
+        bool logical_committed = false;
         {
             std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
             std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
@@ -8024,6 +8026,18 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
             }
 
             if (all_accepted) {
+                auto logical = bucket_allocator_->CommitEvictionLogical(
+                    std::move(pending));
+                if (logical) {
+                    evicted_bucket = std::move(*logical);
+                    logical_committed = true;
+                } else {
+                    LOG(ERROR) << "DFS bucket eviction logical commit failed, "
+                                  "error="
+                               << logical.error();
+                }
+            }
+            if (logical_committed) {
                 for (const auto& [shard_idx, indexes] : indexes_by_shard) {
                     for (const size_t index : indexes) {
                         const auto& candidate = candidates[index];
@@ -8069,12 +8083,17 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
             bucket_allocator_->AbortEviction(std::move(pending));
             continue;
         }
+        if (!logical_committed) {
+            bucket_allocator_->AbortEviction(std::move(pending));
+            continue;
+        }
 
-        auto committed = bucket_allocator_->CommitEviction(std::move(pending));
-        if (!committed) {
+        auto deleted =
+            bucket_allocator_->DeleteEvictedBucket(std::move(evicted_bucket));
+        if (!deleted) {
             LOG(ERROR) << "DFS bucket data deletion failed; capacity remains "
                           "reserved for runtime retry, error="
-                       << committed.error();
+                       << deleted.error();
         } else {
             evicted = true;
             if (force_one) return true;
