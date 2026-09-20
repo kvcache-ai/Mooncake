@@ -389,6 +389,44 @@ TEST(RailMonitorRecoverTest, CooldownDoesNotCarryOverAfterRecovery) {
            "from the previous cycle.";
 }
 
+// ---------------------------------------------------------------------------
+// Defect A: a burst of failures within one error window must not escalate the
+// cooldown. Previously cooldown doubled on every markFailed call, so N error
+// WQEs in 10s pushed a 1s pause to the 300s cap, forcing a multi-minute
+// TCP fallback after the peer had already recovered. Now the cooldown is set
+// once when a fresh pause arms; errors arriving while already paused are
+// no-ops.
+//
+// error_threshold=1, cooldown=1s. 8 rapid markFailed calls must arm resume_time
+// at now+1s, not now+256s.
+// ---------------------------------------------------------------------------
+
+TEST(RailMonitorBurstTest, BurstFailuresDoNotEscalateCooldown) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote = makeSingleNicTopology("mlx5_1");
+
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
+    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
+    cfg.set(RailMonitor::kCfgCooldownSecs, 1);
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
+
+    // A burst of 8 failures within the error window. With the old per-error
+    // doubling, cooldown would be 1->2->4->...->256s (capped 300). With the
+    // fix, only the first failure arms the pause at +1s; the rest are no-ops.
+    for (int i = 0; i < 8; ++i) rail.markFailed(0, 0);
+    EXPECT_FALSE(rail.available(0, 0));
+
+    // 1.5s > 1s initial cooldown, far below any escalated value. If the burst
+    // had escalated, the rail would still be paused here.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    EXPECT_TRUE(rail.available(0, 0))
+        << "A single failure burst must not escalate the cooldown past the "
+           "initial 1s; staying paused past 1.5s indicates per-error doubling.";
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

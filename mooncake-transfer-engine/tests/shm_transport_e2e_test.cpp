@@ -15,13 +15,13 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
-#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unistd.h>
 #include <vector>
 
 #include "common.h"
+#include "shm_hugepage_test_util.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transport/shm_transport/shm_transport.h"
@@ -198,6 +198,66 @@ TEST(ShmTransportE2E, WriteAndReadBetweenEngines) {
                                                   remote_base, length));
     ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
 }
+
+class ShmHugepageE2ETest : public ::testing::TestWithParam<size_t> {};
+
+TEST_P(ShmHugepageE2ETest, WriteAndRead) {
+    const size_t length = GetParam();
+    auto mount = FindHugetlbfsMount(length);
+    if (!mount) {
+        GTEST_SKIP() << "No writable " << HugepageSizeLabel(length)
+                     << " hugetlbfs mount";
+    }
+
+    const uint16_t extra =
+        length == SharedMemoryOptions::kHugepage2MB
+            ? 30
+            : (length == SharedMemoryOptions::kHugepage512MB ? 34 : 32);
+    auto engine_a = MakeEngine(UniqueServerName(extra));
+    auto engine_b = MakeEngine(UniqueServerName(extra + 1));
+    ASSERT_TRUE(engine_a);
+    ASSERT_TRUE(engine_b);
+
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = length;
+    opt.hugetlbfs_path = *mount;
+    opt.populate = false;
+
+    void* remote = engine_a->allocateSharedMemory(length, opt);
+    if (!remote) {
+        GTEST_SKIP() << HugepageSizeLabel(length)
+                     << " hugetlbfs mount present but allocation failed "
+                        "(no free hugepages?)";
+    }
+    ASSERT_EQ(engine_a->registerLocalMemory(remote, length, "cpu:0"), 0);
+
+    auto desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(desc);
+    auto* shm_buffer = FindPosixShmBuffer(*desc);
+    ASSERT_NE(shm_buffer, nullptr);
+    EXPECT_TRUE(isFilesystemShmPath(shm_buffer->shm_name));
+    EXPECT_EQ(shm_buffer->shm_name.rfind(*mount, 0), 0u);
+
+    auto segment_id = engine_b->openSegment(engine_a->getLocalIpAndPort());
+    auto remote_desc = engine_b->getMetadata()->getSegmentDescByID(segment_id);
+    ASSERT_TRUE(remote_desc);
+    auto* remote_shm = FindPosixShmBuffer(*remote_desc);
+    ASSERT_NE(remote_shm, nullptr);
+    EXPECT_TRUE(isFilesystemShmPath(remote_shm->shm_name));
+
+    ASSERT_NO_FATAL_FAILURE(ExpectShmWriteAndRead(*engine_a, *engine_b, remote,
+                                                  remote_shm->addr, length));
+    ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(HugepageSizes, ShmHugepageE2ETest,
+                         ::testing::Values(SharedMemoryOptions::kHugepage2MB,
+                                           SharedMemoryOptions::kHugepage512MB,
+                                           SharedMemoryOptions::kHugepage1GB),
+                         [](const testing::TestParamInfo<size_t>& info) {
+                             return HugepageSizeTestName(info.param);
+                         });
 
 TEST(ShmTransportE2E, WriteAndRead4K) {
     const size_t length = 4096;

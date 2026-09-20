@@ -248,15 +248,18 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
     std::vector<int> put_key_sizes;
     std::vector<char*> put_values;
     std::vector<int> put_value_sizes;
+    std::vector<int> put_preserve_leases;
     put_keys.reserve(puts.size());
     put_key_sizes.reserve(puts.size());
     put_values.reserve(puts.size());
     put_value_sizes.reserve(puts.size());
+    put_preserve_leases.reserve(puts.size());
     for (const auto& put : puts) {
         put_keys.push_back(const_cast<char*>(put.key.data()));
         put_key_sizes.push_back(static_cast<int>(put.key.size()));
         put_values.push_back(const_cast<char*>(put.value.data()));
         put_value_sizes.push_back(static_cast<int>(put.value.size()));
+        put_preserve_leases.push_back(put.preserve_lease ? 1 : 0);
     }
 
     char* err_msg = nullptr;
@@ -265,7 +268,8 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
         compare_values.data(), compare_value_sizes.data(),
         compare_revisions.data(), static_cast<int>(compares.size()),
         put_keys.data(), put_key_sizes.data(), put_values.data(),
-        put_value_sizes.data(), static_cast<int>(puts.size()), &err_msg);
+        put_value_sizes.data(), put_preserve_leases.data(),
+        static_cast<int>(puts.size()), &err_msg);
     if (ret == -2) {
         if (err_msg != nullptr) {
             free(err_msg);

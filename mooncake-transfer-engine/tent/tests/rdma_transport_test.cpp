@@ -76,6 +76,25 @@ class RdmaTransportTestPeer {
         transport.context_set_ = std::move(contexts);
     }
 
+    // Defaults to a monitor tick: that is what the orphan tests stand in for.
+    static void reapOrphanSlices(RdmaTransport& transport,
+                                 bool on_tick = true) {
+        transport.reapOrphanSlices(on_tick);
+    }
+
+    static size_t orphanSliceCount(RdmaTransport& transport) {
+        std::lock_guard<std::mutex> guard(transport.orphan_slice_mutex_);
+        return transport.orphan_slices_.size();
+    }
+    static size_t orphanWarnings(RdmaTransport& transport) {
+        std::lock_guard<std::mutex> guard(transport.orphan_slice_mutex_);
+        return transport.orphan_warnings_;
+    }
+    static void setOrphanWarnAfterPasses(RdmaTransport& transport,
+                                         uint32_t passes) {
+        transport.orphan_warn_after_passes_ = passes;
+    }
+
     // Runs the monitorThread() 1 Hz reclaim tick without starting any worker
     // threads.
     static void reclaimEndpoints(RdmaTransport& transport) {
@@ -257,6 +276,15 @@ class RdmaContextTestPeer {
 // path that does not go through the injectable verbs table (ibv_post_send is
 // an inline that dispatches through the queue pair), so a test stands in for
 // it and puts the slice on the queue pair the way submitSlices would.
+// Tickets are the lock's only observable state; a test that needs to know a
+// thread is queued on it watches them being handed out.
+class TicketLockTestPeer {
+   public:
+    static int ticketsIssued(const TicketLock& lock) {
+        return lock.next_ticket_.load(std::memory_order_acquire);
+    }
+};
+
 class RdmaEndPointTestPeer {
    public:
     static RdmaAddressSnapshot localAddress(const RdmaEndPoint& endpoint) {
@@ -270,6 +298,9 @@ class RdmaEndPointTestPeer {
         slice->ep_weak_ptr = endpoint;
         std::lock_guard<TicketLock> guard(endpoint->queue_lock_list_[qp_index]);
         endpoint->slice_queue_[qp_index].push(slice);
+        // submitSlices() counts the completion the post owes; a stand-in that
+        // skipped it would leave the slice looking settled.
+        slice->completions_owed.fetch_add(1, std::memory_order_acq_rel);
     }
     static void markReady(const std::shared_ptr<RdmaEndPoint>& endpoint) {
         endpoint->status_.store(RdmaEndPoint::EP_READY,
@@ -285,6 +316,11 @@ class RdmaEndPointTestPeer {
     }
     static int inflightSlices(const std::shared_ptr<RdmaEndPoint>& endpoint) {
         return endpoint->inflight_slices_.load();
+    }
+    // Held by a test to stall a completion handler inside acknowledge().
+    static TicketLock& qpLock(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                              int qp_index) {
+        return endpoint->queue_lock_list_[qp_index];
     }
 };
 
@@ -482,6 +518,13 @@ TEST(RdmaNotifyFaultTriageTest, TeardownFlushesStayQuiet) {
     // A real fault surfacing after the endpoint is gone has nothing left to
     // act on.
     EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, false, false), Action::ReportOnly);
+    // The notify QP stays published while the endpoint retires, so a real
+    // fault can still arrive on a not-ready endpoint: it is triaged as on any
+    // other live endpoint, and only flushes are skipped.
+    EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, true, false),
+              Action::RetireEndpoint);
+    EXPECT_EQ(classify(IBV_WC_LOC_LEN_ERR, true, false),
+              Action::DisableNotification);
 }
 
 // context_set_ is subscripted by NicID, so it must keep one slot per NIC even
@@ -681,6 +724,176 @@ TEST_F(RdmaContextEventTest, DeviceFatalMarksUnavailableRegardlessOfPort) {
 TEST_F(RdmaContextEventTest, CqErrLeavesAvailabilityAlone) {
     fire(IBV_EVENT_CQ_ERR, ourPort());
     EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+}
+
+// ---- how a request is cut into slices ------------------------------------
+
+// Walk a plan the way submitTransferTasks() walks it: a block each, and
+// whatever is left for the last. Returns the lengths handed out.
+std::vector<uint64_t> walkPlan(const RdmaSlicePlan& plan, uint64_t length) {
+    std::vector<uint64_t> lengths;
+    uint64_t offset = 0;
+    for (uint64_t i = 0; i < plan.count; ++i) {
+        const uint64_t n =
+            (i + 1 == plan.count) ? length - offset : plan.block_size;
+        lengths.push_back(n);
+        offset += n;
+    }
+    return lengths;
+}
+
+// The whole contract, over a sweep of lengths against both caps: the slices
+// cover the request exactly, none is empty, the cap holds, and the block
+// stays a whole number of configured blocks.
+TEST(RdmaSlicePlanTest, EverySliceCarriesDataAndTheyCoverTheRequest) {
+    constexpr uint64_t kBase = 65536;
+    for (uint64_t max_slices : {32ul, 64ul}) {
+        for (uint64_t length :
+             {1ul, 2ul, kBase - 1, kBase, kBase + 1, 3 * kBase, 3 * kBase + 7,
+              100 * kBase, 100 * kBase + 1, 160 * kBase, 160 * kBase + 8192,
+              1000 * kBase, 1000 * kBase - 1}) {
+            const auto plan = planRdmaSlices(length, kBase, max_slices);
+            SCOPED_TRACE("length=" + std::to_string(length) +
+                         " max=" + std::to_string(max_slices));
+            EXPECT_LE(plan.count, max_slices);
+            EXPECT_GT(plan.count, 0u);
+            EXPECT_EQ(plan.block_size % kBase, 0u);
+
+            const auto lengths = walkPlan(plan, length);
+            uint64_t total = 0;
+            for (size_t i = 0; i < lengths.size(); ++i) {
+                EXPECT_GT(lengths[i], 0u) << "empty slice";
+                if (i + 1 < lengths.size()) {
+                    EXPECT_EQ(lengths[i], plan.block_size);
+                } else {
+                    // The last one carries a folded tail at most.
+                    EXPECT_LE(lengths[i], 2 * plan.block_size);
+                }
+                total += lengths[i];
+            }
+            EXPECT_EQ(total, length);
+        }
+    }
+}
+
+// Under the cap nothing is rounded: blocks are not enlarged unasked.
+TEST(RdmaSlicePlanTest, BelowTheCapTheBlockIsTheConfiguredOne) {
+    constexpr uint64_t kBase = 65536;
+    for (uint64_t blocks = 1; blocks <= 32; ++blocks) {
+        const auto exact = planRdmaSlices(blocks * kBase, kBase, 64);
+        EXPECT_EQ(exact.block_size, kBase) << "blocks=" << blocks;
+        EXPECT_EQ(exact.count, blocks) << "blocks=" << blocks;
+
+        // One byte over is a tail far too short to post on its own, so it
+        // joins the slice before it instead of adding one.
+        const auto ragged = planRdmaSlices(blocks * kBase + 1, kBase, 64);
+        EXPECT_EQ(ragged.block_size, kBase) << "blocks=" << blocks;
+        EXPECT_EQ(ragged.count, blocks) << "blocks=" << blocks;
+    }
+}
+
+// A tail under a quarter block joins the slice before it: one work request
+// and one completion saved, and the request still spread over as many
+// slices as its size deserves. Reducing the count before choosing the block
+// -- what this used to do -- would round the block up to 128 KB instead,
+// which both halves the slices and leaves the 8 KB tail on its own anyway.
+TEST(RdmaSlicePlanTest, AShortTailJoinsTheSliceBeforeIt) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + 8192;  // 520 KB
+
+    const auto plan = planRdmaSlices(length, kBase, 64);
+    EXPECT_EQ(plan.block_size, kBase);  // not widened
+    EXPECT_EQ(plan.count, 8u);          // not 9, and not 5
+
+    const auto lengths = walkPlan(plan, length);
+    ASSERT_EQ(lengths.size(), 8u);
+    EXPECT_EQ(lengths.back(), kBase + 8192);
+    for (size_t i = 0; i + 1 < lengths.size(); ++i)
+        EXPECT_EQ(lengths[i], kBase);
+}
+
+// A tail that is worth a slice of its own keeps one.
+TEST(RdmaSlicePlanTest, ALongTailKeepsItsOwnSlice) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + kBase / 2;  // half a block over
+
+    const auto plan = planRdmaSlices(length, kBase, 64);
+    EXPECT_EQ(plan.block_size, kBase);
+    EXPECT_EQ(plan.count, 9u);
+    EXPECT_EQ(walkPlan(plan, length).back(), kBase / 2);
+}
+
+// The ratio is the whole policy, so a caller can turn folding off.
+TEST(RdmaSlicePlanTest, AZeroRatioNeverFolds) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + 1;
+
+    const auto folded = planRdmaSlices(length, kBase, 64);
+    const auto plain = planRdmaSlices(length, kBase, 64, /*merge_ratio=*/0.0);
+    EXPECT_EQ(folded.count, 8u);
+    EXPECT_EQ(plain.count, 9u);
+    EXPECT_EQ(walkPlan(plain, length).back(), 1u);
+}
+
+// Folding never empties the plan: two slices whose tail is short become one
+// slice holding everything, not zero.
+TEST(RdmaSlicePlanTest, FoldingNeverDropsTheLastSlice) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(kBase + 1, kBase, 64);
+    EXPECT_EQ(plan.count, 1u);
+    EXPECT_EQ(walkPlan(plan, kBase + 1).front(), kBase + 1);
+}
+
+// The regression: a 10 MB read asks for 64 slices of 160 KB, rounded up to
+// 192 KB, and 54 of those cover it. Asking for 64 anyway left ten empty.
+TEST(RdmaSlicePlanTest, RoundingUpTheBlockTakesTheSurplusOutOfTheCount) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(10ull << 20, kBase, 64);
+    EXPECT_EQ(plan.block_size, 3 * kBase);  // 192 KB
+    EXPECT_EQ(plan.count, 54u);             // not 64
+
+    // The same shape one cap down, where writes and CUDA sources live.
+    const auto write = planRdmaSlices(3ull << 20, kBase, 32);
+    EXPECT_EQ(write.block_size, 2 * kBase);  // 128 KB
+    EXPECT_EQ(write.count, 24u);             // not 32
+}
+
+// Dividing evenly needs no rounding, so the count is the cap -- nothing was
+// wasted here before the change either.
+TEST(RdmaSlicePlanTest, ArequestThatDividesEvenlyUsesTheWholeCap) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(6ull << 20, kBase, 32);
+    EXPECT_EQ(plan.block_size, 3 * kBase);  // 192 KB
+    EXPECT_EQ(plan.count, 32u);
+}
+
+// However large the request, the count stops at the cap and the block grows.
+TEST(RdmaSlicePlanTest, TheCapBoundsTheCountAndTheBlockGrowsInstead) {
+    constexpr uint64_t kBase = 65536;
+    const auto small = planRdmaSlices(1ull << 30, kBase, 32);
+    const auto large = planRdmaSlices(1ull << 30, kBase, 64);
+    EXPECT_LE(small.count, 32u);
+    EXPECT_LE(large.count, 64u);
+    EXPECT_GT(small.block_size, large.block_size);
+    EXPECT_EQ(small.block_size % kBase, 0u);
+    EXPECT_EQ(large.block_size % kBase, 0u);
+}
+
+// A zero-length request keeps its one slice; a zero cap or block is treated
+// as one rather than dividing by zero.
+TEST(RdmaSlicePlanTest, DegenerateInputsStayInRange) {
+    constexpr uint64_t kBase = 65536;
+    const auto empty = planRdmaSlices(0, kBase, 64);
+    EXPECT_EQ(empty.count, 1u);
+    EXPECT_EQ(empty.block_size, kBase);
+
+    const auto no_cap = planRdmaSlices(4096, kBase, 0);
+    EXPECT_EQ(no_cap.count, 1u);
+
+    const auto no_block = planRdmaSlices(4096, 0, 64);
+    EXPECT_GT(no_block.count, 0u);
+    EXPECT_LE(no_block.count, 64u);
+    EXPECT_EQ(walkPlan(no_block, 4096).size(), no_block.count);
 }
 
 // ibv_query_port_speed() exists only in rdma-core >= 62. It must be resolved
@@ -2368,6 +2581,206 @@ TEST_F(RdmaWorkersSharedQpTest, TwoPostersOnOneQueuePairKeepPostingOrder) {
     EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
     EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
     EXPECT_EQ(RdmaEndPointTestPeer::inflightSlices(endpoint_), 0);
+}
+
+// The orphan list is about slice storage outliving a work request; it has
+// nothing to do with lane sharing. The fixture above is borrowed only for
+// its fake verbs and a live endpoint to post on.
+class RdmaSliceOrphanTest : public RdmaWorkersSharedQpTest {
+   protected:
+    // Stop TearDown from freeing this slice: something else owns it now.
+    void forgetSlice(RdmaSlice* slice) {
+        slices_.erase(std::remove(slices_.begin(), slices_.end(), slice),
+                      slices_.end());
+    }
+
+    // A sub-batch holding exactly `slice`, as submitTransferTasks would leave
+    // it, handed to freeSubBatch().
+    void freeBatchHolding(RdmaSlice* slice) {
+        Transport::SubBatchRef batch = nullptr;
+        ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+        auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
+        ASSERT_NE(rdma_batch, nullptr);
+        rdma_batch->slice_chain.push_back(slice);
+        forgetSlice(slice);
+        ASSERT_TRUE(transport_.freeSubBatch(batch).ok());
+    }
+};
+
+// A timeout resolves a slice without waiting for its completion, so the batch
+// can read terminal and be freed while a work request is still live. Returning
+// that slice to the slab would let the stale completion resolve whoever gets
+// the storage next, reporting bytes that never moved.
+TEST_F(RdmaSliceOrphanTest, AFreedBatchHoldsBackASliceStillOwedACompletion) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    ASSERT_EQ(slice->completions_owed.load(), 1);
+
+    freeBatchHolding(slice);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // Still nothing to reap: the completion has not arrived and the endpoint
+    // that owes it is alive.
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    completeWith(slice, IBV_WC_SUCCESS);
+    EXPECT_EQ(slice->completions_owed.load(), 0);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// The ordinary path: every slice already polled, nothing held back.
+TEST_F(RdmaSliceOrphanTest, AFreedBatchReturnsASettledSliceStraightAway) {
+    auto* slice = makeSlice();  // never posted
+    ASSERT_EQ(slice->completions_owed.load(), 0);
+    freeBatchHolding(slice);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// The completion may never arrive -- destroying a queue pair clears the
+// completions naming it -- so a gone endpoint settles the orphan too.
+TEST_F(RdmaSliceOrphanTest, AnOrphanIsReapedOnceItsEndpointIsGone) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(slice);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    endpoint_.reset();
+    ASSERT_TRUE(slice->ep_weak_ptr.expired());
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// An orphan is only held while its endpoint is alive, so one that outlives
+// the threshold means a queue pair is not being destroyed. That is reported
+// once per slice, and the slice stays held: freeing it on age would hand the
+// completion queue a dangling address again.
+TEST_F(RdmaSliceOrphanTest, ALingeringOrphanIsReportedOnceAndStillHeld) {
+    RdmaTransportTestPeer::setOrphanWarnAfterPasses(transport_, 3);
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(slice);
+
+    for (int pass = 0; pass < 2; ++pass)
+        RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 0u);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);  // third pass
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 1u);
+    for (int pass = 0; pass < 5; ++pass)
+        RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 1u);    // once
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);  // held
+
+    completeWith(slice, IBV_WC_SUCCESS);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// The handler reads the slice well past acknowledge(), which is what
+// publishes the terminal status the caller is waiting for. A batch freed in
+// that window must not return the storage, and the reaper must not take it
+// either: the completion is paid at the end of the handler, so both see the
+// slice as still owed until it returns.
+TEST_F(RdmaSliceOrphanTest, ASliceIsHeldWhileItsCompletionIsBeingHandled) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+
+    // Stall the handler where it resolves the slice: acknowledge() takes the
+    // queue pair's lock, which this thread holds until the checks below are
+    // done.
+    auto& qp_lock = RdmaEndPointTestPeer::qpLock(endpoint_, 0);
+    qp_lock.lock();
+    const int tickets_before = TicketLockTestPeer::ticketsIssued(qp_lock);
+    std::thread poller([&] { completeWith(slice, IBV_WC_SUCCESS); });
+    // It is where we want it once it holds a ticket behind ours: queued on
+    // the lock, past everything the handler does before acknowledge().
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (TicketLockTestPeer::ticketsIssued(qp_lock) == tickets_before) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            qp_lock.unlock();
+            poller.join();
+            FAIL() << "the handler never queued on the queue pair lock";
+        }
+        std::this_thread::yield();
+    }
+
+    freeBatchHolding(slice);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    qp_lock.unlock();
+    poller.join();
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// What the counter is for, end to end. A freed slice goes to the back of the
+// thread's ring in the slab, so a ring's worth of allocations is all it takes
+// for the address to come back -- a handful of transfers, not a rare event.
+// Handed out, it would be the work-request id of a live post naming somebody
+// else's slice, and the stale completion would resolve that one instead.
+TEST_F(RdmaSliceOrphanTest, AHeldSliceIsNeverHandedToTheNextTransfer) {
+    auto* held = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(held);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // Drain the ring: without the hold, the address is in here.
+    std::vector<RdmaSlice*> reused;
+    for (size_t i = 0; i < SlabBase::kMaxFreeListSizeInThread; ++i)
+        reused.push_back(RdmaSliceStorage::Get().allocate());
+    EXPECT_EQ(std::count(reused.begin(), reused.end(), held), 0)
+        << "a slice still owed a completion was handed to a new transfer";
+    for (auto* slice : reused) RdmaSliceStorage::Get().deallocate(slice);
+
+    // The completion really is still live: it lands on the held slice and
+    // resolves it, which is what it would have done to whoever had the
+    // storage instead -- COMPLETED, with the length of a transfer that never
+    // ran added to that task's byte count.
+    completeWith(held, IBV_WC_SUCCESS);
+    EXPECT_EQ(held->word, COMPLETED);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// A batch free reaps opportunistically so a straggler is not held for a whole
+// monitor tick. Those reaps must not age an orphan: counting them would report
+// a lingering one after a handful of transfers instead of after about a
+// minute, which is the only reading that says a queue pair is stuck.
+TEST_F(RdmaSliceOrphanTest, AnOpportunisticReapDoesNotAgeAnOrphan) {
+    RdmaTransportTestPeer::setOrphanWarnAfterPasses(transport_, 1);
+    auto* held = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(held);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // Every one of these runs the reap inside freeSubBatch().
+    for (int pass = 0; pass < 3; ++pass) freeBatchHolding(makeSlice());
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 0u);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // The monitor's tick is the one that ages it.
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 1u);
+}
+
+// The reaper empties the list before scanning it, so an unsettled slice has
+// to be put back -- and put back once, not dropped and not duplicated.
+TEST_F(RdmaSliceOrphanTest, AnUnsettledOrphanSurvivesRepeatedReaps) {
+    auto* kept = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    auto* settled = postSlice(/*lane=*/1, /*enqueue_ts=*/0);
+    freeBatchHolding(kept);
+    freeBatchHolding(settled);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 2u);
+
+    // One of them gets its completion; the other is scanned three times and
+    // stays exactly once in the list.
+    completeWith(settled, IBV_WC_SUCCESS);
+    for (int pass = 0; pass < 3; ++pass) {
+        RdmaTransportTestPeer::reapOrphanSlices(transport_);
+        ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u)
+            << "pass " << pass;
+    }
+    completeWith(kept, IBV_WC_SUCCESS);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
 }
 
 TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {

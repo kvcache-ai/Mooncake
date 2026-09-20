@@ -34,6 +34,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "buffer_range_index.h"
 #include "common.h"
 #include "topology.h"
 
@@ -125,6 +126,12 @@ class TransferMetadata {
         std::vector<DeviceDesc> devices;
         Topology topology;
         std::vector<BufferDesc> buffers;
+        // Derived from `buffers`. Rebuild after every mutation of that
+        // vector, before the descriptor is published through a shared_ptr.
+        // Copying a SegmentDesc copies this snapshot; a subsequent
+        // push_back/erase must call rebuildBufferRangeIndex() again.
+        BufferRangeIndex buffer_range_index;
+        void rebuildBufferRangeIndex() { buffer_range_index.rebuild(buffers); }
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // this is for cxl.
