@@ -50,9 +50,7 @@ thread_local const ControlService* ControlService::active_bootstrap_service_ =
     nullptr;
 thread_local const ControlService* ControlService::active_notify_service_ =
     nullptr;
-// Async retries retain the originating agent and its connection pool.
-thread_local auto tl_rpc_agent_owner = std::make_shared<CoroRpcAgent>();
-thread_local CoroRpcAgent& tl_rpc_agent = *tl_rpc_agent_owner;
+thread_local CoroRpcAgent tl_rpc_agent;
 
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
                                      std::string& response) {
@@ -690,8 +688,7 @@ void ControlClient::notifySegmentUpdatedAsync(
     const onNotifySegmentUpdateFailure& on_failure) {
     json j = segment_name;
     std::string request = j.dump();
-    auto rpc_agent = tl_rpc_agent_owner;
-    rpc_agent->callAsyncRetryOnce(
+    tl_rpc_agent.callAsyncRetryOnce(
         server_addr, NotifySegmentUpdated, request,
         [on_failure](const Status& status, const std::string&) {
             if (!status.ok()) on_failure();
