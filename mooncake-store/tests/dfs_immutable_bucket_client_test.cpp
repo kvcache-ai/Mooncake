@@ -56,7 +56,8 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         SetEnv("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.0");
         SetEnv("MOONCAKE_DFS_SINGLE_TENANT", "true");
 
-        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+        ASSERT_TRUE(master_.Start(
+            InProcMasterConfigBuilder().set_default_kv_lease_ttl(0).build()));
         writer_ = CreateClient("127.0.0.1:18201");
         provider_ = CreateClient("127.0.0.1:18202");
         ASSERT_NE(writer_, nullptr);
@@ -166,6 +167,39 @@ TEST_F(DfsImmutableBucketClientTest, PutReturnsAfterWriteAndFailureRevokes) {
     auto missing = writer_->Query("failed");
     ASSERT_FALSE(missing);
     EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(DfsImmutableBucketClientTest, SameSizeUpsertAllocatesNewBucketRange) {
+    const std::string key = "same_size_upsert";
+    std::string initial(4096, 'A');
+    auto initial_slices = Slices(initial);
+    ASSERT_TRUE(writer_->Put(key, initial_slices, DfsConfig()));
+
+    auto initial_query = writer_->Query(key);
+    ASSERT_TRUE(initial_query);
+    auto initial_dfs = std::find_if(initial_query->replicas.begin(),
+                                    initial_query->replicas.end(),
+                                    [](const Replica::Descriptor& descriptor) {
+                                        return descriptor.is_dfs_replica();
+                                    });
+    ASSERT_NE(initial_dfs, initial_query->replicas.end());
+    const auto initial_descriptor = initial_dfs->get_dfs_descriptor();
+
+    std::string replacement(4096, 'B');
+    auto replacement_slices = Slices(replacement);
+    ASSERT_TRUE(writer_->Upsert(key, replacement_slices, DfsConfig()));
+
+    auto replacement_query = writer_->Query(key);
+    ASSERT_TRUE(replacement_query);
+    auto replacement_dfs = std::find_if(
+        replacement_query->replicas.begin(), replacement_query->replicas.end(),
+        [](const Replica::Descriptor& descriptor) {
+            return descriptor.is_dfs_replica();
+        });
+    ASSERT_NE(replacement_dfs, replacement_query->replicas.end());
+    const auto& replacement_descriptor = replacement_dfs->get_dfs_descriptor();
+    EXPECT_NE(replacement_descriptor.shard_idx, initial_descriptor.shard_idx);
+    EXPECT_NE(replacement_descriptor.file_path, initial_descriptor.file_path);
 }
 
 TEST_F(DfsImmutableBucketClientTest, ExhaustionEvictsWholeBucketAndRetries) {
