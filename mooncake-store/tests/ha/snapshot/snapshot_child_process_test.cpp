@@ -194,7 +194,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     void CheckWeightSnapshotBoundary(SnapshotBoundaryBackend::Gate gate,
-                                     bool stop_while_pending = false) {
+                                     bool stop_while_pending = false,
+                                     bool publish_operation = false) {
         const std::string cluster = "weight-snapshot-boundary";
         auto backend = std::make_shared<SnapshotBoundaryBackend>();
         CreateService(
@@ -223,6 +224,50 @@ class SnapshotChildProcessTest : public ::testing::Test {
                                          .expected_payload_count = 1,
                                          .expected_logical_bytes = 1});
         };
+        std::optional<WeightRevisionMetadata> ready;
+        std::optional<WeightResidencyOperation> operation;
+        if (publish_operation) {
+            const auto client_id = generate_uuid();
+            Segment segment;
+            segment.id = generate_uuid();
+            segment.name = "weight-snapshot-segment";
+            segment.te_endpoint = segment.name;
+            segment.base = 0x300000000;
+            segment.size = 16 * 1024 * 1024;
+            ASSERT_TRUE(service_->MountSegment(segment, client_id));
+            auto importing = begin();
+            ASSERT_TRUE(importing.has_value());
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.with_hard_pin = true;
+            config.group_ids =
+                std::vector<std::string>{importing->manifest.payload_group_id};
+            const auto manifest_key = MakeWeightManifestKey(identity);
+            for (const auto& key : {std::string("payload"), manifest_key}) {
+                config.data_type = key == "payload" ? ObjectDataType::WEIGHT
+                                                    : ObjectDataType::METADATA;
+                ASSERT_TRUE(service_->PutStart(client_id, key,
+                                               TenantId::Default(), 1, config));
+                ASSERT_TRUE(service_->PutEnd(
+                    client_id, key, TenantId::Default(), ReplicaType::MEMORY));
+            }
+            auto committed =
+                service_->CommitWeightImport(CommitWeightImportRequest{
+                    .identity = identity,
+                    .expected_metadata_generation =
+                        importing->metadata_generation,
+                    .manifest = WeightManifestReference{
+                        .manifest_key = manifest_key,
+                        .manifest_sha256 = std::string(64, 'a'),
+                        .payload_group_id =
+                            importing->manifest.payload_group_id,
+                        .payload_keys_sha256 =
+                            ComputeWeightPayloadKeysSha256({"payload"}),
+                        .payload_count = 1,
+                        .logical_bytes = 1}});
+            ASSERT_TRUE(committed.has_value());
+            ready = *committed;
+        }
         auto manager = CreateTempSnapshotManager();
         backend->Arm(gate);
         std::future<void> mutation;
@@ -253,8 +298,20 @@ class SnapshotChildProcessTest : public ::testing::Test {
                            published_before_prefix_return);
             backend->Release();
         } else {
-            mutation = std::async(std::launch::async,
-                                  [&] { EXPECT_TRUE(begin().has_value()); });
+            mutation = std::async(std::launch::async, [&] {
+                if (publish_operation) {
+                    auto started = service_->StartWeightResidencyOperation(
+                        StartWeightResidencyOperationRequest{
+                            .identity = identity,
+                            .expected_metadata_generation =
+                                ready->metadata_generation,
+                            .target_residency = WeightResidencyState::COLD});
+                    EXPECT_TRUE(started.has_value());
+                    if (started) operation = *started;
+                } else {
+                    EXPECT_TRUE(begin().has_value());
+                }
+            });
             const bool entered = backend->WaitForGate();
             if (!entered) backend->Release();
             ASSERT_TRUE(entered);
@@ -300,8 +357,11 @@ class SnapshotChildProcessTest : public ::testing::Test {
         backend->Release();
         mutation.get();
         manager.reset();
+        RecordProperty("publication_gate_timed_out", backend->TimedOut());
         ASSERT_FALSE(backend->TimedOut());
         ASSERT_TRUE(snapshot.has_value());
+        RecordProperty("captured_sequence",
+                       std::to_string(snapshot->snapshot_sequence_id));
 
         StandbyMetadataStore standby;
         ASSERT_TRUE(standby.RestoreWeightMetadata(snapshot->weight_metadata));
@@ -328,6 +388,21 @@ class SnapshotChildProcessTest : public ::testing::Test {
         ASSERT_EQ(primary.has_value(), recovered.has_value());
         if (primary && recovered) {
             EXPECT_EQ(primary->metadata, *recovered);
+        }
+        if (publish_operation) {
+            ASSERT_TRUE(operation.has_value());
+            const auto queried =
+                service_->QueryWeightOperation(QueryWeightOperationRequest{
+                    .operation_id = operation->operation_id});
+            ASSERT_TRUE(queried.has_value());
+            EXPECT_EQ(*operation, *queried);
+            const auto recovered_operation =
+                standby.GetWeightOperation(operation->operation_id);
+            ASSERT_TRUE(recovered_operation.has_value())
+                << "durable operation missing after periodic snapshot restore "
+                   "and suffix replay; snapshot sequence="
+                << snapshot->snapshot_sequence_id;
+            EXPECT_EQ(*queried, *recovered_operation);
         }
     }
 
@@ -693,6 +768,12 @@ TEST_F(SnapshotChildProcessTest, WeightSnapshotExcludesPublicationAfterPrefix) {
 
 TEST_F(SnapshotChildProcessTest, WeightSnapshotWaitsForDurablePublication) {
     CheckWeightSnapshotBoundary(SnapshotBoundaryBackend::Gate::DurableTxn);
+}
+
+TEST_F(SnapshotChildProcessTest,
+       WeightSnapshotWaitsForDurableOperationPublication) {
+    CheckWeightSnapshotBoundary(SnapshotBoundaryBackend::Gate::DurableTxn,
+                                false, true);
 }
 
 TEST_F(SnapshotChildProcessTest, WeightSnapshotStopWhilePublicationPending) {

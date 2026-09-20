@@ -1,6 +1,7 @@
 #include "weight_store_manager.h"
 
 #include <chrono>
+#include <algorithm>
 #include <condition_variable>
 #include <limits>
 #include <memory>
@@ -39,8 +40,10 @@ WeightMetadataStore::Result<T> PersistAndPublish(
             completion->cv.notify_all();
         });
     if (!persisted) {
-        LOG(ERROR) << "Failed to persist " << error_context
-                   << ", error=" << static_cast<int>(persisted.error());
+        if (!error_context.empty()) {
+            LOG(ERROR) << "Failed to persist " << error_context
+                       << ", error=" << static_cast<int>(persisted.error());
+        }
         return tl::make_unexpected(WeightManagementError::DURABILITY_FAILED);
     }
 
@@ -369,6 +372,276 @@ WeightStoreManager::PersistAndPublishWeightLeaseMutation(
                               "mutation, sequence_id="
                            << durable_entry.sequence_id
                            << ", lease_id=" << mutation.lease_id
+                           << ", error=" << static_cast<int>(result.error());
+            }
+            return result;
+        });
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WeightStoreManager::StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request) {
+    const auto canonical_group = MakeWeightPayloadGroupId(request.identity);
+    if (canonical_group.empty()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+    [[maybe_unused]] auto group_operation_lock =
+        LockGroup(request.identity);
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    auto mutation = weight_metadata_.PrepareStartOperation(request, now_ms);
+    if (!mutation) {
+        return tl::make_unexpected(mutation.error());
+    }
+    if (!mutation->no_op) {
+        auto members = backend_.SnapshotWeightGroup(
+            request.identity,
+            mutation->metadata.next->manifest.payload_group_id);
+        if (!members || members->size() !=
+                            mutation->metadata.next->manifest.payload_count +
+                                1) {
+            return tl::make_unexpected(WeightManagementError::NOT_READY);
+        }
+        mutation->next->total_members = members->size();
+    }
+    return PersistAndPublishWeightOperationMutation(*mutation);
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WeightStoreManager::QueryWeightOperation(
+    const QueryWeightOperationRequest& request) const {
+    return weight_metadata_.QueryOperation(request.operation_id);
+}
+
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WeightStoreManager::ReconcileWeightRevision(
+    const ReconcileWeightRevisionRequest& request) {
+    auto group_operation_lock = LockGroup(request.identity);
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    auto view = weight_metadata_.Get(request.identity, now_ms);
+    if (!view) {
+        return tl::make_unexpected(view.error());
+    }
+    const auto current = view->metadata;
+    if (current.availability == WeightAvailabilityState::DELETED) {
+        return current;
+    }
+    if (current.operation == WeightOperationState::EVICTING) {
+        backend_.EvictManagedWeightGroupToCold(current);
+    }
+
+    auto members = backend_.SnapshotWeightGroup(request.identity,
+                                       current.manifest.payload_group_id);
+    const bool absent = !members &&
+                        members.error() == WeightManagementError::NOT_FOUND;
+    if (!members && !absent) {
+        return tl::make_unexpected(members.error());
+    }
+
+    if (current.availability == WeightAvailabilityState::DELETING) {
+        if (!absent) {
+            return current;
+        }
+        auto mutation = weight_metadata_.PrepareFinishDelete(
+            current.identity, current.metadata_generation, now_ms);
+        if (!mutation) {
+            return tl::make_unexpected(mutation.error());
+        }
+        return PersistAndPublishWeightMutation(*mutation);
+    }
+
+    bool complete = !absent &&
+                    members->size() == current.manifest.payload_count + 1;
+    bool manifest_found = false;
+    bool all_memory = complete;
+    bool all_cold = complete;
+    bool any_readable = false;
+    uint64_t logical_bytes = 0;
+    std::vector<std::string> payload_keys;
+    if (!absent) {
+        for (const auto& member : *members) {
+            complete = complete && member.readable;
+            any_readable = any_readable || member.readable;
+            all_memory = all_memory && member.has_memory;
+            all_cold = all_cold && member.has_cold && !member.has_memory;
+            if (member.key == current.manifest.manifest_key &&
+                member.data_type == ObjectDataType::METADATA) {
+                manifest_found = true;
+            } else if (member.data_type == ObjectDataType::WEIGHT &&
+                       member.size <= std::numeric_limits<uint64_t>::max() -
+                                          logical_bytes) {
+                logical_bytes += member.size;
+                payload_keys.push_back(member.key);
+            } else {
+                complete = false;
+            }
+        }
+    }
+    complete = complete && manifest_found &&
+               payload_keys.size() == current.manifest.payload_count &&
+               logical_bytes == current.manifest.logical_bytes &&
+               ComputeWeightPayloadKeysSha256(payload_keys) ==
+                   current.manifest.payload_keys_sha256;
+    const auto observed_residency =
+        absent || !any_readable
+            ? WeightResidencyState::ABSENT
+            : (all_memory ? WeightResidencyState::HOT
+                          : (all_cold ? WeightResidencyState::COLD
+                                      : WeightResidencyState::MIXED));
+
+    if (current.operation != WeightOperationState::NONE) {
+        auto operation = weight_metadata_.QueryOperation(current.operation_id);
+        if (!operation) {
+            return tl::make_unexpected(operation.error());
+        }
+        if (complete && observed_residency == operation->target_residency) {
+            auto mutation = weight_metadata_.PrepareFinishOperation(
+                operation->operation_id, observed_residency, now_ms);
+            if (!mutation) {
+                return tl::make_unexpected(mutation.error());
+            }
+            auto finished = PersistAndPublishWeightOperationMutation(*mutation);
+            if (!finished) {
+                return tl::make_unexpected(finished.error());
+            }
+            auto reconciled = weight_metadata_.Get(request.identity, now_ms);
+            if (!reconciled) {
+                return tl::make_unexpected(reconciled.error());
+            }
+            return reconciled->metadata;
+        }
+        uint64_t processed_members = 0;
+        std::string cursor;
+        if (!absent) {
+            for (const auto& member : *members) {
+                const bool satisfied =
+                    operation->target_residency == WeightResidencyState::HOT
+                        ? member.has_memory
+                        : member.has_cold && !member.has_memory;
+                if (satisfied) {
+                    ++processed_members;
+                    cursor = member.key;
+                }
+            }
+        }
+        auto progress = weight_metadata_.PrepareUpdateOperationProgress(
+            operation->operation_id, processed_members,
+            operation->total_members == 0 ? current.manifest.payload_count + 1
+                                          : operation->total_members,
+            std::move(cursor),
+            complete ? WeightAvailabilityState::READY
+                     : WeightAvailabilityState::DEGRADED,
+            observed_residency, now_ms);
+        if (!progress) {
+            return tl::make_unexpected(progress.error());
+        }
+        auto published = PersistAndPublishWeightOperationMutation(*progress);
+        if (!published) {
+            return tl::make_unexpected(published.error());
+        }
+        auto reconciled = weight_metadata_.Get(request.identity, now_ms);
+        if (!reconciled) {
+            return tl::make_unexpected(reconciled.error());
+        }
+        return reconciled->metadata;
+    }
+
+    const auto availability = complete ? WeightAvailabilityState::READY
+                                       : WeightAvailabilityState::DEGRADED;
+    auto mutation = weight_metadata_.PrepareReconcile(
+        current.identity, current.metadata_generation, availability,
+        observed_residency, now_ms);
+    if (!mutation) {
+        return tl::make_unexpected(mutation.error());
+    }
+    return PersistAndPublishWeightMutation(*mutation);
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WeightStoreManager::DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request) {
+    const auto canonical_group = MakeWeightPayloadGroupId(request.identity);
+    if (canonical_group.empty()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+    [[maybe_unused]] auto group_operation_lock = LockGroup(request.identity);
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    auto mutation = weight_metadata_.PrepareDelete(request, now_ms);
+    if (!mutation) {
+        return tl::make_unexpected(mutation.error());
+    }
+    // Retire leases durably before publishing a state that cannot own leases.
+    for (const auto& expired :
+         weight_metadata_.PrepareExpireLeases(now_ms, request.identity)) {
+        auto retired = PersistAndPublishWeightLeaseMutation(expired);
+        if (!retired) {
+            return tl::make_unexpected(retired.error());
+        }
+    }
+    auto deleting = PersistAndPublishWeightMutation(*mutation);
+    if (!deleting) {
+        return tl::make_unexpected(deleting.error());
+    }
+
+    auto keys = backend_.GetGroupMemberKeys(TenantId(request.identity.tenant_id),
+                                   deleting->manifest.payload_group_id);
+    std::stable_sort(keys.begin(), keys.end(), [&](const auto& lhs,
+                                                   const auto& rhs) {
+        return lhs != deleting->manifest.manifest_key &&
+               rhs == deleting->manifest.manifest_key;
+    });
+    for (const auto& key : keys) {
+        auto removed = backend_.RemoveObject(key, TenantId(request.identity.tenant_id),
+                                    true, true);
+        if (!removed && removed.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            return tl::make_unexpected(WeightManagementError::BUSY);
+        }
+    }
+    group_operation_lock.unlock();
+    return ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = request.identity});
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WeightStoreManager::PersistAndPublishWeightOperationMutation(
+    const WeightOperationMutation& mutation) {
+    std::shared_lock mutation_lock(mutation_mutex_);
+    if (!mutation.no_op && !backend_.CanPublishWeightMutations()) {
+        return tl::make_unexpected(WeightManagementError::DURABILITY_FAILED);
+    }
+    if (mutation.no_op || !backend_.IsOpLogEnabled()) {
+        return weight_metadata_.Publish(mutation);
+    }
+    if (!mutation.metadata.next.has_value() || !mutation.next.has_value()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+
+    const auto encoded = struct_pack::serialize(WeightMetadataUpsertOp{
+        .metadata = *mutation.metadata.next,
+        .operation = *mutation.next,
+    });
+    const std::string payload(encoded.begin(), encoded.end());
+
+    return PersistAndPublish<WeightResidencyOperation>(
+        backend_, OpType::WEIGHT_METADATA_UPSERT,
+        mutation.metadata.identity.tenant_id,
+        MakeWeightRevisionMetadataKey(mutation.metadata.identity), payload, "",
+        [this, mutation](const OpLogEntry& durable_entry) {
+            auto result = weight_metadata_.Publish(mutation);
+            if (!result) {
+                LOG(ERROR) << "Failed to publish durable weight operation, "
+                              "sequence_id="
+                           << durable_entry.sequence_id
+                           << ", operation_id=" << mutation.next->operation_id
                            << ", error=" << static_cast<int>(result.error());
             }
             return result;

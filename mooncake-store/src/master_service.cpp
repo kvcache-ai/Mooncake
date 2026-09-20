@@ -1726,9 +1726,29 @@ WeightMetadataStore::Result<void> MasterService::ReleaseWeightRevisionLease(
     return weight_manager_.ReleaseWeightRevisionLease(request);
 }
 
+WeightMetadataStore::Result<WeightResidencyOperation>
+MasterService::StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request) {
+    return weight_manager_.StartWeightResidencyOperation(request);
+}
 
+WeightMetadataStore::Result<WeightResidencyOperation>
+MasterService::QueryWeightOperation(
+    const QueryWeightOperationRequest& request) const {
+    return weight_manager_.QueryWeightOperation(request);
+}
 
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::ReconcileWeightRevision(
+    const ReconcileWeightRevisionRequest& request) {
+    return weight_manager_.ReconcileWeightRevision(request);
+}
 
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request) {
+    return weight_manager_.DeleteWeightRevision(request);
+}
 
 void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
                                           const std::string& key,
