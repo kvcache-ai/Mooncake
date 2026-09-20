@@ -544,14 +544,12 @@ MasterMetricManager::MasterMetricManager()
           "Total number of failed MarkTaskToComplete requests"),
       weight_revisions_by_availability_(
           "master_weight_revisions",
-          "Current managed weight revisions by availability",
-          {"availability"}),
+          "Current managed weight revisions by availability", {"availability"}),
       weight_revisions_by_residency_(
           "master_weight_revision_residency",
           "Current managed weight revisions by residency", {"residency"}),
-      weight_active_leases_(
-          "master_weight_active_leases",
-          "Current unexpired managed weight revision leases"),
+      weight_active_leases_("master_weight_active_leases",
+                            "Current unexpired managed weight revision leases"),
       weight_pending_operations_(
           "master_weight_pending_operations",
           "Current unfinished managed weight residency operations"),
@@ -2036,22 +2034,22 @@ void MasterMetricManager::project_weight_metadata(
     };
 
     for (const auto& [state, label] : availability_labels) {
-        const auto count = std::count_if(
-            snapshot.metadata.begin(), snapshot.metadata.end(),
-            [state](const auto& metadata) {
-                return metadata.availability == state;
-            });
-        weight_revisions_by_availability_.update(
-            {label}, static_cast<int64_t>(count));
+        const auto count =
+            std::count_if(snapshot.metadata.begin(), snapshot.metadata.end(),
+                          [state](const auto& metadata) {
+                              return metadata.availability == state;
+                          });
+        weight_revisions_by_availability_.update({label},
+                                                 static_cast<int64_t>(count));
     }
     for (const auto& [state, label] : residency_labels) {
-        const auto count = std::count_if(
-            snapshot.metadata.begin(), snapshot.metadata.end(),
-            [state](const auto& metadata) {
-                return metadata.residency == state;
-            });
-        weight_revisions_by_residency_.update(
-            {label}, static_cast<int64_t>(count));
+        const auto count =
+            std::count_if(snapshot.metadata.begin(), snapshot.metadata.end(),
+                          [state](const auto& metadata) {
+                              return metadata.residency == state;
+                          });
+        weight_revisions_by_residency_.update({label},
+                                              static_cast<int64_t>(count));
     }
 
     const auto active_leases = std::count_if(
@@ -2072,9 +2070,9 @@ void MasterMetricManager::project_weight_metadata(
         }
     }
     weight_pending_operations_.update(pending_operations);
-    weight_oldest_operation_age_ms_.update(static_cast<int64_t>(std::min(
-        oldest_age_ms,
-        static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))));
+    weight_oldest_operation_age_ms_.update(static_cast<int64_t>(
+        std::min(oldest_age_ms,
+                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))));
 }
 
 void MasterMetricManager::inc_weight_reconciliation_failures(int64_t val) {

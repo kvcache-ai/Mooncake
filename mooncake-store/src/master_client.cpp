@@ -503,12 +503,12 @@ void MasterClient::EnableHaConnectionPolicy() {
     ha_connection_policy_enabled_.store(true, std::memory_order_release);
 }
 
-#define DEFINE_WEIGHT_CLIENT_METHOD(method, request_type, result_type)   \
-    WeightRpcResult<result_type> MasterClient::method(                   \
-        const request_type& request) {                                   \
-        return invoke_rpc<&WrappedMasterService::method,                 \
+#define DEFINE_WEIGHT_CLIENT_METHOD(method, request_type, result_type)       \
+    WeightRpcResult<result_type> MasterClient::method(                       \
+        const request_type& request) {                                       \
+        return invoke_rpc<&WrappedMasterService::method,                     \
                           tl::expected<result_type, WeightManagementError>>( \
-            request, tenant_id_.value());                                \
+            request, tenant_id_.value());                                    \
     }
 
 DEFINE_WEIGHT_CLIENT_METHOD(BeginWeightImport, BeginWeightImportRequest,
@@ -530,8 +530,7 @@ DEFINE_WEIGHT_CLIENT_METHOD(RenewWeightRevisionLease,
 DEFINE_WEIGHT_CLIENT_METHOD(StartWeightResidencyOperation,
                             StartWeightResidencyOperationRequest,
                             WeightResidencyOperation)
-DEFINE_WEIGHT_CLIENT_METHOD(QueryWeightOperation,
-                            QueryWeightOperationRequest,
+DEFINE_WEIGHT_CLIENT_METHOD(QueryWeightOperation, QueryWeightOperationRequest,
                             WeightResidencyOperation)
 DEFINE_WEIGHT_CLIENT_METHOD(ReconcileWeightRevision,
                             ReconcileWeightRevisionRequest,
