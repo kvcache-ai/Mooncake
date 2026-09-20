@@ -142,6 +142,7 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
         }
 
         pid_t pid;
+        WeightMetadataSnapshot frozen_weight_metadata;
         {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
@@ -160,6 +161,11 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
                 close(log_pipe[1]);
                 continue;
             }
+            // Weight readers do not take snapshot_mutex_. Freeze their state
+            // in the parent so the child never locks the inherited weight
+            // mutex.
+            frozen_weight_metadata =
+                master_service_->weight_manager_.ExportSnapshot();
             pid = fork();
         }
         if (pid == -1) {
@@ -178,7 +184,8 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             // Save current state using the configured persistence mechanism
             SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
                           snapshot_id);
-            auto result = PersistState(descriptor.value());
+            auto result =
+                PersistState(descriptor.value(), &frozen_weight_metadata);
             if (!result) {
                 SNAP_LOG_ERROR(
                     "[Snapshot] Child process failed to persist state, "
@@ -436,7 +443,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
 }
 
 tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
-    const ha::SnapshotDescriptor& descriptor) {
+    const ha::SnapshotDescriptor& descriptor,
+    const WeightMetadataSnapshot* frozen_weight_metadata) {
     const std::string& snapshot_id = descriptor.snapshot_id;
     const std::string& path_prefix = descriptor.object_prefix;
     const std::string& manifest_path = descriptor.manifest_key;
@@ -462,7 +470,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             master_service_->nof_segment_manager_,
             master_service_->task_manager_);
 
-        auto encode_result = codec.Encode(state_view);
+        auto encode_result = codec.Encode(state_view, frozen_weight_metadata);
         if (!encode_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] state encoding failed, snapshot_id={}, "

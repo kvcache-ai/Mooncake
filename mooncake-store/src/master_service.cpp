@@ -12618,7 +12618,8 @@ void MasterService::NofHeartbeatThreadFunc() {
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>
-MasterService::MetadataSerializer::Serialize() {
+MasterService::MetadataSerializer::Serialize(
+    const WeightMetadataSnapshot* frozen_weight_metadata) {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
@@ -12706,9 +12707,13 @@ MasterService::MetadataSerializer::Serialize() {
     packer.pack(static_cast<uint64_t>(Replica::next_id_.load()));
 
     packer.pack("weight_metadata");
-    const auto weight_metadata = service_->weight_manager_.ExportSnapshot();
+    WeightMetadataSnapshot live_weight_metadata;
+    if (frozen_weight_metadata == nullptr) {
+        live_weight_metadata = service_->weight_manager_.ExportSnapshot();
+        frozen_weight_metadata = &live_weight_metadata;
+    }
     const auto encoded_weight_metadata =
-        struct_pack::serialize(weight_metadata);
+        struct_pack::serialize(*frozen_weight_metadata);
     packer.pack_bin(encoded_weight_metadata.size());
     packer.pack_bin_body(encoded_weight_metadata.data(),
                          encoded_weight_metadata.size());

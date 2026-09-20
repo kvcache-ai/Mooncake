@@ -77,7 +77,8 @@ class MasterSnapshotManager {
     tl::expected<void, SerializationError> PersistState(
         const std::string& snapshot_id);
     tl::expected<void, SerializationError> PersistState(
-        const ha::SnapshotDescriptor& descriptor);
+        const ha::SnapshotDescriptor& descriptor,
+        const WeightMetadataSnapshot* frozen_weight_metadata = nullptr);
     tl::expected<ha::SnapshotDescriptor, SerializationError>
     BuildSnapshotDescriptor(const std::string& snapshot_id,
                             const std::string& manifest_path,

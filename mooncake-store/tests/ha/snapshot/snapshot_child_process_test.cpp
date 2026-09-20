@@ -15,6 +15,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -548,6 +549,102 @@ TEST_F(SnapshotChildProcessTest, AutoSnapshot_GeneratesFiles) {
 
     EXPECT_TRUE(found) << "Snapshot thread should have generated latest.txt at "
                        << latest_path;
+}
+
+TEST_F(SnapshotChildProcessTest,
+       AutoSnapshot_CompletesAfterConcurrentWeightLists) {
+    WeightMetadataSnapshot weights;
+    constexpr size_t kRevisionCount = 4096;
+    weights.metadata.reserve(kRevisionCount);
+    for (size_t i = 0; i < kRevisionCount; ++i) {
+        WeightRevisionMetadata metadata;
+        metadata.identity.name_space = "snapshot-concurrency";
+        metadata.identity.resource_id = "model";
+        metadata.identity.revision = "revision-" + std::to_string(i);
+        metadata.identity.weight_generation = 1;
+        metadata.manifest.payload_group_id =
+            MakeWeightPayloadGroupId(metadata.identity);
+        weights.metadata.push_back(std::move(metadata));
+    }
+
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(true)
+                      .set_enable_snapshot_restore(false)
+                      .set_enable_oplog(false)
+                      .set_memory_allocator(BufferAllocatorType::OFFSET)
+                      .set_snapshot_interval_seconds(1)
+                      .set_snapshot_child_timeout_seconds(4)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .build();
+    CreateService(std::move(config));
+    ASSERT_TRUE(
+        service_->RestoreFromStandbySnapshot({}, 0, {}, weights).has_value());
+    auto* catalog = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog, nullptr);
+
+    // Establish that this metadata can be persisted without reader contention.
+    std::string baseline_id;
+    const auto baseline_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (std::chrono::steady_clock::now() < baseline_deadline) {
+        auto latest = catalog->GetLatest();
+        if (latest && latest->has_value()) {
+            baseline_id = latest->value().snapshot_id;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_FALSE(baseline_id.empty());
+
+    const auto snapshot_failures = [] {
+        const auto metrics =
+            MasterMetricManager::instance().serialize_metrics();
+        std::smatch match;
+        const std::regex pattern(R"((?:^|\n)master_snapshot_fail ([0-9]+))");
+        // YLT omits counters whose zero value has never changed.
+        return std::regex_search(metrics, match, pattern)
+                   ? std::stoull(match[1].str())
+                   : 0ULL;
+    };
+    const auto failures_before = snapshot_failures();
+
+    // A nonmatching resource forces each public List call to scan every entry.
+    const ListWeightRevisionsRequest request{
+        .name_space = "snapshot-concurrency", .resource_id = "absent-model"};
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> errors{0};
+    std::vector<std::thread> readers;
+    for (size_t i = 0; i < 4; ++i) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto result = service_->ListWeightRevisions(request);
+                if (!result || !result->revisions.empty()) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+                completed.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& reader : readers) {
+        reader.join();
+    }
+    // Drain the in-flight snapshot after releasing reader contention.
+    MasterServiceTestPeer::SnapshotManager(*service_).reset();
+    auto latest = catalog->GetLatest();
+    EXPECT_GT(completed.load(), 0u);
+    EXPECT_EQ(errors.load(), 0u);
+    EXPECT_EQ(failures_before, snapshot_failures());
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+    EXPECT_NE(baseline_id, latest->value().snapshot_id);
 }
 
 TEST_F(SnapshotChildProcessTest, PersistState_PublishesSnapshotDescriptor) {

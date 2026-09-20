@@ -1863,7 +1863,8 @@ class MasterService {
         MetadataSerializer(MasterService* service) : service_(service) {}
 
         // Serialize metadata of all shards
-        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+        tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
+            const WeightMetadataSnapshot* frozen_weight_metadata = nullptr);
 
         tl::expected<void, SerializationError> Deserialize(
             const std::vector<uint8_t>& data);
