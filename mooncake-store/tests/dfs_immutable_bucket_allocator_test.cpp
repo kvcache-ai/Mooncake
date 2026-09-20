@@ -134,8 +134,7 @@ TEST(ImmutableBucketAllocatorTest, StaleFreeCannotTombstoneReplacement) {
     EXPECT_TRUE(allocator.MarkCommitted("key", *replacement));
 }
 
-TEST(ImmutableBucketAllocatorTest,
-     TombstonesPreserveConsumedBytesForEviction) {
+TEST(ImmutableBucketAllocatorTest, TombstonesPreserveConsumedBytesForEviction) {
     TempDir dir;
     auto config = BucketConfig(dir);
     config.bucket_capacity = 4096;

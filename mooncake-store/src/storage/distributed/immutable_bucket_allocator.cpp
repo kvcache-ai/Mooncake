@@ -506,8 +506,7 @@ ImmutableBucketAllocator::CommitEvictionLogical(PendingEviction&& pending) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     const auto it = buckets_.find(pending.bucket_id_);
-    if (it == buckets_.end() ||
-        it->second.get() != pending.identity_.get() ||
+    if (it == buckets_.end() || it->second.get() != pending.identity_.get() ||
         it->second->lifecycle != BucketLifecycle::FROZEN ||
         it->second->pending_entries != 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);

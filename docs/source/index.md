@@ -129,7 +129,6 @@ design/architecture
 design/transfer-engine/index
 design/tent/overview
 design/store/mooncake-store
-design/store/immutable-dfs-bucket-allocator
 design/mooncake-backend-pg
 design/mooncake-ep
 design/conductor/index
