@@ -21,7 +21,6 @@
 
 #pragma once
 
-#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -30,6 +29,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "config/replica_selection_config.h"
 #include "replica.h"
 
 namespace mooncake {
@@ -82,11 +82,8 @@ inline double BuiltinRemoteReplicaScore(const Replica::Descriptor &r) {
 // scorer has been injected. Env is read once; the injected-scorer check is
 // live so tests / late injection take effect.
 inline bool RemoteReplicaScoringEnabled() {
-    static const bool env_enabled = [] {
-        const char *env = std::getenv("MC_STORE_REPLICA_SCORING");
-        return env && std::string(env) == "1";
-    }();
-    if (env_enabled) return true;
+    static const auto config = ReplicaSelectionConfig::FromEnvironment();
+    if (config.remote_scoring_enabled) return true;
     std::shared_lock lk(detail::ScorerMutex());
     return static_cast<bool>(detail::ScorerStorage());
 }
@@ -177,16 +174,16 @@ inline const Replica::Descriptor *SelectBestReplica(
     return best;
 }
 
-// Select a complete MEMORY replica for the session range-read path. The
-// session ranged-get path (Client::BatchTransferReadRanges) only ever reads
-// MEMORY replicas: it rejects every non-MEMORY entry, so selecting a NOF_SSD
-// replica here would let a session start and then fail the actual transfer.
+// Select a complete MEMORY replica for the session MEMORY range-read path.
+// The session planner may fall back to DFS, but it does not support NOF_SSD;
+// selecting a NOF_SSD replica here would let a session start and then fail
+// request classification.
 // Among complete MEMORY replicas, a local one is preferred; otherwise the
 // first complete MEMORY replica is returned (nullptr if there is none).
 //
-// Unlike SelectBestReplica this deliberately does NOT consider NOF_SSD: the
-// session path cannot read it. Local MEMORY is still preferred over a remote
-// MEMORY replica regardless of the order the master returned them in.
+// Unlike SelectBestReplica this deliberately does NOT consider NOF_SSD.
+// Local MEMORY is still preferred over a remote MEMORY replica regardless of
+// the order the master returned them in.
 inline const Replica::Descriptor *SelectCompleteMemoryReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {

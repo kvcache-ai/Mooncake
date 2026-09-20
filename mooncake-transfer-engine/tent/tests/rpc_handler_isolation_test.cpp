@@ -158,6 +158,32 @@ TEST_F(RpcHandlerIsolationTest, OffloadedHandlerExceptionReachesTheCaller) {
     EXPECT_FALSE(client.call(addr_, kThrowingFunc, "", response).ok());
 }
 
+TEST_F(RpcHandlerIsolationTest, UnknownFunctionReturnsAnError) {
+    CoroRpcAgent client;
+    std::string response;
+    EXPECT_FALSE(client.call(addr_, 0x7fffffff, "", response).ok());
+}
+
+// The handler map is shared between registerFunction() and the serving
+// coroutines under one mutex, so a function may be registered after start()
+// and is served from then on. Every production registration happens before
+// start() today; this pins the contract that makes a later one safe.
+TEST_F(RpcHandlerIsolationTest, FunctionRegisteredAfterStartIsServed) {
+    constexpr int kLateFunc = 4004;
+    CoroRpcAgent client;
+    std::string response;
+    EXPECT_FALSE(client.call(addr_, kLateFunc, "", response).ok());
+
+    ASSERT_TRUE(
+        server_
+            ->registerFunction(kLateFunc,
+                               [](const std::string_view&,
+                                  std::string& response) { response = "late"; })
+            .ok());
+    ASSERT_TRUE(client.call(addr_, kLateFunc, "", response).ok());
+    EXPECT_EQ(response, "late");
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

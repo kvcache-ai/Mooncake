@@ -1,4 +1,5 @@
 #include "hot_standby_service.h"
+#include "ha_metric_manager.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -106,7 +107,15 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     HotStandbyService service(MakeSnapshotOnlyConfig());
     service.SetSnapshotProvider(std::move(provider.value()));
 
+    HAMetricManager::instance().reset_snapshot_runtime(true);
+    HAMetricManager::instance().update_snapshot_runtime(
+        [](auto& metrics) { metrics.snapshot_bytes = 100; });
     ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
+    const auto metrics = HAMetricManager::instance().get_snapshot_runtime();
+    EXPECT_FALSE(metrics.enabled);
+    EXPECT_EQ(0u, metrics.snapshot_bytes);
+    EXPECT_EQ(HAMetricManager::SnapshotSkipReason::Disabled,
+              metrics.skip_reason);
     EXPECT_EQ(StandbyState::WATCHING, service.GetState());
     EXPECT_EQ(1u, service.GetMetadataCount());
     EXPECT_EQ(descriptor_.last_included_seq,
@@ -187,6 +196,87 @@ TEST(StandbyControllerTest, OplogEnablementControlsReaderController) {
     auto unsupported = ha::CreateStandbyController(spec, config);
     ASSERT_NE(unsupported, nullptr);
     EXPECT_EQ(ErrorCode::OK, unsupported->PromoteStandby());
+}
+
+TEST(StandbyControllerTest, BatchSnapshotDependencyFailureThrowsBeforeStart) {
+    ha::HABackendSpec spec{};
+    spec.type = ha::HABackendType::ETCD;
+    MasterServiceSupervisorConfig config;
+    config.enable_oplog = true;
+    config.enable_oplog_snapshot = true;
+    config.snapshot_object_store_type = "invalid";
+    EXPECT_THROW(ha::CreateStandbyController(spec, config), std::runtime_error);
+
+    // The same unused snapshot setting must not prevent pure OpLog startup.
+    config.enable_oplog_snapshot = false;
+    EXPECT_NO_THROW(ha::CreateStandbyController(spec, config));
+}
+
+TEST(StandbyControllerTest, BatchSnapshotIgnoresLegacyCatalogConfiguration) {
+    const auto path = MakeSnapshotTestTempDir("batch-controller-");
+    ScopedEnvVar local_path(kSnapshotLocalPathEnv, path);
+    ha::HABackendSpec spec{};
+    spec.type = ha::HABackendType::ETCD;
+    MasterServiceSupervisorConfig config;
+    config.enable_oplog = true;
+    config.enable_oplog_snapshot = true;
+    config.enable_snapshot_restore = true;
+    config.snapshot_object_store_type = "local";
+    config.snapshot_catalog_store_type = "invalid";
+    auto controller = ha::CreateStandbyController(spec, config);
+    EXPECT_NO_THROW(controller->StopStandby());
+    EXPECT_NO_THROW(controller->StopStandby());
+    controller.reset();
+    std::filesystem::remove_all(path);
+}
+
+TEST(StandbyControllerTest, BatchSnapshotRepeatedStartStopAndPromotion) {
+    const char* endpoints = std::getenv("MOONCAKE_TEST_ETCD_ENDPOINTS");
+    if (!endpoints) GTEST_SKIP() << "Run with the real-etcd snapshot smoke";
+    const auto path = MakeSnapshotTestTempDir("batch-lifecycle-");
+    ScopedEnvVar local_path(kSnapshotLocalPathEnv, path);
+    MasterServiceSupervisorConfig config;
+    config.cluster_id = "batch-lifecycle-" + UuidToString(generate_uuid());
+    config.enable_oplog = true;
+    config.enable_oplog_snapshot = true;
+    config.snapshot_object_store_type = "local";
+    config.ha_backend_connstring = endpoints;
+    config.snapshot_interval_seconds = 1;
+    ha::HABackendSpec spec{};
+    spec.type = ha::HABackendType::ETCD;
+    auto controller = ha::CreateStandbyController(spec, config);
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        ASSERT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
+        ASSERT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
+        controller->StopStandby();
+        controller->StopStandby();
+    }
+    ASSERT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
+    auto promoted = controller->PromoteStandbyAndExport();
+    ASSERT_TRUE(promoted.has_value());
+    EXPECT_NE(nullptr, promoted->metadata_store);
+    ASSERT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
+    controller.reset();  // Destruction while both workers are running.
+    std::filesystem::remove_all(path);
+}
+
+TEST(StandbyControllerTest, HaWithoutOplogPromotesWithEmptyContext) {
+    ha::HABackendSpec spec{
+        .type = ha::HABackendType::ETCD,
+        .connstring = "http://localhost:2379",
+        .cluster_namespace = "ha-without-oplog-test",
+    };
+    MasterServiceSupervisorConfig config;
+    config.enable_oplog = false;
+
+    auto controller = ha::CreateStandbyController(spec, config);
+    ASSERT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
+
+    auto result = controller->PromoteStandbyAndExport();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(0u, result->applied_seq_id);
+    EXPECT_TRUE(result->objects.empty());
+    EXPECT_TRUE(result->segments.empty());
 }
 
 TEST(StandbyControllerTest,

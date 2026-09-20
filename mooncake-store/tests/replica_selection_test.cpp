@@ -10,6 +10,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -75,11 +77,29 @@ Replica::Descriptor MakeDfs(const std::string& path) {
     return d;
 }
 
-// A test fixture that guarantees scoring state is reset between tests, since
-// the enable flag / injected scorer are process-wide.
+// Restore the environment and injected scorer between tests. The cached
+// environment setting intentionally remains fixed for the process lifetime.
 class ReplicaSelectionTest : public ::testing::Test {
    protected:
-    void TearDown() override { SetRemoteReplicaScorer(nullptr); }
+    void SetUp() override {
+        if (const char* value = std::getenv("MC_STORE_REPLICA_SCORING")) {
+            original_env_ = value;
+        }
+    }
+
+    void TearDown() override {
+        SetRemoteReplicaScorer(nullptr);
+        if (original_env_.has_value()) {
+            EXPECT_EQ(
+                setenv("MC_STORE_REPLICA_SCORING", original_env_->c_str(), 1),
+                0);
+        } else {
+            EXPECT_EQ(unsetenv("MC_STORE_REPLICA_SCORING"), 0);
+        }
+    }
+
+   private:
+    std::optional<std::string> original_env_;
 };
 
 // --- Base policy (scoring off): behaviour must be unchanged --------------
@@ -101,8 +121,8 @@ TEST_F(ReplicaSelectionTest, LocalMemoryAlwaysWins) {
 // complete local NOF replica regardless of the order they appear in the list.
 // ObjectMetadata preserves insertion order, and promotion appends a new MEMORY
 // replica to existing metadata, so a MEMORY replica may legally appear after a
-// NOF replica. The session range-read path is memory-only, so selecting NOF
-// here would regress a session that still has a usable MEMORY replica.
+// NOF replica. The session planner supports MEMORY and DFS, but not NOF, so
+// selecting NOF here would regress a session that has a usable MEMORY replica.
 TEST_F(ReplicaSelectionTest, LocalMemoryBeatsLocalNoFInBothOrders) {
     std::unordered_set<std::string> local = {"memB", "nofB"};
 
@@ -131,19 +151,16 @@ TEST_F(ReplicaSelectionTest, LocalMemoryBeatsLocalNoFInBothOrders) {
         "memB");
 }
 
-// Regression for issue #3658 (session range-read path): the session ranged-get
-// path only reads MEMORY replicas, so a session must never be started against a
-// NOF_SSD replica — it would pass the size check and then fail the actual
-// transfer. SelectCompleteMemoryReplica must therefore skip a NOF-only object
-// and return nullptr (the caller then rejects the session), even though
-// SelectBestReplica would have selected the NOF replica for the single-object
-// get path.
+// Regression for issue #3658 (session range-read path): the session planner
+// supports MEMORY and DFS replicas, but not NOF_SSD. The MEMORY selector must
+// therefore skip a NOF-only object and return nullptr, even though
+// SelectBestReplica would select that replica for the single-object get path.
 TEST_F(ReplicaSelectionTest, SessionPathRejectsNoFOnlyObject) {
     std::unordered_set<std::string> local = {"nofB"};
 
     // A NOF-only object: SelectBestReplica returns the NOF replica (it is the
-    // last-resort tier for the single-object get path), but the session path
-    // cannot read NOF, so the session selector must decline it.
+    // last-resort tier for the single-object get path), but the session planner
+    // cannot read NOF, so its MEMORY selector must decline it.
     std::vector<Replica::Descriptor> nof_only = {MakeNoF("nofB")};
     const auto* best = SelectBestReplica(nof_only, local);
     ASSERT_NE(best, nullptr);
@@ -246,6 +263,19 @@ TEST_F(ReplicaSelectionTest, EnvironmentOptInUsesBuiltinScorer) {
     const auto* sel = SelectBestReplica(reps, local);
     ASSERT_NE(sel, nullptr);
     EXPECT_EQ(sel->get_memory_descriptor().buffer_descriptor.protocol_, "rdma");
+}
+
+TEST_F(ReplicaSelectionTest, EnvironmentIsCachedButInjectedScorerRemainsLive) {
+    const bool initially_enabled = RemoteReplicaScoringEnabled();
+    ASSERT_EQ(
+        setenv("MC_STORE_REPLICA_SCORING", initially_enabled ? "0" : "1", 1),
+        0);
+    EXPECT_EQ(RemoteReplicaScoringEnabled(), initially_enabled);
+
+    SetRemoteReplicaScorer(BuiltinRemoteReplicaScore);
+    EXPECT_TRUE(RemoteReplicaScoringEnabled());
+    SetRemoteReplicaScorer(nullptr);
+    EXPECT_EQ(RemoteReplicaScoringEnabled(), initially_enabled);
 }
 
 TEST_F(ReplicaSelectionTest, ScorerTieKeepsMasterOrder) {

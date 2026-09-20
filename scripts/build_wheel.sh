@@ -63,8 +63,8 @@ if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
-    # Copy async_store.py
-    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
+    # Stage the canonical async Store client for the legacy wheel builder.
+    cp python/mooncake/async_store.py mooncake-wheel/mooncake/async_store.py
 else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
@@ -180,15 +180,40 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
-# Stage the reshard Python package for the combined Mooncake wheel. The tracked
-# source of truth remains in the top-level module.
+# Stage migrated root Python modules and the legacy Reshard package for the
+# combined-wheel builder. Each tracked source remains in its authoritative tree.
+MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
+MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+MIGRATED_PYTHON_MODULES=(
+    _launcher.py
+    cli.py
+    cli_bench.py
+    cli_client.py
+    transfer_engine_topology_dump.py
+    buffer_pool.py
+    mooncake_config.py
+    ep.py
+    mooncake_ep_buffer.py
+    mooncake_elastic_buffer.py
+    _administration.py
+    mooncake_ssd_register.py
+    mooncake_ssd_unregister.py
+    spdk_tgt_create.py
+)
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
-cleanup_reshard_staging() {
+cleanup_migrated_python_staging() {
+    for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+    done
     rm -rf "${RESHARD_STAGING_DIR}"
 }
-trap cleanup_reshard_staging EXIT
-rm -rf "${RESHARD_STAGING_DIR}"
+trap cleanup_migrated_python_staging EXIT
+cleanup_migrated_python_staging
+for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+    cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
+       "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+done
 cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
 
 # Build the wheel package
@@ -204,7 +229,7 @@ WHEEL_DIR="$(pwd)"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
-    cleanup_reshard_staging
+    cleanup_migrated_python_staging
 }
 trap cleanup_wheel_metadata_state EXIT
 
@@ -422,6 +447,10 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 
+# Bundle OpenSSL when required: the OSS adapter links libcrypto directly, and
+# target systems may not provide the OpenSSL ABI used by the wheel builder.
+# Keep libssl eligible too, so auditwheel can repair its libcrypto dependency.
+#
 # `--exclude libmpcomm.so*` below is deliberate, not an oversight. MPComm ships
 # its own wheel / CMake install and is upgraded independently of Mooncake, so
 # engine.so keeps its DT_NEEDED on libmpcomm.so.<N> and the dynamic linker
@@ -446,8 +475,6 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude librtmp.so* \
     --exclude libssh.so* \
     --exclude libpsl.so* \
-    --exclude libssl.so* \
-    --exclude libcrypto.so* \
     --exclude libgssapi_krb5.so* \
     --exclude libldap.so* \
     --exclude liblber.so* \
@@ -477,6 +504,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcudart.so* \
     --exclude libmooncake_ep_device.so* \
     --exclude libmooncake_pg_device.so* \
+    --exclude libnccl.so* \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \

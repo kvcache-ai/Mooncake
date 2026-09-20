@@ -1,5 +1,7 @@
 find_package(yaml-cpp REQUIRED)
-find_path(ASIO_INCLUDE_DIR asio.hpp)
+find_path(ASIO_INCLUDE_DIR asio.hpp
+  HINTS ${yalantinglibs_SOURCE_DIR}/include/ylt/thirdparty
+)
 if(NOT ASIO_INCLUDE_DIR)
   message(FATAL_ERROR "standalone Asio headers not found")
 endif()

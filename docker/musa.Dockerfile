@@ -32,7 +32,7 @@ ENV PYTHON_VERSION=${PYTHON_VERSION} \
 WORKDIR /workspace
 COPY . /workspace
 
-# Install Mooncake dependencies (submodules, yalantinglibs, Go, etc.)
+# Install Mooncake dependencies (submodules, Go, etc.)
 RUN bash dependencies.sh -y
 
 # Configure & build Mooncake

@@ -17,21 +17,75 @@
 namespace mooncake {
 namespace tent {
 
-Status RailMonitor::load(const Topology* local, const Topology* remote,
+namespace {
+
+bool sameNicLayout(const Topology::NicEntry& a, const Topology::NicEntry& b) {
+    return a.name == b.name && a.pci_bus_id == b.pci_bus_id &&
+           a.type == b.type && a.numa_node == b.numa_node;
+}
+
+bool sameMemLayout(const Topology::MemEntry& a, const Topology::MemEntry& b) {
+    if (a.name != b.name || a.pci_bus_id != b.pci_bus_id || a.type != b.type ||
+        a.numa_node != b.numa_node)
+        return false;
+    for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+        if (a.device_list[rank] != b.device_list[rank]) return false;
+    }
+    return true;
+}
+
+// True when two snapshots describe the same NIC/memory wiring. Segment
+// metadata is copy-on-write, so a buffer register publishes a new Topology*
+// even when the rail map is unchanged. Comparing layout (not pointer
+// identity) lets load() refresh pins without rebuilding rail_states_.
+bool sameRailLayout(const Topology* a, const Topology* b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    const size_t nic_count = a->getNicCount();
+    const size_t mem_count = a->getMemCount();
+    if (nic_count != b->getNicCount() || mem_count != b->getMemCount())
+        return false;
+    for (size_t i = 0; i < nic_count; ++i) {
+        auto* ea = a->getNicEntry(static_cast<int>(i));
+        auto* eb = b->getNicEntry(static_cast<int>(i));
+        if (!ea || !eb || !sameNicLayout(*ea, *eb)) return false;
+    }
+    for (size_t i = 0; i < mem_count; ++i) {
+        auto* ea = a->getMemEntry(static_cast<int>(i));
+        auto* eb = b->getMemEntry(static_cast<int>(i));
+        if (!ea || !eb || !sameMemLayout(*ea, *eb)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+Status RailMonitor::load(std::shared_ptr<const Topology> local,
+                         std::shared_ptr<const Topology> remote,
                          const std::string& rail_topo_json,
                          const Config* conf) {
-    local_ = local;
-    remote_ = remote;
+    const bool first_load = !ready_;
+    const bool same_layout = ready_ &&
+                             sameRailLayout(local_.get(), local.get()) &&
+                             sameRailLayout(remote_.get(), remote.get());
+
+    local_ = std::move(local);
+    remote_ = std::move(remote);
     if (conf) {
         error_threshold_ = conf->get(kCfgErrorThreshold, error_threshold_);
         error_window_ = std::chrono::seconds(
             conf->get(kCfgErrorWindowSecs, (int)error_window_.count()));
         cooldown_ = std::chrono::seconds(
             conf->get(kCfgCooldownSecs, (int)cooldown_.count()));
-        LOG(INFO) << "RailMonitor: error_threshold=" << error_threshold_
-                  << " error_window=" << error_window_.count() << "s"
-                  << " cooldown=" << cooldown_.count() << "s";
+        // Config is identical on every COW snapshot refresh. Log once per
+        // monitor so PD/e2e does not reprint the banner per slice/worker.
+        if (first_load) {
+            LOG(INFO) << "RailMonitor: error_threshold=" << error_threshold_
+                      << " error_window=" << error_window_.count() << "s"
+                      << " cooldown=" << cooldown_.count() << "s";
+        }
     }
+    if (same_layout) return Status::OK();
     if (!rail_topo_json.empty()) {
         auto status = loadFromJson(rail_topo_json);
         if (status.ok()) return status;
@@ -45,9 +99,8 @@ bool RailMonitor::available(int local_nic, int remote_nic) {
     if (it == rail_states_.end()) return false;
     auto& st = it->second;
     if (!st.paused()) return true;
-    if (std::chrono::steady_clock::now() < st.resume_time) return false;
-    // Cooldown expired: clear all exponential-backoff memory so a fresh
-    // failure cycle starts from the initial cooldown_, not a doubled value.
+    auto now = std::chrono::steady_clock::now();
+    if (now < st.resume_time) return false;
     st.resume_time = {};
     st.error_count = 0;
     st.cooldown = std::chrono::seconds(0);
@@ -68,15 +121,45 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
         st.error_count++;
     }
     st.last_error = now;
-    if (st.cooldown.count() == 0) {
-        st.cooldown = cooldown_;
-    } else {
-        st.cooldown *= 2;
-        if (st.cooldown > kMaxCooldown) st.cooldown = kMaxCooldown;
-    }
+
+    const bool was_paused = st.paused();
+
     if (st.error_count >= error_threshold_) {
-        st.resume_time = now + st.cooldown;
-        updateBestMapping();
+        if (!was_paused) {
+            // Escalate the cooldown only when a *fresh* pause arms (the rail
+            // was healthy at this instant), never within an ongoing burst.
+            // Previously cooldown was doubled on every markFailed call, so a
+            // single outage -- N error WQEs landing in one 10s window -- pushed
+            // a 30s pause straight to the 300s cap before the outage even
+            // cleared, forcing a ~5min TCP fallback after the peer had already
+            // recovered. Now the cooldown is set once per pause cycle; errors
+            // arriving while already paused do not multiply it.
+            //
+            // cooldown == 0: the previous cycle ended with a proven-healthy
+            //   recovery (markRecovered reset it), so start from the initial
+            //   value. cooldown != 0: left by a cooldown-expiry recovery (time
+            //   elapsed, health not proven); escalate to back off harder.
+            if (st.cooldown.count() == 0) {
+                st.cooldown = cooldown_;
+            } else {
+                st.cooldown *= 2;
+                if (st.cooldown > kMaxCooldown) st.cooldown = kMaxCooldown;
+            }
+            LOG(INFO) << "Rail paused: local_nic=" << local_nic
+                      << " remote_nic=" << remote_nic
+                      << " (errors=" << st.error_count << " in "
+                      << error_window_.count()
+                      << "s, cooldown=" << st.cooldown.count() << "s)";
+            st.resume_time = now + st.cooldown;
+            updateBestMapping();
+        }
+        // Already paused: leave resume_time and cooldown untouched. Re-arming
+        // or escalating here would let a sustained outage extend the pause
+        // indefinitely -- the original defect. The pause runs its course and
+        // available() reopens on cooldown expiry.
+        // Open-phase probing and Half-Open (admit one trial on expiry, escalate
+        // on trial failure) are follow-ups: they need available() split into a
+        // non-mutating predicate plus an admit() with in-flight tracking.
     }
 }
 
@@ -231,7 +314,8 @@ Status RailMonitor::loadDefault() {
         if (matched) continue;
 
         // Priority 2: CUDA memory topology matching (GPU-direct NIC)
-        int remote_nic = matchRemoteNicId(local_, remote_, local_nic);
+        int remote_nic =
+            matchRemoteNicId(local_.get(), remote_.get(), local_nic);
         if (remote_nic >= 0) {
             remote_load[remote_nic]++;
             direct_rails_[local_nic] = remote_nic;

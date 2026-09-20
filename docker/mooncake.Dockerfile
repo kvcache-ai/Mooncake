@@ -15,7 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
-ARG EP_TORCH_VERSIONS="2.13.0"
+ARG EP_TORCH_VERSIONS="2.14.0"
 ARG TORCH_CUDA_ARCH_LIST=""
 # CI can opt in to removing /workspace/build from the builder layer.
 ARG CLEAN_BUILD_ARTIFACTS=0
@@ -49,7 +49,7 @@ RUN apt-get update && \
 WORKDIR /workspace
 COPY . /workspace
 
-# Install Mooncake dependencies (yalantinglibs, Go, etc.)
+# Install Mooncake dependencies (submodules, Go, etc.)
 RUN bash dependencies.sh -y
 
 # Configure and build the wheel in one layer, then remove build/ only after

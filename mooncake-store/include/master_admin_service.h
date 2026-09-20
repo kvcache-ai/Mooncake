@@ -68,6 +68,8 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleHealth(coro_http::coro_http_request& req,
                       coro_http::coro_http_response& resp);
+    void HandleVersion(coro_http::coro_http_request& req,
+                       coro_http::coro_http_response& resp);
     void HandleRole(coro_http::coro_http_request& req,
                     coro_http::coro_http_response& resp);
     void HandleHaStatus(coro_http::coro_http_request& req,
@@ -84,6 +86,10 @@ class MasterAdminServer {
                                  coro_http::coro_http_response& resp);
     void HandleQuerySegment(coro_http::coro_http_request& req,
                             coro_http::coro_http_response& resp);
+    void HandleGetDfsShardCount(coro_http::coro_http_request& req,
+                                coro_http::coro_http_response& resp);
+    async_simple::coro::Lazy<void> HandleExpandDfsShards(
+        coro_http::coro_http_request& req, coro_http::coro_http_response& resp);
     void HandleCreateDrainJob(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
     void HandleQueryDrainJob(coro_http::coro_http_request& req,
@@ -106,6 +112,7 @@ class MasterAdminServer {
                          coro_http::coro_http_response& resp);
 
     void RegisterHandler();
+    void RefreshStorageMetrics() const;
 
     uint16_t http_port_;
     std::string http_host_;
@@ -115,6 +122,13 @@ class MasterAdminServer {
     std::atomic<bool> metric_report_running_{false};
     std::binary_semaphore metric_report_stop_sem_{0};
     std::atomic<bool> started_{false};
+    // Retained by each handler across its blocking operation and completion.
+    // Only one admin expansion may be pending, including disconnected requests.
+    std::shared_ptr<std::atomic<bool>> dfs_expansion_running_{
+        std::make_shared<std::atomic<bool>>(false)};
+    // Serializes storage projection with service-plane handoff so a refresh
+    // that sampled the old leader cannot publish after it becomes unavailable.
+    mutable std::mutex storage_metrics_refresh_mutex_;
     mutable std::mutex state_mutex_;
     ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};
     std::optional<ha::MasterView> leader_view_;

@@ -1,0 +1,8 @@
+name: Expose the CMake-selected CUDA driver runtime
+description: Expose the CMake-selected CUDA driver runtime
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

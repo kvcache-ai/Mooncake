@@ -2,9 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
-#include <cstring>
 #include <exception>
+
+#include "config/redis_connection_config.h"
 
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
@@ -74,11 +74,11 @@ tl::expected<int, ErrorCode> ParsePositiveInt(std::string_view text,
 }
 
 tl::expected<int, ErrorCode> ResolveRedisDbIndex() {
-    const char* raw_db_index = std::getenv("MC_REDIS_DB_INDEX");
-    if (raw_db_index == nullptr || std::strlen(raw_db_index) == 0) {
-        return 0;
+    const auto config = RedisConnectionConfig::FromEnvironment();
+    if (!config.has_value()) {
+        return tl::make_unexpected(config.error());
     }
-    return ParsePositiveInt(raw_db_index, 0, 255);
+    return config->db_index;
 }
 
 tl::expected<RedisEndpoint, ErrorCode> ParseRedisEndpoint(
@@ -174,9 +174,9 @@ tl::expected<RedisContextPtr, ErrorCode> ConnectRedis(
         return tl::make_unexpected(endpoint.error());
     }
 
-    auto db_index = ResolveRedisDbIndex();
-    if (!db_index) {
-        return tl::make_unexpected(db_index.error());
+    const auto config = RedisConnectionConfig::FromEnvironment();
+    if (!config.has_value()) {
+        return tl::make_unexpected(config.error());
     }
 
     timeval connect_timeout{};
@@ -195,26 +195,26 @@ tl::expected<RedisContextPtr, ErrorCode> ConnectRedis(
         return tl::make_unexpected(connection_error);
     }
 
-    const char* username = std::getenv("MC_REDIS_USERNAME");
-    const char* password = std::getenv("MC_REDIS_PASSWORD");
-    if (password != nullptr && std::strlen(password) > 0) {
+    if (!config->password.empty()) {
         RedisReplyPtr reply;
-        if (username != nullptr && std::strlen(username) > 0) {
+        if (!config->username.empty()) {
             reply.reset(static_cast<redisReply*>(redisCommand(
-                context.get(), "AUTH %b %b", username, std::strlen(username),
-                password, std::strlen(password))));
+                context.get(), "AUTH %b %b", config->username.data(),
+                config->username.size(), config->password.data(),
+                config->password.size())));
         } else {
-            reply.reset(static_cast<redisReply*>(redisCommand(
-                context.get(), "AUTH %b", password, std::strlen(password))));
+            reply.reset(static_cast<redisReply*>(
+                redisCommand(context.get(), "AUTH %b", config->password.data(),
+                             config->password.size())));
         }
         if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
             return tl::make_unexpected(connection_error);
         }
     }
 
-    if (db_index.value() != 0) {
+    if (config->db_index != 0) {
         RedisReplyPtr reply(static_cast<redisReply*>(
-            redisCommand(context.get(), "SELECT %d", db_index.value())));
+            redisCommand(context.get(), "SELECT %d", config->db_index)));
         if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
             return tl::make_unexpected(connection_error);
         }

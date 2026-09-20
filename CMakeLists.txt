@@ -19,6 +19,7 @@ endif()
 option(WITH_TE "build mooncake transfer engine and sample code" ON)
 option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_STORE_GO "build Go bindings for mooncake store" OFF)
+option(WITH_CONDUCTOR "build mooncake conductor service" OFF)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE
        "build the Rust interface and sample code for the transfer engine" OFF)
@@ -93,7 +94,10 @@ else()
   message(STATUS "USE_NOF=OFF, NoF SSD pool support is disabled")
 endif()
 
-option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+# The matching STORE_USE_JEMALLOC compile definition is scoped to the master and
+# client executables in mooncake-store/src, since only they link the allocator.
+option(STORE_USE_JEMALLOC
+       "Use jemalloc in the mooncake store master and client binaries" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Dependencies.cmake)
 if(WITH_STORE)
@@ -129,6 +133,11 @@ if(WITH_STORE)
   message(STATUS "Mooncake Store will be built")
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)
+endif()
+
+if(WITH_CONDUCTOR)
+  message(STATUS "Mooncake Conductor will be built")
+  add_subdirectory(mooncake-conductor)
 endif()
 
 if(WITH_STORE_RUST)

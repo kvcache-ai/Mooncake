@@ -172,7 +172,314 @@ class RealClientTest : public ::testing::Test {
     }
 };
 
+TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t object_size = 16;
+    auto make_local_disk = [object_size](const std::string& endpoint,
+                                         ReplicaStatus status) {
+        Replica::Descriptor replica;
+        LocalDiskDescriptor descriptor;
+        descriptor.client_id = generate_uuid();
+        descriptor.object_size = object_size;
+        descriptor.transport_endpoint = endpoint;
+        replica.descriptor_variant = std::move(descriptor);
+        replica.status = status;
+        return replica;
+    };
+
+    struct TestCase {
+        std::string name;
+        std::vector<Replica::Descriptor> replicas;
+        std::string expected_endpoint;
+    };
+    std::vector<TestCase> test_cases;
+    // SelectBestReplica currently chooses the last COMPLETE LOCAL_DISK
+    // descriptor. Both list orders make a first-vs-last mismatch observable.
+    test_cases.push_back(
+        {.name = "a_then_b",
+         .replicas = {make_local_disk("endpoint-a", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-b", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-b"});
+    test_cases.push_back(
+        {.name = "b_then_a",
+         .replicas = {make_local_disk("endpoint-b", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-a", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-a"});
+    test_cases.push_back(
+        {.name = "not_ready_then_complete",
+         .replicas = {make_local_disk("endpoint-not-ready",
+                                      ReplicaStatus::PROCESSING),
+                      make_local_disk("endpoint-complete",
+                                      ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-complete"});
+
+    for (auto& test_case : test_cases) {
+        SCOPED_TRACE(test_case.name);
+        std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+        query_results.emplace_back(QueryResult(
+            std::move(test_case.replicas),
+            std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+
+        std::vector<char> destination(object_size);
+        std::string visited_endpoint;
+        // Stop at the offload RPC boundary after recording its destination.
+        // The injected error also prevents checksum verification of the
+        // intentionally untouched destination buffer.
+        auto local_disk_reader = [&visited_endpoint](
+                                     const std::string& endpoint,
+                                     RealClient::LocalDiskOffloadObjects&)
+            -> tl::expected<void, ErrorCode> {
+            visited_endpoint = endpoint;
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        };
+
+        std::vector<tl::expected<int64_t, ErrorCode>> results;
+        {
+            GLogMuter muter;
+            results = py_client_->batch_get_into_internal(
+                {"endpoint-selection-key"}, {destination.data()},
+                {destination.size()}, query_results, local_disk_reader);
+        }
+
+        EXPECT_EQ(visited_endpoint, test_case.expected_endpoint);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::RPC_FAIL);
+    }
+}
+
+TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_session_dfs_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17824";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    const std::string key = "session_dfs";
+    std::string source(kObjectSize, '\0');
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 7) % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+    const auto dfs_descriptor = replicas.front().get_dfs_descriptor();
+
+    std::string first(512, '\0');
+    std::string second(777, '\0');
+    ASSERT_EQ(py_client_->register_buffer(first.data(), first.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(second.data(), second.size()), 0);
+    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
+
+    auto client_buffer_allocator =
+        std::move(py_client_->client_buffer_allocator_);
+    auto results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data()}}, {{first.size()}}, {{127}});
+    ASSERT_EQ(results, std::vector<int>{static_cast<int>(
+                           toInt(ErrorCode::NO_AVAILABLE_HANDLE))});
+    py_client_->client_buffer_allocator_ = std::move(client_buffer_allocator);
+
+    results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data(), second.data()}}, {{first.size(), second.size()}},
+        {{127, 2048}});
+    ASSERT_EQ(results,
+              std::vector<int>{static_cast<int>(first.size() + second.size())});
+    EXPECT_EQ(first, source.substr(127, first.size()));
+    EXPECT_EQ(second, source.substr(2048, second.size()));
+
+    std::filesystem::resize_file(dfs_descriptor.file_path,
+                                 dfs_descriptor.offset + kObjectSize / 2);
+    results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data()}}, {{first.size()}}, {{0}});
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_EQ(results[0], static_cast<int>(toInt(ErrorCode::FILE_READ_FAIL)));
+
+    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(first.data()), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(second.data()), 0);
+}
+
 #ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, SessionRangesReadDfsIntoGpuUsesPinnedArena) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar pinned_restore_arena(
+        "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "1048576");
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_session_dfs_gpu_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17825";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kSourceOffset = 257;
+    constexpr size_t kRangeSize = 1024;
+    const std::string key = "session_dfs_gpu";
+    std::vector<char> source(kObjectSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
+
+    void* gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kRangeSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(gpu_destination,
+                                                       cleanup);
+    ASSERT_EQ(py_client_->register_buffer(gpu_destination, kRangeSize), 0);
+    registered = true;
+
+    // Remove the fallback allocator so success proves that device-targeted DFS
+    // staging came from the pinned restore arena.
+    auto fallback_allocator = std::move(py_client_->client_buffer_allocator_);
+    auto results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{gpu_destination}}, {{kRangeSize}}, {{kSourceOffset}});
+    py_client_->client_buffer_allocator_ = std::move(fallback_allocator);
+
+    ASSERT_EQ(results, std::vector<int>{static_cast<int>(kRangeSize)});
+    std::vector<char> actual(kRangeSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kRangeSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kSourceOffset));
+    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
+}
+
+TEST_F(RealClientTest, RangedSnapshotGpuReadBypassesNewerHotCacheValue) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar cache_size("MC_STORE_LOCAL_HOT_CACHE_SIZE", "1048576");
+    ScopedEnvVar block_size("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4096");
+    ScopedEnvVar shared_cache("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
+    ScopedEnvVar admission("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD", "1");
+    StartMasterAndSetupClient();
+    const std::string key = "snapshot_gpu_hot_cache";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+
+    // Populate the key-based cache with the new value after taking the old
+    // snapshot. Keep the read buffer alive until the async cache fill
+    // completes.
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+    bool cache_ready = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (py_client_->acquire_hot_cache(key).has_value()) {
+            ASSERT_TRUE(py_client_->release_hot_cache(key).has_value());
+            cache_ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(cache_ready);
+
+    void* destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, original.size()), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> owner(destination, cleanup);
+    ASSERT_EQ(py_client_->register_buffer(destination, original.size()), 0);
+    registered = true;
+    EXPECT_EQ(py_client_->get_into_ranges_from_snapshot(
+                  {destination}, {{key}}, {{{0}}}, {{{0}}},
+                  {{{original.size()}}}, snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{32}}}));
+    std::string actual(original.size(), '\0');
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, actual.size(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, original);
+}
+
 TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
@@ -557,6 +864,72 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
     auto bytes_read = py_client_->get_into(key, dst, test_data.size());
     ASSERT_EQ(bytes_read, static_cast<int64_t>(test_data.size()));
     EXPECT_EQ(std::string(dst, test_data.size()), test_data);
+}
+
+TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_upsert";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    auto destination = py_client_->allocate_client_buffer(original.size());
+    ASSERT_TRUE(destination.has_value());
+    auto read = [&](size_t offset, size_t size) {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{offset}}}, {{{offset}}},
+            {{{size}}}, snapshot);
+    };
+
+    // Pause between prefix and payload, then replace the same-size object.
+    EXPECT_EQ(read(0, 4),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+    EXPECT_EQ(read(4, 28),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{28}}}));
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 32),
+              original);
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    EXPECT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+}
+
+TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_expired";
+    const std::string data(32, 'A');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(data)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(
+        key, QueryResult(
+                 std::vector<Replica::Descriptor>(queries[0]->replicas),
+                 std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+    auto destination = py_client_->allocate_client_buffer(data.size());
+    ASSERT_TRUE(destination.has_value());
+    auto read = [&]() {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{0}}}, {{{4}}}, {{{4}}}, snapshot);
+    };
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::LEASE_EXPIRED)}}}));
+    // The existing cache API still allows refresh for independent reads.
+    EXPECT_EQ(py_client_->get_into_ranges({destination->ptr()}, {{key}},
+                                          {{{0}}}, {{{4}}}, {{{4}}}, &snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    snapshot.clear();
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::INVALID_PARAMS)}}}));
+    snapshot.emplace(key, tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::OBJECT_NOT_FOUND)}}}));
 }
 
 // Test Get Operation will fail if the lease has expired.
@@ -1222,6 +1595,14 @@ TEST_F(RealClientTest, TestPutGetSessionAbnormal) {
 
     std::string buf(kObjectSize, 'x');
     ASSERT_EQ(py_client_->register_buffer(buf.data(), buf.size()), 0);
+
+    EXPECT_TRUE(py_client_->batch_get_session_start({}).empty());
+    EXPECT_TRUE(
+        py_client_->batch_get_into_multi_buffer_ranges({}, {}, {}, {}).empty());
+    EXPECT_EQ(py_client_->batch_get_session_end({}), 0);
+    EXPECT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                  {"outer_arity_get"}, {}, {}, {}),
+              std::vector<int>{kInvalidParams});
 
     // --- Put: ranges/end/revoke without start ---
     {

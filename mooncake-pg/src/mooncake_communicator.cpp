@@ -505,6 +505,10 @@ PGResult<void> MooncakeCommunicator::initialize(
     meta_->engine = context_.engine;
     meta_->communicator = this;
     meta_->autoSyncOnFailure = config.auto_sync_on_failure;
+    if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
+        active_ranks_mirror_device_index_ == device_index_) {
+        meta_->activeRanksMirrorDevice = active_ranks_mirror_;
+    }
     p2p_proxy_->bindMeta(meta_);
 
     // Active ranks will be filled by applyViewUpdate, so only allocate their
@@ -1350,6 +1354,10 @@ void MooncakeCommunicator::syncActiveRanksMirror() const {
     auto active_ranks = getActiveRanks();
     const size_t bytes = max_group_size_ * sizeof(int32_t);
     if (active_ranks_mirror_is_device_) {
+        if (meta_ && meta_->activeRanksMirrorDevice && worker_ &&
+            worker_->hasPendingActiveRanksMirrorUpdate(meta_.get())) {
+            return;
+        }
         const GpuDeviceGuard device_guard(active_ranks_mirror_device_index_);
         PG_ASSERT_CUDA(cudaMemcpyAsync(
             active_ranks_mirror_, active_ranks.data(), bytes,
@@ -1596,8 +1604,8 @@ void MooncakeCommunicator::applyViewUpdate(
         meta_->maybeActivatable[i] = activatable[i];
     }
 
-    // Keep the caller-visible active-ranks mirror in sync with the view.
-    // FIXME: potential deadlock?
+    // A failed CUDA task piggybacks same-device mirror update on its
+    // already-resident enqueue kernel. Other updates use a H2D copy.
     syncActiveRanksMirror();
 
     // Publish the rank-space extent after the corresponding data-plane state.
