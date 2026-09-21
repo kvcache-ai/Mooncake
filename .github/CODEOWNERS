@@ -15,8 +15,28 @@
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
+/python/mooncake/async_store.py @ykwd @stmatengss @zxpdemonio
+/python/tests/store/async_store_integration.py @ykwd @stmatengss @zxpdemonio
+/python/tests/store/test_async_store.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/buffer_pool.py @ykwd @stmatengss
+/python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/mooncake_config.py @ykwd @stmatengss
+/python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
+/python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/pg.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/tests/pg/ @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/cli.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/cli_client.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/cli_bench.py @ShangmingCai @alogfans @stmatengss
+/python/mooncake/transfer_engine_topology_dump.py @ShangmingCai @alogfans @stmatengss
+/python/tests/integration/test_cli.py @ShangmingCai @stmatengss @zxpdemonio
+/python/tests/unit/test_cli_modules.py @ShangmingCai @stmatengss @zxpdemonio
+/python/tests/store/ @ykwd @stmatengss
+/python/tests/unit/test_mooncake_config.py @ykwd @stmatengss
+/python/mooncake/mooncake_ssd_*.py @ykwd @stmatengss
+/python/mooncake/spdk_tgt_create.py @ykwd @stmatengss
+/python/tests/ssd/ @ykwd @stmatengss
 /mooncake-transfer-engine @alogfans @doujiang24 @chestnut-Q @staryxchen
 /mooncake-transfer-engine/tent @alogfans @doujiang24 @chestnut-Q @staryxchen @00fish0 @dtcccc
 /mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov

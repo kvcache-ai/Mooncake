@@ -10,6 +10,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -75,11 +77,29 @@ Replica::Descriptor MakeDfs(const std::string& path) {
     return d;
 }
 
-// A test fixture that guarantees scoring state is reset between tests, since
-// the enable flag / injected scorer are process-wide.
+// Restore the environment and injected scorer between tests. The cached
+// environment setting intentionally remains fixed for the process lifetime.
 class ReplicaSelectionTest : public ::testing::Test {
    protected:
-    void TearDown() override { SetRemoteReplicaScorer(nullptr); }
+    void SetUp() override {
+        if (const char* value = std::getenv("MC_STORE_REPLICA_SCORING")) {
+            original_env_ = value;
+        }
+    }
+
+    void TearDown() override {
+        SetRemoteReplicaScorer(nullptr);
+        if (original_env_.has_value()) {
+            EXPECT_EQ(
+                setenv("MC_STORE_REPLICA_SCORING", original_env_->c_str(), 1),
+                0);
+        } else {
+            EXPECT_EQ(unsetenv("MC_STORE_REPLICA_SCORING"), 0);
+        }
+    }
+
+   private:
+    std::optional<std::string> original_env_;
 };
 
 // --- Base policy (scoring off): behaviour must be unchanged --------------
@@ -95,6 +115,65 @@ TEST_F(ReplicaSelectionTest, LocalMemoryAlwaysWins) {
     EXPECT_EQ(
         sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
         "nodeB");  // locality beats protocol
+}
+
+// Regression for issue #3658: a complete local MEMORY replica must win over a
+// complete local NOF replica regardless of the order they appear in the list.
+// ObjectMetadata preserves insertion order, and promotion appends a new MEMORY
+// replica to existing metadata, so a MEMORY replica may legally appear after a
+// NOF replica. The session planner supports MEMORY and DFS, but not NOF, so
+// selecting NOF here would regress a session that has a usable MEMORY replica.
+TEST_F(ReplicaSelectionTest, LocalMemoryBeatsLocalNoFInBothOrders) {
+    std::unordered_set<std::string> local = {"memB", "nofB"};
+
+    // local NOF listed before local MEMORY
+    std::vector<Replica::Descriptor> nof_first = {
+        MakeNoF("nofB"),
+        MakeMemory("memB", "tcp"),
+    };
+    const auto* sel = SelectBestReplica(nof_first, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+    EXPECT_EQ(
+        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "memB");
+
+    // local MEMORY listed before local NOF (the previously-correct order)
+    std::vector<Replica::Descriptor> mem_first = {
+        MakeMemory("memB", "tcp"),
+        MakeNoF("nofB"),
+    };
+    sel = SelectBestReplica(mem_first, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+    EXPECT_EQ(
+        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "memB");
+}
+
+TEST_F(ReplicaSelectionTest, IncompleteLocalMemoryFallsBackToLocalNoF) {
+    // The local MEMORY replica is not readable yet, so the local NOF_SSD one
+    // remains the best choice.
+    std::unordered_set<std::string> local = {"nodeA"};
+    std::vector<Replica::Descriptor> reps = {
+        MakeNoF("nodeA"),
+        MakeMemory("nodeA", "rdma", ReplicaStatus::PROCESSING),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_nof_replica());
+}
+
+TEST_F(ReplicaSelectionTest, LocalNoFPrecedesRemoteMemory) {
+    // Locality still outranks tier for remote MEMORY replicas.
+    std::unordered_set<std::string> local = {"nodeA"};
+    std::vector<Replica::Descriptor> reps = {
+        MakeNoF("nodeA"),
+        MakeMemory("nodeB", "rdma"),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_nof_replica());
 }
 
 TEST_F(ReplicaSelectionTest, ScoringOffKeepsFirstRemoteMemory) {
@@ -178,6 +257,19 @@ TEST_F(ReplicaSelectionTest, EnvironmentOptInUsesBuiltinScorer) {
     const auto* sel = SelectBestReplica(reps, local);
     ASSERT_NE(sel, nullptr);
     EXPECT_EQ(sel->get_memory_descriptor().buffer_descriptor.protocol_, "rdma");
+}
+
+TEST_F(ReplicaSelectionTest, EnvironmentIsCachedButInjectedScorerRemainsLive) {
+    const bool initially_enabled = RemoteReplicaScoringEnabled();
+    ASSERT_EQ(
+        setenv("MC_STORE_REPLICA_SCORING", initially_enabled ? "0" : "1", 1),
+        0);
+    EXPECT_EQ(RemoteReplicaScoringEnabled(), initially_enabled);
+
+    SetRemoteReplicaScorer(BuiltinRemoteReplicaScore);
+    EXPECT_TRUE(RemoteReplicaScoringEnabled());
+    SetRemoteReplicaScorer(nullptr);
+    EXPECT_EQ(RemoteReplicaScoringEnabled(), initially_enabled);
 }
 
 TEST_F(ReplicaSelectionTest, ScorerTieKeepsMasterOrder) {

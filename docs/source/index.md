@@ -89,8 +89,8 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 :caption: Getting Started
 :maxdepth: 1
 
-getting_started/build
 getting_started/quick-start
+getting_started/build
 
 :::
 
@@ -127,15 +127,13 @@ performance/vllm/index
 
 design/architecture
 design/transfer-engine/index
-design/reshard-manifest
-design/model-weight-reshard-planner
 design/tent/overview
 design/store/mooncake-store
-design/nvme-kv-backend
 design/mooncake-backend-pg
 design/mooncake-ep
+design/conductor/index
+design/mooncake-reshard/index
 design/p2p-store
-design/conductor/conductor-architecture-design
 design/hicache-design
 :::
 

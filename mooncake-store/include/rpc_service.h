@@ -21,6 +21,9 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    void SetBatchOpLogTerminalCallback(
+        OrderedOpLogWriter::TerminalCallback callback);
+    void StopBatchOpLogWriter();
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).
@@ -37,10 +40,20 @@ class WrappedMasterService {
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
 
+    // Point-in-time existence check: shares the ExistKey lookup path but
+    // grants no read lease, so a `true` result does not protect the object
+    // from eviction.
+    tl::expected<bool, ErrorCode> ProbeKey(
+        const std::string& key, const std::string& tenant_id = "default");
+
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
         const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
@@ -187,6 +200,8 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
+
     tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
     ListTenantQuotaSnapshots();
     tl::expected<TenantQuotaSnapshot, ErrorCode> GetTenantQuotaSnapshot(
@@ -242,6 +257,11 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
 
+    // Admin-only, grow-only DFS capacity management. Existing placements remain
+    // valid.
+    tl::expected<int, ErrorCode> GetDfsShardCount() const;
+    tl::expected<int, ErrorCode> ExpandDfsShards(int shard_count);
+
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
@@ -260,6 +280,9 @@ class WrappedMasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments);
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        BatchOpLogPromotionHandoff handoff,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,

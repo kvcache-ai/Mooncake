@@ -81,6 +81,25 @@ class FileStorage {
         return pinned_restore_arena_allocator_ != nullptr;
     }
 
+    // Allocate request-scoped staging from the fixed-capacity accelerator-
+    // pinned restore arena. The returned handle releases its sub-allocation
+    // back to the arena; FileStorage retains ownership of the backing memory.
+    [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
+        size_t size) {
+        if (!pinned_restore_arena_allocator_) return std::nullopt;
+        return pinned_restore_arena_allocator_->allocate(size);
+    }
+
+    /**
+     * @brief Reports whether the backend still holds an entry for the key.
+     *
+     * Answers existence only, without allocating read buffers. After a
+     * physical wipe the per-key backend's filesystem lookup and the bucket
+     * backend's in-memory index both report false, which is exactly the
+     * divergence a dangling-replica probe needs to detect.
+     */
+    tl::expected<bool, ErrorCode> Exists(const std::string& key);
+
     FileStorageConfig config_;
 
     /**
@@ -94,6 +113,14 @@ class FileStorage {
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
+    // TEST_F bodies are generated subclasses and do not inherit the fixture's
+    // friendship, so the dangling-replica tests are friended by their
+    // generated class names (plain friend, no gtest include in a production
+    // header).
+    friend class
+        FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
+    friend class
+        FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;

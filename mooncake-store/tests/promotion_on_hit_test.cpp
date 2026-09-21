@@ -3,6 +3,7 @@
 // layer.
 
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -47,60 +48,76 @@ class PromotionOnHitTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 
-    // Friend access to MasterService::promotion_admission_threshold_, which
-    // is otherwise private. PromotionOnHitTest is friended; TEST_F-generated
-    // subclasses are not, hence this static funnel.
+    // Inspect admission state through the shared test peer.
     static uint32_t GetPromotionAdmissionThresholdForTesting(
         MasterService* service) {
-        return service->promotion_admission_threshold_;
+        return MasterServiceTestPeer::PromotionAdmissionThreshold(*service);
     }
 
     static size_t CountPromotionCandidatesForTesting(MasterService* service,
                                                      const TenantId& tenant) {
-        return service->CountCandidatesForTesting(tenant);
+        return MasterServiceTestPeer(*service).CountCandidatesForTesting(
+            tenant);
     }
 
     static constexpr uint32_t MaxPromotionCandidateRetriesForTesting() {
-        return MasterService::kPromotionCandidateMaxRetries;
+        return MasterServiceTestPeer::kPromotionCandidateMaxRetries;
     }
 
     static constexpr uint32_t MaxPromotionExecutionFailuresForTesting() {
-        return MasterService::kMaxPromotionExecutionFailures;
+        return MasterServiceTestPeer::kMaxPromotionExecutionFailures;
     }
 
     static void ResetCandidateBackoffsForTesting(MasterService* service) {
-        service->ResetCandidateBackoffsForTesting();
+        MasterServiceTestPeer(*service).ResetCandidateBackoffsForTesting();
     }
 
     static size_t RunPromotionCandidateRetryForTesting(MasterService* service) {
-        return service->RunPromotionCandidateRetryForTesting();
+        return MasterServiceTestPeer(*service)
+            .RunPromotionCandidateRetryForTesting();
     }
 
     static size_t RunPromotionCandidateRetryForTesting(MasterService* service,
                                                        size_t shards_to_scan) {
-        return service->RunPromotionCandidateRetry(shards_to_scan);
+        return MasterServiceTestPeer(*service).RunPromotionCandidateRetry(
+            shards_to_scan);
     }
 
     static void ClearCandidatesForReloadForTesting(MasterService* service) {
-        service->ClearCandidatesForReload();
+        MasterServiceTestPeer(*service).ClearCandidatesForReload();
     }
 
     static uint64_t GetPromotionCandidateCountForTesting(
         MasterService* service) {
-        return service->promotion_candidate_count_.load(
+        return MasterServiceTestPeer::PromotionCandidateCount(*service).load(
             std::memory_order_relaxed);
     }
 
     static uint64_t GetPromotionInFlightForTesting(MasterService* service) {
-        return service->promotion_in_flight_.load(std::memory_order_relaxed);
+        return MasterServiceTestPeer::PromotionInFlight(*service).load(
+            std::memory_order_relaxed);
+    }
+
+    static void MarkClientOfflineForTesting(MasterService* service,
+                                            const UUID& client_id) {
+        auto record =
+            MasterServiceTestPeer(*service).FindClientRecord(client_id);
+        ASSERT_TRUE(record);
+        const auto now = ClientLivenessRecord::Clock::now();
+        ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::seconds::zero()),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+        ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::seconds::zero()),
+                  ClientLivenessTransition::BECAME_OFFLINE);
     }
 
     static bool HasPromotionTaskForTesting(MasterService* service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
         const auto* tenant_state = accessor.GetTenantState();
         return tenant_state != nullptr &&
                tenant_state->promotion_tasks.contains(key);
@@ -110,9 +127,9 @@ class PromotionOnHitTest : public ::testing::Test {
     static std::optional<uint32_t> GetPromotionTaskExecutionFailuresForTesting(
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
         const auto* tenant_state = accessor.GetTenantState();
         if (tenant_state == nullptr) {
             return std::nullopt;
@@ -128,22 +145,39 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
         const auto result =
-            service->TryPushPromotionQueue(MasterService::ObjectIdentity{
-                .tenant_id = tenant_id, .user_key = key});
-        return result == MasterService::PromotionQueueResult::kAlreadyInFlight;
+            MasterServiceTestPeer(*service).TryPushPromotionQueue(
+                MasterServiceTestPeer::ObjectIdentity{.tenant_id = tenant_id,
+                                                      .user_key = key});
+        return result ==
+               MasterServiceTestPeer::PromotionQueueResult::kAlreadyInFlight;
     }
 
     static void MarkReplicaCompleteForTesting(MasterService* service,
                                               const TenantId& tenant_id,
                                               const std::string& key,
                                               ReplicaID replica_id) {
-        MasterService::MetadataAccessorRW accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
         ASSERT_TRUE(accessor.Exists());
         auto* replica = accessor.Get().GetReplicaByID(replica_id);
         ASSERT_NE(replica, nullptr);
         replica->mark_complete();
+    }
+
+    static std::unique_ptr<AllocatedBuffer> AllocateOnSegmentForTesting(
+        MasterService* service, const UUID& segment_id, size_t size) {
+        std::shared_ptr<BufferAllocatorBase> allocator;
+        {
+            auto segment_access =
+                MasterServiceTestPeer::SegmentManager(*service)
+                    .getSegmentAccess();
+            allocator = segment_access.GetAllocator(segment_id);
+        }
+        if (!allocator) {
+            return nullptr;
+        }
+        return allocator->allocate(size);
     }
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
@@ -469,8 +503,8 @@ TEST_F(PromotionOnHitTest,
     service->RemoveAll();
 }
 
-// PromotionObjectHeartbeat returns an empty task list when called against a
-// client that has no LocalDiskSegment registered.
+// An unknown Client is rejected by the liveness work gate before the
+// LocalDisk mailbox is consulted.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -480,10 +514,10 @@ TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     UUID unknown_client = generate_uuid();
     auto pending = service->PromotionObjectHeartbeat(unknown_client);
     ASSERT_FALSE(pending.has_value());
-    EXPECT_EQ(pending.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_EQ(pending.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
-// PromotionAllocStart on a non-existent key returns OBJECT_NOT_FOUND.
+// An unknown Client is rejected before object metadata is consulted.
 TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -493,7 +527,7 @@ TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
     auto resp = service->PromotionAllocStart(generate_uuid(), "nonexistent",
                                              TenantId::Default(), 1024, {});
     ASSERT_FALSE(resp.has_value());
-    EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(resp.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 TEST_F(PromotionOnHitTest, InvalidPrimaryEndCannotCompletePromotionReplica) {
@@ -669,7 +703,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReplicaCleanupErasesTask) {
     service->RemoveAll();
 }
 
-// NotifyPromotionSuccess on a non-existent key returns OBJECT_NOT_FOUND.
+// An unknown Client is rejected before promotion metadata is consulted.
 TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -680,7 +714,7 @@ TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
     auto resp = service->NotifyPromotionSuccess(client_id, "nonexistent",
                                                 TenantId::Default());
     ASSERT_FALSE(resp.has_value());
-    EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(resp.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 // Concurrent readers racing into TryPushPromotionQueue must dedupe to a
@@ -1629,10 +1663,11 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
                                               TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value());
 
-    // An unrelated client tries to Notify. Must be rejected as
-    // INVALID_PARAMS so the staged replica stays PROCESSING.
+    // A live but unrelated client reaches the holder check and is rejected,
+    // so the staged replica stays PROCESSING.
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(intruder_id, true).has_value());
     auto bad_notify = service->NotifyPromotionSuccess(intruder_id, "k_cold",
                                                       TenantId::Default());
     ASSERT_FALSE(bad_notify.has_value())
@@ -1977,6 +2012,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureRejectsNonHolder) {
     // Intruder calls Failure with the wrong client_id.
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(intruder_id, true).has_value());
     auto bad_failure = service->NotifyPromotionFailure(intruder_id, "k_cold",
                                                        TenantId::Default());
     ASSERT_FALSE(bad_failure.has_value())
@@ -2027,6 +2063,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsNonHolder) {
 
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(intruder_id, true).has_value());
     auto bad_alloc = service->PromotionAllocStart(
         intruder_id, "k_cold", TenantId::Default(), 1024, {});
     ASSERT_FALSE(bad_alloc.has_value())
@@ -2135,7 +2172,8 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     // ClearInvalidHandles, not from the promotion-task reaper.
     config.put_start_release_timeout_sec = 300;
     // Short client TTL so expiration is fast.
-    config.client_live_ttl_sec = 1;
+    config.client_active_ttl_sec = 1;
+    config.client_suspicion_ttl_sec = 1;
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
@@ -2157,22 +2195,8 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     // different-shard admission must be rejected right now.
     auto second_holder = PrepareSegment(
         *service, "seg_b", kDefaultSegmentBase + seg_size, seg_size);
-    // Promote second_holder into ok_client_ via ReMountSegment so its
-    // LOCAL_DISK replicas survive any ClearInvalidHandles run triggered
-    // by the first holder's expiry. MountSegment alone does not register
-    // the client as alive (only ReMountSegment does), and
-    // CleanupStaleHandles uses ok_client_ to decide which LOCAL_DISK
-    // replicas to erase — without this, second_holder's k_other replica
-    // would be wiped alongside the first holder's k_cold replica when
-    // ClearInvalidHandles runs.
-    {
-        Segment seg_b =
-            MakeSegment("seg_b", kDefaultSegmentBase + seg_size, seg_size);
-        seg_b.id = second_holder.segment_id;
-        std::vector<Segment> segs{seg_b};
-        auto remount = service->ReMountSegment(segs, second_holder.client_id);
-        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
-    }
+    // MountSegment and MountLocalDiskSegment establish Active liveness; no
+    // ReMountSegment is needed for stale cleanup to retain this holder.
     ASSERT_TRUE(InjectLocalDiskReplica(*service, second_holder.client_id,
                                        "k_other", 1024,
                                        second_holder.segment_name));
@@ -2433,9 +2457,7 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
 }
 
 // BatchRemove normal-completion path on a key with an in-flight
-// PromotionTask must drop the task entry. ReMountSegment registers the
-// holder in ok_client_ so CleanupStaleHandles returns false and
-// BatchRemove takes the non-stale branch.
+// PromotionTask must drop the task entry while its holder remains Active.
 TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2449,13 +2471,6 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto holder =
         PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
-    {
-        Segment seg_a = MakeSegment("seg_a", kDefaultSegmentBase, seg_size);
-        seg_a.id = holder.segment_id;
-        std::vector<Segment> segs{seg_a};
-        auto remount = service->ReMountSegment(segs, holder.client_id);
-        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
-    }
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_first",
                                        1024, holder.segment_name));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_second",
@@ -2497,11 +2512,8 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     service->RemoveAll(/*force=*/true);
 }
 
-// BatchRemove stale-handle path on a key with an in-flight
-// PromotionTask must drop the task entry. The holder is mounted via
-// PrepareSegment only (no ReMount), so its client is absent from
-// ok_client_; BatchRemove's CleanupStaleHandles then erases the
-// LOCAL_DISK replica and the stale-handle branch fires.
+// BatchRemove stale-handle path on a key with an in-flight PromotionTask must
+// drop the task entry after its holder becomes Offline.
 TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2531,6 +2543,8 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
         EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
+    MarkClientOfflineForTesting(service.get(), holder.client_id);
+
     auto results =
         service->BatchRemove({"k_first"}, TenantId::Default(), /*force=*/true);
     ASSERT_EQ(results.size(), 1u);
@@ -2544,14 +2558,6 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
 
     auto second_holder = PrepareSegment(
         *service, "seg_b", kDefaultSegmentBase + seg_size, seg_size);
-    {
-        Segment seg_b =
-            MakeSegment("seg_b", kDefaultSegmentBase + seg_size, seg_size);
-        seg_b.id = second_holder.segment_id;
-        std::vector<Segment> segs{seg_b};
-        auto remount = service->ReMountSegment(segs, second_holder.client_id);
-        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
-    }
     ASSERT_TRUE(InjectLocalDiskReplica(*service, second_holder.client_id,
                                        "k_second", 1024,
                                        second_holder.segment_name));
@@ -2694,6 +2700,50 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
     EXPECT_EQ(mm.get_promotion_rejected_watermark() - wm_pre, 1);
 
     wm_service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, WatermarkUsesAllocatorStateAfterMetricsReset) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.eviction_high_watermark_ratio = 0.5;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 12 * 1024 * 1024;
+    const std::string segment_name = "allocator_watermark_segment";
+    auto segment = PrepareSegment(*service, segment_name, kDefaultSegmentBase,
+                                  kSegmentSize);
+    auto allocated = AllocateOnSegmentForTesting(
+        service.get(), segment.segment_id, kAllocationSize);
+    ASSERT_NE(allocated, nullptr);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, segment.client_id,
+                                       "allocator_watermark_key", 1024,
+                                       segment.segment_name));
+
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_mem_size();
+    metrics.reset_total_mem_capacity();
+    metrics.reset_segment_allocated_mem_size(segment_name);
+    metrics.reset_segment_total_mem_capacity(segment_name);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+
+    const int64_t rejected_before = metrics.get_promotion_rejected_watermark();
+    auto get_result =
+        service->GetReplicaList("allocator_watermark_key", TenantId::Default());
+    EXPECT_TRUE(get_result.has_value());
+    EXPECT_EQ(metrics.get_promotion_rejected_watermark() - rejected_before, 1);
+
+    // Restore the observable gauges before normal teardown. The business
+    // assertion above intentionally reset them, but allocator and service
+    // destructors still emit their matching decrements.
+    metrics.inc_allocated_mem_size(segment_name, kAllocationSize);
+    metrics.inc_total_mem_capacity(segment_name, kSegmentSize);
+    allocated.reset();
+    service->RemoveAll();
 }
 
 TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {

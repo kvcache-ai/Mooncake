@@ -11,6 +11,8 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
 
+#include "ha_metric_manager.h"
+
 namespace mooncake {
 
 namespace {
@@ -54,6 +56,8 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     HotStandbyService& standby, BatchOpLogSnapshotCapture& capture,
     const std::string& snapshot_root, const std::string& snapshot_id,
     size_t chunk_object_count, int64_t created_at_ms) {
+    HAMetricManager::SnapshotOperationTimer metric_timer(
+        HAMetricManager::SnapshotOperation::Upload);
     bool capture_active = true;
     bool candidate_touched = false;
     const std::string prefix =
@@ -206,7 +210,17 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     if (!verify) {
         return fail(std::move(verify.error()));
     }
-    return descriptor_json;
+    uint64_t chunk_bytes = 0;
+    for (const auto& chunk : manifest.object_chunks)
+        chunk_bytes += chunk.stored_size;
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.chunk_count = manifest.object_chunks.size();
+        metrics.chunk_bytes = chunk_bytes;
+        metrics.snapshot_bytes = metrics.chunk_bytes +
+                                 manifest.segments.stored_size +
+                                 manifest_json.size() + descriptor_json.size();
+    });
+    return metric_timer.Success(descriptor_json);
 }
 
 }  // namespace mooncake

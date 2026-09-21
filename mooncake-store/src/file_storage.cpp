@@ -1,5 +1,6 @@
 #include "file_storage.h"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -9,7 +10,7 @@
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_URING
 #include "file_interface.h"
@@ -48,10 +49,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
-    if (config_.storage_backend_type == StorageBackendType::kDistributed) {
-        config_.enable_dfs = true;
-    }
-    if (!config.Validate()) {
+    if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
@@ -88,7 +86,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
-        if (client_) {
+        config_.enable_dfs = !distributed_backend->UsesObjectStorage();
+        if (config_.enable_dfs && client_) {
             client_->SetDfsStorageBackend(distributed_backend);
         }
     }
@@ -1101,13 +1100,14 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        // Allocate oversized buffer for O_DIRECT alignment:
-        //   +4096 for aligning the ptr to 4096 boundary
-        //   +4096 for aligned read tail padding (actual_offset may not be
-        //   aligned)
         size_t data_size = static_cast<size_t>(sizes[i]);
-        size_t alloc_size =
-            align_up(data_size, kDirectIOAlignment) + 2 * kDirectIOAlignment;
+        size_t alloc_size = std::max<size_t>(data_size, 1);
+        if (config_.use_uring) {
+            // O_DIRECT reads need room to align the pointer and to round an
+            // unaligned file range out to full pages.
+            alloc_size = align_up(data_size, kDirectIOAlignment) +
+                         2 * kDirectIOAlignment;
+        }
 
         auto alloc_result = allocator.allocate(alloc_size);
         if (!alloc_result && !gc_triggered &&
@@ -1131,19 +1131,19 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
 
-        // Align ptr to 4096 boundary for O_DIRECT
-        void* raw_ptr = alloc_result->ptr();
-        void* aligned_ptr = reinterpret_cast<void*>(
-            (reinterpret_cast<uintptr_t>(raw_ptr) + kDirectIOAlignment - 1) &
-            ~(kDirectIOAlignment - 1));
+        void* data_ptr = alloc_result->ptr();
+        if (config_.use_uring) {
+            data_ptr =
+                reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(data_ptr) +
+                                         kDirectIOAlignment - 1) &
+                                        ~(kDirectIOAlignment - 1));
+        }
 
         total_size += data_size;
-        // Slice records data_size; the buffer behind aligned_ptr is oversized
-        // to accommodate aligned reads
-        result->slices.emplace(keys[i], Slice{aligned_ptr, data_size});
+        result->slices.emplace(keys[i], Slice{data_ptr, data_size});
         // pointers will be adjusted after BatchLoad (offset_in_buffer
         // correction)
-        result->pointers.emplace_back(reinterpret_cast<uintptr_t>(aligned_ptr));
+        result->pointers.emplace_back(reinterpret_cast<uintptr_t>(data_ptr));
         result->handles.emplace_back(std::move(alloc_result.value()));
         result->lease_timeout = lease_timeout;
     }
@@ -1174,6 +1174,14 @@ void FileStorage::ClientBufferGCThreadFunc() {
             std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
+}
+
+tl::expected<bool, ErrorCode> FileStorage::Exists(const std::string& key) {
+    if (!storage_backend_) {
+        LOG(ERROR) << "Storage backend is not initialized. Call Init() first.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return storage_backend_->IsExist(key);
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {

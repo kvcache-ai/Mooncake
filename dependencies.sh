@@ -49,6 +49,19 @@ check_success() {
     fi
 }
 
+# Detect ScaleFabric SHCA (shca-tools).
+has_shca_tools() {
+    if command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W -f='${Status}' shca-tools 2>/dev/null | grep -q "install ok installed"
+        return $?
+    fi
+    if command -v rpm >/dev/null 2>&1; then
+        rpm -q shca-tools >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
 read_os_release_value() {
     local key="$1"
     awk -F= -v key="$key" '
@@ -72,7 +85,7 @@ detect_os() {
     elif [ -f /etc/redhat-release ]; then
         OS="centos"
     else
-        print_error "Cannot detect OS. Supported OS: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, EulerOS, and openEuler."
+        print_error "Cannot detect OS. Supported OS: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, EulerOS, openEuler, and Kylin."
     fi
 
     echo -e "${GREEN}Detected OS: $OS ${OS_VERSION:-unknown}${NC}"
@@ -135,7 +148,7 @@ print_section "Updating package lists"
 if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     apt-get update
     check_success "Failed to update package lists"
-elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ]; then
+elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ] || [ "$OS" = "kylin" ]; then
     yum install -y dnf-plugins-core epel-release || true
     yum config-manager --set-enabled powertools || yum config-manager --set-enabled crb || true
     yum clean all
@@ -183,6 +196,15 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libc6-dev \
                      libc-bin"
 
+    # ScaleFabric SHCA (shca-tools) ships its own libibverbs headers/libs; installing
+    # libibverbs-dev conflicts with it. libboost-all-dev pulls OpenMPI/libfabric,
+    # which also depend on distro ibverbs and fail on SHCA systems.
+    if has_shca_tools; then
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/libibverbs-dev//g')
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed "s/libboost-all-dev/libboost-dev/g")
+        echo -e "${GREEN}shca-tools package detected. Adjusting system packages accordingly; build with -DUSE_SHCA=ON to enable SHCA support.${NC}"
+    fi
+
     apt-get install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
 
@@ -208,6 +230,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      liburing-devel \
                      jemalloc-devel \
                      msgpack-devel \
+                     zeromq-devel \
                      libzstd-devel \
                      pkgconf-pkg-config \
                      elfutils-libelf-devel \
@@ -215,7 +238,67 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      xxhash-devel \
                      libbsd-devel"
 
+    # Same SHCA conflict on RHEL-family: skip rdma-core-devel when shca-tools is present.
+    if has_shca_tools; then
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/rdma-core-devel//g')
+        echo -e "${GREEN}shca-tools package detected. Skipping rdma-core-devel (provided by shca-tools).${NC}"
+    fi
+
     yum install -y $SYSTEM_PACKAGES
+    check_success "Failed to install system packages"
+
+elif [ "$OS" = "kylin" ]; then
+    SYSTEM_PACKAGES="@development \
+                     cmake \
+                     ninja-build \
+                     git \
+                     wget \
+                     rdma-core-devel \
+                     glog-devel \
+                     gflags-devel \
+                     jsoncpp-devel \
+                     libunwind-devel \
+                     numactl-devel \
+                     python3-devel \
+                     boost-devel \
+                     openssl-devel \
+                     protobuf-devel \
+                     yaml-cpp-devel \
+                     libcurl-devel \
+                     hiredis-devel \
+                     liburing-devel \
+                     jemalloc-devel \
+                     msgpack-devel \
+                     libzstd-devel \
+                     pkgconf-pkg-config \
+                     elfutils-libelf-devel \
+                     patchelf  \
+                     xxhash-devel \
+                     libbsd-devel"
+
+    if [ -z "${KYLIN_EPKL_URL:-}" ]; then
+        KYLIN_NKVERS_OUTPUT=""
+        if command -v nkvers >/dev/null 2>&1; then
+            KYLIN_NKVERS_OUTPUT=$(nkvers 2>/dev/null)
+        fi
+
+        KYLIN_VERSION=${KYLIN_VERSION:-$(printf '%s\n' "$KYLIN_NKVERS_OUTPUT" | sed -nE 's/.*release[[:space:]]+(V[0-9]+).*/\1/p' | head -n 1)}
+        KYLIN_VERSION=${KYLIN_VERSION:-$OS_VERSION}
+        case "$KYLIN_VERSION" in
+            V*) ;;
+            [0-9]*) KYLIN_VERSION="V${KYLIN_VERSION}" ;;
+        esac
+
+        KYLIN_EPKL_RELEASE=${KYLIN_EPKL_RELEASE:-$(printf '%s\n' "$KYLIN_NKVERS_OUTPUT" | sed -nE 's/.*release[[:space:]]+V[0-9]+[[:space:]]+([0-9]{4})\/.*/\1/p' | head -n 1)}
+        if [ -z "$KYLIN_VERSION" ] || [ -z "$KYLIN_EPKL_RELEASE" ]; then
+            print_error "Cannot detect Kylin release. Set KYLIN_EPKL_URL or KYLIN_EPKL_RELEASE explicitly."
+        fi
+
+        KYLIN_EPKL_URL="https://eps-server.openkylin.top/NS/${KYLIN_VERSION}/${KYLIN_EPKL_RELEASE}/EPKL/main/$(uname -m)/"
+    fi
+    dnf --repofrompath="kylin-epkl,$KYLIN_EPKL_URL" \
+        --setopt=kylin-epkl.gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-kylin \
+        --enablerepo=kylin-epkl install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
 else
     print_error "Unsupported OS: $OS"
@@ -348,6 +431,11 @@ fi
 if [ "$INSTALL_SPDK" = true ]; then
     print_section "Installing SPDK"
 
+    if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+        apt-get install -y libelf-dev
+        check_success "Failed to install NoF dependencies"
+    fi
+
     cd "${REPO_ROOT}/extern"
     check_success "Failed to change to extern directory"
 
@@ -378,8 +466,8 @@ if [ "$INSTALL_SPDK" = true ]; then
 
     # Install SPDK dependencies
     echo "Installing SPDK dependencies..."
-    ./scripts/pkgdep.sh
-    check_success "Failed to install SPDK dependencies"
+    ./scripts/pkgdep.sh --rdma
+    check_success "Failed to install SPDK RDMA dependencies"
 
     # Configure SPDK with RDMA support
     echo "Configuring SPDK with RDMA support..."
