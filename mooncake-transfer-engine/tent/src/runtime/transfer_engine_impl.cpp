@@ -821,6 +821,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = TCP;
         else if (transport_list_[HP_TCP])
             options.type = HP_TCP;
+        else if (host_location && transport_list_[SHM])
+            options.type = SHM;
         else
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);

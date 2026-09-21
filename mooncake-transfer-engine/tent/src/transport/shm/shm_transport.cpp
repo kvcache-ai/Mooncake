@@ -197,7 +197,7 @@ static inline std::string joinPath(const std::string &path,
 Status ShmTransport::allocateLocalMemory(void **addr, size_t size,
                                          MemoryOptions &options) {
     LocationParser location(options.location);
-    if (location.type() != "cpu") {
+    if (options.location != kWildcardLocation && location.type() != "cpu") {
         return Status::InvalidArgument("ShmTransport allocates DRAM only");
     }
     options.shm_offset = 0;
