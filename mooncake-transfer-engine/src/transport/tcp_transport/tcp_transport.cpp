@@ -74,6 +74,20 @@ std::atomic<size_t> staging_buffer_allocation_count{0};
 std::atomic<size_t> staging_buffer_pinned_count{0};
 std::atomic<size_t> staging_device_query_count{0};
 
+#ifdef USE_CUDA
+using CudaPrefetchHook = void (*)(cudaStream_t) noexcept;
+CudaPrefetchHook cuda_prefetch_hook = nullptr;
+
+void invokeCudaPrefetchHook(cudaStream_t stream) noexcept {
+    CudaPrefetchHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = cuda_prefetch_hook;
+    }
+    if (hook) hook(stream);
+}
+#endif
+
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
@@ -122,6 +136,7 @@ enum SessionProgressTestEvent {
     kSessionTimeoutCommitted = 3,
     kSessionTimeoutStale = 4,
     kSessionTerminal = 5,
+    kSessionWriteBodySuccess = 6,
 };
 
 enum SessionProgressTestAction {
@@ -247,6 +262,13 @@ void tcpTransportSetSessionProgressHookForTest(
     std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
     session_progress_hook = hook;
 }
+
+#ifdef USE_CUDA
+void tcpTransportSetCudaPrefetchHookForTest(CudaPrefetchHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    cuda_prefetch_hook = hook;
+}
+#endif
 
 void tcpTransportSetStartTransferMetadataHookForTest(
     StartTransferMetadataHook hook) noexcept {

@@ -118,10 +118,18 @@ class TcpGpuSendPipeline {
    public:
     ~TcpGpuSendPipeline() {
         if (stream_) {
-            cudaSetDevice(device_);
-            cudaStreamSynchronize(stream_);
+            drain();
             cudaStreamDestroy(stream_);
         }
+    }
+
+    void drain() {
+        if (!stream_) return;
+        cudaSetDevice(device_);
+        auto status = cudaStreamSynchronize(stream_);
+        if (status != cudaSuccess)
+            LOG(ERROR) << "TCP CUDA send pipeline synchronization failed: "
+                       << cudaGetErrorString(status);
     }
 
     cudaError_t prepare(int device, const char* source, size_t offset,
@@ -155,6 +163,9 @@ class TcpGpuSendPipeline {
             const size_t next_slot = 1 - slot_;
             char* next = buffers_.ensure(next_size, next_slot);
             if (!next) return cudaErrorMemoryAllocation;
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+            invokeCudaPrefetchHook(stream_);
+#endif
             status = cudaMemcpyAsync(next, source + next_offset, next_size,
                                      cudaMemcpyDeviceToHost, stream_);
             if (status != cudaSuccess) return status;
@@ -567,6 +578,12 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     void cancel() noexcept {
         cancelStatusDeadline();
         cancelProgressDeadline();
+#ifdef USE_CUDA
+        // Shutdown may publish failure without running the completion handler.
+        // Queued Asio handlers can still retain this session after
+        // cancellation.
+        send_pipeline_.drain();
+#endif
         if (!socket_) return;
         asio::error_code cancel_ec;
         socket_->cancel(cancel_ec);
@@ -697,6 +714,12 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         terminal_reported_ = true;
         cancelStatusDeadline();
         cancelProgressDeadline();
+#ifdef USE_CUDA
+        // A failed socket operation can leave the next D2H copy reading the
+        // caller's source. The handler retains self past the terminal callback,
+        // so waiting in the pipeline destructor alone is too late.
+        if (status == TransferStatusEnum::FAILED) send_pipeline_.drain();
+#endif
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
         (void)invokeSessionProgressHook(kSessionTerminal, clean);
 #endif
@@ -1024,12 +1047,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 if (write_abort_requested_) {
                     // An early ACK failure or a committed progress timeout
                     // closed the socket while this operation still owned the
-                    // caller's source buffer. It is safe to publish failure
-                    // now that the handler has run.
+                    // caller's source buffer. finalize() also drains any CUDA
+                    // prefetch before publishing failure.
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
-                if (transferred_bytes > 0 && !acceptProgress()) {
+                if (transferred_bytes > 0 &&
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+                    !acceptProgressForTest(kSessionWriteBodySuccess)) {
+#else
+                    !acceptProgress()) {
+#endif
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
