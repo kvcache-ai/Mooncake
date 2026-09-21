@@ -1837,10 +1837,6 @@ TEST_F(MasterServiceHATest,
     ClientOffboardingJob job;
     job.client_id = client_id;
     job.retired_session = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
 
     writer->RejectNextCommit();
     ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
@@ -1890,10 +1886,6 @@ TEST_F(MasterServiceHATest,
     ClientOffboardingJob job;
     job.client_id = client_id;
     job.retired_session = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
 
     writer->RejectNextSegmentUnmount();
     ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));

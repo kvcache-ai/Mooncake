@@ -2909,13 +2909,8 @@ TEST_F(MasterServiceTest,
     ClientOffboardingJob job;
     job.client_id = client_id;
     job.retired_session = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
 
     ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
-    EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_TRUE(job.prepared_segments.empty());
     EXPECT_TRUE(job.metadata_cleanup_accepted);
     EXPECT_TRUE(job.local_ssd_unregistered);
@@ -2945,26 +2940,21 @@ TEST_F(MasterServiceTest,
     job.client_id = client_id;
     job.retired_session = FindClientLivenessForTest(service, client_id);
     ASSERT_TRUE(job.retired_session);
-    job.pending_prepare_segments = {
-        {.segment_id = prepared_segment.id,
-         .segment_name = prepared_segment.name,
-         .transport_endpoint = prepared_segment.te_endpoint},
-        {.segment_id = blocked_segment.id,
-         .segment_name = blocked_segment.name,
-         .transport_endpoint = blocked_segment.te_endpoint}};
 
+    // The job names only the incarnation; each attempt finds the segments the
+    // client still owns. One of them is held by another unmount, so the job
+    // prepares the other and waits.
     ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
     ASSERT_EQ(job.prepared_segments.size(), 1u);
-    ASSERT_EQ(job.pending_prepare_segments.size(), 1u);
     EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
-    EXPECT_EQ(job.pending_prepare_segments.front().segment_id,
-              blocked_segment.id);
+    EXPECT_FALSE(job.metadata_cleanup_accepted);
     const auto retained_capacity =
         job.prepared_segments.front().metrics_dec_capacity;
 
+    // Its own prepared segment is still mounted, but must not be prepared, or
+    // mistaken for another unmount's, a second time.
     ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
     ASSERT_EQ(job.prepared_segments.size(), 1u);
-    ASSERT_EQ(job.pending_prepare_segments.size(), 1u);
     EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
     EXPECT_EQ(job.prepared_segments.front().metrics_dec_capacity,
               retained_capacity);
@@ -2974,7 +2964,6 @@ TEST_F(MasterServiceTest,
                                  blocked_metrics_dec_capacity));
     ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
     EXPECT_TRUE(job.prepared_segments.empty());
-    EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
 }
 

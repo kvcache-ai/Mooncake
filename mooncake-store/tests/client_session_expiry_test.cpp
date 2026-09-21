@@ -27,8 +27,13 @@ void Poll(ClientSessionRegistry& registry, Clock::time_point now) {
     ClientSessionRegistryTestPeer::Poll(registry, now);
 }
 
-ClientSessionRegistry::Record Register(ClientSessionRegistry& registry,
-                                       const UUID& id = kClient) {
+// A heartbeat at an explicit time.
+ClientStatus Ping(ClientSessionRegistry& registry, Clock::time_point now) {
+    return ClientSessionRegistryTestPeer::Ping(registry, kClient, now);
+}
+
+ClientSessionRegistryTestPeer::Record Register(ClientSessionRegistry& registry,
+                                               const UUID& id = kClient) {
     {
         auto registration = registry.BeginRegistration(id, kInitial);
         EXPECT_TRUE(registration);
@@ -50,8 +55,9 @@ TEST(ClientSessionExpiryTest, OrderedTransitionsAndMultipleListeners) {
     auto record = Register(registry);
     Poll(registry, kInitial + 10s);
     ASSERT_EQ(events.size(), 1);
-    EXPECT_EQ(record->Observe(kInitial + 11s), Observation::RECOVERED_ACTIVE);
-    // Recovery is queued under the transition lock, before the next expiry.
+    EXPECT_EQ(Ping(registry, kInitial + 11s), ClientStatus::NEED_REMOUNT);
+    EXPECT_EQ(record->state(), State::ACTIVE);
+    // Recovery is queued by the heartbeat itself, before the next expiry.
     Poll(registry, kInitial + 21s);
     Poll(registry, kInitial + 41s);
     Poll(registry, kInitial + 100s);
@@ -73,8 +79,10 @@ TEST(ClientSessionExpiryTest, RefreshEmitsNoEvents) {
     ClientSessionRegistry registry(10s, 20s);
     ASSERT_TRUE(registry.AddListener(
         [&](const auto& event) { states.push_back(event.current); }));
-    auto record = Register(registry);
-    EXPECT_EQ(record->Observe(kInitial + 1s), Observation::REFRESHED_ACTIVE);
+    Register(registry);
+    EXPECT_EQ(Ping(registry, kInitial + 1s), ClientStatus::NEED_REMOUNT);
+    Poll(registry, kInitial + 10s);
+    EXPECT_TRUE(states.empty());
     Poll(registry, kInitial + 11s);
     Poll(registry, kInitial + 31s);
     EXPECT_EQ(states, (std::vector<State>{State::SUSPECTED, State::OFFLINE}));
@@ -82,7 +90,7 @@ TEST(ClientSessionExpiryTest, RefreshEmitsNoEvents) {
 
 TEST(ClientSessionExpiryTest,
      RetiredSessionIsVisibleToListenerAndListenerIsUnlocked) {
-    ClientSessionRegistry::Record record;
+    ClientSessionRegistryTestPeer::Record record;
     bool notified = false;
     ClientSessionRegistry registry(10s, 20s);
     ASSERT_TRUE(registry.AddListener([&](const auto& event) {
@@ -147,28 +155,40 @@ TEST(ClientSessionExpiryTest, OfflineClearsHostHintBeforeNotifyingListeners) {
             EXPECT_EQ(registry.GetHostId(kClient), "host-a");
         }
     }));
-    auto record = Register(registry);
+    Register(registry);
     registry.UpdateHostId(kClient, "host-a");
     Poll(registry, kInitial + 10s);
-    (void)record->Observe(kInitial + 11s);
+    (void)Ping(registry, kInitial + 11s);
     Poll(registry, kInitial + 21s);
     Poll(registry, kInitial + 41s);
     EXPECT_TRUE(offline_notified);
 }
 
-TEST(ClientSessionExpiryTest, OldOfflineEventDoesNotClearNewIncarnation) {
+TEST(ClientSessionExpiryTest, OfflineDropsReadinessWithoutWaitingForDelivery) {
     ClientSessionRegistry registry(10s, 20s);
-    auto old = Register(registry);
-    (void)old->Evaluate(kInitial + 10s, 10s, 20s);
-    (void)old->Evaluate(kInitial + 30s, 10s, 20s);
-    ASSERT_TRUE(registry.Remove(kClient, old));
+    auto record = Register(registry);
     {
         auto remount = registry.BeginRemount(kClient);
+        remount->UpdateHostId("host-a");
+        remount->Commit();
+    }
+    // Expire without delivering: the registry's own state for a terminal
+    // incarnation must not depend on the delivery thread getting to the event.
+    ClientSessionRegistryTestPeer::ExpireSessions(registry, kInitial + 10s);
+    EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+    ClientSessionRegistryTestPeer::ExpireSessions(registry, kInitial + 30s);
+    ASSERT_EQ(record->state(), State::OFFLINE);
+    EXPECT_TRUE(registry.GetHostId(kClient).empty());
+    ASSERT_TRUE(registry.Remove(kClient, record));
+    // The replacement starts without the old incarnation's readiness, and
+    // delivering the old OFFLINE event afterwards does not touch it.
+    {
+        auto remount = registry.BeginRemount(kClient);
+        EXPECT_TRUE(remount->NeedsRemount());
         remount->UpdateHostId("new-host");
         remount->Commit();
     }
-    // Deliver the old record's queued OFFLINE after publishing its replacement.
-    Poll(registry, Clock::now());
+    ClientSessionRegistryTestPeer::Drain(registry);
     EXPECT_EQ(registry.GetHostId(kClient), "new-host");
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::OK);
 }

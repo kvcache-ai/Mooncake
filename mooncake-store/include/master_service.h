@@ -128,7 +128,6 @@ class MasterService {
     friend class test::MasterServiceTestPeer;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
-    friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
 
@@ -1944,7 +1943,10 @@ class MasterService {
     // Client session plane, declared in dependency order so the registry is
     // destroyed before the offboarding worker its listener feeds. Resource
     // coordination is a session listener, not a session responsibility.
-    ClientOffboardingWorker client_offboarding_worker_{this};
+    ClientOffboardingWorker client_offboarding_worker_{
+        [this](ClientOffboardingJob& job) {
+            return ProcessClientOffboardingJob(job);
+        }};
     ClientSessionRegistry client_sessions_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;

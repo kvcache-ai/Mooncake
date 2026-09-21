@@ -17,6 +17,9 @@ class ClientSessionRegistryTestPeer {
 
     // Lookup only: the returned record does not grant operation admission.
     // Use TryAcquire*Session for work that must exclude state transitions.
+    // It is the registry's mutable record: stepping it directly changes the
+    // state only, without the gauges, retirement or events of a transition
+    // the registry causes itself. Use ExpireSessions/Ping/Poll for those.
     static Record Find(const ClientSessionRegistry& registry,
                        const UUID& client_id) {
         const auto slot = registry.FindSlot(client_id);
@@ -39,12 +42,11 @@ class ClientSessionRegistryTestPeer {
         registry.ExpireSessions(now);
     }
 
-    // Drive the registry's own retirement listener directly, without waiting
-    // for an expiry pass to produce the event.
-    static void RetireSession(ClientSessionRegistry& registry,
-                              const UUID& client_id,
-                              const ClientSessionSharedPtr& session) {
-        registry.OnSessionRetired(client_id, session);
+    // Ping at an explicit time, so a recovery goes through the registry (and
+    // is published) like a production heartbeat, not past it.
+    static ClientStatus Ping(ClientSessionRegistry& registry,
+                             const UUID& client_id, Clock::time_point now) {
+        return registry.Observe(client_id, now);
     }
 
     // Deliver queued transitions on the caller's thread instead of the

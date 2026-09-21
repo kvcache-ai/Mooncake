@@ -32,8 +32,8 @@ using Clock = ClientLivenessRecord::Clock;
 const UUID kClient{1, 2};
 const ClientLivenessRecord::TimePoint kInitial{};
 
-ClientSessionRegistry::Record Register(ClientSessionRegistry& registry,
-                                       const UUID& id = kClient) {
+ClientSessionRegistryTestPeer::Record Register(ClientSessionRegistry& registry,
+                                               const UUID& id = kClient) {
     {
         auto registration = registry.BeginRegistration(id, kInitial);
         EXPECT_TRUE(registration);
@@ -46,19 +46,23 @@ ClientSessionRegistry::Record Register(ClientSessionRegistry& registry,
 
 // These tests step one record through its states directly, so they need no
 // TTLs or scan thread; client_session_expiry_test covers those.
-void Suspect(const ClientSessionRegistry::Record& record) {
+void Suspect(const ClientSessionRegistryTestPeer::Record& record) {
     EXPECT_EQ(record->Evaluate(Clock::now(), 0s, 0s),
               Transition::BECAME_SUSPECTED);
 }
 
-void Retire(const ClientSessionRegistry::Record& record) {
+void Retire(const ClientSessionRegistryTestPeer::Record& record) {
     EXPECT_EQ(record->Evaluate(Clock::now(), 0s, 0s),
               Transition::BECAME_OFFLINE);
 }
 
-TEST_F(ClientSessionRegistryTest, HostHintsAreInternallySynchronized) {
+TEST_F(ClientSessionRegistryTest, HostHintsBelongToTheSession) {
     ClientSessionRegistry registry;
     EXPECT_TRUE(registry.GetHostId(kClient).empty());
+    // A hint has nowhere to live before the client has a session.
+    registry.UpdateHostId(kClient, "host-a");
+    EXPECT_TRUE(registry.GetHostId(kClient).empty());
+    Register(registry);
     registry.UpdateHostId(kClient, "host-a");
     registry.UpdateHostId(kClient, "");
     EXPECT_EQ(registry.GetHostId(kClient), "host-a");
@@ -80,6 +84,7 @@ TEST_F(ClientSessionRegistryTest,
        MovedRegistrationUpdatesOnlyItsClientHostHint) {
     ClientSessionRegistry registry;
     const UUID other{3, 4};
+    Register(registry, other);
     registry.UpdateHostId(other, "other-host");
     {
         auto original = registry.BeginRemount(kClient);
@@ -104,8 +109,10 @@ TEST_F(ClientSessionRegistryTest, RemovingOldIncarnationPreservesNewHostHint) {
     registry.UpdateHostId(kClient, "new-host");
     EXPECT_FALSE(registry.Remove(kClient, old));
     EXPECT_EQ(registry.GetHostId(kClient), "new-host");
-    registry.Reset({{kClient, current}});
+    registry.Reset();
     EXPECT_TRUE(registry.GetHostId(kClient).empty());
+    EXPECT_FALSE(Find(registry, kClient));
+    EXPECT_EQ(current->state(), State::ACTIVE);
 }
 
 TEST_F(ClientSessionRegistryTest, OldIncarnationCannotRemoveNewRegistration) {
@@ -615,27 +622,6 @@ TEST_F(ClientSessionRegistryTest, RestoreWaitsWithoutBlockingRemountCommit) {
     EXPECT_EQ(ping.get(), ClientStatus::NEED_REMOUNT);
 }
 
-TEST_F(ClientSessionRegistryTest, RestoreRebindsRecordsWithoutTransitions) {
-    std::vector<ClientSessionEvent> events;
-    ClientSessionRegistry registry;
-    ASSERT_TRUE(registry.AddListener(
-        [&](const ClientSessionEvent& event) { events.push_back(event); }));
-    auto old = Register(registry);
-    auto restored = std::make_shared<ClientLivenessRecord>(kInitial);
-    registry.Reset({{kClient, restored}});
-    Drain(registry);
-    EXPECT_TRUE(events.empty());
-    // A replaced record stays a usable liveness object, but no longer
-    // publishes to the registry that once owned it.
-    Suspect(old);
-    Drain(registry);
-    EXPECT_TRUE(events.empty());
-    Suspect(restored);
-    Drain(registry);
-    ASSERT_EQ(events.size(), 1);
-    EXPECT_EQ(events.front().session, restored);
-}
-
 TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
     std::vector<ClientSessionEvent> events;
     ClientSessionRegistry registry;
@@ -669,7 +655,7 @@ TEST_F(ClientSessionRegistryTest, MovedRestoreOwnsPendingRecordsAndLocks) {
         !std::is_move_assignable_v<ClientSessionRegistry::RestoreBatch>);
     ClientSessionRegistry registry;
     std::optional<ClientSessionRegistry::RestoreBatch> moved;
-    std::weak_ptr<ClientLivenessRecord> provisional;
+    std::weak_ptr<const ClientLivenessRecord> provisional;
     {
         auto restore = registry.BeginRestore();
         provisional = restore.FindOrCreate(kClient);
@@ -724,8 +710,8 @@ TEST_F(ClientSessionRegistryTest, RemovalDoesNotAddALivenessState) {
     EXPECT_EQ(old->state(), State::ACTIVE);
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
     EXPECT_FALSE(registry.TryAcquireRetainingSession(kClient));
-    // A retained record remains a normal liveness object, but its observer
-    // no longer belongs to the registry.
+    // A retained record remains a normal liveness object, but it no longer
+    // belongs to the registry.
     EXPECT_EQ(old->Observe(kInitial + 2s), Observation::REFRESHED_ACTIVE);
     EXPECT_EQ(old->Evaluate(kInitial + 12s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
@@ -806,30 +792,6 @@ TEST_F(ClientSessionRegistryTest, CurrentOperationTryLockDoesNotWait) {
                                           /*try_lock=*/true));
 }
 
-TEST_F(ClientSessionRegistryTest, ResetRejectsOldSlotEvenWhenRecordIsReused) {
-    ClientSessionRegistry registry;
-    auto record = Register(registry);
-    auto old_slot = FindSlot(registry, kClient);
-    std::weak_ptr weak_old_slot = old_slot;
-    {
-        auto remount = registry.BeginRemount(kClient);
-        remount->Commit();
-    }
-    registry.Reset({{kClient, record}});
-    auto current_slot = FindSlot(registry, kClient);
-    EXPECT_NE(old_slot, current_slot);
-    EXPECT_EQ(old_slot->liveness, current_slot->liveness);
-    EXPECT_FALSE(AcquireExclusiveOperation(registry, kClient, old_slot));
-    EXPECT_FALSE(AcquireExclusiveOperation(registry, kClient, old_slot,
-                                           /*try_lock=*/true));
-    EXPECT_TRUE(AcquireExclusiveOperation(registry, kClient, current_slot));
-    EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
-    old_slot.reset();
-    // Read-only resource identities retain liveness, not obsolete slot locks.
-    EXPECT_TRUE(weak_old_slot.expired());
-    EXPECT_EQ(Find(registry, kClient), record);
-}
-
 TEST_F(ClientSessionRegistryTest, RemovedSlotIsReleasedDespiteRetainedRecord) {
     ClientSessionRegistry registry;
     auto record = Register(registry);
@@ -879,56 +841,6 @@ TEST_F(ClientSessionRegistryTest, RestoreDoesNotBlockLookupOrHeartbeat) {
     }
     EXPECT_TRUE(lookup.get());
     EXPECT_TRUE(Find(registry, other));
-}
-
-TEST_F(ClientSessionRegistryTest, ResetPreservesRetainedIncarnationIdentity) {
-    ClientSessionRegistry registry;
-    auto record = Register(registry);
-    {
-        auto remount = registry.BeginRemount(kClient);
-        remount->Commit();
-    }
-    EXPECT_EQ(registry.Ping(kClient), ClientStatus::OK);
-    registry.Reset({{kClient, record}});
-    EXPECT_EQ(Find(registry, kClient), record);
-    EXPECT_TRUE(registry.TryAcquireServingSession(kClient));
-    EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
-}
-
-TEST_F(ClientSessionRegistryTest, RecordCanOutliveRegistry) {
-    ClientSessionRegistry::Record record;
-    std::vector<ClientSessionEvent> events;
-    {
-        ClientSessionRegistry registry;
-        ASSERT_TRUE(registry.AddListener(
-            [&](const ClientSessionEvent& event) { events.push_back(event); }));
-        record = Register(registry);
-    }
-    EXPECT_EQ(record->Evaluate(kInitial + 10s, 10s, 20s),
-              Transition::BECAME_SUSPECTED);
-    EXPECT_EQ(record->Observe(kInitial + 11s), Observation::RECOVERED_ACTIVE);
-    EXPECT_TRUE(events.empty());
-}
-
-TEST_F(ClientSessionRegistryTest, RetireOnlyClearsTheReportedIncarnation) {
-    ClientSessionRegistry registry;
-    auto old = Register(registry);
-    ASSERT_TRUE(registry.Remove(kClient, old));
-    auto current = Register(registry);
-    {
-        auto remount = registry.BeginRemount(kClient);
-        ASSERT_TRUE(remount);
-        remount->UpdateHostId("new-host");
-        remount->Commit();
-    }
-    // A terminal event for the previous incarnation is reported after its
-    // replacement is already published; it must not clear the new one.
-    RetireSession(registry, kClient, old);
-    EXPECT_EQ(registry.GetHostId(kClient), "new-host");
-    EXPECT_EQ(registry.Ping(kClient), ClientStatus::OK);
-    RetireSession(registry, kClient, current);
-    EXPECT_TRUE(registry.GetHostId(kClient).empty());
-    EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
 }
 
 }  // namespace

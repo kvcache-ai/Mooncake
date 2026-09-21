@@ -19,15 +19,7 @@ constexpr int kMaxWaitingExpiryAcquisitionsPerPass = 4;
 
 ClientSessionRegistry::ClientSessionRegistry(Clock::duration active_ttl,
                                              Clock::duration suspicion_ttl)
-    : active_ttl_(active_ttl), suspicion_ttl_(suspicion_ttl) {
-    // Registered first, so the registry has dropped its own state for a
-    // terminal incarnation before any resource owner acts on the event.
-    CHECK(events_.AddListener([this](const ClientSessionEvent& event) {
-        if (event.current == ClientLivenessState::OFFLINE) {
-            OnSessionRetired(event.client_id, event.session);
-        }
-    }));
-}
+    : active_ttl_(active_ttl), suspicion_ttl_(suspicion_ttl) {}
 
 ClientSessionRegistry::~ClientSessionRegistry() {
     Stop();
@@ -64,33 +56,23 @@ void ClientSessionRegistry::Stop() {
     events_.Stop();
 }
 
-void ClientSessionRegistry::Bind(const UUID& client_id, const Record& record) {
-    // Capturing this is safe: EraseSlot stops observing before a bound record
-    // leaves the registry, and the destructor erases every slot.
-    std::weak_ptr<ClientLivenessRecord> session = record;
-    record->SetTransitionObserver(
-        [this, session, client_id](ClientLivenessState previous,
-                                   ClientLivenessState current) {
-            auto record = session.lock();
-            if (!record) {
-                return;
-            }
-            // Update gauges in transition order, rather than at asynchronous
-            // delivery time (a recovered session may already expire again).
-            auto& metrics = MasterMetricManager::instance();
-            switch (current) {
-                case ClientLivenessState::ACTIVE:
-                    metrics.client_liveness_recovered();
-                    break;
-                case ClientLivenessState::SUSPECTED:
-                    metrics.client_liveness_became_suspected();
-                    break;
-                case ClientLivenessState::OFFLINE:
-                    metrics.client_liveness_became_offline();
-                    break;
-            }
-            events_.Publish({client_id, std::move(record), previous, current});
-        });
+void ClientSessionRegistry::PublishTransition(const UUID& client_id,
+                                              const Slot& slot,
+                                              ClientLivenessState previous,
+                                              ClientLivenessState current) {
+    auto& metrics = MasterMetricManager::instance();
+    switch (current) {
+        case ClientLivenessState::ACTIVE:
+            metrics.client_liveness_recovered();
+            break;
+        case ClientLivenessState::SUSPECTED:
+            metrics.client_liveness_became_suspected();
+            break;
+        case ClientLivenessState::OFFLINE:
+            metrics.client_liveness_became_offline();
+            break;
+    }
+    events_.Publish({client_id, slot->liveness, previous, current});
 }
 
 void ClientSessionRegistry::UpdateHostId(const UUID& client_id,
@@ -99,25 +81,22 @@ void ClientSessionRegistry::UpdateHostId(const UUID& client_id,
         return;
     }
     {
-        std::shared_lock lock(host_mutex_);
-        const auto it = host_ids_.find(client_id);
-        if (it != host_ids_.end() && it->second == host_id) {
+        std::shared_lock lock(mutex_);
+        const auto slot = FindSlotLocked(client_id);
+        if (!slot || slot->host_id == host_id) {
             return;
         }
     }
-    std::unique_lock lock(host_mutex_);
-    host_ids_[client_id] = host_id;
+    std::unique_lock lock(mutex_);
+    if (const auto slot = FindSlotLocked(client_id)) {
+        slot->host_id = host_id;
+    }
 }
 
 std::string ClientSessionRegistry::GetHostId(const UUID& client_id) const {
-    std::shared_lock lock(host_mutex_);
-    const auto it = host_ids_.find(client_id);
-    return it == host_ids_.end() ? std::string() : it->second;
-}
-
-void ClientSessionRegistry::EraseHostId(const UUID& client_id) {
-    std::unique_lock lock(host_mutex_);
-    host_ids_.erase(client_id);
+    std::shared_lock lock(mutex_);
+    const auto slot = FindSlotLocked(client_id);
+    return slot ? slot->host_id : std::string();
 }
 
 ClientSessionRegistry::Slot ClientSessionRegistry::FindSlot(
@@ -143,8 +122,8 @@ ClientSessionRegistry::AcquireSharedOperation(const UUID& client_id,
         const std::lock_guard<std::mutex> gate(slot->admission_gate);
     }
     SharedOperation operation(slot->operation_mutex);
-    // Removal holds this lock exclusively through erasure. Revalidate the slot
-    // itself, not just the record (Reset may reuse a record in a new slot).
+    // Removal holds this lock exclusively through erasure, so revalidate that
+    // the slot is still the registered one.
     if (FindSlot(client_id) != slot) return std::nullopt;
     return operation;
 }
@@ -235,7 +214,6 @@ ClientSessionRegistry::Registration::Registration(
         if (provisional_) {
             slot_ = std::make_shared<ClientSlot>(
                 std::make_shared<ClientLivenessRecord>(observed_at_));
-            registry.Bind(client_id, slot_->liveness);
             // Claim the private slot before publication; never acquire a
             // published slot's operation lock under the registry lock.
             operation_ = ExclusiveOperation(slot_->operation_mutex);
@@ -274,14 +252,23 @@ bool ClientSessionRegistry::Registration::NeedsRemount() const {
 void ClientSessionRegistry::Registration::UpdateHostId(
     const std::string& host_id) {
     CHECK(operation_.owns_lock() && admitted_);
-    registry_.UpdateHostId(client_id_, host_id);
+    if (host_id.empty()) {
+        return;
+    }
+    std::unique_lock lock(registry_.mutex_);
+    slot_->host_id = host_id;
 }
 
 void ClientSessionRegistry::Registration::Commit() {
     CHECK(operation_.owns_lock() && admitted_);
     CHECK(!committed_);
     if (kind_ == RegistrationKind::Register) {
-        (void)slot_->liveness->Observe(observed_at_);
+        if (slot_->liveness->Observe(observed_at_) ==
+            ClientLivenessObservation::RECOVERED_ACTIVE) {
+            registry_.PublishTransition(client_id_, slot_,
+                                        ClientLivenessState::SUSPECTED,
+                                        ClientLivenessState::ACTIVE);
+        }
     } else {
         std::unique_lock lock(registry_.mutex_);
         if (slot_->liveness->ShouldRetainResources() &&
@@ -300,7 +287,7 @@ ClientSessionRegistry::RestoreBatch::RestoreBatch(
     ClientSessionRegistry& registry)
     : registry_(registry), lifecycle_lock_(registry.lifecycle_mutex_) {}
 
-ClientSessionRegistry::Record ClientSessionRegistry::RestoreBatch::FindOrCreate(
+ClientSessionSharedPtr ClientSessionRegistry::RestoreBatch::FindOrCreate(
     const UUID& client_id) {
     CHECK(lifecycle_lock_.owns_lock() && !committed_);
     if (const auto slot = registry_.FindSlot(client_id)) {
@@ -321,17 +308,31 @@ void ClientSessionRegistry::RestoreBatch::Commit() {
 }
 
 ClientStatus ClientSessionRegistry::Ping(const UUID& client_id) {
-    const auto slot = FindSlot(client_id);
-    if (!slot || slot->liveness->Observe(Clock::now()) ==
-                     ClientLivenessObservation::REJECTED_OFFLINE) {
+    return Observe(client_id, Clock::now());
+}
+
+ClientStatus ClientSessionRegistry::Observe(const UUID& client_id,
+                                            Clock::time_point now) {
+    // Never the long operation lock. The registry lock covers the observation
+    // too, so a session is either observed before its removal reads the state
+    // or not at all.
+    std::shared_lock lock(mutex_);
+    const auto slot = FindSlotLocked(client_id);
+    if (!slot) {
         return ClientStatus::NEED_REMOUNT;
     }
-    // Read readiness with registry identity, never with the long operation
-    // lock. Observe has already released the liveness transition lock.
-    std::shared_lock lock(mutex_);
-    return FindSlotLocked(client_id) == slot && slot->remount_completed
-               ? ClientStatus::OK
-               : ClientStatus::NEED_REMOUNT;
+    switch (slot->liveness->Observe(now)) {
+        case ClientLivenessObservation::REJECTED_OFFLINE:
+            return ClientStatus::NEED_REMOUNT;
+        case ClientLivenessObservation::RECOVERED_ACTIVE:
+            PublishTransition(client_id, slot, ClientLivenessState::SUSPECTED,
+                              ClientLivenessState::ACTIVE);
+            break;
+        case ClientLivenessObservation::REFRESHED_ACTIVE:
+            break;
+    }
+    return slot->remount_completed ? ClientStatus::OK
+                                   : ClientStatus::NEED_REMOUNT;
 }
 
 bool ClientSessionRegistry::HasRetiredSession() const {
@@ -361,30 +362,24 @@ void ClientSessionRegistry::ClearRemountState(const Slot& slot) {
 }
 
 void ClientSessionRegistry::AdoptRecords(const Records& records) {
-    Slots pending;
-    for (const auto& [client_id, record] : records) {
-        pending.emplace(client_id, std::make_shared<ClientSlot>(record));
-        Bind(client_id, record);
-    }
     std::unique_lock lock(mutex_);
-    for (const auto& [client_id, slot] : pending) {
-        AdoptSlot(client_id, slot);
+    for (const auto& [client_id, record] : records) {
+        AdoptSlot(client_id, std::make_shared<ClientSlot>(record));
     }
 }
 
 void ClientSessionRegistry::EraseSlot(const UUID& client_id, const Slot& slot,
                                       const ExclusiveOperation& operation) {
     CHECK(operation.owns_lock() && operation.mutex() == &slot->operation_mutex);
-    const auto last_observed_state = slot->liveness->StopObserving();
-    MasterMetricManager::instance().on_client_liveness_record_removed(
-        last_observed_state);
-    // Transition is unlocked; operation still excludes other removers and
-    // waiters cannot validate this slot until erasure completes.
+    // The operation excludes other removers, expiry and registration, and the
+    // registry lock excludes Ping, so the state read here is the one the
+    // gauges last counted. Waiters cannot validate this slot once it is gone.
     std::unique_lock lock(mutex_);
     CHECK(FindSlotLocked(client_id) == slot);
+    MasterMetricManager::instance().on_client_liveness_record_removed(
+        slot->liveness->state());
     ClearRemountState(slot);
     slots_.erase(client_id);
-    EraseHostId(client_id);
 }
 
 void ClientSessionRegistry::ClearSlots() {
@@ -394,24 +389,11 @@ void ClientSessionRegistry::ClearSlots() {
         ExclusiveOperation operation(slot->operation_mutex);
         EraseSlot(client_id, slot, operation);
     }
-    std::unique_lock host_lock(host_mutex_);
-    host_ids_.clear();
 }
 
-void ClientSessionRegistry::Reset(Records records) {
+void ClientSessionRegistry::Reset() {
     std::unique_lock lifecycle_lock(lifecycle_mutex_);
     ClearSlots();
-    AdoptRecords(records);
-}
-
-void ClientSessionRegistry::OnSessionRetired(
-    const UUID& client_id, const ClientSessionSharedPtr& session) {
-    std::unique_lock lock(mutex_);
-    const auto slot = FindSlotLocked(client_id);
-    if (slot && slot->liveness == session) {
-        ClearRemountState(slot);
-        EraseHostId(client_id);
-    }
 }
 
 void ClientSessionRegistry::ExpiryThreadFunc() {
@@ -451,7 +433,28 @@ void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
             continue;
         }
         slot->busy_expiry_passes.store(0, std::memory_order_relaxed);
-        (void)slot->liveness->Evaluate(now, active_ttl_, suspicion_ttl_);
+        switch (slot->liveness->Evaluate(now, active_ttl_, suspicion_ttl_)) {
+            case ClientLivenessTransition::NONE:
+                break;
+            case ClientLivenessTransition::BECAME_SUSPECTED:
+                PublishTransition(client_id, slot, ClientLivenessState::ACTIVE,
+                                  ClientLivenessState::SUSPECTED);
+                break;
+            case ClientLivenessTransition::BECAME_OFFLINE: {
+                // Drop this registry's own state for the terminal incarnation
+                // before any resource owner hears of it. The operation is
+                // still held, so the slot is the current one.
+                {
+                    std::unique_lock lock(mutex_);
+                    ClearRemountState(slot);
+                    slot->host_id.clear();
+                }
+                PublishTransition(client_id, slot,
+                                  ClientLivenessState::SUSPECTED,
+                                  ClientLivenessState::OFFLINE);
+                break;
+            }
+        }
     }
 }
 

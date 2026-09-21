@@ -7,7 +7,6 @@
 #include <glog/logging.h>
 
 #include "master_metric_manager.h"
-#include "master_service.h"
 
 namespace mooncake {
 
@@ -113,7 +112,7 @@ void ClientOffboardingWorker::ThreadFunc() {
             jobs_.erase(next);
         }
 
-        if (service_->ProcessClientOffboardingJob(job)) {
+        if (process_(job)) {
             CompleteJob(job);
             continue;
         }
@@ -128,8 +127,6 @@ void ClientOffboardingWorker::ThreadFunc() {
                    << ", action=client_offboarding_retry"
                    << ", retry_count=" << job.retry_count
                    << ", alert=" << (alert ? "true" : "false")
-                   << ", pending_prepare_segments="
-                   << job.pending_prepare_segments.size()
                    << ", prepared_segments=" << job.prepared_segments.size()
                    << ", metadata_cleanup_accepted="
                    << (job.metadata_cleanup_accepted ? "true" : "false");

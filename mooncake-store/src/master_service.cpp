@@ -2601,53 +2601,18 @@ void MasterService::OnClientSessionChanged(const ClientSessionEvent& event) {
     }
     const auto& client_id = event.client_id;
     // The registry has already dropped its own state for this incarnation.
-    // Cancel graceful-unmount deadlines before preparing terminal cleanup.
+    // Cancel graceful-unmount deadlines before terminal cleanup prepares the
+    // same segments. Everything that needs the snapshot or segment locks is
+    // the job's, so a long remount cannot stall event delivery.
     graceful_unmount_scheduler_.RemoveIf(
         [&client_id](const GracefulUnmountDeadlineRecord& pending) {
             return pending.client_id == client_id;
         });
+    // Only the job's completion removes the OFFLINE session and lifts the
+    // snapshot barrier.
     ClientOffboardingJob job;
     job.client_id = client_id;
     job.retired_session = event.session;
-    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-    // Early preparation failure must still submit the job below: only its
-    // completion removes the OFFLINE session and lifts the snapshot barrier.
-    const auto prepare_segments = [&] {
-        auto segment_access = segment_manager_.getSegmentAccess();
-        std::vector<Segment> segments;
-        if (segment_access.GetClientSegments(client_id, segments) !=
-            ErrorCode::OK) {
-            return;
-        }
-        for (const auto& segment : segments) {
-            const PendingSegmentOffboarding pending{
-                .segment_id = segment.id,
-                .segment_name = segment.name,
-                .transport_endpoint = segment.te_endpoint};
-            size_t metrics_dec_capacity = 0;
-            const auto result = segment_access.PrepareUnmountSegment(
-                segment.id, metrics_dec_capacity);
-            if (result == ErrorCode::SEGMENT_NOT_FOUND) {
-                continue;
-            }
-            if (result != ErrorCode::OK) {
-                job.pending_prepare_segments.push_back(pending);
-                // An existing unmount owns the preparation; retry later
-                // without taking over its capacity accounting or logging
-                // errors.
-                if (result != ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
-                    LOG(ERROR) << "client_id=" << client_id
-                               << ", segment_name=" << segment.name
-                               << ", action=prepare_client_offboarding"
-                               << ", error=" << toString(result);
-                }
-                continue;
-            }
-            job.prepared_segments.emplace_back(pending, metrics_dec_capacity);
-        }
-    };
-    prepare_segments();
-
     client_offboarding_worker_.Schedule(std::move(job));
 }
 
@@ -2810,33 +2775,52 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
 
-        if (!job.pending_prepare_segments.empty()) {
+        {
+            // Prepare whatever the client still owns and this job has not
+            // prepared yet. The segments are enumerated again on every attempt
+            // instead of being carried in the job.
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
-            for (auto it = job.pending_prepare_segments.begin();
-                 it != job.pending_prepare_segments.end();) {
+            std::vector<Segment> segments;
+            if (segment_access.GetClientSegments(job.client_id, segments) !=
+                ErrorCode::OK) {
+                segments.clear();
+            }
+            bool unprepared_segment = false;
+            for (const auto& segment : segments) {
+                if (std::any_of(job.prepared_segments.begin(),
+                                job.prepared_segments.end(),
+                                [&segment](const auto& prepared) {
+                                    return prepared.segment_id == segment.id;
+                                })) {
+                    continue;
+                }
                 size_t metrics_dec_capacity = 0;
                 const auto err = segment_access.PrepareUnmountSegment(
-                    it->segment_id, metrics_dec_capacity);
+                    segment.id, metrics_dec_capacity);
                 if (err == ErrorCode::OK) {
-                    job.prepared_segments.emplace_back(std::move(*it),
-                                                       metrics_dec_capacity);
-                    it = job.pending_prepare_segments.erase(it);
+                    job.prepared_segments.push_back(
+                        {.segment_id = segment.id,
+                         .segment_name = segment.name,
+                         .transport_endpoint = segment.te_endpoint,
+                         .metrics_dec_capacity = metrics_dec_capacity});
                     continue;
                 }
                 if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-                    it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
+                // An existing unmount owns the preparation; retry later
+                // without taking over its capacity accounting or logging
+                // errors.
                 if (err != ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
                     LOG(ERROR) << "client_id=" << job.client_id
-                               << ", segment_name=" << it->segment_name
+                               << ", segment_name=" << segment.name
                                << ", action=prepare_client_offboarding"
                                << ", error=" << toString(err);
                 }
-                ++it;
+                unprepared_segment = true;
             }
-            if (!job.pending_prepare_segments.empty()) {
+            if (unprepared_segment) {
                 return false;
             }
         }
@@ -10462,6 +10446,11 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         }
     }
 
+    // Every restored owner gets a session, including one that owns only a
+    // LOCAL_DISK registration; disk-replica owners are staged as the walk
+    // below meets them. The registry is empty here: each restore attempt
+    // starts from ResetStateAfterFailedRestoreAttempt.
+    auto restore = client_sessions_.BeginRestore();
     std::unordered_set<UUID, boost::hash<UUID>> client_ids;
     for (const auto& [segment, owner] : segments) {
         (void)segment;
@@ -10471,38 +10460,13 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         client_ids.insert(client_id);
     }
 
-    for (const auto& shard : metadata_shards_) {
-        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-            (void)tenant_id;
-            for (const auto& [key, metadata] : tenant_state.metadata) {
-                (void)key;
-                for (const auto& replica : metadata.GetAllReplicas()) {
-                    if (replica.is_local_disk_replica()) {
-                        const auto owner = replica.get_local_disk_client_id();
-                        if (owner) {
-                            client_ids.insert(*owner);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
-                       boost::hash<UUID>>
-        records;
-    records.reserve(client_ids.size());
-    const auto now = ClientLivenessRecord::Clock::now();
-    for (const auto& client_id : client_ids) {
-        records.emplace(client_id, std::make_shared<ClientLivenessRecord>(now));
-    }
-
     bool missing_memory_registration = false;
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
-        for (const auto& [client_id, record] : records) {
-            segment_access.BindClientSession(client_id, record);
+        for (const auto& client_id : client_ids) {
+            segment_access.BindClientSession(client_id,
+                                             restore.FindOrCreate(client_id));
         }
         for (auto& shard : metadata_shards_) {
             for (auto& [tenant_id, tenant_state] : shard.tenants) {
@@ -10525,7 +10489,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
                                     replica.get_local_disk_client_id();
                                 if (owner) {
                                     replica.bindLocalDiskSession(
-                                        records.at(*owner));
+                                        restore.FindOrCreate(*owner));
                                 }
                             }
                         });
@@ -10539,7 +10503,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
             "restored memory replica has no Segment registration"));
     }
 
-    client_sessions_.Reset(std::move(records));
+    restore.Commit();
     return {};
 }
 

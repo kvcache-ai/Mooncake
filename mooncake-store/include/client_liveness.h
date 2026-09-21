@@ -3,11 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string_view>
-#include <utility>
 
 namespace mooncake {
 
@@ -44,6 +42,10 @@ enum class ClientLivenessObservation {
     REJECTED_OFFLINE,
 };
 
+// The liveness state machine of one client incarnation. It reports every
+// transition to the caller that caused it and has no side effects of its own:
+// whoever mutates a record owns what a transition means. Only the session
+// registry does; everyone else holds the read-only ClientSessionSharedPtr.
 class ClientLivenessRecord {
    public:
     using Clock = std::chrono::steady_clock;
@@ -75,7 +77,8 @@ class ClientLivenessRecord {
         }
         last_liveness_at_ = std::max(last_liveness_at_, now);
         if (current_state == ClientLivenessState::SUSPECTED) {
-            SetState(ClientLivenessState::ACTIVE);
+            state_.store(ClientLivenessState::ACTIVE,
+                         std::memory_order_release);
             return ClientLivenessObservation::RECOVERED_ACTIVE;
         }
         return ClientLivenessObservation::REFRESHED_ACTIVE;
@@ -89,13 +92,15 @@ class ClientLivenessRecord {
             case ClientLivenessState::ACTIVE:
                 if (now - last_liveness_at_ >= active_ttl) {
                     suspected_since_ = now;
-                    SetState(ClientLivenessState::SUSPECTED);
+                    state_.store(ClientLivenessState::SUSPECTED,
+                                 std::memory_order_release);
                     return ClientLivenessTransition::BECAME_SUSPECTED;
                 }
                 break;
             case ClientLivenessState::SUSPECTED:
                 if (now - suspected_since_ >= suspicion_ttl) {
-                    SetState(ClientLivenessState::OFFLINE);
+                    state_.store(ClientLivenessState::OFFLINE,
+                                 std::memory_order_release);
                     return ClientLivenessTransition::BECAME_OFFLINE;
                 }
                 break;
@@ -105,41 +110,7 @@ class ClientLivenessRecord {
         return ClientLivenessTransition::NONE;
     }
 
-    using TransitionObserver =
-        std::function<void(ClientLivenessState, ClientLivenessState)>;
-
-    // The observer runs under the transition lock, in state-change order. It
-    // must not throw or reenter the record; use it to enqueue work, not to run
-    // resource cleanup. Install before publishing a newly registered record.
-    void SetTransitionObserver(TransitionObserver observer) {
-        std::lock_guard<std::mutex> lock(transition_mutex_);
-        on_transition_ = std::move(observer);
-        observer_enabled_.store(true, std::memory_order_release);
-    }
-
-    // Wait for any in-flight observer, disable future notifications, and
-    // return the state at that point. Does not change liveness. Later
-    // transitions do not invoke the observer unless it is reinstalled; already
-    // queued notifications are not retracted.
-    [[nodiscard]] ClientLivenessState StopObserving() {
-        std::lock_guard lock(transition_mutex_);
-        observer_enabled_.store(false, std::memory_order_release);
-        return state();
-    }
-
    private:
-    TransitionObserver on_transition_;
-    std::atomic<bool> observer_enabled_{false};
-
-    void SetState(ClientLivenessState next) {
-        const auto previous = state_.load(std::memory_order_relaxed);
-        state_.store(next, std::memory_order_release);
-        if (observer_enabled_.load(std::memory_order_acquire) &&
-            on_transition_) {
-            on_transition_(previous, next);
-        }
-    }
-
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
     std::mutex transition_mutex_;
     TimePoint last_liveness_at_;

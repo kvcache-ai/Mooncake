@@ -27,24 +27,24 @@ class ClientSessionRegistryTestPeer;
 // Owns client session identity: which incarnation is registered under a client
 // ID, whether it may serve or retain resources, the scopes that keep one
 // incarnation stable while an operation runs, and the TTL expiry of sessions
-// that stop heartbeating. It also owns the delivery of the resulting liveness
-// transitions: publication happens under the record's transition lock, but
-// listeners run on the owned delivery thread, outside every registry lock, so
-// a listener may take segment, metadata or snapshot locks and may reenter the
-// registry.
+// that stop heartbeating. It is the only mutator of the liveness records it
+// hands out as read-only identities, so every transition is one it caused
+// itself, and it owns what follows from one: its gauges, its own state for a
+// terminal incarnation, and delivery to listeners. Listeners run on the owned
+// delivery thread, outside every registry lock, so a listener may take
+// segment, metadata or snapshot locks and may reenter the registry.
 class ClientSessionRegistry {
    private:
     enum class RegistrationKind { Register, Remount };
-
-   public:
     using Record = std::shared_ptr<ClientLivenessRecord>;
     using Records = std::unordered_map<UUID, Record, boost::hash<UUID>>;
+
+   public:
     using Clock = ClientLivenessRecord::Clock;
 
-    // Records may outlive the registry: removal and destruction stop observing
-    // them first, so their later transitions are dropped. A session unobserved
-    // for active_ttl becomes SUSPECTED, and OFFLINE suspicion_ttl later; the
-    // defaults never expire.
+    // A session unobserved for active_ttl becomes SUSPECTED, and OFFLINE
+    // suspicion_ttl later; the defaults never expire. Identities may outlive
+    // the registry: a record that left it is never mutated again.
     explicit ClientSessionRegistry(
         Clock::duration active_ttl = Clock::duration::max(),
         Clock::duration suspicion_ttl = Clock::duration::max());
@@ -52,10 +52,11 @@ class ClientSessionRegistry {
     ClientSessionRegistry(const ClientSessionRegistry&) = delete;
     ClientSessionRegistry& operator=(const ClientSessionRegistry&) = delete;
 
-    // Host hints may arrive before registration. These methods synchronize
-    // internally and may also be called within a registry transaction. Empty
-    // updates preserve the previous hint; OFFLINE/removal/reset erase it.
-    // Prefer Registration::UpdateHostId within a registration scope.
+    // The host hint is part of the session, so it lives and dies with the
+    // incarnation: OFFLINE, removal and reset drop it, and a hint for a client
+    // without a session is ignored. Empty updates preserve the previous hint.
+    // These synchronize internally and need no session scope; within a
+    // registration scope use Registration::UpdateHostId.
     void UpdateHostId(const UUID& client_id, const std::string& host_id);
     std::string GetHostId(const UUID& client_id) const;
 
@@ -93,11 +94,13 @@ class ClientSessionRegistry {
     [[nodiscard]] std::optional<Registration> BeginRemount(
         const UUID& client_id);
 
-    // Stage restored owners under the exclusive lifecycle lock. Commit adopts
-    // them atomically under the registry lock; destruction without Commit
-    // discards them. Resource rollback is the caller's job. Commit retains the
-    // lifecycle lock; the registry must outlive the scope. Existing records are
-    // reused, not replaced. Lookups and heartbeats remain independent.
+    // The one way restored resources get an owner session, for snapshot and
+    // standby restore alike. Stages owners under the exclusive lifecycle lock.
+    // Commit adopts them atomically under the registry lock; destruction
+    // without Commit discards them. Resource rollback is the caller's job.
+    // Commit retains the lifecycle lock; the registry must outlive the scope.
+    // Existing sessions are reused, not replaced. Lookups and heartbeats remain
+    // independent.
     class RestoreBatch;
     [[nodiscard]] RestoreBatch BeginRestore();
 
@@ -108,13 +111,17 @@ class ClientSessionRegistry {
     // cleanup has not converged. OFFLINE is itself the barrier: whoever can
     // observe it can also observe this, with no separate reservation.
     bool HasRetiredSession() const;
-    // Whole-registry reset/replacement is only allowed once monitoring and
-    // event delivery are stopped.
-    void Reset(Records records = {});
+    // Drops every session. Only allowed once monitoring and event delivery
+    // are stopped.
+    void Reset();
 
     // Register before the first Start; a listener added later is rejected.
     // Listeners run serially, in registration order, on the delivery thread,
-    // and must not throw. Their owners must outlive Stop.
+    // and must not throw. Their owners must outlive Stop. OFFLINE is delivered
+    // once per incarnation, after the registry dropped its own readiness and
+    // host state for it. A recovery and a suspicion of one session come from
+    // different threads and may be delivered out of order; read
+    // event.session for the state that holds now.
     [[nodiscard]] bool AddListener(
         ClientSessionEventDispatcher::Listener listener);
 
@@ -129,13 +136,6 @@ class ClientSessionRegistry {
     void Stop();
 
    private:
-    // Drop readiness and host state for a terminal incarnation. Runs from this
-    // registry's own listener, registered first so no other listener can see
-    // the event earlier, outside the record lock, and ignores an event that a
-    // newer incarnation has already replaced.
-    void OnSessionRetired(const UUID& client_id,
-                          const ClientSessionSharedPtr& session);
-
     friend class test::ClientSessionRegistryTestPeer;
 
     static constexpr std::chrono::seconds kExpiryScanInterval{1};
@@ -157,21 +157,22 @@ class ClientSessionRegistry {
         // Consecutive expiry passes that found this slot busy. Monitoring
         // reads and writes it while scanning; nothing else touches it.
         std::atomic<unsigned> busy_expiry_passes{0};
-        // Protected by the registry mutex, not operation_mutex: Ping must not
-        // wait for long registration/resource work.
+        // Protected by the registry mutex, not operation_mutex: Ping and host
+        // hints must not wait for long registration/resource work.
         bool remount_completed{false};
+        std::string host_id;
     };
     using Slot = std::shared_ptr<ClientSlot>;
     using Slots = std::unordered_map<UUID, Slot, boost::hash<UUID>>;
     using SharedOperation = std::shared_lock<std::shared_mutex>;
     using ExclusiveOperation = std::unique_lock<std::shared_mutex>;
 
-    // Lock order: admission gate -> slot operation -> registry, or slot
-    // operation -> transition. Never acquire an operation under the registry
-    // lock, or nest registry and transition. The caller retains slot until the
-    // returned operation is released. Empty means missing/replaced, or busy
-    // when try_lock is requested; these validate slot identity only, not
-    // liveness admission.
+    // Lock order: admission gate -> slot operation -> registry -> transition.
+    // Never acquire an operation under the registry lock. A record's
+    // transition lock and the event queue are leaves. The caller retains slot
+    // until the returned operation is released. Empty means missing/replaced,
+    // or busy when try_lock is requested; these validate slot identity only,
+    // not liveness admission.
     std::optional<SharedOperation> AcquireSharedOperation(
         const UUID& client_id, const Slot& slot) const;
     std::optional<ExclusiveOperation> AcquireExclusiveOperation(
@@ -186,15 +187,21 @@ class ClientSessionRegistry {
     Slot FindSlotLocked(const UUID& client_id) const;
     void AdoptSlot(const UUID& client_id, const Slot& slot);
     void ClearRemountState(const Slot& slot);
-    // Requires exclusive lifecycle access; binds before taking registry lock.
+    // Requires exclusive lifecycle access.
     void AdoptRecords(const Records& records);
     // Requires a validated current slot operation and lifecycle access.
     void EraseSlot(const UUID& client_id, const Slot& slot,
                    const ExclusiveOperation& operation);
     void ClearSlots();
 
-    void Bind(const UUID& client_id, const Record& record);
-    void EraseHostId(const UUID& client_id);
+    // Ping at an explicit time.
+    ClientStatus Observe(const UUID& client_id, Clock::time_point now);
+    // Gauges and delivery for a transition this registry just caused. The
+    // caller excludes EraseSlot, through the slot's exclusive operation or the
+    // registry lock, so a removed session is counted in exactly one state.
+    void PublishTransition(const UUID& client_id, const Slot& slot,
+                           ClientLivenessState previous,
+                           ClientLivenessState current);
     // One deterministic expiry pass. Applies the TTLs to every session,
     // excluding its operations for the evaluation. A busy session is retried
     // on the next pass; one that stays busy is eventually waited for, so
@@ -210,13 +217,6 @@ class ClientSessionRegistry {
     mutable std::shared_mutex lifecycle_mutex_;
     mutable std::shared_mutex mutex_;
     Slots slots_;
-    // Independent of the registry lock; never acquire the registry lock while
-    // holding this mutex. Host lookups do not need a session transaction.
-    mutable std::shared_mutex host_mutex_;
-    std::unordered_map<UUID, std::string, boost::hash<UUID>> host_ids_;
-    // Published to by the observer of every bound record. EraseSlot stops
-    // observing before a record leaves the registry, and the destructor stops
-    // delivery before erasing, so no observer reaches it after destruction.
     ClientSessionEventDispatcher events_;
 
     const Clock::duration active_ttl_;
@@ -264,8 +264,8 @@ class ClientSessionRegistry::Registration {
     // Whether this incarnation still owes a successful remount handshake.
     // Independent of ACTIVE/SUSPECTED: a suspected session may need no remount.
     bool NeedsRemount() const;
-    // Updates immediately; empty hints preserve the previous value. Rollback
-    // erases the hint only when the session itself is provisional.
+    // Updates immediately; empty hints preserve the previous value. The hint
+    // goes with the session, so rolling back a provisional one drops it.
     void UpdateHostId(const std::string& host_id);
     // Exactly one commit, with semantics fixed by the Begin* call.
     // Destruction without Commit removes only a provisional session, not
@@ -299,7 +299,9 @@ class ClientSessionRegistry::RestoreBatch {
     RestoreBatch(RestoreBatch&&) noexcept = default;
     RestoreBatch& operator=(RestoreBatch&&) = delete;
 
-    Record FindOrCreate(const UUID& client_id);
+    // The owner identity to bind restored resources to: the registered
+    // session, or one staged until Commit.
+    ClientSessionSharedPtr FindOrCreate(const UUID& client_id);
     void Commit();
 
    private:
