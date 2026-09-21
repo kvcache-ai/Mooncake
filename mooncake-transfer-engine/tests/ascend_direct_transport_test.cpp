@@ -57,6 +57,12 @@ static int g_get_device_call_count = 0;
 static int g_set_device_call_count = 0;
 static std::set<int> g_set_device_ids;
 static std::map<const void*, aclrtMemLocation> g_memory_locations;
+static int g_mem_set_access_count = 0;
+static aclError g_mem_set_access_result = ACL_ERROR_NONE;
+static aclrtMemAccessDesc g_last_mem_set_access_desc = {};
+static int g_unmap_mem_count = 0;
+static int g_release_mem_address_count = 0;
+static int g_free_physical_count = 0;
 static std::mutex g_acl_mutex;
 // 0 = no size limit; otherwise aclrtMallocPhysical fails when size > threshold.
 static size_t g_malloc_physical_max_success = 0;
@@ -90,6 +96,12 @@ void reset() {
     g_set_device_call_count = 0;
     g_set_device_ids.clear();
     g_memory_locations.clear();
+    g_mem_set_access_count = 0;
+    g_mem_set_access_result = ACL_ERROR_NONE;
+    g_last_mem_set_access_desc = {};
+    g_unmap_mem_count = 0;
+    g_release_mem_address_count = 0;
+    g_free_physical_count = 0;
     g_malloc_physical_max_success = 0;
     g_malloc_physical_call_count = 0;
 }
@@ -102,6 +114,36 @@ void set_malloc_physical_max_success(size_t max_success) {
 int malloc_physical_call_count() {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     return g_malloc_physical_call_count;
+}
+
+void set_mem_set_access_result(aclError result) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    g_mem_set_access_result = result;
+}
+
+int mem_set_access_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_mem_set_access_count;
+}
+
+aclrtMemAccessDesc last_mem_set_access_desc() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_last_mem_set_access_desc;
+}
+
+int unmap_mem_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_unmap_mem_count;
+}
+
+int release_mem_address_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_release_mem_address_count;
+}
+
+int free_physical_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_free_physical_count;
 }
 
 void set_device_count(int count) {
@@ -294,6 +336,12 @@ aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
     return ACL_ERROR_NONE;
 }
 
+aclError aclrtGetLogicDevIdByUserDevId(int32_t user_dev_id,
+                                       int32_t* logic_dev_id) {
+    *logic_dev_id = user_dev_id;
+    return ACL_ERROR_NONE;
+}
+
 aclError aclrtMallocPhysical(aclrtDrvMemHandle* handle, size_t size,
                              aclrtPhysicalMemProp* prop, uint32_t flags) {
     (void)prop;
@@ -333,17 +381,35 @@ aclError aclrtMapMem(void* va, size_t size, size_t offset,
 
 aclError aclrtFreePhysical(aclrtDrvMemHandle handle) {
     free(handle);
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    ++g_free_physical_count;
     return ACL_ERROR_NONE;
 }
 
 aclError aclrtReleaseMemAddress(void* va) {
     free(va);
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    ++g_release_mem_address_count;
     return ACL_ERROR_NONE;
 }
 
 aclError aclrtUnmapMem(void* va) {
     (void)va;
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    ++g_unmap_mem_count;
     return ACL_ERROR_NONE;
+}
+
+aclError aclrtMemSetAccess(void* va, size_t size, aclrtMemAccessDesc* desc,
+                           size_t count) {
+    (void)va;
+    (void)size;
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    ++g_mem_set_access_count;
+    if (count == 1 && desc != nullptr) {
+        g_last_mem_set_access_desc = *desc;
+    }
+    return g_mem_set_access_result;
 }
 
 aclError aclrtMallocHost(void** host_ptr, size_t size) {
@@ -368,6 +434,7 @@ static adxl::TransferStatus g_transfer_status_enum =
 static std::deque<adxl::Status> g_transfer_results;
 static std::deque<adxl::Status> g_transfer_async_results;
 static std::vector<uintptr_t> g_registered_mem_handles;
+static std::vector<adxl::MemType> g_registered_mem_types;
 static std::vector<uintptr_t> g_deregistered_mem_handles;
 static std::set<std::string> g_connected;
 static std::mutex g_mutex;
@@ -398,6 +465,7 @@ void reset() {
     g_transfer_results.clear();
     g_transfer_async_results.clear();
     g_registered_mem_handles.clear();
+    g_registered_mem_types.clear();
     g_deregistered_mem_handles.clear();
     g_connected.clear();
     g_was_initialize_called = false;
@@ -506,6 +574,11 @@ int get_deregister_mem_count() {
 std::vector<uintptr_t> get_registered_mem_handles() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_registered_mem_handles;
+}
+
+std::vector<adxl::MemType> get_registered_mem_types() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_registered_mem_types;
 }
 
 std::vector<uintptr_t> get_deregistered_mem_handles() {
@@ -644,8 +717,6 @@ Status AdxlEngine::GetTransferStatus(const TransferReq& req,
 
 Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
                                MemHandle& mem_handle) {
-    (void)mem;
-    (void)type;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_register_mem_count++;
     if (g_register_mem_result != adxl::SUCCESS) {
@@ -654,6 +725,7 @@ Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
     mem_handle =
         reinterpret_cast<MemHandle>(static_cast<uintptr_t>(g_next_handle++));
     g_registered_mem_handles.push_back(reinterpret_cast<uintptr_t>(mem_handle));
+    g_registered_mem_types.push_back(type);
     return SUCCESS;
 }
 
@@ -2283,6 +2355,52 @@ TEST(FabricMemBestEffortAllocTest, FullTargetFirstSuccess) {
     ascend_free_memory("ascend", ptr);
     globalConfig().ascend_use_fabric_mem = false;
     mock_acl::reset();
+}
+
+TEST(FabricMemBestEffortAllocTest,
+     DirectVmmAllocationGrantsDeviceAccessAndRollsBackOnFailure) {
+    mock_acl::reset();
+
+    void* ptr = ascend_allocate_vmm_memory_direct(kRegisterMemSize);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(mock_acl::mem_set_access_count(), 1);
+    EXPECT_EQ(mock_acl::unmap_mem_count(), 0);
+    EXPECT_EQ(mock_acl::release_mem_address_count(), 0);
+    EXPECT_EQ(mock_acl::free_physical_count(), 0);
+
+    auto desc = mock_acl::last_mem_set_access_desc();
+    EXPECT_EQ(desc.flags, ACL_RT_MEM_ACCESS_FLAGS_READWRITE);
+    EXPECT_EQ(desc.location.type, ACL_MEM_LOCATION_TYPE_DEVICE);
+    EXPECT_EQ(desc.location.id, 0);
+
+    ascend_free_memory("ascend", ptr);
+
+    mock_acl::set_mem_set_access_result(ACL_ERROR_FAILURE);
+    EXPECT_EQ(ascend_allocate_vmm_memory_direct(kRegisterMemSize), nullptr);
+    EXPECT_EQ(mock_acl::mem_set_access_count(), 2);
+    EXPECT_EQ(mock_acl::unmap_mem_count(), 1);
+    EXPECT_EQ(mock_acl::release_mem_address_count(), 1);
+    EXPECT_EQ(mock_acl::free_physical_count(), 1);
+
+    mock_acl::reset();
+}
+
+TEST_F(AscendDirectTransportTest, FabricMemRegistersHostVmmAsDevice) {
+    globalConfig().ascend_use_fabric_mem = true;
+    globalConfig().ascend_store_te_init = true;
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    const auto mem_types = adxl_mock::get_registered_mem_types();
+    ASSERT_EQ(mem_types.size(), 1U);
+    EXPECT_EQ(mem_types[0], adxl::MEM_DEVICE);
+
+    ASSERT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    globalConfig().ascend_store_te_init = false;
+    globalConfig().ascend_use_fabric_mem = false;
 }
 
 namespace {

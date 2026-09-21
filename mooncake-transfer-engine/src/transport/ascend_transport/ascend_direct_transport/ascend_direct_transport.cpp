@@ -378,6 +378,12 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     if (type_ret != 0) {
         return type_ret;
     }
+    if (use_fabric_mem_) {
+        // Both AdxlEngine::MallocMem and direct ACL VMM allocate host physical
+        // pages behind a device-accessible VA. ADXL expects that VA to be
+        // registered as device memory.
+        mem_type = adxl::MEM_DEVICE;
+    }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {

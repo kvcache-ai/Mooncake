@@ -14,6 +14,7 @@
 namespace mooncake {
 namespace {
 constexpr size_t kFabricMemPageSize = 1024ULL * 1024 * 1024;  // 1G
+constexpr size_t kMemAccessDescCount = 1;
 constexpr int kBestEffortStartPercent = 100;
 constexpr int kBestEffortMinPercent = 50;
 constexpr int kBestEffortPercentStep = 10;
@@ -135,6 +136,39 @@ int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle,
     return 0;
 }
 
+int grant_current_device_access(void *va, size_t total_size, bool quiet) {
+    int32_t user_dev_id = -1;
+    auto ret = aclrtGetDevice(&user_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to get device for MemSetAccess: " << ret;
+        }
+        return -1;
+    }
+    int32_t driver_dev_id = -1;
+    ret = aclrtGetLogicDevIdByUserDevId(user_dev_id, &driver_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to get logical device id for MemSetAccess: "
+                       << ret;
+        }
+        return -1;
+    }
+
+    aclrtMemAccessDesc desc = {};
+    desc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
+    desc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+    desc.location.id = static_cast<uint32_t>(driver_dev_id);
+    ret = aclrtMemSetAccess(va, total_size, &desc, kMemAccessDescCount);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to set memory access: " << ret;
+        }
+        return -1;
+    }
+    return 0;
+}
+
 // Direct ACL VMM allocation (always bypasses adxl MallocMem).
 // Used by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.
 void *allocate_vmm_memory_direct_impl(size_t total_size, bool quiet = false) {
@@ -156,6 +190,12 @@ void *allocate_vmm_memory_direct_impl(size_t total_size, bool quiet = false) {
         if (!quiet) {
             LOG(ERROR) << "Failed to map memory: " << ret;
         }
+        (void)aclrtReleaseMemAddress(va);
+        (void)aclrtFreePhysical(handle);
+        return nullptr;
+    }
+    if (grant_current_device_access(va, total_size, quiet) != 0) {
+        (void)aclrtUnmapMem(va);
         (void)aclrtReleaseMemAddress(va);
         (void)aclrtFreePhysical(handle);
         return nullptr;
