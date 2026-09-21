@@ -405,7 +405,7 @@ class MasterServiceTestPeer {
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
         return ClientSessionRegistryTestPeer::Find(service_.client_sessions_,
-                                                  client_id);
+                                                   client_id);
     }
 
     TenantQuotaHandle GetBoundTenantQuotaHandle(
