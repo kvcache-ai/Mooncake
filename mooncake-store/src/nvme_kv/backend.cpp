@@ -17,8 +17,8 @@
 #include <utility>
 #include <vector>
 
-#include "config/io_concurrency_config.h"
 #include "config/executor_config.h"
+#include "config/io_concurrency_config.h"
 #include "nvme_kv/executor_util.h"
 #include "nvme_kv/key_codec.h"
 #include "nvme_kv/key_conflict_policy.h"

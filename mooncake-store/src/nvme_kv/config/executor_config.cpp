@@ -4,7 +4,7 @@
 
 #include "environ.h"
 #include "environment_variables.h"
-#include "nvme_kv/config/u32_parser.h"
+#include "u32_parser.h"
 
 namespace mooncake {
 namespace {
