@@ -255,6 +255,10 @@ class RdmaContext {
 
     uint8_t portNum() const { return port_; }
 
+    uint8_t maxDestRdAtomic() const { return max_dest_rd_atomic_; }
+
+    uint8_t maxRdAtomic() const { return max_rd_atomic_; }
+
     uint8_t numLagPorts() const { return num_lag_ports_; }
 
     int activeSpeed() const { return active_speed_; }
@@ -320,6 +324,8 @@ class RdmaContext {
 
     uint8_t port_ = 0;
     uint16_t lid_ = 0;
+    uint8_t max_dest_rd_atomic_ = 16;
+    uint8_t max_rd_atomic_ = 16;
     int gid_index_ = -1;
     int active_speed_ = -1;
     int active_width_ = 1;
