@@ -1194,7 +1194,7 @@ bool ScopedSegmentAccess::IsSegmentAllocatable(
         segment_manager_->mounted_segments_.find(segment_id_it->second);
     return mounted_segment_it != segment_manager_->mounted_segments_.end() &&
            mounted_segment_it->second.status == SegmentStatus::OK &&
-           mounted_segment_it->second.allocator_registration->IsServing();
+           mounted_segment_it->second.allocator_registration->IsAllocatable();
 }
 
 ErrorCode ScopedSegmentAccess::GetSegmentStatusByName(

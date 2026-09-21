@@ -203,9 +203,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
-      client_session_manager_(
-          std::chrono::seconds(config.client_active_ttl_sec),
-          std::chrono::seconds(config.client_suspicion_ttl_sec), *this),
+      client_sessions_(std::chrono::seconds(config.client_active_ttl_sec),
+                       std::chrono::seconds(config.client_suspicion_ttl_sec)),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -497,25 +496,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
 #endif
     }
 
-    // Cancel graceful-unmount deadlines before preparing terminal cleanup.
-    CHECK(client_session_manager_.AddSessionListener(
-        [this](const ClientSessionEvent& event) {
-            if (event.current != ClientLivenessState::OFFLINE) {
-                return;
-            }
-            graceful_unmount_scheduler_.RemoveIf(
-                [&event](const GracefulUnmountDeadlineRecord& pending) {
-                    return pending.client_id == event.client_id;
-                });
-        }));
-    CHECK(client_session_manager_.AddSessionListener(
-        [this](const ClientSessionEvent& event) {
-            OnClientSessionChanged(event);
-        }));
-    // Start the owned lifecycle before raw threads for startup unwinding.
-    // The manager starts cleanup before monitoring can reserve retirement work.
-    client_session_manager_.Start();
-    VLOG(1) << "action=start_client_session_manager";
+    CHECK(client_sessions_.AddListener([this](const ClientSessionEvent& event) {
+        OnClientSessionChanged(event);
+    }));
+    // Start these owned lifecycles before any raw std::thread so a startup
+    // failure can unwind the constructor normally instead of encountering
+    // joinable thread destructors. Cleanup must be able to accept work before
+    // expiry can retire a session.
+    client_offboarding_worker_.Start();
+    client_sessions_.Start();
+    VLOG(1) << "action=start_client_session_plane";
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
@@ -688,8 +678,10 @@ MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
 MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
-    // Drain session events while cleanup and its snapshot barrier stay alive.
-    client_session_manager_.Quiesce();
+    // Stop publishing transitions and deliver what is already queued, while
+    // the offboarding worker can still accept the resulting jobs and the
+    // members the listener touches are still alive.
+    client_sessions_.Stop();
 
     // Stop snapshot manager (non-blocking)
     if (snapshot_manager_) {
@@ -737,7 +729,7 @@ MasterService::~MasterService() {
     if (snapshot_manager_) {
         snapshot_manager_.reset();
     }
-    client_session_manager_.Stop();
+    client_offboarding_worker_.Stop();
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }
@@ -753,7 +745,7 @@ MasterService::~MasterService() {
     // constructs a fresh MasterService and the clients remount.
     segment_manager_.releaseCapacityMetrics();
 
-    client_session_manager_.Reset();
+    client_sessions_.Reset();
 }
 
 void MasterService::SetBatchOpLogTerminalCallback(
@@ -875,8 +867,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     ErrorCode mount_result;
     {
-        auto registration =
-            client_session_manager_.BeginRegistration(client_id);
+        auto registration = client_sessions_.BeginRegistration(client_id);
         if (!registration) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -973,7 +964,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     {
-        auto remount = client_session_manager_.BeginRemount(client_id);
+        auto remount = client_sessions_.BeginRemount(client_id);
         if (!remount) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -2609,11 +2600,18 @@ void MasterService::OnClientSessionChanged(const ClientSessionEvent& event) {
         return;
     }
     const auto& client_id = event.client_id;
+    // The registry has already dropped its own state for this incarnation.
+    // Cancel graceful-unmount deadlines before preparing terminal cleanup.
+    graceful_unmount_scheduler_.RemoveIf(
+        [&client_id](const GracefulUnmountDeadlineRecord& pending) {
+            return pending.client_id == client_id;
+        });
     ClientOffboardingJob job;
     job.client_id = client_id;
     job.retired_session = event.session;
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-    // Early preparation failure must still submit the pre-reserved job below.
+    // Early preparation failure must still submit the job below: only its
+    // completion removes the OFFLINE session and lifts the snapshot barrier.
     const auto prepare_segments = [&] {
         auto segment_access = segment_manager_.getSegmentAccess();
         std::vector<Segment> segments;
@@ -2650,7 +2648,7 @@ void MasterService::OnClientSessionChanged(const ClientSessionEvent& event) {
     };
     prepare_segments();
 
-    client_session_manager_.ScheduleOffboarding(std::move(job));
+    client_offboarding_worker_.Schedule(std::move(job));
 }
 
 void MasterService::ClearInvalidHandles() {
@@ -2958,7 +2956,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         return false;
     }
 
-    client_session_manager_.Remove(job.client_id, job.retired_session);
+    client_sessions_.Remove(job.client_id, job.retired_session);
     return true;
 }
 
@@ -3375,7 +3373,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     }
     // Exclude registration/removal before taking the snapshot lock. Restore
     // holds the lifecycle barrier, not the registry lock, so Ping can continue.
-    auto restore = client_session_manager_.BeginRestore();
+    auto restore = client_sessions_.BeginRestore();
     std::unique_lock snapshot_lock(snapshot_mutex_);
     // The ordered writer initializes its sequence from durable_prefix.
     const auto resolve_standby_object = [](const StandbyObjectEntry& entry) {
@@ -4866,13 +4864,13 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(soft_pin_request.error());
     }
 
-    client_session_manager_.UpdateHostId(client_id, config.host_id);
+    client_sessions_.UpdateHostId(client_id, config.host_id);
     std::string writer_host_id;
     if ((allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
          config.prefer_alloc_in_same_node) &&
         config.replica_num == 1) {
         writer_host_id = config.host_id.empty()
-                             ? client_session_manager_.GetHostId(client_id)
+                             ? client_sessions_.GetHostId(client_id)
                              : config.host_id;
     }
 
@@ -5153,7 +5151,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                const TenantId& tenant_id, Replica& replica)
     -> tl::expected<bool, ErrorCode> {
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -5516,13 +5514,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(soft_pin_request.error());
     }
 
-    client_session_manager_.UpdateHostId(client_id, config.host_id);
+    client_sessions_.UpdateHostId(client_id, config.host_id);
     std::string writer_host_id;
     if ((allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
          config.prefer_alloc_in_same_node) &&
         config.replica_num == 1) {
         writer_host_id = config.host_id.empty()
-                             ? client_session_manager_.GetHostId(client_id)
+                             ? client_sessions_.GetHostId(client_id)
                              : config.host_id;
     }
 
@@ -6180,8 +6178,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
                                    key};
     const bool dynamic_copy = dynamic_replication_lease_id != UUID{};
-    auto serving_guard =
-        client_session_manager_.TryAcquireServingSession(client_id);
+    auto serving_guard = client_sessions_.TryAcquireServingSession(client_id);
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -6393,7 +6390,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -6573,7 +6570,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -6650,8 +6647,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const std::string& src_segment, const std::string& tgt_segment) {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-    auto serving_guard =
-        client_session_manager_.TryAcquireServingSession(client_id);
+    auto serving_guard = client_sessions_.TryAcquireServingSession(client_id);
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -6797,7 +6793,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 tl::expected<void, ErrorCode> MasterService::MoveEnd(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id) {
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -6990,7 +6986,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id) {
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -7883,7 +7879,7 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    return PingResponse(view_version_, client_session_manager_.Ping(client_id));
+    return PingResponse(view_version_, client_sessions_.Ping(client_id));
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
@@ -7916,7 +7912,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
-    auto registration = client_session_manager_.BeginRegistration(client_id);
+    auto registration = client_sessions_.BeginRegistration(client_id);
     if (!registration) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -7988,8 +7984,7 @@ bool MasterService::HasMountedLocalDiskSegment(const UUID& client_id) {
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {
-    auto serving_guard =
-        client_session_manager_.TryAcquireServingSession(client_id);
+    auto serving_guard = client_sessions_.TryAcquireServingSession(client_id);
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -8043,7 +8038,7 @@ auto MasterService::ReportSsdCapacity(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -8079,7 +8074,7 @@ auto MasterService::NotifyOffloadSuccess(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -9487,8 +9482,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
 
 auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
     -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode> {
-    auto serving_guard =
-        client_session_manager_.TryAcquireServingSession(client_id);
+    auto serving_guard = client_sessions_.TryAcquireServingSession(client_id);
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -9509,8 +9503,7 @@ auto MasterService::PromotionAllocStart(
     uint64_t size, const std::vector<std::string>& preferred_segments)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-    auto serving_guard =
-        client_session_manager_.TryAcquireServingSession(client_id);
+    auto serving_guard = client_sessions_.TryAcquireServingSession(client_id);
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -9644,7 +9637,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
                                            const TenantId& tenant_id)
     -> tl::expected<void, ErrorCode> {
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -9772,7 +9765,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
                                            const TenantId& tenant_id)
     -> tl::expected<void, ErrorCode> {
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -10449,7 +10442,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     segment_serializer.Reset();
     local_ssd_manager_.Clear();
 
-    client_session_manager_.Reset();
+    client_sessions_.Reset();
 
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
@@ -10546,7 +10539,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
             "restored memory replica has no Segment registration"));
     }
 
-    client_session_manager_.Reset(std::move(records));
+    client_sessions_.Reset(std::move(records));
     return {};
 }
 
@@ -13038,7 +13031,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const auto& [selected_source_segment, select_client, source_session] =
         serving_sources[randomIndex(serving_sources.size())];
     auto serving_guard =
-        client_session_manager_.TryAcquireServingSession(select_client);
+        client_sessions_.TryAcquireServingSession(select_client);
     if (!serving_guard || serving_guard->Session() != source_session) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -13168,7 +13161,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     auto serving_guard =
-        client_session_manager_.TryAcquireServingSession(select_client);
+        client_sessions_.TryAcquireServingSession(select_client);
     if (!serving_guard || serving_guard->Session() != source_session) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -13221,8 +13214,7 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     const UUID& client_id, size_t batch_size) {
-    auto serving_guard =
-        client_session_manager_.TryAcquireServingSession(client_id);
+    auto serving_guard = client_sessions_.TryAcquireServingSession(client_id);
     if (!serving_guard) {
         return std::vector<TaskAssignment>{};
     }
@@ -13239,7 +13231,7 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
 tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     const UUID& client_id, const TaskCompleteRequest& request) {
     auto retaining_guard =
-        client_session_manager_.TryAcquireRetainingSession(client_id);
+        client_sessions_.TryAcquireRetainingSession(client_id);
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }

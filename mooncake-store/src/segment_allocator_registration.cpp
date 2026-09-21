@@ -9,8 +9,9 @@ SegmentAllocatorRegistration::SegmentAllocatorRegistration(
     ClientSessionSharedPtr owner_session)
     : allocator_(std::move(allocator)), lifetime_(std::move(owner_session)) {}
 
-bool SegmentAllocatorRegistration::IsServing() const {
-    return lifetime_.isAllocatable();
+bool SegmentAllocatorRegistration::IsAllocatable() const {
+    return allocatable_.load(std::memory_order_acquire) &&
+           lifetime_.isServing();
 }
 
 std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
@@ -18,7 +19,8 @@ std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
     // Capture one lifetime generation across allocation, even if the segment
     // is rebound concurrently through another allocator-manager snapshot.
     const auto lifetime = lifetime_;
-    if (!lifetime.isAllocatable()) {
+    if (!allocatable_.load(std::memory_order_acquire) ||
+        !lifetime.isServing()) {
         return nullptr;
     }
     auto buffer = GetAllocator()->allocate(size);
@@ -26,7 +28,8 @@ std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
         return nullptr;
     }
     buffer->bindSegmentLifetime(lifetime);
-    if (!lifetime.isAllocatable() || !(lifetime == lifetime_)) {
+    if (!allocatable_.load(std::memory_order_acquire) ||
+        !lifetime.isServing() || !(lifetime == lifetime_)) {
         return nullptr;
     }
     return buffer;
@@ -34,13 +37,12 @@ std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
 
 std::shared_ptr<BufferAllocatorBase>
 SegmentAllocatorRegistration::GetAllocator() const {
-    return std::atomic_load_explicit(&allocator_, std::memory_order_acquire);
+    return allocator_.load(std::memory_order_acquire);
 }
 
 void SegmentAllocatorRegistration::BindAllocator(
     std::shared_ptr<BufferAllocatorBase> replacement) {
-    std::atomic_store_explicit(&allocator_, std::move(replacement),
-                               std::memory_order_release);
+    allocator_.store(std::move(replacement), std::memory_order_release);
 }
 
 void SegmentAllocatorRegistration::BindClientSession(
@@ -58,9 +60,12 @@ bool SegmentAllocatorRegistration::OwnsBuffer(
 }
 
 void SegmentAllocatorRegistration::SetAllocatable(bool allocatable) {
-    lifetime_.SetAllocatable(allocatable);
+    allocatable_.store(allocatable, std::memory_order_release);
 }
 
-void SegmentAllocatorRegistration::Invalidate() { lifetime_.Invalidate(); }
+void SegmentAllocatorRegistration::Invalidate() {
+    allocatable_.store(false, std::memory_order_release);
+    lifetime_.Invalidate();
+}
 
 }  // namespace mooncake

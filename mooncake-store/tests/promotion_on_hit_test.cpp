@@ -103,7 +103,8 @@ class PromotionOnHitTest : public ::testing::Test {
         // Isolate replica visibility from asynchronous resource offboarding.
         MasterServiceTestPeer::ClientSessions(*service).Stop();
         auto record =
-            MasterServiceTestPeer::ClientSessions(*service).Find(client_id);
+            ClientSessionRegistryTestPeer::Find(
+                MasterServiceTestPeer::ClientSessions(*service), client_id);
         ASSERT_TRUE(record);
         const auto now = ClientLivenessRecord::Clock::now();
         ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),

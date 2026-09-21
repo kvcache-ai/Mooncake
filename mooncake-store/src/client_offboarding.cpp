@@ -41,20 +41,12 @@ void ClientOffboardingWorker::Stop() {
     }
 }
 
-void ClientOffboardingWorker::ReserveJob() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        CHECK(running_);
-        pending_jobs_.fetch_add(1, std::memory_order_release);
-        MasterMetricManager::instance().inc_client_offboarding_queue_depth();
-    }
-}
-
-void ClientOffboardingWorker::ScheduleReserved(ClientOffboardingJob job) {
+void ClientOffboardingWorker::Schedule(ClientOffboardingJob job) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         CHECK(running_);
         jobs_.push_back(std::move(job));
+        MasterMetricManager::instance().inc_client_offboarding_queue_depth();
     }
     cv_.notify_one();
 }
@@ -67,7 +59,6 @@ std::chrono::seconds ClientOffboardingWorker::RetryDelay(uint64_t retry_count) {
 }
 
 void ClientOffboardingWorker::CompleteJob(const ClientOffboardingJob& job) {
-    pending_jobs_.fetch_sub(1, std::memory_order_acq_rel);
     MasterMetricManager::instance().dec_client_offboarding_queue_depth();
     const auto duration_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -83,7 +74,6 @@ void ClientOffboardingWorker::CompleteJob(const ClientOffboardingJob& job) {
 
 void ClientOffboardingWorker::DropJob(const ClientOffboardingJob& job,
                                       const char* reason) {
-    pending_jobs_.fetch_sub(1, std::memory_order_acq_rel);
     MasterMetricManager::instance().dec_client_offboarding_queue_depth();
     LOG(ERROR) << "client_id=" << job.client_id
                << ", action=client_offboarding_dropped"

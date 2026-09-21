@@ -756,7 +756,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     static void AssertRestoredClientAffiliations(MasterService* service) {
         const auto records =
-            MasterServiceTestPeer::ClientSessions(*service).SnapshotRecords();
+            ClientSessionRegistryTestPeer::SnapshotRecords(
+                MasterServiceTestPeer::ClientSessions(*service));
         const auto find_record = [&](const UUID& client_id) {
             const auto it = records.find(client_id);
             return it == records.end() ? nullptr : it->second;

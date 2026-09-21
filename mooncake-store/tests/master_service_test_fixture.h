@@ -61,20 +61,24 @@ class MasterServiceTest : public ::testing::Test {
 
     std::shared_ptr<ClientLivenessRecord> FindClientLivenessForTest(
         MasterService& service, const UUID& client_id) {
-        return MasterServiceTestPeer::ClientSessions(service).Find(client_id);
+        return ClientSessionRegistryTestPeer::Find(
+            MasterServiceTestPeer::ClientSessions(service), client_id);
     }
 
+    // Stop publishing and delivering transitions, leaving residual offboarding
+    // running.
     void QuiesceClientSessionsForTest(MasterService& service) {
-        MasterServiceTestPeer::ClientSessions(service).Quiesce();
+        MasterServiceTestPeer::ClientSessions(service).Stop();
     }
 
     void StopClientSessionsForTest(MasterService& service) {
-        MasterServiceTestPeer::ClientSessions(service).Stop();
+        QuiesceClientSessionsForTest(service);
+        MasterServiceTestPeer::ClientOffboarding(service).Stop();
     }
 
     bool HasPendingOffboardingForTest(MasterService& service) {
         return MasterServiceTestPeer::ClientSessions(service)
-            .HasPendingOffboarding();
+            .HasRetiredSession();
     }
 
     bool ProcessClientOffboardingForTest(MasterService& service,

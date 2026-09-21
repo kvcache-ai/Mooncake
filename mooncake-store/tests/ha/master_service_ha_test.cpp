@@ -799,7 +799,8 @@ class MasterServiceHATest : public ::testing::Test {
 
     static std::shared_ptr<ClientLivenessRecord> ClientRecordForTesting(
         MasterService& service, const UUID& client_id) {
-        return MasterServiceTestPeer::ClientSessions(service).Find(client_id);
+        return ClientSessionRegistryTestPeer::Find(
+            MasterServiceTestPeer::ClientSessions(service), client_id);
     }
 
     static tl::expected<bool, ErrorCode> AddReplicaForRetainedClientForTesting(
@@ -959,7 +960,7 @@ class MasterServiceHATest : public ::testing::Test {
         MasterServiceTestPeer::ClientSessions(service).Stop();
     }
 
-    static ClientSessionManager::RestoreBatch RestoreClientsForTesting(
+    static ClientSessionRegistry::RestoreBatch RestoreClientsForTesting(
         MasterService& service) {
         return MasterServiceTestPeer::ClientSessions(service).BeginRestore();
     }

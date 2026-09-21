@@ -30,7 +30,8 @@
 #include "background_worker.h"
 #include "client_liveness.h"
 #include "client_offboarding.h"
-#include "client_session_manager.h"
+#include "client_session_event.h"
+#include "client_session_registry.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "lease.h"
@@ -990,8 +991,10 @@ class MasterService {
         const std::function<bool(const Replica&)>& is_stale);
     void OnClientSessionChanged(const ClientSessionEvent& event);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
+    // An OFFLINE session stays registered until its residual cleanup
+    // converges, and that cleanup is not serializable.
     bool ShouldSkipSnapshotForClientOffboarding() const {
-        return client_session_manager_.HasPendingOffboarding();
+        return client_sessions_.HasRetiredSession();
     }
 
     std::string FormatTimestamp(
@@ -1938,8 +1941,11 @@ class MasterService {
 
     ViewVersionId view_version_;
 
-    // Owns monitoring and offboarding; resource coordination is a listener.
-    ClientSessionManager client_session_manager_;
+    // Client session plane, declared in dependency order so the registry is
+    // destroyed before the offboarding worker its listener feeds. Resource
+    // coordination is a session listener, not a session responsibility.
+    ClientOffboardingWorker client_offboarding_worker_{this};
+    ClientSessionRegistry client_sessions_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;

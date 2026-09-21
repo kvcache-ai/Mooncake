@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "client_session/client_session_registry_test_peer.h"
 #include "master_service.h"
 
 namespace mooncake::test {
@@ -105,10 +106,13 @@ class MasterServiceTestPeer {
     }
 
     static auto& ClientSessions(MasterService& service) {
-        return service.client_session_manager_;
+        return service.client_sessions_;
     }
     static const auto& ClientSessions(const MasterService& service) {
-        return service.client_session_manager_;
+        return service.client_sessions_;
+    }
+    static auto& ClientOffboarding(MasterService& service) {
+        return service.client_offboarding_worker_;
     }
 
     static auto& DynamicReplicationWindows(MasterService& service) {
@@ -400,7 +404,8 @@ class MasterServiceTestPeer {
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
-        return service_.client_session_manager_.Find(client_id);
+        return ClientSessionRegistryTestPeer::Find(service_.client_sessions_,
+                                                  client_id);
     }
 
     TenantQuotaHandle GetBoundTenantQuotaHandle(

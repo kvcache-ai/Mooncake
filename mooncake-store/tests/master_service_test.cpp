@@ -3007,7 +3007,10 @@ TEST_F(MasterServiceTest, SessionManagerOwnsOffboardingShutdown) {
             EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
         }
         StopClientSessionsForTest(service);
-        EXPECT_FALSE(HasPendingOffboardingForTest(service));
+        // A job dropped at shutdown leaves its OFFLINE session registered, so
+        // the barrier outlives the worker instead of lifting over a partial
+        // cleanup.
+        EXPECT_EQ(HasPendingOffboardingForTest(service), !finish_cleanup);
         if (!finish_cleanup) {
             ASSERT_EQ(ErrorCode::OK,
                       CommitUnmountSegmentForTest(service, segment.id,

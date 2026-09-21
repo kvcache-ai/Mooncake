@@ -22,7 +22,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/s3_client_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
-    client_session_manager.cpp
+    client_session_registry.cpp
+    client_session_event_dispatcher.cpp
     master_service.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp

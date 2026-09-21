@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include "allocator.h"
@@ -13,7 +14,9 @@ template <typename T>
 class Serializer;
 class SegmentAllocatorRegistration {
    public:
-    [[nodiscard]] bool IsServing() const;
+    // Whether this segment currently accepts new allocations: its drain
+    // flag and the liveness of the incarnation it belongs to.
+    [[nodiscard]] bool IsAllocatable() const;
     [[nodiscard]] std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const;
     [[nodiscard]] std::shared_ptr<BufferAllocatorBase> GetAllocator() const;
 
@@ -27,7 +30,10 @@ class SegmentAllocatorRegistration {
     [[nodiscard]] bool OwnsBuffer(const AllocatedBuffer& buffer) const;
     void SetAllocatable(bool allocatable);
     void Invalidate();
-    std::shared_ptr<BufferAllocatorBase> allocator_;
+    std::atomic<std::shared_ptr<BufferAllocatorBase>> allocator_;
+    // A registration property, not part of the incarnation state that buffers
+    // carry: it survives a session rebind and no buffer ever reads it.
+    std::atomic<bool> allocatable_{true};
     SegmentLifetime lifetime_;
     friend class AllocatorManager;
     friend class ScopedNoFSegmentAccess;

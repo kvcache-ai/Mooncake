@@ -936,7 +936,7 @@ TEST_F(SegmentTest, DetachedAllocationRejectsReplacedSessionLifetime) {
     blocking->resume_.release();
     ASSERT_TRUE(entered);
     EXPECT_EQ(allocation.get(), nullptr);
-    EXPECT_TRUE(registration->IsServing());
+    EXPECT_TRUE(registration->IsAllocatable());
 }
 
 TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {

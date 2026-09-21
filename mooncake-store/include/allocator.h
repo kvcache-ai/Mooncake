@@ -49,6 +49,9 @@ class SegmentAllocatorRegistration;
 
 // Shared ownership of a segment incarnation, including its client session.
 // Copies retain the current generation, not future session replacements.
+// This is the state a buffer carries: which incarnation it belongs to and
+// whether that incarnation is still alive. Whether the segment currently
+// accepts new allocations belongs to SegmentAllocatorRegistration instead.
 class SegmentLifetime {
    public:
     explicit SegmentLifetime(ClientSessionSharedPtr session = nullptr);
@@ -57,7 +60,6 @@ class SegmentLifetime {
 
     [[nodiscard]] bool isAvailable() const;
     [[nodiscard]] bool isServing() const;
-    [[nodiscard]] bool isAllocatable() const;
     [[nodiscard]] bool operator==(const SegmentLifetime& other) const;
 
    private:
@@ -67,11 +69,10 @@ class SegmentLifetime {
     // Mutations are serialized by the segment lock. Readers, including copies
     // held by detached allocator snapshots, may run concurrently.
     void BindSession(ClientSessionSharedPtr session);
-    void SetAllocatable(bool allocatable);
     void Invalidate();
     struct State;
     std::shared_ptr<State> Snapshot() const;
-    std::shared_ptr<State> state_;
+    std::atomic<std::shared_ptr<State>> state_;
 };
 
 class AllocatedBuffer {

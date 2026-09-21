@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -18,7 +17,6 @@
 namespace mooncake {
 
 class MasterService;
-class ClientSessionManager;
 namespace test {
 class MasterServiceTest;
 }
@@ -68,21 +66,17 @@ class ClientOffboardingWorker {
     ClientOffboardingWorker& operator=(const ClientOffboardingWorker&) = delete;
 
    private:
-    // Only the manager may construct/start/stop the worker and reserve or
-    // submit jobs, keeping OFFLINE publication and the cleanup barrier ordered.
-    friend class ClientSessionManager;
+    // Only MasterService may construct/start/stop the worker and submit jobs.
+    // The snapshot barrier is not tracked here: it is the OFFLINE session
+    // itself, which stays registered until its job removes it.
+    friend class MasterService;
     friend class test::MasterServiceTest;
 
     explicit ClientOffboardingWorker(MasterService* service)
         : service_(service) {}
     void Start();
     void Stop();
-    [[nodiscard]] bool HasPending() const {
-        return pending_jobs_.load(std::memory_order_acquire) != 0;
-    }
-
-    void ReserveJob();
-    void ScheduleReserved(ClientOffboardingJob job);
+    void Schedule(ClientOffboardingJob job);
     void ThreadFunc();
     void CompleteJob(const ClientOffboardingJob& job);
     void DropJob(const ClientOffboardingJob& job, const char* reason);
@@ -99,7 +93,6 @@ class ClientOffboardingWorker {
     std::deque<ClientOffboardingJob> jobs_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
-    std::atomic<size_t> pending_jobs_{0};
 };
 
 }  // namespace mooncake
