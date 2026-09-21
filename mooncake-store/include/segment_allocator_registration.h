@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "allocator.h"
+#include "common/atomic_shared_ptr.h"
 
 namespace mooncake {
 
@@ -30,7 +31,7 @@ class SegmentAllocatorRegistration {
     [[nodiscard]] bool OwnsBuffer(const AllocatedBuffer& buffer) const;
     void SetAllocatable(bool allocatable);
     void Invalidate();
-    std::atomic<std::shared_ptr<BufferAllocatorBase>> allocator_;
+    AtomicSharedPtr<BufferAllocatorBase> allocator_;
     // A registration property, not part of the incarnation state that buffers
     // carry: it survives a session rebind and no buffer ever reads it.
     std::atomic<bool> allocatable_{true};

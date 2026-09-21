@@ -12,6 +12,7 @@
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "client_liveness.h"
+#include "common/atomic_shared_ptr.h"
 #include "offset_allocator/offset_allocator.h"
 #include "storage_usage.h"
 #include "types.h"
@@ -72,7 +73,7 @@ class SegmentLifetime {
     void Invalidate();
     struct State;
     std::shared_ptr<State> Snapshot() const;
-    std::atomic<std::shared_ptr<State>> state_;
+    AtomicSharedPtr<State> state_;
 };
 
 class AllocatedBuffer {

@@ -37,7 +37,7 @@ struct SegmentLifetime::State {
     std::atomic<bool> available{true};
     // Only initial snapshot restoration can change null to a session in place.
     // Replacing a non-null session creates a new State instead.
-    std::atomic<ClientSessionSharedPtr> session;
+    AtomicSharedPtr<const ClientLivenessRecord> session;
 };
 
 SegmentLifetime::SegmentLifetime(ClientSessionSharedPtr session)
