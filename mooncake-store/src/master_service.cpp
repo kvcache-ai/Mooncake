@@ -5716,11 +5716,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
     [[maybe_unused]] auto object_operation_lock =
         AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
+    bool dfs_allocation_failed = false;
+    ReplicateConfig allocation_config = config;
+    std::string allocation_group_id = group_id;
+    std::optional<std::chrono::system_clock::time_point>
+        allocation_committed_soft_pin_timeout;
     auto admit =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
         auto now = std::chrono::system_clock::now();
-        std::optional<std::chrono::system_clock::time_point>
-            case_a_committed_soft_pin_timeout;
         {
             // --- Lock acquisition ---
             std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -5852,11 +5855,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // If no COMPLETE replicas survive the preemption, this key
                     // effectively does not exist — fall through to Case A.
                     if (!metadata.HasReplica(&Replica::fn_is_completed)) {
-                        case_a_committed_soft_pin_timeout =
+                        allocation_committed_soft_pin_timeout =
                             metadata.GetCommittedSoftPinTimeout();
-                        if (case_a_committed_soft_pin_timeout &&
-                            *case_a_committed_soft_pin_timeout <= now) {
-                            case_a_committed_soft_pin_timeout.reset();
+                        if (allocation_committed_soft_pin_timeout &&
+                            *allocation_committed_soft_pin_timeout <= now) {
+                            allocation_committed_soft_pin_timeout.reset();
                         }
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &shard);
@@ -5877,9 +5880,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             if (it == tenant_state.metadata.end()) {
                 VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
                 return AllocateAndInsertMetadata(
-                    shard, client_id, key, slice_length, config, writer_host_id,
-                    group_id, object_id.tenant_id, now, *soft_pin_request,
-                    std::move(case_a_committed_soft_pin_timeout));
+                    shard, client_id, key, slice_length, allocation_config,
+                    writer_host_id, allocation_group_id, object_id.tenant_id,
+                    now, *soft_pin_request,
+                    allocation_committed_soft_pin_timeout,
+                    &dfs_allocation_failed);
             } else {
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
                 // ---
@@ -5986,17 +5991,17 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // Preserve hard_pin and soft_pin from the old metadata so that
                 // eviction protection survives a size-changing upsert (RFC
                 // §2.2.2).
-                ReplicateConfig merged_config = config;
-                merged_config.with_hard_pin =
-                    merged_config.with_hard_pin || metadata.IsHardPinned();
-                auto committed_soft_pin_timeout =
+                allocation_config = config;
+                allocation_config.with_hard_pin =
+                    allocation_config.with_hard_pin || metadata.IsHardPinned();
+                allocation_committed_soft_pin_timeout =
                     metadata.GetCommittedSoftPinTimeout();
-                if (committed_soft_pin_timeout &&
-                    *committed_soft_pin_timeout <= now) {
-                    committed_soft_pin_timeout.reset();
+                if (allocation_committed_soft_pin_timeout &&
+                    *allocation_committed_soft_pin_timeout <= now) {
+                    allocation_committed_soft_pin_timeout.reset();
                 }
 
-                const std::string existing_group_id = metadata.group_id;
+                allocation_group_id = metadata.group_id;
                 const auto previous_kv_media = KvMediaSnapshot(metadata);
                 TenantQuotaLedger replacement_charge;
                 auto* quota_account = GetBoundTenantQuotaHandle(tenant_state);
@@ -6012,14 +6017,16 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 uint64_t replacement_pending_quota_charge = 0;
                 if (has_read_lease) {
                     replacement_pending_quota_charge =
-                        RequestedMemoryQuotaCharge(slice_length, merged_config);
+                        RequestedMemoryQuotaCharge(slice_length,
+                                                   allocation_config);
                     auto quota_result = ChargeTenantQuota(
                         quota_account, replacement_pending_quota_charge);
                     if (!quota_result) {
                         return tl::make_unexpected(quota_result.error());
                     }
                     auto allocation_result = AllocateReplicas(
-                        key, slice_length, merged_config, writer_host_id);
+                        key, slice_length, allocation_config, writer_host_id,
+                        &dfs_allocation_failed);
                     if (!allocation_result) {
                         ReleaseTenantQuota(quota_account,
                                            replacement_pending_quota_charge);
@@ -6074,17 +6081,18 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         replacement_replicas.has_value()
                             ? InsertMetadata(
                                   shard, client_id, key, slice_length,
-                                  merged_config, existing_group_id,
+                                  allocation_config, allocation_group_id,
                                   object_id.tenant_id, now, *soft_pin_request,
                                   std::move(*replacement_replicas),
                                   replacement_pending_quota_charge,
-                                  std::move(committed_soft_pin_timeout))
+                                  allocation_committed_soft_pin_timeout)
                             : AllocateAndInsertMetadata(
                                   shard, client_id, key, slice_length,
-                                  merged_config, writer_host_id,
-                                  existing_group_id, object_id.tenant_id, now,
+                                  allocation_config, writer_host_id,
+                                  allocation_group_id, object_id.tenant_id, now,
                                   *soft_pin_request,
-                                  std::move(committed_soft_pin_timeout));
+                                  allocation_committed_soft_pin_timeout,
+                                  &dfs_allocation_failed);
                 if (!allocate_result) {
                     if (replacement_replicas.has_value()) {
                         ReleaseTenantQuota(quota_account,
@@ -6144,6 +6152,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // every concurrent writer at the ceiling repeated for the same freed
     // extent.
     auto result = admit();
+    // Eviction scans metadata shards, so recover only after admit releases its
+    // shard lock, then retry this admission at most once.
+    if (!result && dfs_allocation_failed && config.dfs_replica_num > 0 &&
+        bucket_allocator_ != nullptr &&
+        TryRecoverDfsSpaceAfterAllocationFailure()) {
+        result = admit();
+    }
     if (!result && result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
         MasterMetricManager::instance().inc_tenant_quota_reject(
             object_id.tenant_id.value(), "quota_exceeded");

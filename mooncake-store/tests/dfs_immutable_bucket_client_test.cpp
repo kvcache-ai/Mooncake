@@ -169,7 +169,8 @@ TEST_F(DfsImmutableBucketClientTest, PutReturnsAfterWriteAndFailureRevokes) {
     EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
-TEST_F(DfsImmutableBucketClientTest, SameSizeUpsertAllocatesNewBucketRange) {
+TEST_F(DfsImmutableBucketClientTest,
+       SameSizeUpsertRecoversFromBucketExhaustion) {
     const std::string key = "same_size_upsert";
     std::string initial(4096, 'A');
     auto initial_slices = Slices(initial);
@@ -184,6 +185,12 @@ TEST_F(DfsImmutableBucketClientTest, SameSizeUpsertAllocatesNewBucketRange) {
                                     });
     ASSERT_NE(initial_dfs, initial_query->replicas.end());
     const auto initial_descriptor = initial_dfs->get_dfs_descriptor();
+
+    // Consume the final bucket so the upsert must evict the tombstoned old
+    // bucket before it can append the replacement.
+    std::string filler(4096, 'F');
+    auto filler_slices = Slices(filler);
+    ASSERT_TRUE(writer_->Put("filler", filler_slices, DfsConfig()));
 
     std::string replacement(4096, 'B');
     auto replacement_slices = Slices(replacement);
