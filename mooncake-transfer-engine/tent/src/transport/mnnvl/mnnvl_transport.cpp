@@ -25,6 +25,18 @@
 #include <memory>
 #include <unordered_map>
 
+#include <sys/syscall.h>
+#include <unistd.h>
+// Older glibc (e.g. RHEL8 in manylinux2_28) does not define the pidfd
+// syscall numbers in its kernel headers. The numbers below come from the
+// arch-independent asm-generic/unistd.h table.
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434 /* since Linux 5.3 */
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438 /* since Linux 5.6 */
+#endif
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 
