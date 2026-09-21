@@ -149,6 +149,18 @@ ErrorCode ScatterFragmentError(const Status& status) {
                                       : ErrorCode::TRANSFER_FAIL;
 }
 
+void MarkScatterOperationFailure(
+    std::vector<tl::expected<int64_t, ErrorCode>>& results,
+    const std::vector<std::optional<ErrorCode>>& entry_errors,
+    const Status& status) {
+    const auto error = ScatterFragmentError(status);
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value() && !entry_errors[i].has_value()) {
+            results[i] = tl::unexpected(error);
+        }
+    }
+}
+
 // Collects the fragments of many ranged entries into a single scatter submit.
 //
 // One submit per entry would hand the transport one tiny transfer per key per
@@ -1458,7 +1470,7 @@ std::optional<StoreScatterTransferOperation> Client::SubmitScatterNative(
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
-    return transfer_submitter_->submitScatter(transfers, intent);
+    return transfer_submitter_->submitNativeScatter(transfers, intent);
 }
 
 struct BatchGetOperation {
@@ -4705,7 +4717,12 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         }
         return results;
     }
-    (void)operation->wait();
+    const auto status = operation->wait();
+    if (!status.ok()) {
+        LOG(ERROR) << "Batch range read scatter operation failed: "
+                   << status.ToString();
+        MarkScatterOperationFailure(results, entry_errors, status);
+    }
 
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value() || !entry_errors[i].has_value()) {
@@ -4808,7 +4825,12 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
         }
         return results;
     }
-    (void)operation->wait();
+    const auto status = operation->wait();
+    if (!status.ok()) {
+        LOG(ERROR) << "Batch range write scatter operation failed: "
+                   << status.ToString();
+        MarkScatterOperationFailure(results, entry_errors, status);
+    }
 
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value() || !entry_errors[i].has_value()) {

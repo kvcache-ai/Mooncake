@@ -96,7 +96,13 @@ TEST(TransferScatterApiTest, SubmitterOwnsScatterOperation) {
     static_assert(std::is_same_v<
                   decltype(std::declval<TransferSubmitter&>().submitScatter(
                       std::declval<const ScatterRanges&>())),
-                  StoreScatterTransferOperation>);
+                  TransferEngine::ScatterTransferOperation>);
+    static_assert(
+        std::is_same_v<
+            decltype(std::declval<TransferSubmitter&>().submitNativeScatter(
+                std::declval<const ScatterRanges&>(),
+                TransferIntent::kForegroundGet)),
+            StoreScatterTransferOperation>);
 }
 
 // Test MemcpyOperationState functionality
@@ -254,7 +260,7 @@ TEST_F(TransferTaskTest, TransferSubmitterScatterUsesTentDataPath) {
 
     std::shared_ptr<StorageBackend> backend;
     TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
-    auto operation = submitter.submitScatter(
+    auto operation = submitter.submitNativeScatter(
         {{.opcode = TransferRequest::READ,
           .remote_segment = engine.getLocalIpAndPort(),
           .remote_base_offset = reinterpret_cast<uintptr_t>(source.data()),
@@ -286,7 +292,7 @@ TEST_F(TransferTaskTest, TransferSubmitterScatterContainsCallbackFailure) {
 
     std::shared_ptr<StorageBackend> backend;
     TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
-    auto operation = submitter.submitScatter(
+    auto operation = submitter.submitNativeScatter(
         {{.opcode = TransferRequest::READ,
           .remote_segment = engine.getLocalIpAndPort(),
           .remote_base_offset = reinterpret_cast<uintptr_t>(source.data()),
@@ -302,6 +308,43 @@ TEST_F(TransferTaskTest, TransferSubmitterScatterContainsCallbackFailure) {
               }}},
         TransferIntent::kForegroundGet);
     EXPECT_FALSE(operation.wait().ok());
+    EXPECT_EQ(engine.freeEngine(), 0);
+}
+
+TEST_F(TransferTaskTest, TransferSubmitterScatterRejectsInvalidRangeIntent) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17936"), 0);
+    if (!engine.isUsingTent()) GTEST_SKIP() << "TENT is unavailable";
+
+    std::vector<char> source(8, 'T'), destination(8, 0);
+    std::vector<size_t> offsets{0};
+    std::vector<size_t> lengths{8};
+    ASSERT_EQ(engine.registerLocalMemory(source.data(), source.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(engine.registerLocalMemory(destination.data(), destination.size(),
+                                         "cpu:0"),
+              0);
+
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, engine.getLocalIpAndPort());
+    auto operation = submitter.submitNativeScatter(
+        {{.opcode = TransferRequest::READ,
+          .remote_segment = engine.getLocalIpAndPort(),
+          .remote_base_offset = reinterpret_cast<uintptr_t>(source.data()),
+          .remote_size = source.size(),
+          .local_buffer = destination.data(),
+          .local_capacity = destination.size(),
+          .local_offsets = offsets,
+          .remote_offsets = offsets,
+          .lengths = lengths,
+          .intent_type = 4}},
+        TransferIntent::kForegroundGet);
+
+    const auto status = operation.wait();
+    EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
+    EXPECT_EQ(destination, std::vector<char>(destination.size(), 0));
+    EXPECT_EQ(engine.unregisterLocalMemory(source.data()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(destination.data()), 0);
     EXPECT_EQ(engine.freeEngine(), 0);
 }
 #endif

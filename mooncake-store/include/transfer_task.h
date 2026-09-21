@@ -318,11 +318,12 @@ class TransferFuture {
     std::shared_ptr<OperationState> state_;
 };
 
-/// Scatter transfer operation returned by TransferSubmitter::submitScatter().
+/// Scatter transfer operation returned by
+/// TransferSubmitter::submitNativeScatter().
 ///
 /// Thread safety: NOT thread-safe. Only one thread may call wait(),
 /// waitFor(), or destroy this object at a time. The caller that received
-/// the operation from submitScatter() owns it for its entire lifetime.
+/// the operation from submitNativeScatter() owns it for its entire lifetime.
 class StoreScatterTransferOperation {
    public:
     StoreScatterTransferOperation(StoreScatterTransferOperation&&) noexcept;
@@ -644,10 +645,12 @@ class TransferSubmitter {
         return submitRangeWrite(replica, slices, dst_offset, *parsed_intent);
     }
 
-    StoreScatterTransferOperation submitScatter(
+    TransferEngine::ScatterTransferOperation submitScatter(
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers);
+    StoreScatterTransferOperation submitNativeScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
-    StoreScatterTransferOperation submitScatter(
+    StoreScatterTransferOperation submitNativeScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         int intent);
 
