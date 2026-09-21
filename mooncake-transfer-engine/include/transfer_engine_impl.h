@@ -411,13 +411,14 @@ class TransferEngineImpl {
 
 #ifdef ENABLE_MULTI_PROTOCOL
     struct RegisteredRecord {
-        Transport* transport;
+        std::shared_ptr<Transport> transport;
         void* addr;
         uint64_t length;
         std::string location;
         bool remote_accessible;
     };
-    void rollbackAllRegistrations(const std::vector<RegisteredRecord>& records);
+    std::vector<RegisteredRecord> rollbackAllRegistrations(
+        const std::vector<RegisteredRecord>& records);
 #endif
 
     void setAutoDiscover(bool auto_discover) {
