@@ -63,7 +63,7 @@ class RdmaContextTestPeer {
     }
 
     static void seedAutoGidState(RdmaContext &context, ibv_context *verbs_ctx,
-                                 uint8_t port, uint16_t lid, const ibv_gid &gid,
+                                 uint8_t port, uint32_t lid, const ibv_gid &gid,
                                  int gid_index) {
         context.context_ = verbs_ctx;
         context.port_ = port;
