@@ -783,14 +783,24 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
             << "Transfer Engine does not support zero length memory region";
         return ERR_INVALID_ARGUMENT;
     }
-
     std::vector<MemoryRegion> regions = {
         {addr, length, location, remote_accessible}};
+    std::unique_lock<std::mutex> shm_validation_lock;
+    auto shm_it = multi_transports_->transport_map_.find("shm");
+    if (shm_it != multi_transports_->transport_map_.end()) {
+        auto* shm = dynamic_cast<ShmTransport*>(shm_it->second.get());
+        if (shm) {
+            int ret = shm->lockAndValidateRegistrationRanges(
+                {{addr, length}}, &shm_validation_lock);
+            if (ret) return ret;
+        }
+    }
     if (!tryReserveMemoryRegions(regions)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
         return ERR_ADDRESS_OVERLAPPED;
     }
+    if (shm_validation_lock.owns_lock()) shm_validation_lock.unlock();
 
     std::vector<Transport*> successful_transports;
     for (auto transport : multi_transports_->listTransports()) {
@@ -949,11 +959,29 @@ int TransferEngineImpl::mp_registerLocalMemory(
     for (const auto& [_, region] : unique_regions) {
         regions.push_back(region);
     }
+    auto shm_it = multi_transports_->transport_map_.find("shm");
+    ShmTransport* shm = shm_it == multi_transports_->transport_map_.end()
+                            ? nullptr
+                            : dynamic_cast<ShmTransport*>(shm_it->second.get());
+    std::vector<Transport::BufferEntry> shm_buffers;
+    if (shm) {
+        shm_buffers.reserve(unique_regions.size());
+        for (const auto& [_, region] : unique_regions) {
+            shm_buffers.push_back({region.addr, region.length});
+        }
+    }
+    std::unique_lock<std::mutex> shm_validation_lock;
+    if (shm) {
+        int ret = shm->lockAndValidateRegistrationRanges(shm_buffers,
+                                                         &shm_validation_lock);
+        if (ret) return ret;
+    }
     if (!tryReserveMemoryRegions(regions)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
         return ERR_ADDRESS_OVERLAPPED;
     }
+    if (shm_validation_lock.owns_lock()) shm_validation_lock.unlock();
 
     std::vector<TransferEngineImpl::RegisteredRecord> success_records;
     RegisteredTransportMap registered_transport_map;
@@ -1187,7 +1215,6 @@ int TransferEngineImpl::registerLocalMemoryBatch(
             }
         }
     }
-
     std::vector<MemoryRegion> regions;
     std::vector<void*> addr_list;
     regions.reserve(buffer_list.size());
@@ -1196,11 +1223,22 @@ int TransferEngineImpl::registerLocalMemoryBatch(
         regions.push_back({buffer.addr, buffer.length, location, true});
         addr_list.push_back(buffer.addr);
     }
+    std::unique_lock<std::mutex> shm_validation_lock;
+    auto shm_it = multi_transports_->transport_map_.find("shm");
+    if (shm_it != multi_transports_->transport_map_.end()) {
+        auto* shm = dynamic_cast<ShmTransport*>(shm_it->second.get());
+        if (shm) {
+            int ret = shm->lockAndValidateRegistrationRanges(
+                buffer_list, &shm_validation_lock);
+            if (ret) return ret;
+        }
+    }
     if (!tryReserveMemoryRegions(regions)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
         return ERR_ADDRESS_OVERLAPPED;
     }
+    if (shm_validation_lock.owns_lock()) shm_validation_lock.unlock();
 
     std::vector<Transport*> successful_transports;
     for (auto transport : multi_transports_->listTransports()) {
