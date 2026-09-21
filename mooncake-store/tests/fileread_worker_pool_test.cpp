@@ -9,6 +9,14 @@
 #include <string>
 
 namespace mooncake {
+
+class FilereadWorkerPoolTestPeer {
+   public:
+    static size_t WorkerCount(const FilereadWorkerPool& pool) {
+        return pool.workers_.size();
+    }
+};
+
 namespace {
 
 class ScopedFilereadWorkersEnv {
@@ -36,15 +44,16 @@ TEST(FilereadWorkerPoolTest, AcceptsTypedTrailingWhitespaceAndCaches) {
     google::InitGoogleLogging("FilereadWorkerPoolTest");
     ScopedFilereadWorkersEnv env("2 ");
     std::shared_ptr<StorageBackend> backend;
+    // Inspect only this pool: linked runtimes (e.g. Go via etcd) can create
+    // unrelated process threads asynchronously, including during destruction.
     {
         FilereadWorkerPool pool(backend);
-        EXPECT_EQ(pool.worker_count(), 2u);
+        EXPECT_EQ(FilereadWorkerPoolTestPeer::WorkerCount(pool), 2u);
     }
     ASSERT_EQ(setenv("MC_FILEREAD_WORKERS", "3", 1), 0);
     {
         FilereadWorkerPool pool(backend);
-        // worker_count is cached on first construction; still 2, not 3.
-        EXPECT_EQ(pool.worker_count(), 2u);
+        EXPECT_EQ(FilereadWorkerPoolTestPeer::WorkerCount(pool), 2u);
     }
     google::ShutdownGoogleLogging();
 }

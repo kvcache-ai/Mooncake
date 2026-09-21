@@ -513,9 +513,9 @@ class FilereadWorkerPool {
      */
     void submitTask(FilereadTask task);
 
-    size_t worker_count() const { return workers_.size(); }
-
    private:
+    friend class FilereadWorkerPoolTestPeer;
+
     void workerThread();
 
     std::vector<std::thread> workers_;
