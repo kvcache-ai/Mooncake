@@ -3034,7 +3034,7 @@ TEST_F(MasterServiceTest, DISABLED_Repro3936RemountKeepsHealthyPings) {
     std::atomic<size_t> need_remount{0};
     std::atomic<int64_t> max_latency_ms{0};
     std::vector<std::thread> pingers;
-    for (const auto client : clients) {
+    for (const auto& client : clients) {
         pingers.emplace_back([&, client] {
             while (running.load()) {
                 const auto start = Clock::now();
