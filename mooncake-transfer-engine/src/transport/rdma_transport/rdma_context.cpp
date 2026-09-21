@@ -28,7 +28,9 @@
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "config.h"
@@ -70,6 +72,22 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
 }
 
 #if defined(USE_ASCEND_RDMA)
+struct AscendUbRegistration {
+    size_t length;
+    uint32_t device_id;
+    size_t refcount;
+};
+
+std::mutex &ascendUbRegistryMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<uintptr_t, AscendUbRegistration> &ascendUbRegistry() {
+    static std::map<uintptr_t, AscendUbRegistration> registry;
+    return registry;
+}
+
 int ascendUbRegister(void* addr, size_t length, bool& registered) {
     aclrtPtrAttributes attributes{};
     aclError acl_ret = aclrtPointerGetAttributes(addr, &attributes);
@@ -90,6 +108,30 @@ int ascendUbRegister(void* addr, size_t length, bool& registered) {
         return 0;
     }
 
+    const uintptr_t va = reinterpret_cast<uintptr_t>(addr);
+    std::lock_guard<std::mutex> lock(ascendUbRegistryMutex());
+    auto &registry = ascendUbRegistry();
+    auto iter = registry.find(va);
+    if (iter != registry.end()) {
+        if (iter->second.length != length ||
+            iter->second.device_id != attributes.location.id) {
+            LOG(ERROR) << "USE_ASCEND_RDMA: UB range already registered with "
+                          "different attributes, addr="
+                       << addr << ", existing_length=" << iter->second.length
+                       << ", requested_length=" << length
+                       << ", existing_device_id=" << iter->second.device_id
+                       << ", requested_device_id=" << attributes.location.id;
+            return -1;
+        }
+        ++iter->second.refcount;
+        registered = true;
+        LOG(INFO) << "USE_ASCEND_RDMA: reuse existing UB registration, addr="
+                  << addr << ", length=" << length
+                  << ", device_id=" << attributes.location.id
+                  << ", refcount=" << iter->second.refcount;
+        return 0;
+    }
+
     drvError_t hal_ret = halMemRegUbSegment(
         attributes.location.id, reinterpret_cast<uintptr_t>(addr), length);
     if (hal_ret != DRV_ERROR_NONE) {
@@ -99,28 +141,49 @@ int ascendUbRegister(void* addr, size_t length, bool& registered) {
         return hal_ret;
     }
 
+    registry.emplace(va, AscendUbRegistration{length, attributes.location.id,
+                                              /*refcount=*/1});
     registered = true;
     LOG(INFO) << "USE_ASCEND_RDMA: halMemRegUbSegment succeeded, addr="
               << addr << ", length=" << length
-              << ", device_id=" << attributes.location.id;
+              << ", device_id=" << attributes.location.id
+              << ", refcount=1";
     return 0;
 }
 
 int ascendUbUnregister(void* addr, size_t length) {
-    aclrtPtrAttributes attributes{};
-    aclError acl_ret = aclrtPointerGetAttributes(addr, &attributes);
-    if (acl_ret != ACL_ERROR_NONE ||
-        attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
+    const uintptr_t va = reinterpret_cast<uintptr_t>(addr);
+    std::lock_guard<std::mutex> lock(ascendUbRegistryMutex());
+    auto &registry = ascendUbRegistry();
+    auto iter = registry.find(va);
+    if (iter == registry.end()) {
+        return 0;
+    }
+
+    if (iter->second.length != length) {
+        LOG(ERROR) << "USE_ASCEND_RDMA: UB unregister length mismatch, addr="
+                   << addr << ", registered_length=" << iter->second.length
+                   << ", requested_length=" << length;
+        return -1;
+    }
+    if (iter->second.refcount > 1) {
+        --iter->second.refcount;
+        LOG(INFO) << "USE_ASCEND_RDMA: release shared UB registration, addr="
+                  << addr << ", length=" << length
+                  << ", device_id=" << iter->second.device_id
+                  << ", refcount=" << iter->second.refcount;
         return 0;
     }
 
     drvError_t hal_ret = halMemUnRegUbSegment(
-        attributes.location.id, reinterpret_cast<uintptr_t>(addr));
+        iter->second.device_id, reinterpret_cast<uintptr_t>(addr), length);
     if (hal_ret != DRV_ERROR_NONE) {
         LOG(ERROR) << "USE_ASCEND_RDMA: halMemUnRegUbSegment failed, device_id="
-                   << attributes.location.id << ", addr=" << addr
+                   << iter->second.device_id << ", addr=" << addr
                    << ", length=" << length << ", ret=" << hal_ret;
+        return hal_ret;
     }
+    registry.erase(iter);
     return hal_ret;
 }
 #endif
