@@ -27,7 +27,6 @@
 
 #include "tenant_quota_policy_store.h"
 #include "types.h"
-#include "common/network.h"
 #include "master_service_test_fixture.h"
 
 namespace mooncake::test {
@@ -983,62 +982,6 @@ TEST_F(MasterServiceTest, TenantScopedPutsAndRemovesUpdateGlobalKeyCount) {
 
     ASSERT_TRUE(service_->Remove(key, tenant_b, /*force=*/true).has_value());
     EXPECT_EQ(service_->GetKeyCount(), 0u);
-}
-
-TEST_F(MasterServiceTest,
-       ResolveMooncakeHostIdUsesLocalHostnameAndRejectsLoopback) {
-    ScopedEnvVar host_id("MOONCAKE_HOST_ID");
-
-    EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
-    EXPECT_EQ(ResolveMooncakeHostId("hostB:5001"), "hostB");
-    EXPECT_EQ(ResolveMooncakeHostId("[2001:db8::1]:5000"), "2001:db8::1");
-    EXPECT_TRUE(ResolveMooncakeHostId("localhost:5000").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("127.0.0.1:5000").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("0.0.0.0:5000").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("::1").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("[::1]:5000").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("::").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("[::]").empty());
-    EXPECT_TRUE(ResolveMooncakeHostId("[::]:5000").empty());
-}
-
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdPrefersDeploymentOverride) {
-    ScopedEnvVar host_id("MOONCAKE_HOST_ID", "  kubernetes-node-a  ");
-
-    EXPECT_EQ(ResolveMooncakeHostId("10.244.1.17:5000"), "kubernetes-node-a");
-}
-
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdNormalizesEndpointOverride) {
-    ScopedEnvVar host_id("MOONCAKE_HOST_ID", "  kubernetes-node-a:5000  ");
-
-    EXPECT_EQ(ResolveMooncakeHostId("10.244.1.17:5000"), "kubernetes-node-a");
-}
-
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdFallsBackForEmptyOverride) {
-    {
-        ScopedEnvVar host_id("MOONCAKE_HOST_ID", "");
-        EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
-    }
-
-    {
-        ScopedEnvVar host_id("MOONCAKE_HOST_ID", " \t ");
-        EXPECT_EQ(ResolveMooncakeHostId("hostB:5000"), "hostB");
-    }
-}
-
-TEST_F(MasterServiceTest, ResolveMooncakeHostIdRejectsInvalidOverride) {
-    const std::vector<const char*> invalid_host_ids = {
-        "localhost",  "localhost:5000",
-        "127.0.0.1",  "127.0.0.1:5000",
-        "0.0.0.0",    "0.0.0.0:5000",
-        "::1",        "[::1]",
-        "[::1]:5000", "::",
-        "[::]",       "[::]:5000"};
-    for (const char* invalid_host_id : invalid_host_ids) {
-        ScopedEnvVar host_id("MOONCAKE_HOST_ID", invalid_host_id);
-        EXPECT_TRUE(ResolveMooncakeHostId("hostB:5000").empty())
-            << invalid_host_id;
-    }
 }
 
 TEST_F(MasterServiceTest, MasterConfigParsesLocalFirstStrategy) {
@@ -2263,6 +2206,112 @@ TEST_F(MasterServiceTest, SoftPinExpiresAndGetDoesNotReactivate) {
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline);
     service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, ExistKeyLeasesPinSegmentButProbeKeyDoesNot) {
+    // Set a long lease TTL so leases granted by ExistKey will not expire
+    // during the test.
+    const uint64_t kv_lease_ttl = 2000;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    constexpr size_t kSegmentSize = 4 * 1024 * 1024;
+    constexpr size_t kObjectSize = 2 * 1024 * 1024;
+
+    // ExistKey grants a read lease on every hit, so a scan-heavy client can
+    // pin the entire segment: eviction cannot reclaim the probed objects and
+    // new allocations fail.
+    {
+        std::unique_ptr<MasterService> service_(
+            new MasterService(service_config));
+        [[maybe_unused]] const auto context =
+            PrepareSimpleSegment(*service_, "exist_lease_segment",
+                                 kDefaultSegmentBase, kSegmentSize);
+        const UUID client_id = generate_uuid();
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        for (const auto& key : {"exist_key_a", "exist_key_b"}) {
+            PutCompletedObject(*service_, client_id, key, config, kObjectSize);
+            auto exists = service_->ExistKey(key, TenantId::Default());
+            ASSERT_TRUE(exists.has_value());
+            ASSERT_TRUE(exists.value());
+        }
+
+        ReplicateConfig trigger_config;
+        trigger_config.replica_num = 1;
+        auto trigger_result = service_->PutStart(
+            client_id, "trigger_exist_eviction", TenantId::Default(),
+            kObjectSize, trigger_config);
+        ASSERT_FALSE(trigger_result.has_value());
+        EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
+    }
+
+    // ProbeKey shares the lookup path but grants no lease, so the probed
+    // objects stay evictable and the allocation eventually succeeds by
+    // evicting them.
+    {
+        std::unique_ptr<MasterService> service_(
+            new MasterService(service_config));
+        [[maybe_unused]] const auto context = PrepareSimpleSegment(
+            *service_, "probe_segment", kDefaultSegmentBase, kSegmentSize);
+        const UUID client_id = generate_uuid();
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        for (const auto& key : {"probe_key_a", "probe_key_b"}) {
+            PutCompletedObject(*service_, client_id, key, config, kObjectSize);
+            auto probed = service_->ProbeKey(key, TenantId::Default());
+            ASSERT_TRUE(probed.has_value());
+            ASSERT_TRUE(probed.value());
+        }
+
+        // A missing key reports false.
+        auto missing =
+            service_->ProbeKey("probe_missing_key", TenantId::Default());
+        ASSERT_TRUE(missing.has_value());
+        EXPECT_FALSE(missing.value());
+
+        ReplicateConfig trigger_config;
+        trigger_config.replica_num = 1;
+        bool allocated = false;
+        for (int i = 0; i < 40 && !allocated; ++i) {
+            auto trigger_result = service_->PutStart(
+                client_id, "trigger_probe_eviction_" + std::to_string(i),
+                TenantId::Default(), kObjectSize, trigger_config);
+            allocated = trigger_result.has_value();
+            if (!allocated) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        EXPECT_TRUE(allocated);
+    }
+}
+
+TEST_F(MasterServiceTest, BatchProbeKeyReportsPointInTimeExistence) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    auto segment = MakeSegment("probe_batch_segment", buffer, size);
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string existing_key = "probe_batch_existing_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, existing_key, config);
+
+    const std::string missing_key = "probe_batch_missing_key";
+    auto results = service_->BatchProbeKey(
+        {existing_key, missing_key, existing_key}, TenantId::Default());
+    ASSERT_EQ(3u, results.size());
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_TRUE(*results[0]);
+    ASSERT_TRUE(results[1].has_value());
+    EXPECT_FALSE(*results[1]);
+    ASSERT_TRUE(results[2].has_value());
+    EXPECT_TRUE(*results[2]);
 }
 
 TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {

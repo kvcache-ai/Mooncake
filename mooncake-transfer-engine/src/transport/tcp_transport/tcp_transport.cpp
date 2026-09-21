@@ -574,7 +574,8 @@ Status TcpTransport::submitTransferTask(
         do {
             task = task_list[i];
             assert(task && task->request);
-            slices.push_back(prepareTransfer(task, *task->request));
+            for (size_t j = 0; j < task->request_count; ++j)
+                slices.push_back(prepareTransfer(task, task->request[j]));
             ++i;
         } while (i < task_list.size() && task_list[i]->request &&
                  task_list[i]->request->task_group_id == group_id &&
@@ -591,7 +592,8 @@ Status TcpTransport::submitTransferTaskGroup(
     slices.reserve(task_list.size());
     for (auto* task : task_list) {
         assert(task && task->request);
-        slices.push_back(prepareTransfer(task, *task->request));
+        for (size_t j = 0; j < task->request_count; ++j)
+            slices.push_back(prepareTransfer(task, task->request[j]));
     }
     startTransferSequence(std::move(slices));
     return Status::OK();
@@ -599,7 +601,7 @@ Status TcpTransport::submitTransferTaskGroup(
 
 Transport::Slice* TcpTransport::prepareTransfer(
     TransferTask* task, const TransferRequest& request) {
-    task->total_bytes = request.length;
+    task->total_bytes += request.length;
     Slice* slice = getSliceCache().allocate();
     slice->source_addr = static_cast<char*>(request.source);
     slice->length = request.length;

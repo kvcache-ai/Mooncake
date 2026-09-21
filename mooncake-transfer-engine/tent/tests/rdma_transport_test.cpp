@@ -76,6 +76,25 @@ class RdmaTransportTestPeer {
         transport.context_set_ = std::move(contexts);
     }
 
+    // Defaults to a monitor tick: that is what the orphan tests stand in for.
+    static void reapOrphanSlices(RdmaTransport& transport,
+                                 bool on_tick = true) {
+        transport.reapOrphanSlices(on_tick);
+    }
+
+    static size_t orphanSliceCount(RdmaTransport& transport) {
+        std::lock_guard<std::mutex> guard(transport.orphan_slice_mutex_);
+        return transport.orphan_slices_.size();
+    }
+    static size_t orphanWarnings(RdmaTransport& transport) {
+        std::lock_guard<std::mutex> guard(transport.orphan_slice_mutex_);
+        return transport.orphan_warnings_;
+    }
+    static void setOrphanWarnAfterPasses(RdmaTransport& transport,
+                                         uint32_t passes) {
+        transport.orphan_warn_after_passes_ = passes;
+    }
+
     // Runs the monitorThread() 1 Hz reclaim tick without starting any worker
     // threads.
     static void reclaimEndpoints(RdmaTransport& transport) {
@@ -200,6 +219,10 @@ class RdmaTransportTestPeer {
                                      uint64_t now_ns) {
         workers.expireTimedOutSlices(ctx, now_ns);
     }
+
+    static Status notifyStatusForEndpointFailure(const Status& failure) {
+        return RdmaTransport::notifyStatusForEndpointFailure(failure);
+    }
 };
 
 // Friend accessor for RdmaContext: TENT reaches libibverbs through a table of
@@ -257,6 +280,15 @@ class RdmaContextTestPeer {
 // path that does not go through the injectable verbs table (ibv_post_send is
 // an inline that dispatches through the queue pair), so a test stands in for
 // it and puts the slice on the queue pair the way submitSlices would.
+// Tickets are the lock's only observable state; a test that needs to know a
+// thread is queued on it watches them being handed out.
+class TicketLockTestPeer {
+   public:
+    static int ticketsIssued(const TicketLock& lock) {
+        return lock.next_ticket_.load(std::memory_order_acquire);
+    }
+};
+
 class RdmaEndPointTestPeer {
    public:
     static RdmaAddressSnapshot localAddress(const RdmaEndPoint& endpoint) {
@@ -270,6 +302,9 @@ class RdmaEndPointTestPeer {
         slice->ep_weak_ptr = endpoint;
         std::lock_guard<TicketLock> guard(endpoint->queue_lock_list_[qp_index]);
         endpoint->slice_queue_[qp_index].push(slice);
+        // submitSlices() counts the completion the post owes; a stand-in that
+        // skipped it would leave the slice looking settled.
+        slice->completions_owed.fetch_add(1, std::memory_order_acq_rel);
     }
     static void markReady(const std::shared_ptr<RdmaEndPoint>& endpoint) {
         endpoint->status_.store(RdmaEndPoint::EP_READY,
@@ -285,6 +320,11 @@ class RdmaEndPointTestPeer {
     }
     static int inflightSlices(const std::shared_ptr<RdmaEndPoint>& endpoint) {
         return endpoint->inflight_slices_.load();
+    }
+    // Held by a test to stall a completion handler inside acknowledge().
+    static TicketLock& qpLock(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                              int qp_index) {
+        return endpoint->queue_lock_list_[qp_index];
     }
 };
 
@@ -470,6 +510,35 @@ TEST(RdmaNotifyFaultTriageTest, PathAndPeerFaultsRetireTheEndpoint) {
               Action::RetireEndpoint);
 }
 
+// A bootstrap RPC that failed says the peer's control plane is not answering,
+// so a notification must not be handed to the RPC fallback: that would only
+// wait out a second RPC timeout on the thread that polls the batch.
+TEST(RdmaNotifyFaultTriageTest, BootstrapRpcFailureNotEligibleForFallback) {
+    const Status mapped = RdmaTransportTestPeer::notifyStatusForEndpointFailure(
+        Status::RpcServiceError("Failed to call RPC function"));
+    EXPECT_TRUE(mapped.IsRpcServiceError()) << mapped.ToString();
+    EXPECT_NE(mapped.message().find("Failed to call RPC function"),
+              std::string_view::npos);
+}
+
+// Every other reason getEndpoint() comes back empty - no enabled context,
+// allocation, QP setup, a stale segment - leaves the control plane reachable,
+// so the engine may still deliver over RPC.
+TEST(RdmaNotifyFaultTriageTest, OtherEndpointFailuresStayEligible) {
+    const Status failures[] = {
+        Status::InternalError("Failed to configure RDMA endpoint"),
+        Status::DeviceNotFound("No enabled RDMA context"),
+        Status::InvalidArgument("Missing peer GID in bootstrap"),
+        Status::NeedsRefreshCache("Empty target segment or device name"),
+    };
+    for (const auto& failure : failures) {
+        const Status mapped =
+            RdmaTransportTestPeer::notifyStatusForEndpointFailure(failure);
+        EXPECT_TRUE(mapped.IsDeviceNotFound())
+            << failure.ToString() << " -> " << mapped.ToString();
+    }
+}
+
 TEST(RdmaNotifyFaultTriageTest, TeardownFlushesStayQuiet) {
     using Action = RdmaTransportTestPeer::NotifyAction;
     const auto classify = &RdmaTransportTestPeer::classifyNotifyCompletion;
@@ -482,6 +551,13 @@ TEST(RdmaNotifyFaultTriageTest, TeardownFlushesStayQuiet) {
     // A real fault surfacing after the endpoint is gone has nothing left to
     // act on.
     EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, false, false), Action::ReportOnly);
+    // The notify QP stays published while the endpoint retires, so a real
+    // fault can still arrive on a not-ready endpoint: it is triaged as on any
+    // other live endpoint, and only flushes are skipped.
+    EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, true, false),
+              Action::RetireEndpoint);
+    EXPECT_EQ(classify(IBV_WC_LOC_LEN_ERR, true, false),
+              Action::DisableNotification);
 }
 
 // context_set_ is subscripted by NicID, so it must keep one slot per NIC even
@@ -2538,6 +2614,206 @@ TEST_F(RdmaWorkersSharedQpTest, TwoPostersOnOneQueuePairKeepPostingOrder) {
     EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
     EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
     EXPECT_EQ(RdmaEndPointTestPeer::inflightSlices(endpoint_), 0);
+}
+
+// The orphan list is about slice storage outliving a work request; it has
+// nothing to do with lane sharing. The fixture above is borrowed only for
+// its fake verbs and a live endpoint to post on.
+class RdmaSliceOrphanTest : public RdmaWorkersSharedQpTest {
+   protected:
+    // Stop TearDown from freeing this slice: something else owns it now.
+    void forgetSlice(RdmaSlice* slice) {
+        slices_.erase(std::remove(slices_.begin(), slices_.end(), slice),
+                      slices_.end());
+    }
+
+    // A sub-batch holding exactly `slice`, as submitTransferTasks would leave
+    // it, handed to freeSubBatch().
+    void freeBatchHolding(RdmaSlice* slice) {
+        Transport::SubBatchRef batch = nullptr;
+        ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+        auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
+        ASSERT_NE(rdma_batch, nullptr);
+        rdma_batch->slice_chain.push_back(slice);
+        forgetSlice(slice);
+        ASSERT_TRUE(transport_.freeSubBatch(batch).ok());
+    }
+};
+
+// A timeout resolves a slice without waiting for its completion, so the batch
+// can read terminal and be freed while a work request is still live. Returning
+// that slice to the slab would let the stale completion resolve whoever gets
+// the storage next, reporting bytes that never moved.
+TEST_F(RdmaSliceOrphanTest, AFreedBatchHoldsBackASliceStillOwedACompletion) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    ASSERT_EQ(slice->completions_owed.load(), 1);
+
+    freeBatchHolding(slice);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // Still nothing to reap: the completion has not arrived and the endpoint
+    // that owes it is alive.
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    completeWith(slice, IBV_WC_SUCCESS);
+    EXPECT_EQ(slice->completions_owed.load(), 0);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// The ordinary path: every slice already polled, nothing held back.
+TEST_F(RdmaSliceOrphanTest, AFreedBatchReturnsASettledSliceStraightAway) {
+    auto* slice = makeSlice();  // never posted
+    ASSERT_EQ(slice->completions_owed.load(), 0);
+    freeBatchHolding(slice);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// The completion may never arrive -- destroying a queue pair clears the
+// completions naming it -- so a gone endpoint settles the orphan too.
+TEST_F(RdmaSliceOrphanTest, AnOrphanIsReapedOnceItsEndpointIsGone) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(slice);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    endpoint_.reset();
+    ASSERT_TRUE(slice->ep_weak_ptr.expired());
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// An orphan is only held while its endpoint is alive, so one that outlives
+// the threshold means a queue pair is not being destroyed. That is reported
+// once per slice, and the slice stays held: freeing it on age would hand the
+// completion queue a dangling address again.
+TEST_F(RdmaSliceOrphanTest, ALingeringOrphanIsReportedOnceAndStillHeld) {
+    RdmaTransportTestPeer::setOrphanWarnAfterPasses(transport_, 3);
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(slice);
+
+    for (int pass = 0; pass < 2; ++pass)
+        RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 0u);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);  // third pass
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 1u);
+    for (int pass = 0; pass < 5; ++pass)
+        RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 1u);    // once
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);  // held
+
+    completeWith(slice, IBV_WC_SUCCESS);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// The handler reads the slice well past acknowledge(), which is what
+// publishes the terminal status the caller is waiting for. A batch freed in
+// that window must not return the storage, and the reaper must not take it
+// either: the completion is paid at the end of the handler, so both see the
+// slice as still owed until it returns.
+TEST_F(RdmaSliceOrphanTest, ASliceIsHeldWhileItsCompletionIsBeingHandled) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+
+    // Stall the handler where it resolves the slice: acknowledge() takes the
+    // queue pair's lock, which this thread holds until the checks below are
+    // done.
+    auto& qp_lock = RdmaEndPointTestPeer::qpLock(endpoint_, 0);
+    qp_lock.lock();
+    const int tickets_before = TicketLockTestPeer::ticketsIssued(qp_lock);
+    std::thread poller([&] { completeWith(slice, IBV_WC_SUCCESS); });
+    // It is where we want it once it holds a ticket behind ours: queued on
+    // the lock, past everything the handler does before acknowledge().
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (TicketLockTestPeer::ticketsIssued(qp_lock) == tickets_before) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            qp_lock.unlock();
+            poller.join();
+            FAIL() << "the handler never queued on the queue pair lock";
+        }
+        std::this_thread::yield();
+    }
+
+    freeBatchHolding(slice);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    qp_lock.unlock();
+    poller.join();
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// What the counter is for, end to end. A freed slice goes to the back of the
+// thread's ring in the slab, so a ring's worth of allocations is all it takes
+// for the address to come back -- a handful of transfers, not a rare event.
+// Handed out, it would be the work-request id of a live post naming somebody
+// else's slice, and the stale completion would resolve that one instead.
+TEST_F(RdmaSliceOrphanTest, AHeldSliceIsNeverHandedToTheNextTransfer) {
+    auto* held = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(held);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // Drain the ring: without the hold, the address is in here.
+    std::vector<RdmaSlice*> reused;
+    for (size_t i = 0; i < SlabBase::kMaxFreeListSizeInThread; ++i)
+        reused.push_back(RdmaSliceStorage::Get().allocate());
+    EXPECT_EQ(std::count(reused.begin(), reused.end(), held), 0)
+        << "a slice still owed a completion was handed to a new transfer";
+    for (auto* slice : reused) RdmaSliceStorage::Get().deallocate(slice);
+
+    // The completion really is still live: it lands on the held slice and
+    // resolves it, which is what it would have done to whoever had the
+    // storage instead -- COMPLETED, with the length of a transfer that never
+    // ran added to that task's byte count.
+    completeWith(held, IBV_WC_SUCCESS);
+    EXPECT_EQ(held->word, COMPLETED);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// A batch free reaps opportunistically so a straggler is not held for a whole
+// monitor tick. Those reaps must not age an orphan: counting them would report
+// a lingering one after a handful of transfers instead of after about a
+// minute, which is the only reading that says a queue pair is stuck.
+TEST_F(RdmaSliceOrphanTest, AnOpportunisticReapDoesNotAgeAnOrphan) {
+    RdmaTransportTestPeer::setOrphanWarnAfterPasses(transport_, 1);
+    auto* held = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(held);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // Every one of these runs the reap inside freeSubBatch().
+    for (int pass = 0; pass < 3; ++pass) freeBatchHolding(makeSlice());
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 0u);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // The monitor's tick is the one that ages it.
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 1u);
+}
+
+// The reaper empties the list before scanning it, so an unsettled slice has
+// to be put back -- and put back once, not dropped and not duplicated.
+TEST_F(RdmaSliceOrphanTest, AnUnsettledOrphanSurvivesRepeatedReaps) {
+    auto* kept = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    auto* settled = postSlice(/*lane=*/1, /*enqueue_ts=*/0);
+    freeBatchHolding(kept);
+    freeBatchHolding(settled);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 2u);
+
+    // One of them gets its completion; the other is scanned three times and
+    // stays exactly once in the list.
+    completeWith(settled, IBV_WC_SUCCESS);
+    for (int pass = 0; pass < 3; ++pass) {
+        RdmaTransportTestPeer::reapOrphanSlices(transport_);
+        ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u)
+            << "pass " << pass;
+    }
+    completeWith(kept, IBV_WC_SUCCESS);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
 }
 
 TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {

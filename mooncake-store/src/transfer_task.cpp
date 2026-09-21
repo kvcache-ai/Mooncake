@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include "config/transfer_submitter_config.h"
+#include "config/fileread_worker_pool_config.h"
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -24,6 +25,7 @@
 #include "spdk/spdk_wrapper.h"
 #endif
 
+#ifdef USE_NOF
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
     if (!raw_value || raw_value[0] == '\0') {
@@ -44,7 +46,6 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
-#ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
     if (!value) {
         return false;
@@ -251,22 +252,10 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 // ============================================================================
 // FilereadWorkerPool Implementation
 // ============================================================================
-// to fully utilize the available ssd bandwidth, we use a default of 10 worker
-// threads.
-constexpr int kDefaultFilereadWorkers = 10;
-
-// The number of fileread workers can be tuned via the MC_FILEREAD_WORKERS
-// environment variable. Falls back to kDefaultFilereadWorkers when unset,
-// empty, or invalid.
-static int GetFilereadWorkerCount() {
-    static const int value =
-        GetPositiveEnvOrDefault("MC_FILEREAD_WORKERS", kDefaultFilereadWorkers);
-    return value;
-}
-
 FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     : shutdown_(false) {
-    const int num_workers = GetFilereadWorkerCount();
+    static const auto config = FilereadWorkerPoolConfig::FromEnvironment();
+    const int num_workers = config.worker_count;
     VLOG(1) << "Creating FilereadWorkerPool with " << num_workers << " workers";
 
     // Start worker threads

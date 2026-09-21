@@ -304,8 +304,10 @@ int RdmaEndPoint::deconstructUnlocked() {
 
     if (result == 0 && !notify_qp_ && !notify_recv_mr_ && !notify_send_mr_ &&
         qp_list_.empty()) {
-        peer_server_name_.clear();
-        peer_nic_name_.clear();
+        // peer_server_name_ / peer_nic_name_ are left alone: the notification
+        // worker reads them from a retiring endpoint it still holds (for the
+        // path health table) without taking lock_, and nothing needs them
+        // cleared - EP_DESTROYED already says the endpoint is gone.
         status_.store(EP_DESTROYED, std::memory_order_release);
         return 0;
     }
@@ -325,12 +327,12 @@ void RdmaEndPoint::beginDestroyNoLock() {
     destroy_start_time_ = getCurrentTimeInNano();
     status_.store(EP_DESTROYING, std::memory_order_release);
 
-    // Stop publishing the endpoint before QPs start flushing. A notification
-    // completion that already locked the weak_ptr may finish safely, while no
-    // later completion can acquire a retiring endpoint.
-    if (notify_qp_) {
-        context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
-    }
+    // The notify QP stays published until deconstruct(): notifications that
+    // already landed (the sender saw them acked) may still sit in the CQ
+    // unpolled, and the worker can only hand them out while it can find
+    // this endpoint. The flushes that follow the ERR transition stay quiet
+    // because the endpoint is no longer ready; deconstruct() unpublishes
+    // under notify_resource_mutex_ before it frees the buffers.
     {
         std::lock_guard<std::mutex> notify_guard(notify_send_mutex_);
         notify_connected_ = false;
@@ -383,6 +385,12 @@ bool RdmaEndPoint::finishDestroy() {
             break;
         }
     }
+    // The notify QP counts too. Destroying it takes its completions with it,
+    // including notifications the peer already saw acknowledged, so the ERR
+    // transition must be given the time to flush them out first. A QP that
+    // never completes them (a provider that drops WRs on RESET) is covered by
+    // the timeout below.
+    if (!has_outstanding && notifyInflight() != 0) has_outstanding = true;
     if (has_outstanding) {
         double elapsed = (getCurrentTimeInNano() - destroy_start_time_) / 1e9;
         if (elapsed < kFinishDestroyTimeoutSec) {
@@ -574,10 +582,14 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                     << "Failed to setup notification QP, notification disabled";
                 notify_connected_ = false;
             } else {
-                notify_connected_ = true;
-                repostAllNotifyRecvs();
+                // Published before the first RECV is posted: a peer that
+                // sends the moment its own handshake returns must find this
+                // endpoint, and a completion cannot arrive before the RECVs
+                // are there anyway.
                 context_->transport_.registerNotifyQp(notify_qp_->qp_num,
                                                       shared_from_this());
+                notify_connected_ = true;
+                repostAllNotifyRecvs();
             }
         }
     }
@@ -672,10 +684,10 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         if (rc) {
             notify_connected_ = false;
         } else {
-            notify_connected_ = true;
-            repostAllNotifyRecvs();
             context_->transport_.registerNotifyQp(notify_qp_->qp_num,
                                                   shared_from_this());
+            notify_connected_ = true;
+            repostAllNotifyRecvs();
         }
     }
 
@@ -837,7 +849,10 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         auto& queue = slice_queue_[qp_index];
         for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
             auto current = slice_list[wr_idx];
-            if (!current->failed) queue.push(current);
+            if (current->failed) continue;  // never reached the hardware
+            queue.push(current);
+            // One signalled work request, one completion owed.
+            current->completions_owed.fetch_add(1, std::memory_order_acq_rel);
         }
     }
     if (rc) {
@@ -1109,7 +1124,13 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
     if (ret) {
         LOG(ERROR) << "Failed to post notification recv: " << strerror(abs(ret))
                    << " [" << ret << "]";
+        return;
     }
+    notify_inflight_.fetch_add(1, std::memory_order_release);
+}
+
+void RdmaEndPoint::rearmNotifyRecv(size_t idx) {
+    if (shouldRearmNotifyRecv(status(), notifyConnected())) postNotifyRecv(idx);
 }
 
 void RdmaEndPoint::repostAllNotifyRecvs() {
@@ -1222,7 +1243,11 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
                notify_pending_count_ < kNotifyMaxPendingSends;
     });
     if (!notify_connected_) {
-        LOG(ERROR) << "Notification QP not connected";
+        // Every send on this endpoint fails the same way until it is
+        // rebuilt, and the caller has a fallback path; one line per hundred
+        // is enough to show it is happening.
+        LOG_EVERY_N(WARNING, 100)
+            << "Notification QP not connected on endpoint " << endpoint_name_;
         return false;
     }
     std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
@@ -1263,12 +1288,21 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     }
 
     notify_pending_count_++;
+    notify_inflight_.fetch_add(1, std::memory_order_release);
     return true;
 }
 
 bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
-    if (!notify_recv_mr_ || buffer_idx >= kNotifyMaxPendingSends ||
+    if (!notify_recv_mr_) {
+        // The endpoint was deconstructed while this completion was in the
+        // worker's batch. Rare, and not a malformed completion.
+        LOG_EVERY_N(WARNING, 100)
+            << "Notification dropped: endpoint " << endpoint_name_
+            << " was torn down before the completion was handled";
+        return false;
+    }
+    if (buffer_idx >= kNotifyMaxPendingSends ||
         notify_recv_buffer_.size() < (buffer_idx + 1) * kNotifyBufferSize) {
         LOG(ERROR) << "Invalid recv buffer index: " << buffer_idx;
         return false;
@@ -1276,7 +1310,7 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
 
     // Silent retry for byte_len == 0
     if (byte_len == 0) {
-        postNotifyRecv(buffer_idx);
+        rearmNotifyRecv(buffer_idx);
         return false;
     }
 
@@ -1286,7 +1320,7 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     if (!decodeNotifyPayload(data, byte_len, &name, &msg)) {
         LOG(ERROR) << "Invalid notification message size or format: "
                    << byte_len;
-        postNotifyRecv(buffer_idx);
+        rearmNotifyRecv(buffer_idx);
         return false;
     }
 
@@ -1294,7 +1328,7 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     context_->transport_.addNotificationToQueue(name, msg);
 
     // Repost recv buffer
-    postNotifyRecv(buffer_idx);
+    rearmNotifyRecv(buffer_idx);
     return true;
 }
 
@@ -1315,13 +1349,9 @@ void RdmaEndPoint::disableNotification(const std::string& reason) {
     }
     LOG(WARNING) << "Notifications disabled on endpoint " << endpoint_name_
                  << ", data path kept alive: " << reason;
-
-    // Unpublish so the WRs still posted on the dead QP flush silently instead
-    // of re-reporting the same fault once per WR.
-    std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
-    if (notify_qp_) {
-        context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
-    }
+    // The QP stays published: notifications already in the CQ are still
+    // handed out, and the worker keeps the flushes of the posted WRs quiet
+    // now that notify_connected_ is off.
 }
 }  // namespace tent
 }  // namespace mooncake

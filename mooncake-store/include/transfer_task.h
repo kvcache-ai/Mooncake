@@ -566,6 +566,8 @@ class FilereadWorkerPool {
     void submitTask(FilereadTask task);
 
    private:
+    friend class FilereadWorkerPoolTestPeer;
+
     void workerThread();
 
     std::vector<std::thread> workers_;

@@ -433,11 +433,29 @@ class Client {
     tl::expected<bool, ErrorCode> IsExist(const std::string& key);
 
     /**
+     * @brief Point-in-time existence check that grants no read lease.
+     *        A `true` result only means the object existed at the time of
+     *        the call; it may be evicted before a subsequent Get.
+     * @param key Key to check
+     * @return Vector of existence results for each key
+     */
+    tl::expected<bool, ErrorCode> ProbeKey(const std::string& key);
+
+    /**
      * @brief Checks if multiple objects exist
      * @param keys Vector of keys to check
      * @return Vector of existence results for each key
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
+        const std::vector<std::string>& keys);
+
+    /**
+     * @brief Point-in-time existence check for multiple objects, granting no
+     *        read leases
+     * @param keys Vector of keys to check
+     * @return Vector of existence results for each key
+     */
+    std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
         const std::vector<std::string>& keys);
 
     /**
@@ -1029,6 +1047,7 @@ class Client {
     std::atomic<bool> last_ping_success_{false};
     std::atomic<bool> segment_desc_publish_pending_{false};
     std::atomic<bool> rpc_meta_publish_pending_{false};
+    ErrorCode ConnectMasterEndpoint(const std::string& address);
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();

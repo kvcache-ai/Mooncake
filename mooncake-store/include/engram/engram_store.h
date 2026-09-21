@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -75,13 +76,19 @@ class EngramStore {
 
    private:
     std::shared_ptr<PyClient> store_;
+    struct QueryCacheEntry;
     struct Layer {
         EngramStoreConfig config;
         std::vector<std::string> keys;
         std::vector<const void*> local_tables;
     };
     const Layer& get_layer(int layer_id) const;
+    std::shared_ptr<const QueryCacheEntry> get_query_cache(
+        int layer_id, const std::vector<std::string>& keys) const;
+    void invalidate_query_cache(int layer_id) const;
     std::map<int, Layer> layers_;
+    mutable std::mutex query_cache_mutex_;
+    mutable std::map<int, std::shared_ptr<QueryCacheEntry>> query_cache_;
 };
 
 }  // namespace engram

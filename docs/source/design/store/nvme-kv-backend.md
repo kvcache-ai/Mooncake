@@ -1,7 +1,3 @@
----
-orphan: true
----
-
 # NVMe KV Backend Design
 
 ## Overview

@@ -3204,6 +3204,17 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 
 auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     -> tl::expected<bool, ErrorCode> {
+    return ExistKeyImpl(key, tenant_id, /*grant_lease=*/true);
+}
+
+auto MasterService::ProbeKey(const std::string& key, const TenantId& tenant_id)
+    -> tl::expected<bool, ErrorCode> {
+    return ExistKeyImpl(key, tenant_id, /*grant_lease=*/false);
+}
+
+auto MasterService::ExistKeyImpl(const std::string& key,
+                                 const TenantId& tenant_id, bool grant_lease)
+    -> tl::expected<bool, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -3217,14 +3228,29 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
         return false;
     }
 
-    // Grant a lease to the object as it may be further used by the client.
-    // Read path is group-agnostic: only the object's own lease is refreshed.
-    metadata.GrantReadLease(std::chrono::milliseconds(default_kv_lease_ttl_));
+    if (grant_lease) {
+        // Grant a lease to the object as it may be further used by the client.
+        // Read path is group-agnostic: only the object's own lease is
+        // refreshed.
+        metadata.GrantReadLease(
+            std::chrono::milliseconds(default_kv_lease_ttl_));
+    }
     return true;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys, const TenantId& tenant_id) {
+    return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/true);
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
+    const std::vector<std::string>& keys, const TenantId& tenant_id) {
+    return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/false);
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
+    const std::vector<std::string>& keys, const TenantId& tenant_id,
+    bool grant_lease) {
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     if (keys.empty()) {
@@ -3275,8 +3301,10 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
                 results[i] = false;
                 continue;
             }
-            metadata.GrantReadLease(
-                std::chrono::milliseconds(default_kv_lease_ttl_));
+            if (grant_lease) {
+                metadata.GrantReadLease(
+                    std::chrono::milliseconds(default_kv_lease_ttl_));
+            }
             results[i] = true;
         }
     }
@@ -8265,6 +8293,8 @@ auto MasterService::NotifyOffloadSuccess(
                         source->dec_refcnt();
                     }
                     tenant_state.offloading_tasks.erase(task_it);
+                    MasterMetricManager::instance().inc_offload_failed(
+                        UuidToString(client_id));
                 }
             }
             continue;
@@ -8331,6 +8361,8 @@ auto MasterService::NotifyOffloadSuccess(
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
                         SyncCacheTotalAccounting(obj_metadata);
+                        MasterMetricManager::instance().inc_offload_completed(
+                            UuidToString(client_id));
                         added_new_local_disk_replica = true;
                     } else {
                         obj_metadata.VisitReplicas(
@@ -8428,6 +8460,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     bool any_enqueued = false;
+    std::string client_id_str;
     const auto liveness = replica.getClientLiveness();
     if (!liveness) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -8472,11 +8505,16 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
         }
         if (err != ErrorCode::OK) {
+            if (err == ErrorCode::KEYS_ULTRA_LIMIT) {
+                MasterMetricManager::instance().inc_offload_enqueue_rejected(
+                    UuidToString(*client_id));
+            }
             return tl::make_unexpected(err);
         }
         if (mirror_clients != nullptr) {
             mirror_clients->push_back(*client_id);
         }
+        client_id_str = UuidToString(*client_id);
         any_enqueued = true;
     }
     // Every segment name was nullopt (or EnqueueOffload found no usable
@@ -8485,6 +8523,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     if (!any_enqueued) {
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
     }
+    MasterMetricManager::instance().inc_offload_enqueued(client_id_str);
     return {};
 }
 
@@ -8509,6 +8548,8 @@ bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
     if (source != nullptr) {
         source->dec_refcnt();
     }
+    MasterMetricManager::instance().inc_offload_cancelled(
+        UuidToString(mirror_clients[0]));
     tenant_state.offloading_tasks.erase(task_it);
     return true;
 }
