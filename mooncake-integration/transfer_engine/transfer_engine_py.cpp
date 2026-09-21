@@ -1286,6 +1286,12 @@ PYBIND11_MODULE(engine, m) {
     m.attr("SUPPORT_CUDA") = false;
 #endif
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    m.attr("SUPPORT_MULTI_PROTOCOL") = true;
+#else
+    m.attr("SUPPORT_MULTI_PROTOCOL") = false;
+#endif
+
     py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
         m, "TransferOpcode", py::arithmetic());
     transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
