@@ -374,6 +374,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
         return SpdkWrapper::GetInstance().ProbeNofSegment(
             te_endpoint, timeout_ms, error_reason);
     };
+    nof_probe_release_fn_ = [](const std::string& te_endpoint) {
+        SpdkWrapper::GetInstance().CloseNofSegment(te_endpoint);
+    };
 #endif
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
@@ -752,6 +755,25 @@ MasterService::~MasterService() {
         metrics.on_client_liveness_record_removed(record->state());
     }
     client_liveness_records_.clear();
+}
+
+
+void MasterService::ReleaseNoFProbeResources(const std::string& te_endpoint) {
+#ifdef USE_NOF
+    if (te_endpoint.empty()) {
+        return;
+    }
+    NoFProbeReleaseFn release_fn;
+    {
+        std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
+        release_fn = nof_probe_release_fn_;
+    }
+    if (release_fn) {
+        release_fn(te_endpoint);
+    }
+#else
+    (void)te_endpoint;
+#endif
 }
 
 void MasterService::SetBatchOpLogTerminalCallback(
@@ -3161,6 +3183,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
     size_t metrics_dec_capacity = 0;  // to update the metrics
+    std::string te_endpoint;
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -3172,7 +3195,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
         ScopedNoFSegmentAccess segment_access =
             nof_segment_manager_.getNoFSegmentAccess();
         ErrorCode err = segment_access.PrepareUnmountSegment(
-            segment_id, metrics_dec_capacity);
+            segment_id, metrics_dec_capacity, &te_endpoint);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             // Return OK because this is an idempotent operation
             return {};
@@ -3197,6 +3220,10 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     {
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(segment_id);
+    }
+    // Drop SpdkWrapper probe resources only if no remount still owns endpoint.
+    if (!te_endpoint.empty() && !nof_segment_manager_.HasEndpoint(te_endpoint)) {
+        ReleaseNoFProbeResources(te_endpoint);
     }
     return {};
 #endif
@@ -12435,6 +12462,10 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     {
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(snapshot.segment_id);
+    }
+    const std::string& te_endpoint = snapshot.segment.te_endpoint;
+    if (!te_endpoint.empty() && !nof_segment_manager_.HasEndpoint(te_endpoint)) {
+        ReleaseNoFProbeResources(te_endpoint);
     }
     MasterMetricManager::instance()
         .inc_nof_segments_unmounted_by_heartbeat_total();

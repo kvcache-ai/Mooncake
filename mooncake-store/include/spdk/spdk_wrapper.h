@@ -44,6 +44,24 @@ class SpdkWrapper {
     /** @brief Open a NoF segment. */
     nof_seg_handle *OpenNofSegment(const std::string &tr_str);
 
+    /**
+     * @brief Release cached probe resources for a NoF transport endpoint.
+     *
+     * Drops this raw endpoint string's claim on the canonical
+     * controller+namespace entry. Frees the namespace I/O qpair when no other
+     * aliases remain, frees this endpoint's probe DMA buffer, and detaches the
+     * controller when no other namespaces remain on it. Safe to call when the
+     * endpoint was never opened (no-op). Serialized with ProbeNofSegment.
+     */
+    void CloseNofSegment(const std::string &tr_str);
+
+    /** @brief Test helpers for cached SpdkWrapper probe resource state. */
+    size_t GetConnectedControllerCountForTesting() const;
+    size_t GetProbeBufferCountForTesting() const;
+    bool HasNamespaceHandleForTesting(const std::string &tr_str) const;
+    bool HasProbeBufferForTesting(const std::string &tr_str) const;
+
+
     uint32_t GetBlockSize(const nof_seg_handle *seg_handle);
 
     int SubmitRequest(const nof_seg_handle *seg_handle, void *ptr, uint64_t lba,
@@ -130,7 +148,7 @@ class SpdkWrapper {
     explicit SpdkWrapper();
     ~SpdkWrapper();
 
-    int ParseTransPortStr(const std::string &tr_str, tr_info *info);
+    int ParseTransPortStr(const std::string &tr_str, tr_info *info) const;
     int ConnectController(const struct spdk_nvme_transport_id *trid,
                           ctrlr_info *info);
     ProbeBuffer *GetOrCreateProbeBuffer(const std::string &tr_str,
@@ -144,9 +162,12 @@ class SpdkWrapper {
     std::atomic<bool> initialized{false};
     std::mutex init_mutex;
     std::map<std::string, std::unique_ptr<ctrlr_info>> connected_ctrlrs;
-    std::mutex ctrlrs_mutex;
+    mutable std::mutex ctrlrs_mutex;
     std::map<std::string, std::unique_ptr<ProbeBuffer>> probe_buffers_;
-    std::mutex probe_buffers_mutex_;
+    mutable std::mutex probe_buffers_mutex_;
+    // Serializes ProbeNofSegment against CloseNofSegment so unmount cannot
+    // free qpairs / DMA buffers while a probe is in flight.
+    mutable std::mutex probe_lifecycle_mutex_;
     std::vector<std::unique_ptr<ProbeRequestContext>> probe_request_contexts_;
     std::stack<ProbeRequestContext *> probe_request_context_pool_;
     std::mutex probe_request_context_pool_mutex_;
