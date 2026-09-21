@@ -73,8 +73,20 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
 int ascendUbRegister(void* addr, size_t length, bool& registered) {
     aclrtPtrAttributes attributes{};
     aclError acl_ret = aclrtPointerGetAttributes(addr, &attributes);
-    if (acl_ret != ACL_ERROR_NONE ||
-        attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
+    LOG(INFO) << "USE_ASCEND_RDMA: aclrtPointerGetAttributes addr=" << addr
+              << ", length=" << length << ", acl_ret=" << acl_ret
+              << ", location_type=" << attributes.location.type
+              << ", location_id=" << attributes.location.id
+              << ", page_size=" << attributes.pageSize;
+    if (acl_ret != ACL_ERROR_NONE) {
+        LOG(WARNING) << "USE_ASCEND_RDMA: cannot query ACL attributes for "
+                     << addr << "; skip halMemRegUbSegment and continue with "
+                        "ibv_reg_mr";
+        return 0;
+    }
+    if (attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
+        LOG(INFO) << "USE_ASCEND_RDMA: address " << addr
+                  << " is not Device memory; skip halMemRegUbSegment";
         return 0;
     }
 
@@ -88,6 +100,9 @@ int ascendUbRegister(void* addr, size_t length, bool& registered) {
     }
 
     registered = true;
+    LOG(INFO) << "USE_ASCEND_RDMA: halMemRegUbSegment succeeded, addr="
+              << addr << ", length=" << length
+              << ", device_id=" << attributes.location.id;
     return 0;
 }
 
@@ -685,16 +700,23 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
     mrMeta.addr = addr;
+    bool ascend_ub_registered = false;
 #if defined(USE_ASCEND_RDMA)
     // kHostReg names the plain ibv_reg_mr path; it does not imply that addr is
     // host memory. ACL performs the actual Ascend HBM check.
     const bool uses_plain_ibv_reg_mr =
         exp.method == DmabufExport::Method::kHostReg;
-    bool ascend_ub_registered = false;
     if (uses_plain_ibv_reg_mr) {
         int ret = ascendUbRegister(addr, length, ascend_ub_registered);
         if (ret != 0) return ERR_CONTEXT;
     }
+    LOG(INFO) << "RDMA memory registration request: device=" << device_name_
+              << ", addr=" << addr << ", length=" << length
+              << ", access=0x" << std::hex << access << std::dec
+              << ", path="
+              << (uses_plain_ibv_reg_mr ? "ibv_reg_mr" : "non-plain")
+              << ", ascend_ub_registered="
+              << (ascend_ub_registered ? "true" : "false");
 #endif
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
@@ -721,7 +743,14 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         errno = saved_errno;
 #endif
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
-                    << length << " dmabuf_offset " << exp.offset;
+                    << length << " dmabuf_offset " << exp.offset
+                    << " device=" << device_name_ << " access=0x" << std::hex
+                    << access << std::dec << " method="
+                    << (exp.method == DmabufExport::Method::kDmabufReg
+                            ? "dmabuf"
+                            : "ibv_reg_mr")
+                    << " ascend_ub_registered="
+                    << (ascend_ub_registered ? "true" : "false");
         return ERR_CONTEXT;
     }
     return 0;
