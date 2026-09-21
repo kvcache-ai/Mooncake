@@ -12,6 +12,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     uds_transport.cpp
     config/distributed_storage_config.cpp
     config/rpc_protocol_config.cpp
+    config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp)
@@ -19,7 +20,9 @@ set(MOONCAKE_STORE_SHARED_SOURCES
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    config/dfs_enablement_config.cpp
     config/ha_cluster_namespace_config.cpp
+    config/master_metadata_config.cpp
     config/local_file_snapshot_config.cpp
     config/redis_connection_config.cpp
     config/s3_client_config.cpp
@@ -103,6 +106,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/backend.cpp
     nvme_kv/connector.cpp
     nvme_kv/config/connector_config.cpp
+    nvme_kv/config/executor_config.cpp
     nvme_kv/config/io_concurrency_config.cpp
     nvme_kv/config/u32_parser.cpp
     nvme_kv/executor_io_uring.cpp

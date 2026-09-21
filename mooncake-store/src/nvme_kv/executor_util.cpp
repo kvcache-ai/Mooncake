@@ -1,4 +1,5 @@
 #include "nvme_kv/executor_util.h"
+#include "nvme_kv/config/executor_config.h"
 #include "nvme_kv/object_layout.h"
 
 #include <algorithm>
@@ -6,14 +7,12 @@
 #include <iomanip>
 #include <limits>
 
-#include "config/u32_parser.h"
+#include "nvme_kv/config/u32_parser.h"
 
 namespace mooncake {
 namespace {
 
 constexpr uint32_t kNvmeStatusCodeMask = 0xFFu;
-constexpr char kNvmeKvTransferAlignmentEnv[] =
-    "MOONCAKE_NVME_KV_TRANSFER_ALIGNMENT_BYTES";
 constexpr uint32_t kNvmeKvStatusCapacityExceeded = 0x81;
 constexpr uint32_t kNvmeKvStatusInvalidValueSize = 0x85;
 constexpr uint32_t kNvmeKvStatusInvalidKeySize = 0x86;
@@ -67,15 +66,14 @@ uint32_t RoundDownToNvmeKvTransferBytes(uint32_t bytes) {
 }
 
 uint32_t NvmeKvTransferAlignmentBytes() {
-    const uint32_t configured = ParseNvmeKvU32EnvOr(
-        kNvmeKvTransferAlignmentEnv, kDefaultNvmeKvTransferAlignmentBytes);
+    const uint32_t configured =
+        NvmeKvExecutorConfig::ReadTransferAlignmentBytesFromEnvironment();
     return configured == 0 ? kDefaultNvmeKvTransferAlignmentBytes : configured;
 }
 
 uint32_t NvmeKvValueBlockUnitBytes() {
     const uint32_t configured =
-        ParseNvmeKvU32EnvOr("MOONCAKE_NVME_KV_VALUE_BLOCK_UNIT_BYTES",
-                            kDefaultNvmeKvValueBlockUnitBytes);
+        NvmeKvExecutorConfig::ReadValueBlockUnitBytesFromEnvironment();
     return configured == 0 ? kDefaultNvmeKvValueBlockUnitBytes : configured;
 }
 
@@ -120,8 +118,7 @@ NvmeKvCommandExecutor::Capabilities BuildNvmeKvCapabilities(
     uint32_t runtime_transfer_limit) {
     NvmeKvCommandExecutor::Capabilities caps;
     const uint32_t protocol_max_value_size =
-        ParseNvmeKvU32EnvOr("MOONCAKE_NVME_KV_PROTOCOL_MAX_VALUE_SIZE",
-                            kDefaultNvmeKvProtocolMaxValueSize);
+        NvmeKvExecutorConfig::ReadProtocolMaxValueSizeFromEnvironment();
     const uint32_t effective_runtime_limit =
         runtime_transfer_limit == 0 ? kDefaultNvmeKvRuntimeTransferLimit
                                     : runtime_transfer_limit;
