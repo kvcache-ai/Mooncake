@@ -14,13 +14,10 @@ jobs:
     uses: ./.github/workflows/_build-efa-wheel.yaml
     with:
       variant: cuda
-      use-cuda: true
-      cuda-version: '12.8.1'
       python-versions: '["3.10", "3.11", "3.12", "3.13"]'
       build-profile: release
       cmake-args: >-
         -DUSE_HTTP=ON -DUSE_ETCD=ON -DWITH_EP=OFF -DSTORE_USE_ETCD=ON
-      variant-flag: EFA_BUILD
       artifact-prefix: mooncake-wheel-efa
 
   publish-release:

@@ -17,6 +17,11 @@ target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags
 add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
 target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest
                                                  gtest_main)
+if(USE_TENT)
+  # Match the compatibility shim public class definition and enable the
+  # MC_USE_TENT regression cases in transport_uint_test.cpp.
+  target_compile_definitions(transport_uint_test PRIVATE USE_TENT)
+endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
 # Hardware-free tests for FlagCX transport range and descriptor validation.
@@ -48,14 +53,21 @@ target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
-# Regression test for the reconnect storm of issue #3299: repeated local
-# completion faults toward one peer RNIC must pause that path instead of
-# re-handshaking it forever. The rail monitor is plain per-worker-pool state, so
-# this runs on every CI runner without an RDMA device.
+# Hardware-free regression tests for peer-rail pausing and the local-WC context
+# breaker. Both are plain per-worker-pool state, so this runs on every CI runner
+# without an RDMA device.
 add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
                                                          gtest_main)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Control GID I/O to exercise recovery while completion failures arrive.
+  target_link_options(
+    worker_pool_rail_state_test
+    PRIVATE
+    "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
+  )
+endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
 # Integration test for the monitorWorker reclaim tick (issue #1845). Self-skips
@@ -138,6 +150,18 @@ if(USE_CXL)
   target_link_libraries(cxl_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME cxl_transport_test COMMAND cxl_transport_test)
+endif()
+
+add_executable(shm_transport_test ${WORKSPACE}/shm_transport_test.cpp)
+target_link_libraries(shm_transport_test PUBLIC transfer_engine gtest
+                                                gtest_main)
+add_test(NAME shm_transport_test COMMAND shm_transport_test)
+
+if(USE_TCP)
+  add_executable(shm_transport_e2e_test ${WORKSPACE}/shm_transport_e2e_test.cpp)
+  target_link_libraries(shm_transport_e2e_test PUBLIC transfer_engine gtest
+                                                      gtest_main)
+  add_test(NAME shm_transport_e2e_test COMMAND shm_transport_e2e_test)
 endif()
 
 if(USE_NVMEOF)
@@ -394,6 +418,12 @@ target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
                                                              gtest gtest_main)
 add_test(NAME rdma_transport_submit_task_test
          COMMAND rdma_transport_submit_task_test)
+
+add_executable(rdma_buffer_range_index_test
+               ${WORKSPACE}/rdma_buffer_range_index_test.cpp)
+target_link_libraries(rdma_buffer_range_index_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+add_test(NAME rdma_buffer_range_index_test COMMAND rdma_buffer_range_index_test)
 
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)

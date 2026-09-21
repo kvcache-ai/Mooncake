@@ -49,26 +49,6 @@ If the current leader fails or becomes partitioned from the network, the remaini
 
 In both modes, the leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
 
-(client-c-api)=
-## Client C++ API
-
-The `Client` class provides the primary interface for Mooncake Store operations:
-
-| API | Description |
-|-----|-------------|
-| `Init` | Initialize the client with metadata server, protocol, and master address |
-| `Get` | Retrieve object data into pre-registered local memory slices |
-| `Put` | Store object data with configurable replication and persistence |
-| `Upsert` / `BatchUpsert` | Insert or update with existing placement reuse |
-| `Remove` | Delete an object and all its replicas |
-| `CreateCopyTask` / `CreateMoveTask` | Asynchronous cross-node data transfer |
-| `QueryTask` | Monitor the status of async copy/move tasks |
-| `BatchQueryIp` | Discover network locations of storage nodes |
-| `BatchReplicaClear` | Batch clear replicas on specific segments |
-| `QueryByRegex` / `RemoveByRegex` | Query or delete objects matching a regex |
-
-For full API signatures, parameter details, and usage examples, see the [Mooncake Store C++ API Reference](../../api-reference/cpp/mooncake-store.md).
-
 ## Master Service
 
 The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication
@@ -109,249 +89,6 @@ Effective quota is recomputed from the current registered memory capacity:
 Admin policy changes are persisted before the final in-memory policy is applied. `PUT` writes the connector first and then applies the policy in memory. `DELETE` first marks the tenant unregistered in memory to block concurrent writes, verifies the tenant is empty, writes the connector, and rolls back the in-memory mark if the connector write fails.
 
 Snapshots restore object runtime state only. Tenant quota policy is always loaded from the connector after metadata restore, then usage and effective quota are rebuilt from restored metadata and current registered capacity. If the connector cannot be loaded in strict multi-tenant mode, startup fails.
-
-### Master Service APIs
-
-The protobuf definition between Master and Client is as follows:
-
-```protobuf
-message BufHandle {
-  required uint64 segment_name = 1;  // Storage segment name (can be simply understood as the name of the storage node)
-  required uint64 size = 2;          // Size of the allocated space
-  required uint64 buffer = 3;        // Pointer to the allocated space
-
-  enum BufStatus {
-    INIT = 0;          // Initial state, space reserved but not used
-    COMPLETE = 1;      // Completed usage, space contains valid data
-    FAILED = 2;        // Usage failed, upstream should update the handle state to this value
-    UNREGISTERED = 3;  // Space has been unregistered, metadata deleted
-  }
-  required BufStatus status = 4 [default = INIT]; // Space status
-};
-
-message ReplicaInfo {
-  repeated BufHandle handles = 1; // Specific locations of the stored object data
-
-  enum ReplicaStatus {
-    UNDEFINED = 0;   // Uninitialized
-    INITIALIZED = 1; // Space allocated, waiting for write
-    PROCESSING = 2;  // Writing data in progress
-    COMPLETE = 3;    // Write completed, replica available
-    REMOVED = 4;     // Replica has been removed
-    FAILED = 5;      // Replica write failed, consider reallocation
-  }
-  required ReplicaStatus status = 2 [default = UNDEFINED]; // Replica status
-};
-
-service MasterService {
-  // Get the list of replicas for an object
-  rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
-
-  // Get replica lists for objects matching a regex
-  rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
-
-  // Batch query IP addresses for multiple client IDs
-  rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
-
-  // Batch clear replicas for multiple object keys
-  rpc BatchReplicaClear(BatchReplicaClearRequest) returns (BatchReplicaClearResponse);
-
-  // Start Put operation, allocate storage space
-  rpc PutStart(PutStartRequest) returns (PutStartResponse);
-
-  // End Put operation, mark object write completion
-  rpc PutEnd(PutEndRequest) returns (PutEndResponse);
-
-  // Delete all replicas of an object
-  rpc Remove(RemoveRequest) returns (RemoveResponse);
-
-  // Remove objects matching a regex
-  rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
-
-  // Storage node (Client) registers a storage segment
-  rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
-
-  // Storage node (Client) unregisters a storage segment
-  rpc UnmountSegment(UnmountSegmentRequest) returns (UnmountSegmentResponse);
-}
-```
-
-1. GetReplicaList
-
-```protobuf
-message GetReplicaListRequest {
-  required string key = 1;
-};
-
-message GetReplicaListResponse {
-  required int32 status_code = 1;
-  repeated ReplicaInfo replica_list = 2; // List of replica information
-};
-```
-
-- **Request**: `GetReplicaListRequest` containing the key to query.
-- **Response**: `GetReplicaListResponse` containing the status code status_code and the list of replica information `replica_list`.
-- **Description**: Used to retrieve information about all available replicas for a specified key. The Client can select an appropriate replica for reading based on this information.
-
-2. GetReplicaListByRegex
-
-```protobuf
-message GetReplicaListByRegexRequest {
-  required string key_regex = 1;
-};
-
-message ObjectReplicaList {
-  repeated ReplicaInfo replica_list = 1;
-};
-
-message GetReplicaListByRegexResponse {
-  required int32 status_code = 1;
-  map<string, ObjectReplicaList> object_map = 2; // Matched objects and their replica information.
-};
-```
-
-- **Request**: GetReplicaListByRegexRequest, which contains the regular expression key_regex to be matched.
-- **Response**: GetReplicaListByRegexResponse, which contains a status_code and an object_map. The keys of this map are the successfully matched object keys, and the values are the lists of replica information for each key.
-- **Description**: Used to query for all keys and their replica information that match the specified regular expression. This interface facilitates bulk queries and management.
-
-3. BatchQueryIp
-
-```protobuf
-message BatchQueryIpRequest {
-  repeated UUID client_ids = 1; // List of client IDs to query
-};
-
-message BatchQueryIpResponse {
-  required int32 status_code = 1;
-  map<UUID, IPAddressList> client_ip_map = 2; // Map from client ID to their IP address lists
-};
-
-message IPAddressList {
-  repeated string ip_addresses = 1; // List of unique IP addresses
-};
-```
-
-- **Request**: `BatchQueryIpRequest` containing a list of client IDs to query.
-- **Response**: `BatchQueryIpResponse` containing the status code `status_code` and a `client_ip_map`. The keys of this map are the client IDs that have successfully mounted segments, and the values are lists of unique IP addresses extracted from all segments mounted by each client. Client IDs that have no mounted segments or are not found are silently skipped and not included in the result map.
-- **Description**: Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client.
-
-4. BatchReplicaClear
-
-```protobuf
-message BatchReplicaClearRequest {
-  repeated string object_keys = 1; // List of object keys to clear
-  required UUID client_id = 2;     // Client ID that owns the objects
-  optional string segment_name = 3; // Optional segment name. If empty, clears all segments
-};
-
-message BatchReplicaClearResponse {
-  required int32 status_code = 1;
-  repeated string cleared_keys = 2; // List of object keys that were successfully cleared
-};
-```
-
-- **Request**: `BatchReplicaClearRequest` containing a list of object keys to clear, the client ID that owns the objects, and an optional segment name. If `segment_name` is empty, all replicas of the specified objects are cleared (the objects are deleted entirely). If `segment_name` is provided, only replicas located on that specific segment are cleared.
-- **Response**: `BatchReplicaClearResponse` containing the status code `status_code` and a list of `cleared_keys` representing the object keys that were successfully cleared. Only objects that belong to the specified `client_id`, have expired leases, and meet the clearing criteria are included in the result. Objects with active leases, incomplete replicas (when clearing all segments), or belonging to different clients are silently skipped.
-- **Description**: Used to batch clear replicas for multiple object keys belonging to a specific client ID. This interface allows clearing replicas either on a specific segment or across all segments, providing flexible storage resource management capabilities.
-
-5. PutStart
-
-```protobuf
-message PutStartRequest {
-  required string key = 1;             // Object key
-  required int64 value_length = 2;     // Total length of data to be written
-  required ReplicateConfig config = 3; // Replica configuration information
-  repeated uint64 slice_lengths = 4;   // Lengths of each data slice
-};
-
-message PutStartResponse {
-  required int32 status_code = 1;
-  repeated ReplicaInfo replica_list = 2;  // Replica information allocated by the Master Service
-};
-```
-
-- **Request**: `PutStartRequest` containing the key, data length, and replica configuration config.
-- **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
-- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
-
-6. PutEnd
-
-```protobuf
-message PutEndRequest {
-  required string key = 1;
-};
-
-message PutEndResponse {
-  required int32 status_code = 1;
-};
-```
-
-- **Request**: `PutEndRequest` containing the key.
-- **Response**: `PutEndResponse` containing the status code status_code.
-- **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
-
-7. Remove
-
-```protobuf
-message RemoveRequest {
-  required string key = 1;
-};
-
-message RemoveResponse {
-  required int32 status_code = 1;
-};
-```
-
-- **Request**: `RemoveRequest` containing the key of the object to be deleted.
-- **Response**: `RemoveResponse` containing the status code `status_code`.
-- **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
-
-8. RemoveByRegex
-
-```protobuf
-message RemoveByRegexRequest {
-  required string key_regex = 1;
-};
-
-message RemoveByRegexResponse {
-  required int32 status_code = 1;
-  optional int64 removed_count = 2; // The number of objects removed.
-};
-```
-
-- **Request**: RemoveByRegexRequest, which contains the regular expression key_regex to be matched.
-- **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
-- **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
-
-9. MountSegment
-
-```protobuf
-message MountSegmentRequest {
-  required uint64 buffer = 1;       // Starting address of the space
-  required uint64 size = 2;         // Size of the space
-  required string segment_name = 3; // Storage segment name
-}
-
-message MountSegmentResponse {
-  required int32 status_code = 1;
-};
-```
-
-The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
-
-10. UnmountSegment
-
-```protobuf
-message UnmountSegmentRequest {
-  required string segment_name = 1;  // Storage segment name used during mounting
-}
-
-message UnMountSegmentResponse {
-  required int32 status_code = 1;
-};
-```
-
-When the space needs to be released, this interface is used to remove the previously mounted resources from the Master Service.
 
 ### Object Information Maintenance
 
@@ -713,8 +450,6 @@ Replica space allocated during a `PutStart` is considered releasable by the Mast
 
 Mooncake Store provides a **preferred segment allocation** feature that allows users to specify a preferred storage segment (node) for object allocation. This feature is particularly useful for optimizing data locality and reducing network overhead in distributed scenarios.
 
-### How It Works
-
 The preferred segment allocation feature is implemented through the
 `AllocationStrategy` system. The following excerpt shows the legacy
 single-segment field and the memory-replica count used by this path; other
@@ -786,10 +521,22 @@ finalized. Removal, revocation, replacement, and allocator eviction release
 the range, with a configurable deferred-free interval preventing immediate
 offset reuse.
 
+The shard set can grow online through the master admin API. Expansion prepares
+new shard files and allocator state, then atomically publishes the complete
+ready set; existing shard paths and ranges remain unchanged. Allocation tries
+the hash-selected shard first and falls back to other ready shards, so added
+capacity can relieve full shards. Startup discovers the existing contiguous
+layout to retain the expanded capacity; it does not recover allocation or key
+metadata.
+
 The client owns the DFS data plane. `DistributedStorageBackend` validates the
 descriptor and delegates positional I/O to either `PosixFsAdapter` or
 `Hf3fsAdapter`. The master and clients must use the same DFS root and shard
 layout so that a descriptor identifies the same physical file everywhere.
+Clients do not open or create shard files during initialization. They open a
+shard only when first using its published descriptor, validating the path,
+shard index, and file capacity before caching the file handle. This prevents
+clients from retaining files that an unsuccessful expansion rolls back.
 
 For a write, the client first completes the requested memory and NoF transfers,
 then writes the DFS replica. `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`
@@ -850,10 +597,6 @@ Note that the HTTP metadata server is designed for single-node deployments and d
 
 For detailed guidance on monitoring master metrics, Prometheus endpoints, and health checks, see the [Observability guide](../../getting_started/observability.md).
 
-## Mooncake Store Python API
-
-**Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html)
-
 ## Version Management Policy
 
 The current version of Mooncake Store is defined in [`CMakeLists.txt`](gh-file:mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
@@ -864,6 +607,258 @@ When to bump the version:
 * **Minor version (0.X.0)**: For new features, API additions, or notable improvements that maintain backward compatibility
 * **Patch version (0.0.X)**: For bug fixes, performance optimizations, or minor improvements that don't affect the API
 
+## Mooncake Store API
+
+Mooncake Store can be accessed through Python, C++, HTTP, and Master RPC APIs.
+
+For Python, C++, and HTTP API signatures, parameter details, and usage examples, see:
+
+- [Mooncake Store Python API](../../api-reference/python/mooncake-store.md)
+- [Mooncake Store C++ API Reference](../../api-reference/cpp/mooncake-store.md)
+- [Mooncake Store HTTP Service](../../api-reference/http/http-service.md)
+
+### Master Service APIs
+
+The protobuf definition between Master and Client is as follows:
+
+```protobuf
+message BufHandle {
+  required uint64 segment_name = 1;  // Storage segment name (can be simply understood as the name of the storage node)
+  required uint64 size = 2;          // Size of the allocated space
+  required uint64 buffer = 3;        // Pointer to the allocated space
+
+  enum BufStatus {
+    INIT = 0;          // Initial state, space reserved but not used
+    COMPLETE = 1;      // Completed usage, space contains valid data
+    FAILED = 2;        // Usage failed, upstream should update the handle state to this value
+    UNREGISTERED = 3;  // Space has been unregistered, metadata deleted
+  }
+  required BufStatus status = 4 [default = INIT]; // Space status
+};
+
+message ReplicaInfo {
+  repeated BufHandle handles = 1; // Specific locations of the stored object data
+
+  enum ReplicaStatus {
+    UNDEFINED = 0;   // Uninitialized
+    INITIALIZED = 1; // Space allocated, waiting for write
+    PROCESSING = 2;  // Writing data in progress
+    COMPLETE = 3;    // Write completed, replica available
+    REMOVED = 4;     // Replica has been removed
+    FAILED = 5;      // Replica write failed, consider reallocation
+  }
+  required ReplicaStatus status = 2 [default = UNDEFINED]; // Replica status
+};
+
+service MasterService {
+  // Get the list of replicas for an object
+  rpc GetReplicaList(GetReplicaListRequest) returns (GetReplicaListResponse);
+
+  // Get replica lists for objects matching a regex
+  rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
+
+  // Batch query IP addresses for multiple client IDs
+  rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
+
+  // Batch clear replicas for multiple object keys
+  rpc BatchReplicaClear(BatchReplicaClearRequest) returns (BatchReplicaClearResponse);
+
+  // Start Put operation, allocate storage space
+  rpc PutStart(PutStartRequest) returns (PutStartResponse);
+
+  // End Put operation, mark object write completion
+  rpc PutEnd(PutEndRequest) returns (PutEndResponse);
+
+  // Delete all replicas of an object
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Remove objects matching a regex
+  rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
+
+  // Storage node (Client) registers a storage segment
+  rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
+
+  // Storage node (Client) unregisters a storage segment
+  rpc UnmountSegment(UnmountSegmentRequest) returns (UnmountSegmentResponse);
+}
+```
+
+1. GetReplicaList
+
+```protobuf
+message GetReplicaListRequest {
+  required string key = 1;
+};
+
+message GetReplicaListResponse {
+  required int32 status_code = 1;
+  repeated ReplicaInfo replica_list = 2; // List of replica information
+};
+```
+
+- **Request**: `GetReplicaListRequest` containing the key to query.
+- **Response**: `GetReplicaListResponse` containing the status code status_code and the list of replica information `replica_list`.
+- **Description**: Used to retrieve information about all available replicas for a specified key. The Client can select an appropriate replica for reading based on this information.
+
+2. GetReplicaListByRegex
+
+```protobuf
+message GetReplicaListByRegexRequest {
+  required string key_regex = 1;
+};
+
+message ObjectReplicaList {
+  repeated ReplicaInfo replica_list = 1;
+};
+
+message GetReplicaListByRegexResponse {
+  required int32 status_code = 1;
+  map<string, ObjectReplicaList> object_map = 2; // Matched objects and their replica information.
+};
+```
+
+- **Request**: GetReplicaListByRegexRequest, which contains the regular expression key_regex to be matched.
+- **Response**: GetReplicaListByRegexResponse, which contains a status_code and an object_map. The keys of this map are the successfully matched object keys, and the values are the lists of replica information for each key.
+- **Description**: Used to query for all keys and their replica information that match the specified regular expression. This interface facilitates bulk queries and management.
+
+3. BatchQueryIp
+
+```protobuf
+message BatchQueryIpRequest {
+  repeated UUID client_ids = 1; // List of client IDs to query
+};
+
+message BatchQueryIpResponse {
+  required int32 status_code = 1;
+  map<UUID, IPAddressList> client_ip_map = 2; // Map from client ID to their IP address lists
+};
+
+message IPAddressList {
+  repeated string ip_addresses = 1; // List of unique IP addresses
+};
+```
+
+- **Request**: `BatchQueryIpRequest` containing a list of client IDs to query.
+- **Response**: `BatchQueryIpResponse` containing the status code `status_code` and a `client_ip_map`. The keys of this map are the client IDs that have successfully mounted segments, and the values are lists of unique IP addresses extracted from all segments mounted by each client. Client IDs that have no mounted segments or are not found are silently skipped and not included in the result map.
+- **Description**: Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client.
+
+4. BatchReplicaClear
+
+```protobuf
+message BatchReplicaClearRequest {
+  repeated string object_keys = 1; // List of object keys to clear
+  required UUID client_id = 2;     // Client ID that owns the objects
+  optional string segment_name = 3; // Optional segment name. If empty, clears all segments
+};
+
+message BatchReplicaClearResponse {
+  required int32 status_code = 1;
+  repeated string cleared_keys = 2; // List of object keys that were successfully cleared
+};
+```
+
+- **Request**: `BatchReplicaClearRequest` containing a list of object keys to clear, the client ID that owns the objects, and an optional segment name. If `segment_name` is empty, all replicas of the specified objects are cleared (the objects are deleted entirely). If `segment_name` is provided, only replicas located on that specific segment are cleared.
+- **Response**: `BatchReplicaClearResponse` containing the status code `status_code` and a list of `cleared_keys` representing the object keys that were successfully cleared. Only objects that belong to the specified `client_id`, have expired leases, and meet the clearing criteria are included in the result. Objects with active leases, incomplete replicas (when clearing all segments), or belonging to different clients are silently skipped.
+- **Description**: Used to batch clear replicas for multiple object keys belonging to a specific client ID. This interface allows clearing replicas either on a specific segment or across all segments, providing flexible storage resource management capabilities.
+
+5. PutStart
+
+```protobuf
+message PutStartRequest {
+  required string key = 1;             // Object key
+  required int64 value_length = 2;     // Total length of data to be written
+  required ReplicateConfig config = 3; // Replica configuration information
+  repeated uint64 slice_lengths = 4;   // Lengths of each data slice
+};
+
+message PutStartResponse {
+  required int32 status_code = 1;
+  repeated ReplicaInfo replica_list = 2;  // Replica information allocated by the Master Service
+};
+```
+
+- **Request**: `PutStartRequest` containing the key, data length, and replica configuration config.
+- **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
+- **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
+
+6. PutEnd
+
+```protobuf
+message PutEndRequest {
+  required string key = 1;
+};
+
+message PutEndResponse {
+  required int32 status_code = 1;
+};
+```
+
+- **Request**: `PutEndRequest` containing the key.
+- **Response**: `PutEndResponse` containing the status code status_code.
+- **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
+
+7. Remove
+
+```protobuf
+message RemoveRequest {
+  required string key = 1;
+};
+
+message RemoveResponse {
+  required int32 status_code = 1;
+};
+```
+
+- **Request**: `RemoveRequest` containing the key of the object to be deleted.
+- **Response**: `RemoveResponse` containing the status code `status_code`.
+- **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
+
+8. RemoveByRegex
+
+```protobuf
+message RemoveByRegexRequest {
+  required string key_regex = 1;
+};
+
+message RemoveByRegexResponse {
+  required int32 status_code = 1;
+  optional int64 removed_count = 2; // The number of objects removed.
+};
+```
+
+- **Request**: RemoveByRegexRequest, which contains the regular expression key_regex to be matched.
+- **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
+- **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
+
+9. MountSegment
+
+```protobuf
+message MountSegmentRequest {
+  required uint64 buffer = 1;       // Starting address of the space
+  required uint64 size = 2;         // Size of the space
+  required string segment_name = 3; // Storage segment name
+}
+
+message MountSegmentResponse {
+  required int32 status_code = 1;
+};
+```
+
+The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
+
+10. UnmountSegment
+
+```protobuf
+message UnmountSegmentRequest {
+  required string segment_name = 1;  // Storage segment name used during mounting
+}
+
+message UnMountSegmentResponse {
+  required int32 status_code = 1;
+};
+```
+
+When the space needs to be released, this interface is used to remove the previously mounted resources from the Master Service.
 
 ---
 
@@ -872,8 +867,8 @@ When to bump the version:
 :maxdepth: 1
 
 ssd-offload
-unified-parallel-tensor-io
 ssd-free-ratio-first-allocation
+nvme-kv-backend
 engram
 
 :::

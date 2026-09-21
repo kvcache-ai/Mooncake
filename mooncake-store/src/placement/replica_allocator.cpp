@@ -1,6 +1,7 @@
 #include "placement/replica_allocator.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 #include "local_ssd/manager.h"
 #include "placement/index.h"
@@ -12,45 +13,53 @@ namespace {
 constexpr size_t kMaxRetryLimit = 100;
 constexpr size_t kCandidateMultiplier = 6;
 
-struct Candidate final {
-    const PlacementGroup* group;
+struct ScoredPlacementEntry final {
+    const PlacementIndex::Entry* entry;
     double score;
 };
 
-class GroupList final {
+class EntryList final {
    public:
-    void Clear() { groups_.clear(); }
+    void Clear() {
+        entries_.clear();
+        members_.clear();
+    }
 
-    void Add(const PlacementGroup* group) {
-        if (group && !Contains(group)) {
-            groups_.push_back(group);
+    void Add(const PlacementIndex::Entry* entry) {
+        if (entry && members_.insert(entry).second) {
+            entries_.push_back(entry);
         }
     }
 
-    bool Contains(const PlacementGroup* group) const {
-        return std::find(groups_.begin(), groups_.end(), group) !=
-               groups_.end();
+    bool Contains(const PlacementIndex::Entry* entry) const {
+        return members_.contains(entry);
     }
 
-    bool empty() const noexcept { return groups_.empty(); }
-    const PlacementGroup* front() const { return groups_.front(); }
-    auto begin() const noexcept { return groups_.begin(); }
-    auto end() const noexcept { return groups_.end(); }
+    bool empty() const noexcept { return entries_.empty(); }
+    const PlacementIndex::Entry* front() const { return entries_.front(); }
+    auto begin() const noexcept { return entries_.begin(); }
+    auto end() const noexcept { return entries_.end(); }
 
    private:
-    std::vector<const PlacementGroup*> groups_;
+    // Preserve preference order; the set is only for membership queries.
+    std::vector<const PlacementIndex::Entry*> entries_;
+    std::unordered_set<const PlacementIndex::Entry*> members_;
 };
 
 struct PlacementScratch final {
-    GroupList preferred;
-    GroupList excluded;
-    GroupList used;
-    std::vector<Candidate> candidates;
+    EntryList preferred;
+    std::unordered_set<const PlacementIndex::Entry*> excluded;
+    std::vector<const PlacementIndex::Entry*> used;
+    std::vector<ScoredPlacementEntry> candidates;
+
+    bool HasUsed(const PlacementIndex::Entry* entry) const {
+        return std::find(used.begin(), used.end(), entry) != used.end();
+    }
 
     void Clear() {
         preferred.Clear();
-        excluded.Clear();
-        used.Clear();
+        excluded.clear();
+        used.clear();
         candidates.clear();
     }
 };
@@ -61,31 +70,32 @@ PlacementScratch& GetPlacementScratch() {
     return scratch;
 }
 
-std::unique_ptr<AllocatedBuffer> TryAllocateFromGroup(
-    const PlacementGroup* group, size_t size) {
-    if (!group || group->targets.empty()) {
+std::unique_ptr<AllocatedBuffer> TryAllocateFromEntry(
+    const PlacementIndex::Entry* entry, size_t size) {
+    if (!entry || entry->candidates.empty()) {
         return nullptr;
     }
-    if (group->targets.size() == 1) {
-        return group->targets.front()->Allocate(size);
+    if (entry->candidates.size() == 1) {
+        return (*entry->candidates.begin())->Allocate(size);
     }
 
-    size_t index = randomIndex(group->targets.size());
-    for (size_t i = 0; i < group->targets.size(); ++i) {
-        if (auto buffer = group->targets[index]->Allocate(size)) [[likely]] {
+    size_t index = randomIndex(entry->candidates.size());
+    for (size_t i = 0; i < entry->candidates.size(); ++i) {
+        if (auto buffer = (*entry->candidates.nth(index))->Allocate(size))
+            [[likely]] {
             return buffer;
         }
-        if (++index == group->targets.size()) {
+        if (++index == entry->candidates.size()) {
             index = 0;
         }
     }
     return nullptr;
 }
 
-double GetFreeRatio(const PlacementGroup& group) {
+double GetFreeRatio(const PlacementIndex::Entry& entry) {
     uint64_t total_capacity = 0;
     uint64_t total_free = 0;
-    for (const auto* target : group.targets) {
+    for (const auto* target : entry.candidates) {
         const uint64_t capacity = target->Capacity();
         const uint64_t used = target->Used();
         total_capacity += capacity;
@@ -103,8 +113,8 @@ struct RandomRanker final {
 struct FreeRatioRanker final {
     static constexpr bool kRanked = true;
 
-    double Score(const PlacementGroup* group) const {
-        return GetFreeRatio(*group);
+    double Score(const PlacementIndex::Entry* entry) const {
+        return GetFreeRatio(*entry);
     }
 };
 
@@ -114,8 +124,8 @@ struct SsdFreeRatioRanker final {
     const ScopedPlacementReadAccess& placement;
     const LocalSSDMetricsView& metrics;
 
-    double Score(const PlacementGroup* group) const {
-        auto owner = placement.GetOwnerClientId(group->name);
+    double Score(const PlacementIndex::Entry* entry) const {
+        auto owner = placement.GetOwnerClientId(entry->segment_name);
         if (!owner) {
             return 1.0;
         }
@@ -124,35 +134,33 @@ struct SsdFreeRatioRanker final {
 };
 
 bool HasExplicitPreference(const PlacementConstraints& constraints) {
-    return !constraints.preferred_group.empty() ||
-           !constraints.preferred_groups.empty();
+    return !constraints.preferred_segment_name.empty() ||
+           !constraints.preferred_segment_names.empty();
 }
 
-void ResolveGroups(const PlacementIndex& index,
-                   const PlacementConstraints& constraints,
-                   PlacementTargetKind target_kind,
-                   std::span<const PlacementGroup* const> affinity_groups,
-                   PlacementScratch& scratch) {
-    for (const auto& excluded : constraints.excluded_groups) {
-        scratch.excluded.Add(index.Find(excluded, target_kind));
-    }
-
-    if (!constraints.preferred_group.empty()) {
-        scratch.preferred.Add(
-            index.Find(constraints.preferred_group, target_kind));
-    } else {
-        for (const auto& preferred : constraints.preferred_groups) {
-            scratch.preferred.Add(index.Find(preferred, target_kind));
+void ResolveEntries(const PlacementIndex& index,
+                    const PlacementConstraints& constraints,
+                    AllocationCandidateKind target_kind,
+                    PlacementScratch& scratch) {
+    for (const auto& excluded : constraints.excluded_segment_names) {
+        if (const auto* entry = index.Find(excluded, target_kind)) {
+            scratch.excluded.insert(entry);
         }
     }
-    for (const auto* group : affinity_groups) {
-        scratch.preferred.Add(group);
+
+    if (!constraints.preferred_segment_name.empty()) {
+        scratch.preferred.Add(
+            index.Find(constraints.preferred_segment_name, target_kind));
+    } else {
+        for (const auto& preferred : constraints.preferred_segment_names) {
+            scratch.preferred.Add(index.Find(preferred, target_kind));
+        }
     }
 }
 
 tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
     const PlacementIndex& index, const ReplicaAllocationRequest& request,
-    PlacementTargetKind required_kind, PlacementScratch& scratch) {
+    AllocationCandidateKind required_kind, PlacementScratch& scratch) {
     const auto& replicas = request.replicas;
     if (replicas.size == 0 || replicas.count == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -160,18 +168,18 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
     if (!HasExplicitPreference(request.placement)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (index.empty(required_kind)) {
+    if (index.active_entries(required_kind).empty()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
     if (scratch.preferred.empty()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
-    const auto* group = scratch.preferred.front();
-    if (scratch.excluded.Contains(group)) {
+    const auto* entry = scratch.preferred.front();
+    if (scratch.excluded.contains(entry)) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
-    auto buffer = TryAllocateFromGroup(group, replicas.size);
+    auto buffer = TryAllocateFromEntry(entry, replicas.size);
     if (!buffer) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
@@ -183,27 +191,27 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
     return result;
 }
 
-bool TryAddReplica(const PlacementGroup* group,
+bool TryAddReplica(const PlacementIndex::Entry* entry,
                    const ReplicaRequirements& requirements,
                    PlacementScratch& scratch, std::vector<Replica>& result) {
-    auto buffer = TryAllocateFromGroup(group, requirements.size);
+    auto buffer = TryAllocateFromEntry(entry, requirements.size);
     if (!buffer) {
         return false;
     }
     result.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING,
                         requirements.type);
-    scratch.used.Add(group);
+    scratch.used.push_back(entry);
     return true;
 }
 
-void AllocatePreferredGroups(const ReplicaRequirements& requirements,
-                             PlacementScratch& scratch,
-                             std::vector<Replica>& result) {
-    for (const auto* group : scratch.preferred) {
-        if (scratch.excluded.Contains(group) || scratch.used.Contains(group)) {
+void AllocatePreferredEntries(const ReplicaRequirements& requirements,
+                              PlacementScratch& scratch,
+                              std::vector<Replica>& result) {
+    for (const auto* entry : scratch.preferred) {
+        if (scratch.excluded.contains(entry) || scratch.HasUsed(entry)) {
             continue;
         }
-        if (TryAddReplica(group, requirements, scratch, result) &&
+        if (TryAddReplica(entry, requirements, scratch, result) &&
             result.size() == requirements.count) {
             return;
         }
@@ -211,91 +219,111 @@ void AllocatePreferredGroups(const ReplicaRequirements& requirements,
 }
 
 template <typename Ranker>
-void AllocateRankedGroups(std::span<const PlacementGroup* const> active_groups,
-                          const ReplicaRequirements& requirements,
-                          const Ranker& ranker, PlacementScratch& scratch,
-                          std::vector<Replica>& result) {
+void AllocateRankedEntries(
+    std::span<const PlacementIndex::Entry* const> active_entries,
+    const ReplicaRequirements& requirements, const Ranker& ranker,
+    PlacementScratch& scratch, std::vector<Replica>& result) {
     const size_t remaining = requirements.count - result.size();
     const size_t sample_count =
-        std::min(active_groups.size(), kCandidateMultiplier * remaining);
-    const size_t start = randomIndex(active_groups.size());
+        std::min(active_entries.size(), kCandidateMultiplier * remaining);
+    const size_t start = randomIndex(active_entries.size());
     scratch.candidates.reserve(sample_count);
     for (size_t i = 0; i < sample_count; ++i) {
-        const auto* group = active_groups[(start + i) % active_groups.size()];
-        if (scratch.excluded.Contains(group) || scratch.used.Contains(group)) {
+        const auto* entry = active_entries[(start + i) % active_entries.size()];
+        if (scratch.excluded.contains(entry) || scratch.HasUsed(entry)) {
             continue;
         }
-        scratch.candidates.push_back({group, ranker.Score(group)});
+        scratch.candidates.push_back({entry, ranker.Score(entry)});
     }
-    std::sort(scratch.candidates.begin(), scratch.candidates.end(),
-              [](const Candidate& lhs, const Candidate& rhs) {
-                  return lhs.score > rhs.score;
-              });
+    std::sort(
+        scratch.candidates.begin(), scratch.candidates.end(),
+        [](const ScoredPlacementEntry& lhs, const ScoredPlacementEntry& rhs) {
+            return lhs.score > rhs.score;
+        });
     for (const auto& candidate : scratch.candidates) {
-        if (TryAddReplica(candidate.group, requirements, scratch, result) &&
+        if (TryAddReplica(candidate.entry, requirements, scratch, result) &&
             result.size() == requirements.count) {
             return;
         }
     }
 }
 
-void AllocateFallbackGroups(
-    std::span<const PlacementGroup* const> active_groups,
+void AllocateFallbackEntries(
+    std::span<const PlacementIndex::Entry* const> active_entries,
     const ReplicaRequirements& requirements, PlacementScratch& scratch,
     std::vector<Replica>& result) {
-    size_t index_offset = randomIndex(active_groups.size());
-    const size_t max_retry = std::min(kMaxRetryLimit, active_groups.size());
+    size_t index_offset = randomIndex(active_entries.size());
+    const size_t max_retry = std::min(kMaxRetryLimit, active_entries.size());
     for (size_t attempt = 0;
          attempt < max_retry && result.size() < requirements.count;
          ++attempt, ++index_offset) {
-        const auto* group = active_groups[index_offset % active_groups.size()];
-        if (scratch.excluded.Contains(group) || scratch.used.Contains(group)) {
+        const auto* entry =
+            active_entries[index_offset % active_entries.size()];
+        if (scratch.excluded.contains(entry) || scratch.HasUsed(entry)) {
             continue;
         }
-        TryAddReplica(group, requirements, scratch, result);
+        TryAddReplica(entry, requirements, scratch, result);
     }
 }
 
 template <typename Ranker>
 tl::expected<std::vector<Replica>, ErrorCode> AllocateWithRanker(
-    const PlacementIndex& index, const ReplicaAllocationRequest& request,
-    PlacementTargetKind target_kind, PlacementScratch& scratch,
-    [[maybe_unused]] const Ranker& ranker) {
+    ScopedPlacementReadAccess& placement,
+    const ReplicaAllocationRequest& request,
+    AllocationCandidateKind target_kind, PlacementScratch& scratch,
+    [[maybe_unused]] const Ranker& ranker, bool use_host_affinity) {
+    const auto& index = placement.GetView();
     const auto& requirements = request.replicas;
     if (requirements.size == 0 || requirements.count == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (index.empty(target_kind)) {
+    const auto active_entries = index.active_entries(target_kind);
+    if (active_entries.empty()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
-    const auto active_groups = index.active_groups(target_kind);
     std::vector<Replica> result;
-    result.reserve(std::min(requirements.count, active_groups.size()));
+    result.reserve(std::min(requirements.count, active_entries.size()));
 
-    if (active_groups.size() == 1) {
-        const auto* group = active_groups.front();
-        if (scratch.excluded.Contains(group) ||
-            !TryAddReplica(group, requirements, scratch, result)) {
+    if (active_entries.size() == 1) {
+        const auto* entry = active_entries.front();
+        if (scratch.excluded.contains(entry) ||
+            !TryAddReplica(entry, requirements, scratch, result)) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         return result;
     }
 
-    AllocatePreferredGroups(requirements, scratch, result);
+    AllocatePreferredEntries(requirements, scratch, result);
     if (result.size() == requirements.count) {
         return result;
     }
 
+    if (use_host_affinity && !request.host_affinity.writer_host_id.empty()) {
+        auto visit = [&](std::string_view name) {
+            const auto* entry = index.Find(name, target_kind);
+            if (!entry || scratch.preferred.Contains(entry) ||
+                scratch.excluded.contains(entry) || scratch.HasUsed(entry)) {
+                return false;
+            }
+            return TryAddReplica(entry, requirements, scratch, result) &&
+                   result.size() == requirements.count;
+        };
+        index.VisitHostOrderedSegmentNames(request.host_affinity.writer_host_id,
+                                           request.host_affinity.object_key,
+                                           std::ref(visit));
+        if (result.size() == requirements.count) return result;
+    }
+
     if constexpr (Ranker::kRanked) {
-        AllocateRankedGroups(active_groups, requirements, ranker, scratch,
-                             result);
+        AllocateRankedEntries(active_entries, requirements, ranker, scratch,
+                              result);
         if (result.size() == requirements.count) {
             return result;
         }
     }
 
-    AllocateFallbackGroups(active_groups, requirements, scratch, result);
+    AllocateFallbackEntries(active_entries, requirements, scratch, result);
     if (result.empty()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
@@ -304,11 +332,11 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateWithRanker(
 
 void UpdateDiagnostics(const PlacementIndex& index,
                        const ReplicaAllocationRequest& request,
-                       PlacementTargetKind target_kind,
+                       AllocationCandidateKind target_kind,
                        PlacementDiagnostics* diagnostics) {
     if (diagnostics) {
-        diagnostics->has_sufficient_active_group_count =
-            index.size(target_kind) >= request.replicas.count;
+        diagnostics->has_sufficient_active_entry_count =
+            index.active_entries(target_kind).size() >= request.replicas.count;
     }
 }
 
@@ -317,49 +345,40 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateUsingRanker(
     ScopedPlacementReadAccess& placement,
     const ReplicaAllocationRequest& request, PlacementDiagnostics* diagnostics,
     const Ranker& ranker, bool use_host_affinity) {
-    constexpr auto kTargetKind = PlacementTargetKind::NATIVE;
+    constexpr auto kTargetKind = AllocationCandidateKind::NATIVE;
     const auto& index = placement.GetView();
     UpdateDiagnostics(index, request, kTargetKind, diagnostics);
 
-    std::span<const PlacementGroup* const> affinity_groups;
-    if (use_host_affinity && !request.host_affinity.writer_host_id.empty()) {
-        thread_local std::vector<const PlacementGroup*> affinity_scratch;
-        placement.GetHostOrderedGroups(request.host_affinity.writer_host_id,
-                                       request.host_affinity.object_key,
-                                       kTargetKind, affinity_scratch);
-        affinity_groups = affinity_scratch;
-    }
-
     auto& scratch = GetPlacementScratch();
-    ResolveGroups(index, request.placement, kTargetKind, affinity_groups,
-                  scratch);
-    return AllocateWithRanker(index, request, kTargetKind, scratch, ranker);
+    ResolveEntries(index, request.placement, kTargetKind, scratch);
+    return AllocateWithRanker(placement, request, kTargetKind, scratch, ranker,
+                              use_host_affinity);
 }
 
 tl::expected<std::vector<Replica>, ErrorCode> AllocateUsingPreferences(
     ScopedPlacementReadAccess& placement,
     const ReplicaAllocationRequest& request, PlacementDiagnostics* diagnostics,
-    PlacementTargetKind required_kind) {
+    AllocationCandidateKind required_kind) {
     const auto& index = placement.GetView();
     UpdateDiagnostics(index, request, required_kind, diagnostics);
 
     auto& scratch = GetPlacementScratch();
-    ResolveGroups(index, request.placement, required_kind, {}, scratch);
+    ResolveEntries(index, request.placement, required_kind, scratch);
     return AllocatePreferredOnly(index, request, required_kind, scratch);
 }
 
-tl::expected<Replica, ErrorCode> AllocateFromNamedGroup(
+tl::expected<Replica, ErrorCode> AllocateFromNamedEntry(
     ScopedPlacementReadAccess& placement, size_t size,
-    std::string_view group_name, ReplicaType replica_type) {
-    if (size == 0) {
+    std::string_view segment_name, ReplicaType replica_type,
+    AllocationCandidateKind kind) {
+    if (size == 0 || segment_name.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const auto* group =
-        placement.GetView().Find(group_name, PlacementTargetKind::NATIVE);
-    if (!group) {
+    const auto* entry = placement.GetView().Find(segment_name, kind);
+    if (!entry) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
-    auto buffer = TryAllocateFromGroup(group, size);
+    auto buffer = TryAllocateFromEntry(entry, size);
     if (!buffer) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
@@ -370,7 +389,7 @@ tl::expected<Replica, ErrorCode> AllocateFromNamedGroup(
 
 std::optional<double> LocalSSDMetricsView::GetFreeRatio(
     const UUID& client_id) const {
-    auto usage = local_ssd_->GetUsage(client_id);
+    auto usage = local_ssd_.GetUsage(client_id);
     if (!usage || usage->total_capacity_bytes <= 0) {
         return std::nullopt;
     }
@@ -407,8 +426,17 @@ ReplicaAllocator<Policy>::Allocate(ScopedPlacementReadAccess& placement,
 template <ReplicaPlacementPolicy Policy>
 tl::expected<Replica, ErrorCode> ReplicaAllocator<Policy>::AllocateFrom(
     ScopedPlacementReadAccess& placement, size_t size,
-    std::string_view group_name, ReplicaType replica_type) const {
-    return AllocateFromNamedGroup(placement, size, group_name, replica_type);
+    std::string_view segment_name, ReplicaType replica_type) const {
+    constexpr bool preferred_only =
+        std::same_as<Policy, PreferredOnlyPlacementPolicy>;
+    if constexpr (preferred_only) {
+        return AllocateFromNamedEntry(placement, size, segment_name,
+                                      replica_type, policy_.required_kind);
+    } else {
+        return AllocateFromNamedEntry(placement, size, segment_name,
+                                      replica_type,
+                                      AllocationCandidateKind::NATIVE);
+    }
 }
 
 template class ReplicaAllocator<RandomPlacementPolicy>;

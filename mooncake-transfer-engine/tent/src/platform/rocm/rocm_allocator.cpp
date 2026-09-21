@@ -18,6 +18,7 @@
 #include <hip/hip_runtime.h>
 #include <numa.h>
 #include <glog/logging.h>
+#include <vector>
 
 namespace mooncake {
 namespace tent {
@@ -71,6 +72,57 @@ Status RocmPlatform::copy(void* dst, void* src, size_t length) {
     CHECK_STATUS(getStreamFromPool(stream, device_id));
     CHECK_HIP(hipMemcpyAsync(dst, src, length, hipMemcpyDefault, stream.get()));
     CHECK_HIP(hipStreamSynchronize(stream.get()));
+    return Status::OK();
+}
+
+Status RocmPlatform::synchronizeDevices(const Topology* topology) {
+    const std::vector<int> devices =
+        topologyDeviceIndices(topology, Topology::MEM_ROCM);
+    if (devices.empty()) return Status::OK();
+
+    int device_count = 0;
+    hipError_t err = hipGetDeviceCount(&device_count);
+    if (err != hipSuccess || device_count <= 0) {
+        if (err != hipSuccess) {
+            LOG(WARNING) << "RocmPlatform::synchronizeDevices "
+                            "hipGetDeviceCount failed: "
+                         << hipGetErrorString(err);
+            (void)hipGetLastError();
+        }
+        return Status::OK();
+    }
+
+    int saved = 0;
+    const bool have_saved = hipGetDevice(&saved) == hipSuccess;
+    if (!have_saved) (void)hipGetLastError();
+
+    for (int device : devices) {
+        if (device >= device_count) continue;
+        err = hipSetDevice(device);
+        if (err != hipSuccess) {
+            LOG(WARNING) << "RocmPlatform::synchronizeDevices hipSetDevice("
+                         << device << ") failed: " << hipGetErrorString(err);
+            (void)hipGetLastError();
+            continue;
+        }
+        err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            LOG(WARNING)
+                << "RocmPlatform::synchronizeDevices hipDeviceSynchronize "
+                   "device "
+                << device << " failed: " << hipGetErrorString(err);
+            (void)hipGetLastError();
+        }
+    }
+    if (have_saved) {
+        err = hipSetDevice(saved);
+        if (err != hipSuccess) {
+            LOG(WARNING)
+                << "RocmPlatform::synchronizeDevices restore hipSetDevice("
+                << saved << ") failed: " << hipGetErrorString(err);
+            (void)hipGetLastError();
+        }
+    }
     return Status::OK();
 }
 

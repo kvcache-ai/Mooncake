@@ -9,6 +9,7 @@ from ..._typing import TypeAlias
 from ...contracts import (
     LeaseId,
     ParticipantId,
+    PlacementFragmentId,
     PlacementId,
     ResourceId,
     RevisionId,
@@ -26,7 +27,7 @@ from ..manifest import (
 from ..storage_manifest import (
     StoredFragmentSnapshot,
     StoredManifestIdentity,
-    WeightManifest,
+    StoredWeightManifest,
     validate_weight_manifest_snapshot,
 )
 from . import contracts as _contracts
@@ -43,6 +44,7 @@ from .fragments import BoundWeightFragment
 
 @dataclass(frozen=True)
 class RuntimeFragmentSnapshot:
+    placement_fragment_id: PlacementFragmentId
     fragment_id: RuntimeFragmentId
     tensor_id: TensorId
     global_offset: tuple[int, ...]
@@ -52,6 +54,7 @@ class RuntimeFragmentSnapshot:
     worker_id: str
     endpoint: str
     device: str
+    itemsize: int
     strides_bytes: tuple[int, ...]
     storage_address: int
     storage_nbytes: int
@@ -61,6 +64,7 @@ class RuntimeFragmentSnapshot:
     @classmethod
     def from_fragment(cls, fragment: BoundWeightFragment) -> RuntimeFragmentSnapshot:
         return cls(
+            placement_fragment_id=fragment.placement_fragment_id,
             fragment_id=fragment.fragment_id,
             tensor_id=fragment.tensor_id,
             global_offset=fragment.global_offset,
@@ -70,6 +74,7 @@ class RuntimeFragmentSnapshot:
             worker_id=fragment.worker_id,
             endpoint=fragment.endpoint,
             device=fragment.device,
+            itemsize=fragment.binding.itemsize,
             strides_bytes=fragment.binding.strides_bytes,
             storage_address=fragment.storage_address,
             storage_nbytes=fragment.storage_nbytes,
@@ -86,6 +91,7 @@ class RuntimeFragmentSnapshot:
         lease_generation: int,
     ) -> RuntimeFragmentSnapshot:
         return cls(
+            placement_fragment_id=placement_fragment.placement_fragment_id,
             fragment_id=runtime_fragment.fragment_id,
             tensor_id=placement_fragment.tensor_id,
             global_offset=placement_fragment.global_offset,
@@ -95,6 +101,7 @@ class RuntimeFragmentSnapshot:
             worker_id=runtime_fragment.worker_id,
             endpoint=runtime_fragment.endpoint,
             device=runtime_fragment.device,
+            itemsize=runtime_fragment.itemsize,
             strides_bytes=runtime_fragment.strides_bytes,
             storage_address=runtime_fragment.storage_address,
             storage_nbytes=runtime_fragment.storage_nbytes,
@@ -428,7 +435,7 @@ def _validate_executor_provenance(
 
 def _validated_stored_source_fragment_snapshots(
     operations: tuple[ExecutableTransferOperation, ...],
-    source_manifest: WeightManifest,
+    source_manifest: StoredWeightManifest,
 ) -> tuple[StoredFragmentSnapshot, ...]:
     """Derive selected Store ranges from the committed manifest snapshot."""
 
@@ -461,7 +468,7 @@ class TransferPlan:
     planning_limits: PlanningLimits = field(default_factory=PlanningLimits)
     source_executors: tuple[ExecutorTransferPlan, ...] = ()
     target_executors: tuple[ExecutorTransferPlan, ...] = ()
-    source_manifest: Optional[WeightManifest] = None
+    source_manifest: Optional[StoredWeightManifest] = None
     source_manifest_identity: Optional[StoredManifestIdentity] = None
     source_stored_fragment_snapshots: tuple[StoredFragmentSnapshot, ...] = field(
         init=False
@@ -484,7 +491,7 @@ class TransferPlan:
             raise ValueError("transfer plan source manifest identity is invalid")
         if self.source_manifest is not None and not isinstance(
             self.source_manifest,
-            WeightManifest,
+            StoredWeightManifest,
         ):
             raise ValueError("transfer plan source manifest is invalid")
         if len(self.operations) > self.planning_limits.max_transfer_regions:

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <thread>
 
+#include "common/byte_size.h"
 #include "version.h"
 
 namespace mooncake {
@@ -29,10 +30,13 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       master_client_metric(labels),
       transfer_operation_metric(labels),
       ssd_metric(labels),
+      dfs_metric(labels),
+      allocator_metric(labels),
       build_info("mooncake_build_info",
                  "Build version of the running client; the value is always 1 "
                  "and the version strings are carried by the labels",
                  WithBuildInfoLabels(labels)),
+      master_heartbeat_metric(labels),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds),
       bandwidth_reporting_enabled_(bandwidth_reporting_enabled),
@@ -79,7 +83,11 @@ void ClientMetric::serialize(std::string& str) {
     }
     transfer_operation_metric.serialize(str);
     ssd_metric.serialize(str);
+    dfs_metric.serialize(str);
+    allocator_metric.Refresh();
+    allocator_metric.serialize(str);
     build_info.serialize(str);
+    master_heartbeat_metric.serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {
@@ -98,6 +106,11 @@ std::string ClientMetric::summary_metrics() {
     ss << transfer_operation_metric.summary_metrics();
     ss << "\n";
     ss << ssd_metric.summary_metrics();
+    ss << "\n";
+    ss << dfs_metric.summary_metrics();
+    ss << "\n";
+    allocator_metric.Refresh();
+    ss << allocator_metric.summary_metrics();
     return ss.str();
 }
 

@@ -11,7 +11,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
-#include "placement/target.h"
+#include "placement/candidate.h"
 #include "replica.h"
 #include "types.h"
 
@@ -23,12 +23,12 @@ class ScopedPlacementReadAccess;
 class LocalSSDMetricsView final {
    public:
     explicit LocalSSDMetricsView(const LocalSsdManager& local_ssd)
-        : local_ssd_(&local_ssd) {}
+        : local_ssd_(local_ssd) {}
 
     std::optional<double> GetFreeRatio(const UUID& client_id) const;
 
    private:
-    const LocalSsdManager* local_ssd_;
+    const LocalSsdManager& local_ssd_;
 };
 
 struct ReplicaRequirements final {
@@ -38,9 +38,9 @@ struct ReplicaRequirements final {
 };
 
 struct PlacementConstraints final {
-    std::string_view preferred_group;
-    std::span<const std::string> preferred_groups;
-    std::span<const std::string> excluded_groups;
+    std::string_view preferred_segment_name;
+    std::span<const std::string> preferred_segment_names;
+    std::span<const std::string> excluded_segment_names;
 };
 
 struct HostAffinity final {
@@ -55,7 +55,7 @@ struct ReplicaAllocationRequest final {
 };
 
 struct PlacementDiagnostics final {
-    bool has_sufficient_active_group_count{false};
+    bool has_sufficient_active_entry_count{false};
 };
 
 struct RandomPlacementPolicy final {};
@@ -63,10 +63,10 @@ struct FreeRatioFirstPlacementPolicy final {};
 struct LocalFirstPlacementPolicy final {};
 
 struct PreferredOnlyPlacementPolicy final {
-    explicit PreferredOnlyPlacementPolicy(PlacementTargetKind required_kind)
+    explicit PreferredOnlyPlacementPolicy(AllocationCandidateKind required_kind)
         : required_kind(required_kind) {}
 
-    PlacementTargetKind required_kind;
+    AllocationCandidateKind required_kind;
 };
 
 struct SsdFreeRatioFirstPlacementPolicy final {
@@ -94,9 +94,11 @@ class ReplicaAllocator final {
         const ReplicaAllocationRequest& request,
         PlacementDiagnostics* diagnostics = nullptr) const;
 
+    // Allocates only in the named segment. PreferredOnly uses its required
+    // kind; other policies use native memory. No segment or kind fallback.
     tl::expected<Replica, ErrorCode> AllocateFrom(
         ScopedPlacementReadAccess& placement, size_t size,
-        std::string_view group_name,
+        std::string_view segment_name,
         ReplicaType replica_type = ReplicaType::MEMORY) const;
 
     static constexpr bool UsesHostAffinity() noexcept {
