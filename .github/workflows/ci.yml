@@ -689,6 +689,13 @@ jobs:
           -R '^transfer_task_tent_completion_test$'
       shell: bash
 
+    - name: Test TENT notification handle ownership
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^tent_compat_notify_test$'
+      shell: bash
+
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
     # with USE_CUDA=ON tent's cuda_probe hits the CUDA stub library at
     # runtime and drives some dispatch paths past the fake objects the
