@@ -124,6 +124,8 @@ TEST(LocalMemoryLifecycle, DefaultHostOptionsAllocateUsableSharedMemory) {
     ASSERT_TRUE(status.ok()) << status.ToString();
     EXPECT_EQ(target_options.type, SHM);
     EXPECT_EQ(source_options.type, SHM);
+    EXPECT_EQ(target_options.location, kWildcardLocation);
+    EXPECT_EQ(source_options.location, "cpu:0");
     ASSERT_FALSE(target_options.shm_path.empty());
     ASSERT_TRUE(
         target.registerLocalMemory({source}, {kSize}, target_options).ok());
