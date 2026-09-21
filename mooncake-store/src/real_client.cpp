@@ -2852,7 +2852,10 @@ RealClient::DiskReadHealResult RealClient::heal_disk_replica_for_read(
     }
     const auto &endpoint =
         local_disk_replica.get_local_disk_descriptor().transport_endpoint;
-    auto verify = client_requester_->verify_disk_replica(endpoint, {key});
+    // Ship this reader's tenant: the owner probes and evicts under it, and it
+    // matches the tenant the write path scoped the file with.
+    auto verify = client_requester_->verify_disk_replica(
+        endpoint, {std::string(client_->tenant_id()), {key}});
     if (!verify) {
         return DiskReadHealResult::kUnknown;
     }
@@ -7252,28 +7255,33 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
 }
 
 async_simple::coro::Lazy<tl::expected<VerifyDiskReplicaResponse, ErrorCode>>
-RealClient::verify_disk_replica(const std::vector<std::string> &keys) {
+RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
     if (!file_storage_) {
         LOG(ERROR) << "verify_disk_replica called but file_storage_ is null";
         co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    // Offload storage keys are tenant-scoped, same as the local probe behind
-    // the dangling-replica heal: a raw object key never hits the scoped index.
-    // SSD I/O off the coro_rpc IO thread. Same heap-owned state pattern as
-    // batch_get_offload_object: the lambda captures only a raw pointer, every
-    // owning value lives in the heap state.
+    // The write path scopes offload files by the object's recorded tenant,
+    // not by this client's own tenant, so probing under client_->tenant_id()
+    // would miss (and the eviction would target a record that does not
+    // exist) whenever the two differ. The reader reached this replica through
+    // its own tenant's master records, so the request tenant matches the
+    // write scope. SSD I/O off the coro_rpc IO thread. Same heap-owned state
+    // pattern as batch_get_offload_object: the lambda captures only a raw
+    // pointer, every owning value lives in the heap state.
     struct CallState {
+        std::string tenant_id;
         std::vector<std::string> raw_keys;
         std::vector<std::string> scoped_keys;
         std::shared_ptr<FileStorage> file_storage;
         std::shared_ptr<Client> client;
     };
     auto state = std::make_unique<CallState>();
-    const TenantId tenant_id(client_->tenant_id());
-    state->raw_keys = keys;
-    state->scoped_keys.reserve(keys.size());
-    for (const auto &key : keys) {
-        state->scoped_keys.emplace_back(tenant_id.MakeScopedKey(key));
+    state->tenant_id = request.tenant_id;
+    const TenantId scoped_tenant(request.tenant_id);
+    state->raw_keys = request.keys;
+    state->scoped_keys.reserve(request.keys.size());
+    for (const auto &key : request.keys) {
+        state->scoped_keys.emplace_back(scoped_tenant.MakeScopedKey(key));
     }
     state->file_storage = file_storage_;
     state->client = client_;
@@ -7296,10 +7304,11 @@ RealClient::verify_disk_replica(const std::vector<std::string> &keys) {
             }
             // The backing file is gone for good. The master scopes LOCAL_DISK
             // eviction to the owning client, so the eviction has to happen on
-            // this side of the RPC. OBJECT_NOT_FOUND is the goal state too:
-            // the metadata is already gone.
-            auto evicted = s->client->EvictDiskReplica(s->raw_keys[i],
-                                                       ReplicaType::LOCAL_DISK);
+            // this side of the RPC, and it goes out under the request tenant
+            // to hit the same master record the reader saw. OBJECT_NOT_FOUND
+            // is the goal state too: the metadata is already gone.
+            auto evicted = s->client->EvictDiskReplica(
+                s->raw_keys[i], s->tenant_id, ReplicaType::LOCAL_DISK);
             if (!evicted && evicted.error() != ErrorCode::OBJECT_NOT_FOUND) {
                 LOG(WARNING)
                     << "Owner-side eviction of dangling LOCAL_DISK "
@@ -7498,10 +7507,10 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
 
 tl::expected<VerifyDiskReplicaResponse, ErrorCode>
 ClientRequester::verify_disk_replica(const std::string &client_addr,
-                                     const std::vector<std::string> &keys) {
+                                     const VerifyDiskReplicaRequest &request) {
     auto result =
         invoke_rpc<&RealClient::verify_disk_replica, VerifyDiskReplicaResponse>(
-            client_addr, keys);
+            client_addr, request);
     if (!result) {
         LOG(ERROR) << "Failed to invoke verify_disk_replica, client_addr = "
                    << client_addr << ", error is: " << result.error();

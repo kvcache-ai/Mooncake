@@ -3254,6 +3254,119 @@ TEST_F(RealClientTest,
     reader->tearDownAll();
 }
 
+// fcczzz's review on #3889: an SSD owner can hold objects recorded under a
+// different tenant than its own. The verify handler used to probe the scoped
+// file and emit the eviction under the owner's own tenant, so the probe
+// missed the tenant-scoped file and the eviction went to a master record
+// that does not exist (OBJECT_NOT_FOUND, swallowed as success), leaving the
+// dangling replica advertised. The verify request now carries the reader's
+// tenant, which always matches the tenant the write path scoped the file
+// with, and both the probe and the eviction go through it.
+//
+// The owner is the cross-tenant side here: it runs on tenant-a while the
+// object and its callers stay on default, which also keeps the memory
+// replica clearable through the default-scoped batch_replica_clear RPC.
+TEST_F(RealClientTest, GetBufferHealUsesReaderTenantForCrossTenantReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_cross_tenant_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    // Tenant isolation has to be on for the mismatch to exist: with it off
+    // the master resolves every tenant to default and the owner's tenant can
+    // never differ from the object's.
+    char quota_path[] = "/tmp/mooncake_tenant_quota_heal_XXXXXX.yaml";
+    const int quota_fd = mkstemps(quota_path, 5);
+    ASSERT_NE(quota_fd, -1);
+    const char quota_yaml[] =
+        "version: 1\n\ntenants:\n"
+        "  - name: \"default\"\n    quota: 1073741824\n"
+        "  - name: \"tenant-a\"\n    quota: 1073741824\n";
+    ASSERT_EQ(::write(quota_fd, quota_yaml, sizeof(quota_yaml) - 1),
+              (ssize_t)(sizeof(quota_yaml) - 1));
+    ::close(quota_fd);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .set_enable_multi_tenants(true)
+                                  .set_tenant_quota_connector_uri(quota_path)
+                                  .build()));
+    master_address_ = master_.master_address();
+    // The SSD owner runs on tenant-a. The object and its caller stay on the
+    // default tenant, so the offload file is written under the default scope
+    // while the owner's own tenant is wrong for both the probe and the
+    // eviction.
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_, nullptr, "", true,
+                                     ssd_path_, "tenant-a"),
+              0);
+
+    // The caller mounts no segment of its own, so the put allocates on the
+    // owner's segment and the offload task lands on the owner.
+    auto caller = RealClient::create();
+    ASSERT_EQ(caller->setup_real("localhost:17815", "P2PHANDSHAKE", 0,
+                                 16 * 1024 * 1024, "tcp", "", master_address_),
+              0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "cross_tenant_heal";
+    ASSERT_EQ(caller->put(key, source), 0);
+
+    const auto disk_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool disk_ready = false;
+    while (std::chrono::steady_clock::now() < disk_deadline && !disk_ready) {
+        for (const auto& replica : caller->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) disk_ready = true;
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (caller->batch_replica_clear({key}, "localhost:17813").size() == 1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    // Sanity: the cross-tenant remote read works while the file is there.
+    ASSERT_NE(caller->get_buffer(key), nullptr);
+
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    // The probe must look under the caller's (default) tenant and the
+    // eviction must hit the default master record; going out with the
+    // owner's tenant-a leaves the dangling replica advertised here.
+    EXPECT_EQ(caller->get_buffer(key), nullptr);
+    EXPECT_TRUE(caller->get_replica_desc(key).empty());
+
+    caller->tearDownAll();
+    std::remove(quota_path);
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

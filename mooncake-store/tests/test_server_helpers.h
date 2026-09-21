@@ -136,6 +136,14 @@ class InProcMaster {
             if (config.quota_bytes.has_value()) {
                 wms_cfg.quota_bytes = config.quota_bytes.value();
             }
+            if (config.enable_multi_tenants.has_value()) {
+                wms_cfg.enable_multi_tenants =
+                    config.enable_multi_tenants.value();
+            }
+            if (config.tenant_quota_connector_uri.has_value()) {
+                wms_cfg.tenant_quota_connector_uri =
+                    config.tenant_quota_connector_uri.value();
+            }
 
             wms_cfg.enable_cxl = config.enable_cxl.has_value()
                                      ? config.enable_cxl.value()

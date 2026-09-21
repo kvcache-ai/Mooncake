@@ -827,12 +827,14 @@ class RealClient : public PyClient {
      * against one of this client's LOCAL_DISK replicas; the eviction has to
      * happen here because the master scopes replica eviction to the owning
      * client.
-     * @param keys The object keys to verify
+     * @param request The reader's tenant (the write path scopes offload
+     * files by the object's recorded tenant, which the reader necessarily
+     * shares) and the object keys to verify
      * @return Per-key tri-state in request order (present, evicted,
      * undetermined)
      */
     async_simple::coro::Lazy<tl::expected<VerifyDiskReplicaResponse, ErrorCode>>
-    verify_disk_replica(const std::vector<std::string> &keys);
+    verify_disk_replica(const VerifyDiskReplicaRequest &request);
 
     /**
      * @brief Retrieves multiple stored objects from a remote service.
