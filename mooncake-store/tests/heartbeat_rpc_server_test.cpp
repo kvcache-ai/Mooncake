@@ -21,7 +21,7 @@ namespace {
 std::atomic<bool> main_io_thread_held{false};
 std::shared_future<void> main_io_thread_release;
 
-// Stands in for any long handler: it keeps the main server's only io thread.
+// Stands in for any long handler: it keeps the io thread that read it.
 void HoldMainIoThread() {
     main_io_thread_held.store(true);
     main_io_thread_release.wait();
@@ -29,6 +29,9 @@ void HoldMainIoThread() {
 
 class HeartbeatRpcServerTest : public ::testing::Test {
    protected:
+    explicit HeartbeatRpcServerTest(size_t main_io_thread_num = 1)
+        : main_io_thread_num_(main_io_thread_num) {}
+
     void SetUp() override {
         const auto ports = getFreeTcpPorts(2);
         ASSERT_EQ(ports.size(), 2u);
@@ -40,8 +43,8 @@ class HeartbeatRpcServerTest : public ::testing::Test {
         config.enable_metric_reporting = false;
         wrapped_ = std::make_unique<WrappedMasterService>(config);
         main_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
-            /*thread_num=*/1, main_port_, "127.0.0.1", std::chrono::seconds(0),
-            /*tcp_no_delay=*/true);
+            main_io_thread_num_, main_port_, "127.0.0.1",
+            std::chrono::seconds(0), /*tcp_no_delay=*/true);
         RegisterRpcService(*main_server_, *wrapped_);
         main_server_->register_handler<HoldMainIoThread>();
         ASSERT_FALSE(main_server_->async_start().hasResult());
@@ -93,6 +96,7 @@ class HeartbeatRpcServerTest : public ::testing::Test {
         }
     }
 
+    const size_t main_io_thread_num_;
     int main_port_ = 0;
     int heartbeat_port_ = 0;
     std::unique_ptr<WrappedMasterService> wrapped_;
@@ -101,6 +105,12 @@ class HeartbeatRpcServerTest : public ::testing::Test {
     std::promise<void> release_;
     bool released_ = false;
     std::thread hold_caller_;
+};
+
+class HeartbeatRpcServerTwoMainIoThreadsTest : public HeartbeatRpcServerTest {
+   protected:
+    HeartbeatRpcServerTwoMainIoThreadsTest()
+        : HeartbeatRpcServerTest(/*main_io_thread_num=*/2) {}
 };
 
 TEST_F(HeartbeatRpcServerTest, PingIsServedWhileTheMainIoThreadIsBusy) {
@@ -138,6 +148,39 @@ TEST_F(HeartbeatRpcServerTest, PingFallsBackToTheMainServerWhenUnreachable) {
     ASSERT_EQ(client.Connect(MainAddress()), ErrorCode::OK);
 
     EXPECT_TRUE(client.Ping().has_value());
+}
+
+TEST_F(HeartbeatRpcServerTwoMainIoThreadsTest,
+       PingWaitsForABusyIoThreadEvenWhenAnotherIsIdle) {
+    coro_rpc::coro_rpc_client first;
+    coro_rpc::coro_rpc_client second;
+    for (auto* client : {&first, &second}) {
+        ASSERT_FALSE(async_simple::coro::syncAwait(
+            client->connect("127.0.0.1", std::to_string(main_port_))));
+    }
+
+    // Connections take io threads round-robin, so the hold's connection,
+    // opened right after these two, shares its thread with exactly one.
+    HoldTheMainIoThread();
+    auto ping_on = [](coro_rpc::coro_rpc_client& client) {
+        return std::async(std::launch::async, [&client] {
+            return async_simple::coro::syncAwait(
+                client.call<&WrappedMasterService::Ping>(generate_uuid()));
+        });
+    };
+    auto first_ping = ping_on(first);
+    auto second_ping = ping_on(second);
+    auto answered_while_busy = [](auto& ping) {
+        return ping.wait_for(std::chrono::seconds(2)) ==
+               std::future_status::ready;
+    };
+    const int pings_answered_while_busy =
+        answered_while_busy(first_ping) + answered_while_busy(second_ping);
+    ReleaseMainIoThread();
+
+    EXPECT_EQ(pings_answered_while_busy, 1);
+    EXPECT_TRUE(first_ping.get().has_value());
+    EXPECT_TRUE(second_ping.get().has_value());
 }
 
 }  // namespace
