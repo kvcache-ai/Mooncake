@@ -54,7 +54,14 @@ Supported size-class patterns:
 
 - `kv_mixed`: 4KB at 70%, 256KB at 20%, and 3.12MB at 10%.
 - `dsa_pair`: 3.12MB KV pages at 50% and 643KB indexer entries at 50%.
-- `all`: run both patterns.
+- `variable`: equally weighted classes spread log-uniformly over
+  `[--variable_min_kib, --variable_max_mib]`, four per octave. KV cache traffic
+  is near-fixed-size, so a segment only has to have *enough* bytes free; RL
+  data-plane offload hands the allocator data-dependent sizes spanning several
+  octaves, and then a segment also has to have them *contiguous*. Quarter-octave
+  steps keep the sizes off the power-of-two boundaries that are exactly
+  representable for any `MANTISSA_BITS`, so `IntFrag%` stays meaningful.
+- `all`: run every pattern.
 
 Key output columns:
 
@@ -63,6 +70,13 @@ Key output columns:
 - `Frag_avg`, `Frag_p50`, `Frag_p90`, and `Frag_p99` summarize sampled
   fragmentation ratios.
 - `LargestFreeMB` shows the final largest contiguous free region.
+- `Useful%` is live requested bytes over cluster capacity, and `IntFrag%` is the
+  size-class round-up charged on top of it. The split separates the capacity a
+  finer mantissa can recover from the capacity lost to placement.
+- `Fail@Util%` is `Useful%` at the first failed allocation, so a run that fails
+  with most of the pool free is visible without reading the log.
+- `Survive%` is the share of objects that reached their own removal instead of
+  being evicted to make room for another object.
 - `Evictions` counts fail-triggered eviction rounds during measurement.
 - `Full/Partial/Fail/Total` reports allocation outcomes. Only results with
   `result->size() == replica_num` count as full success; shorter replica
