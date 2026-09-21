@@ -69,6 +69,11 @@ class WorkerPool {
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
                     bool handoff_to_local_worker = false,
                     bool defer_local_redispatch = false);
+    void delayRedispatch(Transport::Slice *slice, bool handoff_to_local_worker,
+                         const char *reason);
+    void releaseReadyDelayedSlices(int thread_id);
+    bool hasDelayedSlices() const;
+    uint64_t nextDelayedSliceDueNs() const;
 
     void transferWorker(int thread_id);
 
@@ -89,6 +94,8 @@ class WorkerPool {
     void markRailFailed(const std::string &peer_nic_path,
                         bool immediate_pause = false);
     bool isRailAvailable(const std::string &peer_nic_path);
+    uint64_t peerRailPauseRemainingNs(const std::string &peer_nic_path,
+                                      uint64_t now);
 
     // Retry helper: increment retry count and return whether retry is allowed
     static bool shouldRetrySlice(Transport::Slice *slice);
@@ -110,6 +117,11 @@ class WorkerPool {
                             RdmaEndPoint *endpoint = nullptr);
 
     bool tryHandoffToAnotherLocalWorker(Transport::Slice *slice);
+    bool selectAvailablePeerRailAlternative(
+        RdmaTransport::SegmentDesc *peer_segment_desc, int buffer_id,
+        int selected_device_id, uint64_t selection_seed, int &device_id,
+        std::string &peer_nic_path);
+    static uint64_t peerRailSelectionSeed(const Transport::Slice *slice);
 
     // Only direct local completion errors charge the context breaker.
     // Submit-side all-rails-unavailable failures remain peer/rail scoped.
@@ -161,6 +173,14 @@ class WorkerPool {
     // skips rail_state_lock_ while this is zero. Expired pauses are cleared on
     // the next locked isRailAvailable() for any path, not only the expired one.
     std::atomic<int> paused_rail_count_{0};
+
+    struct DelayedSlice {
+        Transport::Slice *slice = nullptr;
+        uint64_t due_ns = 0;
+        bool handoff_to_local_worker = false;
+    };
+    mutable std::mutex delayed_slices_lock_;
+    std::vector<DelayedSlice> delayed_slices_;
 
     // Rail monitor configuration
     const static int kRailErrorThreshold = 5;  // Errors before pause
