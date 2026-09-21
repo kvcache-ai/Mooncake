@@ -336,10 +336,9 @@ std::string ZMQClient::ProcessMessage() {
     }
 
     if (!ReplayEnabled(config_)) {
-        if (auto err =
-                DispatchMessage(topic, seq,
-                                static_cast<const char*>(payload_msg.data()),
-                                payload_msg.size());
+        if (auto err = DispatchMessage(
+                topic, seq, static_cast<const char*>(payload_msg.data()),
+                payload_msg.size());
             !err.empty()) {
             // The handler may have applied only part of the batch.  The
             // source therefore cannot safely advance or retry this sequence

@@ -1089,7 +1089,8 @@ TEST(ZMQClient, HandlerFailureMarksLiveOnlySourceStaleWithoutAdvancing) {
     EXPECT_EQ(client.GetLastSequence(), -1);
     EXPECT_EQ(handler->StaleNotificationCount(), 1u);
     EXPECT_TRUE(handler->WasSourceMarkedStale("test-pod", endpoint, -1));
-    EXPECT_NE(client.GetStaleReason().find("event handler failed: index write failed"),
+    EXPECT_NE(client.GetStaleReason().find(
+                  "event handler failed: index write failed"),
               std::string::npos);
     EXPECT_FALSE(handler->FindBatch(10, endpoint).has_value());
     client.Stop();
@@ -1113,7 +1114,8 @@ TEST(ZMQClient, HandlerFailureMarksReplaySourceStaleWithoutAdvancing) {
     EXPECT_EQ(client.GetLastSequence(), -1);
     EXPECT_EQ(handler->StaleNotificationCount(), 1u);
     EXPECT_TRUE(handler->WasSourceMarkedStale("test-pod", endpoint, -1));
-    EXPECT_NE(client.GetStaleReason().find("event handler failed: index write failed"),
+    EXPECT_NE(client.GetStaleReason().find(
+                  "event handler failed: index write failed"),
               std::string::npos);
     EXPECT_FALSE(handler->FindBatch(10, endpoint).has_value());
     client.Stop();
