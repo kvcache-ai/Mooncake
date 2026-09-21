@@ -991,6 +991,7 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             oplog_applier_->GetSegmentRegistry().GetAllSegments(),
             metadata_store_->BeginSnapshotTraversal(), state->generation,
             state);
+        capture.weight_metadata = metadata_store_->SnapshotWeightMetadata();
         ready_snapshot_capture_ = std::move(capture);
         state->active = true;
     }
