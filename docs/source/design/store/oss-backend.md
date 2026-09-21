@@ -12,7 +12,7 @@ This document describes the OSS adapter implementation. Its signing protocol
 is OSS-specific; S3 requires a compatible adapter, not just a different endpoint.
 
 For prerequisites, configuration, and startup examples, see
-[OSS Local-Disk Backend](../deployment/oss.md).
+[OSS Local-Disk Backend](../../deployment/oss-offload.md).
 
 ## Design Goals
 
