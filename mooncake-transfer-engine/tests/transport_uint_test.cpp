@@ -433,26 +433,41 @@ class SequencedUnregisterTransport : public BatchResultTransport {
     std::shared_ptr<std::atomic<int>> sequence_;
 };
 
-class SequencedRegistrationTransport : public BatchResultTransport {
+class SecondRegistrationFailsTransport : public BatchResultTransport {
    public:
-    explicit SequencedRegistrationTransport(
-        std::shared_ptr<std::atomic<int>> sequence)
-        : sequence_(std::move(sequence)) {}
+    explicit SecondRegistrationFailsTransport(int unregister_result = 0)
+        : unregister_result_(unregister_result) {}
 
-    void setRollbackResult(int result) { rollback_result_ = result; }
-
-   private:
-    int registerLocalMemory(void*, size_t, const std::string&, bool,
-                            bool) override {
-        return sequence_->fetch_add(1) == 0 ? 0 : ERR_MEMORY;
+    int registerCalls() const { return register_calls_; }
+    int unregisterCalls() const { return unregister_calls_; }
+    bool lastUnregisterUpdatedMetadata() const {
+        return last_unregister_update_metadata_;
     }
 
-    int unregisterLocalMemory(void*, bool) override { return rollback_result_; }
+   private:
+    int registerLocalMemory(void* addr, size_t, const std::string&, bool,
+                            bool) override {
+        if (register_calls_++ != 0) return ERR_MEMORY;
+        registered_addr_ = addr;
+        return 0;
+    }
 
-    const char* getName() const override { return "sequenced-registration"; }
+    int unregisterLocalMemory(void* addr, bool update_metadata) override {
+        ++unregister_calls_;
+        last_unregister_update_metadata_ = update_metadata;
+        if (addr != registered_addr_) return ERR_ADDRESS_NOT_REGISTERED;
+        if (unregister_result_) return unregister_result_;
+        registered_addr_ = nullptr;
+        return 0;
+    }
 
-    std::shared_ptr<std::atomic<int>> sequence_;
-    int rollback_result_ = ERR_MEMORY;
+    const char* getName() const override { return "second-registration-fails"; }
+
+    int register_calls_ = 0;
+    int unregister_calls_ = 0;
+    int unregister_result_;
+    bool last_unregister_update_metadata_ = true;
+    void* registered_addr_ = nullptr;
 };
 
 class StatefulUnregisterTransport : public BatchResultTransport {
@@ -1047,11 +1062,13 @@ TEST_F(TransportTest, UnregisterRejectsConcurrentRegistration) {
     std::promise<void> unregister_started;
     auto unregister = std::async(std::launch::async, [&] {
         unregister_started.set_value();
-        return engine.unregisterLocalMemory(buffer.data());
+        return engine.unregisterLocalMemory(buffer.data() + 1);
     });
     unregister_started.get_future().wait();
 
     EXPECT_EQ(unregister.get(), ERR_TOO_MANY_REQUESTS);
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data() + 1}),
+              ERR_TOO_MANY_REQUESTS);
     EXPECT_EQ(transport->unregistrationCalls(), 0);
 
     transport->releaseFirstRegistration();
@@ -1222,14 +1239,34 @@ TEST_F(TransportTest, MultiProtocolRegisterRejectsDuplicateTransportAddress) {
     EXPECT_FALSE(engine.checkOverlap(buffer.data(), buffer.size()));
 }
 
-TEST_F(TransportTest, MultiProtocolRegisterKeepsFailedRollbackTracked) {
+TEST_F(TransportTest,
+       MultiProtocolRollbackPreservesSuccessfulRegistrationMetadataFlag) {
     TransferEngineImpl engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
-    auto sequence = std::make_shared<std::atomic<int>>(0);
-    auto first = std::make_shared<SequencedRegistrationTransport>(sequence);
-    auto second = std::make_shared<SequencedRegistrationTransport>(sequence);
+    auto transport = std::make_shared<SecondRegistrationFailsTransport>();
+    TransferEngineImplTestPeer::replaceTransports(engine, transport);
+
+    std::array<char, 2> buffer{};
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>> buffer_map =
+        {{"blocking",
+          {
+              {buffer.data(), 1, kWildcardLocation, true, false},
+              {buffer.data() + 1, 1, kWildcardLocation, true, true},
+          }}};
+
+    EXPECT_EQ(engine.mp_registerLocalMemory(buffer_map), ERR_MEMORY);
+    EXPECT_EQ(transport->unregisterCalls(), 3);
+    EXPECT_FALSE(transport->lastUnregisterUpdatedMetadata());
+    EXPECT_FALSE(engine.checkOverlap(buffer.data(), 1));
+    EXPECT_TRUE(engine.checkOverlap(buffer.data() + 1, 1));
+}
+
+TEST_F(TransportTest, MultiProtocolFailedAttemptCleanupCannotBypassQuarantine) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<SecondRegistrationFailsTransport>();
     TransferEngineImplTestPeer::replaceTransports(
-        engine, {{"first", first}, {"second", second}});
+        engine, {{"first", transport}, {"second", transport}});
 
     std::array<char, 1> buffer{};
     std::unordered_map<std::string, std::vector<RegisteredBuffer>> buffer_map =
@@ -1239,13 +1276,68 @@ TEST_F(TransportTest, MultiProtocolRegisterKeepsFailedRollbackTracked) {
         };
 
     EXPECT_EQ(engine.mp_registerLocalMemory(buffer_map), ERR_MEMORY);
+    EXPECT_EQ(transport->unregisterCalls(), 2);
     EXPECT_TRUE(engine.checkOverlap(buffer.data(), buffer.size()));
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()),
+              ERR_ADDRESS_OVERLAPPED);
+}
 
-    first->setRollbackResult(0);
-    second->setRollbackResult(0);
-    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+TEST_F(TransportTest, BatchUnregisterUsesRecordedTransportSubset) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto registered = std::make_shared<BatchResultTransport>();
+    auto unrelated = std::make_shared<BatchResultTransport>();
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"registered", registered}, {"unrelated", unrelated}});
+
+    std::array<char, 1> buffer{};
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>> buffer_map =
+        {{"registered", {{buffer.data(), buffer.size()}}}};
+    ASSERT_EQ(engine.mp_registerLocalMemory(buffer_map), 0);
+
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}), 0);
+    EXPECT_EQ(registered->unregisterBatchCalls(), 1);
+    EXPECT_EQ(unrelated->unregisterBatchCalls(), 0);
     EXPECT_FALSE(engine.checkOverlap(buffer.data(), buffer.size()));
 }
+
+TEST_F(TransportTest, MultiProtocolRollbackFailureQuarantinesAddress) {
+    for (int rollback_error : {ERR_MEMORY, ERR_ADDRESS_NOT_REGISTERED}) {
+        SCOPED_TRACE(rollback_error);
+        TransferEngineImpl engine(false);
+        ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+        auto transport =
+            std::make_shared<SecondRegistrationFailsTransport>(rollback_error);
+        TransferEngineImplTestPeer::replaceTransports(engine, transport);
+
+        std::array<char, 3> buffer{};
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>
+            buffer_map = {{"blocking",
+                           {
+                               {buffer.data(), 2},
+                               {buffer.data() + 2, 1},
+                           }}};
+
+        EXPECT_EQ(engine.mp_registerLocalMemory(buffer_map), ERR_MEMORY);
+        EXPECT_EQ(transport->unregisterCalls(), 3);
+        EXPECT_TRUE(engine.checkOverlap(buffer.data(), 2));
+        EXPECT_TRUE(engine.checkOverlap(buffer.data() + 2, 1));
+
+        EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()),
+                  ERR_TOO_MANY_REQUESTS);
+        EXPECT_EQ(engine.unregisterLocalMemory(buffer.data() + 1),
+                  ERR_TOO_MANY_REQUESTS);
+        EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}),
+                  ERR_TOO_MANY_REQUESTS);
+        EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data() + 1}),
+                  ERR_TOO_MANY_REQUESTS);
+        EXPECT_EQ(transport->unregisterBatchCalls(), 0);
+        EXPECT_EQ(engine.registerLocalMemory(buffer.data(), 1),
+                  ERR_ADDRESS_OVERLAPPED);
+        EXPECT_EQ(transport->registerCalls(), 2);
+    }
+}
+
 #endif
 
 TEST_F(TransportTest, RegisterRejectsAddressWhileUnregisterIsInProgress) {
@@ -1255,12 +1347,16 @@ TEST_F(TransportTest, RegisterRejectsAddressWhileUnregisterIsInProgress) {
     TransferEngineImplTestPeer::replaceTransports(engine, transport);
 
     std::array<char, 1> buffer{};
+    std::array<char, 1> other_buffer{};
     auto unregister = std::async(std::launch::async, [&] {
         return engine.unregisterLocalMemory(buffer.data());
     });
     transport->waitForUnregister();
 
     EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
+              ERR_ADDRESS_OVERLAPPED);
+    EXPECT_EQ(engine.registerLocalMemory(other_buffer.data(),
+                                         other_buffer.size(), "cpu:0"),
               ERR_ADDRESS_OVERLAPPED);
     EXPECT_EQ(transport->registerCalls(), 0);
 
@@ -1289,9 +1385,36 @@ TEST_F(TransportTest, UnregisterLocalMemoryBatchContinuesAcrossTransports) {
         engine, {{"a-failing", failing}, {"b-succeeding", succeeding}});
 
     std::array<char, 1> buffer{};
+    ASSERT_EQ(engine.registerLocalMemoryBatch({{buffer.data(), buffer.size()}},
+                                              "cpu:0"),
+              0);
     EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}), ERR_MEMORY);
     EXPECT_EQ(failing->unregisterBatchCalls(), 1);
     EXPECT_EQ(succeeding->unregisterBatchCalls(), 1);
+    EXPECT_TRUE(engine.checkOverlap(buffer.data(), buffer.size()));
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}),
+              ERR_TOO_MANY_REQUESTS);
+    EXPECT_EQ(failing->unregisterBatchCalls(), 1);
+    EXPECT_EQ(succeeding->unregisterBatchCalls(), 1);
+}
+
+TEST_F(TransportTest, UnregisterLocalMemoryBatchSkipsCompletedScalarTransport) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto completed = std::make_shared<BatchResultTransport>();
+    auto transient = std::make_shared<BatchResultTransport>(ERR_MEMORY);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"a-completed", completed}, {"b-transient", transient}});
+
+    std::array<char, 1> buffer{};
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+    ASSERT_EQ(engine.unregisterLocalMemory(buffer.data()), ERR_MEMORY);
+
+    transient->setUnregisterResult(0);
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}), 0);
+    EXPECT_EQ(completed->unregisterBatchCalls(), 0);
+    EXPECT_EQ(transient->unregisterBatchCalls(), 1);
+    EXPECT_FALSE(engine.checkOverlap(buffer.data(), buffer.size()));
 }
 
 TEST_F(TransportTest, UnregisterLocalMemoryBatchContinuesAfterAddressError) {
@@ -1325,6 +1448,30 @@ TEST_F(TransportTest, UnregisterLocalMemoryBatchContinuesAfterAddressError) {
               ERR_ADDRESS_NOT_REGISTERED);
     EXPECT_FALSE(contains_buffer(registered.data()));
     EXPECT_FALSE(contains_buffer(registered.data() + 1));
+    EXPECT_FALSE(engine.checkOverlap(registered.data(), registered.size()));
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch(
+                  {registered.data(), registered.data() + 1}),
+              0);
+}
+
+TEST_F(TransportTest, RegisterRollbackFailureQuarantinesAddress) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto succeeding = std::make_shared<BatchResultTransport>(ERR_MEMORY);
+    auto failing = std::make_shared<BatchResultTransport>();
+    failing->setRegisterResult(ERR_MEMORY);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"a-succeeding", succeeding}, {"b-failing", failing}});
+
+    std::array<char, 1> buffer{};
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()),
+              ERR_MEMORY);
+    EXPECT_EQ(succeeding->unregisterCalls(), 1);
+    EXPECT_EQ(failing->unregisterCalls(), 1);
+    EXPECT_TRUE(engine.checkOverlap(buffer.data(), buffer.size()));
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()),
+              ERR_ADDRESS_OVERLAPPED);
 }
 
 TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
@@ -1354,6 +1501,28 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
     EXPECT_EQ(
         engine.unregisterLocalMemoryBatch({buffer.data(), buffer.data() + 1}),
         0);
+}
+
+TEST_F(TransportTest, BatchRegisterRollbackFailureQuarantinesAddresses) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto succeeding = std::make_shared<BatchResultTransport>(ERR_MEMORY);
+    auto failing = std::make_shared<BatchResultTransport>();
+    failing->setRegisterResult(ERR_MEMORY);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"a-succeeding", succeeding}, {"b-failing", failing}});
+
+    std::array<char, 2> buffer{};
+    std::vector<BufferEntry> entries = {
+        {buffer.data(), 1},
+        {buffer.data() + 1, 1},
+    };
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), ERR_MEMORY);
+    EXPECT_EQ(succeeding->unregisterBatchCalls(), 1);
+    EXPECT_EQ(failing->unregisterBatchCalls(), 1);
+    EXPECT_TRUE(engine.checkOverlap(buffer.data(), buffer.size()));
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"),
+              ERR_ADDRESS_OVERLAPPED);
 }
 
 TEST_F(TransportTest, FreeBatchClearsPendingNotify) {

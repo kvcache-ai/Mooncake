@@ -792,29 +792,39 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
         return ERR_ADDRESS_OVERLAPPED;
     }
 
-    std::vector<Transport*> attempted_transports;
+    std::vector<Transport*> successful_transports;
     for (auto transport : multi_transports_->listTransports()) {
-        attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata);
         if (ret < 0) {
             // Roll back the transports that already registered so a partial
             // failure doesn't leave the region registered on some of them.
             // Mirrors registerLocalMemoryBatch (#2869).
-            for (auto it = attempted_transports.rbegin();
-                 it != attempted_transports.rend(); ++it) {
+            int cleanup_ret =
+                transport->unregisterLocalMemory(addr, update_metadata);
+            if (cleanup_ret != 0) {
+                successful_transports.push_back(transport);
+            }
+            bool rollback_failed = false;
+            for (auto it = successful_transports.rbegin();
+                 it != successful_transports.rend(); ++it) {
                 int rollback_ret =
                     (*it)->unregisterLocalMemory(addr, update_metadata);
-                if (rollback_ret != 0 &&
-                    rollback_ret != ERR_ADDRESS_NOT_REGISTERED) {
+                if (rollback_ret != 0) {
+                    rollback_failed = true;
                     LOG(WARNING)
                         << "Failed to roll back registration for "
                         << (*it)->getName() << ", ret=" << rollback_ret;
                 }
             }
-            releaseMemoryRegions(regions);
+            std::unordered_set<uintptr_t> quarantined_addresses;
+            if (rollback_failed) {
+                quarantined_addresses.insert(reinterpret_cast<uintptr_t>(addr));
+            }
+            releaseMemoryRegions(regions, &quarantined_addresses);
             return ret;
         }
+        successful_transports.push_back(transport);
     }
 
     commitMemoryRegions(regions);
@@ -835,8 +845,10 @@ int TransferEngineImpl::unregisterLocalMemoryInternal(
     bool tracked = false;
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
-        if (unregistering_memory_regions_.count(address) != 0 ||
-            registering_memory_regions_.count(address) != 0) {
+        if (hasOverlapInMapLocked(quarantined_memory_regions_, address, 1) ||
+            unregistering_memory_regions_.count(address) != 0 ||
+            hasOverlapInMapLocked(unregistering_memory_regions_, address, 1) ||
+            hasOverlapInMapLocked(registering_memory_regions_, address, 1)) {
             return ERR_TOO_MANY_REQUESTS;
         }
         auto region = local_memory_regions_.find(address);
@@ -947,22 +959,12 @@ int TransferEngineImpl::mp_registerLocalMemory(
     RegisteredTransportMap registered_transport_map;
     auto rollback_and_release = [&] {
         auto rollback_failures = rollbackAllRegistrations(success_records);
-        if (!rollback_failures.empty()) {
-            RegisteredTransportMap failed_transport_map;
-            std::vector<MemoryRegion> failed_regions;
-            std::unordered_set<uintptr_t> failed_addresses;
-            for (const auto& record : rollback_failures) {
-                const auto address = reinterpret_cast<uintptr_t>(record.addr);
-                failed_transport_map[address].insert(record.transport);
-                if (failed_addresses.insert(address).second) {
-                    failed_regions.push_back(unique_regions.at(address));
-                }
-            }
-            // Keep rollback failures tracked so address reuse stays blocked
-            // and a later unregister can finish the cleanup.
-            commitMemoryRegions(failed_regions, &failed_transport_map);
+        std::unordered_set<uintptr_t> quarantined_addresses;
+        for (const auto& record : rollback_failures) {
+            quarantined_addresses.insert(
+                reinterpret_cast<uintptr_t>(record.addr));
         }
-        releaseMemoryRegions(regions);
+        releaseMemoryRegions(regions, &quarantined_addresses);
     };
 
     // Reserve space to reduce reallocations
@@ -996,14 +998,25 @@ int TransferEngineImpl::mp_registerLocalMemory(
                            << " length=" << buffer.length;
 
                 // ========== Phase 4: Rollback on failure ==========
+                // Compensate the failed attempt separately. Any nonzero result
+                // is ambiguous because lower-level resources may exist before
+                // metadata becomes visible.
+                int cleanup_ret = transport->unregisterLocalMemory(
+                    buffer.addr, buffer.update_metadata);
+                if (cleanup_ret != 0) {
+                    success_records.push_back(
+                        TransferEngineImpl::RegisteredRecord{
+                            transport.get(), buffer.addr, buffer.length,
+                            buffer.location, buffer.remote_accessible,
+                            buffer.update_metadata});
+                }
                 rollback_and_release();
                 return ret;
             }
 
-            // Record successful registration for potential rollback
             success_records.push_back(TransferEngineImpl::RegisteredRecord{
-                transport, buffer.addr, buffer.length, buffer.location,
-                buffer.remote_accessible});
+                transport.get(), buffer.addr, buffer.length, buffer.location,
+                buffer.remote_accessible, buffer.update_metadata});
             registered_transport_map[reinterpret_cast<uintptr_t>(buffer.addr)]
                 .insert(transport);
         }
@@ -1024,8 +1037,8 @@ TransferEngineImpl::rollbackAllRegistrations(
     for (auto it = records.rbegin(); it != records.rend(); ++it) {
         const auto& record = *it;
         if (record.transport) {
-            int ret =
-                record.transport->unregisterLocalMemory(record.addr, true);
+            int ret = record.transport->unregisterLocalMemory(
+                record.addr, record.update_metadata);
             if (ret) {
                 LOG(WARNING) << "Failed to roll back registration for "
                              << record.transport->getName()
@@ -1055,8 +1068,13 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         for (const auto& [address, addr] : unique_addresses) {
-            if (registering_memory_regions_.count(address) != 0 ||
-                unregistering_memory_regions_.count(address) != 0) {
+            if (hasOverlapInMapLocked(quarantined_memory_regions_, address,
+                                      1) ||
+                unregistering_memory_regions_.count(address) != 0 ||
+                hasOverlapInMapLocked(unregistering_memory_regions_, address,
+                                      1) ||
+                hasOverlapInMapLocked(registering_memory_regions_, address,
+                                      1)) {
                 return ERR_TOO_MANY_REQUESTS;
             }
         }
@@ -1184,24 +1202,36 @@ int TransferEngineImpl::registerLocalMemoryBatch(
         return ERR_ADDRESS_OVERLAPPED;
     }
 
-    std::vector<Transport*> attempted_transports;
+    std::vector<Transport*> successful_transports;
     for (auto transport : multi_transports_->listTransports()) {
-        attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemoryBatch(buffer_list, location);
         if (ret) {
-            for (auto it = attempted_transports.rbegin();
-                 it != attempted_transports.rend(); ++it) {
+            int cleanup_ret = transport->unregisterLocalMemoryBatch(addr_list);
+            if (cleanup_ret != 0) {
+                successful_transports.push_back(transport);
+            }
+            bool rollback_failed = false;
+            for (auto it = successful_transports.rbegin();
+                 it != successful_transports.rend(); ++it) {
                 int rollback_ret = (*it)->unregisterLocalMemoryBatch(addr_list);
-                if (rollback_ret != 0 &&
-                    rollback_ret != ERR_ADDRESS_NOT_REGISTERED) {
+                if (rollback_ret != 0) {
+                    rollback_failed = true;
                     LOG(WARNING)
                         << "Failed to roll back batch registration for "
                         << (*it)->getName() << ", ret=" << rollback_ret;
                 }
             }
-            releaseMemoryRegions(regions);
+            std::unordered_set<uintptr_t> quarantined_addresses;
+            if (rollback_failed) {
+                for (auto* addr : addr_list) {
+                    quarantined_addresses.insert(
+                        reinterpret_cast<uintptr_t>(addr));
+                }
+            }
+            releaseMemoryRegions(regions, &quarantined_addresses);
             return ret;
         }
+        successful_transports.push_back(transport);
     }
 
     commitMemoryRegions(regions);
@@ -1210,23 +1240,99 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    int first_error = 0;
-    for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret && !first_error) first_error = ret;
+    std::unordered_map<uintptr_t, void*> unique_addresses;
+    std::unordered_map<std::shared_ptr<Transport>, std::vector<void*>>
+        tracked_addresses_by_transport;
+    std::unordered_map<std::shared_ptr<Transport>, std::vector<void*>>
+        untracked_addresses_by_transport;
+    for (auto* addr : addr_list) {
+        unique_addresses[reinterpret_cast<uintptr_t>(addr)] = addr;
     }
-    if (first_error) return first_error;
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& [address, _] : unique_addresses) {
+            if (hasOverlapInMapLocked(quarantined_memory_regions_, address,
+                                      1) ||
+                unregistering_memory_regions_.count(address) != 0 ||
+                hasOverlapInMapLocked(unregistering_memory_regions_, address,
+                                      1) ||
+                hasOverlapInMapLocked(registering_memory_regions_, address,
+                                      1)) {
+                return ERR_TOO_MANY_REQUESTS;
+            }
+        }
+        for (const auto& [address, addr] : unique_addresses) {
+            auto region = local_memory_regions_.find(address);
+            unregistering_memory_regions_[address] =
+                region != local_memory_regions_.end()
+                    ? region->second
+                    : MemoryRegion{addr, 0, "", false};
+            TransportSet transports;
+            if (region != local_memory_regions_.end()) {
+                auto registered = registered_transports_.find(address);
+                if (registered != registered_transports_.end()) {
+                    transports = registered->second;
+                }
+                if (transports.empty()) {
+                    for (const auto& [_, transport] :
+                         multi_transports_->transport_map_) {
+                        transports.insert(transport);
+                    }
+                }
+                auto completed = unregistered_transports_.find(address);
+                if (completed != unregistered_transports_.end()) {
+                    for (const auto& transport : completed->second) {
+                        transports.erase(transport);
+                    }
+                }
+                for (const auto& transport : transports) {
+                    tracked_addresses_by_transport[transport].push_back(addr);
+                }
+            } else {
+                for (const auto& [_, transport] :
+                     multi_transports_->transport_map_) {
+                    untracked_addresses_by_transport[transport].push_back(addr);
+                }
+            }
+        }
+    }
+
+    int first_error = 0;
+    std::unordered_set<uintptr_t> failed_addresses;
+    for (const auto& [transport, addresses] :
+         untracked_addresses_by_transport) {
+        int ret = transport->unregisterLocalMemoryBatch(addresses);
+        recordUnregisterError(ret, first_error);
+    }
+    for (const auto& [transport, addresses] : tracked_addresses_by_transport) {
+        int ret = transport->unregisterLocalMemoryBatch(addresses);
+        if (ret) {
+            recordUnregisterError(ret, first_error);
+            for (auto* addr : addresses) {
+                failed_addresses.insert(reinterpret_cast<uintptr_t>(addr));
+            }
+        }
+    }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto& addr : addr_list) {
-        eraseMemoryRegionLocked(addr);
+    for (const auto& [address, addr] : unique_addresses) {
+        unregistering_memory_regions_.erase(address);
+        if (failed_addresses.count(address) != 0) {
+            auto region = local_memory_regions_.find(address);
+            if (region != local_memory_regions_.end()) {
+                quarantined_memory_regions_[address] = region->second;
+            }
+        } else {
+            eraseMemoryRegionLocked(addr);
+        }
     }
-    return 0;
+    return first_error;
 }
 
 bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
                                           uint64_t length) const {
     return hasOverlapInMapLocked(local_memory_regions_, addr, length) ||
+           hasOverlapInMapLocked(quarantined_memory_regions_, addr, length) ||
            hasOverlapInMapLocked(registering_memory_regions_, addr, length);
 }
 
@@ -1258,6 +1364,11 @@ bool TransferEngineImpl::hasOverlapInMapLocked(const MemoryRegionMap& regions,
 bool TransferEngineImpl::tryReserveMemoryRegions(
     const std::vector<MemoryRegion>& regions) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (const auto& [_, region] : unregistering_memory_regions_) {
+        if (region.length == 0) {
+            return false;
+        }
+    }
     std::vector<uintptr_t> reserved;
     reserved.reserve(regions.size());
 
@@ -1304,11 +1415,16 @@ void TransferEngineImpl::commitMemoryRegions(
 }
 
 void TransferEngineImpl::releaseMemoryRegions(
-    const std::vector<MemoryRegion>& regions) {
+    const std::vector<MemoryRegion>& regions,
+    const std::unordered_set<uintptr_t>* quarantined_addresses) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (const auto& region : regions) {
-        registering_memory_regions_.erase(
-            reinterpret_cast<uintptr_t>(region.addr));
+        const auto address = reinterpret_cast<uintptr_t>(region.addr);
+        registering_memory_regions_.erase(address);
+        if (quarantined_addresses &&
+            quarantined_addresses->count(address) != 0) {
+            quarantined_memory_regions_[address] = region;
+        }
     }
 }
 
