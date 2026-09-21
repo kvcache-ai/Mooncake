@@ -336,10 +336,20 @@ std::string ZMQClient::ProcessMessage() {
     }
 
     if (!ReplayEnabled(config_)) {
+        if (auto err =
+                DispatchMessage(topic, seq,
+                                static_cast<const char*>(payload_msg.data()),
+                                payload_msg.size());
+            !err.empty()) {
+            // The handler may have applied only part of the batch.  The
+            // source therefore cannot safely advance or retry this sequence
+            // without a full resynchronization.
+            MarkStale("failed to dispatch live sequence " +
+                      std::to_string(seq) + ": " + err);
+            return "";
+        }
         UpdateLastSequence(seq);
-        return DispatchMessage(topic, seq,
-                               static_cast<const char*>(payload_msg.data()),
-                               payload_msg.size());
+        return "";
     }
 
     std::string buffer_error;
@@ -434,10 +444,7 @@ std::string ZMQClient::DispatchMessage(const std::string& topic,
         return "event handler is nil";
     }
     if (auto err = event_handler_->HandleBatch(batch, metadata); !err.empty()) {
-        LOG(ERROR) << "Handler error service=" << config_.cache_pool_key
-                   << " endpoint=" << metadata.endpoint
-                   << " topic=" << metadata.topic
-                   << " seq=" << metadata.sequence << " error=" << err;
+        return "event handler failed: " + err;
     }
 
     VLOG(1) << "Processed batch service=" << config_.cache_pool_key
@@ -511,7 +518,7 @@ std::string ZMQClient::DrainBufferedMessages(bool allow_initial_baseline) {
             !err.empty()) {
             MarkStale("failed to dispatch buffered sequence " +
                       std::to_string(message.sequence) + ": " + err);
-            return err;
+            return "";
         }
         UpdateLastSequence(message.sequence);
         allow_initial_baseline = false;

@@ -79,6 +79,7 @@ class MockEventHandler : public EventHandler {
     std::string HandleBatch(const DecodedBatch& batch,
                             const MessageMetadata& metadata) override {
         std::lock_guard<std::mutex> lock(mu_);
+        if (!handle_error_.empty()) return handle_error_;
         batches_.push_back({batch, metadata});
         if (const auto* vllm = std::get_if<VllmEventBatch>(&batch)) {
             for (const auto& decoded : vllm->events) {
@@ -101,6 +102,11 @@ class MockEventHandler : public EventHandler {
             }
         }
         return "";
+    }
+
+    void SetHandleError(std::string error) {
+        std::lock_guard<std::mutex> lock(mu_);
+        handle_error_ = std::move(error);
     }
 
     void OnSourceStale(const std::string& cache_pool_key,
@@ -181,6 +187,7 @@ class MockEventHandler : public EventHandler {
     std::mutex mu_;
     std::vector<HandledBatch> batches_;
     std::unordered_set<uint64_t> present_hashes_;
+    std::string handle_error_;
     size_t stale_notifications_ = 0;
     std::string stale_cache_pool_key_;
     MessageMetadata stale_metadata_;
@@ -504,6 +511,14 @@ bool PublishUntilHandled(MockEventHandler& handler, int64_t sequence,
         }
     }
     return false;
+}
+
+bool WaitForStale(ZMQClient& client, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!client.IsStale() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return client.IsStale();
 }
 
 const VllmStoredEvent* GetVllmStored(const HandledBatch& handled) {
@@ -1052,6 +1067,55 @@ TEST(ZMQClient, EventGapMarksSourceStaleWhenReplayUnavailable) {
     EXPECT_EQ(publisher.ReplayRequestCount(), 0u);
     EXPECT_EQ(client.GetDroppedEvents(), 2);
     EXPECT_EQ(client.GetGapCount(), 1);
+    client.Stop();
+}
+
+TEST(ZMQClient, HandlerFailureMarksLiveOnlySourceStaleWithoutAdvancing) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    handler->SetHandleError("index write failed");
+    auto config = TestConfig(publisher);
+    config.replay_endpoint.clear();
+    const std::string endpoint = config.endpoint;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+
+    for (int attempt = 0; attempt < 20 && !client.IsStale(); ++attempt) {
+        publisher.Publish("", PackVllmStoredBatch(1), 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ASSERT_TRUE(WaitForStale(client, std::chrono::seconds(1)));
+    EXPECT_EQ(client.GetLastSequence(), -1);
+    EXPECT_EQ(handler->StaleNotificationCount(), 1u);
+    EXPECT_TRUE(handler->WasSourceMarkedStale("test-pod", endpoint, -1));
+    EXPECT_NE(client.GetStaleReason().find("event handler failed: index write failed"),
+              std::string::npos);
+    EXPECT_FALSE(handler->FindBatch(10, endpoint).has_value());
+    client.Stop();
+}
+
+TEST(ZMQClient, HandlerFailureMarksReplaySourceStaleWithoutAdvancing) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    handler->SetHandleError("index write failed");
+    auto config = TestConfig(publisher);
+    const std::string endpoint = config.endpoint;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+
+    for (int attempt = 0; attempt < 20 && !client.IsStale(); ++attempt) {
+        publisher.Publish("", PackVllmStoredBatch(1), 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ASSERT_TRUE(WaitForStale(client, std::chrono::seconds(1)));
+    EXPECT_EQ(client.GetLastSequence(), -1);
+    EXPECT_EQ(handler->StaleNotificationCount(), 1u);
+    EXPECT_TRUE(handler->WasSourceMarkedStale("test-pod", endpoint, -1));
+    EXPECT_NE(client.GetStaleReason().find("event handler failed: index write failed"),
+              std::string::npos);
+    EXPECT_FALSE(handler->FindBatch(10, endpoint).has_value());
     client.Stop();
 }
 
