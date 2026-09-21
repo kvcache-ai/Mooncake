@@ -224,11 +224,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     }
 
    private:
-    int setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
+    int setupAllQPs(const std::string& peer_gid, uint32_t peer_lid,
                     std::vector<uint32_t> peer_qp_num_list, int local_gid_index,
                     std::string* reply_msg = nullptr);
 
-    int setupOneQP(int qp_index, const std::string& peer_gid, uint16_t peer_lid,
+    int setupOneQP(int qp_index, const std::string& peer_gid, uint32_t peer_lid,
                    uint32_t peer_qp_num, int local_gid_index,
                    std::string* reply_msg = nullptr);
 

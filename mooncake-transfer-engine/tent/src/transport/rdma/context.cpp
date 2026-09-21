@@ -21,6 +21,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <atomic>
 #include <cassert>
@@ -724,8 +727,13 @@ RdmaAddressRefreshResult RdmaContext::refreshAddress(
         return RdmaAddressRefreshResult::FAILED;
     }
 
-    RdmaAddressSnapshot next_address{
-        port_attr.lid, gidBytesToString(next_gid.raw), next_gid_index};
+#ifdef USE_SHCA
+    const uint32_t next_lid = u17_to_32(port_attr.lid);
+#else
+    const uint32_t next_lid = port_attr.lid;
+#endif
+    RdmaAddressSnapshot next_address{next_lid, gidBytesToString(next_gid.raw),
+                                     next_gid_index};
     if (current) *current = next_address;
     const bool changed = next_address.lid != old_address.lid ||
                          next_address.gid != old_address.gid ||
@@ -932,7 +940,11 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     }
 
     native_context_ = context.release();
+#ifdef USE_SHCA
+    lid_ = u17_to_32(port_attr.lid);
+#else
     lid_ = port_attr.lid;
+#endif
     recordPortSpeed(port_attr);
     queryEffectiveSpeed();
     return 0;
