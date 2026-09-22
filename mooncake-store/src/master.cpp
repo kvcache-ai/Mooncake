@@ -15,6 +15,7 @@
 #include <ylt/easylog/record.hpp>
 
 #include "allocator_status.h"
+#include "config/metrics_bootstrap_config_loader.h"
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
@@ -124,9 +125,13 @@ DEFINE_int32(port, 50051,
 DEFINE_int32(
     max_threads, 16,
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
-DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
-DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
-DEFINE_string(metrics_host, "0.0.0.0",
+DEFINE_bool(enable_metric_reporting,
+            mooncake::MetricsBootstrapConfig::kDefaultEnabled,
+            "Enable periodic metric reporting");
+DEFINE_int32(metrics_port, mooncake::MetricsBootstrapConfig::kDefaultPort,
+             "Port for HTTP metrics server to listen on");
+DEFINE_string(metrics_host,
+              std::string(mooncake::MetricsBootstrapConfig::kDefaultHost),
               "Address for the HTTP metrics/admin server to listen on. "
               "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
@@ -456,6 +461,25 @@ std::string ResolveHABackendConnstring(
         master_config.etcd_endpoints);
 }
 
+mooncake::MetricsBootstrapCommandLineOverrides
+GetMetricsBootstrapCommandLineOverrides() {
+    mooncake::MetricsBootstrapCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
+        !info.is_default) {
+        command_line.enabled = FLAGS_enable_metric_reporting;
+    }
+    if (google::GetCommandLineFlagInfo("metrics_port", &info) &&
+        !info.is_default) {
+        command_line.port = static_cast<uint32_t>(FLAGS_metrics_port);
+    }
+    if (google::GetCommandLineFlagInfo("metrics_host", &info) &&
+        !info.is_default) {
+        command_line.host = FLAGS_metrics_host;
+    }
+    return command_line;
+}
+
 void ResolveRpcAddressFromInterfaceOrDie(
     mooncake::MasterConfig& master_config) {
     if (master_config.rpc_interface.empty()) {
@@ -492,13 +516,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cxl_path);
     default_config.GetUInt64("cxl_size", &master_config.cxl_size,
                              FLAGS_cxl_size);
-    default_config.GetBool("enable_metric_reporting",
-                           &master_config.enable_metric_reporting,
-                           FLAGS_enable_metric_reporting);
-    default_config.GetUInt32("metrics_port", &master_config.metrics_port,
-                             FLAGS_metrics_port);
-    default_config.GetString("metrics_host", &master_config.metrics_host,
-                             FLAGS_metrics_host);
     default_config.GetUInt32("rpc_port", &master_config.rpc_port,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
@@ -858,21 +875,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
-    }
-    if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_metric_reporting = FLAGS_enable_metric_reporting;
-    }
-    if ((google::GetCommandLineFlagInfo("metrics_port", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.metrics_port = FLAGS_metrics_port;
-    }
-    if ((google::GetCommandLineFlagInfo("metrics_host", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.metrics_host = FLAGS_metrics_host;
     }
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
@@ -1544,6 +1546,8 @@ int main(int argc, char* argv[]) {
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
+        loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
     try {
         InitClientLivenessConf(loaded_default_config, master_config);
     } catch (const std::invalid_argument& error) {
@@ -1654,9 +1658,9 @@ int main(int argc, char* argv[]) {
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
-        << ", enable_metric_reporting=" << master_config.enable_metric_reporting
-        << ", metrics_port=" << master_config.metrics_port
-        << ", metrics_host=" << master_config.metrics_host
+        << ", enable_metric_reporting=" << master_config.metrics.enabled
+        << ", metrics_port=" << master_config.metrics.port
+        << ", metrics_host=" << master_config.metrics.host
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
         << ", max_kv_soft_pin_ttl=" << master_config.max_kv_soft_pin_ttl
@@ -1788,8 +1792,8 @@ int main(int argc, char* argv[]) {
                 mooncake::WrappedMasterServiceConfig(master_config, version),
                 metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
-            static_cast<uint16_t>(master_config.metrics_port),
-            master_config.enable_metric_reporting, master_config.metrics_host);
+            static_cast<uint16_t>(master_config.metrics.port),
+            master_config.metrics.enabled, master_config.metrics.host);
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;
