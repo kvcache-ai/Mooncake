@@ -135,7 +135,7 @@ std::string ImmutableBucketAllocator::BucketDataPath(int64_t bucket_id) const {
 tl::expected<ImmutableBucketAllocator::BucketPtr, ErrorCode>
 ImmutableBucketAllocator::EnsureActiveBucketLocked(uint64_t required) {
     if (required == 0 || required > bucket_capacity_) {
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (active_bucket_id_ >= 0) {
         const auto current = buckets_.find(active_bucket_id_);
@@ -154,8 +154,12 @@ ImmutableBucketAllocator::EnsureActiveBucketLocked(uint64_t required) {
         active_bucket_id_ = -1;
     }
 
-    if (buckets_.size() >= static_cast<size_t>(max_bucket_count_) ||
-        next_bucket_id_ > kMaxBucketId) {
+    if (next_bucket_id_ > kMaxBucketId) {
+        LOG(ERROR) << "Immutable DFS bucket id space exhausted, next_id="
+                   << next_bucket_id_;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (buckets_.size() >= static_cast<size_t>(max_bucket_count_)) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
@@ -193,7 +197,10 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     if (!layout || layout->end() > bucket.capacity ||
         layout->offset >
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        LOG(ERROR) << "Immutable DFS bucket layout invariant violated, bucket="
+                   << bucket.id << ", append_offset=" << bucket.append_offset
+                   << ", size=" << size;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     BucketEntry entry;
