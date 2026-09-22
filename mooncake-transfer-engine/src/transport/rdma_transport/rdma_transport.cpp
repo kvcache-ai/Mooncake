@@ -881,6 +881,8 @@ Status RdmaTransport::submitTransferTask(
     uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
     int last_local_buffer_id = -1;
+    int last_local_device_id = -1;
+    int last_local_device_buffer_id = -1;
     int last_remote_buffer_id = -1;
     SegmentID last_remote_target_id = static_cast<SegmentID>(-1);
     while (task_index < task_list.size()) {
@@ -909,13 +911,19 @@ Status RdmaTransport::submitTransferTask(
         }
 
         auto request_buffer_id = -1, request_device_id = -1;
+        const int local_hint_device_id =
+            last_local_device_buffer_id == last_local_buffer_id
+                ? last_local_device_id
+                : -1;
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
                          request.length, request_buffer_id, request_device_id,
-                         0, last_local_buffer_id)) {
+                         0, last_local_buffer_id, local_hint_device_id)) {
             request_buffer_id = -1;
             request_device_id = -1;
         } else {
             last_local_buffer_id = request_buffer_id;
+            last_local_device_id = request_device_id;
+            last_local_device_buffer_id = request_buffer_id;
         }
 
         SliceLengthCalculator slice_calc{request,
@@ -959,10 +967,14 @@ Status RdmaTransport::submitTransferTask(
                 }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
+                const int slice_hint_device_id =
+                    last_local_device_buffer_id == last_local_buffer_id
+                        ? last_local_device_id
+                        : -1;
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,
                                  buffer_id, device_id, retry_cnt++,
-                                 last_local_buffer_id))
+                                 last_local_buffer_id, slice_hint_device_id))
                     continue;
                 assert(device_id >= 0 &&
                        static_cast<size_t>(device_id) < context_list_.size());
@@ -975,6 +987,9 @@ Status RdmaTransport::submitTransferTask(
                 assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
                        context_list_.size());
                 found_device = true;
+                last_local_buffer_id = buffer_id;
+                last_local_device_id = device_id;
+                last_local_device_buffer_id = buffer_id;
                 break;
             }
             if (!found_device) {
@@ -1242,11 +1257,11 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
                      size_t length, std::string_view hint,
                      std::string_view local_hca, bool by_local_hca,
                      int &buffer_id, int &device_id, int retry_count,
-                     int hint_buffer_id) {
+                     int hint_buffer_id, int hint_device_id) {
     if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
     const auto &buffers = desc->buffers;
 
-    auto try_buffer = [&](int candidate) -> bool {
+    auto try_buffer = [&](int candidate, bool allow_device_reuse) -> bool {
         if (candidate < 0 || static_cast<size_t>(candidate) >= buffers.size())
             return false;
         const auto &buffer = buffers[candidate];
@@ -1254,8 +1269,24 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             !bufferCoversRange(buffer.addr, buffer.length, offset, length)) {
             return false;
         }
-        const int selected = pickTopologyDevice(
-            desc, buffer, offset, hint, local_hca, retry_count, by_local_hca);
+        int selected = -1;
+        // Consecutive hits in the same offset-independent MR (typical GPU
+        // "cuda:N" buffers) keep the previous topology pick. retry_count > 0
+        // is a failover walk and must re-run selectDevice.
+        if (allow_device_reuse && retry_count == 0 && hint_device_id >= 0 &&
+            buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0) {
+            const size_t nkeys =
+                by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
+            if (static_cast<size_t>(hint_device_id) < nkeys &&
+                (desc->devices.empty() ||
+                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
+                selected = hint_device_id;
+            }
+        }
+        if (selected < 0) {
+            selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
+                                          retry_count, by_local_hca);
+        }
         if (selected < 0) return false;
         buffer_id = candidate;
         device_id = selected;
@@ -1263,15 +1294,15 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
     };
 
     if (const BufferRangeIndex *index = uniqueCoverageIndex(desc)) {
-        if (try_buffer(hint_buffer_id)) return 0;
+        if (try_buffer(hint_buffer_id, true)) return 0;
         const int found = index->findCovering(offset, length);
-        if (found != hint_buffer_id && try_buffer(found)) return 0;
+        if (found != hint_buffer_id && try_buffer(found, false)) return 0;
         return ERR_ADDRESS_NOT_REGISTERED;
     }
 
     for (int candidate = 0; candidate < static_cast<int>(buffers.size());
          ++candidate) {
-        if (try_buffer(candidate)) return 0;
+        if (try_buffer(candidate, candidate == hint_buffer_id)) return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;
 }
@@ -1281,24 +1312,28 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, std::string_view hint,
                                 int &buffer_id, int &device_id, int retry_count,
-                                int hint_buffer_id) {
+                                int hint_buffer_id, int hint_device_id) {
     return selectDeviceImpl(desc, offset, length, hint, {}, false, buffer_id,
-                            device_id, retry_count, hint_buffer_id);
+                            device_id, retry_count, hint_buffer_id,
+                            hint_device_id);
 }
 
 int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
                                           size_t length,
                                           std::string_view local_hca,
                                           int &buffer_id, int &device_id,
-                                          int retry_count, int hint_buffer_id) {
+                                          int retry_count, int hint_buffer_id,
+                                          int hint_device_id) {
     return selectDeviceImpl(desc, offset, length, {}, local_hca, true,
-                            buffer_id, device_id, retry_count, hint_buffer_id);
+                            buffer_id, device_id, retry_count, hint_buffer_id,
+                            hint_device_id);
 }
 
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, int &buffer_id, int &device_id,
-                                int retry_count, int hint_buffer_id) {
+                                int retry_count, int hint_buffer_id,
+                                int hint_device_id) {
     return selectDevice(desc, offset, length, "", buffer_id, device_id,
-                        retry_count, hint_buffer_id);
+                        retry_count, hint_buffer_id, hint_device_id);
 }
 }  // namespace mooncake
