@@ -22,6 +22,10 @@
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef USE_CUDA
+#include <dlfcn.h>
+#include <infiniband/mlx5dv.h>
+#endif
 #ifdef USE_SHCA
 #include <infiniband/shca_17b_types.h>
 #endif
@@ -62,6 +66,39 @@ static int isNullGid(union ibv_gid *gid) {
 }
 
 namespace {
+#ifdef USE_CUDA
+#if CUDA_VERSION < 12080
+#define CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE 0x1
+#endif
+#ifndef MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT
+#define MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT (1 << 0)
+#endif
+using Mlx5RegDmabufMr = ibv_mr *(*)(ibv_pd *, uint64_t, size_t, uint64_t, int,
+                                    int, int);
+
+static Mlx5RegDmabufMr dataDirectRegMr() {
+    static const Mlx5RegDmabufMr reg_mr = []() -> Mlx5RegDmabufMr {
+        dlerror();
+        void *handle = dlopen("libmlx5.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (!handle) {
+            LOG(ERROR) << "MC_RDMA_DATA_DIRECT cannot load libmlx5: "
+                       << dlerror();
+            return nullptr;
+        }
+        void *symbol = dlvsym(handle, "mlx5dv_reg_dmabuf_mr", "MLX5_1.25");
+        if (!symbol) {
+            const char *error = dlerror();
+            LOG(ERROR) << "MC_RDMA_DATA_DIRECT requires "
+                          "mlx5dv_reg_dmabuf_mr@MLX5_1.25 in libmlx5"
+                       << (error ? std::string(": ") + error : "");
+            dlclose(handle);
+        }
+        return reinterpret_cast<Mlx5RegDmabufMr>(symbol);
+    }();
+    return reg_mr;
+}
+#endif
+
 bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_start = reinterpret_cast<uintptr_t>(region.addr);
     const auto region_length = static_cast<uintptr_t>(region.mr->length);
@@ -414,6 +451,15 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
     (void)length;
+    const bool data_direct = Environ::Get().GetRdmaDataDirect();
+    if (data_direct) {
+#ifdef USE_CUDA
+        if (!dataDirectRegMr()) return ERR_CONTEXT;
+#else
+        LOG(ERROR) << "MC_RDMA_DATA_DIRECT requires a CUDA build";
+        return ERR_CONTEXT;
+#endif
+    }
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_SUPA)
     // Decide host vs GPU without assuming the presence of nvidia-peermem. Host
@@ -428,7 +474,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         out.method = DmabufExport::Method::kHostReg;
 #if defined(USE_CUDA) || defined(USE_SUPA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
-               Environ::Get().GetWithNvidiaPeermem()) {
+               Environ::Get().GetWithNvidiaPeermem() && !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
         out.method = DmabufExport::Method::kHostReg;
@@ -507,17 +553,23 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
                        " expandable_segments.";
         }
 
-        // flags must be 0: the PCIE-BAR1 mapping flag is rejected (error 801)
-        // on some GPU/driver combinations (e.g. B200).
+        // Without Data Direct, flags must be 0: the PCIE-BAR1 mapping flag is
+        // rejected (error 801) on some GPU/driver combinations (e.g. B200).
+        unsigned long long export_flags = 0;
+#ifdef USE_CUDA
+        if (data_direct)
+            export_flags = CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE;
+#endif
         result = cuMemGetHandleForAddressRange(
             &dmabuf_fd, exportBase, exportSize,
-            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, export_flags);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
                        << " base=" << (uintptr_t)exportBase
-                       << " size=" << exportSize << " cuda error=" << errStr;
+                       << " size=" << exportSize << " flags=" << export_flags
+                       << " cuda error=" << errStr;
 #if defined(USE_CUDA) || defined(USE_SUPA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif
@@ -650,8 +702,18 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // by the caller until every NIC has registered; this MR takes its own
         // reference, so all NICs share one dma_buf object (and one BAR1
         // window).
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, exp.offset, length, (uintptr_t)addr,
-                                      exp.fd, access);
+#ifdef USE_CUDA
+        if (Environ::Get().GetRdmaDataDirect()) {
+            auto reg_mr = dataDirectRegMr();
+            if (!reg_mr) return ERR_CONTEXT;
+            mrMeta.mr = reg_mr(pd_, exp.offset, length, (uintptr_t)addr, exp.fd,
+                               access, MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+        } else
+#endif
+        {
+            mrMeta.mr = ibv_reg_dmabuf_mr(pd_, exp.offset, length,
+                                          (uintptr_t)addr, exp.fd, access);
+        }
     } else {
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     }
@@ -661,7 +723,9 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #endif
     if (!mrMeta.mr) {
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
-                    << length << " dmabuf_offset " << exp.offset;
+                    << length << " dmabuf_offset " << exp.offset << " on "
+                    << device_name_ << " MC_RDMA_DATA_DIRECT="
+                    << Environ::Get().GetRdmaDataDirect();
         return ERR_CONTEXT;
     }
     return 0;
