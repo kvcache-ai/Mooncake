@@ -19,7 +19,7 @@
 
 #include "client_service.h"
 #include "environ.h"
-#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "test_server_helpers.h"
