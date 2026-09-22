@@ -58,11 +58,25 @@ else()
       "conductor: msgpack-cxx via headers in ${CONDUCTOR_MSGPACK_INCLUDE_DIR}")
 endif()
 
+# In the top-level build mooncake-common/common.cmake has already found
+# yalantinglibs; its config.cmake mutates the imported target and cannot run
+# twice, because the target belongs to the parent scope. Guard it so both the
+# top-level and standalone paths configure.
+if(NOT TARGET yalantinglibs::yalantinglibs)
+  find_package(yalantinglibs CONFIG REQUIRED)
+endif()
+
 add_library(
   conductor_cpp_core STATIC
-  src/common/utils.cpp src/prefixindex/hash_strategy.cpp
-  src/prefixindex/prefix_indexer.cpp src/zmq/msg_decoder.cpp
-  src/zmq/zmq_client.cpp src/kvevent/object_key_parser.cpp)
+  src/common/utils.cpp
+  src/prefixindex/hash_strategy.cpp
+  src/prefixindex/prefix_indexer.cpp
+  src/zmq/msg_decoder.cpp
+  src/zmq/zmq_client.cpp
+  src/kvevent/object_key_parser.cpp
+  src/kvevent/config.cpp
+  src/kvevent/event_handler.cpp
+  src/kvevent/event_manager.cpp)
 
 # mooncake-common headers are consumed directly instead of linking
 # mooncake_common: the helpers conductor needs (ascii_string.h,
@@ -77,8 +91,22 @@ target_include_directories(
 
 target_link_libraries(
   conductor_cpp_core
-  PUBLIC OpenSSL::Crypto ${CONDUCTOR_ZMQ_LIBS} ${CONDUCTOR_MSGPACK_LIBS}
-         glog::glog JsonCpp::JsonCpp Threads::Threads)
+  PUBLIC OpenSSL::Crypto
+         ${CONDUCTOR_ZMQ_LIBS}
+         ${CONDUCTOR_MSGPACK_LIBS}
+         yalantinglibs::yalantinglibs
+         glog::glog
+         JsonCpp::JsonCpp
+         Threads::Threads)
+
+# The top-level build compiles yalantinglibs against its own asio; picking that
+# up keeps this target's coroutine HTTP server ABI-consistent with the parent.
+if(TARGET asio_shared)
+  target_link_libraries(conductor_cpp_core PUBLIC asio_shared ibverbs)
+endif()
+
+add_executable(mooncake_conductor src/main.cpp)
+target_link_libraries(mooncake_conductor PRIVATE conductor_cpp_core)
 
 # The /query hash chain prefers the low-level SHA256_* API, which hashes through
 # a stack context instead of allocating an EVP context per call. Those
@@ -115,3 +143,5 @@ if(BUILD_UNIT_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+install(TARGETS mooncake_conductor DESTINATION bin)
