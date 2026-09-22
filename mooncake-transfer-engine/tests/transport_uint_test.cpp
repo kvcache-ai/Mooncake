@@ -37,6 +37,7 @@
 
 #include "multi_transport.h"
 #include "transfer_engine.h"
+#include "transfer_engine_c.h"
 #include "transfer_engine_impl.h"
 #include "transport/transport.h"
 #ifdef USE_TENT
@@ -1333,6 +1334,46 @@ TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
 
     Transport::Slice::sealTaskSubmission(&task);
     EXPECT_EQ(batch.finished_task_count.load(), 1);
+}
+#endif
+
+#ifdef USE_TENT
+TEST(TransferEngineTentCompatibilityTest,
+     InstallTransportReturnsCompatibilityHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    TransferEngine engine;
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "tent-install-transport"), 0);
+
+    auto* transport = engine.installTransport("tcp", nullptr);
+    ASSERT_NE(transport, nullptr);
+    EXPECT_EQ(transport->allocateBatchID(1), INVALID_BATCH_ID);
+    EXPECT_EQ(transport->freeBatchID(INVALID_BATCH_ID).code(),
+              Status::Code::kNotImplemented);
+    EXPECT_EQ(transport->submitTransfer(0, {}).code(),
+              Status::Code::kNotImplemented);
+    TransferStatus status{};
+    EXPECT_EQ(transport->getTransferStatus(0, 0, status).code(),
+              Status::Code::kNotImplemented);
+    EXPECT_EQ(engine.uninstallTransport("tcp"), 0);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     CApiInstallTransportReturnsCompatibilityHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    transfer_engine_t engine = createTransferEngine(
+        P2PHANDSHAKE, "tent-c-api-install-transport", "", 0, false);
+    ASSERT_NE(engine, nullptr);
+
+    EXPECT_NE(installTransport(engine, "tcp", nullptr), nullptr);
+    EXPECT_EQ(uninstallTransport(engine, "tcp"), 0);
+    destroyTransferEngine(engine);
 }
 #endif
 

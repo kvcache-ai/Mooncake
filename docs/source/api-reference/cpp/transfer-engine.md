@@ -445,7 +445,10 @@ Installs a transport backend explicitly.
 
 - `proto`: Transport protocol name, such as `rdma`, `tcp`, `nvmeof`, or `shm`.
 - `args`: Transport-specific arguments.
-> Note: In TENT, `installTransport` is not exposed (removed from the public API, including compatibility surfaces). Transport selection is internal to TENT.
+> Note: In TENT, this method is a compatibility no-op and returns a non-null
+> handle for callers that check the classic success contract. The handle cannot
+> submit or query transfers; TENT selects transports internally from its
+> configuration.
 
 #### TransferEngine::uninstallTransport
 

@@ -316,6 +316,7 @@ class TransferEngine {
 
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::unique_ptr<Transport> tent_compat_transport_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
     // Classic callers provide this through TransferEngine(auto_discover,
     // filter) before init() creates the native TENT engine.
