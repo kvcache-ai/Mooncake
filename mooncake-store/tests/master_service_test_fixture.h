@@ -157,7 +157,7 @@ class MasterServiceTest : public ::testing::Test {
     std::unique_ptr<SharedMutexLocker> LockMetadataShardForTest(
         MasterService& service, size_t shard_idx) {
         return std::make_unique<SharedMutexLocker>(
-            &service.metadata_shards_[shard_idx].mutex);
+            &MasterServiceTestPeer::MetadataShards(service)[shard_idx].mutex);
     }
 
     size_t MetadataBucketCount(

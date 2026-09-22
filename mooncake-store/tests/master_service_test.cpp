@@ -605,7 +605,7 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
         config.replica_num = 1;
         config.dfs_replica_num = 1;
 
-        for (const std::string& key : {"memory_full_a", "memory_full_b"}) {
+        for (const char* key : {"memory_full_a", "memory_full_b"}) {
             auto start = service.PutStart(context.client_id, key,
                                           TenantId::Default(), 4096, config);
             ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
@@ -624,7 +624,7 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
         ASSERT_FALSE(failed.has_value());
         EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-        for (const std::string& key : {"memory_full_a", "memory_full_b"}) {
+        for (const char* key : {"memory_full_a", "memory_full_b"}) {
             auto query = service.GetReplicaList(key, TenantId::Default());
             ASSERT_TRUE(query.has_value()) << key;
             ASSERT_EQ(query->replicas.size(), 1u);
@@ -691,7 +691,7 @@ TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
         ASSERT_TRUE(old_memory_address.has_value());
         ASSERT_TRUE(old_bucket_id.has_value());
 
-        service.RunDfsEvictionForTesting();
+        MasterServiceTestPeer(service).RunDfsEvictionForTesting();
         auto after_eviction =
             service.GetReplicaList("upsert_restore", TenantId::Default());
         ASSERT_TRUE(after_eviction.has_value());
