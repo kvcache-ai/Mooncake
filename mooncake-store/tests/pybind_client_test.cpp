@@ -3367,6 +3367,92 @@ TEST_F(RealClientTest, GetBufferHealUsesReaderTenantForCrossTenantReplica) {
     std::remove(quota_path);
 }
 
+// fcczzz's review on #3889 (isolation-off follow-up): with tenant isolation
+// disabled the master resolves every request to "default", so the offload
+// file is written under the default scope no matter what tenant a reader is
+// configured with. A tenant-a reader's verify then probed the tenant-a scope,
+// reported the healthy default-scoped file missing, and the master normalized
+// the follow-up eviction to "default" and deleted that healthy replica. On a
+// scoped miss the handler now also probes the default scope and answers
+// undetermined instead of evicting on the ambiguity.
+TEST_F(RealClientTest, GetBufferHealDoesNotEvictHealthyReplicaWhenTenancyIsOff) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_tenancy_off_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    // No enable_multi_tenants: the master resolves everything to "default".
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "tenancy_off_heal";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    const auto disk_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool disk_ready = false;
+    while (std::chrono::steady_clock::now() < disk_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) disk_ready = true;
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    // A reader configured for tenant-a still sees the replica (the master
+    // resolves its query to "default"), but its storage read is scoped with
+    // its own tenant and misses. Its verify must NOT evict the healthy
+    // default replica.
+    auto reader = RealClient::create();
+    ASSERT_EQ(reader->setup_real("localhost:17814", "P2PHANDSHAKE",
+                                 16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                                 master_address_, nullptr, "", false, "",
+                                 "tenant-a"),
+              0);
+
+    EXPECT_EQ(reader->get_buffer(key), nullptr);
+    bool disk_replica_survives = false;
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        if (replica.is_local_disk_replica()) disk_replica_survives = true;
+    }
+    EXPECT_TRUE(disk_replica_survives);
+
+    reader->tearDownAll();
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

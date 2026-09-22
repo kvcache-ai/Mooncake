@@ -7261,17 +7261,20 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
         co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     // The write path scopes offload files by the object's recorded tenant,
-    // not by this client's own tenant, so probing under client_->tenant_id()
-    // would miss (and the eviction would target a record that does not
-    // exist) whenever the two differ. The reader reached this replica through
-    // its own tenant's master records, so the request tenant matches the
-    // write scope. SSD I/O off the coro_rpc IO thread. Same heap-owned state
-    // pattern as batch_get_offload_object: the lambda captures only a raw
-    // pointer, every owning value lives in the heap state.
+    // which is the tenant the master resolved for it. The reader reached this
+    // replica through its own tenant's master records, so the request tenant
+    // matches the write scope when tenant isolation is on. With isolation off
+    // the master resolves every request to "default", and the write scope is
+    // always "default" regardless of the reader's configured tenant: a scoped
+    // probe would report a healthy default-scoped file missing, and the
+    // master would then normalize the follow-up eviction to "default" and
+    // delete that healthy replica. So on a scoped miss we probe the default
+    // scope too and refuse to evict on the ambiguity.
     struct CallState {
         std::string tenant_id;
         std::vector<std::string> raw_keys;
         std::vector<std::string> scoped_keys;
+        std::vector<std::string> default_scoped_keys;
         std::shared_ptr<FileStorage> file_storage;
         std::shared_ptr<Client> client;
     };
@@ -7280,8 +7283,11 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
     const TenantId scoped_tenant(request.tenant_id);
     state->raw_keys = request.keys;
     state->scoped_keys.reserve(request.keys.size());
+    state->default_scoped_keys.reserve(request.keys.size());
     for (const auto &key : request.keys) {
         state->scoped_keys.emplace_back(scoped_tenant.MakeScopedKey(key));
+        state->default_scoped_keys.emplace_back(
+            TenantId::Default().MakeScopedKey(key));
     }
     state->file_storage = file_storage_;
     state->client = client_;
@@ -7301,6 +7307,22 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
             if (*exists) {
                 states.push_back(1);
                 continue;
+            }
+            // A scoped miss is not proof of absence. When the request tenant
+            // is not "default", the file may sit under the default scope
+            // instead: with tenant isolation off every write lands there no
+            // matter what tenant the reader configured, and under isolation a
+            // different tenant's object can share the raw key. Either way the
+            // object the reader meant is indistinguishable from the one we
+            // would find, so report undetermined rather than evict a possibly
+            // healthy replica.
+            if (s->tenant_id != TenantId::Default().value()) {
+                auto default_exists =
+                    s->file_storage->Exists(s->default_scoped_keys[i]);
+                if (!default_exists || *default_exists) {
+                    states.push_back(2);
+                    continue;
+                }
             }
             // The backing file is gone for good. The master scopes LOCAL_DISK
             // eviction to the owning client, so the eviction has to happen on
