@@ -21,8 +21,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
 #include <string>
+#include <type_traits>
 
 #include "config.h"
 #include "multi_transport.h"
@@ -44,8 +46,13 @@ class SubmitTransferTaskTest : public ::testing::Test {
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::unique_ptr<RdmaTransport> transport_;
-    std::shared_ptr<RdmaContext> context_;
     uint64_t block_size_ = 0;
+    int local_device_id_ = -1;
+    int global_device_id_ = -1;
+
+    uint32_t lkeyForDevice(int device_id) const {
+        return static_cast<uint32_t>(100 + device_id);
+    }
 
     void SetUp() override {
         block_size_ = globalConfig().slice_size;
@@ -55,23 +62,42 @@ class SubmitTransferTaskTest : public ::testing::Test {
         RdmaTransportTestPeer::bindMetadata(*transport_, metadata_,
                                             "unit-test-server:1234");
 
-        // construct() is never called: no real device is opened. active()
-        // defaults to true, which is all submitTransferTask() checks.
-        context_ = std::make_shared<RdmaContext>(*transport_, "mlx5_unit_test");
-        RdmaTransportTestPeer::addContext(*transport_, context_);
-
         auto desc = std::make_shared<SegmentDesc>();
         desc->name = "unit-test-server:1234";
         desc->protocol = "rdma";
+        ASSERT_EQ(desc->topology.parse(R"({"cpu:0": [["mlx5_local"], []],)"
+                                       R"("cpu:1": [["mlx5_global"], []]})"),
+                  0);
+
+        const auto &hca_list = desc->topology.getHcaList();
+        auto device_id = [&hca_list](const std::string &name) {
+            const auto it = std::find(hca_list.begin(), hca_list.end(), name);
+            return it == hca_list.end()
+                       ? -1
+                       : static_cast<int>(std::distance(hca_list.begin(), it));
+        };
+        local_device_id_ = device_id("mlx5_local");
+        global_device_id_ = device_id("mlx5_global");
+        ASSERT_GE(local_device_id_, 0);
+        ASSERT_GE(global_device_id_, 0);
+
+        // construct() is never called: no real device is opened. active()
+        // defaults to true, which is all submitTransferTask() checks. Contexts
+        // and lkeys must retain the topology's global HCA index ordering.
+        for (const auto &hca : hca_list) {
+            auto context = std::make_shared<RdmaContext>(*transport_, hca);
+            RdmaTransportTestPeer::addContext(*transport_, std::move(context));
+        }
+
         BufferDesc buffer;
         buffer.name = "cpu:0";
         buffer.addr = kBufferAddr;
         buffer.length = block_size_;
-        buffer.lkey = {1};
-        buffer.rkey = {1};
-        desc->buffers.push_back(buffer);
-        ASSERT_EQ(
-            desc->topology.parse(R"({"cpu:0": [["mlx5_unit_test"], []]})"), 0);
+        for (size_t i = 0; i < hca_list.size(); ++i) {
+            buffer.lkey.push_back(lkeyForDevice(static_cast<int>(i)));
+            buffer.rkey.push_back(lkeyForDevice(static_cast<int>(i)));
+        }
+        desc->buffers.push_back(std::move(buffer));
         metadata_->addLocalSegment(LOCAL_SEGMENT_ID, desc->name,
                                    std::move(desc));
     }
@@ -95,7 +121,43 @@ class SubmitTransferTaskTest : public ::testing::Test {
         ASSERT_EQ(task.slice_list.size(), 2u);
         EXPECT_EQ(transport_->freeBatchID(task.batch_id), Status::OK());
     }
+
+    uint32_t selectedLkey(Transport::TransferRequest &req) {
+        Transport::TransferTask task;
+        triggerError(req, task);
+        return task.slice_list.front()->rdma.source_lkey;
+    }
 };
+
+TEST_F(SubmitTransferTaskTest, NicHintKeepsRequestLayoutLightweight) {
+    EXPECT_EQ(sizeof(Transport::TransferRequest), 64u);
+    EXPECT_TRUE(std::is_trivially_copyable_v<Transport::TransferRequest>);
+}
+
+TEST_F(SubmitTransferTaskTest, EmptyNicHintPreservesDefaultSelection) {
+    Transport::TransferRequest default_request;
+    Transport::TransferRequest explicit_empty_request;
+    explicit_empty_request.nic_hint = -1;
+
+    EXPECT_EQ(selectedLkey(default_request), lkeyForDevice(local_device_id_));
+    EXPECT_EQ(selectedLkey(explicit_empty_request),
+              lkeyForDevice(local_device_id_));
+}
+
+TEST_F(SubmitTransferTaskTest, NicHintUsesWildcardWhenAbsentFromLocation) {
+    Transport::TransferRequest request;
+    request.nic_hint = global_device_id_;
+
+    EXPECT_EQ(selectedLkey(request), lkeyForDevice(global_device_id_));
+}
+
+TEST_F(SubmitTransferTaskTest, SubmitRetryDropsNicHint) {
+    Transport::TransferRequest request;
+    request.nic_hint = global_device_id_;
+    request.advise_retry_cnt = 1;
+
+    EXPECT_EQ(selectedLkey(request), lkeyForDevice(local_device_id_));
+}
 
 TEST_F(SubmitTransferTaskTest, NoDuplicateSlice) {
     Transport::Slice *original = nullptr;

@@ -709,6 +709,16 @@ Json::Value Topology::toJson() const {
     return root;
 }
 
+int Topology::getDeviceIndex(const std::string &storage_type,
+                             std::string_view device_name) const {
+    const auto it = resolved_matrix_.find(storage_type);
+    if (it == resolved_matrix_.end() || device_name.empty()) {
+        return ERR_DEVICE_NOT_FOUND;
+    }
+    const int hca_idx = it->second.getHcaIndex(std::string(device_name));
+    return hca_idx >= 0 ? hca_idx : ERR_DEVICE_NOT_FOUND;
+}
+
 int Topology::selectDevice(const std::string storage_type,
                            std::string_view hint, int retry_count) {
     const auto it = resolved_matrix_.find(std::string(storage_type));

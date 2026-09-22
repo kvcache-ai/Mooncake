@@ -220,6 +220,8 @@ class TransferEnginePy {
     uintptr_t getEnginePtr() const { return (uintptr_t)engine_.get(); }
 
    private:
+    int resolveNicHint(const std::string &name) const;
+
     char *allocateRawBuffer(size_t capacity);
 
     int findClassId(size_t size);

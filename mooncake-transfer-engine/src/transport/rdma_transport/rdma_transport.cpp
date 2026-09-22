@@ -861,6 +861,14 @@ Status RdmaTransport::submitTransferTask(
         target_segment_descs;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
+    const auto &local_hca_list = local_segment_desc->topology.getHcaList();
+    auto nic_hint_name = [&local_hca_list](int nic_hint) -> std::string_view {
+        if (nic_hint < 0 ||
+            static_cast<size_t>(nic_hint) >= local_hca_list.size()) {
+            return {};
+        }
+        return local_hca_list[static_cast<size_t>(nic_hint)];
+    };
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
     const size_t kFragmentSize = globalConfig().fragment_limit;
@@ -932,12 +940,11 @@ Status RdmaTransport::submitTransferTask(
         }
 
         // Select once per request so all of its slices normally use the same
-        // local RNIC. A caller-provided hint takes precedence when it names an
-        // eligible device; Topology falls back to its normal policy when the
-        // hint is empty, unknown, or no longer available.
+        // local RNIC. The advisory hint affects initial submission only;
+        // submit-level retries keep the existing topology policy.
         auto request_buffer_id = -1, request_device_id = -1;
         const std::string_view request_hint =
-            request.advise_retry_cnt == 0 ? std::string_view(request.nic_hint)
+            request.advise_retry_cnt == 0 ? nic_hint_name(request.nic_hint)
                                           : std::string_view{};
         const int local_hint_device_id =
             request_hint.empty() &&
@@ -1007,7 +1014,7 @@ Status RdmaTransport::submitTransferTask(
                 // valid. Honor the hint for the initial per-slice attempt too,
                 // then drop it so retries can fail over to another RNIC.
                 const std::string_view slice_hint =
-                    retry_cnt == 0 ? std::string_view(request.nic_hint)
+                    retry_cnt == 0 ? nic_hint_name(request.nic_hint)
                                    : std::string_view{};
                 const int slice_hint_device_id =
                     slice_hint.empty() &&
@@ -1326,14 +1333,20 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
         location = resolveSegmentsLocation(seg_info, buffer.length,
                                            offset - buffer.addr);
     }
-    int device_id =
-        hint.empty() ? desc->topology.selectDevice(location, retry_count)
-                     : desc->topology.selectDevice(location, hint, retry_count);
+    // A named hint is an explicit override: try the buffer location first,
+    // then the global HCA set. Do not call the hint-taking selectDevice()
+    // overload here because it applies normal selection immediately on a
+    // location miss, making the wildcard attempt unreachable.
+    if (!hint.empty()) {
+        int device_id = desc->topology.getDeviceIndex(location, hint);
+        if (device_id >= 0) return device_id;
+        device_id = desc->topology.getDeviceIndex(kWildcardLocation, hint);
+        if (device_id >= 0) return device_id;
+    }
+
+    int device_id = desc->topology.selectDevice(location, retry_count);
     if (device_id >= 0) return device_id;
-    return hint.empty()
-               ? desc->topology.selectDevice(kWildcardLocation, retry_count)
-               : desc->topology.selectDevice(kWildcardLocation, hint,
-                                             retry_count);
+    return desc->topology.selectDevice(kWildcardLocation, retry_count);
 }
 
 int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,

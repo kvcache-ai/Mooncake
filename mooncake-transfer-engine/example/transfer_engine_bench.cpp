@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -399,6 +400,20 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
     uint64_t remote_base =
         (uint64_t)segment_desc->buffers[thread_id % buffer_num].addr;
 
+    int nic_hint_id = -1;
+    if (!FLAGS_nic_hint.empty()) {
+        const auto topology = engine->getLocalTopology();
+        const auto& hca_list = topology->getHcaList();
+        const auto it =
+            std::find(hca_list.begin(), hca_list.end(), FLAGS_nic_hint);
+        if (it == hca_list.end()) {
+            LOG(WARNING) << "Unknown --nic_hint=" << FLAGS_nic_hint
+                         << "; using normal topology selection";
+        } else {
+            nic_hint_id = static_cast<int>(std::distance(hca_list.begin(), it));
+        }
+    }
+
     size_t batch_count = 0;
     while (running) {
         auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
@@ -414,7 +429,7 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
             entry.target_offset =
                 remote_base +
                 FLAGS_block_size * (i * FLAGS_threads + thread_id);
-            entry.nic_hint = FLAGS_nic_hint;
+            entry.nic_hint = nic_hint_id;
             requests.emplace_back(entry);
         }
 

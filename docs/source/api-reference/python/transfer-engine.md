@@ -170,10 +170,11 @@ Gets the address of the first buffer in a specified segment.
 The optional `transport_hint` argument pins the request onto a named transport (`"rdma"`, `"tcp"`, ...), overriding policy-driven selection for that one call. **TENT backend only** (`MC_USE_TENT=1`); silently ignored on the classic backend. See [TENT transport selector](../../design/tent/transport-selector.md) for more details.
 
 The optional `nic_hint` argument prefers a named local RNIC (for example,
-`"mlx5_3"`) for that call. **Classic RDMA only**; an empty, unknown, or
-unavailable device falls back to normal topology-based selection. The hint is
-used only on the initial attempt so retries can fail over to another RNIC. For
-example: `engine.batch_transfer_sync_read(..., nic_hint="mlx5_3")`.
+`"mlx5_3"`) for that call. **Classic RDMA only**; the Python boundary resolves
+it to an index in the local topology. An empty, unknown, or unavailable device
+falls back to normal topology-based selection. The hint affects initial
+submission only; it is advisory rather than a hard pin for an in-flight slice.
+For example: `engine.batch_transfer_sync_read(..., nic_hint="mlx5_3")`.
 ```
 
 #### transfer_sync_write()
