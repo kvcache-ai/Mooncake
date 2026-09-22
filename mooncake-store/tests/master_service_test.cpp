@@ -636,6 +636,117 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_upsert_restore_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.7");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.5");
+    ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+                                   "60");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        std::optional<uint64_t> old_memory_address;
+        std::optional<int> old_bucket_id;
+        for (const std::string key :
+             {"upsert_restore", "bucket_0_peer", "bucket_1_peer"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            if (key == "upsert_restore") {
+                for (const auto& descriptor : *start) {
+                    if (descriptor.is_memory_replica()) {
+                        old_memory_address =
+                            descriptor.get_memory_descriptor()
+                                .buffer_descriptor.buffer_address_;
+                    } else if (descriptor.is_dfs_replica()) {
+                        old_bucket_id =
+                            descriptor.get_dfs_descriptor().shard_idx;
+                    }
+                }
+            }
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+        ASSERT_TRUE(old_memory_address.has_value());
+        ASSERT_TRUE(old_bucket_id.has_value());
+
+        service.RunDfsEvictionForTesting();
+        auto after_eviction =
+            service.GetReplicaList("upsert_restore", TenantId::Default());
+        ASSERT_TRUE(after_eviction.has_value());
+        ASSERT_EQ(after_eviction->replicas.size(), 1u);
+        EXPECT_TRUE(after_eviction->replicas.front().is_memory_replica());
+
+        auto mismatched_config = config;
+        mismatched_config.replica_num = 2;
+        auto mismatched =
+            service.UpsertStart(context.client_id, "upsert_restore",
+                                TenantId::Default(), 4096, mismatched_config);
+        ASSERT_FALSE(mismatched.has_value());
+        EXPECT_EQ(mismatched.error(), ErrorCode::INVALID_PARAMS);
+
+        auto restored = service.UpsertStart(context.client_id, "upsert_restore",
+                                            TenantId::Default(), 4096, config);
+        ASSERT_TRUE(restored.has_value()) << restored.error();
+        ASSERT_EQ(restored->size(), 2u);
+        bool restored_memory = false;
+        bool restored_dfs = false;
+        for (const auto& descriptor : *restored) {
+            if (descriptor.is_memory_replica()) {
+                restored_memory = true;
+                EXPECT_NE(descriptor.get_memory_descriptor()
+                              .buffer_descriptor.buffer_address_,
+                          *old_memory_address);
+            } else if (descriptor.is_dfs_replica()) {
+                restored_dfs = true;
+                EXPECT_NE(descriptor.get_dfs_descriptor().shard_idx,
+                          *old_bucket_id);
+            }
+        }
+        EXPECT_TRUE(restored_memory);
+        EXPECT_TRUE(restored_dfs);
+        ASSERT_TRUE(service
+                        .UpsertEnd(context.client_id, "upsert_restore",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        auto complete =
+            service.GetReplicaList("upsert_restore", TenantId::Default());
+        ASSERT_TRUE(complete.has_value());
+        EXPECT_EQ(complete->replicas.size(), 2u);
+        EXPECT_EQ(
+            std::count_if(complete->replicas.begin(), complete->replicas.end(),
+                          [](const Replica::Descriptor& descriptor) {
+                              return descriptor.is_dfs_replica();
+                          }),
+            1);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
 TEST_F(MasterServiceTest,
        DfsBucketConcurrentPutAndUpsertShareSingleRecoveryBucket) {
     const auto dfs_root =

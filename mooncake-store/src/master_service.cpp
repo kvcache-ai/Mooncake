@@ -5626,7 +5626,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
 // Three-way dispatch depending on key state:
 //   Case A: key does not exist  → allocate new buffers (same as PutStart)
 //   Case B: key exists, same size, no readers → in-place update
-//   Case C: key exists, different size or leased memory → allocate new buffers
+//   Case C: key exists, different size, bucket DFS, or leased memory → allocate
+//           new buffers
 //
 // Before reaching Case B/C the function runs safety checks and may preempt
 // an in-progress Put/Upsert on the same key.  Preempted PROCESSING replicas
@@ -5905,6 +5906,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
                 }
 
+                bool restore_missing_bucket_dfs = false;
                 if (metadata.size == slice_length) {
                     // Validate same-size DFS topology before changing storage.
                     const size_t existing_dfs_replicas =
@@ -5916,9 +5918,16 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 &Replica::fn_is_memory_replica);
                         const size_t existing_nof_replicas =
                             metadata.CountReplicas(&Replica::fn_is_nof_replica);
+                        restore_missing_bucket_dfs =
+                            bucket_allocator_ != nullptr &&
+                            existing_memory_replicas == config.replica_num &&
+                            existing_nof_replicas == config.nof_replica_num &&
+                            existing_dfs_replicas == 0 &&
+                            config.dfs_replica_num > 0;
                         if (existing_memory_replicas != config.replica_num ||
                             existing_nof_replicas != config.nof_replica_num ||
-                            existing_dfs_replicas != config.dfs_replica_num) {
+                            (existing_dfs_replicas != config.dfs_replica_num &&
+                             !restore_missing_bucket_dfs)) {
                             LOG(ERROR)
                                 << "key=" << key
                                 << ", error=dfs_upsert_topology_mismatch"
@@ -5949,7 +5958,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     bucket_allocator_ != nullptr &&
                     metadata.HasReplica(&Replica::fn_is_dfs_replica);
                 if (metadata.size == slice_length && !has_read_lease &&
-                    !has_bucket_dfs_replica) {
+                    !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
@@ -5987,8 +5996,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return replica_list;
                 }
 
-                // --- Case C: different size, bucket DFS, or active readers —
-                // reallocate
+                // --- Case C: different size, bucket DFS (including a replica
+                // lost to bucket eviction), or active readers — reallocate
                 // --- Old buffers cannot be reused.  Move them to
                 // discarded_replicas_ for delayed release (readers may still
                 // hold descriptors without refcnt), then allocate fresh buffers
