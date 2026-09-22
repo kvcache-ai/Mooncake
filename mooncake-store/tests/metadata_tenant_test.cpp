@@ -166,6 +166,40 @@ TEST(TenantTest, RebuildGroupStateRegroupsTheSameMembers) {
     EXPECT_EQ(rebuilt_first.get(), rebuilt_second.get());
 }
 
+TEST(TenantTest, ResetDynamicReplicationStateClearsTheLeasesItHolds) {
+    Tenant tenant;
+    auto entry = test::MakeObjectEntry("k1", "g1");
+    ASSERT_TRUE(tenant.InsertObject(entry));
+
+    // What a replica-action proposal leaves behind: one lease in flight, a
+    // cooldown before the next action, and the proposal the entry waits on.
+    ReplicaActionLease lease;
+    lease.key = "k1";
+    tenant.PutDynamicReplicationLease(UUID{7, 8}, lease);
+    entry->WithExclusiveAccess([](ObjectMetadata&, ObjectEntry::State& state) {
+        state.dynamic_replication_pending = DynamicReplicaPending{};
+        state.dynamic_replication_cooldown =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    });
+    ASSERT_FALSE(tenant.Empty());
+
+    entry->WithExclusiveAccess([&](ObjectMetadata&, ObjectEntry::State& state) {
+        tenant.ResetDynamicReplicationState(state, entry->key());
+    });
+
+    // The reset drops the lease and the cooldown and leaves the object routed,
+    // which is what separates this path from RemoveObject.
+    EXPECT_TRUE(tenant.ContainsObject("k1"));
+    EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
+    EXPECT_TRUE(entry->WithSharedAccess(
+        [](const ObjectMetadata&, const ObjectEntry::State& state) {
+            return !state.dynamic_replication_pending.has_value() &&
+                   state.dynamic_replication_cooldown ==
+                       std::chrono::steady_clock::time_point{};
+        }));
+    EXPECT_FALSE(tenant.Empty());
+}
+
 TEST(TenantTest, PromotionCandidateKeysTrackWhatWasIndexed) {
     Tenant tenant;
     EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());

@@ -181,6 +181,19 @@ class Tenant {
 
     // --- In-flight replica-action leases ------------------------------------
 
+    // Clears the replica-action state of one object: the pending proposal, the
+    // cooldown, and the leases still in flight for its key. The caller passes
+    // the state it already holds under the entry's lock, so this joins a larger
+    // critical section rather than taking the entry lock again. `RemoveObject`
+    // is the teardown path; this is the reset path, which leaves the object
+    // routed.
+    void ResetDynamicReplicationState(ObjectEntry::State& state,
+                                      std::string_view key) {
+        state.dynamic_replication_pending.reset();
+        state.dynamic_replication_cooldown = {};
+        lease_table_.EraseForObject(key);
+    }
+
     [[nodiscard]] std::optional<ReplicaActionLease> FindDynamicReplicationLease(
         const UUID& proposal_id) const {
         return lease_table_.Find(proposal_id);
