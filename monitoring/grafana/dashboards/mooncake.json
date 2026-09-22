@@ -865,7 +865,7 @@
       "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "rate(master_batch_put_start_items_total[5m])", "legendFormat": "BatchPutStart Items", "refId": "A" },
-        { "expr": "rate(master_batch_put_start_object_already_exists_total[5m])", "legendFormat": "BatchPutStart Already Exists Items", "refId": "B" }
+        { "expr": "rate(master_batch_put_start_object_already_exists_total[5m])", "legendFormat": "BatchPutStart Already Exists Items", "refId": "B" },
         { "expr": "rate(master_batch_put_end_items_total[5m])", "legendFormat": "BatchPutEnd Items", "refId": "C" },
         { "expr": "rate(master_batch_get_replica_list_items_total[5m])", "legendFormat": "BatchGetRL Items", "refId": "D" },
         { "expr": "rate(master_batch_exist_key_items_total[5m])", "legendFormat": "BatchExistKey Items", "refId": "E" },
