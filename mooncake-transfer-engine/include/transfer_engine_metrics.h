@@ -13,6 +13,7 @@
 #ifndef TRANSFER_ENGINE_METRICS_H_
 #define TRANSFER_ENGINE_METRICS_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -41,6 +42,15 @@ class TransferEngineMetrics {
     enum class Direction { Read, Write };
 
     static TransferEngineMetrics& instance();
+
+    // Enable task collection process-wide from now on, independently of the
+    // exporter lifecycle. Checking this flag does not construct the singleton.
+    static void enable() {
+        collection_enabled_.store(true, std::memory_order_relaxed);
+    }
+    static bool isEnabled() {
+        return collection_enabled_.load(std::memory_order_relaxed);
+    }
 
     // Start HTTP using MC_TE_METRIC_*; repeated calls are ignored until
     // shutdown.
@@ -79,6 +89,8 @@ class TransferEngineMetrics {
     TransferEngineMetrics& operator=(const TransferEngineMetrics&) = delete;
 
     std::string buildSummary();
+
+    static std::atomic<bool> collection_enabled_;
 
     DirectionMetrics read_{"read"};
     DirectionMetrics write_{"write"};
