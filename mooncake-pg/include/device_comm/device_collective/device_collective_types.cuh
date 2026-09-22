@@ -11,10 +11,28 @@
 
 namespace mooncake {
 
+struct CollectiveStepResult {
+    InGroupRank failed_rank = kInvalidInGroupRank;
+
+    [[nodiscard]] __device__ __forceinline__ bool succeeded() const {
+        return failed_rank == kInvalidInGroupRank;
+    }
+};
+
+// Local data operands for one collective step.
+// count is in T elements. Each operation defines which pointers it uses;
+// unused pointers may be null.
+template <typename T>
+struct CollectiveChunk {
+    const T* source = nullptr;
+    T* destination = nullptr;
+    uint64_t count = 0;
+};
+
 inline constexpr uint32_t kMaxDeviceCollectiveChannels = 32;
 static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
 inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 8;
-inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 1024;
+inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 8192;
 
 inline constexpr bool isDeviceAllReduceCombinationSupported(
     DataType datatype, ReduceOp op) noexcept {
@@ -29,7 +47,6 @@ inline constexpr bool isDeviceAllReduceCombinationSupported(
     }
     switch (datatype) {
         case DataType::Float16:
-            return op == ReduceOp::Sum;
         case DataType::Uint8:
         case DataType::Int8:
         case DataType::Int16:

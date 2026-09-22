@@ -156,8 +156,8 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
     rpc.sockfd = sockfd;
     ASSERT_EQ(server.addRpcMetaEntry("nccl-metadata-test", rpc), 0);
     ASSERT_EQ(server.startHandshakeDaemon(
-                  [](const TransferMetadata::HandShakeDesc& peer,
-                     TransferMetadata::HandShakeDesc& local) {
+                  [](const TransferMetadata::HandShakeDesc &peer,
+                     TransferMetadata::HandShakeDesc &local) {
                       local.payload = "reply:" + peer.payload;
                       return 0;
                   },
@@ -226,14 +226,14 @@ class LocalHttpMetadataServer {
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
+        if (bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr),
                  sizeof(addr)) != 0)
             return;
         if (listen(listen_fd_, 16) != 0) return;
 
         socklen_t len = sizeof(addr);
-        if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) !=
-            0)
+        if (getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&addr),
+                        &len) != 0)
             return;
         port_ = ntohs(addr.sin_port);
         ok_ = true;
@@ -253,7 +253,7 @@ class LocalHttpMetadataServer {
     }
 
    private:
-    static std::string decodeUrlComponent(const std::string& value) {
+    static std::string decodeUrlComponent(const std::string &value) {
         auto hex_digit = [](char c) -> int {
             if (c >= '0' && c <= '9') return c - '0';
             if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -278,7 +278,7 @@ class LocalHttpMetadataServer {
         return decoded;
     }
 
-    static bool sendExact(int fd, const std::string& value) {
+    static bool sendExact(int fd, const std::string &value) {
         size_t offset = 0;
         while (offset < value.size()) {
             const ssize_t n = send(fd, value.data() + offset,
@@ -289,7 +289,7 @@ class LocalHttpMetadataServer {
         return true;
     }
 
-    static bool readRequest(int fd, std::string& request) {
+    static bool readRequest(int fd, std::string &request) {
         constexpr size_t kMaximumRequestSize = 1 << 20;
         char buffer[4096];
         size_t header_end = std::string::npos;
@@ -867,7 +867,7 @@ TEST(TransferMetadataValidationTest, RejectsMoreKeysThanDevices) {
 
     auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
     ASSERT_EQ(server_desc->devices.size(), 1u);
-    auto& buffer = server_desc->buffers[0];
+    auto &buffer = server_desc->buffers[0];
     while (buffer.rkey.size() < kKeyCount) {
         buffer.lkey.push_back(1);
         buffer.rkey.push_back(2);
@@ -906,7 +906,7 @@ TEST(TransferMetadataValidationTest, AcceptsOneKeyPerDevice) {
     const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
 
     auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
-    auto& buffer = server_desc->buffers[0];
+    auto &buffer = server_desc->buffers[0];
     while (server_desc->devices.size() < kDeviceCount) {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name =

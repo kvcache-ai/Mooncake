@@ -36,6 +36,7 @@ enum class TransferResult : uint32_t {
 struct DeviceP2pRoute {
     // Local CUDA address produced by importing the peer's memory mapping.
     uint64_t mapped_region_address;
+    bool native_atomics = false;
 };
 
 struct DeviceRdmaRoute {
@@ -134,6 +135,14 @@ struct DeviceTransferHandle {
     [[nodiscard]] __device__ __forceinline__ DeviceRouteType
     routeType(GlobalRank rank) const {
         return routes[rank].type;
+    }
+
+    // Supports naturally aligned scalar atomic loads/stores up to eight bytes
+    // through remotePtr(). Other routes make no packet-atomicity promise.
+    [[nodiscard]] __device__ __forceinline__ bool supportsNativeAtomics(
+        GlobalRank rank) const {
+        return routes[rank].type == DeviceRouteType::P2p &&
+               routes[rank].p2p.native_atomics;
     }
 
     // Return a lightweight view of one fixed service lane.

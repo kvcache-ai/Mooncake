@@ -1293,6 +1293,12 @@ void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
                   << " backend=" << gpuCollectiveBackendName(selected)
                   << " active_rank_count=" << active_rank_count;
     }
+
+    view.all_reduce_algorithm_choices.clear();
+    if (selected == GpuCollectiveBackend::New) {
+        view.all_reduce_algorithm_choices.push_back(
+            {4096, DeviceAllReduceAlgorithm::OneShot});
+    }
 }
 
 void CentralizedCoordinatorStateMachine::checkGroupTransitions(

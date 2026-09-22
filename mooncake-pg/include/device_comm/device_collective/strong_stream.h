@@ -72,22 +72,28 @@ namespace mooncake {
 //           record H1 ------------>  wait H1                  |
 //              |                    kernel A                  |
 //            wait H2 <------------- record H2                 |
-//              |                       |                      |
-//      recordExternal(serial_event) -> wait tail              |  post-A record
+//              ｜
+//       release: SET {A}               |                      |
 //              |                       |                      |
 //          record H3 -------------------------------------> wait H3
 //              |                       |                   kernel B
 //            wait H4 <------------------------------------ record H4
-//              |                       |                      |
-//      recordExternal(serial_event) ----------------------> wait tail
-//              |                       |                      |  G1 final tail
+//       release: SET {B}               |                      |
 //              |                       |                      |
 //
-//    The ordinary H1-H4 operations become static Graph edges. A's return
-//    handoff advances GraphOrder's capture frontier; B's entry handoff copies
-//    that frontier to user stream B. The resulting Graph therefore contains
-//    the static dependency A -> B. The external-event operations are needed
-//    for cases 3 and 4; they are not what establishes A -> B.
+//    The ordinary H1-H4 operations become static Graph edges. Capturing A
+//    sets the user frontier to {A}; return H2 can leave {old nodes, A} in the
+//    order frontier. release() SETs the order frontier to the user frontier
+//    {A}. A already depends on the old nodes, so retaining them would only
+//    add redundant edges. B's entry handoff copies {A} to user stream B,
+//    establishing A -> B. The external-event operations are needed for
+//    cases 3 and 4; they are not what establishes A -> B.
+//
+//    release() creates one completion record per GraphOrder directly in the
+//    Graph. Later releases replace its incoming edges: A -> completion becomes
+//    A -> B -> completion. This node records serial_event_ on every replay.
+//    Adding/updating it leaves all stream frontiers unchanged, so B inherits
+//    A rather than completion and the record can move after B.
 //
 //    Capture only constructs these nodes and edges. It does not wait for or
 //    execute either kernel.
@@ -129,12 +135,10 @@ namespace mooncake {
 //    collective region, as established in case 2:
 //
 //      G1: waitExternal(serial_event)
-//             -> A -> recordExternal(serial_event) after A
-//             -> B -> recordExternal(serial_event) after B
+//             -> A -> B -> recordExternal(serial_event) after B
 //
 //      G2: waitExternal(serial_event)
-//             -> C -> recordExternal(serial_event) after C
-//             -> D -> recordExternal(serial_event) after D
+//             -> C -> D -> recordExternal(serial_event) after D
 //
 //    The event handle and Graph nodes remain fixed after capture, but every
 //    replay executes those event nodes again. Each record creates a new
@@ -146,32 +150,26 @@ namespace mooncake {
 //
 //      launch(G1):
 //        G1 entry wait  -> previous serial_event_ generation
-//        post-A record  -> generation n
-//        post-B record  -> generation n+1  (latest G1 generation)
+//        post-B record  -> generation n  (latest G1 generation)
 //
 //      launch(G2):
-//        G2 entry wait  -> generation n+1
-//        post-C record  -> generation n+2
-//        post-D record  -> generation n+3  (latest G2 generation)
+//        G2 entry wait  -> generation n
+//        post-D record  -> generation n+1  (latest G2 generation)
 //
-//    G2's entry wait binds to post-B before G2's own later records replace the
+//    G2's entry wait binds to post-B before G2's own later record replaces the
 //    event's current state; a wait is not changed by later records. At runtime:
 //
-//      GPU completes A -> generation n becomes ready
-//                         G2 still waits for generation n+1
-//      GPU completes B -> generation n+1 becomes ready
+//      GPU completes A -> G2 still waits for generation n
+//      GPU completes B -> generation n becomes ready
 //                         G2 may now run C, then D
 //
 //    A later replay executes the same static nodes, but its entry wait binds to
-//    the latest generation from previously submitted work and its records
-//    create fresh generations. This is the same replay-time mechanism used in
+//    the latest generation from previously submitted work and its record
+//    creates a fresh generation. This is the same replay-time mechanism used in
 //    case 3.
 //
 //    The collective order is therefore A -> B -> C -> D, never A -> C -> B ->
-//    D. release() adds a record after every captured collective because it
-//    cannot know whether another call will be appended to that Graph. If
-//    another call is appended, its later record becomes the Graph's published
-//    tail for subsequently submitted work.
+//    D. The Graph publishes completion once, after its last collective.
 //
 //    Reversing the host launch order reverses the two complete collective
 //    regions. Racing Graph launches from different host threads do not define
@@ -239,6 +237,8 @@ class StrongStream {
 
         uint64_t graph_id;
         GpuStream stream;
+        // Owned by the graph, outside every stream's capture frontier.
+        cudaGraphNode_t completion_node = nullptr;
     };
 
     struct PendingRelease {

@@ -1,80 +1,36 @@
 #include "device_comm/device_collective/algorithms/ring/ring_all_reduce.h"
 
-#include <algorithm>
 #include <new>
-#include <utility>
-#include <vector>
 
 #include <glog/logging.h>
 
 #include "device_comm/device_collective/device_control_update.h"
 #include "device_comm/device_collective/device_collective_workspace.h"
-#include "device_comm/device_primitives/payload_writer.h"
+#include "device_comm/device_collective/protocols/simple/simple_resources.h"
 #include "device_comm/device_transfer/transfer_service.h"
-#include "pg_utils.h"
 
 namespace mooncake {
-namespace {
-
-bool rangesOverlap(uint64_t first_offset, uint64_t first_size,
-                   uint64_t second_offset, uint64_t second_size) noexcept {
-    if (addOverflows(first_offset, first_size) ||
-        addOverflows(second_offset, second_size)) {
-        return true;
-    }
-    return first_offset < second_offset + second_size &&
-           second_offset < first_offset + first_size;
-}
-
-bool endpointValid(const DeviceCollectiveWorkspaceEndpoint& workspace,
-                   const DeviceGroupEndpoint& group,
-                   uint64_t required_buffer_size,
-                   uint32_t required_signal_count,
-                   uint32_t required_view_epoch_signal_count) noexcept {
-    if (!group.ring_all_reduce) return false;
-    const auto& ring_endpoint = *group.ring_all_reduce;
-    if (workspace.buffer_size < required_buffer_size ||
-        ring_endpoint.signal_count < required_signal_count ||
-        group.view_epoch_signal_count < required_view_epoch_signal_count) {
-        return false;
-    }
-    const uint64_t signal_bytes =
-        static_cast<uint64_t>(ring_endpoint.signal_count) * sizeof(uint64_t);
-    const uint64_t view_epoch_signal_bytes =
-        static_cast<uint64_t>(group.view_epoch_signal_count) * sizeof(uint64_t);
-    return !rangesOverlap(workspace.buffer_offset, workspace.buffer_size,
-                          ring_endpoint.signal_offset, signal_bytes) &&
-           !addOverflows(group.view_epoch_signal, view_epoch_signal_bytes);
-}
-
-}  // namespace
 
 RingAllReduceAlgorithm::RingAllReduceAlgorithm(
-    DeviceTransferService& transfer_service,
-    DeviceCollectiveWorkspace& workspace,
+    DeviceCollectiveWorkspace& workspace, SimpleResources& simple,
     const DeviceTransferHandle* transfer_handle,
     const uint64_t* view_epoch_signals, InvocationState* invocation_state,
     ControlMailbox* control_mailbox, uint64_t timeout_ticks, int device_index,
-    InGroupRank self_rank, uint32_t max_group_size, RegionSlice signals,
-    RingSignalLayout signal_layout) noexcept
-    : transfer_service_(transfer_service),
-      workspace_(workspace),
+    InGroupRank self_rank) noexcept
+    : workspace_(workspace),
+      simple_(simple),
       transfer_handle_(transfer_handle),
       view_epoch_signals_(view_epoch_signals),
       invocation_state_(invocation_state),
       control_mailbox_(control_mailbox),
       timeout_ticks_(timeout_ticks),
       device_index_(device_index),
-      self_rank_(self_rank),
-      max_group_size_(max_group_size),
-      signals_(std::move(signals)),
-      signal_layout_(signal_layout),
-      endpoint_{.signal_offset = signals_.offset(),
-                .signal_count = signal_layout_.total_signal_count} {}
+      self_rank_(self_rank) {}
 
 PGResult<std::unique_ptr<RingAllReduceAlgorithm>>
 RingAllReduceAlgorithm::create(DeviceTransferService& transfer_service,
                                DeviceCollectiveWorkspace& workspace,
+                               SimpleResources& simple,
                                const uint64_t* view_epoch_signals,
                                InvocationState* invocation_state,
                                ControlMailbox* control_mailbox,
@@ -85,7 +41,8 @@ RingAllReduceAlgorithm::create(DeviceTransferService& transfer_service,
         self_rank >= 0 && static_cast<uint32_t>(self_rank) < max_group_size,
         "Ring self rank is outside the group");
 
-    const auto signal_layout = RingSignalLayout::make(max_group_size);
+    PG_VALIDATE_ARG(simple.maxGroupSize() == max_group_size,
+                    "Ring Simple group capacity mismatch");
     const auto* const transfer_handle = transfer_service.deviceHandle();
     PG_VALIDATE_ARG(transfer_handle, "Ring transfer handle is null");
     PG_VALIDATE_ARG(view_epoch_signals, "Ring View-epoch signal slice is null");
@@ -93,17 +50,11 @@ RingAllReduceAlgorithm::create(DeviceTransferService& transfer_service,
     PG_VALIDATE_ARG(control_mailbox, "Ring control mailbox is null");
     PG_VALIDATE_ARG(workspace.buffer().addr(), "Ring buffer address is null");
 
-    const uint64_t signal_bytes =
-        static_cast<uint64_t>(signal_layout.total_signal_count) *
-        sizeof(uint64_t);
-    PG_TRY(auto signals, transfer_service.allocatePeerAccessible(
-                             signal_bytes, alignof(uint64_t)));
-
     auto algorithm =
         std::unique_ptr<RingAllReduceAlgorithm>(new RingAllReduceAlgorithm(
-            transfer_service, workspace, transfer_handle, view_epoch_signals,
+            workspace, simple, transfer_handle, view_epoch_signals,
             invocation_state, control_mailbox, timeout_ticks, device_index,
-            self_rank, max_group_size, std::move(signals), signal_layout));
+            self_rank));
     PG_TRY(algorithm->initializeDeviceState());
     return algorithm;
 }
@@ -121,11 +72,11 @@ PGResult<void> RingAllReduceAlgorithm::initializeDeviceState() {
         .view_epoch_signals = view_epoch_signals_,
         .invocation_state = invocation_state_,
         .control_mailbox = control_mailbox_,
+        .simple = simple_.state(),
     };
     PG_TRY_CUDA(cudaMemcpy(state_, &initial_state,
                            sizeof(RingAllReduceDeviceState),
                            cudaMemcpyHostToDevice));
-    PG_TRY_CUDA(cudaMemset(signals_.addr(), 0, signals_.size()));
     return {};
 }
 
@@ -148,8 +99,8 @@ void RingAllReduceAlgorithm::releaseDeviceState() noexcept {
 
 RingAllReducePlan RingAllReduceAlgorithm::makePlan(
     uint64_t view_epoch, int32_t self_active_index, uint32_t participant_count,
-    uint64_t buffer_size, RingPeerTarget predecessor, RingPeerTarget successor,
-    char* staging_ptr) const {
+    uint64_t buffer_size, InGroupRank predecessor, InGroupRank successor,
+    uint64_t send_buffer_offset, char* staging_ptr) const {
     PG_ASSERT(buffer_size != 0 && buffer_size <= workspace_.buffer().size(),
               "Ring Plan buffer binding is invalid");
 
@@ -159,11 +110,9 @@ RingAllReducePlan RingAllReduceAlgorithm::makePlan(
         .view_epoch = view_epoch,
         .buffer_ptr = static_cast<char*>(workspace_.buffer().addr()),
         .buffer_size = buffer_size,
-        .signal_ptr = static_cast<uint64_t*>(signals_.addr()),
-        .signal_layout = signal_layout_,
+        .send_buffer_offset = send_buffer_offset,
         .staging_ptr = staging_ptr,
         .staging_size = staging_ptr ? buffer_size : 0,
-        .self_rank = self_rank_,
         .self_active_index = self_active_index,
         .participant_count = participant_count,
         .predecessor = predecessor,
@@ -173,101 +122,37 @@ RingAllReducePlan RingAllReduceAlgorithm::makePlan(
 
 PGResult<void> RingAllReduceAlgorithm::appendPlanUpdate(
     ControlUpdateBuilder& builder) const {
-    // A Plan update also resets all algorithm progress state. Keeping the reset
-    // and Plan copy in one ControlUpdate makes replacing Published safe.
-    PG_VALIDATE_STATE(signals_.size() % sizeof(uint64_t) == 0,
-                      "Ring signal storage is not uint64-aligned");
-    PG_TRY(builder.fillU64(static_cast<uint64_t*>(signals_.addr()), 0,
-                           signal_layout_.total_signal_count));
-    PG_TRY(builder.fillU64(state_->next_step_sequences, 1,
-                           kMaxDeviceCollectiveChannels * kRingPipelineSlots));
-    PG_TRY(builder.fillU64(state_->next_recv_buffer_ready_sequences, 1,
-                           kMaxDeviceCollectiveChannels));
-    PG_TRY(builder.copyBytes(&state_->plan, &host_plan_, sizeof(host_plan_)));
-    return {};
+    return builder.copyBytes(&state_->plan, &host_plan_, sizeof(host_plan_));
 }
 
 void RingAllReduceAlgorithm::useLocalOnly(uint64_t view_epoch) {
-    const RingPeerTarget self{.in_group_rank = self_rank_};
     host_plan_ = RingAllReducePlanSlot{
         .status = DevicePlanStatus::Ready,
-        .plan = makePlan(view_epoch, 0, 1, workspace_.buffer().size(), self,
-                         self, nullptr),
+        .plan =
+            makePlan(view_epoch, 0, 1, workspace_.buffer().size(), self_rank_,
+                     self_rank_, workspace_.buffer().offset(), nullptr),
     };
 }
 
-PGResult<void> RingAllReduceAlgorithm::applyGroupView(const GroupView& view) {
-    PG_ASSERT(view.max_group_size == static_cast<int32_t>(max_group_size_),
-              "Ring group capacity changed");
-
-    std::vector<InGroupRank> participants;
-    participants.reserve(view.rank_order.size());
-    for (InGroupRank in_group_rank = 0;
-         static_cast<size_t>(in_group_rank) < view.rank_order.size();
-         ++in_group_rank) {
-        const auto global_rank = view.rank_order[in_group_rank];
-        const auto& member = view.members[global_rank];
-        if (!member.isActive()) continue;
-        participants.push_back(in_group_rank);
-    }
-
-    const auto self =
-        std::find(participants.begin(), participants.end(), self_rank_);
-    if (self == participants.end()) {
+PGResult<void> RingAllReduceAlgorithm::applyGroupView(
+    const DeviceCollectiveRuntime::ResolvedGroupView& view) {
+    if (view.self_active_index < 0) {
         invalidateHostPlan();
         return {};
     }
+    const auto& participants = view.participants;
 
-    // Every rank must derive the same channel and slot layout even though its
-    // registered buffer has an independent offset and may have a different
-    // capacity. Bind the largest prefix available on every active rank.
-    uint64_t common_buffer_size = workspace_.buffer().size();
-    for (const InGroupRank in_group_rank : participants) {
-        const auto global_rank = view.rank_order[in_group_rank];
-        PG_TRY(auto workspace_endpoint, workspace_.endpoint(global_rank));
-        common_buffer_size =
-            std::min(common_buffer_size, workspace_endpoint.buffer_size);
-    }
-    const auto active_index =
-        static_cast<size_t>(std::distance(participants.begin(), self));
+    const auto active_index = static_cast<size_t>(view.self_active_index);
     const auto participant_count = participants.size();
     const auto predecessor =
-        participants[(active_index + participant_count - 1) %
-                     participant_count];
-    const auto successor = participants[(active_index + 1) % participant_count];
-    auto targetFor =
-        [&](InGroupRank in_group_rank) -> PGResult<RingPeerTarget> {
-        const auto global_rank = view.rank_order[in_group_rank];
-        const auto& member = view.members[global_rank];
-        PG_ASSERT(member.endpoint &&
-                      member.endpoint->device_collective.ring_all_reduce,
-                  "active Ring peer ", in_group_rank, " has no Ring endpoint");
-        const auto& group_endpoint = member.endpoint->device_collective;
-        const auto& ring_endpoint = *group_endpoint.ring_all_reduce;
-        PG_TRY(auto workspace_endpoint, workspace_.endpoint(global_rank));
-        PG_ASSERT(endpointValid(
-                      workspace_endpoint, group_endpoint, common_buffer_size,
-                      signal_layout_.total_signal_count, max_group_size_),
-                  "active Ring peer ", in_group_rank,
-                  " has an invalid endpoint");
-        return RingPeerTarget{
-            .global_rank = global_rank,
-            .in_group_rank = in_group_rank,
-            .buffer_offset = workspace_endpoint.buffer_offset,
-            .signal_offset = ring_endpoint.signal_offset,
-            .view_epoch_signal_offset =
-                group_endpoint.view_epoch_signal +
-                static_cast<uint64_t>(self_rank_) * sizeof(uint64_t),
-        };
-    };
-
-    PG_TRY(auto predecessor_target, targetFor(predecessor));
-    PG_TRY(auto successor_target, targetFor(successor));
+        participants[(active_index + participant_count - 1) % participant_count]
+            .in_group_rank;
+    const auto& successor =
+        participants[(active_index + 1) % participant_count];
     char* staging_ptr = nullptr;
     if (participant_count > 1) {
         PG_TRY(auto requires_staging,
-               payloadWriterRequiresStaging(transfer_service_,
-                                            successor_target.global_rank));
+               simple_.requiresStaging(successor.in_group_rank));
         if (requires_staging) {
             PG_TRY(auto staging, workspace_.staging());
             staging_ptr = static_cast<char*>(staging->addr());
@@ -278,8 +163,8 @@ PGResult<void> RingAllReduceAlgorithm::applyGroupView(const GroupView& view) {
         .status = DevicePlanStatus::Ready,
         .plan = makePlan(view.epoch, static_cast<int32_t>(active_index),
                          static_cast<uint32_t>(participant_count),
-                         common_buffer_size, predecessor_target,
-                         successor_target, staging_ptr),
+                         view.buffer_size, predecessor, successor.in_group_rank,
+                         successor.workspace.buffer_offset, staging_ptr),
     };
     return {};
 }
@@ -288,11 +173,6 @@ void RingAllReduceAlgorithm::invalidateHostPlan() noexcept { host_plan_ = {}; }
 
 bool RingAllReduceAlgorithm::ready() const noexcept {
     return host_plan_.status == DevicePlanStatus::Ready;
-}
-
-const RingAllReduceEndpoint& RingAllReduceAlgorithm::localEndpoint()
-    const noexcept {
-    return endpoint_;
 }
 
 PGResult<void> RingAllReduceAlgorithm::enqueue(

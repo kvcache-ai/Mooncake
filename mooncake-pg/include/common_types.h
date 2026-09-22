@@ -114,6 +114,11 @@ inline constexpr const char* gpuCollectiveBackendName(
     return "unknown";
 }
 
+// Static execution scopes for device helpers. SingleCta covers the calling
+// CTA; MultiCta covers all CTAs in a one-dimensional grid.
+struct SingleCta {};
+struct MultiCta {};
+
 }  // namespace mooncake
 
 #endif  // MOONCAKE_PG_COMMON_TYPES_H

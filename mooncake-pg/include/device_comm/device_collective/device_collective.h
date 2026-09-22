@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include "common_types.h"
 #include "control_plane/control_types.h"
@@ -21,14 +22,37 @@ namespace mooncake {
 
 class DeviceCollectiveWorkspace;
 class RingAllReduceAlgorithm;
+class OneShotAllReduceAlgorithm;
+class SimpleResources;
+class LLResources;
 class StrongStream;
 
-// Algorithm-independent lifecycle facade. It owns communicator view epoch
-// synchronization, invocation and recovery state, stream ordering,
-// control-update publication, and graph references. The selected algorithm owns
-// topology, algorithm resources, and kernel launch policy.
+// Collective lifecycle facade. Owns communicator protocol resources,
+// view-epoch synchronization, invocation/recovery state, control-update
+// publication, and graph references. StrongStream supplies device-wide
+// ordering.
 class DeviceCollectiveRuntime {
    public:
+    struct Peer {
+        GlobalRank global_rank = kInvalidGlobalRank;
+        InGroupRank in_group_rank = kInvalidInGroupRank;
+        DeviceGroupEndpoint endpoint;
+        DeviceCollectiveWorkspaceEndpoint workspace;
+        // Remote word written by this communicator's rank.
+        uint64_t view_epoch_signal_offset = 0;
+    };
+
+    // Host-only input to protocol binding and algorithm Plan construction.
+    // Runtime resolves active peers and View-epoch bindings; protocols
+    // interpret their own endpoints. Algorithms choose connections and payload
+    // layout.
+    struct ResolvedGroupView {
+        uint64_t epoch = 0;
+        int32_t self_active_index = -1;
+        uint64_t buffer_size = 0;
+        std::vector<Peer> participants;
+    };
+
     using FailureRecoveryCallback = std::function<PGResult<void>(InGroupRank)>;
 
     static PGResult<std::unique_ptr<DeviceCollectiveRuntime>> create(
@@ -62,6 +86,7 @@ class DeviceCollectiveRuntime {
     friend class MooncakeCommunicator;
 
     DeviceCollectiveRuntime(DeviceTransferService& transfer_service,
+                            DeviceCollectiveWorkspace& workspace,
                             int device_index, InGroupRank self_rank,
                             uint32_t max_group_size,
                             int32_t* active_ranks_mirror,
@@ -70,6 +95,9 @@ class DeviceCollectiveRuntime {
                             GpuEvent handoff_event);
 
     PGResult<void> attachGraphUse(const GpuCaptureInfo& capture);
+    PGResult<ResolvedGroupView> resolveGroupView(const GroupView& view) const;
+    [[nodiscard]] DeviceAllReduceAlgorithm allReduceAlgorithm(
+        size_t bytes, DataType datatype, ReduceOp op) const noexcept;
     [[nodiscard]] bool hasPendingRecovery() const noexcept;
     PGResult<void> publishControlState(bool pinned,
                                        bool include_active_ranks_mirror);
@@ -77,11 +105,17 @@ class DeviceCollectiveRuntime {
     void releaseState() noexcept;
 
     DeviceTransferService& transfer_service_;
+    DeviceCollectiveWorkspace& workspace_;
     int device_index_ = -1;
     InGroupRank self_rank_ = kInvalidInGroupRank;
     RegionSlice view_epoch_signals_;
     InvocationState* invocation_state_ = nullptr;
-    std::unique_ptr<RingAllReduceAlgorithm> all_reduce_;
+    // Protocol resources outlive all algorithms borrowing them.
+    std::unique_ptr<SimpleResources> simple_;
+    std::unique_ptr<LLResources> ll_;
+    std::unique_ptr<RingAllReduceAlgorithm> ring_all_reduce_;
+    std::unique_ptr<OneShotAllReduceAlgorithm> one_shot_all_reduce_;
+    std::vector<DeviceAllReduceAlgorithmChoice> all_reduce_algorithm_choices_;
     StrongStream& strong_stream_;
     ControlMailbox* control_mailbox_ = nullptr;
     int32_t* active_ranks_mirror_ = nullptr;

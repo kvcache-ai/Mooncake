@@ -7,6 +7,45 @@
 #include "gpu_runtime.h"
 
 namespace mooncake {
+namespace {
+
+struct P2pEndpointMetadata {
+    std::vector<int32_t> handle;
+    std::string device_uuid;
+};
+
+std::string deviceUuid(int device) {
+    cudaDeviceProp properties{};
+    if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return {};
+    }
+    return {properties.uuid.bytes, sizeof(properties.uuid.bytes)};
+}
+
+bool supportsNativeAtomics(const std::string& peer_uuid, int source_device) {
+    if (peer_uuid.size() != sizeof(cudaUUID_t)) return false;
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    for (int peer_device = 0; peer_device < device_count; ++peer_device) {
+        if (deviceUuid(peer_device) != peer_uuid) continue;
+        if (peer_device == source_device) return true;
+        int supported = 0;
+        if (cudaDeviceGetP2PAttribute(
+                &supported, cudaDevP2PAttrNativeAtomicSupported, source_device,
+                peer_device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        return supported != 0;
+    }
+    return false;
+}
+
+}  // namespace
 
 P2pRoute::P2pRoute(device::P2pTransport& transport, void* local_region,
                    int device_index, GlobalRank self_rank,
@@ -30,12 +69,13 @@ uint32_t P2pRoute::routeVersion() const noexcept { return kEndpointVersion; }
 
 std::optional<RouteEndpoint> P2pRoute::localEndpoint() {
     if (!local_region_) return std::nullopt;
-    const auto handle = localHandle();
+    auto handle = localHandle();
     if (handle.empty()) return std::nullopt;
+    P2pEndpointMetadata metadata{std::move(handle), deviceUuid(device_index_)};
     return RouteEndpoint{
         .route_key = std::string(kRouteKey),
         .version = routeVersion(),
-        .metadata = encodeEndpointMetadata(handle),
+        .metadata = encodeEndpointMetadata(metadata),
     };
 }
 
@@ -54,13 +94,16 @@ PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
 
     // Decode the complete snapshot before changing the imported mappings.
     std::vector<std::vector<int32_t>> handles(max_world_size_);
+    std::vector<std::string> device_uuids(max_world_size_);
     std::vector<int> active(max_world_size_, 0);
     for (GlobalRank rank = 0; rank < static_cast<GlobalRank>(max_world_size_);
          ++rank) {
         PG_TRY(auto endpoint, findEndpoint(endpoints[rank]));
         if (!endpoint) continue;
-        PG_TRY(handles[rank],
-               decodeEndpointMetadata<std::vector<int32_t>>(*endpoint));
+        PG_TRY(auto metadata,
+               decodeEndpointMetadata<P2pEndpointMetadata>(*endpoint));
+        handles[rank] = std::move(metadata.handle);
+        device_uuids[rank] = std::move(metadata.device_uuid);
         PG_VALIDATE_ARG(!handles[rank].empty(),
                         "P2P route endpoint handle is empty");
         active[rank] = 1;
@@ -99,7 +142,9 @@ PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
         routes[rank] = DeviceTransferRoute{
             .type = DeviceRouteType::P2p,
             .region_size = endpoints[rank]->region_size,
-            .p2p = {.mapped_region_address = mapped_region_address},
+            .p2p = {.mapped_region_address = mapped_region_address,
+                    .native_atomics = supportsNativeAtomics(device_uuids[rank],
+                                                            device_index_)},
         };
     }
     return routes;

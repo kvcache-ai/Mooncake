@@ -35,7 +35,7 @@ class TransferEngineImpl;
 namespace tent {
 class Config;
 class TransferEngine;
-};
+};  // namespace tent
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 namespace device {

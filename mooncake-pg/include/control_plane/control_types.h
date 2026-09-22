@@ -75,34 +75,43 @@ struct DeviceTransferEndpoint {
     bool operator==(const DeviceTransferEndpoint&) const = default;
 };
 
-// Group-level endpoint of one Ring AllReduce algorithm instance. Signals are
-// communicator-local even though their backing memory comes from the
-// process-wide peer-accessible region.
-struct RingAllReduceEndpoint {
+// Communicator-local signals interpreted by Simple primitives. Payload uses
+// the process-level collective workspace.
+struct SimpleEndpoint {
     uint64_t signal_offset = 0;
     uint32_t signal_count = 0;
 
-    bool operator==(const RingAllReduceEndpoint&) const = default;
+    bool operator==(const SimpleEndpoint&) const = default;
+};
+
+// Communicator-local workspace-ready and tag-wrap signals for LL primitives.
+struct LLEndpoint {
+    uint64_t signal_offset = 0;
+
+    bool operator==(const LLEndpoint&) const = default;
 };
 
 // Group-level endpoints published by the device collective runtime and the
-// algorithms owned by one communicator.
+// protocol instances owned by one communicator.
 struct DeviceGroupEndpoint {
     // Runtime-owned signal slice for synchronizing one GroupView incarnation.
     // Each slot is written only by the peer with the matching InGroupRank.
     uint64_t view_epoch_signal = 0;
     uint32_t view_epoch_signal_count = 0;
 
-    std::optional<RingAllReduceEndpoint> ring_all_reduce;
+    std::optional<SimpleEndpoint> simple;
+    std::optional<LLEndpoint> ll;
 
     [[nodiscard]] bool empty() const noexcept {
-        return view_epoch_signal_count == 0 && !ring_all_reduce.has_value();
+        return view_epoch_signal_count == 0 && !simple.has_value() &&
+               !ll.has_value();
     }
 
-    // True when the runtime and every algorithm required by the New backend
+    // True when the runtime and every protocol required by the New backend
     // have published their group-level endpoints.
     [[nodiscard]] bool hasAllRequiredEndpoints() const noexcept {
-        return view_epoch_signal_count != 0 && ring_all_reduce.has_value();
+        return view_epoch_signal_count != 0 && simple.has_value() &&
+               ll.has_value();
     }
 
     [[nodiscard]] bool supportsBackend(
@@ -208,6 +217,19 @@ enum class GroupStatus : uint8_t {
     Ready = 2,
 };
 
+enum class DeviceAllReduceAlgorithm : uint8_t {
+    Ring = 1,
+    OneShot = 2,
+};
+
+// Coordinator-provided upper bounds, in increasing byte order.
+struct DeviceAllReduceAlgorithmChoice {
+    uint64_t max_bytes = 0;
+    DeviceAllReduceAlgorithm algorithm = DeviceAllReduceAlgorithm::Ring;
+
+    bool operator==(const DeviceAllReduceAlgorithmChoice&) const = default;
+};
+
 // Runtime state for a group.
 struct GroupView {
     GroupId group_id;
@@ -217,6 +239,7 @@ struct GroupView {
     // Coordinator-selected implementation for active GPU group members. It is
     // empty for CPU groups and until a GPU group leaves Bootstrapping.
     std::optional<GpuCollectiveBackend> gpu_collective_backend;
+    std::vector<DeviceAllReduceAlgorithmChoice> all_reduce_algorithm_choices;
     int32_t max_group_size = 0;          // fixed in-group slot capacity
     std::vector<GlobalRank> rank_order;  // InGroupRank -> GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank
