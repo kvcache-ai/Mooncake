@@ -1,10 +1,8 @@
-#include "tenant/tenant_metadata.h"
+#include "metadata/tenant.h"
 #include "object_test_helpers.h"
 
 #include <chrono>
 #include <memory>
-#include <string>
-#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -20,8 +18,8 @@ std::shared_ptr<Lease> LeaseOf(const std::shared_ptr<ObjectEntry>& entry) {
         });
 }
 
-TEST(TenantMetadataTest, InsertObjectWiresTheGroupLeaseAndJoinsTheGroup) {
-    TenantMetadata tenant;
+TEST(TenantTest, InsertObjectWiresTheGroupLeaseAndJoinsTheGroup) {
+    Tenant tenant;
 
     auto first = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(first));
@@ -39,8 +37,8 @@ TEST(TenantMetadataTest, InsertObjectWiresTheGroupLeaseAndJoinsTheGroup) {
     EXPECT_EQ(first_lease.get(), second_lease.get());
 }
 
-TEST(TenantMetadataTest, InsertObjectLeavesAnUngroupedEntryOnItsOwnLease) {
-    TenantMetadata tenant;
+TEST(TenantTest, InsertObjectLeavesAnUngroupedEntryOnItsOwnLease) {
+    Tenant tenant;
 
     auto singleton = test::MakeObjectEntry("k1");
     ASSERT_TRUE(tenant.InsertObject(singleton));
@@ -57,8 +55,8 @@ TEST(TenantMetadataTest, InsertObjectLeavesAnUngroupedEntryOnItsOwnLease) {
         }));
 }
 
-TEST(TenantMetadataTest, InsertObjectRejectsAKeyThatIsAlreadyRouted) {
-    TenantMetadata tenant;
+TEST(TenantTest, InsertObjectRejectsAKeyThatIsAlreadyRouted) {
+    Tenant tenant;
     ASSERT_TRUE(tenant.InsertObject(test::MakeObjectEntry("k1", "g1")));
 
     // The second insert is rejected and registers nothing: no new route slot,
@@ -69,8 +67,8 @@ TEST(TenantMetadataTest, InsertObjectRejectsAKeyThatIsAlreadyRouted) {
     EXPECT_TRUE(tenant.GroupMembers("g2").empty());
 }
 
-TEST(TenantMetadataTest, EraseObjectIfHonoursTheEntryIdentity) {
-    TenantMetadata tenant;
+TEST(TenantTest, EraseObjectIfHonoursTheEntryIdentity) {
+    Tenant tenant;
     auto entry = test::MakeObjectEntry("k1", "");
     ASSERT_TRUE(tenant.InsertObject(entry));
     EXPECT_EQ(tenant.Get("k1"), entry);
@@ -85,8 +83,8 @@ TEST(TenantMetadataTest, EraseObjectIfHonoursTheEntryIdentity) {
     EXPECT_FALSE(tenant.EraseObjectIf(entry));
 }
 
-TEST(TenantMetadataTest, RemoveObjectDropsRouteGroupAndLeasesTogether) {
-    TenantMetadata tenant;
+TEST(TenantTest, RemoveObjectDropsRouteGroupAndLeasesTogether) {
+    Tenant tenant;
     auto entry = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(entry));
     ReplicaActionLease lease;
@@ -104,8 +102,8 @@ TEST(TenantMetadataTest, RemoveObjectDropsRouteGroupAndLeasesTogether) {
     EXPECT_TRUE(tenant.Empty());
 }
 
-TEST(TenantMetadataTest, RemoveObjectRequiresTheEntryStillOnTheRoute) {
-    TenantMetadata tenant;
+TEST(TenantTest, RemoveObjectRequiresTheEntryStillOnTheRoute) {
+    Tenant tenant;
     auto published = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(published));
 
@@ -123,8 +121,8 @@ TEST(TenantMetadataTest, RemoveObjectRequiresTheEntryStillOnTheRoute) {
     EXPECT_FALSE(tenant.RemoveObject(std::shared_ptr<ObjectEntry>{}));
 }
 
-TEST(TenantMetadataTest, EmptyTracksObjectsGroupsAndLeases) {
-    TenantMetadata tenant;
+TEST(TenantTest, EmptyTracksObjectsGroupsAndLeases) {
+    Tenant tenant;
     EXPECT_TRUE(tenant.Empty());
 
     auto grouped = test::MakeObjectEntry("k1", "g1");
@@ -146,8 +144,8 @@ TEST(TenantMetadataTest, EmptyTracksObjectsGroupsAndLeases) {
     EXPECT_TRUE(tenant.Empty());
 }
 
-TEST(TenantMetadataTest, RebuildGroupStateRegroupsTheSameMembers) {
-    TenantMetadata tenant;
+TEST(TenantTest, RebuildGroupStateRegroupsTheSameMembers) {
+    Tenant tenant;
     auto first = test::MakeObjectEntry("k1", "g1");
     auto second = test::MakeObjectEntry("k2", "g1");
     ASSERT_TRUE(tenant.InsertObject(first));
@@ -168,8 +166,8 @@ TEST(TenantMetadataTest, RebuildGroupStateRegroupsTheSameMembers) {
     EXPECT_EQ(rebuilt_first.get(), rebuilt_second.get());
 }
 
-TEST(TenantMetadataTest, PromotionCandidateKeysTrackWhatWasIndexed) {
-    TenantMetadata tenant;
+TEST(TenantTest, PromotionCandidateKeysTrackWhatWasIndexed) {
+    Tenant tenant;
     EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());
 
     tenant.IndexPromotionCandidate("k1");

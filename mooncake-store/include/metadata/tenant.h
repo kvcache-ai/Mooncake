@@ -1,8 +1,8 @@
 #pragma once
 
-// TenantMetadata: one tenant's metadata state — the object route, the group
-// table, the in-flight replica-action leases, the promotion-candidate index and
-// the bound quota account.
+// Tenant: one tenant's metadata state — the object route, the group table, the
+// in-flight replica-action leases, the promotion-candidate index and the bound
+// quota account.
 //
 // Every method is internally synchronized: each container guards its own
 // state, and an object's fields are only touched under that entry's own lock.
@@ -36,7 +36,7 @@
 namespace mooncake {
 namespace metadata {
 
-class TenantMetadata {
+class Tenant {
    public:
     // Publishes `entry` on this tenant's route. The route slot and the group
     // lease are wired under the entry's own lock, so a reader that reaches the
@@ -159,6 +159,8 @@ class TenantMetadata {
                 });
         }
         for (const auto& entry : objects) {
+            // `group_id` is a const member of the envelope, so it reads without
+            // the entry lock, unlike the metadata write below.
             const std::string group_id = entry->group_id();
             if (group_id.empty()) {
                 continue;
@@ -191,10 +193,6 @@ class TenantMetadata {
 
     [[nodiscard]] bool RemoveDynamicReplicationLease(const UUID& proposal_id) {
         return lease_table_.Remove(proposal_id);
-    }
-
-    void EraseDynamicReplicationLeasesForObject(std::string_view key) {
-        lease_table_.EraseForObject(key);
     }
 
     void EraseExpiredDynamicReplicationLeases(
