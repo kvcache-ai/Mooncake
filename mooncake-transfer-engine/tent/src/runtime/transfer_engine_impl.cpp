@@ -821,6 +821,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = TCP;
         else if (transport_list_[HP_TCP])
             options.type = HP_TCP;
+        else if (host_location && transport_list_[SHM])
+            options.type = SHM;
         else
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
@@ -829,7 +831,13 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
     if (!transport)
         return Status::InvalidArgument(
             "Not supported type in memory options" LOC_MARK);
-    CHECK_STATUS(transport->allocateLocalMemory(addr, size, options));
+    const bool default_shm =
+        options.type == SHM && options.location == kWildcardLocation;
+    if (default_shm) options.location = "cpu:0";
+    auto status = transport->allocateLocalMemory(addr, size, options);
+    // Keep wildcard registration based on the actual memory-location probe.
+    if (default_shm) options.location = kWildcardLocation;
+    if (!status.ok()) return status;
     std::lock_guard<std::mutex> lock(mutex_);
     AllocatedMemory entry{.addr = *addr,
                           .size = size,
