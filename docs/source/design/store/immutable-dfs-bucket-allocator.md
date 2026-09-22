@@ -52,14 +52,15 @@ capacity and is retained for a later deletion retry.
 
 ## Configuration
 
-Set the same DFS root, adapter, alignment, and allocator selection in the
-master and every client that accesses DFS replicas. The bucket-specific
-settings are consumed by the master allocator.
+Set the same DFS root, adapter, allocator selection, alignment, and
+`MOONCAKE_DFS_BUCKET_CAPACITY` on the master and every client that accesses
+DFS replicas. `MOONCAKE_DFS_MAX_BUCKET_COUNT` and the bucket eviction settings
+are consumed only by the master allocator.
 
 | Environment variable | Default | Description |
 | --- | --- | --- |
 | `MOONCAKE_DFS_ALLOCATOR` | `shard` | Select `bucket` to enable this allocator, or `shard` for the existing allocator. |
-| `MOONCAKE_DFS_BUCKET_CAPACITY` | `1073741824` (1 GiB) | Logical and preallocated size of every bucket; must be nonzero, aligned, and fit in a signed 64-bit file offset. |
+| `MOONCAKE_DFS_BUCKET_CAPACITY` | `1073741824` (1 GiB) | Logical and preallocated size of every bucket; must be nonzero, aligned, fit in a signed 64-bit file offset, and match on the master and every DFS client. |
 | `MOONCAKE_DFS_MAX_BUCKET_COUNT` | `64` | Maximum number of live bucket files; must be positive. Buckets awaiting a successful deletion still count. |
 | `MOONCAKE_DFS_ROOT_DIR` | `/mnt/3fs/mooncake` | Absolute shared directory containing the bucket files. |
 | `MOONCAKE_DFS_FS_ADAPTER` | `hf3fs` | Filesystem adapter (`hf3fs` or `posix`). This version uses its buffered synchronous interface. |
