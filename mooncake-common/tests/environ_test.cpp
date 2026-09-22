@@ -37,7 +37,6 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MC_TEST_DOUBLE");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
-        unsetenv("MOONCAKE_STORE_CHECKSUM");
     }
 };
 
@@ -143,13 +142,6 @@ TEST_F(EnvironTest, GetDoubleMissingOrInvalidUsesRequestedDefault) {
     EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
     setenv("MC_TEST_DOUBLE", "nan", 1);
     EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
-}
-
-TEST_F(EnvironTest, StoreChecksumPopulatesFromEnv) {
-    setenv("MOONCAKE_STORE_CHECKSUM", "1", 1);
-
-    const auto& e = Environ::Get();
-    EXPECT_TRUE(e.GetStoreChecksumEnabled());
 }
 
 // --- GetSizeT ---
