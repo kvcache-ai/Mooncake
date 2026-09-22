@@ -27,7 +27,9 @@
 //    reports only cudaMemoryTypeDevice.
 //  - Copy stages through a queue bound to that same default context so a
 //    memcpy touching foreign USM is legal.
-//  - AllocatePinnedHost returns USM host memory (sycl::malloc_host).
+//  - AllocatePinnedHost returns USM host memory (sycl::malloc_host) from that
+//    context, so any device queue may consume it. All queues share one
+//    context (see XpuRuntime::Init).
 
 #include "device/accelerator_device.h"
 #include "device/accelerator_registry.h"
@@ -61,31 +63,47 @@ class XpuRuntime {
     }
 
     // Enumerate GPU devices that support USM device allocations and build
-    // one out-of-order queue per device on the platform default context.
-    // Idempotent; returns false when no usable device is visible.
+    // one out-of-order queue per device, all on a single platform default
+    // context. USM allocations are only valid within the context they were
+    // made in: the pinned host buffers handed out by AllocHost are consumed
+    // by whichever device queue Copy() picks, so every queue must share the
+    // context those buffers come from. When several SYCL platforms expose
+    // GPUs (e.g. Level Zero and OpenCL both visible) only one is used: the
+    // Level Zero one if present -- that is the backend PyTorch XPU allocates
+    // from, so its tensors are recognised -- otherwise the platform with the
+    // most usable GPUs. Idempotent; returns false when no usable device is
+    // visible.
     bool Init() {
         std::lock_guard<std::mutex> lock(mu_);
         if (initialized_) return !queues_.empty();
         initialized_ = true;
         try {
-            for (const auto& d : sycl::device::get_devices()) {
-                if (!d.is_gpu() || !d.has(sycl::aspect::usm_device_allocations))
-                    continue;
-                sycl::context ctx =
-                    d.get_platform().ext_oneapi_get_default_context();
-                bool known = false;
-                for (const auto& c : contexts_) {
-                    if (c == ctx) {
-                        known = true;
-                        break;
-                    }
+            std::vector<sycl::device> best;
+            bool best_is_level_zero = false;
+            for (const auto& platform : sycl::platform::get_platforms()) {
+                std::vector<sycl::device> usable;
+                for (const auto& d : platform.get_devices()) {
+                    if (d.is_gpu() &&
+                        d.has(sycl::aspect::usm_device_allocations))
+                        usable.push_back(d);
                 }
-                if (!known) contexts_.push_back(ctx);
-                queues_.emplace_back(ctx, d);
+                if (usable.empty()) continue;
+                const bool is_level_zero = platform.get_backend() ==
+                                           sycl::backend::ext_oneapi_level_zero;
+                if (best.empty() || (is_level_zero && !best_is_level_zero) ||
+                    (is_level_zero == best_is_level_zero &&
+                     usable.size() > best.size())) {
+                    best = std::move(usable);
+                    best_is_level_zero = is_level_zero;
+                }
             }
+            if (best.empty()) return false;
+            context_ =
+                best.front().get_platform().ext_oneapi_get_default_context();
+            for (const auto& d : best) queues_.emplace_back(*context_, d);
         } catch (const sycl::exception&) {
             queues_.clear();
-            contexts_.clear();
+            context_.reset();
         }
         return !queues_.empty();
     }
@@ -96,28 +114,26 @@ class XpuRuntime {
     }
 
     // Classify `ptr`; returns the device ordinal when it is USM device
-    // memory, -1 otherwise.
+    // memory in our context, -1 otherwise.
     int DeviceIndexOf(const void* ptr) {
         std::lock_guard<std::mutex> lock(mu_);
-        for (const auto& ctx : contexts_) {
-            try {
-                if (sycl::get_pointer_type(ptr, ctx) !=
-                    sycl::usm::alloc::device)
-                    continue;
-                sycl::device owner = sycl::get_pointer_device(ptr, ctx);
-                for (size_t i = 0; i < queues_.size(); ++i) {
-                    if (queues_[i].get_device() == owner)
-                        return static_cast<int>(i);
-                }
-                // Device memory on a GPU we did not enumerate (e.g. one lacking
-                // usm_device_allocations): still device memory, use device 0's
-                // queue which shares the context.
-                return 0;
-            } catch (const sycl::exception&) {
-                // Fall through: not a pointer this context knows about.
+        if (!context_) return -1;
+        try {
+            if (sycl::get_pointer_type(ptr, *context_) !=
+                sycl::usm::alloc::device)
+                return -1;
+            sycl::device owner = sycl::get_pointer_device(ptr, *context_);
+            for (size_t i = 0; i < queues_.size(); ++i) {
+                if (queues_[i].get_device() == owner)
+                    return static_cast<int>(i);
             }
+            // Device memory on a GPU we did not enumerate (e.g. one lacking
+            // usm_device_allocations): still device memory, use device 0's
+            // queue which shares the context.
+            return 0;
+        } catch (const sycl::exception&) {
+            return -1;  // not a pointer this context knows about
         }
-        return -1;
     }
 
     bool Copy(void* dst, const void* src, size_t size, int device_id) {
@@ -137,11 +153,12 @@ class XpuRuntime {
         }
     }
 
+    // Pinned host memory in the shared context, usable by every queue.
     void* AllocHost(size_t size) {
         std::lock_guard<std::mutex> lock(mu_);
-        if (contexts_.empty()) return nullptr;
+        if (!context_) return nullptr;
         try {
-            return sycl::malloc_host(size, contexts_.front());
+            return sycl::malloc_host(size, *context_);
         } catch (const sycl::exception&) {
             return nullptr;
         }
@@ -149,9 +166,9 @@ class XpuRuntime {
 
     void FreeHost(void* ptr) {
         std::lock_guard<std::mutex> lock(mu_);
-        if (contexts_.empty() || !ptr) return;
+        if (!context_ || !ptr) return;
         try {
-            sycl::free(ptr, contexts_.front());
+            sycl::free(ptr, *context_);
         } catch (const sycl::exception&) {
         }
     }
@@ -159,7 +176,7 @@ class XpuRuntime {
    private:
     std::mutex mu_;
     bool initialized_ = false;
-    std::vector<sycl::context> contexts_;
+    std::optional<sycl::context> context_;
     std::vector<sycl::queue> queues_;
 };
 

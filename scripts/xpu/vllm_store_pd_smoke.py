@@ -22,11 +22,19 @@ Roles:
                    prefill on ``--prefill-xpu`` and decode on ``--decode-xpu``
                    (Level Zero device indices) - the single-node 2-XPU case.
   --role prefill   run the prefill side only; writes ``--result`` when the KV
-                   is in the store and holds until ``--done-file`` appears.
+                   is in the store and holds until ``--done-file`` appears
+                   (both required: the segment lives in this process, so it
+                   must outlive the decode side's loads).
   --role decode    run the decode side only; waits for ``--reference`` (the
-                   prefill side's ``--result``), then decodes and reports.
-  For the two-node case run ``--role prefill`` on node A (with the master) and
-  ``--role decode --master <A>:50051`` on node B, copying the result file over.
+                   prefill side's ``--result``), then decodes, reports and
+                   creates ``--done-file`` if given.
+  For the two-node case run on node A (with the master)
+    --role prefill --result /shared/prefill.json --done-file /shared/done
+  and on node B
+    --role decode --master <A>:50051 --reference /shared/prefill.json \
+                  --done-file /shared/done
+  with ``/shared`` on a filesystem both nodes see; otherwise copy
+  ``prefill.json`` to B and ``touch`` the done file on A once decode reports.
 
 Requires the same environment as vllm_store_smoke.py (XPU vLLM, Mooncake
 bindings built with -DUSE_XPU=ON) and reuses its vLLM shims.
@@ -87,13 +95,20 @@ def parse_args() -> argparse.Namespace:
         "--reference", default=None, help="decode: prefill side's --result"
     )
     parser.add_argument(
-        "--done-file", default=None, help="prefill exits once this exists"
+        "--done-file",
+        default=None,
+        help="prefill: hold the segment until this exists; decode: create it",
     )
     parser.add_argument("--hold-timeout", type=float, default=900.0)
     parser.add_argument(
         "--wait-timeout", type=float, default=900.0, help="decode: --reference"
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.role == "prefill" and not (args.result and args.done_file):
+        parser.error("--role prefill requires --result and --done-file")
+    if args.role == "decode" and not args.reference:
+        parser.error("--role decode requires --reference")
+    return args
 
 
 def write_config(args: argparse.Namespace, role: str) -> str:
@@ -203,11 +218,14 @@ def run_prefill(args: argparse.Namespace) -> int:
             print("FAIL: prefill side saved no KV blocks", file=sys.stderr)
             return 1
 
-        # Keep the segment mounted for the decode side.
-        if args.done_file:
-            print(f"[prefill] holding until {args.done_file} exists", flush=True)
-            if not wait_for_file(args.done_file, args.hold_timeout):
-                print("[prefill] hold timed out", flush=True)
+        # Keep the segment mounted for the decode side: the KV blocks live in
+        # this process's segment and are unmounted when the LLM is destroyed.
+        print(f"[prefill] holding until {args.done_file} exists", flush=True)
+        if not wait_for_file(args.done_file, args.hold_timeout):
+            print(
+                "FAIL: prefill hold timed out before decode finished", file=sys.stderr
+            )
+            return 1
         return 0
     finally:
         if llm is not None:
@@ -228,7 +246,7 @@ def run_decode(args: argparse.Namespace) -> int:
     try:
         print(f"[decode] xpu : {describe_xpu()}", flush=True)
         llm = build_llm(args, "kv_consumer")
-        if not args.reference or not wait_for_file(args.reference, args.wait_timeout):
+        if not wait_for_file(args.reference, args.wait_timeout):
             print("FAIL: prefill reference did not appear", file=sys.stderr)
             return 1
         with open(args.reference) as f:
