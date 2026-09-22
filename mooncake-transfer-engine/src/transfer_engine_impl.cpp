@@ -25,6 +25,7 @@
 #ifdef WITH_METRICS
 #include <iomanip>
 #include <sstream>
+#include "transfer_engine_metrics.h"
 #endif
 
 #include "transfer_metadata_plugin.h"
@@ -1131,6 +1132,10 @@ void TransferEngineImpl::InitializeMetricsConfig() {
                          << interval_env
                          << ", using default: " << metrics_interval_seconds_;
         }
+    }
+
+    if (metrics_enabled_) {
+        TransferEngineMetrics::instance().initializeFromEnv();
     }
 }
 

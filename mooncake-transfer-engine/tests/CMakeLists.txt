@@ -34,6 +34,14 @@ target_link_libraries(flagcx_transport_internal_test PUBLIC gtest gtest_main)
 add_test(NAME flagcx_transport_internal_test
          COMMAND flagcx_transport_internal_test)
 
+if(WITH_METRICS)
+  # Binds a real HTTP server on a free port and scrapes it.
+  add_executable(metrics_exporter_test ${WORKSPACE}/metrics_exporter_test.cpp)
+  target_link_libraries(metrics_exporter_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+  add_test(NAME metrics_exporter_test COMMAND metrics_exporter_test)
+endif()
+
 add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
 target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
