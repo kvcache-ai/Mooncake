@@ -139,7 +139,7 @@ class StoreSessionMetadataTest(unittest.TestCase):
             def get(self, key):
                 return self.values.get(key, b"")
 
-            def isExist(self, key):
+            def is_exist(self, key):
                 return int(key in self.values)
 
             def remove(self, key):
@@ -182,7 +182,7 @@ class StoreSessionMetadataTest(unittest.TestCase):
             def get(self, key):
                 return self.values.get(key, b"")
 
-            def isExist(self, key):
+            def is_exist(self, key):
                 return int(key in self.values)
 
             def remove(self, key):

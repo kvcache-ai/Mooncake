@@ -467,7 +467,7 @@ class StoreSession:
             lengths = self._get_lengths_zcopy(keys, len(object_ids))
             for slot, (object_id, length) in enumerate(zip(object_ids, lengths)):
                 if length < 0:
-                    if self.store.isExist(keys[slot]) == 0:
+                    if self.store.is_exist(keys[slot]) == 0:
                         misses += 1
                         errors["MISS"] += 1
                     else:
@@ -509,7 +509,7 @@ class StoreSession:
         if operation == "put":
             payload = self.payload_factory.build(object_id)
             result_code = self.store.put(key, payload, self.config)
-            actual_present = result_code == 0 or self.store.isExist(key) == 1
+            actual_present = result_code == 0 or self.store.is_exist(key) == 1
             success = result_code == 0 or (expected_present and actual_present)
             bytes_processed = len(payload) if success else 0
         elif operation == "get":
@@ -526,12 +526,12 @@ class StoreSession:
                 result_code = "PRESENCE_MISMATCH"
             bytes_processed = len(payload) if actual_present else 0
         elif operation == "exist":
-            result_code = self.store.isExist(key)
+            result_code = self.store.is_exist(key)
             actual_present = result_code == 1
             success = result_code >= 0 and actual_present == expected_present
         elif operation == "remove":
             result_code = self.store.remove(key)
-            actual_present = self.store.isExist(key) == 1
+            actual_present = self.store.is_exist(key) == 1
             success = not actual_present and (result_code == 0 or not expected_present)
         else:
             raise ValueError(f"unsupported metadata operation: {operation}")
