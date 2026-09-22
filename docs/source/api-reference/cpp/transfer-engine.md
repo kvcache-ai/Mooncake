@@ -84,7 +84,7 @@ struct TransferRequest
     int transport_hint = 0;
     uint64_t task_group_id = kNoTaskGroup;
     int priority = PRIO_MEDIUM;
-    std::string nic_hint = {};
+    int nic_hint = -1;
 };
 ```
 
@@ -94,7 +94,7 @@ struct TransferRequest
   - RAM space type, covering DRAM/VRAM. As mentioned earlier, there is only one segment under the same process (or `TransferEngine` instance), which contains various types of Buffers (DRAM/VRAM). In this case, the segment name passed to the `openSegment` interface is equivalent to the server hostname. `target_offset` is the virtual address of the target server.
   - NVMeOF space type, where each file corresponds to a segment. In this case, the segment name passed to the `openSegment` interface is equivalent to the unique identifier of the file. `target_offset` is the offset of the target file.
 - `length` represents the amount of data transferred. TransferEngine may further split this into multiple read/write requests internally.
-- `nic_hint` optionally prefers a local RNIC by name (for example, `"mlx5_3"`) in the classic RDMA transport. An empty, unknown, or unavailable device falls back to normal topology-based selection. Retries are not pinned to the hinted device.
+- `nic_hint` optionally prefers a local RNIC by its index in `getLocalTopology()->getHcaList()` in the classic RDMA transport. The default `-1`, an out-of-range index, or an unavailable device falls back to normal topology-based selection. The hint affects initial submission only and is not a hard pin for an in-flight slice.
 
 #### TransferEngine::allocateBatchID
 

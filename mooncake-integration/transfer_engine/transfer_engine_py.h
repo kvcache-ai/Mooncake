@@ -252,6 +252,8 @@ class TransferEnginePy {
         const std::vector<std::vector<size_t>> &remote_offsets,
         const std::vector<std::vector<size_t>> &lengths, TransferOpcode opcode);
 
+    int resolveNicHint(const std::string &name) const;
+
     char *allocateRawBuffer(size_t capacity);
 
     int findClassId(size_t size);
