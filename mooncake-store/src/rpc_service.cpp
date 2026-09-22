@@ -404,7 +404,7 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
                                const ReplicateConfig& config,
                                const std::string& tenant_id) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "PutStart",
         [&] {
             return WithWriteTenant(tenant_id,
@@ -421,6 +421,10 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    if (!result && result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+        MasterMetricManager::instance().inc_put_start_object_already_exists();
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
@@ -535,14 +539,14 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     }
 
     size_t failure_count = 0;
+    int64_t already_exists_count = 0;
     int no_available_handle_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
-                        << keys[i] << "': " << toString(error);
+                ++already_exists_count;
             } else if (error == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
             } else {
@@ -551,6 +555,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     }
+
+    MasterMetricManager::instance().inc_batch_put_start_object_already_exists(
+        already_exists_count);
 
     if (no_available_handle_count > 0) {
         LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
