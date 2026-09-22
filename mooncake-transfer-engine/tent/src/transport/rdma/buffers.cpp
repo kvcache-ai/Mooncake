@@ -92,6 +92,17 @@ static inline int getAccessFlags(Permission perm,
     return access;
 }
 
+static void rollbackMemRegistrations(
+    const std::vector<RdmaContext*>& contexts,
+    const std::vector<RdmaContext::MemReg>& registrations) {
+    for (size_t id = 0; id < contexts.size(); ++id) {
+        if (registrations[id] &&
+            contexts[id]->unregisterMemReg(registrations[id])) {
+            LOG(ERROR) << "Failed to roll back RDMA registration";
+        }
+    }
+}
+
 Status LocalBufferManager::addBuffer(BufferDesc& desc,
                                      const MemoryOptions& options) {
     return addBufferInternal(desc, options, false);
@@ -144,14 +155,7 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     // If one rail fails, release every MR created for this buffer.
     for (size_t id = 0; id < context_list_.size(); ++id) {
         if (context_list_[id] && !mem_reg_list[id]) {
-            for (size_t rollback = 0; rollback < context_list_.size();
-                 ++rollback) {
-                if (mem_reg_list[rollback] &&
-                    context_list_[rollback]->unregisterMemReg(
-                        mem_reg_list[rollback])) {
-                    LOG(ERROR) << "Failed to roll back RDMA registration";
-                }
-            }
+            rollbackMemRegistrations(context_list_, mem_reg_list);
             return Status::RdmaError(
                 "Unable to register buffer of local memory segment" LOC_MARK);
         }
@@ -175,10 +179,7 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
             return Status::OK();
     }
 
-    for (auto& elem : staging.mem_reg_map) {
-        if (elem.first->unregisterMemReg(elem.second))
-            LOG(ERROR) << "Failed to roll back duplicate RDMA registration";
-    }
+    rollbackMemRegistrations(context_list_, mem_reg_list);
     desc.lkey.clear();
     desc.rkey.clear();
     return Status::InvalidArgument(
