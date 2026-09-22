@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -28,6 +29,22 @@
 namespace mooncake {
 
 class CUFileDescPoolTestPeer;
+
+class CUFileBatchAPI {
+   public:
+    virtual ~CUFileBatchAPI() = default;
+
+    virtual CUfileError_t setUp(CUfileBatchHandle_t* batch_handle,
+                                unsigned nr) = 0;
+    virtual CUfileError_t submit(CUfileBatchHandle_t batch_handle, unsigned nr,
+                                 CUfileIOParams_t* params, unsigned flags) = 0;
+    virtual CUfileError_t getStatus(CUfileBatchHandle_t batch_handle,
+                                    unsigned min_nr, unsigned* nr,
+                                    CUfileIOEvents_t* events,
+                                    struct timespec* timeout) = 0;
+    virtual CUfileError_t cancel(CUfileBatchHandle_t batch_handle) = 0;
+    virtual void destroy(CUfileBatchHandle_t batch_handle) = 0;
+};
 
 // Wrapper for reusable CUfileBatchHandle_t
 // cuFileBatchIOSetUp is expensive, so we reuse handles (similar to GDS
@@ -40,14 +57,31 @@ struct BatchHandle {
 // Per-batch descriptor with independent io_params and io_events
 // Each allocation gets a fresh descriptor to avoid parameter confusion
 struct CUFileBatchDesc {
-    BatchHandle* batch_handle;  // Pointer to reusable handle from pool
+    BatchHandle* batch_handle = nullptr;  // Reusable handle from the pool
     std::vector<CUfileIOParams_t> io_params;
     // Completion events returned by cuFile are correlated by cookie and cached
     // by submission index. cuFileBatchIOGetStatus only returns completed I/Os,
     // so its output cannot be treated as a positional status snapshot.
     std::vector<CUfileIOEvents_t> io_events;
     std::vector<CUfileIOEvents_t> polled_events;
+    std::vector<bool> cancel_requested;
+    size_t submitted_count = 0;
+    bool failure_seen = false;
+    bool cancel_attempted = false;
     bool reusable = true;
+};
+
+struct CUFileBatchSnapshot {
+    std::vector<CUfileIOEvents_t> io_events;
+    std::vector<bool> cancel_requested;
+    bool failure_seen = false;
+    bool all_terminal = true;
+};
+
+enum class CUFileBatchPollResult {
+    kError = -1,
+    kSuccess = 0,
+    kRetry = 1,
 };
 
 class CUFileDescPool {
@@ -71,8 +105,13 @@ class CUFileDescPool {
     // Submit the batch
     int submitBatch(int idx);
 
-    // Get transfer status for a specific slice
-    CUfileIOEvents_t getTransferStatus(int idx, int slice_id);
+    // Drop parameters appended since the last successful submission.
+    int discardUnsubmittedParams(int idx);
+
+    bool isAcceptingSubmissions(int idx);
+
+    // Poll once and return a descriptor-wide completion snapshot.
+    CUFileBatchPollResult pollBatch(int idx, CUFileBatchSnapshot& snapshot);
 
     // Poll cuFile once for the batch and update cached completion events.
     bool updateBatchStatus(int idx);
@@ -96,17 +135,22 @@ class CUFileDescPool {
     CUFileBatchDesc* getDesc(int idx);
 
    private:
+    CUFileDescPool(size_t max_batch_size,
+                   std::shared_ptr<CUFileBatchAPI> batch_api);
+
     static bool cachePolledEvent(std::vector<CUfileIOEvents_t>& io_events,
                                  const CUfileIOEvents_t& event);
-    static bool isTerminalStatus(CUfileStatus_t status);
+    static bool isTerminal(CUfileStatus_t status);
+    static bool allTerminal(const CUFileBatchDesc& desc);
     static CUfileIOEvents_t failedEvent();
-    static void destroyDesc(CUFileBatchDesc* desc);
-    static bool updateBatchStatus(CUFileBatchDesc* desc, int idx);
+    bool updateBatchStatus(CUFileBatchDesc* desc, int idx);
+    void destroyDesc(CUFileBatchDesc* desc);
 
     static const size_t MAX_NR_DESC = 256;  // Max number of descriptors
     void cleanupQuarantinedDescs();
 
     size_t max_batch_size_;
+    std::shared_ptr<CUFileBatchAPI> batch_api_;
 
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
     std::vector<BatchHandle*> handle_pool_;

@@ -108,9 +108,9 @@ class NVMeoFTransport : public Transport {
         return 0;
     }
 
-    void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,
-                               uint64_t slice_len, uint64_t desc_id,
-                               TransferRequest::OpCode op, CUfileHandle_t fh);
+    int addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,
+                              uint64_t slice_len, uint64_t desc_id,
+                              TransferRequest::OpCode op, CUfileHandle_t fh);
 
     const char *getName() const override { return "nvmeof"; }
 
