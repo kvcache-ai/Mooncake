@@ -54,9 +54,13 @@ void RunPoint(int threads) {
             while (!stop.load(std::memory_order_relaxed)) {
                 const std::string& member = members[round % kMembersPerGroup];
                 for (size_t group = 0; group < kGroupsPerThread; ++group) {
-                    (void)index.AddMember(groups[group], member);
+                    // One publication generation per member: the benchmark
+                    // measures the write path of the table, not replacement.
+                    const uint64_t generation = round + 1;
+                    (void)index.AddMember(groups[group], member, generation);
                     if (round >= kMembersPerGroup) {
-                        (void)index.RemoveMember(groups[group], member);
+                        (void)index.RemoveMember(groups[group], member,
+                                                 generation);
                     }
                     ++writes;
                     if (stop.load(std::memory_order_relaxed)) {

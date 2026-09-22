@@ -116,8 +116,8 @@ TEST(TenantRegistryTest, VisitReachesEveryTenantAndCarriesABroadcast) {
         ASSERT_TRUE(tenant->InsertObject(first));
         ASSERT_TRUE(tenant->InsertObject(second));
         // A restored tenant starts without membership.
-        tenant->UnregisterGroupMember(first);
-        tenant->UnregisterGroupMember(second);
+        tenant->UnregisterGroupMember(first, first->generation());
+        tenant->UnregisterGroupMember(second, second->generation());
         ASSERT_TRUE(tenant->GroupMembers("g1").empty());
     }
 

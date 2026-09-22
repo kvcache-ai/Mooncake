@@ -71,6 +71,45 @@ TEST(ObjectIndexTest, DuplicateInsertIsRejected) {
     EXPECT_EQ(store.Get("k1").get(), winner.get());
 }
 
+TEST(ObjectIndexTest, IsCurrentTracksThePublishedGeneration) {
+    ObjectIndex store;
+    auto e1 = test::MakeObjectEntry("k1");
+    EXPECT_FALSE(store.IsCurrent("k1", e1->generation()));  // never published
+    EXPECT_FALSE(store.IsCurrent("k1", 0));
+    ASSERT_TRUE(store.Insert(e1));
+    const uint64_t first = e1->generation();
+    EXPECT_TRUE(store.IsCurrent("k1", first));
+
+    // Nothing is current once the slot is gone.
+    ASSERT_TRUE(store.EraseIf("k1", e1));
+    EXPECT_FALSE(store.IsCurrent("k1", first));
+
+    // A replacement is current under its own generation only.
+    auto e2 = test::MakeObjectEntry("k1");
+    ASSERT_TRUE(store.Insert(e2));
+    EXPECT_FALSE(store.IsCurrent("k1", first));
+    EXPECT_TRUE(store.IsCurrent("k1", e2->generation()));
+}
+
+TEST(ObjectIndexTest, EraseIfGenerationNeedsThePublishedGeneration) {
+    ObjectIndex store;
+    auto e1 = test::MakeObjectEntry("k1");
+    ASSERT_TRUE(store.Insert(e1));
+    const uint64_t first = e1->generation();
+
+    // A generation that is no longer published matches nothing, and neither
+    // does the 0 of an entry that never reached the route.
+    ASSERT_TRUE(store.EraseIf("k1", e1));
+    auto e2 = test::MakeObjectEntry("k1");
+    ASSERT_TRUE(store.Insert(e2));
+    EXPECT_FALSE(store.EraseIfGeneration("k1", first));
+    EXPECT_FALSE(store.EraseIfGeneration("k1", 0));
+    EXPECT_TRUE(store.Contains("k1"));
+
+    EXPECT_TRUE(store.EraseIfGeneration("k1", e2->generation()));
+    EXPECT_FALSE(store.Contains("k1"));
+}
+
 TEST(ObjectIndexTest, SnapshotObjectsEnumeratesEveryEntry) {
     ObjectIndex store;
     ASSERT_TRUE(store.Insert(test::MakeObjectEntry("k1")));

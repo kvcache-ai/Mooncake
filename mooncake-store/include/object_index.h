@@ -20,11 +20,9 @@ namespace mooncake {
 // The object route for one tenant: a flat map from object key to a strong
 // ObjectEntry handle.
 //
-// A strong handle keeps the entry alive, not current: Get returns it under the
-// shared route lock and releases that lock before the caller takes the entry's
-// own mutex, so a caller that needs the published instance compares its
-// generation under that lock, and a teardown erases with the identity-checked
-// EraseIf.
+// A strong handle keeps the entry alive, not current. A caller holding one
+// states identity by comparing handles (EraseIf); a caller holding only the key
+// states it by the generation it recorded (IsCurrent, EraseIfGeneration).
 class ObjectIndex {
    public:
     // nullptr when the key is absent. The returned handle is strong, so it
@@ -65,6 +63,33 @@ class ObjectIndex {
         std::unique_lock<std::shared_mutex> lock(route_lock_);
         const auto it = route_.find(key);
         if (it == route_.end() || it->second != expected) {
+            return false;
+        }
+        route_.erase(it);
+        return true;
+    }
+
+    // True while the route publishes `generation` for `key`; 0 never matches.
+    [[nodiscard]] bool IsCurrent(std::string_view key,
+                                 uint64_t generation) const {
+        if (generation == 0) {
+            return false;
+        }
+        std::shared_lock<std::shared_mutex> lock(route_lock_);
+        const auto it = route_.find(key);
+        return it != route_.end() && it->second->generation() == generation;
+    }
+
+    // Erase the slot for `key` only while it still publishes `generation`, for
+    // a caller that holds a recorded generation instead of the handle.
+    [[nodiscard]] bool EraseIfGeneration(std::string_view key,
+                                         uint64_t generation) {
+        if (generation == 0) {
+            return false;
+        }
+        std::unique_lock<std::shared_mutex> lock(route_lock_);
+        const auto it = route_.find(key);
+        if (it == route_.end() || it->second->generation() != generation) {
             return false;
         }
         route_.erase(it);

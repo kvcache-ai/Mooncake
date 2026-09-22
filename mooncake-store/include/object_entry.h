@@ -58,9 +58,12 @@ class ObjectEntry {
     const std::string& key() const noexcept { return metadata_->user_key; }
     const std::string& group_id() const noexcept { return metadata_->group_id; }
 
-    // Monotonic generation assigned by ObjectIndex at route publication
-    // (0 = never published). Lets a holder distinguish the entry it holds from
-    // a later replacement of the same key.
+    // Monotonic generation assigned by ObjectIndex at route publication. It is
+    // the entry's identity for a caller that holds the key rather than the
+    // handle, since publishing again assigns a new one; re-publishing an entry
+    // renumbers it in place, so a caller reads this once and keeps the value.
+    // Comparable only inside one route, and 0 means never published: every
+    // check on a generation rejects 0.
     [[nodiscard]] uint64_t generation() const noexcept {
         return generation_.load(std::memory_order_relaxed);
     }
