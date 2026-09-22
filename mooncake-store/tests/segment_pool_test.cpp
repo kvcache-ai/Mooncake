@@ -1279,15 +1279,9 @@ TEST(SegmentPoolTest,
             Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
                 fields.ptr[4], target->getOffsetAllocator());
         ASSERT_TRUE(handle.has_value());
-        // The restored handle carries the node extent from the persisted
-        // layout; keep it when the buffer is rebuilt around the handle.
-        std::optional<std::size_t> reserved_size = std::nullopt;
-        if (const auto handle_reserved = (*handle)->reserved_size()) {
-            reserved_size = static_cast<std::size_t>(*handle_reserved);
-        }
         auto buffer = std::make_unique<AllocatedBuffer>(
             target, reinterpret_cast<void*>(fields.ptr[1].as<uint64_t>()),
-            fields.ptr[0].as<uint64_t>(), reserved_size, std::move(**handle));
+            fields.ptr[0].as<uint64_t>(), std::move(**handle));
         buffer.reset();
         EXPECT_EQ(restored.GetMemoryUsage().used_bytes, (1U - i) * 4096U);
     }

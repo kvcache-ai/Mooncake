@@ -40,11 +40,8 @@ class TestBufferAllocator final
                 const uintptr_t address =
                     base_ +
                     next_offset_.fetch_add(size, std::memory_order_relaxed);
-                // This double reserves exactly `size` bytes of its synthetic
-                // capacity, so requested and reserved extents coincide.
                 return std::make_unique<AllocatedBuffer>(
-                    shared_from_this(), reinterpret_cast<void*>(address), size,
-                    std::optional<std::size_t>(size));
+                    shared_from_this(), reinterpret_cast<void*>(address), size);
             }
         }
         return nullptr;

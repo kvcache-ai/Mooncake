@@ -1,5 +1,3 @@
-#include <msgpack.hpp>
-
 #include "allocator.h"
 #include "offset_allocator/offset_allocator.h"
 #include "mutex.h"
@@ -8,7 +6,6 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -16,7 +13,6 @@
 #include <map>
 #include <memory>
 #include <random>
-#include <thread>
 
 namespace mooncake::offset_allocator {
 
@@ -335,56 +331,11 @@ class OffsetAllocatorTest : public ::testing::Test {
         return allocator->m_multiplier_bits;
     }
 
-    // E01: private-state accessors. TEST_F bodies execute in a generated
-    // subclass, so state that is private to the handle/allocator has to stay
-    // in fixture members that hold the granted friendship.
-    // OffsetAllocation's own members are not reachable from the fixture, so
-    // node identity is obtained through the public traversal helper instead.
-    OffsetAllocation allocationOf(const OffsetAllocationHandle& handle) const {
-        return handle.m_allocation;
-    }
-
-    struct RawNodeReservation {
-        uint32_t node_index{0};
-        // Node offset in the allocator's own (multiplier-scaled) units, i.e.
-        // exactly what OffsetAllocation carries on the wire.
-        uint32_t fake_offset{0};
-        uint64_t real_offset{0};
-        uint64_t reserved_size{0};
-        bool valid{false};
-    };
-
-    // Reserves a node through the internal allocator without creating an
-    // owning handle, then locates it through visit_used_nodes so that a handle
-    // rebuilt by createHandleAtNode is the only owner. The fixture must hold
-    // exactly one live node for the lookup to be unambiguous.
-    RawNodeReservation reserveRawNode(
-        const std::shared_ptr<OffsetAllocator>& allocator, uint32 size) {
-        RawNodeReservation result;
-        lockAllocator(allocator);
-        const auto allocation = allocator->m_allocator->allocate(size);
-        unlockAllocator(allocator);
-        if (allocation.isNoSpace()) {
-            return result;
-        }
-        allocator->visit_used_nodes([&](uint64_t offset, uint64_t reserved,
-                                        uint32_t index) {
-            result.node_index = index;
-            result.real_offset = offset;
-            result.reserved_size = reserved;
-            result.fake_offset = static_cast<uint32_t>(
-                (offset - allocator->m_base) >> allocator->m_multiplier_bits);
-            result.valid = true;
-        });
-        return result;
-    }
-
     OffsetAllocationHandle copyHandleWithNewAllocator(
         const OffsetAllocationHandle& handle,
         const std::shared_ptr<OffsetAllocator>& new_allocator) {
         return OffsetAllocationHandle(new_allocator, handle.m_allocation,
-                                      handle.real_base, handle.requested_size,
-                                      handle.reserved_size_);
+                                      handle.real_base, handle.requested_size);
     }
 
     void substituteWithNewAllocator(
@@ -2238,147 +2189,6 @@ TEST_F(OffsetAllocatorTest,
             EXPECT_TRUE(small->CaptureSnapshot().Validate().has_value());
         }
     }
-}
-
-// ============================================================================
-// E01: runtime reserved (node extent) tracking
-// ============================================================================
-
-// T02/T10: an allocation exposes the extent of the node that owns it, and a
-// handle rebuilt from that node agrees. The extent is read from the node, so a
-// non-boundary request proves it is not simply the requested length.
-TEST_F(OffsetAllocatorTest, E01HandleReservedMatchesNodeExtent) {
-    auto allocator = OffsetAllocator::create(0, 4u << 20, 128, 1024);
-    ASSERT_NE(allocator, nullptr);
-
-    auto handle = allocator->allocate(477);
-    ASSERT_TRUE(handle.has_value());
-    EXPECT_EQ(handle->size(), 477U);
-    ASSERT_TRUE(handle->reserved_size().has_value());
-    EXPECT_GT(*handle->reserved_size(), 477U);
-    EXPECT_EQ(*handle->reserved_size(),
-              allocator->normalizedAllocationSize(477));
-
-    // The lookup used when rebuilding restored handles agrees with the live
-    // handle and does not take a second lock or scan every node.
-    const auto via_lookup =
-        allocator->allocationReservedSize(allocationOf(*handle));
-    ASSERT_TRUE(via_lookup.has_value());
-    EXPECT_EQ(*via_lookup, *handle->reserved_size());
-
-    // Moving the handle keeps the extent.
-    OffsetAllocationHandle moved = std::move(*handle);
-    ASSERT_TRUE(moved.reserved_size().has_value());
-    EXPECT_EQ(*moved.reserved_size(), *via_lookup);
-}
-
-// T10: createHandleAtNode derives the extent from the reconstructed node.
-TEST_F(OffsetAllocatorTest, E01CreateHandleAtNodeCarriesNodeExtent) {
-    auto allocator = OffsetAllocator::create(0, 4u << 20, 128, 1024);
-    ASSERT_NE(allocator, nullptr);
-
-    const RawNodeReservation raw = reserveRawNode(allocator, 477);
-    ASSERT_TRUE(raw.valid) << "raw node reservation failed";
-    EXPECT_GT(raw.reserved_size, 477U);
-
-    auto rebuilt =
-        allocator->createHandleAtNode(raw.node_index, raw.real_offset, 477);
-    ASSERT_TRUE(rebuilt.has_value());
-    EXPECT_EQ(rebuilt->size(), 477U);
-    ASSERT_TRUE(rebuilt->reserved_size().has_value());
-    EXPECT_EQ(*rebuilt->reserved_size(), raw.reserved_size);
-
-    // A mismatched offset is still rejected.
-    EXPECT_FALSE(
-        allocator->createHandleAtNode(raw.node_index, raw.real_offset + 1, 477)
-            .has_value());
-
-    rebuilt.reset();  // frees the reserved node exactly once
-}
-
-// T10: a handle rebuilt from the persisted wire shape reports the same extent
-// as the node it owns, and is the only owner of that node. Cross-revision byte
-// compatibility is covered separately by the fixture tool.
-TEST_F(OffsetAllocatorTest, E01DeserializedHandleKeepsNodeExtent) {
-    auto allocator = OffsetAllocator::create(0, 4u << 20, 128, 1024);
-    ASSERT_NE(allocator, nullptr);
-
-    const RawNodeReservation raw = reserveRawNode(allocator, 477);
-    ASSERT_TRUE(raw.valid);
-
-    msgpack::sbuffer buffer;
-    MsgpackPacker packer(&buffer);
-    packer.pack_array(3);
-    packer.pack(raw.real_offset);
-    packer.pack(static_cast<uint64_t>(477));
-    packer.pack_array(2);
-    packer.pack(raw.fake_offset);
-    packer.pack(raw.node_index);
-
-    auto object = msgpack::unpack(buffer.data(), buffer.size());
-    auto restored = Serializer<OffsetAllocationHandle>::deserialize(
-        object.get(), allocator);
-    ASSERT_TRUE(restored.has_value());
-    EXPECT_EQ((*restored)->size(), 477U);
-    ASSERT_TRUE((*restored)->reserved_size().has_value());
-    EXPECT_EQ(*(*restored)->reserved_size(), raw.reserved_size);
-
-    // The rebuilt handle is the only owner, so this releases the node once.
-    restored->reset();
-}
-
-// T15: unattributable allocations are rejected instead of indexing the node
-// array out of bounds.
-TEST_F(OffsetAllocatorTest, E01AllocationReservedSizeRejectsBadNodes) {
-    auto allocator = OffsetAllocator::create(0, 1u << 20, 128, 256);
-    ASSERT_NE(allocator, nullptr);
-
-    const OffsetAllocation no_space(OffsetAllocation::NO_SPACE,
-                                    OffsetAllocation::NO_SPACE);
-    EXPECT_FALSE(allocator->allocationReservedSize(no_space).has_value());
-
-    const OffsetAllocation out_of_range(
-        0, std::numeric_limits<uint32_t>::max() - 1);
-    EXPECT_FALSE(allocator->allocationReservedSize(out_of_range).has_value());
-}
-
-// T16: concurrent allocate/free keeps every reported extent accurate and
-// returns the allocator to its baseline.
-TEST_F(OffsetAllocatorTest, E01ConcurrentExtentsAreConsistent) {
-    auto allocator = OffsetAllocator::create(0, 64u << 20, 1024, 1u << 20);
-    ASSERT_NE(allocator, nullptr);
-
-    constexpr int kThreads = 4;
-    constexpr int kIterations = 300;
-    std::atomic<int> failures{0};
-    std::atomic<int> bad_extent{0};
-    std::vector<std::thread> threads;
-    threads.reserve(kThreads);
-    for (int t = 0; t < kThreads; ++t) {
-        threads.emplace_back([&, t]() {
-            for (int i = 0; i < kIterations; ++i) {
-                const size_t size =
-                    1 + static_cast<size_t>((t * 131 + i * 7) % 8192);
-                auto handle = allocator->allocate(size);
-                if (!handle.has_value()) {
-                    failures.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-                const auto reserved = handle->reserved_size();
-                if (!reserved.has_value() || *reserved < size) {
-                    bad_extent.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        });
-    }
-    for (auto& thread : threads) {
-        thread.join();
-    }
-
-    EXPECT_EQ(failures.load(), 0);
-    EXPECT_EQ(bad_extent.load(), 0);
-    EXPECT_EQ(allocator->get_metrics().allocated_num_, 0U);
-    EXPECT_EQ(allocator->get_metrics().allocated_size_, 0U);
 }
 
 }  // namespace mooncake::offset_allocator
