@@ -109,6 +109,9 @@ option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
 option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
 option(USE_ASCEND_HETEROGENEOUS
        "option for transferring between ascend npu and gpu" OFF)
+option(USE_ASCEND_RDMA
+       "enable Ascend UB segment registration for plain RDMA memory regions"
+       OFF)
 option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_EFA "option for using AWS EFA transport" OFF)
@@ -614,7 +617,8 @@ endif()
 
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
-   OR USE_UBSHMEM)
+   OR USE_UBSHMEM
+   OR USE_ASCEND_RDMA)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)

@@ -31,7 +31,9 @@
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "config.h"
@@ -45,6 +47,10 @@
 
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
+#endif
+#if defined(USE_ASCEND_RDMA)
+#include <acl/acl.h>
+#include <driver/ascend_hal.h>
 #endif
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
@@ -67,6 +73,123 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_length = static_cast<uintptr_t>(region.mr->length);
     return region_start <= addr && addr - region_start < region_length;
 }
+
+#if defined(USE_ASCEND_RDMA)
+struct AscendUbRegistration {
+    size_t length;
+    uint32_t device_id;
+    size_t refcount;
+};
+
+std::mutex &ascendUbRegistryMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<uintptr_t, AscendUbRegistration> &ascendUbRegistry() {
+    static std::map<uintptr_t, AscendUbRegistration> registry;
+    return registry;
+}
+
+int ascendUbRegister(void* addr, size_t length, bool& registered) {
+    aclrtPtrAttributes attributes{};
+    aclError acl_ret = aclrtPointerGetAttributes(addr, &attributes);
+    LOG(INFO) << "USE_ASCEND_RDMA: aclrtPointerGetAttributes addr=" << addr
+              << ", length=" << length << ", acl_ret=" << acl_ret
+              << ", location_type=" << attributes.location.type
+              << ", location_id=" << attributes.location.id
+              << ", page_size=" << attributes.pageSize;
+    if (acl_ret != ACL_ERROR_NONE) {
+        LOG(WARNING) << "USE_ASCEND_RDMA: cannot query ACL attributes for "
+                     << addr << "; skip halMemRegUbSegment and continue with "
+                        "ibv_reg_mr";
+        return 0;
+    }
+    if (attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
+        LOG(INFO) << "USE_ASCEND_RDMA: address " << addr
+                  << " is not Device memory; skip halMemRegUbSegment";
+        return 0;
+    }
+
+    const uintptr_t va = reinterpret_cast<uintptr_t>(addr);
+    std::lock_guard<std::mutex> lock(ascendUbRegistryMutex());
+    auto &registry = ascendUbRegistry();
+    auto iter = registry.find(va);
+    if (iter != registry.end()) {
+        if (iter->second.length != length ||
+            iter->second.device_id != attributes.location.id) {
+            LOG(ERROR) << "USE_ASCEND_RDMA: UB range already registered with "
+                          "different attributes, addr="
+                       << addr << ", existing_length=" << iter->second.length
+                       << ", requested_length=" << length
+                       << ", existing_device_id=" << iter->second.device_id
+                       << ", requested_device_id=" << attributes.location.id;
+            return -1;
+        }
+        ++iter->second.refcount;
+        registered = true;
+        LOG(INFO) << "USE_ASCEND_RDMA: reuse existing UB registration, addr="
+                  << addr << ", length=" << length
+                  << ", device_id=" << attributes.location.id
+                  << ", refcount=" << iter->second.refcount;
+        return 0;
+    }
+
+    drvError_t hal_ret = halMemRegUbSegment(
+        attributes.location.id, reinterpret_cast<uintptr_t>(addr), length);
+    if (hal_ret != DRV_ERROR_NONE) {
+        LOG(ERROR) << "USE_ASCEND_RDMA: halMemRegUbSegment failed, device_id="
+                   << attributes.location.id << ", addr=" << addr
+                   << ", length=" << length << ", ret=" << hal_ret;
+        return hal_ret;
+    }
+
+    registry.emplace(va, AscendUbRegistration{length, attributes.location.id,
+                                              /*refcount=*/1});
+    registered = true;
+    LOG(INFO) << "USE_ASCEND_RDMA: halMemRegUbSegment succeeded, addr="
+              << addr << ", length=" << length
+              << ", device_id=" << attributes.location.id
+              << ", refcount=1";
+    return 0;
+}
+
+int ascendUbUnregister(void* addr, size_t length) {
+    const uintptr_t va = reinterpret_cast<uintptr_t>(addr);
+    std::lock_guard<std::mutex> lock(ascendUbRegistryMutex());
+    auto &registry = ascendUbRegistry();
+    auto iter = registry.find(va);
+    if (iter == registry.end()) {
+        return 0;
+    }
+
+    if (iter->second.length != length) {
+        LOG(ERROR) << "USE_ASCEND_RDMA: UB unregister length mismatch, addr="
+                   << addr << ", registered_length=" << iter->second.length
+                   << ", requested_length=" << length;
+        return -1;
+    }
+    if (iter->second.refcount > 1) {
+        --iter->second.refcount;
+        LOG(INFO) << "USE_ASCEND_RDMA: release shared UB registration, addr="
+                  << addr << ", length=" << length
+                  << ", device_id=" << iter->second.device_id
+                  << ", refcount=" << iter->second.refcount;
+        return 0;
+    }
+
+    drvError_t hal_ret = halMemUnRegUbSegment(
+        iter->second.device_id, reinterpret_cast<uintptr_t>(addr), length);
+    if (hal_ret != DRV_ERROR_NONE) {
+        LOG(ERROR) << "USE_ASCEND_RDMA: halMemUnRegUbSegment failed, device_id="
+                   << iter->second.device_id << ", addr=" << addr
+                   << ", length=" << length << ", ret=" << hal_ret;
+        return hal_ret;
+    }
+    registry.erase(iter);
+    return hal_ret;
+}
+#endif
 
 #if defined(USE_HIP_DMABUF)
 // Returns true when the kernel has CONFIG_PCI_P2PDMA and
@@ -643,6 +766,24 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
     mrMeta.addr = addr;
+    bool ascend_ub_registered = false;
+#if defined(USE_ASCEND_RDMA)
+    // kHostReg names the plain ibv_reg_mr path; it does not imply that addr is
+    // host memory. ACL performs the actual Ascend HBM check.
+    const bool uses_plain_ibv_reg_mr =
+        exp.method == DmabufExport::Method::kHostReg;
+    if (uses_plain_ibv_reg_mr) {
+        int ret = ascendUbRegister(addr, length, ascend_ub_registered);
+        if (ret != 0) return ERR_CONTEXT;
+    }
+    LOG(INFO) << "RDMA memory registration request: device=" << device_name_
+              << ", addr=" << addr << ", length=" << length
+              << ", access=0x" << std::hex << access << std::dec
+              << ", path="
+              << (uses_plain_ibv_reg_mr ? "ibv_reg_mr" : "non-plain")
+              << ", ascend_ub_registered="
+              << (ascend_ub_registered ? "true" : "false");
+#endif
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
@@ -660,8 +801,22 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
+#if defined(USE_ASCEND_RDMA)
+        int saved_errno = errno;
+        if (ascend_ub_registered) {
+            (void)ascendUbUnregister(addr, length);
+        }
+        errno = saved_errno;
+#endif
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
-                    << length << " dmabuf_offset " << exp.offset;
+                    << length << " dmabuf_offset " << exp.offset
+                    << " device=" << device_name_ << " access=0x" << std::hex
+                    << access << std::dec << " method="
+                    << (exp.method == DmabufExport::Method::kDmabufReg
+                            ? "dmabuf"
+                            : "ibv_reg_mr")
+                    << " ascend_ub_registered="
+                    << (ascend_ub_registered ? "true" : "false");
         return ERR_CONTEXT;
     }
     return 0;
@@ -712,13 +867,17 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
     }
+    int ub_ret = 0;
+#if defined(USE_ASCEND_RDMA)
+    ub_ret = ascendUbUnregister(region_addr, region_length);
+#endif
     if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
         PLOG(WARNING) << "Failed to restore fork state for memory region at "
                       << region_addr << " (" << region_length
                       << " bytes), deregister already succeeded";
     }
     memory_region_map_.erase(iter);
-    return 0;
+    return ub_ret == 0 ? 0 : ERR_CONTEXT;
 }
 
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
@@ -737,7 +896,13 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
     if (ret != 0) {
         return ret;
     }
-    return ibv_dereg_mr(mrMeta.mr);
+    ret = ibv_dereg_mr(mrMeta.mr);
+    if (ret != 0) return ret;
+#if defined(USE_ASCEND_RDMA)
+    ret = ascendUbUnregister(addr, length);
+    if (ret != DRV_ERROR_NONE) return ERR_CONTEXT;
+#endif
+    return 0;
 }
 
 uint32_t RdmaContext::rkey(void *addr) {
