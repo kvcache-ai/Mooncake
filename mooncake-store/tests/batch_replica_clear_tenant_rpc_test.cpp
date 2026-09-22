@@ -24,9 +24,8 @@ class ScopedPolicyFile {
     ScopedPolicyFile() {
         const UUID suffix = generate_uuid();
         path_ = std::filesystem::temp_directory_path() /
-                ("batch_replica_clear_tenants_" +
-                 std::to_string(suffix.first) + "_" +
-                 std::to_string(suffix.second) + ".yaml");
+                ("batch_replica_clear_tenants_" + std::to_string(suffix.first) +
+                 "_" + std::to_string(suffix.second) + ".yaml");
     }
 
     ~ScopedPolicyFile() {
@@ -91,19 +90,19 @@ TEST(BatchReplicaClearTenantRpcTest, UsesClientTenantAndKeepsTenantsIsolated) {
         auto put_start = service->PutStart(client_id, kSharedKey, kObjectSize,
                                            replicate_config, tenant);
         ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-        auto put_end = service->PutEnd(
-            client_id, ObjectMeta{kSharedKey, std::nullopt},
-            ReplicaType::MEMORY, tenant);
+        auto put_end =
+            service->PutEnd(client_id, ObjectMeta{kSharedKey, std::nullopt},
+                            ReplicaType::MEMORY, tenant);
         ASSERT_TRUE(put_end.has_value()) << toString(put_end.error());
     }
 
     {
         MasterClient tenant_client(client_id, nullptr, kTenant);
-        ASSERT_EQ(tenant_client.Connect("127.0.0.1:" +
-                                        std::to_string(ports.front())),
-                  ErrorCode::OK);
-        auto cleared = tenant_client.BatchReplicaClear({kSharedKey}, client_id,
-                                                        "");
+        ASSERT_EQ(
+            tenant_client.Connect("127.0.0.1:" + std::to_string(ports.front())),
+            ErrorCode::OK);
+        auto cleared =
+            tenant_client.BatchReplicaClear({kSharedKey}, client_id, "");
         ASSERT_TRUE(cleared.has_value()) << toString(cleared.error());
         EXPECT_EQ(cleared.value(), std::vector<std::string>{kSharedKey});
     }
@@ -112,8 +111,7 @@ TEST(BatchReplicaClearTenantRpcTest, UsesClientTenantAndKeepsTenantsIsolated) {
     ASSERT_TRUE(tenant_exists.has_value());
     EXPECT_FALSE(tenant_exists.value());
     auto default_exists =
-        service->ExistKey(kSharedKey,
-                          std::string(TenantId::kDefaultValue));
+        service->ExistKey(kSharedKey, std::string(TenantId::kDefaultValue));
     ASSERT_TRUE(default_exists.has_value());
     EXPECT_TRUE(default_exists.value());
 
@@ -122,14 +120,14 @@ TEST(BatchReplicaClearTenantRpcTest, UsesClientTenantAndKeepsTenantsIsolated) {
         ASSERT_EQ(default_client.Connect("127.0.0.1:" +
                                          std::to_string(ports.front())),
                   ErrorCode::OK);
-        auto cleared = default_client.BatchReplicaClear({kSharedKey}, client_id,
-                                                         "");
+        auto cleared =
+            default_client.BatchReplicaClear({kSharedKey}, client_id, "");
         ASSERT_TRUE(cleared.has_value()) << toString(cleared.error());
         EXPECT_EQ(cleared.value(), std::vector<std::string>{kSharedKey});
     }
 
-    default_exists = service->ExistKey(
-        kSharedKey, std::string(TenantId::kDefaultValue));
+    default_exists =
+        service->ExistKey(kSharedKey, std::string(TenantId::kDefaultValue));
     ASSERT_TRUE(default_exists.has_value());
     EXPECT_FALSE(default_exists.value());
 
