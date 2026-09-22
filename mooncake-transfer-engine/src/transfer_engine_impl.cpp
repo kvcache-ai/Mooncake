@@ -1164,6 +1164,7 @@ void TransferEngineImpl::InitializeMetricsConfig() {
     }
 
     if (metrics_enabled_) {
+        TransferEngineMetrics::enable();
         TransferEngineMetrics::instance().initializeFromEnv();
     }
 }

@@ -18,6 +18,8 @@
 
 namespace mooncake {
 
+std::atomic<bool> TransferEngineMetrics::collection_enabled_{false};
+
 TransferEngineMetrics& TransferEngineMetrics::instance() {
     static TransferEngineMetrics instance;
     return instance;
