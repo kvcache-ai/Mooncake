@@ -1017,7 +1017,7 @@ std::string RdmaContext::gid() const { return gidSelection().gid; }
 
 GidSelectionSnapshot RdmaContext::gidSelection() const {
     std::lock_guard<std::mutex> guard(gid_lock_);
-    return {gidBytesToString(gid_.raw), gid_index_};
+    return {gidBytesToString(gid_.raw), gid_index_, auto_gid_selection_rank_};
 }
 
 int RdmaContext::gidIndex() const {
@@ -1309,6 +1309,7 @@ bool RdmaContext::reprobeAutoGid(
         std::lock_guard<std::mutex> guard(gid_lock_);
         gid_ = new_gid;
         gid_index_ = selection->gid_index;
+        auto_gid_selection_rank_ = selection->rank;
         next_gid_index = selection->gid_index;
         next_candidate_class = selection->candidate_class;
         if (next_gid) {
@@ -1326,6 +1327,120 @@ bool RdmaContext::reprobeAutoGid(
                  << next_gid_index << " (" << next_gid_string << "), class "
                  << autoGidCandidateClassToString(next_candidate_class);
     return true;
+}
+
+GidRefreshResult RdmaContext::ensureAutoGidRank(uint32_t requested_rank,
+                                                std::string *previous_gid,
+                                                std::string *next_gid) {
+    std::lock_guard<std::mutex> reprobe_guard(gid_reprobe_lock_);
+    std::string current_gid_string;
+    int current_gid_index = -1;
+    uint32_t current_rank = 0;
+    uint32_t current_lid = 0;
+    ibv_context *current_context = nullptr;
+    uint8_t current_port = 0;
+    {
+        std::lock_guard<std::mutex> guard(gid_lock_);
+        if (!auto_gid_selection_enabled_ || !context_) {
+            return GidRefreshResult::FAILED;
+        }
+        current_rank = auto_gid_selection_rank_;
+        current_gid_index = gid_index_;
+        current_gid_string = gidBytesToString(gid_.raw);
+        current_lid = lid_;
+        current_context = context_;
+        current_port = port_;
+    }
+
+    if (requested_rank <= current_rank) {
+        if (next_gid) *next_gid = current_gid_string;
+        return GidRefreshResult::UNCHANGED;
+    }
+    if (requested_rank >
+        static_cast<uint32_t>(globalConfig().auto_gid_max_retries)) {
+        return GidRefreshResult::FAILED;
+    }
+
+    ibv_port_attr port_attr;
+    int ret = ibv_query_port(current_context, current_port, &port_attr);
+    if (ret) {
+        LOG(WARNING) << "Failed to query port attributes while advancing auto "
+                        "GID rank on "
+                     << device_name_ << "/" << static_cast<int>(current_port)
+                     << ": " << strerror(ret);
+        return GidRefreshResult::FAILED;
+    }
+
+    std::vector<AutoGidCandidate> candidates;
+    candidates.reserve(port_attr.gid_tbl_len);
+    for (int i = 0; i < port_attr.gid_tbl_len; ++i) {
+        AutoGidCandidate candidate;
+        candidate.gid_index = i;
+        struct ibv_gid_entry gid_entry;
+        if (ibv_query_gid_ex(current_context, current_port, i, &gid_entry, 0)) {
+            candidate.query_succeeded = false;
+            candidates.push_back(candidate);
+            continue;
+        }
+
+        const auto *gid_addr =
+            reinterpret_cast<const struct in6_addr *>(gid_entry.gid.raw);
+        std::string ndev = readGidNdev(device_name_, current_port, i);
+        candidate.gid = gidBytesToString(gid_entry.gid.raw);
+        candidate.gid_type = gid_entry.gid_type;
+        candidate.has_network_device = !ndev.empty();
+        candidate.is_ipv4_mapped = ipv6_addr_v4mapped(gid_addr);
+        candidate.is_link_local_ipv6 = isLinkLocalIpv6(gid_addr);
+        candidate.is_overlay_network =
+            candidate.has_network_device && isOverlayNetwork(ndev);
+        candidate.is_overlay_ipv4 =
+            candidate.is_ipv4_mapped && isOverlayIPv4(gid_addr);
+        candidate.is_null_gid = isNullGid(&gid_entry.gid);
+        candidates.push_back(std::move(candidate));
+    }
+
+    auto selection = selectAutoGidCandidateAtRank(candidates, requested_rank);
+    if (!selection.has_value()) {
+        LOG(WARNING) << "No auto GID candidate at rank " << requested_rank
+                     << " on " << device_name_ << "/"
+                     << static_cast<int>(current_port);
+        return GidRefreshResult::FAILED;
+    }
+
+    ibv_gid new_gid = {};
+    if (ibv_query_gid(current_context, current_port, selection->gid_index,
+                      &new_gid) ||
+        isNullGid(&new_gid)) {
+        return GidRefreshResult::FAILED;
+    }
+    std::string next_gid_string = gidBytesToString(new_gid.raw);
+    int publish_ret = engine_.refreshLocalDeviceDesc(device_name_, current_lid,
+                                                     next_gid_string);
+    if (publish_ret) {
+        LOG(ERROR) << "Failed to publish auto GID rank " << requested_rank
+                   << " for " << device_name_ << ": " << publish_ret;
+        return GidRefreshResult::FAILED;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(gid_lock_);
+        if (auto_gid_selection_rank_ > current_rank) {
+            if (next_gid) *next_gid = gidBytesToString(gid_.raw);
+            return GidRefreshResult::UNCHANGED;
+        }
+        gid_ = new_gid;
+        gid_index_ = selection->gid_index;
+        auto_gid_selection_rank_ = requested_rank;
+    }
+    if (previous_gid) *previous_gid = current_gid_string;
+    if (next_gid) *next_gid = next_gid_string;
+    LOG(WARNING) << "Advanced auto GID rank on " << device_name_ << "/"
+                 << static_cast<int>(current_port) << " from rank "
+                 << current_rank << ", index " << current_gid_index << " ("
+                 << current_gid_string << ") to rank " << requested_rank
+                 << ", index " << selection->gid_index << " ("
+                 << next_gid_string << ")";
+    return GidRefreshResult::CHANGED;
 }
 
 GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
@@ -1433,6 +1548,7 @@ GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
         std::lock_guard<std::mutex> guard(gid_lock_);
         gid_ = new_gid;
         gid_index_ = next_gid_index;
+        if (auto_gid_selection_enabled) auto_gid_selection_rank_ = 0;
     }
     if (previous_gid) *previous_gid = current_gid_string;
     if (next_gid) *next_gid = next_gid_string;
@@ -1614,6 +1730,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         updateGlobalConfig(device_attr);
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;
+        auto_gid_selection_rank_ = 0;
         if (gid_index < 0) {
             int found_gid_index = -1;
             gid_state = findBestGidIndex(device_name, context, port_attr, port,
