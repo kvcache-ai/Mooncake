@@ -93,7 +93,7 @@ production `OpLogApplier` and `StandbyMetadataStore`: exact object metadata,
 tenant isolation, deleted/revoked objects, Segment state, replay cursor, replica
 IDs, and duplicate replay idempotence are checked. Memory addresses in descriptors
 are fixtures; no data buffers are dereferenced or serving resources rebuilt.
-The [P02 gating notes](results/2026-09-16/RESULTS.md#p02-codec-decision-versus-production-rollout)
+The P02 gating notes (record retained locally)
 separate codec/schema evidence from the serving-recovery validation required for
 production rollout, including cases where descriptor semantics affect selection.
 
@@ -104,5 +104,5 @@ E2E. A size/CPU gain here does not establish an end-to-end service improvement.
 
 ## Recorded evidence
 
-See [the 2026-09-16 report](results/2026-09-16/RESULTS.md) for both repeated
+See the 2026-09-16 report (record retained locally) for both repeated
 raw sample passes, summaries, build metadata, and the eight-case E2E report.
