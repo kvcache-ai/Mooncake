@@ -1302,6 +1302,7 @@ TEST_F(MasterMetricsTest, DuplicatePutResponsesCountItemsWithoutPerKeyLogs) {
             SCOPED_TRACE(::testing::Message()
                          << "v=" << verbosity << ", same_node=" << same_node);
             WrappedMasterServiceConfig service_config;
+            service_config.default_kv_lease_ttl = 100;
             service_config.enable_metric_reporting = false;
             WrappedMasterService service(service_config);
             const auto client_id = generate_uuid();
