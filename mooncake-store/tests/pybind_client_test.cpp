@@ -3375,7 +3375,8 @@ TEST_F(RealClientTest, GetBufferHealUsesReaderTenantForCrossTenantReplica) {
 // the follow-up eviction to "default" and deleted that healthy replica. On a
 // scoped miss the handler now also probes the default scope and answers
 // undetermined instead of evicting on the ambiguity.
-TEST_F(RealClientTest, GetBufferHealDoesNotEvictHealthyReplicaWhenTenancyIsOff) {
+TEST_F(RealClientTest,
+       GetBufferHealDoesNotEvictHealthyReplicaWhenTenancyIsOff) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
@@ -3437,11 +3438,11 @@ TEST_F(RealClientTest, GetBufferHealDoesNotEvictHealthyReplicaWhenTenancyIsOff) 
     // its own tenant and misses. Its verify must NOT evict the healthy
     // default replica.
     auto reader = RealClient::create();
-    ASSERT_EQ(reader->setup_real("localhost:17814", "P2PHANDSHAKE",
-                                 16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
-                                 master_address_, nullptr, "", false, "",
-                                 "tenant-a"),
-              0);
+    ASSERT_EQ(
+        reader->setup_real("localhost:17814", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                           16 * 1024 * 1024, "tcp", "", master_address_,
+                           nullptr, "", false, "", "tenant-a"),
+        0);
 
     EXPECT_EQ(reader->get_buffer(key), nullptr);
     bool disk_replica_survives = false;
