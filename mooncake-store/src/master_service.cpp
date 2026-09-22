@@ -5130,15 +5130,21 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     };
 
     // Tenant over-quota remains a background-eviction concern. Bucket-count
-    // exhaustion is different: one forced, fully validated bucket eviction is
-    // allowed before retrying this admission once. The retry is gated on
-    // dfs_allocation_failed so only genuine DFS capacity exhaustion triggers
-    // it; memory/NoF exhaustion keeps its background-eviction path.
+    // exhaustion is different: serialize recovery, retry admission after any
+    // recovery ahead of us, then allow one forced, fully validated bucket
+    // eviction and one final retry. The path is gated on dfs_allocation_failed
+    // so memory/NoF exhaustion keeps its background-eviction behavior.
     auto result = admit();
     if (!result && dfs_allocation_failed && config.dfs_replica_num > 0 &&
-        bucket_allocator_ != nullptr &&
-        TryRecoverDfsSpaceAfterAllocationFailure()) {
+        bucket_allocator_ != nullptr) {
+        std::lock_guard recovery_lock(dfs_bucket_recovery_mutex_);
+        dfs_allocation_failed = false;
         result = admit();
+        if (!result && dfs_allocation_failed &&
+            TryRecoverDfsSpaceAfterAllocationFailure()) {
+            dfs_allocation_failed = false;
+            result = admit();
+        }
     }
     if (!result && result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
         MasterMetricManager::instance().inc_tenant_quota_reject(
@@ -6153,11 +6159,18 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // extent.
     auto result = admit();
     // Eviction scans metadata shards, so recover only after admit releases its
-    // shard lock, then retry this admission at most once.
+    // shard lock. Serialize recovery and re-admit before deciding whether this
+    // request still needs to evict one bucket.
     if (!result && dfs_allocation_failed && config.dfs_replica_num > 0 &&
-        bucket_allocator_ != nullptr &&
-        TryRecoverDfsSpaceAfterAllocationFailure()) {
+        bucket_allocator_ != nullptr) {
+        std::lock_guard recovery_lock(dfs_bucket_recovery_mutex_);
+        dfs_allocation_failed = false;
         result = admit();
+        if (!result && dfs_allocation_failed &&
+            TryRecoverDfsSpaceAfterAllocationFailure()) {
+            dfs_allocation_failed = false;
+            result = admit();
+        }
     }
     if (!result && result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
         MasterMetricManager::instance().inc_tenant_quota_reject(

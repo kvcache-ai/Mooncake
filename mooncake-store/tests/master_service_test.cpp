@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -629,6 +630,128 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
             ASSERT_EQ(query->replicas.size(), 1u);
             EXPECT_TRUE(query->replicas.front().is_dfs_replica());
         }
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest,
+       DfsBucketConcurrentPutAndUpsertShareSingleRecoveryBucket) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_single_flight_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "32768");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "1.0");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.9");
+    ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+                                   "60");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        constexpr size_t kObjectSize = 4096;
+        constexpr size_t kConcurrentWrites = 8;
+        constexpr size_t kOldKeyCount = 32;
+        const size_t old_shard =
+            MetadataShardIndex(service, "single_flight_old_seed");
+        std::vector<std::string> old_keys;
+        std::vector<std::string> new_keys;
+        for (size_t i = 0; old_keys.size() < kOldKeyCount ||
+                           new_keys.size() < kConcurrentWrites;
+             ++i) {
+            const std::string key = "single_flight_key_" + std::to_string(i);
+            if (MetadataShardIndex(service, key) == old_shard) {
+                if (old_keys.size() < kOldKeyCount) old_keys.push_back(key);
+            } else if (new_keys.size() < kConcurrentWrites) {
+                new_keys.push_back(key);
+            }
+        }
+
+        for (const auto& key : old_keys) {
+            auto start =
+                service.PutStart(context.client_id, key, TenantId::Default(),
+                                 kObjectSize, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+
+        auto old_shard_lock = LockMetadataShardForTest(service, old_shard);
+        std::barrier start_barrier(kConcurrentWrites + 1);
+        std::vector<int> errors(kConcurrentWrites,
+                                static_cast<int>(ErrorCode::INTERNAL_ERROR));
+        std::vector<int> bucket_ids(kConcurrentWrites, -1);
+        std::vector<std::thread> writers;
+        writers.reserve(kConcurrentWrites);
+        for (size_t i = 0; i < kConcurrentWrites; ++i) {
+            writers.emplace_back([&, i] {
+                start_barrier.arrive_and_wait();
+                auto result =
+                    i % 2 == 0
+                        ? service.PutStart(context.client_id, new_keys[i],
+                                           TenantId::Default(), kObjectSize,
+                                           config)
+                        : service.UpsertStart(context.client_id, new_keys[i],
+                                              TenantId::Default(), kObjectSize,
+                                              config);
+                if (!result) {
+                    errors[i] = static_cast<int>(result.error());
+                    return;
+                }
+                errors[i] = static_cast<int>(ErrorCode::OK);
+                for (const auto& descriptor : *result) {
+                    if (descriptor.is_dfs_replica()) {
+                        bucket_ids[i] =
+                            descriptor.get_dfs_descriptor().shard_idx;
+                    }
+                }
+            });
+        }
+
+        start_barrier.arrive_and_wait();
+        // Keep eviction validation blocked long enough for all writers to
+        // encounter the full allocator. Without single-flight recovery they
+        // freeze different LRU buckets while waiting on this shard.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        old_shard_lock.reset();
+        for (auto& writer : writers) writer.join();
+
+        for (size_t i = 0; i < kConcurrentWrites; ++i) {
+            EXPECT_EQ(errors[i], static_cast<int>(ErrorCode::OK))
+                << new_keys[i];
+            EXPECT_GE(bucket_ids[i], 0) << new_keys[i];
+            EXPECT_EQ(bucket_ids[i], bucket_ids.front()) << new_keys[i];
+        }
+
+        size_t old_dfs_replicas = 0;
+        for (const auto& key : old_keys) {
+            auto query = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(query.has_value()) << key;
+            old_dfs_replicas +=
+                std::count_if(query->replicas.begin(), query->replicas.end(),
+                              [](const Replica::Descriptor& descriptor) {
+                                  return descriptor.is_dfs_replica();
+                              });
+        }
+        EXPECT_EQ(old_dfs_replicas, kOldKeyCount - kConcurrentWrites);
     }
 
     std::error_code ec;

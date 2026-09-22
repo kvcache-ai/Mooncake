@@ -2210,6 +2210,10 @@ class MasterService {
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     DfsGlobalAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};
+    // Serializes allocation-failure recovery so concurrent writers can reuse
+    // capacity made available by the first recovery instead of each evicting
+    // a different frozen bucket.
+    std::mutex dfs_bucket_recovery_mutex_;
 
     // Segment management
     SegmentManager segment_manager_;
