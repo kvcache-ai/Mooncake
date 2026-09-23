@@ -102,6 +102,29 @@ TEST(ToplogyTest, TestSelectDevice) {
     ASSERT_TRUE(items.empty());
 }
 
+TEST(ToplogyTest, GetDeviceIndexDoesNotApplyFallback) {
+    mooncake::Topology topology;
+    std::string json_str =
+        "{\"cpu:0\" : [[\"mlx5_0\"],[]],"
+        "\"cpu:1\" : [[\"mlx5_1\"],[]]}";
+    topology.clear();
+    ASSERT_EQ(topology.parse(json_str), 0);
+
+    const int local = topology.getDeviceIndex("cpu:0", "mlx5_0");
+    const int remote = topology.getDeviceIndex("cpu:1", "mlx5_1");
+    ASSERT_GE(local, 0);
+    ASSERT_GE(remote, 0);
+    EXPECT_EQ(topology.getDeviceIndex("cpu:0", "mlx5_1"), ERR_DEVICE_NOT_FOUND);
+    EXPECT_EQ(topology.getDeviceIndex(mooncake::kWildcardLocation, "mlx5_1"),
+              remote);
+    EXPECT_EQ(topology.getDeviceIndex("cpu:0", "does_not_exist"),
+              ERR_DEVICE_NOT_FOUND);
+
+    ASSERT_EQ(topology.disableDevice("mlx5_1"), 0);
+    EXPECT_EQ(topology.getDeviceIndex(mooncake::kWildcardLocation, "mlx5_1"),
+              ERR_DEVICE_NOT_FOUND);
+}
+
 TEST(ToplogyTest, TestSelectDeviceAny) {
     mooncake::Topology topology;
     std::string json_str = "{\"cpu:0\" : [[\"erdma_0\"],[\"erdma_1\"]]}";

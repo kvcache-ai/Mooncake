@@ -95,6 +95,12 @@ class Topology {
     int selectDeviceByLocalHca(const std::string storage_type,
                                std::string_view local_hca, int retry_count = 0);
 
+    // Resolve a named HCA in one topology entry without applying fallback
+    // selection. Returns ERR_DEVICE_NOT_FOUND when either the entry or HCA is
+    // absent. This lets callers explicitly try a location and then wildcard.
+    int getDeviceIndex(const std::string &storage_type,
+                       std::string_view device_name) const;
+
     TopologyMatrix getMatrix() const { return matrix_; }
 
     const std::vector<std::string> &getHcaList() const { return hca_list_; }

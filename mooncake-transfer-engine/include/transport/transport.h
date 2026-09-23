@@ -75,6 +75,10 @@ class Transport {
         uint64_t task_group_id = kNoTaskGroup;
         // TENT transport selection priority; ignored by classic TE.
         int priority = PRIO_MEDIUM;
+        // Optional local RNIC index for the classic RDMA transport. The index
+        // refers to Topology::getHcaList(); -1 keeps normal topology-based
+        // selection. The hint is advisory and only affects initial submission.
+        int nic_hint = -1;
     };
 
     enum TransferStatusEnum {
