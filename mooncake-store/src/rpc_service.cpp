@@ -235,17 +235,23 @@ WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
-    const std::string& segment_name) {
+    const std::string& segment_name, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchReplicaClear");
     const size_t total_keys = object_keys.size();
     timer.LogRequest("object_keys_count=", total_keys,
-                     ", client_id=", client_id,
-                     ", segment_name=", segment_name);
+                     ", client_id=", client_id, ", segment_name=", segment_name,
+                     ", tenant_id=", tenant_id);
     MasterMetricManager::instance().inc_batch_replica_clear_requests(
         total_keys);
 
-    auto result =
-        master_service_.BatchReplicaClear(object_keys, client_id, segment_name);
+    auto result = WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchReplicaClear(
+                object_keys, client_id, segment_name,
+                resolved_tenant_id.value());
+        });
 
     size_t failure_count = 0;
     if (!result.has_value()) {
