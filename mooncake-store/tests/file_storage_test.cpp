@@ -52,6 +52,10 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
         UnsetEnv("MOONCAKE_USE_URING");
+        UnsetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE");
+        UnsetEnv("MOONCAKE_DFS_FS_ADAPTER");
+        UnsetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR");
+        UnsetEnv("MOONCAKE_DFS_ROOT_DIR");
         data_path = (std::filesystem::current_path() / "file_storage_test_data")
                         .string();
         fs::create_directories(data_path);
@@ -97,6 +101,10 @@ class FileStorageTest : public ::testing::Test {
     tl::expected<bool, ErrorCode> FileStorageIsEnableOffloading(
         FileStorage& fileStorage) {
         return fileStorage.IsEnableOffloading();
+    }
+
+    bool FileStorageUsesDfsControlPlane(const FileStorage& file_storage) {
+        return file_storage.config_.enable_dfs;
     }
 
     tl::expected<void, ErrorCode> FileStorageNotifyEvictedDiskReplicas(
@@ -529,6 +537,33 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
                 !enable_offloading_result3.value());
 }
 
+TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
+    SetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "distributed_storage_backend");
+    SetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR", data_path + "/distributed");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    EXPECT_FALSE(config.enable_dfs);
+
+    SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "posix");
+    {
+        FileStorage file_storage(config, nullptr, "localhost:9003");
+        EXPECT_TRUE(FileStorageUsesDfsControlPlane(file_storage));
+    }
+
+#ifdef HAVE_OSS_ADAPTER
+    SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "oss");
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    EXPECT_FALSE(FileStorageUsesDfsControlPlane(file_storage));
+
+    auto enable_offloading = FileStorageIsEnableOffloading(file_storage);
+    ASSERT_TRUE(enable_offloading);
+    EXPECT_TRUE(*enable_offloading);
+#endif
+}
+
 TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
@@ -738,15 +773,6 @@ TEST_F(FileStorageTest,
     }
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
-}
-
-TEST_F(FileStorageTest, ReadBucketBackendValues) {
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "536870912");
-
-    const auto config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(config.bucket_keys_limit, 1000);
-    EXPECT_EQ(config.bucket_size_limit, 512 * 1024 * 1024);
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {

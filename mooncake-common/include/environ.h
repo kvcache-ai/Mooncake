@@ -65,29 +65,10 @@ class Environ {
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
+    bool GetRdmaDataDirect() const { return rdma_data_direct_; }
     int GetEfaCqThreads() const { return efa_cq_threads_; }
     bool GetStoreChecksumEnabled() const { return store_checksum_enabled_; }
 
-    // AWS / S3 client configuration
-    std::string GetAwsRegion() const { return aws_region_; }
-    std::string GetAwsS3Endpoint() const { return aws_s3_endpoint_; }
-    std::string GetAwsBucketName() const { return aws_bucket_name_; }
-    std::string GetAwsAccessKeyId() const { return aws_access_key_id_; }
-    std::string GetAwsSecretAccessKey() const { return aws_secret_access_key_; }
-    bool GetAwsUseVirtualAddressing() const {
-        return aws_use_virtual_addressing_;
-    }
-    bool GetAwsUseHttps() const { return aws_use_https_; }
-    // Empty string means "unset" — s3_helper keeps the AWS SDK default in
-    // that case. Parsing to AWS enums is done by the consumer.
-    std::string GetAwsRequestChecksumCalculation() const {
-        return aws_request_checksum_calculation_;
-    }
-    std::string GetAwsResponseChecksumValidation() const {
-        return aws_response_checksum_validation_;
-    }
-    int64_t GetAwsConnectTimeoutMs() const { return aws_connect_timeout_ms_; }
-    int64_t GetAwsRequestTimeoutMs() const { return aws_request_timeout_ms_; }
     uint32_t GetRpcClientIoThreads() const { return rpc_client_io_threads_; }
     uint32_t GetStoreRpcClientIoThreads() const {
         return store_rpc_client_io_threads_;
@@ -178,24 +159,12 @@ class Environ {
     bool intra_nvlink_;
     bool path_roundrobin_;
     bool with_nvidia_peermem_;
+    bool rdma_data_direct_;
     int efa_cq_threads_;
     bool store_checksum_enabled_;
     uint32_t rpc_client_io_threads_;
     uint32_t store_rpc_client_io_threads_;
     uint32_t transfer_engine_rpc_client_io_threads_;
-
-    // AWS / S3 client configuration
-    std::string aws_region_;
-    std::string aws_s3_endpoint_;
-    std::string aws_bucket_name_;
-    std::string aws_access_key_id_;
-    std::string aws_secret_access_key_;
-    bool aws_use_virtual_addressing_;
-    bool aws_use_https_;
-    std::string aws_request_checksum_calculation_;
-    std::string aws_response_checksum_validation_;
-    int64_t aws_connect_timeout_ms_;
-    int64_t aws_request_timeout_ms_;
 };
 
 }  // namespace mooncake

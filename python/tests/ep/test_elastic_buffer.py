@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--reconfigure",
+        action="store_true",
+        help="Rebuild the NCCL generation and verify post-update correctness.",
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
         "--quick",
@@ -411,6 +416,78 @@ def main() -> None:
     if expanded_idx.shape[0] != expanded_actual:
         raise AssertionError(f"rank={rank}: expanded metadata extent mismatch")
 
+    if args.reconfigure:
+        if buffer.transport != "nccl":
+            raise RuntimeError("--reconfigure requires the NCCL transport")
+
+        stale_handle = handle0
+        # Exercise retirement of more than one obsolete communicator/window
+        # generation before checking the new data path.
+        for _ in range(2):
+            buffer.update_ep_member()
+
+        try:
+            buffer.dispatch(
+                x0,
+                handle=stale_handle,
+                num_experts=num_experts,
+                num_max_tokens_per_rank=max_tokens,
+                num_sms=args.num_sms,
+            )
+        except RuntimeError as exc:
+            if "obsolete NCCL ElasticBuffer generation" not in str(exc):
+                raise
+        else:
+            raise AssertionError(
+                f"rank={rank}: cached dispatch accepted a stale EPHandle"
+            )
+
+        x3 = make_input(
+            rank=rank,
+            num_tokens=args.num_tokens,
+            hidden=args.hidden,
+            multiplier=4_000_000,
+            addend=47,
+        )
+        recv3, _idx3, w3, handle3, _ = buffer.dispatch(
+            x3,
+            topk_idx=route_plan.topk_idx,
+            topk_weights=weights,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=max_tokens,
+            expert_alignment=1,
+            do_cpu_sync=True,
+            num_sms=args.num_sms,
+            async_with_compute_stream=False,
+        )
+        torch.cuda.synchronize()
+        actual3 = check_dispatch_payload(
+            rank=rank,
+            recv_x=recv3,
+            handle=handle3,
+            expected_recv_tokens=route_plan.expected_recv_tokens,
+            max_tokens=max_tokens,
+            num_tokens=args.num_tokens,
+            hidden=args.hidden,
+            multiplier=4_000_000,
+            addend=47,
+        )
+        combined3, _, _ = buffer.combine(
+            recv3[:actual3].contiguous(),
+            handle3,
+            topk_weights=w3[:actual3].contiguous(),
+            num_sms=args.num_sms,
+            async_with_compute_stream=False,
+        )
+        torch.cuda.synchronize()
+        expected3 = (x3.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
+        check_combined(
+            rank=rank,
+            combined=combined3,
+            expected=expected3,
+            label="post-reconfiguration",
+        )
+
     distributed_barrier()
     if rank == 0:
         print(
@@ -422,6 +499,7 @@ def main() -> None:
             f"expanded={expanded_output}",
             f"scaleout={buffer.num_scaleout_ranks}",
             f"scaleup={buffer.num_scaleup_ranks}",
+            f"reconfigured={args.reconfigure}",
             flush=True,
         )
     buffer.destroy()

@@ -37,6 +37,7 @@
 #include "tent/runtime/hp_tcp_transport_config.h"
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
 namespace tent {
 
 class Batch;
@@ -80,6 +81,7 @@ struct TaskInfo {
     uint64_t device_mask{~0ULL};  // Device mask for quota allocation
     std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
     Request request;
+    size_t public_length{0};  // Original API request; request may be merged.
     bool staging{false};
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
@@ -118,6 +120,7 @@ struct TaskInfo {
           device_mask(other.device_mask),
           qp_pool(other.qp_pool),
           request(other.request),
+          public_length(other.public_length),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -142,6 +145,7 @@ struct TaskInfo {
           device_mask(other.device_mask),
           qp_pool(std::move(other.qp_pool)),
           request(std::move(other.request)),
+          public_length(other.public_length),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -167,6 +171,7 @@ struct TaskInfo {
             device_mask = other.device_mask;
             qp_pool = other.qp_pool;
             request = other.request;
+            public_length = other.public_length;
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -197,6 +202,7 @@ struct TaskInfo {
             device_mask = other.device_mask;
             qp_pool = std::move(other.qp_pool);
             request = std::move(other.request);
+            public_length = other.public_length;
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -217,6 +223,7 @@ struct TaskInfo {
 
 class TransferEngineImpl {
     friend class ProxyManager;
+    friend class ::mooncake::TransferEngineImplTestPeer;
 
    public:
     TransferEngineImpl();
@@ -297,8 +304,18 @@ class TransferEngineImpl {
 
     Status cancelTransfer(BatchID batch_id, size_t task_id);
 
+    // Tries every loaded notification transport in slot order. A transport
+    // whose channel is unavailable (endpoint down, no notify QP) is skipped
+    // for the next one, and when all are, the notification goes over the
+    // control-plane RPC the peer answers bootstrap on. Any other error is
+    // returned as is. notification/rpc_fallback=false restores the
+    // first-transport-only behavior.
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 
+    // Drains every loaded notification transport plus the in-process queue,
+    // so a notification lands with the caller no matter which path carried
+    // it. Order is kept within one path only: in a poll, notifications that
+    // took the RPC fallback come after the ones the notify QP carried.
     Status receiveNotification(std::vector<Notification>& notifi_list);
 
     Status probePeerAliveByID(SegmentID target_id);
@@ -389,6 +406,8 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
+    void deregisterRemovedBuffer(BufferDesc& desc);
+
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
     // Submit-stage failover: recover a task whose synchronous
@@ -478,6 +497,12 @@ class TransferEngineImpl {
 
     Status loadTransports();
 
+    // Control-plane delivery used by sendNotification() once every loaded
+    // notification transport has reported its channel unavailable. Same
+    // wire path as TcpTransport::sendNotification().
+    Status sendNotificationViaRpc(SegmentID target_id,
+                                  const Notification& notifi);
+
     void findStagingPolicy(const Request& req,
                            std::vector<std::string>& policy);
 
@@ -564,6 +589,7 @@ class TransferEngineImpl {
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
     std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
+    bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;

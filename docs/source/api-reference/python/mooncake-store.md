@@ -760,6 +760,56 @@ store.put("key-a", b"value-a", config)
 
 ---
 
+(choosing-a-parallel-tensor-io-api)=
+## Choosing a Parallel Tensor IO API
+
+Use the API that matches the object being stored. The single-axis TP methods
+and the manifest-backed weight snapshot API have different storage contracts.
+
+| Requirement | Public API | Contract |
+| --- | --- | --- |
+| Store and retrieve a complete tensor | `put_tensor()` / `get_tensor()` | One ordinary Store tensor object. |
+| Split a full tensor and read a TP shard | `put_tensor_with_tp()` / `get_tensor_with_tp()` | Legacy single-axis TP tensor objects; batch and registered-buffer variants are also available. |
+| Save weights and restore into a different TP/DP/EP/PP placement | `begin_weight_snapshot()` and `WeightStore.load_manifest()` / `plan_load()` / `load()` | Immutable manifest-managed fragments, with framework-supplied placement and runtime bindings. |
+| Use `put/get_tensor_with_cp`, `*_with_dp`, `*_with_ep`, or `*_with_pp` | No such public convenience methods | DP/EP/PP weight placement is expressed through the manifest API; CP is not a supported axis. |
+| Supply an arbitrary parallel strategy through `*_with_config` | No such public tensor API | `ReplicateConfig` controls Store replication and placement policy, not tensor parallel topology. |
+
+For example, with an already initialized `MooncakeDistributedStore`, the
+legacy TP write accepts the **full** tensor and writes all shards. `tp_rank`
+on this write does not select a single shard to persist:
+
+```python
+import torch
+
+tensor = torch.linspace(0, 23, 24, dtype=torch.float32).reshape(4, 6)
+assert store.put_tensor_with_tp("tp-example", tensor, tp_size=2, split_dim=1) == 0
+shard = store.get_tensor_with_tp("tp-example", tp_rank=1, tp_size=2, split_dim=1)
+assert torch.equal(shard, tensor[:, 3:])
+```
+
+### Parallel configuration boundaries
+
+The model-weight API uses typed `ParallelTopology`, `WeightPlacementManifest`,
+and `WeightRuntimeBindingManifest` values supplied by the framework adapter.
+It does not provide a factory that generates a separate put/get method family
+for each axis, or accept an arbitrary strategy dictionary.
+
+- TP and EP can describe logical splits. EP splits the leading logical expert
+  dimension; TP names an explicit logical dimension.
+- DP describes replicas or ownership. PP describes framework-provided tensor
+  or layer ownership. Neither implies a tensor split dimension.
+- CP (context parallelism) is absent from the current topology and axis types.
+  A sequence-dimension slice through the TP API does not establish CP topology
+  support or CP-aware KV-cache resharding.
+- Combining supported axes still requires complete logical coverage and
+  compatible source/target tensor descriptors. The planner is copy-only; it
+  does not convert dtype, quantization, packing, or model semantics.
+
+See the [manifest contracts](../../design/mooncake-reshard/reshard-manifest.md),
+[weight reshard planner](../../design/mooncake-reshard/model-weight-reshard-planner.md), and
+[Store upload planning](../../design/mooncake-reshard/model-weight-store-upload-planning.md)
+for the configuration and execution boundaries.
+
 ## Model Weight Snapshot API
 
 Heterogeneous model-weight snapshots use the manifest-backed Reshard API.
@@ -787,7 +837,8 @@ placement and runtime binding manifests.
 
 ### Breaking Change and Migration
 
-This release removes the public `*_with_parallelism` API family and the
+PR [#3772](https://github.com/kvcache-ai/Mooncake/pull/3772) removed the public
+`*_with_parallelism` API family and the
 associated `ParallelAxis`, `TensorParallelism`, and `ReadTarget` helper types.
 Applications that create heterogeneous model-weight snapshots migrate their
 write path to `begin_weight_snapshot()`, `write_tensor()`, and `commit()`.
@@ -1457,6 +1508,67 @@ results = store.batch_is_exist(keys)
 for key, exists in zip(keys, results):
     status = "exists" if exists == 1 else "not found" if exists == 0 else "error"
     print(f"{key}: {status}")
+```
+
+---
+
+#### probe_key()
+Point-in-time existence check that grants no read lease.
+
+Unlike `is_exist()`, a successful probe does not extend the object's lease,
+so probed objects remain eligible for eviction. A `1` result only means the
+object existed at the time of the call; it may be evicted before a
+subsequent `get`, and callers must treat a following miss as normal. This is
+suited for speculative scans (e.g., probing candidate keys to estimate
+prefix reuse) where the caller reads back only a subset of the probed keys.
+
+```python
+def probe_key(self, key: str) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier to check
+
+**Returns:**
+- `int`:
+  - `1`: Object existed at the time of the call
+  - `0`: Object didn't exist
+  - `-1`: Error occurred
+
+**Example:**
+```python
+exists = store.probe_key("my_key")
+if exists == 1:
+    print("Object existed at probe time (no lease granted)")
+elif exists == 0:
+    print("Object not found")
+else:
+    print("Error checking existence")
+```
+
+---
+
+#### batch_probe_key()
+Point-in-time existence check for multiple objects in a single batch
+operation, granting no read leases.
+
+```python
+def batch_probe_key(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers to check
+
+**Returns:**
+- `List[int]`: List of existence results (1=existed at probe time,
+0=not exists, -1=error)
+
+**Example:**
+```python
+keys = ["key1", "key2", "key3"]
+results = store.batch_probe_key(keys)
+candidates = [key for key, exists in zip(keys, results) if exists == 1]
+print("Probed candidates (unprotected from eviction):", candidates)
 ```
 
 ---
@@ -2844,9 +2956,18 @@ Typical flow:
 - Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
-Get sessions cache a filtered `QueryResult` (single complete memory replica + lease).
-Range calls only check the cached lease locally (zero Master RPCs). Put sessions
-reserve object space via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+Get sessions cache a filtered `QueryResult` (one complete MEMORY or DFS replica
+plus its lease). The MEMORY path remains zero-copy. DFS replicas are read into
+request-scoped host staging and then scattered to host or device destinations.
+If a key has no complete MEMORY or DFS replica, for example because it has only
+LOCAL_DISK, DISK, or NOF replicas, `batch_get_session_start` returns
+`INVALID_REPLICA` for that key and does not open a session.
+For device destinations, DFS staging first uses the fixed-capacity pinned restore
+arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`; if that arena is
+unavailable or exhausted, it falls back to the regular client buffer allocator.
+Host-only reads use the regular client buffer allocator. Range calls only check
+the cached lease locally (zero Master RPCs). Put sessions reserve object space
+via Master `BatchPutStart` and finalize with `BatchPutEnd`.
 
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
@@ -2855,8 +2976,9 @@ Reliable multi-replica NoF configs are rejected at session start. `end` / `revok
 seal the session (no further range writes) and wait for in-flight range transfers
 before talking to Master.
 
-⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed
-registered memory before ranged zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All destination buffers must resolve to
+Store-managed registered memory. DFS session reads use temporary staging; the
+staging allocation is released after the synchronous read and scatter finish.
 
 #### batch_get_session_start()
 

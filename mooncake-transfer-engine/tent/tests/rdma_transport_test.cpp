@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
+#include <sys/eventfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -74,6 +75,25 @@ class RdmaTransportTestPeer {
     static void bindContexts(RdmaTransport& transport,
                              RdmaContextSet contexts) {
         transport.context_set_ = std::move(contexts);
+    }
+
+    // Defaults to a monitor tick: that is what the orphan tests stand in for.
+    static void reapOrphanSlices(RdmaTransport& transport,
+                                 bool on_tick = true) {
+        transport.reapOrphanSlices(on_tick);
+    }
+
+    static size_t orphanSliceCount(RdmaTransport& transport) {
+        std::lock_guard<std::mutex> guard(transport.orphan_slice_mutex_);
+        return transport.orphan_slices_.size();
+    }
+    static size_t orphanWarnings(RdmaTransport& transport) {
+        std::lock_guard<std::mutex> guard(transport.orphan_slice_mutex_);
+        return transport.orphan_warnings_;
+    }
+    static void setOrphanWarnAfterPasses(RdmaTransport& transport,
+                                         uint32_t passes) {
+        transport.orphan_warn_after_passes_ = passes;
     }
 
     // Runs the monitorThread() 1 Hz reclaim tick without starting any worker
@@ -200,6 +220,10 @@ class RdmaTransportTestPeer {
                                      uint64_t now_ns) {
         workers.expireTimedOutSlices(ctx, now_ns);
     }
+
+    static Status notifyStatusForEndpointFailure(const Status& failure) {
+        return RdmaTransport::notifyStatusForEndpointFailure(failure);
+    }
 };
 
 // Friend accessor for RdmaContext: TENT reaches libibverbs through a table of
@@ -237,7 +261,7 @@ class RdmaContextTestPeer {
     }
 
     static void seedAddress(RdmaContext& context,
-                            const std::string& device_name, uint16_t lid,
+                            const std::string& device_name, uint32_t lid,
                             int gid_index, const ibv_gid& gid,
                             RdmaContext::DeviceStatus status) {
         std::lock_guard<std::mutex> guard(context.address_mutex_);
@@ -251,12 +275,41 @@ class RdmaContextTestPeer {
     static void unbindDevice(RdmaContext& context) {
         context.native_context_ = nullptr;
     }
+
+    // Everything construct() does before it calls enable(), so a test can
+    // install stand-in verbs in between and then drive enable() itself.
+    static void prepareForEnable(RdmaContext& context,
+                                 const std::string& device_name,
+                                 std::shared_ptr<RdmaParams> params) {
+        context.device_name_ = device_name;
+        context.params_ = params;
+        context.endpoint_store_ = std::make_shared<SIEVEEndpointStore>(
+            context, params->endpoint.endpoint_store_cap);
+        context.status_ = RdmaContext::DEVICE_DISABLED;
+    }
+
+    // What enable() built and disable() has to give back.
+    static size_t compChannelCount(const RdmaContext& context) {
+        return context.comp_channel_.size();
+    }
+    static size_t cqCount(const RdmaContext& context) {
+        return context.cq_list_.size();
+    }
 };
 
 // Friend accessor for RdmaEndPoint. Posting is the one step in the data
 // path that does not go through the injectable verbs table (ibv_post_send is
 // an inline that dispatches through the queue pair), so a test stands in for
 // it and puts the slice on the queue pair the way submitSlices would.
+// Tickets are the lock's only observable state; a test that needs to know a
+// thread is queued on it watches them being handed out.
+class TicketLockTestPeer {
+   public:
+    static int ticketsIssued(const TicketLock& lock) {
+        return lock.next_ticket_.load(std::memory_order_acquire);
+    }
+};
+
 class RdmaEndPointTestPeer {
    public:
     static RdmaAddressSnapshot localAddress(const RdmaEndPoint& endpoint) {
@@ -270,6 +323,9 @@ class RdmaEndPointTestPeer {
         slice->ep_weak_ptr = endpoint;
         std::lock_guard<TicketLock> guard(endpoint->queue_lock_list_[qp_index]);
         endpoint->slice_queue_[qp_index].push(slice);
+        // submitSlices() counts the completion the post owes; a stand-in that
+        // skipped it would leave the slice looking settled.
+        slice->completions_owed.fetch_add(1, std::memory_order_acq_rel);
     }
     static void markReady(const std::shared_ptr<RdmaEndPoint>& endpoint) {
         endpoint->status_.store(RdmaEndPoint::EP_READY,
@@ -285,6 +341,11 @@ class RdmaEndPointTestPeer {
     }
     static int inflightSlices(const std::shared_ptr<RdmaEndPoint>& endpoint) {
         return endpoint->inflight_slices_.load();
+    }
+    // Held by a test to stall a completion handler inside acknowledge().
+    static TicketLock& qpLock(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                              int qp_index) {
+        return endpoint->queue_lock_list_[qp_index];
     }
 };
 
@@ -470,6 +531,35 @@ TEST(RdmaNotifyFaultTriageTest, PathAndPeerFaultsRetireTheEndpoint) {
               Action::RetireEndpoint);
 }
 
+// A bootstrap RPC that failed says the peer's control plane is not answering,
+// so a notification must not be handed to the RPC fallback: that would only
+// wait out a second RPC timeout on the thread that polls the batch.
+TEST(RdmaNotifyFaultTriageTest, BootstrapRpcFailureNotEligibleForFallback) {
+    const Status mapped = RdmaTransportTestPeer::notifyStatusForEndpointFailure(
+        Status::RpcServiceError("Failed to call RPC function"));
+    EXPECT_TRUE(mapped.IsRpcServiceError()) << mapped.ToString();
+    EXPECT_NE(mapped.message().find("Failed to call RPC function"),
+              std::string_view::npos);
+}
+
+// Every other reason getEndpoint() comes back empty - no enabled context,
+// allocation, QP setup, a stale segment - leaves the control plane reachable,
+// so the engine may still deliver over RPC.
+TEST(RdmaNotifyFaultTriageTest, OtherEndpointFailuresStayEligible) {
+    const Status failures[] = {
+        Status::InternalError("Failed to configure RDMA endpoint"),
+        Status::DeviceNotFound("No enabled RDMA context"),
+        Status::InvalidArgument("Missing peer GID in bootstrap"),
+        Status::NeedsRefreshCache("Empty target segment or device name"),
+    };
+    for (const auto& failure : failures) {
+        const Status mapped =
+            RdmaTransportTestPeer::notifyStatusForEndpointFailure(failure);
+        EXPECT_TRUE(mapped.IsDeviceNotFound())
+            << failure.ToString() << " -> " << mapped.ToString();
+    }
+}
+
 TEST(RdmaNotifyFaultTriageTest, TeardownFlushesStayQuiet) {
     using Action = RdmaTransportTestPeer::NotifyAction;
     const auto classify = &RdmaTransportTestPeer::classifyNotifyCompletion;
@@ -482,6 +572,13 @@ TEST(RdmaNotifyFaultTriageTest, TeardownFlushesStayQuiet) {
     // A real fault surfacing after the endpoint is gone has nothing left to
     // act on.
     EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, false, false), Action::ReportOnly);
+    // The notify QP stays published while the endpoint retires, so a real
+    // fault can still arrive on a not-ready endpoint: it is triaged as on any
+    // other live endpoint, and only flushes are skipped.
+    EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, true, false),
+              Action::RetireEndpoint);
+    EXPECT_EQ(classify(IBV_WC_LOC_LEN_ERR, true, false),
+              Action::DisableNotification);
 }
 
 // context_set_ is subscripted by NicID, so it must keep one slot per NIC even
@@ -683,6 +780,176 @@ TEST_F(RdmaContextEventTest, CqErrLeavesAvailabilityAlone) {
     EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
 }
 
+// ---- how a request is cut into slices ------------------------------------
+
+// Walk a plan the way submitTransferTasks() walks it: a block each, and
+// whatever is left for the last. Returns the lengths handed out.
+std::vector<uint64_t> walkPlan(const RdmaSlicePlan& plan, uint64_t length) {
+    std::vector<uint64_t> lengths;
+    uint64_t offset = 0;
+    for (uint64_t i = 0; i < plan.count; ++i) {
+        const uint64_t n =
+            (i + 1 == plan.count) ? length - offset : plan.block_size;
+        lengths.push_back(n);
+        offset += n;
+    }
+    return lengths;
+}
+
+// The whole contract, over a sweep of lengths against both caps: the slices
+// cover the request exactly, none is empty, the cap holds, and the block
+// stays a whole number of configured blocks.
+TEST(RdmaSlicePlanTest, EverySliceCarriesDataAndTheyCoverTheRequest) {
+    constexpr uint64_t kBase = 65536;
+    for (uint64_t max_slices : {32ul, 64ul}) {
+        for (uint64_t length :
+             {1ul, 2ul, kBase - 1, kBase, kBase + 1, 3 * kBase, 3 * kBase + 7,
+              100 * kBase, 100 * kBase + 1, 160 * kBase, 160 * kBase + 8192,
+              1000 * kBase, 1000 * kBase - 1}) {
+            const auto plan = planRdmaSlices(length, kBase, max_slices);
+            SCOPED_TRACE("length=" + std::to_string(length) +
+                         " max=" + std::to_string(max_slices));
+            EXPECT_LE(plan.count, max_slices);
+            EXPECT_GT(plan.count, 0u);
+            EXPECT_EQ(plan.block_size % kBase, 0u);
+
+            const auto lengths = walkPlan(plan, length);
+            uint64_t total = 0;
+            for (size_t i = 0; i < lengths.size(); ++i) {
+                EXPECT_GT(lengths[i], 0u) << "empty slice";
+                if (i + 1 < lengths.size()) {
+                    EXPECT_EQ(lengths[i], plan.block_size);
+                } else {
+                    // The last one carries a folded tail at most.
+                    EXPECT_LE(lengths[i], 2 * plan.block_size);
+                }
+                total += lengths[i];
+            }
+            EXPECT_EQ(total, length);
+        }
+    }
+}
+
+// Under the cap nothing is rounded: blocks are not enlarged unasked.
+TEST(RdmaSlicePlanTest, BelowTheCapTheBlockIsTheConfiguredOne) {
+    constexpr uint64_t kBase = 65536;
+    for (uint64_t blocks = 1; blocks <= 32; ++blocks) {
+        const auto exact = planRdmaSlices(blocks * kBase, kBase, 64);
+        EXPECT_EQ(exact.block_size, kBase) << "blocks=" << blocks;
+        EXPECT_EQ(exact.count, blocks) << "blocks=" << blocks;
+
+        // One byte over is a tail far too short to post on its own, so it
+        // joins the slice before it instead of adding one.
+        const auto ragged = planRdmaSlices(blocks * kBase + 1, kBase, 64);
+        EXPECT_EQ(ragged.block_size, kBase) << "blocks=" << blocks;
+        EXPECT_EQ(ragged.count, blocks) << "blocks=" << blocks;
+    }
+}
+
+// A tail under a quarter block joins the slice before it: one work request
+// and one completion saved, and the request still spread over as many
+// slices as its size deserves. Reducing the count before choosing the block
+// -- what this used to do -- would round the block up to 128 KB instead,
+// which both halves the slices and leaves the 8 KB tail on its own anyway.
+TEST(RdmaSlicePlanTest, AShortTailJoinsTheSliceBeforeIt) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + 8192;  // 520 KB
+
+    const auto plan = planRdmaSlices(length, kBase, 64);
+    EXPECT_EQ(plan.block_size, kBase);  // not widened
+    EXPECT_EQ(plan.count, 8u);          // not 9, and not 5
+
+    const auto lengths = walkPlan(plan, length);
+    ASSERT_EQ(lengths.size(), 8u);
+    EXPECT_EQ(lengths.back(), kBase + 8192);
+    for (size_t i = 0; i + 1 < lengths.size(); ++i)
+        EXPECT_EQ(lengths[i], kBase);
+}
+
+// A tail that is worth a slice of its own keeps one.
+TEST(RdmaSlicePlanTest, ALongTailKeepsItsOwnSlice) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + kBase / 2;  // half a block over
+
+    const auto plan = planRdmaSlices(length, kBase, 64);
+    EXPECT_EQ(plan.block_size, kBase);
+    EXPECT_EQ(plan.count, 9u);
+    EXPECT_EQ(walkPlan(plan, length).back(), kBase / 2);
+}
+
+// The ratio is the whole policy, so a caller can turn folding off.
+TEST(RdmaSlicePlanTest, AZeroRatioNeverFolds) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + 1;
+
+    const auto folded = planRdmaSlices(length, kBase, 64);
+    const auto plain = planRdmaSlices(length, kBase, 64, /*merge_ratio=*/0.0);
+    EXPECT_EQ(folded.count, 8u);
+    EXPECT_EQ(plain.count, 9u);
+    EXPECT_EQ(walkPlan(plain, length).back(), 1u);
+}
+
+// Folding never empties the plan: two slices whose tail is short become one
+// slice holding everything, not zero.
+TEST(RdmaSlicePlanTest, FoldingNeverDropsTheLastSlice) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(kBase + 1, kBase, 64);
+    EXPECT_EQ(plan.count, 1u);
+    EXPECT_EQ(walkPlan(plan, kBase + 1).front(), kBase + 1);
+}
+
+// The regression: a 10 MB read asks for 64 slices of 160 KB, rounded up to
+// 192 KB, and 54 of those cover it. Asking for 64 anyway left ten empty.
+TEST(RdmaSlicePlanTest, RoundingUpTheBlockTakesTheSurplusOutOfTheCount) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(10ull << 20, kBase, 64);
+    EXPECT_EQ(plan.block_size, 3 * kBase);  // 192 KB
+    EXPECT_EQ(plan.count, 54u);             // not 64
+
+    // The same shape one cap down, where writes and CUDA sources live.
+    const auto write = planRdmaSlices(3ull << 20, kBase, 32);
+    EXPECT_EQ(write.block_size, 2 * kBase);  // 128 KB
+    EXPECT_EQ(write.count, 24u);             // not 32
+}
+
+// Dividing evenly needs no rounding, so the count is the cap -- nothing was
+// wasted here before the change either.
+TEST(RdmaSlicePlanTest, ArequestThatDividesEvenlyUsesTheWholeCap) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(6ull << 20, kBase, 32);
+    EXPECT_EQ(plan.block_size, 3 * kBase);  // 192 KB
+    EXPECT_EQ(plan.count, 32u);
+}
+
+// However large the request, the count stops at the cap and the block grows.
+TEST(RdmaSlicePlanTest, TheCapBoundsTheCountAndTheBlockGrowsInstead) {
+    constexpr uint64_t kBase = 65536;
+    const auto small = planRdmaSlices(1ull << 30, kBase, 32);
+    const auto large = planRdmaSlices(1ull << 30, kBase, 64);
+    EXPECT_LE(small.count, 32u);
+    EXPECT_LE(large.count, 64u);
+    EXPECT_GT(small.block_size, large.block_size);
+    EXPECT_EQ(small.block_size % kBase, 0u);
+    EXPECT_EQ(large.block_size % kBase, 0u);
+}
+
+// A zero-length request keeps its one slice; a zero cap or block is treated
+// as one rather than dividing by zero.
+TEST(RdmaSlicePlanTest, DegenerateInputsStayInRange) {
+    constexpr uint64_t kBase = 65536;
+    const auto empty = planRdmaSlices(0, kBase, 64);
+    EXPECT_EQ(empty.count, 1u);
+    EXPECT_EQ(empty.block_size, kBase);
+
+    const auto no_cap = planRdmaSlices(4096, kBase, 0);
+    EXPECT_EQ(no_cap.count, 1u);
+
+    const auto no_block = planRdmaSlices(4096, 0, 64);
+    EXPECT_GT(no_block.count, 0u);
+    EXPECT_LE(no_block.count, 64u);
+    EXPECT_EQ(walkPlan(no_block, 4096).size(), no_block.count);
+}
+
 // ibv_query_port_speed() exists only in rdma-core >= 62. It must be resolved
 // as an optional symbol: present -> non-null, absent -> null, and either way
 // the mandatory verbs are still there (an older libibverbs must not lose
@@ -711,6 +978,8 @@ struct FakePortVerbs {
     uint16_t lid = 0;
     int gid_table_len = 8;
     int query_port_rc = 0;
+    int query_port_calls = 0;
+    int query_port_fail_from = -1;  // fail that call onwards; -1 = never
     ibv_gid gid{};
     int expected_gid_index = 3;
     int query_gid_rc = 0;
@@ -722,8 +991,12 @@ struct FakePortVerbs {
 FakePortVerbs fake_port;
 
 int fakeQueryPort(ibv_context* context, uint8_t, ibv_port_attr* attr) {
+    const int call = fake_port.query_port_calls++;
     if (context != &fake_port.native) return EINVAL;
     if (fake_port.query_port_rc) return fake_port.query_port_rc;
+    if (fake_port.query_port_fail_from >= 0 &&
+        call >= fake_port.query_port_fail_from)
+        return EIO;
     *attr = {};
     attr->state = fake_port.state;
     attr->active_speed = fake_port.active_speed;
@@ -847,71 +1120,538 @@ TEST_F(RdmaContextFakeVerbsTest, RefreshFailsCleanlyWhenQueryPortFails) {
     EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);  // cached values kept
 }
 
-// The whole runtime chain: a port event reaches Workers::applyContextEvent,
+// ---- enable() over a whole stand-in RNIC ---------------------------------
+
+// Every verb enable() walks, with counters for what is currently held and a
+// switch to fail one step, so a test can cut enable() short anywhere and
+// assert that whatever it had already acquired was given back. The fds are
+// real: enable() puts the async fd and every completion-channel fd into an
+// epoll set.
+struct FakeRnic {
+    static constexpr int kChannels = 2;
+    static constexpr int kCqs = 8;
+    static constexpr const char* kName = "mc-fake-rnic-0";
+
+    ibv_device device{};
+    ibv_device* device_list[1] = {nullptr};
+    ibv_context native{};
+    ibv_pd pd{};
+    ibv_comp_channel channel[kChannels]{};
+    ibv_cq cq[kCqs]{};
+
+    // What the device reports.
+    int phys_port_cnt = 1;
+    ibv_port_state port_state = IBV_PORT_ACTIVE;
+    uint64_t effective_speed_100mbps = 0;
+
+    // Where to fail; false / -1 means "never".
+    bool fail_open_device = false;
+    bool fail_query_device = false;
+    bool no_valid_gid = false;  // every GID entry unreadable
+    bool fail_alloc_pd = false;
+    int fail_comp_channel_at = -1;  // index of the create call that fails
+    int fail_create_cq_at = -1;     // data CQs first, notification CQ last
+    int fail_query_port_from = -1;  // that call onwards
+
+    // Attempts, so a test can say how far enable() got.
+    int list_calls = 0;
+    int free_list_calls = 0;
+    int open_attempts = 0;
+    int alloc_pd_attempts = 0;
+    int channel_attempts = 0;
+    int cq_attempts = 0;
+    int query_port_calls = 0;
+    int query_speed_calls = 0;
+
+    // Held right now: every one must be back to zero once enable() has
+    // failed or disable() has run.
+    int devices_open = 0;
+    int pds_open = 0;
+    int channels_open = 0;
+    int cqs_open = 0;
+};
+FakeRnic fake_rnic;
+
+ibv_device** fakeGetDeviceList(int* num_devices) {
+    ++fake_rnic.list_calls;
+    fake_rnic.device_list[0] = &fake_rnic.device;
+    *num_devices = 1;
+    return fake_rnic.device_list;
+}
+
+void fakeFreeDeviceList(ibv_device**) { ++fake_rnic.free_list_calls; }
+
+const char* fakeGetDeviceName(ibv_device*) { return FakeRnic::kName; }
+
+ibv_context* fakeOpenDevice(ibv_device* device) {
+    ++fake_rnic.open_attempts;
+    if (fake_rnic.fail_open_device || device != &fake_rnic.device)
+        return nullptr;
+    ++fake_rnic.devices_open;
+    return &fake_rnic.native;
+}
+
+int fakeCloseDevice(ibv_context* context) {
+    if (context != &fake_rnic.native) return EINVAL;
+    --fake_rnic.devices_open;
+    return 0;
+}
+
+int fakeQueryDevice(ibv_context* context, ibv_device_attr* attr) {
+    if (fake_rnic.fail_query_device || context != &fake_rnic.native)
+        return EINVAL;
+    *attr = {};
+    attr->phys_port_cnt = fake_rnic.phys_port_cnt;
+    attr->max_cqe = 4096;
+    attr->max_cq = 64;
+    attr->max_sge = 8;
+    attr->max_qp_wr = 1024;
+    return 0;
+}
+
+int fakeRnicQueryPort(ibv_context* context, uint8_t, ibv_port_attr* attr) {
+    const int call = fake_rnic.query_port_calls++;
+    if (context != &fake_rnic.native) return EINVAL;
+    if (fake_rnic.fail_query_port_from >= 0 &&
+        call >= fake_rnic.fail_query_port_from)
+        return EIO;
+    *attr = {};
+    attr->state = fake_rnic.port_state;
+    attr->active_speed = 128;  // NDR
+    attr->active_width = 2;    // 4x -> 400 Gbps encoded
+    attr->active_mtu = IBV_MTU_1024;
+    attr->lid = 7;
+    attr->gid_tbl_len = 4;
+    return 0;
+}
+
+// One usable entry, index 0: IB type, non-zero, and with no netdev behind it
+// (the stand-in has no sysfs), which is what auto-select settles on.
+int fakeQueryGidEx(ibv_context* context, uint32_t, uint32_t gid_index,
+                   ibv_gid_entry* entry, uint32_t, size_t) {
+    if (fake_rnic.no_valid_gid || context != &fake_rnic.native ||
+        gid_index != 0)
+        return EINVAL;
+    *entry = {};
+    entry->gid_type = IBV_GID_TYPE_IB;
+    entry->gid.raw[15] = 1;
+    return 0;
+}
+
+int fakeRnicQueryGid(ibv_context* context, uint8_t, int index, ibv_gid* gid) {
+    if (fake_rnic.no_valid_gid || context != &fake_rnic.native || index != 0)
+        return EINVAL;
+    *gid = {};
+    gid->raw[15] = 1;
+    return 0;
+}
+
+ibv_pd* fakeAllocPd(ibv_context* context) {
+    ++fake_rnic.alloc_pd_attempts;
+    if (fake_rnic.fail_alloc_pd || context != &fake_rnic.native) return nullptr;
+    ++fake_rnic.pds_open;
+    return &fake_rnic.pd;
+}
+
+int fakeDeallocPd(ibv_pd* pd) {
+    if (pd != &fake_rnic.pd) return EINVAL;
+    --fake_rnic.pds_open;
+    return 0;
+}
+
+ibv_comp_channel* fakeCreateCompChannel(ibv_context* context) {
+    const int index = fake_rnic.channel_attempts++;
+    if (context != &fake_rnic.native || index >= FakeRnic::kChannels) {
+        return nullptr;
+    }
+    if (index == fake_rnic.fail_comp_channel_at) return nullptr;
+    ++fake_rnic.channels_open;
+    return &fake_rnic.channel[index];
+}
+
+int fakeDestroyCompChannel(ibv_comp_channel*) {
+    --fake_rnic.channels_open;
+    return 0;
+}
+
+ibv_cq* fakeCreateCq(ibv_context* context, int, void*, ibv_comp_channel*, int) {
+    const int index = fake_rnic.cq_attempts++;
+    if (context != &fake_rnic.native || index >= FakeRnic::kCqs) return nullptr;
+    if (index == fake_rnic.fail_create_cq_at) return nullptr;
+    ++fake_rnic.cqs_open;
+    return &fake_rnic.cq[index];
+}
+
+int fakeDestroyCq(ibv_cq*) {
+    --fake_rnic.cqs_open;
+    return 0;
+}
+
+int fakeRnicQueryPortSpeed(ibv_context* context, uint32_t, uint64_t* speed) {
+    ++fake_rnic.query_speed_calls;
+    if (context != &fake_rnic.native) return EINVAL;
+    *speed = fake_rnic.effective_speed_100mbps;
+    return 0;
+}
+
+// A context one call short of enable(), with the whole verbs table replaced.
+// The #3325 fix -- release everything already acquired when a later step
+// fails -- has no other way to be exercised without an RNIC.
+class RdmaContextEnableTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        fake_rnic = FakeRnic{};
+        async_fd_ = eventfd(0, 0);
+        ASSERT_GE(async_fd_, 0);
+        fake_rnic.native.async_fd = async_fd_;
+        fake_rnic.native.num_comp_vectors = 4;
+        for (int i = 0; i < FakeRnic::kChannels; ++i) {
+            channel_fd_[i] = eventfd(0, 0);
+            ASSERT_GE(channel_fd_[i], 0);
+            fake_rnic.channel[i].fd = channel_fd_[i];
+        }
+
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(topology
+                        ->parse(R"({"nics":[
+                            {"name":"mc-fake-rnic-0","type":0,"numa_node":0}]})")
+                        .ok());
+        RdmaTransportTestPeer::bindTopology(transport_, topology);
+
+        context_ = std::make_unique<RdmaContext>(transport_);
+        auto& verbs = RdmaContextTestPeer::verbs(*context_);
+        verbs.ibv_get_device_list = fakeGetDeviceList;
+        verbs.ibv_free_device_list = fakeFreeDeviceList;
+        verbs.ibv_get_device_name = fakeGetDeviceName;
+        verbs.ibv_open_device = fakeOpenDevice;
+        verbs.ibv_close_device = fakeCloseDevice;
+        verbs.ibv_query_device = fakeQueryDevice;
+        verbs.ibv_query_port_default = fakeRnicQueryPort;
+        verbs.ibv_query_gid = fakeRnicQueryGid;
+        verbs.ibv_query_gid_ex = fakeQueryGidEx;
+        verbs.ibv_query_port_speed = fakeRnicQueryPortSpeed;
+        verbs.ibv_alloc_pd = fakeAllocPd;
+        verbs.ibv_dealloc_pd = fakeDeallocPd;
+        verbs.ibv_create_comp_channel = fakeCreateCompChannel;
+        verbs.ibv_destroy_comp_channel = fakeDestroyCompChannel;
+        verbs.ibv_create_cq = fakeCreateCq;
+        verbs.ibv_destroy_cq = fakeDestroyCq;
+
+        params_ = std::make_shared<RdmaParams>();
+        params_->device.num_cq_list = 2;
+        params_->device.num_comp_channels = 1;
+        RdmaContextTestPeer::prepareForEnable(*context_, FakeRnic::kName,
+                                              params_);
+    }
+
+    void TearDown() override {
+        context_.reset();  // ~RdmaContext -> disable()
+        close(async_fd_);
+        for (int fd : channel_fd_)
+            if (fd >= 0) close(fd);
+    }
+
+    // The postcondition the #3325 fix is about, from both sides: the device
+    // holds nothing, and the context points at nothing.
+    void expectNothingHeld() {
+        EXPECT_EQ(fake_rnic.devices_open, 0);
+        EXPECT_EQ(fake_rnic.pds_open, 0);
+        EXPECT_EQ(fake_rnic.channels_open, 0);
+        EXPECT_EQ(fake_rnic.cqs_open, 0);
+        EXPECT_EQ(fake_rnic.free_list_calls, fake_rnic.list_calls);
+        EXPECT_EQ(context_->nativeContext(), nullptr);
+        EXPECT_EQ(context_->nativePD(), nullptr);
+        EXPECT_EQ(context_->eventFd(), -1);
+        EXPECT_EQ(RdmaContextTestPeer::compChannelCount(*context_), 0u);
+        EXPECT_EQ(RdmaContextTestPeer::cqCount(*context_), 0u);
+        EXPECT_EQ(context_->notifyCq(), nullptr);
+        EXPECT_EQ(context_->status(), RdmaContext::DEVICE_DISABLED);
+    }
+
+    RdmaTransport transport_;
+    std::unique_ptr<RdmaContext> context_;
+    std::shared_ptr<RdmaParams> params_;
+    int async_fd_ = -1;
+    int channel_fd_[FakeRnic::kChannels] = {-1, -1};
+};
+
+TEST_F(RdmaContextEnableTest, EnableBuildsEverythingAndDisableGivesItBack) {
+    ASSERT_EQ(context_->enable(), 0);
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_ENABLED);
+    EXPECT_EQ(fake_rnic.devices_open, 1);
+    EXPECT_EQ(fake_rnic.pds_open, 1);
+    EXPECT_EQ(fake_rnic.channels_open, 1);
+    EXPECT_EQ(fake_rnic.cqs_open, 3);  // two data CQs plus the notification CQ
+    EXPECT_EQ(RdmaContextTestPeer::cqCount(*context_), 2u);
+    EXPECT_NE(context_->notifyCq(), nullptr);
+    EXPECT_GE(context_->eventFd(), 0);
+
+    ASSERT_EQ(context_->disable(), 0);
+    expectNothingHeld();
+}
+
+// Nothing is opened when the name does not match, and the device list is
+// still freed.
+TEST_F(RdmaContextEnableTest, UnknownDeviceNameOpensNothing) {
+    RdmaContextTestPeer::prepareForEnable(*context_, "mc-not-here", params_);
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 0);
+}
+
+// A port outside the device's range is rejected after the device is open:
+// the scoped handle openDevice holds must close it on the way out.
+TEST_F(RdmaContextEnableTest, PortOutOfRangeClosesTheDeviceItOpened) {
+    params_->device.port = 2;  // the stand-in reports one physical port
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 1);
+}
+
+// The device list is freed whether or not the open that follows it works.
+TEST_F(RdmaContextEnableTest, OpenDeviceFailureStillFreesTheDeviceList) {
+    fake_rnic.fail_open_device = true;
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 1);
+    EXPECT_EQ(fake_rnic.alloc_pd_attempts, 0);
+}
+
+// Two more exits with the device already open, one before the port check and
+// one after it: the scoped handle has to close the device on both.
+TEST_F(RdmaContextEnableTest, QueryDeviceFailureClosesTheDevice) {
+    fake_rnic.fail_query_device = true;
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 1);
+    EXPECT_EQ(fake_rnic.query_port_calls, 0);
+}
+
+TEST_F(RdmaContextEnableTest, NoUsableGidClosesTheDevice) {
+    fake_rnic.no_valid_gid =
+        true;  // auto-select scans the table and finds nothing
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 1);
+    EXPECT_EQ(fake_rnic.alloc_pd_attempts, 0);
+}
+
+TEST_F(RdmaContextEnableTest, AllocPdFailureClosesTheDevice) {
+    fake_rnic.fail_alloc_pd = true;
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.alloc_pd_attempts, 1);
+}
+
+TEST_F(RdmaContextEnableTest, CompChannelFailureReleasesThePdAndTheDevice) {
+    params_->device.num_comp_channels = 2;
+    fake_rnic.fail_comp_channel_at = 1;  // the second one
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.channel_attempts, 2);
+}
+
+TEST_F(RdmaContextEnableTest, DataCqFailureReleasesTheChannelAndThePd) {
+    fake_rnic.fail_create_cq_at = 1;  // the second data CQ
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.cq_attempts, 2);
+}
+
+TEST_F(RdmaContextEnableTest, NotifyCqFailureReleasesTheDataCqs) {
+    fake_rnic.fail_create_cq_at = 2;  // after the two data CQs
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.cq_attempts, 3);
+}
+
+// The last step of enable() re-reads the port to decide ENABLED vs PAUSED.
+// Everything is built by then, so this is the failure point that releases
+// the most.
+TEST_F(RdmaContextEnableTest, FinalPortQueryFailureReleasesEverything) {
+    fake_rnic.fail_query_port_from = 1;  // openDevice's read is call 0
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.query_port_calls, 2);
+}
+
+// A port that is not ACTIVE at open is not a failure: everything is built and
+// the context waits in DEVICE_PAUSED for a PORT_ACTIVE event.
+TEST_F(RdmaContextEnableTest, PortThatIsNotActiveEnablesPaused) {
+    fake_rnic.port_state = IBV_PORT_DOWN;
+    ASSERT_EQ(context_->enable(), 0);
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_PAUSED);
+    EXPECT_EQ(fake_rnic.pds_open, 1);
+    EXPECT_EQ(fake_rnic.cqs_open, 3);
+    EXPECT_NE(context_->notifyCq(), nullptr);
+}
+
+// openDevice() seeds the link speed, so a context is never selected on the
+// encoded rate when the effective one is available -- the first transfer
+// does not have to wait for a monitor tick.
+TEST_F(RdmaContextEnableTest, OpenDeviceSeedsTheEffectiveSpeed) {
+    fake_rnic.effective_speed_100mbps = 2000;  // LAG down to one 200G member
+    ASSERT_EQ(context_->enable(), 0);
+    EXPECT_EQ(fake_rnic.query_speed_calls, 1);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+}
+
+TEST_F(RdmaContextEnableTest, OpenDeviceFallsBackToTheEncodedRate) {
+    fake_rnic.effective_speed_100mbps = 0;  // the verb has nothing to say
+    ASSERT_EQ(context_->enable(), 0);
+    EXPECT_EQ(fake_rnic.query_speed_calls, 1);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);  // NDR 4x encoded
+}
+
+// The whole runtime chain: an async event reaches Workers::applyContextEvent,
 // the context re-reads its (fake) port, and the selector is re-seeded only
 // when the speed actually changed -- with the device marked available again
 // on the new rate, not the old one.
-TEST(RdmaContextEventChainTest, PortActiveReseedsOnlyWhenTheSpeedChanged) {
-    auto topology = std::make_shared<Topology>();
-    ASSERT_TRUE(topology
-                    ->parse(R"({"nics":[
+class RdmaContextLinkSpeedEventTest : public ::testing::Test {
+   protected:
+    static constexpr int kDev = 1;
+
+    void SetUp() override {
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(topology
+                        ->parse(R"({"nics":[
                         {"name":"mc-tcp-0","type":1,"numa_node":0},
                         {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
-                    .ok());
-    RdmaTransport transport;
-    RdmaTransportTestPeer::bindTopology(transport, topology);
-    ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport), 0u);
-    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
-    auto* selector = workers->getDeviceSelector();
-    constexpr int kDev = 1;
-    auto& context = *RdmaTransportTestPeer::contextSet(transport)[kDev];
+                        .ok());
+        RdmaTransportTestPeer::bindTopology(transport_, topology);
+        ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport_), 0u);
+        workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
+        selector_ = workers_->getDeviceSelector();
+        context_ = RdmaTransportTestPeer::contextSet(transport_)[kDev].get();
 
-    fake_port = FakePortVerbs{};
-    fake_port.active_speed = 128;
-    fake_port.active_width = 2;  // 400G
-    fake_port.lid = 1;
-    fake_port.gid.raw[15] = 1;
-    auto& verbs = RdmaContextTestPeer::verbs(context);
-    verbs.ibv_query_port_default = fakeQueryPort;
-    verbs.ibv_query_gid = fakeQueryGid;
-    verbs.ibv_query_port_speed = fakeQueryPortSpeed;
-    auto params = std::make_shared<RdmaParams>();
-    params->device.gid_index = fake_port.expected_gid_index;
-    RdmaContextTestPeer::bindDevice(context, &fake_port.native, params);
-    RdmaContextTestPeer::seedAddress(context, "mc-absent-rnic-1", fake_port.lid,
-                                     fake_port.expected_gid_index,
-                                     fake_port.gid,
-                                     RdmaContext::DEVICE_ENABLED);
-    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
-    RdmaTransportTestPeer::bindMetadata(transport, metadata);
-    ASSERT_TRUE(transport.setupLocalSegment().ok());
+        fake_port = FakePortVerbs{};
+        fake_port.active_speed = 128;
+        fake_port.active_width = 2;  // 400G
+        fake_port.lid = 1;
+        fake_port.gid.raw[15] = 1;
+        auto& verbs = RdmaContextTestPeer::verbs(*context_);
+        verbs.ibv_query_port_default = fakeQueryPort;
+        verbs.ibv_query_gid = fakeQueryGid;
+        verbs.ibv_query_port_speed = fakeQueryPortSpeed;
+        params_ = std::make_shared<RdmaParams>();
+        params_->device.gid_index = fake_port.expected_gid_index;
+        RdmaContextTestPeer::bindDevice(*context_, &fake_port.native, params_);
+        RdmaContextTestPeer::seedAddress(
+            *context_, "mc-absent-rnic-1", fake_port.lid,
+            fake_port.expected_gid_index, fake_port.gid,
+            RdmaContext::DEVICE_ENABLED);
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata_);
+        ASSERT_TRUE(transport_.setupLocalSegment().ok());
 
-    // Pretend init seeded it at 400G and it learned ~45 GB/s since.
-    ASSERT_EQ(context.refreshPortAttributes(), 0);
-    ASSERT_TRUE(
-        selector->setDeviceBandwidth(kDev, context.linkSpeedGbps()).ok());
-    ASSERT_TRUE(selector->setDeviceAvailable(kDev, true).ok());
-    for (int i = 0; i < 64; ++i)
-        ASSERT_TRUE(selector->release(kDev, 1 << 20, (1 << 20) / 45e9).ok());
-    ASSERT_NEAR(selector->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+        // Pretend init seeded it at 400G and it learned ~45 GB/s since.
+        ASSERT_EQ(context_->refreshPortAttributes(), 0);
+        ASSERT_TRUE(
+            selector_->setDeviceBandwidth(kDev, context_->linkSpeedGbps())
+                .ok());
+        ASSERT_TRUE(selector_->setDeviceAvailable(kDev, true).ok());
+        for (int i = 0; i < 64; ++i)
+            ASSERT_TRUE(
+                selector_->release(kDev, 1 << 20, (1 << 20) / 45e9).ok());
+        ASSERT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    }
 
-    ibv_async_event event{};
-    event.event_type = IBV_EVENT_PORT_ACTIVE;
-    event.element.port_num = context.portNum();
+    void TearDown() override { RdmaContextTestPeer::unbindDevice(*context_); }
 
+    ibv_async_event portActive() const {
+        ibv_async_event event{};
+        event.event_type = IBV_EVENT_PORT_ACTIVE;
+        event.element.port_num = context_->portNum();
+        return event;
+    }
+
+    // Device-scoped, so it names no port.
+    static ibv_async_event speedChange() {
+        ibv_async_event event{};
+        event.event_type =
+            static_cast<ibv_event_type>(kIbvEventDeviceSpeedChange);
+        return event;
+    }
+
+    void fire(const ibv_async_event& event) {
+        RdmaTransportTestPeer::applyContextEvent(*workers_, kDev, *context_,
+                                                 event);
+    }
+
+    RdmaTransport transport_;
+    std::unique_ptr<Workers> workers_;
+    DeviceSelector* selector_ = nullptr;
+    RdmaContext* context_ = nullptr;
+    std::shared_ptr<RdmaParams> params_;
+    std::shared_ptr<ControlService> metadata_;
+};
+
+TEST_F(RdmaContextLinkSpeedEventTest,
+       PortActiveReseedsOnlyWhenTheSpeedChanged) {
     // Same speed after the flap: keep what was learned.
-    RdmaTransportTestPeer::applyContextEvent(*workers, kDev, context, event);
-    EXPECT_NEAR(selector->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
-    EXPECT_TRUE(selector->isDeviceAvailable(kDev));
+    fire(portActive());
+    EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
 
     // LAG lost a PF: the effective speed halves, the seed and clamp follow.
     fake_port.speed_100mbps = 2000;
-    RdmaTransportTestPeer::applyContextEvent(*workers, kDev, context, event);
-    EXPECT_DOUBLE_EQ(context.linkSpeedGbps(), 200.0);
-    EXPECT_DOUBLE_EQ(selector->getAggregateEwmaBandwidth(), 25e9);
-    EXPECT_TRUE(selector->isDeviceAvailable(kDev));
+    fire(portActive());
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+    EXPECT_DOUBLE_EQ(selector_->getAggregateEwmaBandwidth(), 25e9);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+}
 
-    RdmaContextTestPeer::unbindDevice(context);
+// The re-read that decides whether to re-seed is the last step of bringing a
+// port back up, after the address refresh has already succeeded. Losing it
+// must not cost the device its recovery: no re-seed, but selectable again on
+// what is still known about the link.
+TEST_F(RdmaContextLinkSpeedEventTest, PortActiveRecoversWhenTheReReadFails) {
+    fake_port.speed_100mbps = 2000;  // a change the failed read cannot see
+    fake_port.query_port_calls = 0;
+    fake_port.query_port_fail_from = 1;  // the address refresh is call 0
+
+    fire(portActive());
+    EXPECT_EQ(fake_port.query_port_calls, 2);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);  // last known kept
+    EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_ENABLED);
+}
+
+// A speed change with no link flap: re-query and re-seed, but leave
+// availability and the endpoints alone -- the port never went down.
+TEST_F(RdmaContextLinkSpeedEventTest,
+       SpeedChangeReseedsWithoutTouchingTheLink) {
+    fake_port.speed_100mbps = 2000;  // LAG down to one 200G member
+    fire(speedChange());
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+    EXPECT_DOUBLE_EQ(selector_->getAggregateEwmaBandwidth(), 25e9);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_ENABLED);
+}
+
+// The same event when nothing actually changed -- a spurious or duplicated
+// notification -- must not throw away what the EWMA has learned.
+TEST_F(RdmaContextLinkSpeedEventTest, SpeedChangeAtTheSameSpeedKeepsTheEwma) {
+    fake_port.query_port_calls = 0;
+    fire(speedChange());
+    EXPECT_EQ(fake_port.query_port_calls, 1);  // it did re-read
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);
+    EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+}
+
+// A failed re-query keeps the last known speed, so there is nothing to
+// re-seed from and the learned estimate stands.
+TEST_F(RdmaContextLinkSpeedEventTest,
+       SpeedChangeWithAFailedReReadChangesNothing) {
+    fake_port.query_port_rc = EIO;
+    fake_port.query_port_calls = 0;
+    fire(speedChange());
+    EXPECT_EQ(fake_port.query_port_calls, 1);  // it tried
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);
+    EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
 }
 
 // The complete address-refresh chain: a GID_CHANGE event re-queries both
@@ -2368,6 +3108,206 @@ TEST_F(RdmaWorkersSharedQpTest, TwoPostersOnOneQueuePairKeepPostingOrder) {
     EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
     EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
     EXPECT_EQ(RdmaEndPointTestPeer::inflightSlices(endpoint_), 0);
+}
+
+// The orphan list is about slice storage outliving a work request; it has
+// nothing to do with lane sharing. The fixture above is borrowed only for
+// its fake verbs and a live endpoint to post on.
+class RdmaSliceOrphanTest : public RdmaWorkersSharedQpTest {
+   protected:
+    // Stop TearDown from freeing this slice: something else owns it now.
+    void forgetSlice(RdmaSlice* slice) {
+        slices_.erase(std::remove(slices_.begin(), slices_.end(), slice),
+                      slices_.end());
+    }
+
+    // A sub-batch holding exactly `slice`, as submitTransferTasks would leave
+    // it, handed to freeSubBatch().
+    void freeBatchHolding(RdmaSlice* slice) {
+        Transport::SubBatchRef batch = nullptr;
+        ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+        auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
+        ASSERT_NE(rdma_batch, nullptr);
+        rdma_batch->slice_chain.push_back(slice);
+        forgetSlice(slice);
+        ASSERT_TRUE(transport_.freeSubBatch(batch).ok());
+    }
+};
+
+// A timeout resolves a slice without waiting for its completion, so the batch
+// can read terminal and be freed while a work request is still live. Returning
+// that slice to the slab would let the stale completion resolve whoever gets
+// the storage next, reporting bytes that never moved.
+TEST_F(RdmaSliceOrphanTest, AFreedBatchHoldsBackASliceStillOwedACompletion) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    ASSERT_EQ(slice->completions_owed.load(), 1);
+
+    freeBatchHolding(slice);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // Still nothing to reap: the completion has not arrived and the endpoint
+    // that owes it is alive.
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    completeWith(slice, IBV_WC_SUCCESS);
+    EXPECT_EQ(slice->completions_owed.load(), 0);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// The ordinary path: every slice already polled, nothing held back.
+TEST_F(RdmaSliceOrphanTest, AFreedBatchReturnsASettledSliceStraightAway) {
+    auto* slice = makeSlice();  // never posted
+    ASSERT_EQ(slice->completions_owed.load(), 0);
+    freeBatchHolding(slice);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// The completion may never arrive -- destroying a queue pair clears the
+// completions naming it -- so a gone endpoint settles the orphan too.
+TEST_F(RdmaSliceOrphanTest, AnOrphanIsReapedOnceItsEndpointIsGone) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(slice);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    endpoint_.reset();
+    ASSERT_TRUE(slice->ep_weak_ptr.expired());
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// An orphan is only held while its endpoint is alive, so one that outlives
+// the threshold means a queue pair is not being destroyed. That is reported
+// once per slice, and the slice stays held: freeing it on age would hand the
+// completion queue a dangling address again.
+TEST_F(RdmaSliceOrphanTest, ALingeringOrphanIsReportedOnceAndStillHeld) {
+    RdmaTransportTestPeer::setOrphanWarnAfterPasses(transport_, 3);
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(slice);
+
+    for (int pass = 0; pass < 2; ++pass)
+        RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 0u);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);  // third pass
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 1u);
+    for (int pass = 0; pass < 5; ++pass)
+        RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 1u);    // once
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);  // held
+
+    completeWith(slice, IBV_WC_SUCCESS);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// The handler reads the slice well past acknowledge(), which is what
+// publishes the terminal status the caller is waiting for. A batch freed in
+// that window must not return the storage, and the reaper must not take it
+// either: the completion is paid at the end of the handler, so both see the
+// slice as still owed until it returns.
+TEST_F(RdmaSliceOrphanTest, ASliceIsHeldWhileItsCompletionIsBeingHandled) {
+    auto* slice = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+
+    // Stall the handler where it resolves the slice: acknowledge() takes the
+    // queue pair's lock, which this thread holds until the checks below are
+    // done.
+    auto& qp_lock = RdmaEndPointTestPeer::qpLock(endpoint_, 0);
+    qp_lock.lock();
+    const int tickets_before = TicketLockTestPeer::ticketsIssued(qp_lock);
+    std::thread poller([&] { completeWith(slice, IBV_WC_SUCCESS); });
+    // It is where we want it once it holds a ticket behind ours: queued on
+    // the lock, past everything the handler does before acknowledge().
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (TicketLockTestPeer::ticketsIssued(qp_lock) == tickets_before) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            qp_lock.unlock();
+            poller.join();
+            FAIL() << "the handler never queued on the queue pair lock";
+        }
+        std::this_thread::yield();
+    }
+
+    freeBatchHolding(slice);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    qp_lock.unlock();
+    poller.join();
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// What the counter is for, end to end. A freed slice goes to the back of the
+// thread's ring in the slab, so a ring's worth of allocations is all it takes
+// for the address to come back -- a handful of transfers, not a rare event.
+// Handed out, it would be the work-request id of a live post naming somebody
+// else's slice, and the stale completion would resolve that one instead.
+TEST_F(RdmaSliceOrphanTest, AHeldSliceIsNeverHandedToTheNextTransfer) {
+    auto* held = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(held);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // Drain the ring: without the hold, the address is in here.
+    std::vector<RdmaSlice*> reused;
+    for (size_t i = 0; i < SlabBase::kMaxFreeListSizeInThread; ++i)
+        reused.push_back(RdmaSliceStorage::Get().allocate());
+    EXPECT_EQ(std::count(reused.begin(), reused.end(), held), 0)
+        << "a slice still owed a completion was handed to a new transfer";
+    for (auto* slice : reused) RdmaSliceStorage::Get().deallocate(slice);
+
+    // The completion really is still live: it lands on the held slice and
+    // resolves it, which is what it would have done to whoever had the
+    // storage instead -- COMPLETED, with the length of a transfer that never
+    // ran added to that task's byte count.
+    completeWith(held, IBV_WC_SUCCESS);
+    EXPECT_EQ(held->word, COMPLETED);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// A batch free reaps opportunistically so a straggler is not held for a whole
+// monitor tick. Those reaps must not age an orphan: counting them would report
+// a lingering one after a handful of transfers instead of after about a
+// minute, which is the only reading that says a queue pair is stuck.
+TEST_F(RdmaSliceOrphanTest, AnOpportunisticReapDoesNotAgeAnOrphan) {
+    RdmaTransportTestPeer::setOrphanWarnAfterPasses(transport_, 1);
+    auto* held = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    freeBatchHolding(held);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // Every one of these runs the reap inside freeSubBatch().
+    for (int pass = 0; pass < 3; ++pass) freeBatchHolding(makeSlice());
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 0u);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u);
+
+    // The monitor's tick is the one that ages it.
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanWarnings(transport_), 1u);
+}
+
+// The reaper empties the list before scanning it, so an unsettled slice has
+// to be put back -- and put back once, not dropped and not duplicated.
+TEST_F(RdmaSliceOrphanTest, AnUnsettledOrphanSurvivesRepeatedReaps) {
+    auto* kept = postSlice(/*lane=*/0, /*enqueue_ts=*/0);
+    auto* settled = postSlice(/*lane=*/1, /*enqueue_ts=*/0);
+    freeBatchHolding(kept);
+    freeBatchHolding(settled);
+    ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 2u);
+
+    // One of them gets its completion; the other is scanned three times and
+    // stays exactly once in the list.
+    completeWith(settled, IBV_WC_SUCCESS);
+    for (int pass = 0; pass < 3; ++pass) {
+        RdmaTransportTestPeer::reapOrphanSlices(transport_);
+        ASSERT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 1u)
+            << "pass " << pass;
+    }
+    completeWith(kept, IBV_WC_SUCCESS);
+    RdmaTransportTestPeer::reapOrphanSlices(transport_);
+    EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
 }
 
 TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {
