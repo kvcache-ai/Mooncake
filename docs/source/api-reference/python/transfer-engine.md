@@ -71,7 +71,7 @@ Initializes the transfer engine with basic configuration.
 **Parameters:**
 - `local_hostname` (str): The hostname and port of the local server (e.g., "127.0.0.1:12345")
 - `metadata_server` (str): The metadata server connection string (e.g., "127.0.0.1:2379" or "etcd://127.0.0.1:2379")
-- `protocol` (str): The transport protocol to use ("rdma", "tcp", etc.)
+- `protocol` (str): The transport protocol to use (`"rdma"`, `"tcp"`, `"shm"`, etc.)
 - `device_name` (str): Comma-separated list of device names to filter, or empty string for all devices
 
 **Returns:**
@@ -88,7 +88,7 @@ Initializes the transfer engine with extended configuration including metadata t
 **Parameters:**
 - `local_hostname` (str): The hostname and port of the local server
 - `metadata_server` (str): The metadata server connection string
-- `protocol` (str): The transport protocol to use
+- `protocol` (str): The transport protocol to use (`"rdma"`, `"tcp"`, `"shm"`, etc.)
 - `device_name` (str): Comma-separated list of device names to filter
 - `metadata_type` (str): The type of metadata server ("etcd", "p2p", etc.)
 
@@ -127,7 +127,14 @@ Gets the RPC port that the transfer engine is listening on.
 allocate_managed_buffer(length)
 ```
 
-Allocates a managed buffer of the specified size using a buddy allocation system for efficient memory management.
+Allocates a managed buffer of the specified size using a buddy allocation system.
+
+When SHM is enabled (`MC_FORCE_SHM=1`, or `initialize(..., protocol="shm")`), the
+backing memory comes from `allocateSharedMemory` so same-host peers can copy
+over POSIX shm. Buddy slabs are 256 MiB in that mode (instead of the 2 GiB
+malloc super-slab) so `/dev/shm` stays usable. Interior buddy pointers are
+covered by the registered slab; only the slab base is registered. GPU protocols
+(`nvlink` / `hip` / `musa` / `nvlink_intra`) keep their pinned allocators.
 
 **Parameters:**
 - `length` (int): The size of the buffer to allocate in bytes
