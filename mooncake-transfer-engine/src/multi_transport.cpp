@@ -596,9 +596,16 @@ Status MultiTransport::selectTransports(
     Transport* reused_transport = nullptr;
     Transport::SegmentID reused_target = 0;
     bool reuse_allowed = false;
+    const bool metacache = globalConfig().metacache;
     for (const auto& request : entries) {
         Transport* transport = nullptr;
-        if (reuse_allowed && reused_transport &&
+        // Reuse only address-independent routes within this submission. Mixed
+        // protocol segments must still resolve each address independently, and
+        // disabling the metadata cache must retain the explicit refresh
+        // behavior. This restores MultiTransport routing (protocol to
+        // Transport*), not RDMA's per-target SegmentDesc fetch inside
+        // submitTransferTask.
+        if (reuse_allowed && reused_transport && metacache &&
             request.target_id == reused_target) {
             transport = reused_transport;
         } else {
