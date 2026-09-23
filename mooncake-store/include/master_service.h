@@ -80,7 +80,6 @@ class HaKvBackend;
 class HttpMetadataServer;
 class OpLogBatchStorage;
 class OrderedOpLogWriter;
-struct MetadataStoragePlugin;
 
 namespace test {
 class MasterServiceTestPeer;
@@ -2183,9 +2182,10 @@ class MasterService {
     // nullptr means cleanup is disabled
     HttpMetadataServer* http_metadata_server_{nullptr};
 
-    // Remote HTTP metadata client, used when the metadata server is deployed
-    // separately. nullptr = no remote cleanup (co-located prefers the pointer).
-    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
+    // Remote HTTP metadata server URL, used when the metadata server is
+    // deployed separately. Empty = no remote cleanup (co-located prefers the
+    // pointer).
+    std::string http_metadata_remote_url_;
 
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;
@@ -2199,6 +2199,8 @@ class MasterService {
     std::vector<std::string> http_metadata_cleanup_queue_;
 
     void HttpMetadataCleanupThreadFunc();
+    // DELETEs one key on the remote HTTP metadata server; true on success.
+    bool removeRemoteHttpMetadataKey(const std::string& key) const;
 
     // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
     // segment. For the co-located case this is synchronous (no network I/O);

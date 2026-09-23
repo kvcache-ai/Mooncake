@@ -16,7 +16,9 @@
 #define COMMON_H
 
 #include <glog/logging.h>
+#ifdef __linux__
 #include <numa.h>
+#endif
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
@@ -144,6 +146,12 @@ inline std::mutex &numaNodeCpuCacheMutex() {
 }
 
 static inline int bindToSocket(int socket_id) {
+#ifndef __linux__
+    // libnuma and pthread_setaffinity_np are Linux-only.
+    (void)socket_id;
+    LOG(WARNING) << "The platform does not support NUMA";
+    return ERR_NUMA;
+#else
     if (unlikely(numa_available() < 0)) {
         LOG(WARNING) << "The platform does not support NUMA";
         return ERR_NUMA;
@@ -173,6 +181,7 @@ static inline int bindToSocket(int socket_id) {
         return ERR_NUMA;
     }
     return 0;
+#endif
 }
 
 static inline int64_t getCurrentTimeInNano() {

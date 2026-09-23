@@ -455,11 +455,10 @@ target_include_directories(mooncake_store_shared_objects
 target_link_libraries(
   mooncake_store_shared_objects
   PRIVATE cachelib_memory_allocator
-          transfer_metadata_plugin
           glog::glog
           gflags::gflags
           mooncake_common
-          numa
+          $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
 if(STORE_USE_ETCD)
@@ -481,7 +480,6 @@ target_link_libraries(
   mooncake_store_master_objects
   PRIVATE mooncake_store_shared_objects
           mooncake_local_ssd
-          transfer_metadata_plugin
           cachelib_memory_allocator
           glog::glog
           gflags::gflags
@@ -531,7 +529,7 @@ target_link_libraries(
           yaml-cpp
           Mooncake::xxhash
           mooncake_common
-          numa
+          $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
 if(BUILD_UNIT_TESTS)
@@ -592,13 +590,12 @@ target_link_libraries(
           Mooncake::zstd
           asio_shared
           yalantinglibs::yalantinglibs
-          transfer_metadata_plugin
           gflags::gflags
           JsonCpp::JsonCpp
           yaml-cpp
           Mooncake::xxhash
           OpenSSL::Crypto
-          numa)
+          $<$<PLATFORM_ID:Linux>:numa>)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store_master PRIVATE Mooncake::libzmq)
 endif()
@@ -630,7 +627,7 @@ target_link_libraries(
          transfer_engine
          yalantinglibs::yalantinglibs
   PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash
-          OpenSSL::Crypto numa)
+          OpenSSL::Crypto $<$<PLATFORM_ID:Linux>:numa>)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()
@@ -671,7 +668,7 @@ target_link_libraries(
   PRIVATE mooncake_store_master
           cachelib_memory_allocator
           pthread
-          ibverbs
+          $<$<BOOL:${YLT_ENABLE_IBV}>:ibverbs>
           mooncake_common
           glog::glog
           gflags::gflags

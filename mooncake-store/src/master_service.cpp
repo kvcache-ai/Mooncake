@@ -26,17 +26,16 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <ylt/util/tl/expected.hpp>
+#include <ylt/standalone/cinatra/url_encode_decode.hpp>
 #include <boost/algorithm/string.hpp>
 
 #include "http_metadata_server.h"
 #include "master_metric_manager.h"
 #include "common.h"
+#include "common/network.h"
 #include "environ.h"
 #include "segment.h"
 #include "segment/region_driver.h"
-#ifdef USE_HTTP
-#include "transfer_metadata_plugin.h"
-#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -529,7 +528,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     replica_cleanup_worker_.Start();
 
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
-    // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
+    // setHttpMetadataRemoteUrl() once http_metadata_remote_url_ is set,
     // since that happens after this constructor returns (in
     // WrappedMasterService).
 
@@ -14685,44 +14684,26 @@ void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {
 
 void MasterService::setHttpMetadataRemoteUrl(
     const std::string& metadata_connstring) {
-#ifdef USE_HTTP
-    // Only http(s) is supported; guard the scheme to avoid
-    // MetadataStoragePlugin::Create()'s LOG(FATAL) on other backends.
-    if (metadata_connstring.rfind("http://", 0) == 0 ||
-        metadata_connstring.rfind("https://", 0) == 0) {
-        try {
-            http_metadata_remote_ =
-                MetadataStoragePlugin::Create(metadata_connstring);
-            LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
-                         "(remote metadata server "
-                      << metadata_connstring << ")";
-            // Start async cleanup worker now that http_metadata_remote_ is
-            // ready
-            http_metadata_cleanup_running_ = true;
-            http_metadata_cleanup_thread_ = std::thread(
-                &MasterService::HttpMetadataCleanupThreadFunc, this);
-            LOG(INFO) << "HTTP metadata cleanup worker thread started";
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to initialize remote HTTP metadata client "
-                            "for "
-                         << metadata_connstring << ": " << e.what()
-                         << ". Metadata cleanup on timeout disabled.";
-            http_metadata_remote_.reset();
-        }
+    // The HTTP client is built without TLS, so only plain http:// metadata
+    // servers support remote cleanup.
+    if (metadata_connstring.rfind("http://", 0) != 0) {
+        LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but the "
+                        "configured metadata server '"
+                     << metadata_connstring
+                     << "' is not an http:// endpoint; remote cleanup "
+                        "currently supports only plain HTTP. Metadata cleanup "
+                        "on timeout disabled.";
         return;
     }
-    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but the "
-                    "configured metadata server '"
-                 << metadata_connstring
-                 << "' is not an HTTP endpoint; remote cleanup currently "
-                    "supports only http(s). Metadata cleanup on timeout "
-                    "disabled.";
-#else
-    (void)metadata_connstring;
-    LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set but this build "
-                    "has no HTTP metadata support (USE_HTTP=OFF); metadata "
-                    "cleanup on timeout disabled.";
-#endif
+    http_metadata_remote_url_ = metadata_connstring;
+    LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
+                 "(remote metadata server "
+              << metadata_connstring << ")";
+    // Start async cleanup worker now that http_metadata_remote_url_ is set.
+    http_metadata_cleanup_running_ = true;
+    http_metadata_cleanup_thread_ =
+        std::thread(&MasterService::HttpMetadataCleanupThreadFunc, this);
+    LOG(INFO) << "HTTP metadata cleanup worker thread started";
 }
 
 void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
@@ -14742,7 +14723,7 @@ void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
 
     // Separately-deployed: enqueue for async cleanup so a slow/unreachable
     // server never blocks the client monitor thread.
-    if (http_metadata_remote_) {
+    if (!http_metadata_remote_url_.empty()) {
         {
             std::lock_guard<std::mutex> lk(http_metadata_cleanup_mutex_);
             http_metadata_cleanup_queue_.push_back(segment_name);
@@ -14752,6 +14733,20 @@ void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
     }
 
     // Neither configured: cleanup is disabled, nothing to do.
+}
+
+bool MasterService::removeRemoteHttpMetadataKey(const std::string& key) const {
+    // Matches the timeout the Transfer Engine HTTP metadata plugin used.
+    constexpr std::chrono::milliseconds kTimeout{3000};
+    auto result = httpDelete(
+        http_metadata_remote_url_ + "?key=" + code_utils::url_encode(key),
+        kTimeout);
+    if (!result) {
+        LOG(WARNING) << "Remote HTTP metadata cleanup failed for key: " << key
+                     << ": " << result.error();
+        return false;
+    }
+    return true;
 }
 
 void MasterService::HttpMetadataCleanupThreadFunc() {
@@ -14779,22 +14774,8 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
 
             // Each key attempted independently so one failure does not
             // prevent cleanup of the other.
-            bool ram_removed = false;
-            bool rpc_removed = false;
-            try {
-                ram_removed = http_metadata_remote_->remove(ram_key);
-            } catch (const std::exception& e) {
-                LOG(WARNING)
-                    << "Remote HTTP metadata cleanup failed for ram_key: "
-                    << ram_key << ": " << e.what();
-            }
-            try {
-                rpc_removed = http_metadata_remote_->remove(rpc_key);
-            } catch (const std::exception& e) {
-                LOG(WARNING)
-                    << "Remote HTTP metadata cleanup failed for rpc_key: "
-                    << rpc_key << ": " << e.what();
-            }
+            const bool ram_removed = removeRemoteHttpMetadataKey(ram_key);
+            const bool rpc_removed = removeRemoteHttpMetadataKey(rpc_key);
             LOG(INFO) << "Cleaned up remote HTTP metadata for segment: "
                       << segment_name << ", ram_key_removed=" << ram_removed
                       << ", rpc_key_removed=" << rpc_removed;

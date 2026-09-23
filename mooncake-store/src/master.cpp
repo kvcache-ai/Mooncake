@@ -515,8 +515,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_cxl);
     default_config.GetString("cxl_path", &master_config.cxl_path,
                              FLAGS_cxl_path);
-    default_config.GetUInt64("cxl_size", &master_config.cxl_size,
-                             FLAGS_cxl_size);
+    // cxl_size is size_t, which is not uint64_t on every platform (macOS).
+    uint64_t cxl_size = master_config.cxl_size;
+    default_config.GetUInt64("cxl_size", &cxl_size, FLAGS_cxl_size);
+    master_config.cxl_size = cxl_size;
     default_config.GetUInt32("rpc_port", &master_config.rpc_port,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
