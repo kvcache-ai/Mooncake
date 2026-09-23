@@ -7,6 +7,7 @@
 #include <glog/logging.h>
 
 #include "config_helper.h"
+#include "config/admin_http_bootstrap_config.h"
 #include "types.h"
 
 namespace mooncake {
@@ -138,9 +139,7 @@ struct MasterConfig {
     std::string allocation_strategy;
 
     // HTTP metadata server configuration
-    bool enable_http_metadata_server;
-    uint32_t http_metadata_server_port;
-    std::string http_metadata_server_host;
+    AdminHttpBootstrapConfig admin_http;
     // Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*)
     // when client heartbeat times out. Works in two modes: (1) co-located
     // (enable_http_metadata_server=true) via in-process removal, or

@@ -15,6 +15,7 @@
 #include <ylt/easylog/record.hpp>
 
 #include "allocator_status.h"
+#include "config/admin_http_bootstrap_config_loader.h"
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
@@ -359,11 +360,14 @@ DEFINE_string(
     allocation_strategy, "random",
     "Allocation strategy for segments, random | free_ratio_first | cxl | "
     "ssd_free_ratio_first | local_first");
-DEFINE_bool(enable_http_metadata_server, false,
+DEFINE_bool(enable_http_metadata_server,
+            mooncake::AdminHttpBootstrapConfig::kDefaultEnabled,
             "Enable HTTP metadata server instead of etcd");
-DEFINE_int32(http_metadata_server_port, 8080,
+DEFINE_int32(http_metadata_server_port,
+             mooncake::AdminHttpBootstrapConfig::kDefaultPort,
              "Port for HTTP metadata server to listen on");
-DEFINE_string(http_metadata_server_host, "0.0.0.0",
+DEFINE_string(http_metadata_server_host,
+              std::string(mooncake::AdminHttpBootstrapConfig::kDefaultHost),
               "Host for HTTP metadata server to bind to");
 DEFINE_bool(
     enable_metadata_cleanup_on_timeout, false,
@@ -455,6 +459,26 @@ std::string ResolveHABackendConnstring(
     return mooncake::ResolveConfiguredHABackendConnstring(
         master_config.ha_backend_type, master_config.ha_backend_connstring,
         master_config.etcd_endpoints);
+}
+
+mooncake::AdminHttpBootstrapCommandLineOverrides
+GetAdminHttpBootstrapCommandLineOverrides() {
+    mooncake::AdminHttpBootstrapCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
+        !info.is_default) {
+        command_line.enabled = FLAGS_enable_http_metadata_server;
+    }
+    if (google::GetCommandLineFlagInfo("http_metadata_server_port", &info) &&
+        !info.is_default) {
+        command_line.port =
+            static_cast<uint32_t>(FLAGS_http_metadata_server_port);
+    }
+    if (google::GetCommandLineFlagInfo("http_metadata_server_host", &info) &&
+        !info.is_default) {
+        command_line.host = FLAGS_http_metadata_server_host;
+    }
+    return command_line;
 }
 
 void ResolveRpcAddressFromInterfaceOrDie(
@@ -674,15 +698,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("allocation_strategy",
                              &master_config.allocation_strategy,
                              FLAGS_allocation_strategy);
-    default_config.GetBool("enable_http_metadata_server",
-                           &master_config.enable_http_metadata_server,
-                           FLAGS_enable_http_metadata_server);
-    default_config.GetUInt32("http_metadata_server_port",
-                             &master_config.http_metadata_server_port,
-                             FLAGS_http_metadata_server_port);
-    default_config.GetString("http_metadata_server_host",
-                             &master_config.http_metadata_server_host,
-                             FLAGS_http_metadata_server_host);
     default_config.GetString("pod_name", &master_config.pod_name,
                              FLAGS_pod_name);
     default_config.GetString("pod_namespace", &master_config.pod_namespace,
@@ -1200,24 +1215,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
     }
-    if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_http_metadata_server =
-            FLAGS_enable_http_metadata_server;
-    }
-    if ((google::GetCommandLineFlagInfo("http_metadata_server_port", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.http_metadata_server_port =
-            FLAGS_http_metadata_server_port;
-    }
-    if ((google::GetCommandLineFlagInfo("http_metadata_server_host", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.http_metadata_server_host =
-            FLAGS_http_metadata_server_host;
-    }
     if ((google::GetCommandLineFlagInfo("pod_name", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1481,7 +1478,7 @@ void InitClientLivenessConf(const mooncake::DefaultConfig* default_config,
 
 // Function to start HTTP metadata server
 std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
-    int port, const std::string& host) {
+    uint16_t port, const std::string& host) {
     LOG(INFO) << "Starting C++ HTTP metadata server on " << host << ":" << port;
 
     try {
@@ -1547,6 +1544,14 @@ int main(int argc, char* argv[]) {
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    try {
+        master_config.admin_http = mooncake::ResolveAdminHttpBootstrapConfig(
+            loaded_default_config, GetAdminHttpBootstrapCommandLineOverrides());
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Invalid HTTP metadata server configuration: "
+                   << error.what();
+        return 1;
+    }
     try {
         InitClientLivenessConf(loaded_default_config, master_config);
     } catch (const std::invalid_argument& error) {
@@ -1633,7 +1638,7 @@ int main(int argc, char* argv[]) {
     // process is never affected.
     std::string http_metadata_remote_url;
     if (master_config.enable_metadata_cleanup_on_timeout &&
-        !master_config.enable_http_metadata_server) {
+        !master_config.admin_http.enabled) {
         std::string derived = ResolveMetadataServerForCleanup();
         if (derived.rfind("http://", 0) == 0 ||
             derived.rfind("https://", 0) == 0) {
@@ -1702,12 +1707,9 @@ int main(int argc, char* argv[]) {
         << ", global_file_segment_size="
         << master_config.global_file_segment_size
         << ", memory_allocator=" << master_config.memory_allocator
-        << ", enable_http_metadata_server="
-        << master_config.enable_http_metadata_server
-        << ", http_metadata_server_port="
-        << master_config.http_metadata_server_port
-        << ", http_metadata_server_host="
-        << master_config.http_metadata_server_host
+        << ", enable_http_metadata_server=" << master_config.admin_http.enabled
+        << ", http_metadata_server_port=" << master_config.admin_http.port
+        << ", http_metadata_server_host=" << master_config.admin_http.host
         << ", enable_metadata_cleanup_on_timeout="
         << master_config.enable_metadata_cleanup_on_timeout
         << ", put_start_discard_timeout_sec="
@@ -1741,10 +1743,9 @@ int main(int argc, char* argv[]) {
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
-    if (master_config.enable_http_metadata_server) {
-        http_metadata_server =
-            StartHttpMetadataServer(master_config.http_metadata_server_port,
-                                    master_config.http_metadata_server_host);
+    if (master_config.admin_http.enabled) {
+        http_metadata_server = StartHttpMetadataServer(
+            master_config.admin_http.port, master_config.admin_http.host);
 
         if (!http_metadata_server) {
             LOG(FATAL) << "Failed to start HTTP metadata server";
@@ -1759,7 +1760,7 @@ int main(int argc, char* argv[]) {
     // paths): prefer the co-located in-process server, else the separate URL.
     mooncake::HttpMetadataServer* metadata_server_ptr = nullptr;
     if (master_config.enable_metadata_cleanup_on_timeout &&
-        master_config.enable_http_metadata_server) {
+        master_config.admin_http.enabled) {
         metadata_server_ptr = http_metadata_server.get();
     }
 
