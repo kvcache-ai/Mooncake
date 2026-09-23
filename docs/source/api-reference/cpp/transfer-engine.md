@@ -147,6 +147,13 @@ Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
 Obtains the aggregated status of the batch and the total transferred bytes.
 
+While the batch is still `WAITING`, RDMA-only batches that use the
+completion-counter fast path report `status.transferred_bytes = 0`. That
+is still a valid lower bound; the accurate total is filled in when the
+batch reaches `COMPLETED`. TCP, NVLink, mixed batches, failures, and
+`MC_SLICE_TIMEOUT > 0` keep walking every task and still accumulate bytes
+while in flight.
+
 - `batch_id`: The `BatchID` it belongs to;
 - `status`: Output Transfer status;
 - Return value: If successful, returns an OK status; otherwise, returns a non-OK status.
