@@ -57,7 +57,7 @@ TEST_F(MetricsBootstrapConfigTest, UsesOwnerDefaultsWithoutSources) {
     EXPECT_EQ(resolved.host, "0.0.0.0");
 }
 
-TEST_F(MetricsBootstrapConfigTest, LoadsLegacyFlatYamlAndJsonKeys) {
+TEST_F(MetricsBootstrapConfigTest, LoadsExistingFlatYamlAndJsonKeys) {
     const auto yaml =
         LoadConfig(".yaml",
                    "enable_metric_reporting: false\nmetrics_port: 9101\n"
@@ -76,45 +76,12 @@ TEST_F(MetricsBootstrapConfigTest, LoadsLegacyFlatYamlAndJsonKeys) {
     EXPECT_EQ(from_json.host, "127.0.0.2");
 }
 
-TEST_F(MetricsBootstrapConfigTest, LoadsGroupedYamlAndJsonKeys) {
-    const auto yaml =
-        LoadConfig(".yaml",
-                   "bootstrap:\n  metrics:\n    enabled: false\n    port: "
-                   "9201\n    host: 127.0.1.1\n");
-    const auto from_yaml = ResolveMetricsBootstrapConfig(yaml.get(), {});
-    EXPECT_FALSE(from_yaml.enabled);
-    EXPECT_EQ(from_yaml.port, 9201u);
-    EXPECT_EQ(from_yaml.host, "127.0.1.1");
-
-    const auto json = LoadConfig(
-        ".json",
-        R"({"bootstrap":{"metrics":{"enabled":false,"port":9202,"host":"127.0.1.2"}}})");
-    const auto from_json = ResolveMetricsBootstrapConfig(json.get(), {});
-    EXPECT_FALSE(from_json.enabled);
-    EXPECT_EQ(from_json.port, 9202u);
-    EXPECT_EQ(from_json.host, "127.0.1.2");
-}
-
-TEST_F(MetricsBootstrapConfigTest, GroupedKeysOverrideLegacyKeysPerField) {
-    const auto file =
-        LoadConfig(".yaml",
-                   "enable_metric_reporting: true\nmetrics_port: 9003\n"
-                   "metrics_host: legacy-host\nbootstrap:\n  metrics:\n    "
-                   "enabled: false\n    port: 9301\n");
-
-    const auto resolved = ResolveMetricsBootstrapConfig(file.get(), {});
-
-    EXPECT_FALSE(resolved.enabled);
-    EXPECT_EQ(resolved.port, 9301u);
-    EXPECT_EQ(resolved.host, "legacy-host");
-}
-
 TEST_F(MetricsBootstrapConfigTest,
        ExplicitCommandLineValuesOverrideFileValues) {
     const auto file =
         LoadConfig(".yaml",
-                   "bootstrap:\n  metrics:\n    enabled: true\n    port: "
-                   "9401\n    host: configured-host\n");
+                   "enable_metric_reporting: true\nmetrics_port: 9401\n"
+                   "metrics_host: configured-host\n");
     const MetricsBootstrapCommandLineOverrides command_line{
         .enabled = false,
         .port = 0,
@@ -132,8 +99,8 @@ TEST_F(MetricsBootstrapConfigTest,
 TEST_F(MetricsBootstrapConfigTest, AbsentCommandLineValuesPreserveFileValues) {
     const auto file =
         LoadConfig(".yaml",
-                   "bootstrap:\n  metrics:\n    enabled: false\n    port: "
-                   "9501\n    host: configured-host\n");
+                   "enable_metric_reporting: false\nmetrics_port: 9501\n"
+                   "metrics_host: configured-host\n");
 
     const auto resolved = ResolveMetricsBootstrapConfig(file.get(), {});
 
@@ -142,7 +109,8 @@ TEST_F(MetricsBootstrapConfigTest, AbsentCommandLineValuesPreserveFileValues) {
     EXPECT_EQ(resolved.host, "configured-host");
 }
 
-TEST_F(MetricsBootstrapConfigTest, PreservesFullUnsignedPortOverride) {
+TEST_F(MetricsBootstrapConfigTest,
+       PreservesExistingUnsignedPortOverrideBehavior) {
     MetricsBootstrapCommandLineOverrides command_line;
     command_line.port = UINT32_MAX;
 

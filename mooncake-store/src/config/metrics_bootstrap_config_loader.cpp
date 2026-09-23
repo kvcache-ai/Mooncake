@@ -19,16 +19,6 @@ MetricsBootstrapConfig ResolveMetricsBootstrapConfig(
         if (file_config->Contains("metrics_host")) {
             file_config->GetString("metrics_host", &result.host);
         }
-
-        if (file_config->Contains("bootstrap.metrics.enabled")) {
-            file_config->GetBool("bootstrap.metrics.enabled", &result.enabled);
-        }
-        if (file_config->Contains("bootstrap.metrics.port")) {
-            file_config->GetUInt32("bootstrap.metrics.port", &result.port);
-        }
-        if (file_config->Contains("bootstrap.metrics.host")) {
-            file_config->GetString("bootstrap.metrics.host", &result.host);
-        }
     }
 
     if (command_line.enabled.has_value()) {
