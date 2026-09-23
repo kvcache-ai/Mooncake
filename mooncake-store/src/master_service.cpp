@@ -4831,7 +4831,6 @@ auto MasterService::InsertMetadata(
     auto& tenant_state = GetOrCreateTenantState(shard.get(), tenant_id);
     if (tenant_state.metadata.contains(key)) {
         FreeDfsReplicas(key, replicas);
-        LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
@@ -4875,7 +4874,6 @@ auto MasterService::InsertMetadata(
                               tenant_id, key));
     if (!inserted) {
         FreeDfsReplicas(key, replicas);
-        LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
     if (enable_multi_tenants_) {
@@ -4920,7 +4918,6 @@ auto MasterService::AllocateAndInsertMetadata(
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     auto& tenant_state = GetOrCreateTenantState(shard.get(), tenant_id);
     if (tenant_state.metadata.contains(key)) {
-        LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
@@ -5088,8 +5085,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                         metadata.put_start_time +
                                 put_start_discard_timeout_sec_ >=
                             now) {
-                        LOG(INFO)
-                            << "key=" << key << ", info=object_already_exists";
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     }
