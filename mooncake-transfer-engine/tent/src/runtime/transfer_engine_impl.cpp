@@ -745,6 +745,7 @@ Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
     } else {
         CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, handle));
     }
+    info.buffers.clear();
     if (desc->type == SegmentType::File) {
         info.type = SegmentInfo::File;
         auto& detail = std::get<FileSegmentDesc>(desc->detail);
