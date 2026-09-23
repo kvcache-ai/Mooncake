@@ -531,8 +531,13 @@ class StoreSession:
             success = result_code >= 0 and actual_present == expected_present
         elif operation == "remove":
             result_code = self.store.remove(key)
-            actual_present = self.store.isExist(key) == 1
-            success = not actual_present and (result_code == 0 or not expected_present)
+            existence_result = self.store.isExist(key)
+            actual_present = existence_result == 1
+            success = existence_result == 0 and (
+                result_code == 0 or not expected_present
+            )
+            if existence_result < 0:
+                result_code = existence_result
         else:
             raise ValueError(f"unsupported metadata operation: {operation}")
 

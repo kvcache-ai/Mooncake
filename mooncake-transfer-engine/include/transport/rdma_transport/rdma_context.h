@@ -107,6 +107,8 @@ class RdmaContext {
    public:
     friend class RdmaContextTestPeer;
     friend class WorkerPool;
+    friend class RdmaEndPoint;
+    friend class RdmaTransport;
 
     RdmaContext(RdmaTransport &engine, const std::string &device_name);
 
@@ -175,6 +177,8 @@ class RdmaContext {
     }
 
    public:
+    bool nativeNotifyEnabled() const { return native_notify_enabled_; }
+
     // EndPoint Management
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path,
@@ -335,6 +339,17 @@ class RdmaContext {
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
+    bool native_notify_enabled_ = false;
+    std::mutex notify_mutex_;
+    // One fixed-size notification CQ per device, separate from the data CQs.
+    ibv_cq *notify_cq_ = nullptr;
+    std::unordered_map<uint32_t, std::weak_ptr<RdmaEndPoint>> notify_endpoints_;
+    void registerNotifyQp(uint32_t qp_num,
+                          const std::weak_ptr<RdmaEndPoint> &endpoint);
+    void unregisterNotifyQp(uint32_t qp_num);
+    int pollNotificationCq();
+    void dispatchNotificationCompletion(
+        const ibv_wc &wc, std::vector<TransferMetadata::NotifyDesc> &received);
 
     // Active-connect circuit-breaker (keyed by peer server name).
     ConnectPauseTracker connect_pause_;

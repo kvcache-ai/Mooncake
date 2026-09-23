@@ -20,10 +20,10 @@ concurrency:
 # ── Workflow Design Notes ──────────────────────────────────────────────────────
 # 1. version-stamp computes a forward-looking nightly version (next patch + .devYYYYMMDD)
 #    that sorts AFTER the current release per PEP 440, e.g. "0.3.12.dev20260720".
-# 2. Build jobs pass the nightly version via `version-override` to _build-wheel.yaml
-#    so each wheel is stamped with the correct dev version for TestPyPI.
+# 2. Build jobs pass the nightly version to their reusable wheel workflows so
+#    each wheel is stamped with the correct dev version for TestPyPI.
 # 3. Specialized platform and packaging checks run nightly instead of on every PR.
-# 4. publish-testpypi uploads all nightly-* artifacts to TestPyPI.
+# 4. publish-testpypi uploads standard and ROCm nightly artifacts to TestPyPI.
 # 5. nightly-gate aggregates ALL build + test results; notify-failure files an issue.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -96,6 +96,8 @@ jobs:
   build-wheel-rocm:
     needs: version-stamp
     uses: ./.github/workflows/ci_rocm.yml
+    with:
+      version_override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   rocm-integration-test:
     needs: build-wheel-rocm
@@ -164,7 +166,7 @@ jobs:
     secrets: inherit
 
   publish-testpypi:
-    needs: [version-stamp, build-wheels, nightly-test]
+    needs: [version-stamp, build-wheels, build-wheel-rocm, nightly-test]
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
@@ -175,13 +177,21 @@ jobs:
         run: |
           echo "Publishing nightly version: ${{ needs.version-stamp.outputs.nightly_version }}"
 
-      - name: Download all nightly wheel artifacts
+      - name: Download standard nightly wheel artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist-all
           pattern: 'nightly-*'
 
-      - name: Collect and rename wheels with nightly version
+      # Keep the established artifact names because integration-test-rocm.yml
+      # consumes them from the same run.
+      - name: Download ROCm nightly wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          pattern: 'mooncake-wheel-rocm-ubuntu-*'
+
+      - name: Collect wheels for nightly publication
         run: |
           mkdir -p dist-publish
           find dist-all -name "*.whl" -exec cp {} dist-publish/ \;
