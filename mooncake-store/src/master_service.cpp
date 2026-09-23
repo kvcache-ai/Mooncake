@@ -4217,11 +4217,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
 
     if (legacy_objects) {
         LegacyRestoreContext legacy_ctx{
-            *legacy_objects,        memory_segments_by_alias,
-            restored_allocators,    restored_accounted_memory_bytes,
-            rejected_count,         already_existing_count,
-            repair_remove_keys,     repair_canonical_keys,
-            installed_keys,         new_known_owner_records};
+            *legacy_objects,     memory_segments_by_alias,
+            restored_allocators, restored_accounted_memory_bytes,
+            rejected_count,      already_existing_count,
+            repair_remove_keys,  repair_canonical_keys,
+            installed_keys,      new_known_owner_records};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
             return tl::make_unexpected(r.error());
         }
