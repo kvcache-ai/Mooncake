@@ -2562,12 +2562,38 @@ TEST_F(MasterServiceHATest, OplogDoesNotStartWithUnsupportedHABackend) {
     auto config = MasterServiceConfig::builder()
                       .set_enable_ha(true)
                       .set_enable_oplog(true)
-                      .set_ha_backend_type("redis")
+                      .set_ha_backend_type("k8s")
+                      .set_ha_backend_connstring("unused")
                       .set_cluster_id("oplog_unsupported_ha_backend")
                       .build();
 
     MasterService service(config);
     EXPECT_FALSE(HasOpLogWriter(service));
+}
+
+TEST_F(MasterServiceHATest, OplogRedisWithoutConnstringDoesNotCreateWriter) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_ha_backend_type("redis")
+                      .set_cluster_id("oplog_redis_without_connstring")
+                      .build();
+
+    MasterService service(config);
+    EXPECT_FALSE(HasOpLogWriter(service));
+}
+
+TEST_F(MasterServiceHATest, OplogRedisInvalidConnstringThrows) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_ha_backend_type("redis")
+                      .set_ha_backend_connstring("redis://")
+                      .set_cluster_id("oplog_redis_bad_connstring")
+                      .build();
+
+    EXPECT_THROW(
+        { MasterService service(config); }, std::runtime_error);
 }
 
 TEST_F(MasterServiceHATest, BatchPrimaryDoesNotStartSnapshotWorker) {

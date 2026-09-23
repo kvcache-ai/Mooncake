@@ -55,6 +55,10 @@ TEST(MasterServiceConfigTest, ValidatesOplogSnapshotConfiguration) {
     config.snapshot_object_store_type = "local";
     EXPECT_FALSE(ValidateBatchOpLogSnapshotConfig(config).has_value());
 
+    config.ha_backend_type = "redis";
+    EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    config.ha_backend_type = "etcd";
+
     config.snapshot_chunk_object_count = 0;
     EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
     config.snapshot_chunk_object_count = 1;

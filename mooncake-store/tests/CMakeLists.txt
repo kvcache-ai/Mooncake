@@ -397,6 +397,10 @@ add_ha_test(ha_backend_availability_test
 add_ha_test(leader_label_reconciler_test
             ha/leadership/leader_label_reconciler_test.cpp)
 add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)
+add_ha_test(redis_ha_kv_backend_test ha/kv/redis_ha_kv_backend_test.cpp)
+if(STORE_USE_REDIS)
+  target_link_libraries(redis_ha_kv_backend_test PRIVATE Mooncake::hiredis)
+endif()
 add_ha_test(oplog_batch_auditor_test ha/oplog/oplog_batch_auditor_test.cpp)
 target_sources(oplog_batch_auditor_test
                PRIVATE ../tools/oplog_batch_auditor.cpp)

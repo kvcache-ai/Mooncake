@@ -57,6 +57,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
     ha/kv/etcd_ha_kv_backend.cpp
+    ha/kv/redis_ha_kv_backend.cpp
+    ha/kv/ha_kv_backend_factory.cpp
     ha/standby_controller.cpp
     ha/standby_metadata_store.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
