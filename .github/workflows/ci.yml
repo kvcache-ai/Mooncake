@@ -87,6 +87,35 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
+    - name: Run tensor snapshot regressions
+      env:
+        MASTER_SERVER: "127.0.0.1:50061"
+        MC_METADATA_SERVER: "P2PHANDSHAKE"
+        LOCAL_HOSTNAME: "127.0.0.1"
+        DEFAULT_KV_LEASE_TTL: "500"
+      run: |
+        source test_env/bin/activate
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        mooncake_master --port 50061 --default_kv_lease_ttl=500 \
+          >"$RUNNER_TEMP/tensor-snapshot-master.log" 2>&1 &
+        master_pid=$!
+        trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
+        python - <<'PY'
+        import socket
+        import time
+        for attempt in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", 50061), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("Tensor snapshot test master did not start")
+        PY
+        python mooncake-wheel/tests/test_tensor_read_snapshot.py -v
+        python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
+      shell: bash
+
     - name: Run all PG CPU tests with latest PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
@@ -146,14 +175,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Install and start etcd
-      run: |
-        wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-        sleep 3
-        ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
-      shell: bash
+      uses: ./.github/actions/setup-etcd
 
     - name: Free up disk space
       uses: ./.github/actions/free-disk-space
@@ -174,15 +196,8 @@ jobs:
         echo "/usr/local/go/bin" >> "$GITHUB_PATH"
       shell: bash
 
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
 
     - name: Configure project with unit tests
       run: |
@@ -192,6 +207,7 @@ jobs:
           -DUSE_UB=ON \
           -DUSE_ETCD=ON \
           -DUSE_CUDA=ON \
+          -DUSE_MNNVL=ON \
           -DWITH_P2P_STORE=ON \
           -DWITH_CONDUCTOR=ON \
           -DSTORE_USE_ETCD=ON \
@@ -201,22 +217,7 @@ jobs:
       shell: bash
 
     - name: Configure CUDA driver runtime
-      run: |
-        cuda_driver_library=$(sed -n \
-          's/^CUDA_cuda_driver_LIBRARY:FILEPATH=//p' build/CMakeCache.txt)
-        if [ -z "$cuda_driver_library" ] || [ ! -f "$cuda_driver_library" ]; then
-          echo "::error::CMake did not resolve the CUDA driver library"
-          exit 1
-        fi
-
-        cuda_driver_dir=$(dirname "$cuda_driver_library")
-        if [ ! -e "$cuda_driver_dir/libcuda.so.1" ]; then
-          sudo ln -s "$(basename "$cuda_driver_library")" \
-            "$cuda_driver_dir/libcuda.so.1"
-        fi
-        echo "LIBRARY_PATH=$cuda_driver_dir:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-        echo "LD_LIBRARY_PATH=$cuda_driver_dir:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-      shell: bash
+      uses: ./.github/actions/setup-cuda-runtime
 
     - name: Build project and unit tests
       run: |
@@ -235,25 +236,14 @@ jobs:
       shell: bash
 
     - name: Start Metadata Server
-      run: |
-        cd mooncake-transfer-engine/example/http-metadata-server-python
-        pip install aiohttp
-        python ./bootstrap_server.py &
-        sleep 2
-      shell: bash
+      uses: ./.github/actions/setup-metadata-server
 
     - name: Run all CTest unit tests
       id: ctest
-      run: |
-        reserved_ports=$(sysctl -n net.ipv4.ip_local_reserved_ports)
-        sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
-        mkdir -p build/test-results
-        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-        DEFAULT_KV_LEASE_TTL=500 \
-          ctest --test-dir build --parallel "$(nproc)" --output-on-failure \
-            --output-junit "$GITHUB_WORKSPACE/build/test-results/ctest.xml"
-      shell: bash
+      uses: ./.github/actions/run-ctest
+      with:
+        junit-report: build/test-results/ctest.xml
+        label-exclude: '^nvlink_gpu$'
 
     - name: Preserve CTest diagnostics
       if: ${{ always() && steps.ctest.outcome == 'failure' }}
@@ -297,15 +287,8 @@ jobs:
         sub-packages: '["nvcc", "nvrtc-dev"]'
         non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
 
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
 
     - name: Install dependencies
       run: |
@@ -392,12 +375,26 @@ jobs:
     - name: Run focused release gate tests
       run: |
         python -m pip install --disable-pip-version-check \
-          packaging pytest==8.3.5
+          packaging pytest==8.3.5 pyyaml
         python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
       shell: bash
 
     - name: Test CI service and smoke scripts
       run: python -m unittest discover -s scripts/ci/tests -v
+
+  tone-script-tests:
+    name: Test external CI lifecycle helpers
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Run focused shell regression tests
+      run: |
+        bash scripts/tone_tests/tests/test_common_cleanup.sh
+        python3 scripts/tone_tests/tests/test_hicache_model_selection.py
+      shell: bash
 
   clang-format:
     name: Check code format
@@ -548,6 +545,9 @@ jobs:
               - '.github/workflows/**'
             tent:
               - 'mooncake-transfer-engine/**'
+              - 'mooncake-store/src/transfer_task.cpp'
+              - 'mooncake-store/tests/transfer_task_test.cpp'
+              - 'mooncake-store/tests/CMakeLists.txt'
               - 'mooncake-common/**'
               - 'extern/**'
               - 'cmake/**'
@@ -595,7 +595,7 @@ jobs:
             need_cuda: true
             metrics_flags: ''
           - name: cuda-off
-            cmake_flags: '-DUSE_CUDA=OFF'
+            cmake_flags: '-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON'
             need_cuda: false
             metrics_flags: ''
           - name: cuda-off-metrics-on
@@ -631,15 +631,8 @@ jobs:
         method: 'network'
         sub-packages: '["nvcc", "nvrtc-dev"]'
 
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
 
     - name: Install dependencies
       run: |
@@ -690,6 +683,13 @@ jobs:
         cargo test --lib
         cargo test --examples --tests --no-run
         cargo clean
+      shell: bash
+
+    - name: Test Store completion with TENT
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^transfer_task_tent_completion_test$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
@@ -751,6 +751,7 @@ jobs:
       - docs-check
       - reshard-type-check
       - ci-script-tests
+      - tone-script-tests
       - build-wheel
       - unit-tests
       - build-flags
@@ -772,7 +773,8 @@ jobs:
                 needs.clang-format.result == 'success' &&
                 needs.python-lint.result == 'success' &&
                 needs.reshard-type-check.result == 'success' &&
-                needs.ci-script-tests.result == 'success' }}
+                needs.ci-script-tests.result == 'success' &&
+                needs.tone-script-tests.result == 'success' }}
         run: |
           echo "$NEEDS_JSON"
           test "$PASSED" = true

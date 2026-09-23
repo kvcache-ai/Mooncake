@@ -417,7 +417,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
-        } else if (kGpuP2PCompiled && (force_gpu_p2p || no_hca)) {
+        } else if (kGpuP2PCompiled &&
+                   (force_gpu_p2p || (no_hca && !force_hca))) {
+            // MC_FORCE_HCA suppresses automatic no-HCA fallback, but keeps
+            // explicitly requested GPU P2P transport precedence unchanged.
             Transport* t =
                 multi_transports_->installTransport(gpu_p2p_protocol, nullptr);
             if (!t) {
@@ -564,6 +567,11 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
 }
 
 void* TransferEngineImpl::allocateSharedMemory(size_t length) {
+    return allocateSharedMemory(length, SharedMemoryOptions{});
+}
+
+void* TransferEngineImpl::allocateSharedMemory(size_t length,
+                                               const SharedMemoryOptions& opt) {
     auto* shm =
         dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
     if (!shm) {
@@ -571,7 +579,7 @@ void* TransferEngineImpl::allocateSharedMemory(size_t length) {
                       "(set MC_FORCE_SHM=1 or installTransport(\"shm\"))";
         return nullptr;
     }
-    return shm->allocateSharedMemory(length);
+    return shm->allocateSharedMemory(length, opt);
 }
 
 int TransferEngineImpl::freeSharedMemory(void* addr) {
@@ -659,6 +667,15 @@ int TransferEngineImpl::sendNotifyByName(
             }
             VLOG(1) << "sendNotifyByName: RDMA notify unavailable for "
                     << remote_agent << ", falling back to OOB";
+        } else if (auto* rdma = dynamic_cast<RdmaTransport*>(transport)) {
+            int ret = rdma->sendNativeNotify(remote_agent, notify_msg);
+            if (ret == 0) return 0;
+            // Only unsupported peers/oversized payloads may use OOB. A QP
+            // failure must remain visible, and accepted SENDs are never
+            // replayed.
+            if (ret != ERR_NOT_IMPLEMENTED ||
+                !globalConfig().rdma_notify_oob_fallback)
+                return ret;
         }
     }
     Transport::NotifyDesc peer_desc;

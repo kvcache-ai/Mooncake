@@ -2,6 +2,7 @@
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "allocator_status.h"
 #include "client_service.h"
 #include "common.h"
 #include "config.h"
@@ -44,6 +45,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::batchRemove_internal>(&real_client);
     server.register_handler<&RealClient::isExist_internal>(&real_client);
     server.register_handler<&RealClient::batchIsExist_internal>(&real_client);
+    server.register_handler<&RealClient::probeKey_internal>(&real_client);
+    server.register_handler<&RealClient::batchProbeKey_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
         &real_client);
@@ -119,6 +122,8 @@ int main(int argc, char *argv[]) {
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);
     }
+    mooncake::LogAllocatorStatus();
+    mooncake::InstallAllocatorStatsCollector();
 
     LOG(INFO) << "Mooncake real client version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;

@@ -7,6 +7,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "allocator_metric.h"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -98,10 +99,12 @@ class MasterMetricManager {
     void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);
     int64_t get_segment_total_mem_capacity(const std::string& segment);
-    // Remove all per-segment metric labels for the given segment.
-    // Called when a segment is unmounted to prevent stale 0-value entries
-    // from persisting in Prometheus output (e.g. after snapshot restore
-    // followed by client expiry / reaper cleanup).
+
+    // Remove per-segment memory labels only when both usage and capacity are
+    // zero. Allocator destruction and capacity release retry cleanup when
+    // retained resources are released. Cleanup is best-effort: the zero check
+    // and removal are not atomic with concurrent updates, avoiding a global
+    // lock on the allocation hot path.
     void remove_segment_metrics(const std::string& segment);
 
     // NoF segment Metrics
@@ -158,6 +161,7 @@ class MasterMetricManager {
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
+    void inc_put_start_object_already_exists(int64_t val = 1);
     void inc_put_start_alloc_failures(int64_t val = 1);
     void inc_put_start_partial_allocations(int64_t val = 1);
     void inc_put_end_requests(int64_t val = 1);
@@ -211,6 +215,7 @@ class MasterMetricManager {
     void inc_batch_get_replica_list_partial_success(int64_t failed_items);
     void inc_batch_put_start_requests(int64_t items);
     void inc_batch_put_start_failures(int64_t failed_items);
+    void inc_batch_put_start_object_already_exists(int64_t items);
     void inc_batch_put_start_partial_success(int64_t failed_items);
     void inc_batch_put_end_requests(int64_t items);
     void inc_batch_put_end_failures(int64_t failed_items);
@@ -222,6 +227,7 @@ class MasterMetricManager {
     // Operation Statistics Getters
     int64_t get_put_start_requests();
     int64_t get_put_start_failures();
+    int64_t get_put_start_object_already_exists();
     int64_t get_put_start_alloc_failures();
     int64_t get_put_start_partial_allocations();
     int64_t get_put_end_requests();
@@ -272,6 +278,7 @@ class MasterMetricManager {
     int64_t get_batch_get_replica_list_failed_items();
     int64_t get_batch_put_start_requests();
     int64_t get_batch_put_start_failures();
+    int64_t get_batch_put_start_object_already_exists();
     int64_t get_batch_put_start_partial_successes();
     int64_t get_batch_put_start_items();
     int64_t get_batch_put_start_failed_items();
@@ -349,6 +356,14 @@ class MasterMetricManager {
     void inc_promotion_candidate_expired_evaluated(int64_t val = 1);
     void inc_promotion_candidate_expired_unevaluated(int64_t val = 1);
     void inc_promotion_candidate_dropped_limit(int64_t val = 1);
+
+    // SSD Offload Task Metrics (per store worker via client_id label)
+    void inc_offload_enqueued(const std::string& client_id, int64_t val = 1);
+    void inc_offload_completed(const std::string& client_id, int64_t val = 1);
+    void inc_offload_failed(const std::string& client_id, int64_t val = 1);
+    void inc_offload_cancelled(const std::string& client_id, int64_t val = 1);
+    void inc_offload_enqueue_rejected(const std::string& client_id,
+                                      int64_t val = 1);
 
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
@@ -555,6 +570,8 @@ class MasterMetricManager {
     std::set<std::string> projected_mem_segments_;
     std::set<std::string> projected_nof_segments_;
 
+    AllocatorMetric allocator_metric_;
+
     // Memory Storage Metrics
     ylt::metric::gauge_t
         mem_allocated_size_;  // Overall memory usage update for gauge
@@ -605,6 +622,7 @@ class MasterMetricManager {
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;
     ylt::metric::counter_t put_start_failures_;
+    ylt::metric::counter_t put_start_object_already_exists_;
     ylt::metric::counter_t put_start_alloc_failures_;
     ylt::metric::counter_t put_start_partial_allocations_;
     ylt::metric::counter_t put_end_requests_;
@@ -666,6 +684,7 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_get_replica_list_failed_items_;
     ylt::metric::counter_t batch_put_start_requests_;
     ylt::metric::counter_t batch_put_start_failures_;
+    ylt::metric::counter_t batch_put_start_object_already_exists_;
     ylt::metric::counter_t batch_put_start_partial_successes_;
     ylt::metric::counter_t batch_put_start_items_;
     ylt::metric::counter_t batch_put_start_failed_items_;
@@ -746,6 +765,13 @@ class MasterMetricManager {
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
+
+    // SSD Offload Task Metrics
+    ylt::metric::dynamic_counter_1t offload_enqueued_total_;
+    ylt::metric::dynamic_counter_1t offload_completed_total_;
+    ylt::metric::dynamic_counter_1t offload_failed_total_;
+    ylt::metric::dynamic_counter_1t offload_cancelled_total_;
+    ylt::metric::dynamic_counter_1t offload_enqueue_rejected_total_;
 
     // Snapshot Metrics
     ylt::metric::histogram_t snapshot_duration_ms_;

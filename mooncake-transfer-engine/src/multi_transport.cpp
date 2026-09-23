@@ -147,14 +147,8 @@ Status MultiTransport::submitTransfer(
     }
 
     std::vector<Transport*> transports;
-    transports.reserve(entries.size());
-    for (const auto& request : entries) {
-        Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
-        assert(transport);
-        transports.push_back(transport);
-    }
+    auto select_status = selectTransports(entries, transports);
+    if (!select_status.ok()) return select_status;
 
     auto& task_list = batch_desc.task_list;
     task_list.reserve(task_list.size() + entries.size());
@@ -309,11 +303,14 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
 
     // Fallback for tasks without a transport pointer (legacy path)
-    status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
         __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the byte updates made by
+    // Slice::markSuccess().
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     assert(task.slice_count);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
@@ -375,7 +372,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
+    if (batch_desc.status_cached.load(std::memory_order_acquire) ||
         task_count == 0) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
@@ -407,9 +404,10 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
-        batch_desc.is_finished.store(true, std::memory_order_release);
         batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
-                                                 std::memory_order_release);
+                                                 std::memory_order_relaxed);
+        batch_desc.status_cached.store(true, std::memory_order_release);
+        batch_desc.is_finished.store(true, std::memory_order_release);
     } else if (status.s == Transport::TransferStatusEnum::FAILED) {
         batch_desc.has_failure.store(true, std::memory_order_release);
     }
@@ -590,13 +588,57 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     return transport;
 }
 
+Status MultiTransport::selectTransports(
+    const std::vector<TransferRequest>& entries,
+    std::vector<Transport*>& transports) {
+    transports.clear();
+    transports.reserve(entries.size());
+    Transport* reused_transport = nullptr;
+    Transport::SegmentID reused_target = 0;
+    bool reuse_allowed = false;
+    const bool metacache = globalConfig().metacache;
+    for (const auto& request : entries) {
+        Transport* transport = nullptr;
+        // Reuse only address-independent routes within this submission. Mixed
+        // protocol segments must still resolve each address independently, and
+        // disabling the metadata cache must retain the explicit refresh
+        // behavior. This restores MultiTransport routing (protocol to
+        // Transport*), not RDMA's per-target SegmentDesc fetch inside
+        // submitTransferTask.
+        if (reuse_allowed && reused_transport && metacache &&
+            request.target_id == reused_target) {
+            transport = reused_transport;
+        } else {
+            auto status = selectTransport(request, transport, &reuse_allowed);
+            if (!status.ok()) return status;
+            assert(transport);
+            reused_transport = transport;
+            reused_target = request.target_id;
+        }
+        transports.push_back(transport);
+    }
+    return Status::OK();
+}
+
 Status MultiTransport::selectTransport(const TransferRequest& entry,
-                                       Transport*& transport) {
+                                       Transport*& transport,
+                                       bool* allows_reuse) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
+        if (allows_reuse) *allows_reuse = false;
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Offset-based routing is only compiled for mixed-protocol segments.
+    // A homogeneous batch can reuse this Transport*.
+    if (allows_reuse) {
+        *allows_reuse =
+            target_segment_desc->protocol.find(',') == std::string::npos;
+    }
+#else
+    if (allows_reuse) *allows_reuse = true;
+#endif
 
     auto proto = target_segment_desc->protocol;
 #ifdef ENABLE_MULTI_PROTOCOL

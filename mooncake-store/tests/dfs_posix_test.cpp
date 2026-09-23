@@ -4,10 +4,13 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -604,6 +607,293 @@ TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {
     EXPECT_EQ(fail_count.load(), 0);
 }
 
+TEST(DfsGlobalAllocatorTest, ExpansionValidatesCountAndUsesEmptyShards) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_capacity");
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    auto old = alloc.Allocate("old", 100);
+    ASSERT_TRUE(old);
+    ASSERT_FALSE(alloc.Allocate("full", 100));
+
+    for (int count : {-1, 0}) {
+        auto result = alloc.ExpandShards(count);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    auto unchanged = alloc.ExpandShards(1);
+    ASSERT_TRUE(unchanged);
+    EXPECT_EQ(*unchanged, 1);
+    auto expanded = alloc.ExpandShards(2);
+    ASSERT_TRUE(expanded);
+    EXPECT_EQ(*expanded, 2);
+    EXPECT_EQ(alloc.GetShardCount(), 2);
+    ASSERT_TRUE(alloc.ExpandShards(2));
+    auto shrink = alloc.ExpandShards(1);
+    ASSERT_FALSE(shrink);
+    EXPECT_EQ(shrink.error(), ErrorCode::INVALID_PARAMS);
+
+    // This key still prefers the full original shard. Expansion must provide
+    // usable capacity even when hashing does not select the new shard.
+    std::string key;
+    for (int i = 0; i < 1000; ++i) {
+        key = "fallback_" + std::to_string(i);
+        if (std::hash<std::string>{}(key) % 2 == 0) break;
+    }
+    ASSERT_EQ(std::hash<std::string>{}(key) % 2, 0);
+    auto added = alloc.Allocate(key, 100);
+    ASSERT_TRUE(added);
+    EXPECT_EQ(added->shard_idx, 1);
+    alloc.Free(old->offset, old->aligned_size, old->shard_idx, "old");
+    alloc.Free(added->offset, added->aligned_size, added->shard_idx, key);
+}
+
+TEST(DfsGlobalAllocatorTest, ExpansionPreservesLegacyPathsAndRestartsLayout) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_legacy");
+    // Seed the legacy padded layout rather than relying on how new roots are
+    // named after this change. Crossing 100 must never rename these files.
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    for (int i = 0; i < 100; ++i) {
+        const auto path =
+            tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(i, 100) +
+                     ".data");
+        ASSERT_TRUE(adapter.PreallocateFile(path, 8192));
+    }
+    std::string old_path;
+    {
+        DfsGlobalAllocator alloc;
+        ASSERT_TRUE(
+            alloc.Init(MakeAllocatorConfig(tmp.path(), 100, 8192, 4096)));
+        auto old = alloc.Allocate("preserved", 100);
+        ASSERT_TRUE(old);
+        old_path = old->file_path;
+        const int fd = ::open(old_path.c_str(), O_WRONLY);
+        ASSERT_GE(fd, 0);
+        const char marker = 'P';
+        EXPECT_EQ(::pwrite(fd, &marker, 1, old->offset), 1);
+        EXPECT_EQ(::close(fd), 0);
+        ASSERT_TRUE(alloc.ExpandShards(101));
+        EXPECT_EQ(alloc.GetShardCount(), 101);
+        EXPECT_TRUE(std::filesystem::exists(old_path));
+        char readback = 0;
+        const int read_fd = ::open(old_path.c_str(), O_RDONLY);
+        ASSERT_GE(read_fd, 0);
+        EXPECT_EQ(::pread(read_fd, &readback, 1, old->offset), 1);
+        EXPECT_EQ(::close(read_fd), 0);
+        EXPECT_EQ(readback, marker);
+    }
+    // Only the shard layout is recovered. This deliberately makes no claim
+    // about recovering the previous object's allocation or Master metadata.
+    DfsGlobalAllocator restarted;
+    ASSERT_TRUE(restarted.Init(MakeAllocatorConfig(tmp.path(), 2, 8192, 4096)));
+    EXPECT_EQ(restarted.GetShardCount(), 101);
+    EXPECT_TRUE(std::filesystem::exists(old_path));
+}
+
+TEST(DfsGlobalAllocatorTest, ExpansionRetainsPaddedLegacyShardDescriptors) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_padded");
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    ASSERT_TRUE(adapter.PreallocateFile(tmp.file("dfs_shard_000.data"), 8192));
+    ASSERT_TRUE(adapter.PreallocateFile(tmp.file("dfs_shard_001.data"), 8192));
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 2, 8192, 4096)));
+    auto old = alloc.Allocate("old", 100);
+    ASSERT_TRUE(old);
+    EXPECT_EQ(old->file_path,
+              tmp.file(old->shard_idx == 0 ? "dfs_shard_000.data"
+                                           : "dfs_shard_001.data"));
+    ASSERT_TRUE(alloc.ExpandShards(3));
+    EXPECT_TRUE(std::filesystem::exists(old->file_path));
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_00.data")));
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+}
+
+TEST(DfsGlobalAllocatorTest, InitRejectsMalformedShardNames) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    for (const std::string& name :
+         {"dfs_shard_0.data", "dfs_shard_.data", "dfs_shard_+0.data",
+          "dfs_shard_-1.data", "dfs_shard_00x.data",
+          "dfs_shard_2147483647.data", "dfs_shard_2147483648.data"}) {
+        SCOPED_TRACE(name);
+        TempDir tmp("dfs_invalid_shard_name");
+        PosixFsAdapter adapter;
+        ASSERT_TRUE(adapter.Init(tmp.path()));
+        ASSERT_TRUE(adapter.PreallocateFile(tmp.file(name), 8192));
+        DfsGlobalAllocator alloc;
+        auto result =
+            alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096));
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_FALSE(alloc.IsInitialized());
+        EXPECT_EQ(alloc.GetShardCount(), 0);
+        EXPECT_EQ(std::filesystem::file_size(tmp.file(name)), 8192);
+        EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_00.data")));
+    }
+}
+
+TEST(DfsGlobalAllocatorTest, InitRejectsAmbiguousOrNoncontiguousLayout) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    for (const std::string& second_name :
+         {"dfs_shard_000.data", "dfs_shard_02.data"}) {
+        SCOPED_TRACE(second_name);
+        TempDir tmp("dfs_invalid_shard_layout");
+        PosixFsAdapter adapter;
+        ASSERT_TRUE(adapter.Init(tmp.path()));
+        ASSERT_TRUE(
+            adapter.PreallocateFile(tmp.file("dfs_shard_00.data"), 8192));
+        ASSERT_TRUE(adapter.PreallocateFile(tmp.file(second_name), 8192));
+        DfsGlobalAllocator alloc;
+        auto result =
+            alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096));
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(alloc.GetShardCount(), 0);
+        EXPECT_EQ(std::filesystem::file_size(tmp.file("dfs_shard_00.data")),
+                  8192);
+        EXPECT_EQ(std::filesystem::file_size(tmp.file(second_name)), 8192);
+        EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+    }
+}
+
+TEST(DfsGlobalAllocatorTest, InitRejectsExistingCapacityWithoutTruncation) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_invalid_shard_capacity");
+    const auto path = tmp.file("dfs_shard_00.data");
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    ASSERT_TRUE(adapter.PreallocateFile(path, 4096));
+    DfsGlobalAllocator alloc;
+    auto result = alloc.Init(MakeAllocatorConfig(tmp.path(), 2, 8192, 4096));
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_FALSE(alloc.IsInitialized());
+    EXPECT_EQ(alloc.GetShardCount(), 0);
+    EXPECT_EQ(std::filesystem::file_size(path), 4096);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+}
+
+TEST(DfsGlobalAllocatorTest, FailedExpansionPreservesExistingUnpublishedShard) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_existing_failure");
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    // A previous interrupted expansion may have left a complete shard. Failed
+    // retries must only clean files created by the current operation.
+    const auto existing = tmp.file("dfs_shard_01.data");
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    ASSERT_TRUE(adapter.PreallocateFile(existing, 8192));
+    const auto blocked = tmp.file("dfs_shard_03.data");
+    ASSERT_TRUE(std::filesystem::create_directory(blocked));
+    auto result = alloc.ExpandShards(4);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(alloc.GetShardCount(), 1);
+    EXPECT_EQ(std::filesystem::file_size(existing), 8192);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_02.data")));
+    ASSERT_TRUE(std::filesystem::remove(blocked));
+    ASSERT_TRUE(alloc.ExpandShards(4));
+    EXPECT_EQ(alloc.GetShardCount(), 4);
+}
+
+TEST(DfsGlobalAllocatorTest, FailedExpansionDoesNotPublishPartialCapacity) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_failure");
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    // The second new shard cannot be prepared. The first must not become
+    // visible to allocators when the whole expansion request fails.
+    const auto blocked = tmp.file("dfs_shard_02.data");
+    ASSERT_TRUE(std::filesystem::create_directory(blocked));
+    auto result = alloc.ExpandShards(3);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(alloc.GetShardCount(), 1);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+    auto old = alloc.Allocate("still_usable", 100);
+    ASSERT_TRUE(old);
+    EXPECT_EQ(old->shard_idx, 0);
+    EXPECT_FALSE(alloc.Allocate("not_published", 100));
+    ASSERT_TRUE(std::filesystem::remove(blocked));
+    ASSERT_TRUE(alloc.ExpandShards(3));
+    EXPECT_EQ(alloc.GetShardCount(), 3);
+}
+
+TEST(DfsGlobalAllocatorTest, PreparedEvictionRemainsValidAcrossExpansion) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_eviction");
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    auto old = alloc.Allocate("old", 100);
+    ASSERT_TRUE(old);
+    alloc.UpdateAccess("old", old->shard_idx, old->offset);
+    auto pending = alloc.PrepareEviction();
+    ASSERT_EQ(pending.Candidates().size(), 1);
+    ASSERT_TRUE(alloc.ExpandShards(2));
+    alloc.CommitPreparedEviction(std::move(pending));
+    auto after = alloc.Allocate("after", 100);
+    ASSERT_TRUE(after);
+    alloc.Free(after->offset, after->aligned_size, after->shard_idx, "after");
+    EXPECT_TRUE(alloc.PrepareEviction().Empty());
+}
+
+TEST(DfsGlobalAllocatorTest, ConcurrentExpansionAllocationAndEvictionRestore) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_concurrent");
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 1 << 20, 4096)));
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 4; ++worker) {
+        workers.emplace_back([&, worker] {
+            while (!start.load()) std::this_thread::yield();
+            for (int i = 0; i < 200; ++i) {
+                const auto key = "worker_" + std::to_string(worker) + "_" +
+                                 std::to_string(i);
+                auto desc = alloc.Allocate(key, 100);
+                if (!desc) {
+                    ++failures;
+                    continue;
+                }
+                alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
+                alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx,
+                           key);
+            }
+        });
+    }
+    workers.emplace_back([&] {
+        while (!start.load()) std::this_thread::yield();
+        for (int i = 0; i < 200; ++i) {
+            auto pending = alloc.PrepareEviction();
+            alloc.RestorePreparedEviction(std::move(pending));
+        }
+    });
+    workers.emplace_back([&] {
+        while (!start.load()) std::this_thread::yield();
+        for (int count = 2; count <= 8; ++count) {
+            if (!alloc.ExpandShards(count)) ++failures;
+        }
+    });
+    start.store(true);
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(failures.load(), 0);
+    EXPECT_EQ(alloc.GetShardCount(), 8);
+    EXPECT_TRUE(alloc.PrepareEviction().Empty());
+}
+
 TEST(ReplicaDfsTest, HelpersAndDescriptor) {
     DistributedFSDescriptor desc{"/mnt/3fs/shard0.data", 4096, 100, 4096, 0};
     Replica replica(desc, ReplicaStatus::PROCESSING);
@@ -656,6 +946,15 @@ class DfsBackendTest : public ::testing::Test {
         distributed_config.shard_capacity = 64 * 1024 * 1024;
         distributed_config.alignment = 4096;
 
+        // The master prepares shard files; client initialization only sets up
+        // the adapter and must not create or open files before descriptors.
+        PosixFsAdapter adapter;
+        ASSERT_TRUE(adapter.Init(tmp_->path()));
+        for (int i = 0; i < distributed_config.shard_count; ++i) {
+            ASSERT_TRUE(adapter.PreallocateFile(
+                ShardPath(i), distributed_config.shard_capacity));
+        }
+
         backend_ = std::make_unique<DistributedStorageBackend>(
             file_config, distributed_config,
             std::make_unique<PosixFsAdapter>());
@@ -679,6 +978,16 @@ class DfsBackendTest : public ::testing::Test {
 
 class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
+    void FailOpenCall(int call) { fail_open_call_ = call; }
+    int OpenCallCount() const { return open_calls_.load(); }
+
+    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+        if (++open_calls_ == fail_open_call_) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        return PosixFsAdapter::OpenFile(path);
+    }
+
     void FailWriteCall(int call) { fail_write_call_ = call; }
     void ShortWriteCall(int call) { short_write_call_ = call; }
     void FailReadCall(int call) { fail_read_call_ = call; }
@@ -720,6 +1029,8 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     }
 
    private:
+    std::atomic<int> open_calls_{0};
+    int fail_open_call_ = -1;
     std::atomic<int> write_calls_{0};
     std::atomic<int> read_calls_{0};
     int fail_write_call_ = -1;
@@ -727,6 +1038,367 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int fail_read_call_ = -1;
     int short_read_call_ = -1;
 };
+
+class BlockingShardFsAdapter : public PosixFsAdapter {
+   public:
+    BlockingShardFsAdapter(std::string path, bool block_file_size)
+        : path_(std::move(path)), block_file_size_(block_file_size) {}
+
+    bool WaitUntilBlocked() {
+        return blocked_.wait_for(std::chrono::seconds(5)) ==
+               std::future_status::ready;
+    }
+
+    void Release() {
+        if (!released_once_.exchange(true)) release_signal_.set_value();
+    }
+
+    int OpenCallCount() const { return open_calls_.load(); }
+
+    tl::expected<size_t, ErrorCode> GetFileSize(
+        const std::string& path) override {
+        if (path == path_ && block_file_size_) Block();
+        return PosixFsAdapter::GetFileSize(path);
+    }
+
+    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+        if (path == path_) {
+            ++open_calls_;
+            if (!block_file_size_) Block();
+        }
+        return PosixFsAdapter::OpenFile(path);
+    }
+
+   private:
+    void Block() {
+        if (!blocked_once_.exchange(true)) blocked_signal_.set_value();
+        released_.wait();
+    }
+
+    std::string path_;
+    bool block_file_size_;
+    std::atomic<int> open_calls_{0};
+    std::atomic<bool> blocked_once_{false};
+    std::atomic<bool> released_once_{false};
+    std::promise<void> blocked_signal_;
+    std::future<void> blocked_{blocked_signal_.get_future()};
+    std::promise<void> release_signal_;
+    std::shared_future<void> released_{release_signal_.get_future().share()};
+};
+
+TEST_F(DfsBackendTest, SlowShardInitializationDoesNotBlockOtherShards) {
+    for (bool block_file_size : {false, true}) {
+        SCOPED_TRACE(block_file_size ? "GetFileSize" : "OpenFile");
+        FileStorageConfig file_config;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        file_config.storage_filepath = tmp_->path();
+        auto config =
+            MakeAllocatorConfig(tmp_->path(), 4, 64 * 1024 * 1024, 4096);
+        config.fs_adapter_type = "posix";
+        auto adapter = std::make_unique<BlockingShardFsAdapter>(
+            ShardPath(1), block_file_size);
+        auto* controlled = adapter.get();
+        backend_ = std::make_unique<DistributedStorageBackend>(
+            file_config, config, std::move(adapter));
+        ASSERT_TRUE(backend_->Init());
+
+        auto write_and_read = [&](int index, uint64_t offset) {
+            std::string input(4096, 'V'), output(4096, '\0');
+            const DistributedFSDescriptor descriptor{ShardPath(index), offset,
+                                                     4096, 4096, index};
+            auto writes = backend_->BatchWrite(
+                {{"value", descriptor, {{input.data(), input.size()}}}});
+            auto reads = backend_->BatchRead(
+                {{"value", descriptor, {{output.data(), output.size()}}}});
+            return writes.size() == 1 && writes[0] && reads.size() == 1 &&
+                   reads[0] && output == input;
+        };
+        ASSERT_TRUE(write_and_read(0, 0));
+
+        // Release the adapter before waiting on any async future's destructor,
+        // including when an assertion fails while initialization is blocked.
+        std::future<bool> first, same_shard, other_shards;
+        struct ReleaseOnExit {
+            BlockingShardFsAdapter* adapter;
+            ~ReleaseOnExit() { adapter->Release(); }
+        } release{controlled};
+        first = std::async(std::launch::async,
+                           [&] { return write_and_read(1, 0); });
+        ASSERT_TRUE(controlled->WaitUntilBlocked());
+        same_shard = std::async(std::launch::async,
+                                [&] { return write_and_read(1, 4096); });
+        other_shards = std::async(std::launch::async, [&] {
+            std::string output(4096, '\0');
+            auto reads =
+                backend_->BatchRead({{"cached",
+                                      {ShardPath(0), 0, 4096, 4096, 0},
+                                      {{output.data(), output.size()}}}});
+            return reads.size() == 1 && reads[0] &&
+                   output == std::string(4096, 'V') &&
+                   write_and_read(0, 4096) && write_and_read(2, 0);
+        });
+        EXPECT_EQ(other_shards.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        EXPECT_EQ(same_shard.wait_for(std::chrono::seconds(0)),
+                  std::future_status::timeout);
+        controlled->Release();
+        EXPECT_TRUE(first.get());
+        EXPECT_TRUE(same_shard.get());
+        EXPECT_TRUE(other_shards.get());
+        EXPECT_EQ(controlled->OpenCallCount(), 1);
+    }
+}
+
+TEST(DfsBackendInitializationTest, ClientBeforeMasterDoesNotCreateShards) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_client_before_master");
+    const auto client_config = MakeAllocatorConfig(tmp.path(), 4, 8192, 4096);
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageBackend client(file_config, client_config,
+                                     std::make_unique<PosixFsAdapter>());
+    ASSERT_TRUE(client.Init());
+    EXPECT_TRUE(std::filesystem::is_empty(tmp.path()));
+
+    DfsGlobalAllocator allocator;
+    ASSERT_TRUE(allocator.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    EXPECT_EQ(allocator.GetShardCount(), 1);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+    ASSERT_TRUE(allocator.ExpandShards(4));
+    auto descriptor = allocator.Allocate("after_master_start", 100);
+    ASSERT_TRUE(descriptor);
+    std::string value(100, 'S'), output(100, '\0');
+    auto writes = client.BatchWrite(
+        {{"after_master_start", *descriptor, {{value.data(), value.size()}}}});
+    ASSERT_EQ(writes.size(), 1);
+    ASSERT_TRUE(writes[0]);
+    auto reads = client.BatchRead({{"after_master_start",
+                                    *descriptor,
+                                    {{output.data(), output.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, value);
+}
+
+TEST(DfsBackendInitializationTest, DoesNotCacheRolledBackPreparedShard) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_prepared_shard_rollback");
+    auto config = MakeAllocatorConfig(tmp.path(), 1, 8192, 4096);
+    DfsGlobalAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    const auto path = tmp.file("dfs_shard_01.data");
+    // Reproduce the preparation window before an expansion publishes shard 1.
+    ASSERT_TRUE(adapter.PreallocateFile(path, config.shard_capacity));
+    const int prepared_fd = ::open(path.c_str(), O_RDONLY);
+    ASSERT_GE(prepared_fd, 0);
+    struct stat prepared_stat{};
+    ASSERT_EQ(::fstat(prepared_fd, &prepared_stat), 0);
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    auto client_config = config;
+    client_config.shard_count = 2;
+    DistributedStorageBackend writer(file_config, client_config,
+                                     std::make_unique<PosixFsAdapter>());
+    ASSERT_TRUE(writer.Init());
+    // A failed expansion removes the unpublished file. Keep its old inode
+    // alive until retry creates a different file with the same pathname.
+    ASSERT_TRUE(std::filesystem::remove(path));
+    ASSERT_TRUE(allocator.ExpandShards(2));
+    struct stat published_stat{};
+    ASSERT_EQ(::stat(path.c_str(), &published_stat), 0);
+    EXPECT_NE(prepared_stat.st_ino, published_stat.st_ino);
+    ASSERT_EQ(::close(prepared_fd), 0);
+
+    std::string key;
+    for (int i = 0; i < 1000; ++i) {
+        key = "retry_shard_" + std::to_string(i);
+        if (std::hash<std::string>{}(key) % 2 == 1) break;
+    }
+    ASSERT_EQ(std::hash<std::string>{}(key) % 2, 1);
+    auto descriptor = allocator.Allocate(key, 100);
+    ASSERT_TRUE(descriptor);
+    ASSERT_EQ(descriptor->shard_idx, 1);
+    std::string value(100, 'R'), output(100, '\0');
+    auto writes =
+        writer.BatchWrite({{key, *descriptor, {{value.data(), value.size()}}}});
+    ASSERT_EQ(writes.size(), 1);
+    ASSERT_TRUE(writes[0]);
+    DistributedStorageBackend reader(file_config, config,
+                                     std::make_unique<PosixFsAdapter>());
+    ASSERT_TRUE(reader.Init());
+    auto reads = reader.BatchRead(
+        {{key, *descriptor, {{output.data(), output.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, value);
+}
+
+TEST(DfsBackendInitializationTest, OpensLegacyPaddedDescriptorWithoutAliases) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_backend_legacy_padding");
+    const auto config = MakeAllocatorConfig(tmp.path(), 2, 8192, 4096);
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    const auto path = tmp.file("dfs_shard_000.data");
+    ASSERT_TRUE(adapter.PreallocateFile(path, config.shard_capacity));
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageBackend client(file_config, config,
+                                     std::make_unique<PosixFsAdapter>());
+    ASSERT_TRUE(client.Init());
+    const DistributedFSDescriptor descriptor{path, 0, 100, 4096, 0};
+    std::string value(100, 'L'), output(100, '\0');
+    auto writes = client.BatchWrite(
+        {{"legacy", descriptor, {{value.data(), value.size()}}}});
+    ASSERT_EQ(writes.size(), 1);
+    ASSERT_TRUE(writes[0]);
+    auto reads = client.BatchRead(
+        {{"legacy", descriptor, {{output.data(), output.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, value);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_00.data")));
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+}
+
+// Four shard files exist before initialization. A descriptor published after
+// capacity expansion must work without restarting that existing client.
+TEST_F(DfsBackendTest, OpensNewShardDescriptorAfterClientInitialization) {
+    const std::string new_path = ShardPath(4);
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()));
+    ASSERT_TRUE(adapter.PreallocateFile(new_path, 64 * 1024 * 1024));
+
+    AlignedBuffer expected(4096), actual(4096);
+    ASSERT_NE(expected.data(), nullptr);
+    ASSERT_NE(actual.data(), nullptr);
+    expected.Fill('N');
+    actual.Fill('X');
+    const DistributedFSDescriptor descriptor{new_path, 0, 4096, 4096, 4};
+
+    auto writes = backend_->BatchWrite(
+        {{"new_shard", descriptor, {{expected.data(), expected.size()}}}});
+    ASSERT_EQ(writes.size(), 1);
+    ASSERT_TRUE(writes[0].has_value());
+    auto reads = backend_->BatchRead(
+        {{"new_shard", descriptor, {{actual.data(), actual.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0].has_value());
+    EXPECT_EQ(std::memcmp(expected.data(), actual.data(), expected.size()), 0);
+}
+
+TEST_F(DfsBackendTest, LazyOpenRetriesAfterOpenFailure) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+    auto config = MakeAllocatorConfig(tmp_->path(), 4, 64 * 1024 * 1024, 4096);
+    config.fs_adapter_type = "posix";
+    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
+    auto* controlled = adapter.get();
+    controlled->FailOpenCall(1);
+    backend_ = std::make_unique<DistributedStorageBackend>(file_config, config,
+                                                           std::move(adapter));
+    ASSERT_TRUE(backend_->Init());
+
+    std::string input(4096, 'R'), output(4096, '\0');
+    const DistributedFSDescriptor descriptor{ShardPath(1), 0, 4096, 4096, 1};
+    const std::vector<DfsWriteRequest> request{
+        {"retry", descriptor, {{input.data(), input.size()}}}};
+    auto failed = backend_->BatchWrite(request);
+    ASSERT_EQ(failed.size(), 1);
+    ASSERT_FALSE(failed[0]);
+    EXPECT_EQ(failed[0].error(), ErrorCode::FILE_OPEN_FAIL);
+    auto retried = backend_->BatchWrite(request);
+    ASSERT_EQ(retried.size(), 1);
+    ASSERT_TRUE(retried[0]);
+    auto reads = backend_->BatchRead(
+        {{"retry", descriptor, {{output.data(), output.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, input);
+    EXPECT_EQ(controlled->OpenCallCount(), 2);
+}
+
+TEST_F(DfsBackendTest, LazyOpenRejectsMissingAndMalformedShardFiles) {
+    AlignedBuffer value(4096);
+    ASSERT_NE(value.data(), nullptr);
+    value.Fill('V');
+    const auto missing = ShardPath(4);
+    auto write = backend_->BatchWrite({{"missing",
+                                        {missing, 0, 4096, 4096, 4},
+                                        {{value.data(), value.size()}}}});
+    ASSERT_EQ(write.size(), 1);
+    EXPECT_FALSE(write[0]);
+    EXPECT_FALSE(std::filesystem::exists(missing));
+
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()));
+    ASSERT_TRUE(adapter.PreallocateFile(missing, 8192));
+    write = backend_->BatchWrite({{"wrong_capacity",
+                                   {missing, 0, 4096, 4096, 4},
+                                   {{value.data(), value.size()}}}});
+    ASSERT_EQ(write.size(), 1);
+    ASSERT_FALSE(write[0]);
+    EXPECT_EQ(write[0].error(), ErrorCode::INVALID_PARAMS);
+
+    const auto mismatched = ShardPath(5);
+    ASSERT_TRUE(adapter.PreallocateFile(mismatched, 64 * 1024 * 1024));
+    write = backend_->BatchWrite({{"wrong_index",
+                                   {mismatched, 0, 4096, 4096, 4},
+                                   {{value.data(), value.size()}}}});
+    ASSERT_EQ(write.size(), 1);
+    ASSERT_FALSE(write[0]);
+    EXPECT_EQ(write[0].error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(DfsBackendTest, ConcurrentLazyOpenPreservesIndependentWrites) {
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()));
+    const auto path = ShardPath(4);
+    ASSERT_TRUE(adapter.PreallocateFile(path, 64 * 1024 * 1024));
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 8; ++i) {
+        workers.emplace_back([&, i] {
+            AlignedBuffer input(4096), output(4096);
+            if (!input.data() || !output.data()) {
+                ++failures;
+                return;
+            }
+            input.Fill(static_cast<char>('A' + i));
+            output.Fill('X');
+            const DistributedFSDescriptor descriptor{
+                path, static_cast<uint64_t>(i) * 4096, 4096, 4096, 4};
+            while (!start.load()) std::this_thread::yield();
+            auto writes =
+                backend_->BatchWrite({{std::to_string(i),
+                                       descriptor,
+                                       {{input.data(), input.size()}}}});
+            auto reads =
+                backend_->BatchRead({{std::to_string(i),
+                                      descriptor,
+                                      {{output.data(), output.size()}}}});
+            if (writes.size() != 1 || !writes[0] || reads.size() != 1 ||
+                !reads[0] ||
+                std::memcmp(input.data(), output.data(), input.size())) {
+                ++failures;
+            }
+        });
+    }
+    start.store(true);
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(failures.load(), 0);
+}
 
 TEST_F(DfsBackendTest, BatchWriteUsesExplicitDescriptors) {
     AlignedBuffer write_buf(4096);

@@ -14,6 +14,8 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
+#include "allocator_status.h"
+#include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
@@ -148,6 +150,18 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in Memory");
+DEFINE_double(tenant_eviction_high_watermark_ratio,
+              mooncake::DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO,
+              "Per-tenant high watermark, as a fraction of that tenant's own "
+              "effective quota, at which background eviction starts for it. "
+              "Defaults to the same value as -eviction_high_watermark_ratio; "
+              "0 disables it. Only meaningful with -enable_multi_tenants. "
+              "This is the only mechanism that frees space for a tenant: "
+              "admission itself never evicts, it rejects with "
+              "TENANT_QUOTA_EXCEEDED. Without it, a tenant whose effective "
+              "quota sits at or below eviction_high_watermark_ratio reaches "
+              "its own ceiling before the pool crosses the pool-wide "
+              "watermark, so nothing ever reclaims on its behalf");
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -177,6 +191,15 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
+DEFINE_validator(tenant_eviction_high_watermark_ratio,
+                 [](const char* flagname, double value) {
+                     if (value < 0.0 || value > 1.0) {
+                         LOG(FATAL) << "Tenant eviction high watermark ratio "
+                                       "must be between 0.0 and 1.0";
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "NoF eviction ratio must be between 0.0 and 1.0";
@@ -507,6 +530,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble(
+        "tenant_eviction_high_watermark_ratio",
+        &master_config.tenant_eviction_high_watermark_ratio,
+        FLAGS_tenant_eviction_high_watermark_ratio);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -883,6 +910,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.eviction_high_watermark_ratio =
             FLAGS_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("tenant_eviction_high_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.tenant_eviction_high_watermark_ratio =
+            FLAGS_tenant_eviction_high_watermark_ratio;
     }
     if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
          !info.is_default) ||
@@ -1487,6 +1521,8 @@ int main(int argc, char* argv[]) {
         google::SetLogDestination(google::GLOG_FATAL, "");
         google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
+    mooncake::LogAllocatorStatus();
+    mooncake::InstallAllocatorStatsCollector();
 
     LOG(INFO) << "Mooncake master version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
@@ -1570,11 +1606,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    std::string protocol = "tcp";
-    if (value && std::string_view(value) == "rdma") {
-        protocol = "rdma";
+    const auto rpc_protocol_config =
+        mooncake::RpcProtocolConfig::FromEnvironment();
+#ifdef YLT_ENABLE_IBV
+    const std::string protocol = rpc_protocol_config.use_rdma ? "rdma" : "tcp";
+#else
+    const std::string protocol = "tcp";
+    if (rpc_protocol_config.use_rdma) {
+        LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP RPC";
     }
+#endif
 
     // enable_metadata_cleanup_on_timeout requires a reachable HTTP metadata
     // server. Two topologies are supported:
@@ -1624,6 +1665,8 @@ int main(int argc, char* argv[]) {
         << ", eviction_ratio=" << master_config.eviction_ratio
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
+        << ", tenant_eviction_high_watermark_ratio="
+        << master_config.tenant_eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_oplog=" << master_config.enable_oplog
         << ", enable_oplog_snapshot=" << master_config.enable_oplog_snapshot
@@ -1732,9 +1775,13 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        if (rpc_protocol_config.use_rdma) {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#else
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
         }
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(

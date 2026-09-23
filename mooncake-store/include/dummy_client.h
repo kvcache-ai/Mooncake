@@ -21,6 +21,7 @@ namespace mooncake {
 class DummyClient : public PyClient {
    public:
     DummyClient();
+    // Drains in-flight RPCs before the pool member is released (#3909).
     ~DummyClient();
 
     int64_t unregister_shm();
@@ -69,6 +70,15 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) override;
+
+    std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache &query_result_cache) override;
 
     std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) override;
@@ -172,6 +182,10 @@ class DummyClient : public PyClient {
     int isExist(const std::string &key);
 
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
+
+    int probeKey(const std::string &key);
+
+    std::vector<int> batchProbeKey(const std::vector<std::string> &keys);
 
     int64_t getSize(const std::string &key);
 
@@ -312,6 +326,7 @@ class DummyClient : public PyClient {
     }
 
     RpcClientPool client_accessor_;
+    RpcDrainGuard rpc_drain_;
 
     // The client identification.
     const UUID client_id_;

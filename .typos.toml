@@ -18,4 +18,8 @@ extend-exclude = [
   # DeepEP-derived elastic kernel headers keep upstream identifiers such as
   # `ue8m0x4`; exclude the imported header block from spelling checks.
   "mooncake-ep/include/elastic/*",
+  # Conductor hash golden vectors are generated digests and pickle byte
+  # dumps; hex runs collide with dictionary words. The generator scripts
+  # stay checked.
+  "mooncake-conductor/tests/fixtures/*.json",
 ]

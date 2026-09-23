@@ -34,6 +34,7 @@ Under real workloads, Mooncake’s innovative architecture enables Kimi to handl
 
 <h2 id="updates">🔄 Updates</h2>
 
+- **Aug 24, 2026**: [AgentX / InferenceX v3](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat) highlights Mooncake's contributions to agentic inference workloads, including ROCm wheels, CI, and packaging improvements. [Mooncake optimization details](https://inferencex.semianalysis.com/agentx/optimizations/mooncake).
 - **Aug 20, 2026**: Mooncake is integrated into [Miles](https://github.com/radixark/miles) as a rollout data-transfer backend for the fragmented, heterogeneous data moving between rollout and training in disaggregated RL. Blogs: [KVCache.AI](https://kvcache.ai/blog/mooncake-rl-rollout-data-transfer/), [lmsys](https://www.lmsys.org/blog/2026-08-20-miles-mooncake-rollout-data-transfer).
 - **Aug 17, 2026**: Mooncake is integrated into [Speculators](https://github.com/vllm-project/speculators) as a distributed backend for multi-node online training, efficiently moves hidden-state between vLLM inference workers and Speculators trainers through RDMA, eliminating the need for massive hidden-state storage in offline training. [Benchmark on GB300 NVL72](https://x.com/mgoin_/status/2072785822231728363).
 - **May 7, 2026**: 🚀 [vLLM officially features Mooncake Store](https://vllm.ai/blog/mooncake-store) — a deep dive into how Mooncake's distributed KVCache engine supercharges vLLM inference with high-throughput, memory-efficient, cross-instance KV cache sharing!
@@ -213,6 +214,29 @@ pip install mooncake-transfer-engine
 ```bash
 pip install mooncake-transfer-engine-cuda13
 ```
+
+#### Master image
+
+The multi-architecture master image publishes explicit CUDA flavor tags:
+
+```bash
+# Fixed versions, recommended for production
+docker pull kvcacheai/mooncake:0.3.14-cuda12
+docker pull kvcacheai/mooncake:0.3.14-cuda13
+
+# CUDA 13 is the default flavor
+docker pull kvcacheai/mooncake:0.3.14
+docker pull kvcacheai/mooncake:latest
+
+# Floating flavor aliases
+docker pull kvcacheai/mooncake:cuda12
+docker pull kvcacheai/mooncake:cuda13
+```
+
+The unqualified `:<version>` and `:latest` tags point to CUDA 13 starting with the first
+release published by the new tagging workflow. Existing releases keep their original contents;
+use `:cuda12` or `:<version>-cuda12` when CUDA 12 is required. The former `:latest-cuda13` tag
+is deprecated and is not part of the new naming contract.
 
 In addition to CUDA, Mooncake also supports other accelerator backends, along with flexible installation and deployment options. See the guides below for details:
 

@@ -99,6 +99,10 @@ MasterMetricManager::MasterMetricManager()
                           "Total number of PutStart requests received"),
       put_start_failures_("master_put_start_failures_total",
                           "Total number of failed PutStart requests"),
+      put_start_object_already_exists_(
+          "master_put_start_object_already_exists_total",
+          "Total PutStart requests returning "
+          "OBJECT_ALREADY_EXISTS"),
       put_start_alloc_failures_(
           "master_put_start_alloc_failures_total",
           "Total number of PutStart failures caused by replica allocation "
@@ -267,6 +271,9 @@ MasterMetricManager::MasterMetricManager()
       batch_put_start_failures_(
           "master_batch_put_start_failures_total",
           "Total number of failed BatchPutStart requests"),
+      batch_put_start_object_already_exists_(
+          "master_batch_put_start_object_already_exists_total",
+          "Total BatchPutStart response items with OBJECT_ALREADY_EXISTS"),
       batch_put_start_partial_successes_(
           "master_batch_put_start_partial_successes_total",
           "Total number of partially successful BatchPutStart requests"),
@@ -444,6 +451,23 @@ MasterMetricManager::MasterMetricManager()
       tenant_evict_bytes_total_(
           "mooncake_tenant_evict_bytes_total",
           "Total bytes evicted by tenant-scoped quota eviction", {"tenant_id"}),
+      offload_enqueued_total_(
+          "master_offload_enqueued_total",
+          "SSD offload tasks successfully enqueued (per store worker)",
+          {"client_id"}),
+      offload_completed_total_(
+          "master_offload_completed_total",
+          "SSD offload tasks completed (worker reported OK)", {"client_id"}),
+      offload_failed_total_("master_offload_failed_total",
+                            "SSD offload tasks failed (worker reported NACK)",
+                            {"client_id"}),
+      offload_cancelled_total_(
+          "master_offload_cancelled_total",
+          "SSD offload tasks cancelled (preempted before write)",
+          {"client_id"}),
+      offload_enqueue_rejected_total_(
+          "master_offload_enqueue_rejected_total",
+          "SSD offload tasks rejected at enqueue (queue full)", {"client_id"}),
 
       // Snapshot Metrics
       snapshot_duration_ms_(
@@ -571,6 +595,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_candidate_dropped_limit_.inc(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
+    put_start_object_already_exists_.inc(0);
     put_start_alloc_failures_.inc(0);
     put_start_partial_allocations_.inc(0);
     put_end_requests_.inc(0);
@@ -648,6 +673,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_get_replica_list_failed_items_.inc(0);
     batch_put_start_requests_.inc(0);
     batch_put_start_failures_.inc(0);
+    batch_put_start_object_already_exists_.inc(0);
     batch_put_start_partial_successes_.inc(0);
     batch_put_start_items_.inc(0);
     batch_put_start_failed_items_.inc(0);
@@ -718,6 +744,7 @@ void MasterMetricManager::dec_total_mem_capacity(const std::string& segment,
                                                  int64_t val) {
     mem_total_capacity_.dec(val);
     if (!segment.empty()) mem_total_capacity_per_segment_.dec({segment}, val);
+    remove_segment_metrics(segment);
 }
 
 void MasterMetricManager::reset_total_mem_capacity() {
@@ -753,6 +780,11 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
 }
 
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
+    if (segment.empty() ||
+        mem_allocated_size_per_segment_.value({segment}) != 0 ||
+        mem_total_capacity_per_segment_.value({segment}) != 0) {
+        return;
+    }
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
 }
@@ -1065,6 +1097,9 @@ void MasterMetricManager::inc_exist_key_failures(int64_t val) {
 void MasterMetricManager::inc_put_start_requests(int64_t val) {
     put_start_requests_.inc(val);
 }
+void MasterMetricManager::inc_put_start_object_already_exists(int64_t val) {
+    put_start_object_already_exists_.inc(val);
+}
 void MasterMetricManager::inc_put_start_failures(int64_t val) {
     put_start_failures_.inc(val);
 }
@@ -1244,6 +1279,10 @@ void MasterMetricManager::inc_batch_put_start_failures(int64_t failed_items) {
     batch_put_start_failures_.inc(1);
     batch_put_start_failed_items_.inc(failed_items);
 }
+void MasterMetricManager::inc_batch_put_start_object_already_exists(
+    int64_t items) {
+    batch_put_start_object_already_exists_.inc(items);
+}
 void MasterMetricManager::inc_batch_put_start_partial_success(
     int64_t failed_items) {
     batch_put_start_partial_successes_.inc(1);
@@ -1359,6 +1398,31 @@ void MasterMetricManager::inc_tenant_evict_bytes(const std::string& tenant_id,
     tenant_evict_bytes_total_.inc({tenant_id}, bytes);
 }
 
+void MasterMetricManager::inc_offload_enqueued(const std::string& client_id,
+                                               int64_t val) {
+    offload_enqueued_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_completed(const std::string& client_id,
+                                                int64_t val) {
+    offload_completed_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_failed(const std::string& client_id,
+                                             int64_t val) {
+    offload_failed_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_cancelled(const std::string& client_id,
+                                                int64_t val) {
+    offload_cancelled_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_enqueue_rejected(
+    const std::string& client_id, int64_t val) {
+    offload_enqueue_rejected_total_.inc({client_id}, val);
+}
+
 void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
     snapshot_duration_ms_.observe(size);
 }
@@ -1371,6 +1435,9 @@ int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
 
+int64_t MasterMetricManager::get_put_start_object_already_exists() {
+    return put_start_object_already_exists_.value();
+}
 int64_t MasterMetricManager::get_put_start_failures() {
     return put_start_failures_.value();
 }
@@ -1565,6 +1632,10 @@ int64_t MasterMetricManager::get_batch_put_start_requests() {
 
 int64_t MasterMetricManager::get_batch_put_start_failures() {
     return batch_put_start_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_start_object_already_exists() {
+    return batch_put_start_object_already_exists_.value();
 }
 
 int64_t MasterMetricManager::get_batch_put_start_partial_successes() {
@@ -1935,6 +2006,11 @@ std::string MasterMetricManager::serialize_metrics() {
         ss << metric_str;
     };
 
+    // The generic lambda above accepts AllocatorMetric because it matches the
+    // serialize(std::string&) shape of every other metric type here.
+    allocator_metric_.Refresh();
+    serialize_metric(allocator_metric_);
+
     // Serialize Gauges
     serialize_metric(mem_allocated_size_);
     serialize_metric(mem_total_capacity_);
@@ -1969,6 +2045,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(exist_key_failures_);
     serialize_metric(put_start_requests_);
     serialize_metric(put_start_failures_);
+    serialize_metric(put_start_object_already_exists_);
     serialize_metric(put_start_alloc_failures_);
     serialize_metric(put_start_partial_allocations_);
     serialize_metric(put_end_requests_);
@@ -2058,6 +2135,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(batch_get_replica_list_failed_items_);
     serialize_metric(batch_put_start_requests_);
     serialize_metric(batch_put_start_failures_);
+    serialize_metric(batch_put_start_object_already_exists_);
     serialize_metric(batch_put_start_partial_successes_);
     serialize_metric(batch_put_start_items_);
     serialize_metric(batch_put_start_failed_items_);
@@ -2120,6 +2198,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
+    serialize_metric(offload_enqueued_total_);
+    serialize_metric(offload_completed_total_);
+    serialize_metric(offload_failed_total_);
+    serialize_metric(offload_cancelled_total_);
+    serialize_metric(offload_enqueue_rejected_total_);
     serialize_metric(build_info_);
 
     // Serialize Snapshot Metrics

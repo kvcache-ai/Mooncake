@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <unordered_map>
@@ -429,6 +430,8 @@ bool tensor_destination_matches_metadata(const PyTensorInfo &target,
                                stored.metadata.header.ndim);
 }
 
+// Read tensor payloads directly into caller-owned CUDA buffers.  Metadata is
+// fetched separately so no complete-object host staging buffer is needed.
 template <typename ResultType>
 bool apply_indexed_results(const char *context,
                            const std::vector<ResultType> &op_results,
@@ -491,6 +494,41 @@ inline int to_py_ret(ErrorCode error_code) {
 #include "store_py_internal.h"
 
 }  // namespace
+
+class RangedReadSnapshotPy {
+   public:
+    RangedReadSnapshotPy(std::shared_ptr<PyClient> store,
+                         std::vector<std::string> keys)
+        : store_(std::move(store)), keys_(std::move(keys)) {
+        snapshot_ = store_->prepare_get_into_ranges_snapshot(keys_);
+    }
+
+    bool belongs_to(const std::shared_ptr<PyClient> &store) const {
+        return store_.get() == store.get();
+    }
+
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (snapshot_.should_refresh()) {
+            store_->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        }
+        return store_->get_into_ranges_from_snapshot(
+            buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+            snapshot_);
+    }
+
+   private:
+    std::shared_ptr<PyClient> store_;
+    std::vector<std::string> keys_;
+    PyClient::RangedReadSnapshot snapshot_;
+    std::mutex mutex_;
+};
+
 // Python-specific wrapper functions that handle GIL and return pybind11 types
 class MooncakeStorePyWrapper {
    public:
@@ -835,8 +873,10 @@ class MooncakeStorePyWrapper {
     }
 
     std::vector<std::optional<ParsedTensorMetadata>>
-    batch_get_tensor_metadata_prefixes(const std::vector<std::string> &keys,
-                                       const std::string &context) {
+    batch_get_tensor_metadata_prefixes(
+        const std::vector<std::string> &keys, const std::string &context,
+        const PyClient::QueryResultCache *snapshot = nullptr,
+        std::vector<int64_t> *errors = nullptr) {
         std::vector<std::optional<ParsedTensorMetadata>> metadata(keys.size());
         if (keys.empty()) return metadata;
 
@@ -844,6 +884,10 @@ class MooncakeStorePyWrapper {
         auto scratch = store_->allocate_client_buffer(scratch_size);
         if (!scratch) {
             LOG(ERROR) << context << ": failed to allocate metadata buffer";
+            if (errors) {
+                std::fill(errors->begin(), errors->end(),
+                          to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE));
+            }
             return metadata;
         }
 
@@ -863,12 +907,19 @@ class MooncakeStorePyWrapper {
         std::vector<std::vector<std::vector<int64_t>>> results;
         {
             py::gil_scoped_release release_gil;
-            results =
-                store_->get_into_ranges(buffers, all_keys, all_dst_offsets,
-                                        all_src_offsets, all_sizes, nullptr);
+            results = snapshot ? real_client_->get_into_ranges_from_snapshot(
+                                     buffers, all_keys, all_dst_offsets,
+                                     all_src_offsets, all_sizes, *snapshot)
+                               : store_->get_into_ranges(
+                                     buffers, all_keys, all_dst_offsets,
+                                     all_src_offsets, all_sizes, nullptr);
         }
         if (results.size() != 1 || results[0].size() != keys.size()) {
             LOG(ERROR) << context << ": metadata read result size mismatch";
+            if (errors) {
+                std::fill(errors->begin(), errors->end(),
+                          to_py_ret(ErrorCode::INTERNAL_ERROR));
+            }
             return metadata;
         }
 
@@ -877,6 +928,12 @@ class MooncakeStorePyWrapper {
             if (results[0][i].size() != 1 ||
                 results[0][i][0] !=
                     static_cast<int64_t>(sizeof(TensorMetadata))) {
+                if (errors) {
+                    (*errors)[i] =
+                        results[0][i].size() == 1 && results[0][i][0] < 0
+                            ? results[0][i][0]
+                            : to_py_ret(ErrorCode::INTERNAL_ERROR);
+                }
                 continue;
             }
             metadata[i] = parse_tensor_metadata_from_prefix(
@@ -909,8 +966,89 @@ class MooncakeStorePyWrapper {
         }
 
         if (!use_dummy_client_) {
-            LOG(ERROR) << context
-                       << ": CUDA IPC tensor read requires a dummy client";
+            if (keys.empty()) return results;
+            // Keep both reads on one snapshot. Re-querying between the prefix
+            // and payload can select a different version after an upsert.
+            PyClient::QueryResultCache snapshot;
+            {
+                py::gil_scoped_release release_gil;
+                auto queries = store_->batch_query(keys);
+                if (queries.size() != keys.size()) {
+                    return std::vector<int64_t>(
+                        keys.size(), to_py_ret(ErrorCode::INTERNAL_ERROR));
+                }
+                snapshot.reserve(keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    snapshot.emplace(keys[i], std::move(queries[i]));
+                }
+            }
+            auto metadata = batch_get_tensor_metadata_prefixes(
+                keys, context, &snapshot, &results);
+            std::vector<void *> buffers;
+            std::vector<std::vector<std::string>> all_keys;
+            std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+            std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+            std::vector<std::vector<std::vector<size_t>>> all_sizes;
+            std::vector<size_t> original_indices;
+            buffers.reserve(keys.size());
+            all_keys.reserve(keys.size());
+            all_dst_offsets.reserve(keys.size());
+            all_src_offsets.reserve(keys.size());
+            all_sizes.reserve(keys.size());
+            original_indices.reserve(keys.size());
+
+            for (size_t i = 0; i < keys.size(); ++i) {
+                PyTensorInfo target = extract_tensor_destination_info(
+                    tensors_list[i].cast<py::object>(), keys[i]);
+                if (!target.valid() || !metadata[i].has_value() ||
+                    !tensor_destination_matches_metadata(target, *metadata[i],
+                                                         keys[i], context)) {
+                    continue;
+                }
+                const auto &stored = *metadata[i];
+                if (stored.data_offset >
+                    std::numeric_limits<size_t>::max() - stored.data_bytes) {
+                    LOG(ERROR)
+                        << context << " : tensor range overflows for key "
+                        << keys[i];
+                    continue;
+                }
+                if (stored.data_bytes == 0) {
+                    results[i] = 0;
+                    continue;
+                }
+
+                buffers.push_back(reinterpret_cast<void *>(target.data_ptr));
+                all_keys.push_back({keys[i]});
+                all_dst_offsets.push_back({{0}});
+                all_src_offsets.push_back({{stored.data_offset}});
+                all_sizes.push_back({{stored.data_bytes}});
+                original_indices.push_back(i);
+            }
+
+            if (buffers.empty()) return results;
+
+            std::vector<std::vector<std::vector<int64_t>>> range_results;
+            {
+                py::gil_scoped_release release_gil;
+                range_results = real_client_->get_into_ranges_from_snapshot(
+                    buffers, all_keys, all_dst_offsets, all_src_offsets,
+                    all_sizes, snapshot);
+            }
+            for (size_t i = 0; i < original_indices.size(); ++i) {
+                const size_t original_index = original_indices[i];
+                results[original_index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                if (range_results.size() != original_indices.size() ||
+                    range_results[i].size() != 1 ||
+                    range_results[i][0].size() != 1) {
+                    continue;
+                }
+                const int64_t result = range_results[i][0][0];
+                if (result < 0 || static_cast<size_t>(result) ==
+                                      metadata[original_index]->data_bytes) {
+                    results[original_index] = result;
+                }
+            }
             return results;
         }
 
@@ -1976,6 +2114,10 @@ PYBIND11_MODULE(store, m) {
     m.def("_deserialize_tensor", &deserialize_tensor_from_bytes,
           "Deserialize Mooncake tensor metadata plus payload bytes.");
 
+    py::class_<RangedReadSnapshotPy, std::shared_ptr<RangedReadSnapshotPy>>(
+        m, "RangedReadSnapshot",
+        "Reusable metadata snapshot for repeated ranged reads");
+
     // Object data type classification
     py::enum_<ObjectDataType>(m, "ObjectDataType")
         .value("UNKNOWN", ObjectDataType::UNKNOWN)
@@ -2456,6 +2598,29 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
+        .def(
+            "probe_key",
+            [](MooncakeStorePyWrapper &self, const std::string &key) {
+                py::gil_scoped_release release;
+                return self.store_->probeKey(key);
+            },
+            py::arg("key"),
+            "Point-in-time existence check that grants no read lease. "
+            "Returns 1 if the object existed at the time of the call, 0 if "
+            "not exists, -1 if error. The object may still be evicted "
+            "before a subsequent get.")
+        .def(
+            "batch_probe_key",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                py::gil_scoped_release release;
+                return self.store_->batchProbeKey(keys);
+            },
+            py::arg("keys"),
+            "Point-in-time existence check for multiple objects that grants "
+            "no read leases. Returns list of results: 1 if existed at the "
+            "time of the call, 0 if not exists, -1 if error. Objects may "
+            "still be evicted before a subsequent get.")
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;
@@ -2820,6 +2985,60 @@ PYBIND11_MODULE(store, m) {
             py::arg("all_sizes"),
             "Get multiple byte ranges from multiple objects into multiple "
             "pre-allocated buffers")
+        .def(
+            "prepare_get_into_ranges_snapshot",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    throw std::runtime_error("Client is not initialized");
+                }
+                std::vector<std::string> unique_keys;
+                unique_keys.reserve(keys.size());
+                std::unordered_set<std::string> seen;
+                seen.reserve(keys.size());
+                for (const auto &key : keys) {
+                    if (seen.insert(key).second) unique_keys.push_back(key);
+                }
+                py::gil_scoped_release release;
+                return std::make_shared<RangedReadSnapshotPy>(
+                    self.store_, std::move(unique_keys));
+            },
+            py::arg("keys"),
+            "Prepare a reusable metadata snapshot for ranged reads")
+        .def(
+            "get_into_ranges_from_snapshot",
+            [](MooncakeStorePyWrapper &self,
+               const std::shared_ptr<RangedReadSnapshotPy> &snapshot,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<std::vector<std::string>> &all_keys,
+               const std::vector<std::vector<std::vector<size_t>>>
+                   &all_dst_offsets,
+               const std::vector<std::vector<std::vector<size_t>>>
+                   &all_src_offsets,
+               const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+                if (!self.is_client_initialized()) {
+                    throw std::runtime_error("Client is not initialized");
+                }
+                if (!snapshot || !snapshot->belongs_to(self.store_)) {
+                    throw std::invalid_argument(
+                        "Ranged-read snapshot belongs to another Store");
+                }
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return snapshot->get_into_ranges(buffers, all_keys,
+                                                 all_dst_offsets,
+                                                 all_src_offsets, all_sizes);
+            },
+            py::arg("snapshot"), py::arg("buffer_ptrs"), py::arg("all_keys"),
+            py::arg("all_dst_offsets"), py::arg("all_src_offsets"),
+            py::arg("all_sizes"),
+            "Get byte ranges using a reusable metadata snapshot. The "
+            "snapshot is refreshed at the read-lease midpoint before a new "
+            "transfer is submitted.")
         .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,
