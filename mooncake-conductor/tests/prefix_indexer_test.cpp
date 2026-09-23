@@ -321,6 +321,32 @@ TEST(Registration, ForgedSeedRootPairIsRejectedWithoutMutation) {
     EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), registered);
 }
 
+TEST(Registration, SglangSeedVariantsShareContextAndBinding) {
+    for (const auto& profile : {SglangProfile(), SglangBigramProfile()}) {
+        PrefixCacheTable table;
+        auto first = Registration();
+        first.profile = profile;
+        ASSERT_TRUE(table.Register(first).error.empty());
+        auto second = Registration("instance-b", 1);
+        second.profile = profile;
+        second.profile.python_hash_seed = "different-unused-seed";
+        ASSERT_TRUE(table.Register(second).error.empty());
+        EXPECT_TRUE(table.ValidateProfileBinding(TestContext(), second.profile)
+                        .empty());
+        auto snapshot = PrefixCacheTableTestPeer::Snapshot(table);
+        EXPECT_EQ(snapshot.contexts.size(), 1u);
+        EXPECT_EQ(snapshot.contexts.at(TestContext()).instance_ranks.size(),
+                  2u);
+        auto conflict = second;
+        conflict.profile.root_digest = std::string(64, '1');
+        EXPECT_FALSE(table.Register(conflict).error.empty());
+        EXPECT_FALSE(
+            table.ValidateProfileBinding(TestContext(), conflict.profile)
+                .empty());
+        EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), snapshot);
+    }
+}
+
 TEST(Registration, TracksEveryInstanceAndRankIdempotently) {
     PrefixCacheTable table;
 

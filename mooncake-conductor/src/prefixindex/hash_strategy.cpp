@@ -569,27 +569,36 @@ int LowerHexValue(char value) {
 
 std::string ValidateProfileSelectors(std::string_view strategy,
                                      std::string_view algorithm,
-                                     std::string_view index_projection) {
+                                     std::string_view index_projection,
+                                     std::string* error_field = nullptr) {
+    const auto reject = [&](const char* field, std::string message) {
+        if (error_field != nullptr) *error_field = field;
+        return message;
+    };
     if (strategy != "vllm_v1" && strategy != "sglang" &&
         strategy != "sglang_bigram") {
-        return "unsupported hash strategy: " + std::string(strategy);
+        return reject("strategy",
+                      "unsupported hash strategy: " + std::string(strategy));
     }
     if (strategy == "sglang" || strategy == "sglang_bigram") {
         if (algorithm != "sha256_raw") {
-            return "unsupported SGLang hash algorithm: " +
-                   std::string(algorithm);
+            return reject("algorithm", "unsupported SGLang hash algorithm: " +
+                                           std::string(algorithm));
         }
         if (index_projection != "first64_be") {
-            return "unsupported SGLang index projection: " +
-                   std::string(index_projection);
+            return reject("index_projection",
+                          "unsupported SGLang index projection: " +
+                              std::string(index_projection));
         }
         return "";
     }
     if (algorithm != "sha256" && algorithm != "sha256_cbor") {
-        return "unsupported hash algorithm: " + std::string(algorithm);
+        return reject("algorithm",
+                      "unsupported hash algorithm: " + std::string(algorithm));
     }
     if (index_projection != "low64_be") {
-        return "unsupported index projection: " + std::string(index_projection);
+        return reject("index_projection", "unsupported index projection: " +
+                                              std::string(index_projection));
     }
     return "";
 }
@@ -1041,14 +1050,16 @@ class SglangHashStrategy final : public HashStrategy {
 }  // namespace
 
 std::string ResolveHashProfile(const common::HashProfileConfig& config,
-                               HashProfile* out) {
+                               HashProfile* out, std::string* error_field) {
+    if (error_field != nullptr) error_field->clear();
     if (out == nullptr) {
         return "resolved hash profile output must not be null";
     }
     *out = {};
 
-    if (auto error = ValidateProfileSelectors(config.strategy, config.algorithm,
-                                              config.index_projection);
+    if (auto error =
+            ValidateProfileSelectors(config.strategy, config.algorithm,
+                                     config.index_projection, error_field);
         !error.empty()) {
         return error;
     }
@@ -1059,7 +1070,7 @@ std::string ResolveHashProfile(const common::HashProfileConfig& config,
         // actual chain root at query time.
         *out = {.strategy = config.strategy,
                 .algorithm = config.algorithm,
-                .python_hash_seed = config.python_hash_seed,
+                .python_hash_seed = "0",
                 .root_digest = std::string(64, '0'),
                 .index_projection = config.index_projection};
         return "";
@@ -1067,6 +1078,7 @@ std::string ResolveHashProfile(const common::HashProfileConfig& config,
 
     if (auto error = ValidatePythonHashSeed(config.python_hash_seed);
         !error.empty()) {
+        if (error_field != nullptr) *error_field = "python_hash_seed";
         return error;
     }
 

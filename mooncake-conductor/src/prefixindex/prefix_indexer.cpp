@@ -181,7 +181,7 @@ void EvictIfOverCapacity(ContextState& state) {
         << "Prefix index hit the capacity limit; oldest entries dropped."
         << " limit=" << state.max_blocks << " now=" << state.blocks.size()
         << " cumulative_evicted=" << state.evicted_by_capacity
-        << " (non-zero means stored/removed events are out of sync)";
+        << " (capacity eviction can reduce reported cache coverage)";
 }
 
 int64_t TokensForBlocks(size_t block_count, int64_t block_size) {

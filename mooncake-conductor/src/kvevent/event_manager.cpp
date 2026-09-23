@@ -10,7 +10,6 @@
 #include <limits>
 #include <optional>
 #include <set>
-#include <thread>
 #include <utility>
 
 #include "conductor/prefixindex/hash_strategy.h"
@@ -66,13 +65,6 @@ bool MsgpackInt64(const msgpack::object& value, int64_t* out) {
         return true;
     }
     return false;
-}
-
-// Validate the supported vLLM and SGLang recipes at the request boundary
-// before invoking root derivation or mutating subscription state.
-bool IsSupportedHashAlgorithm(std::string_view algorithm) {
-    return algorithm == "sha256" || algorithm == "sha256_cbor" ||
-           algorithm == "sha256_raw";
 }
 
 // ---------------------------------------------------------------------------
@@ -325,34 +317,29 @@ bool ParseHashProfileConfig(const msgpack::object_map& body,
     common::HashProfileConfig source;
     if (!RequiredString(profile_map, "strategy", resp, &source.strategy) ||
         !RequiredString(profile_map, "algorithm", resp, &source.algorithm) ||
-        !RequiredStringAllowEmpty(profile_map, "python_hash_seed", resp,
-                                  &source.python_hash_seed) ||
         !RequiredString(profile_map, "index_projection", resp,
                         &source.index_projection)) {
         return false;
     }
 
-    if (!IsSupportedHashAlgorithm(source.algorithm)) {
-        HttpValidationError(resp, "invalid_value",
-                            "unsupported hash algorithm: " + source.algorithm,
-                            "algorithm");
+    const bool sglang =
+        source.strategy == "sglang" || source.strategy == "sglang_bigram";
+    if ((!sglang || MapFind(profile_map, "python_hash_seed") != nullptr) &&
+        !RequiredStringAllowEmpty(profile_map, "python_hash_seed", resp,
+                                  &source.python_hash_seed)) {
         return false;
     }
 
     // Resolve the selected recipe before ParseServiceConfigRequest returns.
     // SubscribeToService (and thus prefix-index/ZMQ state mutation) is only
     // reached after this derived profile has been validated.
-    if (std::string error = prefixindex::ResolveHashProfile(source, profile);
+    std::string error_field;
+    if (std::string error =
+            prefixindex::ResolveHashProfile(source, profile, &error_field);
         !error.empty()) {
-        const char* field = "python_hash_seed";
-        if (source.strategy != "vllm_v1") {
-            field = "strategy";
-        } else if (!IsSupportedHashAlgorithm(source.algorithm)) {
-            field = "algorithm";
-        } else if (source.index_projection != "low64_be") {
-            field = "index_projection";
-        }
-        HttpValidationError(resp, "invalid_value", error, field);
+        HttpValidationError(
+            resp, "invalid_value", error,
+            error_field.empty() ? nullptr : error_field.c_str());
         return false;
     }
     return true;
@@ -410,10 +397,9 @@ int32_t DecodeLeInt32(const char* p) {
 }
 
 // Parses a /query request body encoded as msgpack (Content-Type:
-// application/msgpack). Same schema and validation semantics as
-// ParseQueryRequest; token_ids may be a msgpack bin of little-endian int32
+// application/msgpack). token_ids may be a msgpack bin of little-endian int32
 // (preferred: 4 bytes/token, no per-element parsing) or an array of integers.
-// Errors are reported as JSON regardless of request encoding.
+// Errors are reported as MessagePack maps.
 bool ParseQueryMsgpackRequest(coro_http_request& req, coro_http_response& resp,
                               QueryRequest* request) {
     const auto body = req.get_body();
@@ -792,38 +778,28 @@ void EventManager::Start() {
         services_snapshot = services_;
     }
 
-    // Subscribe to all services concurrently.
-    // mu_ serialises the check-then-act inside SubscribeToService and
-    // serialises with concurrent /register HTTP handlers so that
-    // subscribers_, active_configs_, and services_ stay consistent.
-    std::atomic<int> failure_count{0};
-    std::vector<std::thread> workers;
-    workers.reserve(services_snapshot.size());
+    // Serialize subscription state changes with concurrent HTTP handlers.
+    // Release the lock between services so HTTP work can make progress.
+    size_t failure_count = 0;
     for (const auto& svc : services_snapshot) {
-        workers.emplace_back([this, svc, &failure_count] {
-            std::pair<bool, std::string> result;
-            {
-                std::unique_lock lock(mu_);
-                result = SubscribeToService(svc);
-            }
-            if (!result.second.empty()) {
-                LOG(ERROR) << "Failed to initiate subscription service_type="
-                           << common::PublisherKindName(svc.publisher_kind)
-                           << " instance_id=" << svc.instance_id
-                           << " endpoint=" << svc.endpoint
-                           << " error=" << result.second;
-                failure_count.fetch_add(1);
-            }
-        });
-    }
-    for (auto& worker : workers) {
-        worker.join();
+        std::pair<bool, std::string> result;
+        {
+            std::unique_lock lock(mu_);
+            result = SubscribeToService(svc);
+        }
+        if (!result.second.empty()) {
+            LOG(ERROR) << "Failed to initiate subscription service_type="
+                       << common::PublisherKindName(svc.publisher_kind)
+                       << " instance_id=" << svc.instance_id
+                       << " endpoint=" << svc.endpoint
+                       << " error=" << result.second;
+            ++failure_count;
+        }
     }
 
-    const int failed = failure_count.load();
     LOG(INFO) << "Static KV Event Manager started. Subscriptions success="
-              << (static_cast<int>(services_snapshot.size()) - failed)
-              << " failed=" << failed;
+              << (services_snapshot.size() - failure_count)
+              << " failed=" << failure_count;
 }
 
 void EventManager::Stop() {
@@ -926,7 +902,6 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     zmq_config.cache_pool_key = svc_key;
     zmq_config.endpoint = svc.endpoint;
     zmq_config.replay_endpoint = replay_endpoint;
-    zmq_config.model_name = svc.model_name;
     zmq_config.publisher_kind = svc.publisher_kind;
     zmq_config.poll_timeout = std::chrono::milliseconds(100);
     zmq_config.replay_timeout = std::chrono::seconds(5);
@@ -1074,7 +1049,7 @@ void EventManager::RegisterHttpHandlers() {
     // msgpack-only protocol (JSON support was dropped during development:
     // JsonCpp DOM parsing dominates cost at long context). token_ids may be
     // a bin of little-endian int32 or an integer array. Responses and error
-    // bodies remain JSON.
+    // bodies are also MessagePack maps.
     server->set_http_handler<POST>(
         "/query", [this](coro_http_request& req, coro_http_response& resp) {
             VLOG(1) << "receive req method=POST path=/query";

@@ -68,6 +68,7 @@ using mooncake::conductor::zmq::MooncakeEvent;
 using mooncake::conductor::zmq::MooncakeEventBatch;
 using mooncake::conductor::zmq::MooncakeRemovedEvent;
 using mooncake::conductor::zmq::MooncakeStoredEvent;
+using mooncake::conductor::zmq::VllmClearedEvent;
 using mooncake::conductor::zmq::VllmEvent;
 using mooncake::conductor::zmq::VllmEventBatch;
 using mooncake::conductor::zmq::VllmRemovedEvent;
@@ -1040,6 +1041,62 @@ TEST_F(RegistrationHttpTest, ResolvesAndReportsPickleProfile) {
     EXPECT_TRUE(query.isMember("instances"));
 }
 
+TEST_F(RegistrationHttpTest, SglangSeedIsOptionalAndCanonical) {
+    for (const auto* recipe : {"sglang", "sglang_bigram"}) {
+        auto service = VllmService(recipe);
+        service.publisher_kind = PublisherKind::kSglang;
+        service.model_name = recipe;
+        ASSERT_TRUE(ResolveHashProfile({.strategy = recipe,
+                                        .algorithm = "sha256_raw",
+                                        .python_hash_seed = "0",
+                                        .index_projection = "first64_be"},
+                                       &service.hash_profile)
+                        .empty());
+        auto body = ServiceJson(service);
+        body["hash_profile"].removeMember("python_hash_seed");
+        ASSERT_EQ(
+            HttpPostMsgpack(port_, "/register", MsgpackDocument(body)).status,
+            200);
+        for (const auto* seed : {"", "1"}) {
+            body["hash_profile"]["python_hash_seed"] = seed;
+            ASSERT_EQ(HttpPostMsgpack(port_, "/register", MsgpackDocument(body))
+                          .status,
+                      200);
+        }
+        auto other = service;
+        other.instance_id += "-other";
+        other.endpoint = VllmService(other.instance_id).endpoint;
+        auto other_body = ServiceJson(other);
+        other_body["hash_profile"]["python_hash_seed"] = "1";
+        ASSERT_EQ(
+            HttpPostMsgpack(port_, "/register", MsgpackDocument(other_body))
+                .status,
+            200);
+        EXPECT_EQ(QueryEmpty(service)["instances"].size(), 2u);
+    }
+    const auto services = ParseMsgpackResponse(HttpGet(port_, "/services"));
+    ASSERT_EQ(services["count"].asInt(), 4);
+    for (const auto& service : services["services"]) {
+        EXPECT_EQ(service["HashProfile"]["python_hash_seed"].asString(), "0");
+    }
+}
+
+TEST_F(RegistrationHttpTest, SglangSelectorErrorsIdentifyActualField) {
+    for (const auto* field : {"algorithm", "index_projection", "strategy"}) {
+        auto body = ServiceJson(VllmService());
+        body["type"] = "SGLang";
+        body["hash_profile"]["strategy"] = "sglang";
+        body["hash_profile"]["algorithm"] = "sha256_raw";
+        body["hash_profile"]["index_projection"] = "first64_be";
+        body["hash_profile"][field] = "invalid";
+        const auto response =
+            HttpPostMsgpack(port_, "/register", MsgpackDocument(body));
+        ASSERT_EQ(response.status, 400);
+        EXPECT_EQ(ParseMsgpackResponse(response)["field"].asString(), field);
+        EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 0u);
+    }
+}
+
 TEST_F(RegistrationHttpTest, RejectsUnsupportedAlgorithmWithoutMutation) {
     for (const std::string algorithm : {"md5", "sha512", "xxhash", "SHA256"}) {
         SCOPED_TRACE(algorithm);
@@ -1345,15 +1402,17 @@ MooncakeClearedEvent MooncakeCleared(const ServiceConfig& context,
                        .data_parallel_rank = 9}};
 }
 
-class WarningSink : public google::LogSink {
+class LevelSink : public google::LogSink {
    public:
-    WarningSink() { google::AddLogSink(this); }
-    ~WarningSink() override { google::RemoveLogSink(this); }
+    explicit LevelSink(google::LogSeverity level) : level_(level) {
+        google::AddLogSink(this);
+    }
+    ~LevelSink() override { google::RemoveLogSink(this); }
 
     void send(google::LogSeverity severity, const char*, const char*, int,
               const google::LogMessageTime&, const char* message,
               size_t message_len) override {
-        if (severity != google::GLOG_WARNING) {
+        if (severity != level_) {
             return;
         }
         std::lock_guard lock(mu_);
@@ -1369,8 +1428,20 @@ class WarningSink : public google::LogSink {
     }
 
    private:
+    google::LogSeverity level_;
     mutable std::mutex mu_;
     std::vector<std::string> messages_;
+};
+
+class WarningSink : public LevelSink {
+   public:
+    WarningSink() : LevelSink(google::GLOG_WARNING) {}
+};
+
+// VLOG(1) and below are reported to sinks as GLOG_INFO.
+class InfoSink : public LevelSink {
+   public:
+    InfoSink() : LevelSink(google::GLOG_INFO) {}
 };
 
 TEST(RegistrationLifecycle,
@@ -1470,7 +1541,7 @@ TEST(KVEventHandlerTest, VllmAdmissionFailureDoesNotBlockValidSiblings) {
               0);
 }
 
-TEST(KVEventHandlerTest, VllmNonNullLoraIdIsRejectedWithoutBlockingSibling) {
+TEST(KVEventHandlerTest, VllmIdOnlyLoraIsRejectedWithoutBlockingSibling) {
     EventManager manager({}, 0);
     const auto service = VllmService("engine", "default", 0, 4);
     ASSERT_TRUE(
@@ -1492,8 +1563,242 @@ TEST(KVEventHandlerTest, VllmNonNullLoraIdIsRejectedWithoutBlockingSibling) {
     const auto view = manager.GetIndexer()->GetGlobalView();
     ASSERT_EQ(view.contexts.size(), 1u);
     EXPECT_EQ(view.contexts[0].prefix_count, 1u);
-    EXPECT_TRUE(warnings.Contains(
-        "lora_id cannot be validated against trusted registration"));
+    EXPECT_TRUE(
+        warnings.Contains("lora_name is required when lora_id is provided"));
+}
+
+TEST(KVEventHandlerTest, VllmNamedLoraLifecycleKeepsContextsIsolated) {
+    for (const auto* algorithm : {"sha256", "sha256_cbor"}) {
+        SCOPED_TRACE(algorithm);
+        EventManager manager({}, 0);
+        auto service = VllmService("adapter-engine", "default", 0, 4);
+        service.lora_name = "adapter-a";
+        service.hash_profile = TestProfile("0", algorithm);
+        auto other = VllmService("other-engine", "default", 0, 4);
+        other.lora_name = "adapter-b";
+        other.hash_profile = service.hash_profile;
+        auto base = VllmService("base-engine", "default", 0, 4);
+        base.hash_profile = service.hash_profile;
+        for (const auto& registered : {service, other, base}) {
+            ASSERT_TRUE(manager.GetIndexer()
+                            ->Register(RegistrationFor(registered))
+                            .error.empty());
+        }
+        KVEventHandler handler(&manager, service);
+        KVEventHandler other_handler(&manager, other);
+        KVEventHandler base_handler(&manager, base);
+        const auto tokens = Sequence(1, 8);
+        const auto prefixes =
+            ProjectedFor(ContextFor(service), service.hash_profile, tokens);
+        ASSERT_EQ(prefixes.size(), 2u);
+        auto make_event = [&](const ServiceConfig& registered) {
+            const auto hashes = ProjectedFor(ContextFor(registered),
+                                             registered.hash_profile, tokens);
+            auto event = VllmStored(hashes.at(0).value, 4);
+            event.block_hashes = {hashes.at(0).value, hashes.at(1).value};
+            event.token_ids = tokens;
+            if (!registered.lora_name.empty()) {
+                event.lora_name = registered.lora_name;
+            }
+            return event;
+        };
+        auto named = make_event(service);
+        named.lora_id = 7;
+        // Modern vLLM includes extra_keys; query identity uses registration.
+        named.extra_keys_present = true;
+        auto other_named = make_event(other);
+        // The same numeric ID can name a different adapter on another engine.
+        other_named.lora_id = 7;
+        ASSERT_TRUE(DispatchVllm(handler, service, {named}, 0).empty());
+        ASSERT_TRUE(
+            DispatchVllm(other_handler, other, {other_named}, 0).empty());
+        ASSERT_TRUE(
+            DispatchVllm(base_handler, base, {make_event(base)}, 0).empty());
+        auto matched = [&](const ServiceConfig& registered) {
+            return manager.GetIndexer()
+                ->Query(ContextFor(registered), tokens)
+                .at(registered.instance_id)
+                .gpu;
+        };
+        EXPECT_EQ(matched(service), 8);
+        EXPECT_EQ(matched(other), 8);
+        EXPECT_EQ(matched(base), 8);
+
+        // A named adapter event must not populate a base-model registration.
+        ASSERT_TRUE(
+            DispatchVllm(base_handler, base, {VllmClearedEvent{}}, 0).empty());
+        ASSERT_TRUE(DispatchVllm(base_handler, base, {named}, 0).empty());
+        EXPECT_EQ(matched(base), 0);
+        ASSERT_TRUE(
+            DispatchVllm(base_handler, base, {make_event(base)}, 0).empty());
+        EXPECT_EQ(matched(base), 8);
+
+        // Repeated announcements and an engine-local ID change do not create
+        // another owner for the same name and hash.
+        named.lora_id = 19;
+        ASSERT_TRUE(DispatchVllm(handler, service, {named, named}, 0).empty());
+        VllmRemovedEvent tail{.block_hashes = {prefixes[1].value},
+                              .medium = "GPU",
+                              .group_idx = 0};
+        ASSERT_TRUE(DispatchVllm(handler, service, {tail, tail}, 0).empty());
+        EXPECT_EQ(matched(service), 4);
+        EXPECT_EQ(matched(other), 8);
+        EXPECT_EQ(matched(base), 8);
+
+        // Name-based publishers may omit the deprecated ID entirely.
+        named.lora_id = std::nullopt;
+        ASSERT_TRUE(DispatchVllm(handler, service, {named}, 0).empty());
+        EXPECT_EQ(matched(service), 8);
+        ASSERT_TRUE(
+            DispatchVllm(handler, service, {VllmClearedEvent{}}, 0).empty());
+        EXPECT_EQ(matched(service), 0);
+        EXPECT_EQ(matched(other), 8);
+        EXPECT_EQ(matched(base), 8);
+    }
+}
+
+TEST(KVEventHandlerTest, VllmNamedLoraRejectsAmbiguousAndConflictingIdentity) {
+    EventManager manager({}, 0);
+    auto service = VllmService("adapter-engine", "default", 0, 4);
+    service.lora_name = "adapter-a";
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(service)).error.empty());
+    KVEventHandler handler(&manager, service);
+    const auto tokens = Sequence(1, 4);
+    const auto prefixes =
+        ProjectedFor(ContextFor(service), service.hash_profile, tokens);
+    ASSERT_EQ(prefixes.size(), 1u);
+    const auto prefix = prefixes.front();
+    auto valid = VllmStored(prefix.value, 4);
+    valid.lora_id = 7;
+    valid.lora_name = service.lora_name;
+    std::vector<VllmStoredEvent> invalid;
+    auto candidate = valid;
+    candidate.lora_name = std::nullopt;
+    invalid.push_back(candidate);
+    candidate.lora_name = "";
+    invalid.push_back(candidate);
+    candidate.lora_name = "adapter-b";
+    invalid.push_back(candidate);
+    candidate = valid;
+    candidate.lora_id = 0;
+    invalid.push_back(candidate);
+    candidate.lora_id = -1;
+    invalid.push_back(candidate);
+    for (const auto& event : invalid) {
+        ASSERT_TRUE(DispatchVllm(handler, service, {event}, 0).empty());
+        const auto view = manager.GetIndexer()->GetGlobalView();
+        ASSERT_EQ(view.contexts.size(), 1u);
+        EXPECT_EQ(view.contexts[0].prefix_count, 0u);
+    }
+    // An event-local rejection must not prevent a valid sibling from indexing.
+    ASSERT_TRUE(
+        DispatchVllm(handler, service, {invalid.front(), valid}, 0).empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(service), tokens)
+                  .at(service.instance_id)
+                  .gpu,
+              4);
+}
+
+TEST(KVEventHandlerTest, VllmFullPrefixSpecsSupportStoreRemoveAndClear) {
+    const std::vector<std::optional<std::string>> kinds{
+        std::nullopt, "full_attention", "mla_attention", "sink_full_attention"};
+    for (const auto& kind : kinds) {
+        SCOPED_TRACE(kind.value_or("omitted"));
+        EventManager manager({}, 0);
+        const auto service = VllmService("engine", "default", 0, 4);
+        ASSERT_TRUE(manager.GetIndexer()
+                        ->Register(RegistrationFor(service))
+                        .error.empty());
+        KVEventHandler handler(&manager, service);
+        const auto tokens = Sequence(1, 8);
+        const auto prefixes =
+            ProjectedFor(ContextFor(service), service.hash_profile, tokens);
+        ASSERT_EQ(prefixes.size(), 2u);
+        auto event = VllmStored(prefixes[0].value, 4);
+        event.block_hashes = {prefixes[0].value, prefixes[1].value};
+        event.token_ids = tokens;
+        event.kv_cache_spec_kind = kind;
+        ASSERT_TRUE(DispatchVllm(handler, service, {event, event}, 0).empty());
+        auto matched = [&] {
+            return manager.GetIndexer()
+                ->Query(ContextFor(service), tokens)
+                .at(service.instance_id)
+                .gpu;
+        };
+        EXPECT_EQ(matched(), 8);
+        VllmRemovedEvent first{.block_hashes = {prefixes[0].value},
+                               .medium = "GPU",
+                               .group_idx = 0};
+        ASSERT_TRUE(DispatchVllm(handler, service, {first}, 0).empty());
+        EXPECT_EQ(matched(), 0);
+        auto view = manager.GetIndexer()->GetGlobalView();
+        ASSERT_EQ(view.contexts.size(), 1u);
+        EXPECT_EQ(view.contexts[0].prefix_count, 1u);
+        ASSERT_TRUE(DispatchVllm(handler, service, {event}, 0).empty());
+        EXPECT_EQ(matched(), 8);
+        ASSERT_TRUE(
+            DispatchVllm(handler, service, {VllmClearedEvent{}}, 0).empty());
+        EXPECT_EQ(matched(), 0);
+        view = manager.GetIndexer()->GetGlobalView();
+        ASSERT_EQ(view.contexts.size(), 1u);
+        EXPECT_EQ(view.contexts[0].prefix_count, 0u);
+    }
+}
+
+TEST(KVEventHandlerTest, VllmFullPrefixSpecsKeepLayoutAndWindowGuards) {
+    EventManager manager({}, 0);
+    const auto service = VllmService("engine", "default", 0, 4);
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(service)).error.empty());
+    KVEventHandler handler(&manager, service);
+    const auto tokens = Sequence(1, 4);
+    const auto prefixes =
+        ProjectedFor(ContextFor(service), service.hash_profile, tokens);
+    ASSERT_EQ(prefixes.size(), 1u);
+    const auto prefix = prefixes.front();
+    auto valid = VllmStored(prefix.value, 4);
+    valid.kv_cache_spec_kind = "mla_attention";
+    std::vector<VllmStoredEvent> invalid;
+    for (const auto* kind : {"sliding_window", "sliding_window_mla", "mamba",
+                             "chunked_local_attention", "cross_attention",
+                             "encoder_only_attention", "unknown"}) {
+        auto event = valid;
+        event.kv_cache_spec_kind = kind;
+        invalid.push_back(event);
+    }
+    for (const auto& kind : std::vector<std::optional<std::string>>{
+             std::nullopt, "full_attention", "mla_attention",
+             "sink_full_attention"}) {
+        auto event = valid;
+        event.kv_cache_spec_kind = kind;
+        event.kv_cache_spec_sliding_window = 128;
+        invalid.push_back(event);
+    }
+    auto candidate = valid;
+    candidate.group_idx = 1;
+    invalid.push_back(candidate);
+    candidate.group_idx = -1;
+    invalid.push_back(candidate);
+    candidate = valid;
+    candidate.block_size = 2;
+    invalid.push_back(candidate);
+    candidate.block_size = 8;
+    invalid.push_back(candidate);
+    for (const auto& event : invalid) {
+        ASSERT_TRUE(DispatchVllm(handler, service, {event}, 0).empty());
+        const auto view = manager.GetIndexer()->GetGlobalView();
+        ASSERT_EQ(view.contexts.size(), 1u);
+        EXPECT_EQ(view.contexts[0].prefix_count, 0u);
+    }
+    ASSERT_TRUE(
+        DispatchVllm(handler, service, {invalid.front(), valid}, 0).empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(service), tokens)
+                  .at(service.instance_id)
+                  .gpu,
+              4);
 }
 
 TEST(KVEventHandlerTest, VllmBinaryHashUsesFinalEightBytesWithoutRehashing) {
@@ -1538,20 +1843,23 @@ TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
     const auto prefixes =
         ProjectedFor(ContextFor(service), TestProfile(), tokens);
 
-    const std::array<std::string, 4> warning_media = {"CPU", "cpu", "DISK",
+    const std::array<std::string, 4> ignored_media = {"CPU", "cpu", "DISK",
                                                       "disk"};
     std::vector<VllmEvent> events;
-    for (const auto& medium : warning_media) {
+    for (const auto& medium : ignored_media) {
         events.emplace_back(VllmStored(prefixes[0].value, 4, medium));
     }
     events.emplace_back(VllmStored(prefixes[0].value, 4, "GPU"));
-    for (const auto& medium : warning_media) {
+    for (const auto& medium : ignored_media) {
         events.emplace_back(
             VllmRemovedEvent{.block_hashes = {prefixes[0].value},
                              .medium = medium,
                              .group_idx = 0});
     }
 
+    // Expected non-GPU traffic is traced at VLOG(1) (reported to sinks as
+    // GLOG_INFO), not at WARNING: this test would emit eight warnings.
+    InfoSink info;
     WarningSink warnings;
     EXPECT_TRUE(DispatchVllm(handler, service, std::move(events), 0).empty());
     const auto result =
@@ -1567,17 +1875,26 @@ TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
     EXPECT_FALSE(presence.gpu_owners.empty());
     EXPECT_TRUE(presence.cpu_owners.empty());
     EXPECT_TRUE(presence.disk_owners.empty());
-    EXPECT_TRUE(warnings.Contains("endpoint=" + service.endpoint));
-    EXPECT_TRUE(warnings.Contains("publisher_kind=vLLM"));
-    EXPECT_TRUE(warnings.Contains("instance=engine"));
-    EXPECT_TRUE(warnings.Contains("dp_rank=0"));
-    for (const auto& medium : warning_media) {
-        EXPECT_TRUE(
+    if (VLOG_IS_ON(1)) {
+        EXPECT_TRUE(info.Contains("endpoint=" + service.endpoint));
+        EXPECT_TRUE(info.Contains("publisher_kind=vLLM"));
+        EXPECT_TRUE(info.Contains("instance=engine"));
+        EXPECT_TRUE(info.Contains("dp_rank=0"));
+        for (const auto& medium : ignored_media) {
+            EXPECT_TRUE(
+                info.Contains("event_type=BlockStored medium=" + medium));
+            EXPECT_TRUE(
+                info.Contains("event_type=BlockRemoved medium=" + medium));
+        }
+        EXPECT_TRUE(info.Contains("hash_count=1"));
+    }
+    // Non-GPU events never reach the tier-ignore warning path.
+    for (const auto& medium : ignored_media) {
+        EXPECT_FALSE(
             warnings.Contains("event_type=BlockStored medium=" + medium));
-        EXPECT_TRUE(
+        EXPECT_FALSE(
             warnings.Contains("event_type=BlockRemoved medium=" + medium));
     }
-    EXPECT_TRUE(warnings.Contains("hash_count=1"));
 }
 
 TEST(KVEventHandlerTest, VllmClearPreservesOtherEngineAndSharedOwners) {
@@ -1759,6 +2076,118 @@ TEST(KVEventHandlerTest, MooncakeMediumMigrationAndTenantClearAreScoped) {
     EXPECT_FALSE(snapshot.contexts.at(ContextFor(tenant_b))
                      .blocks.at(prefix_b)
                      .cpu_owners.empty());
+}
+
+// A shared object is re-announced on every batch, so the event stream repeats
+// itself.  The prefix index, unlike pool_bindings_, drops the oldest entries
+// when a context exceeds its block limit; re-announcing an object whose index
+// entry was evicted has to write it back.
+TEST(KVEventHandlerTest, SglangMooncakeRepeatRestoresCapacityEvictedPrefix) {
+    for (const auto* medium : {"CPU", "DISK"}) {
+        SCOPED_TRACE(medium);
+        EventManager manager({}, 0);
+        ASSERT_TRUE(PrefixCacheTableTestPeer::SetBlockLimitBeforeRegistration(
+            *manager.GetIndexer(), 4));
+        auto service = VllmService("sglang-engine", "default", 0, 4);
+        service.publisher_kind = PublisherKind::kSglang;
+        ASSERT_TRUE(ResolveHashProfile({.strategy = "sglang",
+                                        .algorithm = "sha256_raw",
+                                        .python_hash_seed = "",
+                                        .index_projection = "first64_be"},
+                                       &service.hash_profile)
+                        .empty());
+        ASSERT_TRUE(manager.GetIndexer()
+                        ->Register(RegistrationFor(service))
+                        .error.empty());
+        EXPECT_FALSE(PrefixCacheTableTestPeer::SetBlockLimitBeforeRegistration(
+            *manager.GetIndexer(), 2));
+        KVEventHandler handler(&manager, service);
+        std::string error;
+        auto strategy = CreateHashStrategy(service.hash_profile, &error);
+        ASSERT_NE(strategy, nullptr) << error;
+        const auto tokens = Sequence(1, 4);
+        std::vector<HashBlock> hashes;
+        ASSERT_TRUE(
+            strategy
+                ->Compute(ContextFor(service), tokens, std::nullopt, &hashes)
+                .empty());
+        ASSERT_EQ(hashes.size(), 1u);
+        const auto prefix = hashes[0].projected;
+        const auto hash =
+            mooncake::conductor::prefixindex::DigestToHex(hashes[0].digest);
+        auto stored =
+            MooncakeStored(service, prefix.value, hash + "_0_k", medium);
+        stored.object.connector_block_hash.reset();
+        ASSERT_TRUE(DispatchMooncake(handler, service, {stored}).empty());
+        for (int i = 1; i <= 4; ++i) {
+            std::vector<HashBlock> other_hashes;
+            ASSERT_TRUE(strategy
+                            ->Compute(ContextFor(service), Sequence(10 * i, 4),
+                                      std::nullopt, &other_hashes)
+                            .empty());
+            ASSERT_EQ(other_hashes.size(), 1u);
+            auto other =
+                MooncakeStored(service, other_hashes[0].projected.value,
+                               mooncake::conductor::prefixindex::DigestToHex(
+                                   other_hashes[0].digest) +
+                                   "_0_k",
+                               medium);
+            other.object.connector_block_hash.reset();
+            ASSERT_TRUE(DispatchMooncake(handler, service, {other}).empty());
+        }
+        EXPECT_GT(PrefixCacheTableTestPeer::Order(*manager.GetIndexer(),
+                                                  ContextFor(service))
+                      .evicted_by_capacity,
+                  0);
+        EXPECT_FALSE(PrefixCacheTableTestPeer::Presence(
+                         *manager.GetIndexer(), ContextFor(service), prefix)
+                         .has_value());
+        EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 5u);
+
+        ASSERT_TRUE(
+            DispatchMooncake(handler, service, {stored, stored}).empty());
+        const auto presence = PrefixCacheTableTestPeer::Presence(
+            *manager.GetIndexer(), ContextFor(service), prefix);
+        ASSERT_TRUE(presence.has_value());
+        EXPECT_EQ(presence->cpu_owners.size() + presence->disk_owners.size(),
+                  1u);
+        const auto match = manager.GetIndexer()
+                               ->Query(ContextFor(service), tokens)
+                               .at(service.instance_id);
+        EXPECT_EQ(match.disk, 4);
+        EXPECT_EQ(match.cpu, std::string(medium) == "CPU" ? 4 : 0);
+        EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 5u);
+        const auto sizes = PrefixCacheTableTestPeer::Order(
+            *manager.GetIndexer(), ContextFor(service));
+        EXPECT_EQ(sizes.blocks, sizes.write_order);
+        EXPECT_EQ(sizes.blocks, sizes.order_pos);
+
+        auto value = stored;
+        value.object.object_key = hash + "_0_v";
+        ASSERT_TRUE(DispatchMooncake(handler, service, {value, value}).empty());
+        EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 5u);
+        ASSERT_TRUE(
+            DispatchMooncake(handler, service,
+                             {MooncakeRemoved(stored), MooncakeRemoved(stored)})
+                .empty());
+        EXPECT_TRUE(PrefixCacheTableTestPeer::Presence(
+                        *manager.GetIndexer(), ContextFor(service), prefix)
+                        .has_value());
+        ASSERT_TRUE(DispatchMooncake(handler, service, {MooncakeRemoved(value)})
+                        .empty());
+        EXPECT_FALSE(PrefixCacheTableTestPeer::Presence(
+                         *manager.GetIndexer(), ContextFor(service), prefix)
+                         .has_value());
+        ASSERT_TRUE(DispatchMooncake(handler, service,
+                                     {stored, MooncakeCleared(service)})
+                        .empty());
+        EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 0u);
+        EXPECT_EQ(manager.GetIndexer()
+                      ->Query(ContextFor(service), tokens)
+                      .at(service.instance_id)
+                      .disk,
+                  0);
+    }
 }
 
 TEST(KVEventHandlerTest, MooncakeHashConflictDoesNotBlockValidSibling) {
@@ -2365,6 +2794,36 @@ TEST(ParseConfig, ExplicitInstanceIdSupportsMultipleStaticRanks) {
     EXPECT_EQ(services[0].tenant_id, "default");
     EXPECT_EQ(services[1].tenant_id, "default");
     std::remove(path.c_str());
+}
+
+TEST(ParseConfig, SglangSeedMayBeOmittedWithoutWeakeningVllm) {
+    ConfigEnvGuard guard;
+    const auto path = ::testing::TempDir() + "conductor_sglang_seed.json";
+    Json::Value config(Json::objectValue);
+    for (const auto* recipe : {"sglang", "sglang_bigram", "vllm_v1"}) {
+        auto entry = ServiceJson(VllmService(recipe));
+        entry["hash_profile"].removeMember("python_hash_seed");
+        if (std::string(recipe) != "vllm_v1") {
+            entry["type"] = "SGLang";
+            entry["hash_profile"]["strategy"] = recipe;
+            entry["hash_profile"]["algorithm"] = "sha256_raw";
+            entry["hash_profile"]["index_projection"] = "first64_be";
+        }
+        config["kvevent_instance"][recipe] = entry;
+    }
+    {
+        std::ofstream out(path);
+        out << config;
+    }
+    guard.SetPath(path);
+    int port = 0;
+    const auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    std::remove(path.c_str());
+    ASSERT_EQ(services.size(), 2u);
+    for (const auto& service : services) {
+        EXPECT_EQ(service.publisher_kind, PublisherKind::kSglang);
+        EXPECT_EQ(service.hash_profile.python_hash_seed, "0");
+    }
 }
 
 TEST(ParseConfig, MissingPortFieldZeroesPort) {

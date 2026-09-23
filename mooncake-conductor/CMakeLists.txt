@@ -59,7 +59,7 @@ else()
 endif()
 
 # In the top-level build mooncake-common/common.cmake has already found
-# yalantinglibs; its config.cmake mutates the imported target and cannot run
+# yalantinglibs; Its config.cmake mutates the imported target and cannot run
 # twice, because the target belongs to the parent scope. Guard it so both the
 # top-level and standalone paths configure.
 if(NOT TARGET yalantinglibs::yalantinglibs)

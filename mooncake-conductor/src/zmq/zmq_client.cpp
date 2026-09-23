@@ -61,9 +61,7 @@ std::string ValidateConfig(const ZMQClientConfig& config) {
 
 ZMQClient::ZMQClient(ZMQClientConfig config,
                      std::shared_ptr<EventHandler> handler)
-    : config_(std::move(config)),
-      event_handler_(std::move(handler)),
-      reconnect_delay_(config_.reconnect_delay) {}
+    : config_(std::move(config)), event_handler_(std::move(handler)) {}
 
 ZMQClient::~ZMQClient() { Stop(); }
 
@@ -123,7 +121,7 @@ void ZMQClient::Loop() {
 void ZMQClient::HandleReconnect() {
     LOG(INFO) << "Attempting to reconnect to the service. service="
               << config_.cache_pool_key
-              << " reconnectDelay=" << reconnect_delay_.count() << "ms";
+              << " reconnectDelay=" << config_.reconnect_delay.count() << "ms";
 
     // Poll the stop flag in slices so Stop() is honored within ~one poll
     // interval.
@@ -194,8 +192,6 @@ std::string ZMQClient::Connect() {
             replay_socket_ = std::move(replay_socket);
         }
         connected_ = true;
-
-        reconnect_delay_ = config_.reconnect_delay;
     } catch (const ::zmq::error_t& e) {
         CleanupSocketsLocked();
         return std::string("failed to connect to ") + config_.endpoint + ": " +
@@ -726,15 +722,17 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
                 return fail("failed to receive replay response: timed out",
                             ReplayFailure::kRetryable);
             }
-            // The ROUTER sends [identity, empty, sequence, payload]. The
-            // DEALER strips only the routing identity.
-            if (frames.size() != 3 || !frames[0].empty()) {
+            // DEALER strips only the ROUTER identity. SGLang/older vLLM reply
+            // [empty, sequence, payload]; newer vLLM adds topic after empty,
+            // including an empty topic in its end marker.
+            if ((frames.size() != 3 && frames.size() != 4) ||
+                !frames[0].empty()) {
                 return fail("invalid replay response frame count or delimiter",
                             ReplayFailure::kRetryable);
             }
 
-            auto& seq_msg = frames[1];
-            auto& payload_msg = frames[2];
+            auto& seq_msg = frames[frames.size() - 2];
+            auto& payload_msg = frames.back();
             if (seq_msg.size() != 8) {
                 return fail("invalid replay sequence length",
                             ReplayFailure::kRetryable);
@@ -781,6 +779,7 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
             next_expected = replay_seq + 1;
 
             const size_t payload_size = payload_msg.size();
+            const size_t topic_size = frames.size() == 4 ? frames[1].size() : 0;
             const bool message_limit_exceeded =
                 existing_messages >= config_.max_recovery_buffered_messages ||
                 messages.size() >=
@@ -790,17 +789,21 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
                 replay_bytes >
                     config_.max_recovery_buffered_bytes - existing_bytes ||
                 payload_size > config_.max_recovery_buffered_bytes -
-                                   existing_bytes - replay_bytes;
+                                   existing_bytes - replay_bytes ||
+                topic_size > config_.max_recovery_buffered_bytes -
+                                 existing_bytes - replay_bytes - payload_size;
             if (message_limit_exceeded || byte_limit_exceeded) {
                 return fail("replay response exceeds recovery buffer limits",
                             ReplayFailure::kUnrecoverable);
             }
-            replay_bytes += payload_size;
-            messages.push_back({.topic = "",
-                                .sequence = replay_seq,
-                                .payload = std::string(static_cast<const char*>(
-                                                           payload_msg.data()),
-                                                       payload_size)});
+            replay_bytes += payload_size + topic_size;
+            messages.push_back(
+                {.topic =
+                     frames.size() == 4 ? frames[1].to_string() : std::string{},
+                 .sequence = replay_seq,
+                 .payload =
+                     std::string(static_cast<const char*>(payload_msg.data()),
+                                 payload_size)});
         }
     } catch (const ::zmq::error_t& e) {
         return fail(std::string("replay request failed: ") + e.what(),

@@ -187,7 +187,15 @@ std::string ValidateVllmStoredAssertions(const zmq::VllmStoredEvent& event,
                std::to_string(event.block_size);
     }
     if (event.lora_id.has_value()) {
-        return "lora_id cannot be validated against trusted registration";
+        // Modern vLLM hashes the adapter name, but still publishes the legacy
+        // numeric ID. It need not match an ID on another engine. ID-only
+        // events cannot establish the name used by our query hash strategy.
+        if (*event.lora_id <= 0) {
+            return "lora_id must be positive when provided";
+        }
+        if (event.lora_name.value_or("").empty()) {
+            return "lora_name is required when lora_id is provided";
+        }
     }
     if (event.lora_name.value_or("") != service.lora_name) {
         return "lora_name conflicts with trusted registration";
@@ -196,8 +204,12 @@ std::string ValidateVllmStoredAssertions(const zmq::VllmStoredEvent& event,
         !error.empty()) {
         return error;
     }
+    // MLA shares the full-attention prefix lifecycle. Static sink blocks are
+    // separate from request blocks and do not participate in their events.
     if (event.kv_cache_spec_kind.has_value() &&
-        *event.kv_cache_spec_kind != "full_attention") {
+        *event.kv_cache_spec_kind != "full_attention" &&
+        *event.kv_cache_spec_kind != "mla_attention" &&
+        *event.kv_cache_spec_kind != "sink_full_attention") {
         return "unsupported kv_cache_spec_kind assertion: " +
                *event.kv_cache_spec_kind;
     }
@@ -632,17 +644,19 @@ std::string KVEventHandler::HandleSglangMooncakeStored(
          existing->second.group_id != binding.group_id)) {
         return "conflicting active SGLang logical-hash binding";
     }
+    // Capacity eviction drops index entries but retains bindings. Refresh the
+    // idempotent logical owner on every announcement to restore lost presence.
+    if (std::string error = manager_->GetIndexer()->StoreShared(
+            {.context = context,
+             .prefixes = {parsed.prefix},
+             .tier = *tier,
+             .owner = owner,
+             .effective_block_size = context.block_size,
+             .cache_group = std::nullopt});
+        !error.empty()) {
+        return error;
+    }
     if (existing == pool_bindings_.end()) {
-        if (std::string error = manager_->GetIndexer()->StoreShared(
-                {.context = context,
-                 .prefixes = {parsed.prefix},
-                 .tier = *tier,
-                 .owner = owner,
-                 .effective_block_size = context.block_size,
-                 .cache_group = std::nullopt});
-            !error.empty()) {
-            return error;
-        }
         pool_bindings_.emplace(key, std::move(binding));
     } else {
         existing->second.physical_components.insert(parsed.component_suffix);
@@ -789,16 +803,16 @@ std::string KVEventHandler::HandleVllmStored(
     }
     const std::string medium = AsciiToLower(event.medium.value_or(""));
     if (medium != "gpu") {
-        LOG(WARNING) << "Ignoring vLLM non-GPU event endpoint="
-                     << service_.endpoint << " publisher_kind="
-                     << common::PublisherKindName(metadata.publisher_kind)
-                     << " instance=" << service_.instance_id
-                     << " dp_rank=" << service_.dp_rank
-                     << " event_type=BlockStored medium="
-                     << OriginalMedium(event.medium)
-                     << " hash_count=" << HashCount(event)
-                     << " topic=" << metadata.topic
-                     << " seq=" << metadata.sequence;
+        // This adapter indexes GPU ownership; other tiers are expected no-ops.
+        VLOG(1) << "Ignoring vLLM non-GPU event endpoint=" << service_.endpoint
+                << " publisher_kind="
+                << common::PublisherKindName(metadata.publisher_kind)
+                << " instance=" << service_.instance_id
+                << " dp_rank=" << service_.dp_rank
+                << " event_type=BlockStored medium="
+                << OriginalMedium(event.medium)
+                << " hash_count=" << HashCount(event)
+                << " topic=" << metadata.topic << " seq=" << metadata.sequence;
         return "";
     }
     std::vector<prefixindex::ProjectedPrefix> prefixes;
@@ -824,16 +838,15 @@ std::string KVEventHandler::HandleVllmRemoved(
     }
     const std::string medium = AsciiToLower(event.medium.value_or(""));
     if (medium != "gpu") {
-        LOG(WARNING) << "Ignoring vLLM non-GPU event endpoint="
-                     << service_.endpoint << " publisher_kind="
-                     << common::PublisherKindName(metadata.publisher_kind)
-                     << " instance=" << service_.instance_id
-                     << " dp_rank=" << service_.dp_rank
-                     << " event_type=BlockRemoved medium="
-                     << OriginalMedium(event.medium)
-                     << " hash_count=" << HashCount(event)
-                     << " topic=" << metadata.topic
-                     << " seq=" << metadata.sequence;
+        VLOG(1) << "Ignoring vLLM non-GPU event endpoint=" << service_.endpoint
+                << " publisher_kind="
+                << common::PublisherKindName(metadata.publisher_kind)
+                << " instance=" << service_.instance_id
+                << " dp_rank=" << service_.dp_rank
+                << " event_type=BlockRemoved medium="
+                << OriginalMedium(event.medium)
+                << " hash_count=" << HashCount(event)
+                << " topic=" << metadata.topic << " seq=" << metadata.sequence;
         return "";
     }
     std::vector<prefixindex::ProjectedPrefix> prefixes;
@@ -881,7 +894,7 @@ std::string KVEventHandler::HandleMooncakeStored(
                      << " instance=" << service_.instance_id
                      << " event_type=stored medium="
                      << OriginalMedium(event.fields.medium)
-                     << " hash_count=" << event.object.seq_hashes.size()
+                     << " seq_hash_count=" << event.object.seq_hashes.size()
                      << " backend=" << event.fields.backend_id
                      << " event_dp=" << event.fields.data_parallel_rank
                      << " topic=" << metadata.topic
@@ -999,7 +1012,7 @@ std::string KVEventHandler::HandleMooncakeRemoved(
                      << " instance=" << service_.instance_id
                      << " event_type=removed medium="
                      << OriginalMedium(event.fields.medium)
-                     << " hash_count=" << event.object.seq_hashes.size()
+                     << " seq_hash_count=" << event.object.seq_hashes.size()
                      << " backend=" << event.fields.backend_id
                      << " event_dp=" << event.fields.data_parallel_rank
                      << " topic=" << metadata.topic

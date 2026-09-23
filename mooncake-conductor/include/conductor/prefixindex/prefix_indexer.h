@@ -129,7 +129,8 @@ class PrefixCacheTable {
 
     mutable std::shared_mutex context_map_mutex_;
     std::unordered_map<ContextKey, std::shared_ptr<ContextState>> contexts_;
-    const size_t block_limit_ = kDefaultMaxBlocks;
+    // Fixed for production; tests may set it before any context is registered.
+    size_t block_limit_ = kDefaultMaxBlocks;
 };
 
 }  // namespace mooncake::conductor::prefixindex

@@ -309,24 +309,6 @@ bool ParseOptional(const MapReader& reader, std::string_view field,
     return true;
 }
 
-template <typename T, typename Parser>
-bool ParseOptionalNullable(const MapReader& reader, std::string_view field,
-                           Parser parser, std::optional<T>* output,
-                           std::string* error) {
-    const object* value = reader.Get(field);
-    if (value == nullptr) {
-        output->reset();
-        return true;
-    }
-    auto parsed = parser(*value);
-    if (!parsed.value.has_value()) {
-        *error = "invalid " + std::string(field) + ": " + parsed.error;
-        return false;
-    }
-    *output = std::move(*parsed.value);
-    return true;
-}
-
 const std::set<std::string_view> kVllmFields = {
     "type",      "block_hashes",       "parent_block_hash",
     "token_ids", "block_size",         "lora_id",
@@ -391,14 +373,13 @@ ValueResult<VllmEvent> ParseVllmEvent(const object& raw) {
                            &error) ||
             !ParseRequired(reader, "lora_name", ParseNullableString,
                            &event.lora_name, &error) ||
-            !ParseOptionalNullable(reader, "group_idx", ParseNullableInt64,
-                                   &event.group_idx, &error) ||
-            !ParseOptionalNullable(reader, "kv_cache_spec_kind",
-                                   ParseNullableString,
-                                   &event.kv_cache_spec_kind, &error) ||
-            !ParseOptionalNullable(
-                reader, "kv_cache_spec_sliding_window", ParseNullableInt64,
-                &event.kv_cache_spec_sliding_window, &error)) {
+            !ParseOptional(reader, "group_idx", ParseNullableInt64,
+                           &event.group_idx, &error) ||
+            !ParseOptional(reader, "kv_cache_spec_kind", ParseNullableString,
+                           &event.kv_cache_spec_kind, &error) ||
+            !ParseOptional(reader, "kv_cache_spec_sliding_window",
+                           ParseNullableInt64,
+                           &event.kv_cache_spec_sliding_window, &error)) {
             return ValueResult<VllmEvent>::Err(error);
         }
         if (const object* extra_keys = reader.Get("extra_keys");
@@ -428,8 +409,8 @@ ValueResult<VllmEvent> ParseVllmEvent(const object& raw) {
                            &event.block_hashes, &error) ||
             !ParseRequired(reader, "medium", ParseNullableString, &event.medium,
                            &error) ||
-            !ParseOptionalNullable(reader, "group_idx", ParseNullableInt64,
-                                   &event.group_idx, &error)) {
+            !ParseOptional(reader, "group_idx", ParseNullableInt64,
+                           &event.group_idx, &error)) {
             return ValueResult<VllmEvent>::Err(error);
         }
         return ValueResult<VllmEvent>::Ok(std::move(event));
@@ -548,18 +529,18 @@ bool ParseMooncakeObject(const MapReader& reader, MooncakeObjectFields* object,
                        &object->connector_block_hash, error) ||
         !ParseOptional(reader, "cache_prefix", ParseString,
                        &object->cache_prefix, error) ||
-        !ParseOptionalNullable(reader, "tp_rank", ParseNullableInt64,
-                               &object->tp_rank, error) ||
-        !ParseOptionalNullable(reader, "head_or_tp_rank", ParseNullableInt64,
-                               &object->head_or_tp_rank, error) ||
-        !ParseOptionalNullable(reader, "pcp_rank", ParseNullableInt64,
-                               &object->pcp_rank, error) ||
-        !ParseOptionalNullable(reader, "dcp_rank", ParseNullableInt64,
-                               &object->dcp_rank, error) ||
-        !ParseOptionalNullable(reader, "pp_rank", ParseNullableInt64,
-                               &object->pp_rank, error) ||
-        !ParseOptionalNullable(reader, "layer_id", ParseNullableInt64,
-                               &object->layer_id, error) ||
+        !ParseOptional(reader, "tp_rank", ParseNullableInt64, &object->tp_rank,
+                       error) ||
+        !ParseOptional(reader, "head_or_tp_rank", ParseNullableInt64,
+                       &object->head_or_tp_rank, error) ||
+        !ParseOptional(reader, "pcp_rank", ParseNullableInt64,
+                       &object->pcp_rank, error) ||
+        !ParseOptional(reader, "dcp_rank", ParseNullableInt64,
+                       &object->dcp_rank, error) ||
+        !ParseOptional(reader, "pp_rank", ParseNullableInt64, &object->pp_rank,
+                       error) ||
+        !ParseOptional(reader, "layer_id", ParseNullableInt64,
+                       &object->layer_id, error) ||
         !ParseOptional(reader, "block_hashes", ParseUint64Array,
                        &object->legacy_block_hashes, error)) {
         return false;

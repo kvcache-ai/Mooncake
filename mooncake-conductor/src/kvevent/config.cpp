@@ -8,7 +8,6 @@
 #include <fstream>
 #include <limits>
 #include <set>
-#include <string_view>
 
 #include "conductor/common/utils.h"
 #include "conductor/prefixindex/hash_strategy.h"
@@ -44,13 +43,6 @@ bool JsonInt64(const Json::Value& value, int64_t* out) {
         return true;
     }
     return false;
-}
-
-// Validate the supported vLLM and SGLang recipes at the configuration
-// boundary before creating any subscriptions.
-bool IsSupportedHashAlgorithm(std::string_view algorithm) {
-    return algorithm == "sha256" || algorithm == "sha256_cbor" ||
-           algorithm == "sha256_raw";
 }
 
 bool ParseHashProfile(const Json::Value& raw,
@@ -90,13 +82,15 @@ bool ParseHashProfile(const Json::Value& raw,
     };
     if (!require_string("strategy", &source.strategy) ||
         !require_string("algorithm", &source.algorithm) ||
-        !require_string("python_hash_seed", &source.python_hash_seed) ||
         !require_string("index_projection", &source.index_projection)) {
         return false;
     }
 
-    if (!IsSupportedHashAlgorithm(source.algorithm)) {
-        *error = "unsupported hash algorithm: " + source.algorithm;
+    // SGLang does not use a Python seed; a supplied value must still be text.
+    const bool sglang =
+        source.strategy == "sglang" || source.strategy == "sglang_bigram";
+    if ((!sglang || value.isMember("python_hash_seed")) &&
+        !require_string("python_hash_seed", &source.python_hash_seed)) {
         return false;
     }
 

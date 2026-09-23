@@ -83,6 +83,20 @@ class PrefixCacheTableTestPeer {
                 .evicted_by_capacity = state->evicted_by_capacity};
     }
 
+    // Test-only capacity seam.  The per-context block limit is copied into a
+    // ContextState by Register(), so it can only be changed before the first
+    // registration; the lock plus the emptiness check keep that invariant.
+    // Returns false when a context already exists.
+    static bool SetBlockLimitBeforeRegistration(PrefixCacheTable& table,
+                                                size_t block_limit) {
+        std::unique_lock map_lock(table.context_map_mutex_);
+        if (!table.contexts_.empty()) {
+            return false;
+        }
+        table.block_limit_ = block_limit;
+        return true;
+    }
+
     static PrefixCacheTableSnapshot Snapshot(const PrefixCacheTable& table) {
         PrefixCacheTableSnapshot snapshot;
         std::vector<std::pair<ContextKey, std::shared_ptr<ContextState>>>

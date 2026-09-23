@@ -331,10 +331,17 @@ std::string PackMooncakeStoredBatch(uint64_t event_id, uint64_t hash,
 
 class MockPublisher {
    public:
-    MockPublisher()
+    explicit MockPublisher(bool replay_with_topic = false,
+                           std::string replay_topic = "",
+                           bool bad_delimiter = false,
+                           bool bad_sequence = false)
         : ctx_(1),
           pub_(ctx_, ::zmq::socket_type::pub),
-          router_(ctx_, ::zmq::socket_type::router) {
+          router_(ctx_, ::zmq::socket_type::router),
+          replay_with_topic_(replay_with_topic),
+          replay_topic_(std::move(replay_topic)),
+          bad_delimiter_(bad_delimiter),
+          bad_sequence_(bad_sequence) {
         pub_.set(::zmq::sockopt::ipv6, 1);
         pub_.bind("tcp://127.0.0.1:*");
         router_.set(::zmq::sockopt::ipv6, 1);
@@ -447,14 +454,17 @@ class MockPublisher {
                     value >>= 8;
                 }
                 const auto payload = PackVllmStoredBatch(sequence);
-                // Match vLLM/SGLang: DEALER receives
-                // [empty, sequence, payload] after ROUTER removes identity.
-                std::array<::zmq::const_buffer, 4> reply = {
+                // SGLang/older vLLM omit topic; newer vLLM includes it.
+                const std::string delimiter = bad_delimiter_ ? "bad" : "";
+                std::vector<::zmq::const_buffer> reply = {
                     ::zmq::buffer(frames[0].data(), frames[0].size()),
-                    ::zmq::buffer(empty),
-                    ::zmq::buffer(sequence_bytes),
-                    ::zmq::buffer(payload),
+                    ::zmq::buffer(delimiter),
                 };
+                if (replay_with_topic_)
+                    reply.push_back(::zmq::buffer(replay_topic_));
+                reply.push_back(::zmq::buffer(sequence_bytes.data(),
+                                              bad_sequence_ ? 7 : 8));
+                reply.push_back(::zmq::buffer(payload));
                 ::zmq::send_multipart(router_, reply);
                 replay_events_.fetch_add(1);
             }
@@ -465,12 +475,13 @@ class MockPublisher {
             }
             std::array<unsigned char, 8> end_sequence{};
             end_sequence.fill(0xFF);
-            std::array<::zmq::const_buffer, 4> end = {
+            std::vector<::zmq::const_buffer> end = {
                 ::zmq::buffer(frames[0].data(), frames[0].size()),
                 ::zmq::buffer(empty),
-                ::zmq::buffer(end_sequence),
-                ::zmq::buffer(empty),
             };
+            if (replay_with_topic_) end.push_back(::zmq::buffer(empty));
+            end.push_back(::zmq::buffer(end_sequence));
+            end.push_back(::zmq::buffer(empty));
             ::zmq::send_multipart(router_, end);
         }
     }
@@ -478,6 +489,10 @@ class MockPublisher {
     ::zmq::context_t ctx_;
     ::zmq::socket_t pub_;
     ::zmq::socket_t router_;
+    const bool replay_with_topic_;
+    const std::string replay_topic_;
+    const bool bad_delimiter_;
+    const bool bad_sequence_;
     std::atomic<bool> closed_{false};
     std::atomic<size_t> replay_requests_{0};
     std::atomic<size_t> replay_events_{0};
@@ -492,7 +507,6 @@ ZMQClientConfig TestConfig(MockPublisher& publisher) {
     config.cache_pool_key = "test-pod";
     config.endpoint = publisher.PubEndpoint();
     config.replay_endpoint = publisher.RouterEndpoint();
-    config.model_name = "test-model";
     config.publisher_kind = PublisherKind::kVllm;
     config.poll_timeout = std::chrono::milliseconds(100);
     config.replay_timeout = std::chrono::milliseconds(1000);
@@ -884,6 +898,82 @@ TEST(ZMQClient, EventGapReplaysMissingMessagesBeforeLiveMessage) {
               (std::vector<int64_t>{11, 12, 13, 14, 15}));
     EXPECT_EQ(client.GetDroppedEvents(), 4);
     EXPECT_EQ(client.GetGapCount(), 1);
+    client.Stop();
+}
+
+TEST(ZMQClient, ReplayWithTopicRecoversGapAndPreservesMetadata) {
+    for (const std::string topic : {"", "kv-events"}) {
+        SCOPED_TRACE(topic);
+        MockPublisher publisher(true, topic);
+        auto handler = std::make_shared<MockEventHandler>();
+        auto config = TestConfig(publisher);
+        config.replay_recovery_timeout = std::chrono::milliseconds(500);
+        ZMQClient client(config, handler);
+        ASSERT_EQ(client.Start(), "");
+        ASSERT_TRUE(PublishUntilHandled(*handler, 10, config.endpoint, [&] {
+            publisher.Publish(topic, PackVllmStoredBatch(1), 10);
+        }));
+        publisher.Publish(topic, PackVllmStoredBatch(2), 15);
+        ASSERT_TRUE(handler->WaitForBatch(15, config.endpoint,
+                                          std::chrono::seconds(2)));
+        EXPECT_EQ(handler->Sequences(config.endpoint, 11),
+                  (std::vector<int64_t>{11, 12, 13, 14, 15}));
+        const auto replayed = handler->FindBatch(11, config.endpoint);
+        ASSERT_TRUE(replayed.has_value());
+        EXPECT_EQ(replayed->metadata.topic, topic);
+        EXPECT_FALSE(client.IsStale());
+        client.Stop();
+    }
+}
+
+TEST(ZMQClient, ReplayWithTopicStillRejectsMalformedFrames) {
+    for (const bool bad_delimiter : {true, false}) {
+        SCOPED_TRACE(bad_delimiter);
+        MockPublisher publisher(true, "kv-events", bad_delimiter,
+                                !bad_delimiter);
+        auto handler = std::make_shared<MockEventHandler>();
+        auto config = TestConfig(publisher);
+        config.replay_recovery_timeout = std::chrono::milliseconds(150);
+        ZMQClient client(config, handler);
+        ASSERT_EQ(client.Start(), "");
+        ASSERT_TRUE(PublishUntilHandled(*handler, 10, config.endpoint, [&] {
+            publisher.Publish("kv-events", PackVllmStoredBatch(1), 10);
+        }));
+        publisher.Publish("kv-events", PackVllmStoredBatch(2), 15);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!client.IsStale() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        EXPECT_TRUE(client.IsStale());
+        EXPECT_EQ(client.GetLastSequence(), 10);
+        EXPECT_FALSE(handler->FindBatch(15, config.endpoint).has_value());
+        client.Stop();
+    }
+}
+
+TEST(ZMQClient, ReplayTopicCountsTowardsRecoveryByteLimit) {
+    MockPublisher publisher(true, std::string(8192, 't'));
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.max_recovery_buffered_bytes = 4096;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+    ASSERT_TRUE(PublishUntilHandled(*handler, 10, config.endpoint, [&] {
+        publisher.Publish("", PackVllmStoredBatch(1), 10);
+    }));
+    publisher.Publish("", PackVllmStoredBatch(2), 15);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!client.IsStale() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(client.IsStale());
+    EXPECT_NE(client.GetStaleReason().find(
+                  "replay response exceeds recovery buffer limits"),
+              std::string::npos);
+    EXPECT_FALSE(handler->FindBatch(15, config.endpoint).has_value());
     client.Stop();
 }
 
