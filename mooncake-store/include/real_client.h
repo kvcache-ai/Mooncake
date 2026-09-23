@@ -38,6 +38,16 @@ class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
 
+// Effective live TTL used by the dummy-client monitor before it evicts a
+// client's mapped segments. Reads MC_DUMMY_CLIENT_TTL_SEC and falls back to
+// DEFAULT_CLIENT_LIVE_TTL_SEC when unset, empty or not a positive integer.
+//
+// Registering a large pool segment can monopolize the single-threaded UDS
+// channel long enough to starve other clients' pings past the default 10s TTL,
+// which makes the monitor evict segments that are still in use. Deployments
+// with very large client pools can raise the TTL to compensate.
+int64_t ResolveDummyClientLiveTtlSec();
+
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
    public:
@@ -1130,7 +1140,12 @@ class RealClient : public PyClient {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> dummy_client_ping_queue_{
         kDummyClientPingQueueSize};
-    const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    // The dummy-client live TTL is overridable via MC_DUMMY_CLIENT_TTL_SEC.
+    // Registering a large pool segment (~20s per 192GB) monopolizes the
+    // single-threaded UDS channel and starves other clients' pings past the
+    // previously hardcoded 10s TTL, so the monitor silently evicts their
+    // segments. Operators can raise the TTL for large pools; default unchanged.
+    const int64_t dummy_client_live_ttl_sec_ = ResolveDummyClientLiveTtlSec();
     int64_t view_version_ = 0;
 
     // IPC Server members for receiving FD from Dummy Clients

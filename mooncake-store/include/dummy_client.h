@@ -170,6 +170,11 @@ class DummyClient : public PyClient {
         return p >= base && p < base + hot_cache_size_;
     }
 
+    // Identity this client uses when talking to the RealClient. Exposed so
+    // callers (and tests) can correlate a DummyClient with the shm context the
+    // RealClient keeps for it.
+    [[nodiscard]] const UUID &client_id() const { return client_id_; }
+
     int remove(const std::string &key, bool force = false);
 
     long removeByRegex(const std::string &str, bool force = false);
@@ -273,6 +278,11 @@ class DummyClient : public PyClient {
 
     int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
+
+    // Clear stale local 'registered' flags for the segments
+    // covering `buffers` after a DUMMY_BUFFER_NOT_MAPPED batch failure, so
+    // the next register_buffer() performs a real re-registration.
+    void mark_shms_unregistered(const std::vector<void *> &buffers);
 
 #if defined(USE_ASCEND_DIRECT)
     int register_device_buffer_for_reconnect(void *buffer, size_t size);
