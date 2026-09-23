@@ -134,6 +134,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
 | `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES` | `0` | Size of the additional preallocated pinned-host arena for same-process SSD-to-GPU restores and DFS ranged-session reads into device memory. See the constraints below |
+| `MC_OFFLOAD_PARALLEL_WORKERS` | `8` | Worker threads the client uses to read a batch's LOCAL_DISK endpoints in parallel. See the note below |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
@@ -144,6 +145,8 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | `true` | Enable proactive local-disk eviction from the FileStorage heartbeat |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO` | `0.90` | Trigger proactive disk eviction when backend usage exceeds this ratio of its quota |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO` | `0.80` | Target backend usage ratio for proactive disk eviction |
+
+A batch whose LOCAL_DISK replicas live on several peers groups its keys by transport endpoint and reads the groups through `MC_OFFLOAD_PARALLEL_WORKERS` workers, so the batch waits for the slowest endpoint instead of the sum of all of them. The workers spend their time blocked on the peer RPC rather than on CPU, and the useful upper bound is however many peers a single batch spans; a batch confined to one endpoint is unaffected. Values that are not a positive integer are ignored with a warning and the default is used.
 
 The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO` and `MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO` are also accepted. The high watermark must be greater than the low watermark.
 
