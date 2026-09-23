@@ -6,6 +6,7 @@
 
 #include <glog/logging.h>
 
+#include "config/runtime_identity_config.h"
 #include "config_helper.h"
 #include "types.h"
 
@@ -148,8 +149,7 @@ struct MasterConfig {
     bool enable_metadata_cleanup_on_timeout;
 
     // Pod identity for K8s label-based routing
-    std::string pod_name;
-    std::string pod_namespace;
+    RuntimeIdentityConfig identity;
 
     uint64_t put_start_discard_timeout_sec;
     uint64_t put_start_release_timeout_sec;
@@ -485,8 +485,8 @@ class MasterServiceSupervisorConfig {
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
 
-        pod_name = config.pod_name;
-        pod_namespace = config.pod_namespace;
+        pod_name = config.identity.pod_name;
+        pod_namespace = config.identity.pod_namespace;
         validate();
     }
 

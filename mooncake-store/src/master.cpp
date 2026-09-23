@@ -16,6 +16,7 @@
 
 #include "allocator_status.h"
 #include "config/rpc_protocol_config.h"
+#include "config/runtime_identity_config_loader.h"
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
@@ -457,6 +458,20 @@ std::string ResolveHABackendConnstring(
         master_config.etcd_endpoints);
 }
 
+mooncake::RuntimeIdentityCommandLineOverrides
+GetRuntimeIdentityCommandLineOverrides() {
+    mooncake::RuntimeIdentityCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("pod_name", &info) && !info.is_default) {
+        command_line.pod_name = FLAGS_pod_name;
+    }
+    if (google::GetCommandLineFlagInfo("pod_namespace", &info) &&
+        !info.is_default) {
+        command_line.pod_namespace = FLAGS_pod_namespace;
+    }
+    return command_line;
+}
+
 void ResolveRpcAddressFromInterfaceOrDie(
     mooncake::MasterConfig& master_config) {
     if (master_config.rpc_interface.empty()) {
@@ -683,10 +698,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("http_metadata_server_host",
                              &master_config.http_metadata_server_host,
                              FLAGS_http_metadata_server_host);
-    default_config.GetString("pod_name", &master_config.pod_name,
-                             FLAGS_pod_name);
-    default_config.GetString("pod_namespace", &master_config.pod_namespace,
-                             FLAGS_pod_namespace);
     default_config.GetBool("enable_metadata_cleanup_on_timeout",
                            &master_config.enable_metadata_cleanup_on_timeout,
                            FLAGS_enable_metadata_cleanup_on_timeout);
@@ -1218,16 +1229,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.http_metadata_server_host =
             FLAGS_http_metadata_server_host;
     }
-    if ((google::GetCommandLineFlagInfo("pod_name", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.pod_name = FLAGS_pod_name;
-    }
-    if ((google::GetCommandLineFlagInfo("pod_namespace", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.pod_namespace = FLAGS_pod_namespace;
-    }
     if ((google::GetCommandLineFlagInfo("enable_metadata_cleanup_on_timeout",
                                         &info) &&
          !info.is_default) ||
@@ -1555,15 +1556,8 @@ int main(int argc, char* argv[]) {
     }
     ResolveRpcAddressFromInterfaceOrDie(master_config);
 
-    // Fall back to environment variables for pod identity (K8s Downward API)
-    if (master_config.pod_name.empty()) {
-        const char* env = std::getenv("POD_NAME");
-        if (env) master_config.pod_name = env;
-    }
-    if (master_config.pod_namespace.empty()) {
-        const char* env = std::getenv("POD_NAMESPACE");
-        if (env) master_config.pod_namespace = env;
-    }
+    master_config.identity = mooncake::ResolveRuntimeIdentityConfig(
+        loaded_default_config, GetRuntimeIdentityCommandLineOverrides());
 
     const std::string ha_backend_connstring =
         ResolveHABackendConnstring(master_config);
