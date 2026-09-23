@@ -86,6 +86,7 @@ class LocalBufferManager {
     ~LocalBufferManager();
 
     void setTopology(std::shared_ptr<Topology> &topology) {
+        std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
         topology_ = topology;
         context_list_.resize(topology->getNicCount(), nullptr);
     }
@@ -110,9 +111,12 @@ class LocalBufferManager {
     struct BufferEntryForRdma {
         MemoryOptions options;
         std::unordered_map<RdmaContext *, void *> mem_reg_map;
+        bool removing = false;
     };
 
    private:
+    // 设备变更和整体清理等待并发 buffer 操作完成。
+    std::shared_mutex lifecycle_mutex_;
     RWSpinlock lock_;
     std::vector<RdmaContext *> context_list_;
     std::map<AddressRange, BufferEntryForRdma> buffer_list_;

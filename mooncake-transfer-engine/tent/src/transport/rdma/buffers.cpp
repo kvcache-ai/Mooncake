@@ -111,6 +111,7 @@ Status LocalBufferManager::addBuffer(BufferDesc& desc,
 Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                                              const MemoryOptions& options,
                                              bool force_sequential) {
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     AddressRange range((void*)desc.addr, desc.length);
     BufferEntryForRdma staging;
     assert(desc.rkey.empty());
@@ -223,12 +224,19 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
 }
 
 Status LocalBufferManager::removeBuffer(BufferDesc& desc) {
-    RWSpinlock::WriteGuard guard(lock_);
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     AddressRange range((void*)desc.addr, desc.length);
-    auto buffer = buffer_list_.find(range);
-    if (buffer == buffer_list_.end()) return Status::OK();
-
-    auto& registrations = buffer->second.mem_reg_map;
+    decltype(BufferEntryForRdma::mem_reg_map) registrations;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        auto buffer = buffer_list_.find(range);
+        if (buffer == buffer_list_.end()) return Status::OK();
+        if (buffer->second.removing)
+            return Status::InvalidArgument(
+                "Address region is being unregistered" LOC_MARK);
+        buffer->second.removing = true;
+        registrations.swap(buffer->second.mem_reg_map);
+    }
     Status result = Status::OK();
     for (auto it = registrations.begin(); it != registrations.end();) {
         if (it->first->unregisterMemReg(it->second)) {
@@ -241,16 +249,24 @@ Status LocalBufferManager::removeBuffer(BufferDesc& desc) {
             it = registrations.erase(it);
         }
     }
-    if (!result.ok()) return result;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        auto buffer = buffer_list_.find(range);
+        if (!result.ok()) {
+            registrations.swap(buffer->second.mem_reg_map);
+            buffer->second.removing = false;
+            return result;
+        }
+        buffer_list_.erase(buffer);
+    }
 
     desc.lkey.clear();
     desc.rkey.clear();
-    buffer_list_.erase(buffer);
     return Status::OK();
 }
 
 Status LocalBufferManager::addDevice(RdmaContext* context) {
-    RWSpinlock::WriteGuard guard(lock_);
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     assert(topology_ && context);
     int index = topology_->getNicId(context->name());
     if (index < 0) {
@@ -282,14 +298,16 @@ Status LocalBufferManager::addDevice(RdmaContext* context) {
 }
 
 Status LocalBufferManager::removeDevice(RdmaContext* context, bool do_unreg) {
-    RWSpinlock::WriteGuard guard(lock_);
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     assert(topology_ && context);
     auto iter = std::find(context_list_.begin(), context_list_.end(), context);
     if (iter == context_list_.end()) return Status::OK();
     for (auto& buffer : buffer_list_) {
         if (!buffer.second.mem_reg_map.count(context)) continue;
-        if (do_unreg)
-            context->unregisterMemReg(buffer.second.mem_reg_map[context]);
+        if (do_unreg &&
+            context->unregisterMemReg(buffer.second.mem_reg_map[context]))
+            return Status::RdmaError(
+                "Unable to unregister device buffer" LOC_MARK);
         buffer.second.mem_reg_map.erase(context);
     }
     *iter = nullptr;
@@ -297,11 +315,22 @@ Status LocalBufferManager::removeDevice(RdmaContext* context, bool do_unreg) {
 }
 
 Status LocalBufferManager::clear() {
-    RWSpinlock::WriteGuard guard(lock_);
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+    Status result = Status::OK();
     for (auto& buffer : buffer_list_) {
-        for (auto& elem : buffer.second.mem_reg_map)
-            elem.first->unregisterMemReg(elem.second);
+        auto& registrations = buffer.second.mem_reg_map;
+        for (auto it = registrations.begin(); it != registrations.end();) {
+            if (it->first->unregisterMemReg(it->second)) {
+                if (result.ok())
+                    result = Status::RdmaError(
+                        "Unable to unregister buffer during cleanup" LOC_MARK);
+                ++it;
+            } else {
+                it = registrations.erase(it);
+            }
+        }
     }
+    if (!result.ok()) return result;
     buffer_list_.clear();
     context_list_.clear();
     return Status::OK();

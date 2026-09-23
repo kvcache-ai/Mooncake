@@ -28,9 +28,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -316,6 +318,10 @@ class RdmaContextTestPeer {
         context.cleanupResources();
         context.status_ = RdmaContext::DEVICE_UNINIT;
     }
+
+    static int cleanupMemoryRegistration(RdmaContext& context) {
+        return context.cleanupResources();
+    }
 };
 
 namespace {
@@ -325,6 +331,11 @@ struct RegistrationVerbs {
     void* fail_addr = nullptr;
     ibv_pd* fail_pd = nullptr;
     int deregister_failures = 0;
+    std::condition_variable cv;
+    void* blocked_addr = nullptr;
+    bool deregister_entered = false;
+    bool release_deregister = false;
+    std::atomic<int> deallocated_pds{0};
 } registration_verbs;
 
 ibv_mr* registerMemory(ibv_pd* pd, void* addr, size_t size, int) {
@@ -342,7 +353,14 @@ ibv_mr* registerMemory(ibv_pd* pd, void* addr, size_t size, int) {
 }
 
 int deregisterMemory(ibv_mr* mr) {
-    std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+    std::unique_lock<std::mutex> lock(registration_verbs.mutex);
+    if (mr->addr == registration_verbs.blocked_addr &&
+        !registration_verbs.deregister_entered) {
+        registration_verbs.deregister_entered = true;
+        registration_verbs.cv.notify_all();
+        registration_verbs.cv.wait(
+            lock, [] { return registration_verbs.release_deregister; });
+    }
     if (registration_verbs.deregister_failures > 0) {
         --registration_verbs.deregister_failures;
         errno = EIO;
@@ -352,6 +370,35 @@ int deregisterMemory(ibv_mr* mr) {
     delete mr;
     return 0;
 }
+
+int deallocateRegistrationPd(ibv_pd*) {
+    ++registration_verbs.deallocated_pds;
+    return 0;
+}
+
+// 必须先放行 mock，再回收异步任务，断言失败时也不会卡住测试。
+class BlockedDeregistration {
+   public:
+    explicit BlockedDeregistration(void* addr) {
+        std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+        registration_verbs.blocked_addr = addr;
+    }
+
+    ~BlockedDeregistration() { release(); }
+
+    bool wait() {
+        std::unique_lock<std::mutex> lock(registration_verbs.mutex);
+        return registration_verbs.cv.wait_for(
+            lock, std::chrono::seconds(2),
+            [] { return registration_verbs.deregister_entered; });
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+        registration_verbs.release_deregister = true;
+        registration_verbs.cv.notify_all();
+    }
+};
 
 size_t liveRegistrations() {
     std::lock_guard<std::mutex> lock(registration_verbs.mutex);
@@ -365,6 +412,10 @@ class RdmaRegistrationRollbackTest : public testing::Test {
         registration_verbs.fail_addr = nullptr;
         registration_verbs.fail_pd = nullptr;
         registration_verbs.deregister_failures = 0;
+        registration_verbs.blocked_addr = nullptr;
+        registration_verbs.deregister_entered = false;
+        registration_verbs.release_deregister = false;
+        registration_verbs.deallocated_pds = 0;
 
         auto topology = std::make_shared<Topology>();
         ASSERT_TRUE(topology
@@ -377,6 +428,7 @@ class RdmaRegistrationRollbackTest : public testing::Test {
         IbvSymbols verbs{};
         verbs.ibv_reg_mr_default = registerMemory;
         verbs.ibv_dereg_mr = deregisterMemory;
+        verbs.ibv_dealloc_pd = deallocateRegistrationPd;
         for (size_t i = 0; i < contexts_.size(); ++i) {
             contexts_[i] = std::make_unique<RdmaContext>(transport_);
             RdmaContextTestPeer::configureMemoryRegistration(
@@ -480,6 +532,164 @@ TEST_F(RdmaRegistrationRollbackTest, FailedDeregistrationCanBeRetried) {
     EXPECT_EQ(liveRegistrations(), 0u);
     EXPECT_TRUE(desc.lkey.empty());
     EXPECT_TRUE(desc.rkey.empty());
+}
+
+TEST_F(RdmaRegistrationRollbackTest,
+       SlowDeregistrationAllowsOtherMrOperations) {
+    auto& context = *contexts_[0];
+    auto mr = context.registerMemReg(memory_.data(), kPageSize,
+                                     IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_NE(mr, nullptr);
+    std::future<int> slow;
+    std::future<int> other;
+    std::future<int> repeated;
+    BlockedDeregistration blocked(memory_.data());
+    slow = std::async(std::launch::async,
+                      [&] { return context.unregisterMemReg(mr); });
+    ASSERT_TRUE(blocked.wait());
+    other = std::async(std::launch::async, [&] {
+        auto next = context.registerMemReg(memory_.data() + kPageSize,
+                                           kPageSize, IBV_ACCESS_LOCAL_WRITE);
+        return next ? context.unregisterMemReg(next) : -1;
+    });
+    EXPECT_EQ(other.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    repeated = std::async(std::launch::async,
+                          [&] { return context.unregisterMemReg(mr); });
+    EXPECT_EQ(repeated.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    blocked.release();
+    EXPECT_EQ(slow.get(), 0);
+    EXPECT_EQ(other.get(), 0);
+    EXPECT_NE(repeated.get(), 0);
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, SlowBufferRemovalPreservesRangeAndRetry) {
+    auto desc = descriptor(0);
+    ASSERT_TRUE(buffers_.addBuffer(desc, options_).ok());
+    std::future<Status> slow;
+    std::future<Status> other;
+    std::future<Status> duplicate;
+    std::future<Status> repeated;
+    BlockedDeregistration blocked(memory_.data());
+    slow = std::async(std::launch::async,
+                      [&] { return buffers_.removeBuffer(desc); });
+    ASSERT_TRUE(blocked.wait());
+    other = std::async(std::launch::async, [&] {
+        auto next = descriptor(1);
+        auto status = buffers_.addBuffer(next, options_);
+        return status.ok() ? buffers_.removeBuffer(next) : status;
+    });
+    EXPECT_EQ(other.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    duplicate = std::async(std::launch::async, [&] {
+        auto copy = descriptor(0);
+        return buffers_.addBuffer(copy, options_);
+    });
+    repeated = std::async(std::launch::async, [&] {
+        auto copy = descriptor(0);
+        return buffers_.removeBuffer(copy);
+    });
+    EXPECT_EQ(duplicate.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(repeated.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    {
+        std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+        registration_verbs.deregister_failures = 1;
+    }
+    blocked.release();
+    EXPECT_FALSE(slow.get().ok());
+    EXPECT_TRUE(other.get().ok());
+    EXPECT_FALSE(duplicate.get().ok());
+    EXPECT_FALSE(repeated.get().ok());
+    EXPECT_EQ(liveRegistrations(), 1u);
+    EXPECT_TRUE(buffers_.removeBuffer(desc).ok());
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, CleanupWaitsForInFlightDeregistration) {
+    auto& context = *contexts_[0];
+    auto mr = context.registerMemReg(memory_.data(), kPageSize,
+                                     IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_NE(mr, nullptr);
+    std::future<int> slow;
+    std::future<int> cleanup;
+    BlockedDeregistration blocked(memory_.data());
+    slow = std::async(std::launch::async,
+                      [&] { return context.unregisterMemReg(mr); });
+    ASSERT_TRUE(blocked.wait());
+    std::promise<void> started;
+    cleanup = std::async(std::launch::async, [&] {
+        started.set_value();
+        return RdmaContextTestPeer::cleanupMemoryRegistration(context);
+    });
+    started.get_future().wait();
+    EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    EXPECT_EQ(registration_verbs.deallocated_pds.load(), 0);
+    blocked.release();
+    EXPECT_EQ(slow.get(), 0);
+    EXPECT_EQ(cleanup.get(), 0);
+    EXPECT_EQ(registration_verbs.deallocated_pds.load(), 1);
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, CleanupFailurePreservesPdAndMrForRetry) {
+    auto& context = *contexts_[0];
+    ASSERT_NE(context.registerMemReg(memory_.data(), kPageSize,
+                                     IBV_ACCESS_LOCAL_WRITE),
+              nullptr);
+    registration_verbs.deregister_failures = 1;
+    EXPECT_NE(RdmaContextTestPeer::cleanupMemoryRegistration(context), 0);
+    EXPECT_EQ(registration_verbs.deallocated_pds.load(), 0);
+    EXPECT_EQ(RdmaContextTestPeer::trackedRegistrations(context), 1u);
+    EXPECT_EQ(RdmaContextTestPeer::cleanupMemoryRegistration(context), 0);
+    EXPECT_EQ(registration_verbs.deallocated_pds.load(), 1);
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, BufferClearWaitsForRemovalRollback) {
+    auto desc = descriptor(0);
+    ASSERT_TRUE(buffers_.addBuffer(desc, options_).ok());
+    std::future<Status> slow;
+    std::future<Status> cleanup;
+    BlockedDeregistration blocked(memory_.data());
+    slow = std::async(std::launch::async,
+                      [&] { return buffers_.removeBuffer(desc); });
+    ASSERT_TRUE(blocked.wait());
+    std::promise<void> started;
+    cleanup = std::async(std::launch::async, [&] {
+        started.set_value();
+        return buffers_.clear();
+    });
+    started.get_future().wait();
+    EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+        registration_verbs.deregister_failures = 1;
+    }
+    blocked.release();
+    EXPECT_FALSE(slow.get().ok());
+    EXPECT_TRUE(cleanup.get().ok());
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, DeviceRemovalAndClearCanRetryFailures) {
+    auto desc = descriptor(0);
+    ASSERT_TRUE(buffers_.addBuffer(desc, options_).ok());
+    registration_verbs.deregister_failures = 1;
+    EXPECT_FALSE(buffers_.removeDevice(contexts_[0].get()).ok());
+    EXPECT_EQ(liveRegistrations(), 2u);
+    EXPECT_TRUE(buffers_.removeDevice(contexts_[0].get()).ok());
+    EXPECT_EQ(liveRegistrations(), 1u);
+    registration_verbs.deregister_failures = 1;
+    EXPECT_FALSE(buffers_.clear().ok());
+    EXPECT_EQ(liveRegistrations(), 1u);
+    EXPECT_TRUE(buffers_.clear().ok());
+    EXPECT_EQ(liveRegistrations(), 0u);
 }
 }  // namespace
 
