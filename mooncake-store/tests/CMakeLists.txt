@@ -74,6 +74,8 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_metadata_config_test master_metadata_config_test.cpp)
+add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
@@ -237,6 +239,13 @@ add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(client_host_identity_config_test
                client_host_identity_config_test.cpp)
 add_store_test(client_metric_config_test client_metric_config_test.cpp)
+add_test(
+  NAME client_metric_cluster_id_test
+  COMMAND
+    client_metric_config_test
+    --gtest_filter=ClientMetricClusterIdTest.MergeLabelsUsesConfiguredClusterId)
+set_tests_properties(client_metric_cluster_id_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_CLUSTER_ID=test-cluster")
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(allocator_metric_test allocator_metric_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
@@ -300,6 +309,7 @@ add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_connector_config_test nvme_kv/connector_config_test.cpp)
+add_store_test(nvme_kv_executor_config_test nvme_kv/executor_config_test.cpp)
 add_store_test(ha_cluster_namespace_config_test
                ha_cluster_namespace_config_test.cpp)
 add_store_test(redis_connection_config_test redis_connection_config_test.cpp)

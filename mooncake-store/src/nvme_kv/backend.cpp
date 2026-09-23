@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "config/executor_config.h"
 #include "config/io_concurrency_config.h"
 #include "nvme_kv/executor_util.h"
 #include "nvme_kv/key_codec.h"
@@ -28,12 +29,6 @@ namespace mooncake {
 namespace {
 
 constexpr uint32_t kMinMaxValueSize = sizeof(NvmeKvObjectHeader) + 1;
-constexpr size_t kDefaultReadPlanBatchSize = 8;
-
-size_t PositiveSizeEnvOr(const char *name, size_t fallback, size_t maximum) {
-    const uint32_t parsed = ParseNvmeKvU32EnvOr(name, 0);
-    return parsed == 0 ? fallback : std::min<size_t>(parsed, maximum);
-}
 
 class IndexQueue {
    public:
@@ -97,8 +92,7 @@ std::string_view BuildPayloadView(const std::vector<Slice> &slices,
 }
 
 size_t ReadPlanBatchSize() {
-    return PositiveSizeEnvOr("MOONCAKE_NVME_KV_READ_PLAN_BATCH_SIZE",
-                             kDefaultReadPlanBatchSize, 1024);
+    return NvmeKvExecutorConfig::ReadPlanBatchSizeFromEnvironment();
 }
 
 std::optional<std::vector<size_t>> ValidateChunkRecords(

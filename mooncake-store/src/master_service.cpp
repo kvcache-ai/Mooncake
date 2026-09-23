@@ -31,6 +31,8 @@
 #include "http_metadata_server.h"
 #include "master_metric_manager.h"
 #include "common.h"
+#include "config/dfs_enablement_config.h"
+#include "config/master_metadata_config.h"
 #include "environ.h"
 #include "segment.h"
 #include "segment/region_driver.h"
@@ -248,16 +250,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument("Invalid soft-pin TTL configuration");
     }
 
-    // Initialize HTTP metadata key prefix (read env var once at startup)
-    const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
-    if (custom_prefix && std::strlen(custom_prefix) > 0) {
-        http_metadata_prefix_ = "mooncake/" + std::string(custom_prefix);
-        if (http_metadata_prefix_.back() != '/') {
-            http_metadata_prefix_ += '/';
-        }
-    } else {
-        http_metadata_prefix_ = "mooncake/";
-    }
+    // Initialize the HTTP metadata key prefix from its component-owned
+    // startup configuration.
+    http_metadata_prefix_ =
+        MasterMetadataConfig::FromEnvironment().HttpMetadataPrefix();
     if (allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST) {
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
@@ -604,8 +600,7 @@ tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
 
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
-    enable_dfs_ = Environ::GetBool(
-        "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
+    enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled;
     if (!enable_dfs_) return;
 
     if (config.enable_snapshot || config.enable_snapshot_restore ||
