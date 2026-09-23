@@ -15,7 +15,11 @@
 #include "utils.h"
 
 #include <gflags/gflags.h>
+#include <cctype>
+#include <charconv>
 #include <iostream>
+#include <optional>
+#include <string_view>
 
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
@@ -101,6 +105,19 @@ DEFINE_string(xport_type, "",
               "rdma|tcp|hp_tcp|shm|mnnvl|nvlink|gds|iouring|ub|sunrise_link|"
               "mpcomm|flagcx");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
+DEFINE_bool(use_hugepage, false,
+            "classic DRAM: SHM allocates on hugetlbfs; RDMA allocates with "
+            "MAP_HUGETLB so ibv_reg_mr does not explode NIC PTEs on 4K pages. "
+            "Length must be a multiple of hugepage_size. No 4K fallback.");
+DEFINE_string(hugepage_size, "0",
+              "Hugepage size: 2MB, 512MB, or 1GB (same as "
+              "MC_STORE_HUGEPAGE_SIZE), or the size in bytes "
+              "(2097152, 536870912, 1073741824). "
+              "0 defaults to 2MB when --use_hugepage is set.");
+DEFINE_string(
+    hugetlbfs_path, "",
+    "classic shm hugepage mount. Empty uses the size-specific "
+    "default (/dev/hugepages, /dev/hugepages-512M, /dev/hugepages-1G).");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
 DEFINE_string(tent_transport_hint, "unspec",
@@ -147,12 +164,60 @@ std::string XferBenchConfig::metadata_url_list;
 int XferBenchConfig::rpc_server_port = 0;
 std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
+bool XferBenchConfig::use_hugepage = false;
+size_t XferBenchConfig::hugepage_size = 0;
+std::string XferBenchConfig::hugetlbfs_path;
 bool XferBenchConfig::notifi = false;
 std::string XferBenchConfig::tent_transport_hint;
 std::string XferBenchConfig::tent_intent_type;
 
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
+
+namespace {
+
+std::string_view trimFlag(std::string_view text) {
+    while (!text.empty() &&
+           std::isspace(static_cast<unsigned char>(text.front()))) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() &&
+           std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
+bool equalsIgnoreCase(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        unsigned char ca = static_cast<unsigned char>(a[i]);
+        unsigned char cb = static_cast<unsigned char>(b[i]);
+        if (ca >= 'A' && ca <= 'Z')
+            ca = static_cast<unsigned char>(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z')
+            cb = static_cast<unsigned char>(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// Store labels 2MB/512MB/1GB, or a raw byte count. Empty/"0" → 0.
+std::optional<size_t> parseHugepageSizeFlag(std::string_view raw) {
+    raw = trimFlag(raw);
+    if (raw.empty() || raw == "0") return 0;
+    if (equalsIgnoreCase(raw, "2MB")) return 2ULL << 20;
+    if (equalsIgnoreCase(raw, "512MB")) return 512ULL << 20;
+    if (equalsIgnoreCase(raw, "1GB")) return 1ULL << 30;
+    size_t bytes = 0;
+    const auto* first = raw.data();
+    const auto* last = raw.data() + raw.size();
+    const auto [ptr, ec] = std::from_chars(first, last, bytes);
+    if (ec == std::errc{} && ptr == last) return bytes;
+    return std::nullopt;
+}
+
+}  // namespace
 
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
@@ -189,6 +254,10 @@ void XferBenchConfig::loadFromFlags() {
 
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;
+    use_hugepage = FLAGS_use_hugepage;
+    const auto parsed_hp = parseHugepageSizeFlag(FLAGS_hugepage_size);
+    hugepage_size = parsed_hp.value_or(static_cast<size_t>(-1));
+    hugetlbfs_path = FLAGS_hugetlbfs_path;
     notifi = FLAGS_notifi;
     tent_transport_hint = FLAGS_tent_transport_hint;
     tent_intent_type = FLAGS_tent_intent_type;

@@ -126,6 +126,7 @@ environment setup must be prepared separately.
 | Huawei Ascend UBSHMEM | `-DUSE_UBSHMEM=ON` | Install Ascend CANN Toolkit. Requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5. | Source the CANN `set_env.sh` before configuring CMake. |
 | AMD HIP / ROCm | `-DUSE_HIP=ON` | Install ROCm/HIP SDK. | Ensure HIP compiler, headers, and runtime libraries are visible to CMake. |
 | Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Use `-DDTK_INCLUDE_DIR` and `-DDTK_LIB_DIR` for custom layouts. |
+| ScaleFabric SHCA | `-DUSE_SHCA=ON` | Install `shca-tools`. | Supports Transfer Engine/TENT RDMA paths only; Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
 
 ```{admonition} NCCL host RMA constraints
@@ -239,12 +240,13 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
 | `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
+| `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
 | `-DUSE_UBSHMEM=ON/OFF` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |
 | `-DUSE_INTRA_NVLINK=ON/OFF` | `OFF` | Enable intranode NVLink transport. |
 | `-DUSE_VRAM_SEGMENT=ON/OFF` | `OFF` | Enable create VRAM Segment instead of (default) DRAM Segment. |
 | `-DUSE_CXL=ON/OFF` | `OFF` | Enable CXL support. |
-| `-DUSE_MPCOMM=ON/OFF` | `OFF` | Enable the MPComm transport in TENT (multi-NIC memory pooling over RDMA). Requires `-DUSE_TENT=ON` and `-DMPCOMM_ROOT=<prefix>`. See [MPComm Transport](../design/transfer-engine/mpcomm_transport.md). |
+| `-DUSE_MPCOMM=ON/OFF` | `OFF` | Enable the MPComm transport in TENT (multi-NIC memory pooling over RDMA). Requires `-DUSE_TENT=ON` and `-DMPCOMM_ROOT=<prefix>`. See [MPComm Transport](../design/transfer-engine/transport/mpcomm_transport.md). |
 
 ### Vendor SDK Path Overrides
 
@@ -269,7 +271,7 @@ The following options can be passed to `cmake ..`.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/efa_transport.md). |
+| `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/transport/efa_transport.md). |
 | `-DUSE_NOF=ON/OFF` | `OFF` | Build Mooncake Store with NVMe-oF SSD pool support. Use `sudo bash dependencies.sh --with-spdk` before enabling it. |
 | `-DUSE_REDIS=ON/OFF` | `OFF` | Enable Redis-based metadata service for Transfer Engine. Requires hiredis. |
 | `-DUSE_HTTP=ON/OFF` | `ON` | Enable HTTP-based metadata service. |

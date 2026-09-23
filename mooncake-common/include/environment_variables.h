@@ -127,6 +127,26 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_EVICTION_CHECK_INTERVAL);
 };
 
+struct OssAdapterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_ENDPOINT);
+    MC_DEFINE_ENV_VAR(std::string, OSS_ENDPOINT);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_BUCKET);
+    MC_DEFINE_ENV_VAR(std::string, OSS_BUCKET);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_REGION);
+    MC_DEFINE_ENV_VAR(std::string, OSS_REGION);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_ACCESS_KEY_ID);
+    MC_DEFINE_ENV_VAR(std::string, OSS_ACCESS_KEY_ID);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_ACCESS_KEY_SECRET);
+    MC_DEFINE_ENV_VAR(std::string, OSS_ACCESS_KEY_SECRET);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_SECURITY_TOKEN);
+    MC_DEFINE_ENV_VAR(std::string, OSS_SESSION_TOKEN);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OSS_PATH_STYLE);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OSS_ANONYMOUS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_OSS_MAX_CONNECTIONS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_OSS_RECEIVE_BUFFER_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_OSS_UPLOAD_BUFFER_SIZE);
+};
+
 struct OffsetAllocatorBackendEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_EVICTION_POLICY);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_HIGH_RATIO);
@@ -159,10 +179,19 @@ struct LocalFileSnapshotEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_SNAPSHOT_LOCAL_PATH);
 };
 
+struct HaClusterNamespaceEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLUSTER_ID);
+};
+
 struct TransferSubmitterEnvironmentVariables {
     // Keep the raw string to preserve the legacy token set, whitespace,
     // invalid-value fallback, and warning behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_MEMCPY);
+};
+
+struct FilereadWorkerPoolEnvironmentVariables {
+    // Preserve the raw value in invalid-value warnings.
+    MC_DEFINE_ENV_VAR(std::string, MC_FILEREAD_WORKERS);
 };
 
 struct NoFRegisterEnvironmentVariables {
@@ -191,11 +220,23 @@ struct NvmeKvConnectorEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_TRANSPORT);
 };
 
+struct RedisConnectionEnvironmentVariables {
+    // Keep the DB index as a string so an explicitly empty value remains
+    // distinguishable from a nonempty malformed value.
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_DB_INDEX);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_USERNAME);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_PASSWORD);
+};
+
 struct ClientAutoDiscoveryEnvironmentVariables {
     // Keep the raw strings to preserve std::stoi prefix acceptance and the
     // distinction between unset and explicitly empty filter values.
     MC_DEFINE_ENV_VAR(std::string, MC_MS_AUTO_DISC);
     MC_DEFINE_ENV_VAR(std::string, MC_MS_FILTERS);
+};
+
+struct ClientHostIdentityEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_HOST_ID);
 };
 
 struct NvmeKvIoConcurrencyEnvironmentVariables {
@@ -206,6 +247,20 @@ struct NvmeKvIoConcurrencyEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_BATCH_SUBMIT_CONCURRENCY);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_ROOT_SUBMIT_CONCURRENCY);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_PREPARE_CONCURRENCY);
+};
+
+struct S3ClientEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_REGION);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_S3_ENDPOINT);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_BUCKET_NAME);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_ACCESS_KEY_ID);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_SECRET_ACCESS_KEY);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_AWS_USE_HTTPS);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_REQUEST_CHECKSUM_CALCULATION);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION);
+    MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_AWS_CONNECT_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_AWS_REQUEST_TIMEOUT_MS);
 };
 
 #undef MC_DEFINE_ENV_VAR

@@ -33,6 +33,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "buffer_range_index.h"
 #include "common.h"
 #include "topology.h"
 
@@ -58,7 +59,7 @@ class TransferMetadata {
    public:
     struct DeviceDesc {
         std::string name;
-        uint16_t lid;
+        uint32_t lid;
         std::string gid;
         std::string eid;  // for ub
 
@@ -124,6 +125,12 @@ class TransferMetadata {
         std::vector<DeviceDesc> devices;
         Topology topology;
         std::vector<BufferDesc> buffers;
+        // Derived from `buffers`. Rebuild after every mutation of that
+        // vector, before the descriptor is published through a shared_ptr.
+        // Copying a SegmentDesc copies this snapshot; a subsequent
+        // push_back/erase must call rebuildBufferRangeIndex() again.
+        BufferRangeIndex buffer_range_index;
+        void rebuildBufferRangeIndex() { buffer_range_index.rebuild(buffers); }
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
         // this is for cxl.
@@ -178,7 +185,7 @@ class TransferMetadata {
     struct HandShakeDesc {
         std::string payload;  // opaque transport-specific handshake data
         std::string local_nic_path;
-        uint16_t local_lid = 0;
+        uint32_t local_lid = 0;
         std::string local_gid;
         std::string peer_nic_path;
 #ifdef USE_UB

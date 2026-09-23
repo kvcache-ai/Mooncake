@@ -410,7 +410,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
         if (RpcProtocolConfig::FromEnvironment().use_rdma) {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#else
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
         }
 
         mooncake::WrappedMasterServiceConfig wrapped_config(
