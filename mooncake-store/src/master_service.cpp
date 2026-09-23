@@ -3450,6 +3450,7 @@ struct MasterService::LegacyRestoreContext {
     size_t& already_existing_count;
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>>& repair_canonical_keys;
+    std::vector<std::tuple<size_t, TenantId, std::string>>& installed_keys;
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>& new_known_owner_records;
 
@@ -3813,6 +3814,8 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
                     object.tenant_id, object.user_key, standby_meta.group_id);
             }
             tenant_state.processing_keys.erase(object.user_key);
+            ctx.installed_keys.emplace_back(shard_idx, object.tenant_id,
+                                            object.user_key);
         }
     }
     return restored_count;
@@ -3975,6 +3978,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     // the survivors.
     std::vector<std::pair<TenantId, std::string>> repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>> repair_canonical_keys;
+    // (shard_idx, tenant, key) of everything this call installed, so a
+    // failed restore can roll its own state back before reporting the error.
+    std::vector<std::tuple<size_t, TenantId, std::string>> installed_keys;
 
     const auto restore_chunk =
         [&](const std::vector<StandbyObjectEntry>& objects)
@@ -4201,6 +4207,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                                             standby_meta.group_id);
                 }
                 tenant_state.processing_keys.erase(object.user_key);
+                installed_keys.emplace_back(shard_idx, object.tenant_id,
+                                            object.user_key);
             }
         }
         restored_object_count += objects.size();
@@ -4213,7 +4221,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             restored_allocators,    restored_accounted_memory_bytes,
             rejected_count,         already_existing_count,
             repair_remove_keys,     repair_canonical_keys,
-            new_known_owner_records};
+            installed_keys,         new_known_owner_records};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
             return tl::make_unexpected(r.error());
         }
@@ -4240,6 +4248,42 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             }
         }
     }
+
+    const auto prev_standby_accounted_memory_bytes =
+        standby_accounted_memory_bytes_;
+    const auto prev_standby_memory_segments = standby_memory_segments_;
+    const auto prev_standby_allocator_keepalive = standby_allocator_keepalive_;
+    const auto prev_invalid_replica_endpoints = invalid_replica_endpoints_;
+
+    // A failed restore leaves nothing behind: installed keys go back out
+    // through the canonical removal, bookkeeping returns to its pre-restore
+    // snapshots, and the new liveness records come out with their counters.
+    const auto rollback_restored_state = [&]() {
+        for (const auto& [shard_idx, tenant, key] : installed_keys) {
+            MetadataShardAccessorRW shard(this, shard_idx);
+            auto tenant_it = shard->tenants.find(tenant);
+            if (tenant_it == shard->tenants.end()) {
+                continue;
+            }
+            auto meta_it = tenant_it->second.metadata.find(key);
+            if (meta_it == tenant_it->second.metadata.end()) {
+                continue;
+            }
+            EraseMetadata(tenant_it->second, meta_it, tenant);
+        }
+        standby_accounted_memory_bytes_ = prev_standby_accounted_memory_bytes;
+        standby_memory_segments_ = prev_standby_memory_segments;
+        standby_allocator_keepalive_ = prev_standby_allocator_keepalive;
+        invalid_replica_endpoints_ = prev_invalid_replica_endpoints;
+        for (const auto& [client_id, record] : new_known_owner_records) {
+            client_liveness_records_.erase(client_id);
+            MasterMetricManager::instance().on_client_liveness_record_removed(
+                record->state());
+        }
+        if (enable_multi_tenants_) {
+            RebuildTenantQuotaUsageFromMetadata();
+        }
+    };
 
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
@@ -4278,7 +4322,18 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     // carrying only the survivors for partial ones), and the restore fails
     // unless the batch becomes durable, so the candidate never serves an
     // index whose discards could resurrect. With no OpLog configured there
-    // is nothing to replay into, so the local filter stands alone.
+    // is nothing to replay into, so the local filter stands alone. With
+    // OpLog enabled but no writer available (e.g. no HA backend connection
+    // string), a filtered discard would be silently unrepaired, so the
+    // restore fails explicitly instead.
+    if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
+        enable_oplog_ && !ordered_oplog_writer_) {
+        LOG(ERROR) << "RestoreFromStandbySnapshot: conflict discards need "
+                      "durable repair but no OpLog writer is available; "
+                      "failing the restore";
+        rollback_restored_state();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
         enable_oplog_ && ordered_oplog_writer_) {
         const size_t total =
@@ -4338,6 +4393,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             LOG(ERROR) << "RestoreFromStandbySnapshot: durable repair failed, "
                           "error="
                        << toString(repair_err);
+            rollback_restored_state();
             return tl::make_unexpected(repair_err);
         }
         LOG(INFO) << "RestoreFromStandbySnapshot: durable repair records="

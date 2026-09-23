@@ -2441,8 +2441,8 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    auto* writer = InstallRejectingWriter(service, backend);
-    writer->RejectCommitsWith(ErrorCode::ETCD_OPERATION_ERROR);
+    auto* writer = InstallRejectOnceWriter(service, backend);
+    writer->RejectNextCommit();
 
     const std::string endpoint = "standby_repair_reject_segment";
     auto survivor =
@@ -2466,8 +2466,72 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
         {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
 
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error());
-    EXPECT_GE(writer->rejected_commits(), 1u);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, result.error());
+
+    // Rollback leaves nothing behind: no metadata, no liveness records. A
+    // retry must see an empty index rather than already-existing objects.
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+
+    // Retry: the writer accepts now, and the same restore lands cleanly.
+    auto retry = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_survivor"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_lost"),
+              0);
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
+    const std::string cluster_id = "test_restore_repair_no_writer";
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build();
+    MasterService service(service_config);
+    // OpLog is enabled but no HA backend connection string configured, so
+    // the constructor leaves the writer unset. A filtered discard cannot
+    // become a durable repair record, and the restore must say so loudly
+    // instead of succeeding with an unrepaired drop.
+    ASSERT_FALSE(HasOpLogWriter(service));
+
+    const std::string endpoint = "standby_repair_nowriter_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_nowriter_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_nowriter_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_nowriter_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_nowriter_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
 }
 
 TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
