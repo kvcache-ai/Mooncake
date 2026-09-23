@@ -169,6 +169,9 @@ the snapshot skips that cycle and retries at the next interval rather than
 waiting for publication while holding the global snapshot lock. Continuous
 overlapping weight mutations can therefore postpone snapshots. Weight state
 is frozen in the parent; the forked child only serializes the frozen value.
+Snapshots also skip capture when the OpLog writer is not accepting writes:
+a failed caller may have an uncertain durable outcome, which must remain
+recoverable from the log rather than be skipped by a new snapshot boundary.
 
 Batch-OpLog snapshots containing weight state use a version-2 manifest with a
 checksummed weight-state artifact captured at the same replay cursor as object

@@ -331,6 +331,117 @@ class SnapshotChildProcessTest : public ::testing::Test {
         }
     }
 
+    void CheckWeightSnapshotAfterWriterStop() {
+        const std::string cluster = "weight-snapshot-writer-stop";
+        auto backend = std::make_shared<SnapshotBoundaryBackend>();
+        CreateService(
+            MasterServiceConfigBuilder()
+                .set_enable_ha(true)
+                .set_enable_oplog(true)
+                .set_cluster_id(cluster)
+                .set_oplog_batch_max_entries(1)
+                .set_weight_management_oplog_capability_confirmed(true)
+                .set_enable_snapshot(false)
+                .set_enable_snapshot_restore(true)
+                .set_snapshot_interval_seconds(1)
+                .set_snapshot_object_store_type("local")
+                .build());
+        ASSERT_EQ(ErrorCode::OK, MasterServiceTestPeer(*service_)
+                                     .SetBatchOpLogBackendForTesting(backend));
+        const WeightRevisionIdentity identity{.tenant_id = "default",
+                                              .name_space = "production",
+                                              .resource_id = "model",
+                                              .revision = "writer-stop",
+                                              .weight_generation = 1};
+        auto manager = CreateTempSnapshotManager();
+        auto provider = CreateCatalogBackedSnapshotProvider(
+            MakeSnapshotProviderConfig({.name = "embedded",
+                                        .catalog_store_type = "embedded",
+                                        .requires_redis = false},
+                                       cluster, {}));
+        ASSERT_TRUE(provider.has_value());
+        backend->Arm(SnapshotBoundaryBackend::Gate::DurableTxn);
+        auto mutation = std::async(std::launch::async, [&] {
+            return service_->BeginWeightImport(
+                BeginWeightImportRequest{.identity = identity,
+                                         .payload_group_id = {},
+                                         .expected_payload_count = 1,
+                                         .expected_logical_bytes = 1});
+        });
+        const bool entered = backend->WaitForGate();
+        if (!entered) backend->Release();
+        ASSERT_TRUE(entered);
+        auto stopped = std::async(std::launch::async,
+                                  [&] { service_->StopBatchOpLogWriter(); });
+        const auto mutation_status = mutation.wait_for(std::chrono::seconds(3));
+        if (mutation_status != std::future_status::ready) {
+            backend->Release();
+            stopped.get();
+        }
+        const auto imported = mutation.get();
+        if (imported && stopped.valid()) {
+            backend->Release();
+            stopped.get();
+        }
+        ASSERT_EQ(std::future_status::ready, mutation_status);
+        ASSERT_FALSE(imported.has_value());
+        EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, imported.error());
+        const bool writer_stop_pending =
+            stopped.wait_for(std::chrono::milliseconds(0)) !=
+            std::future_status::ready;
+        RecordProperty("writer_stop_pending_after_rpc_failure",
+                       writer_stop_pending);
+        EXPECT_TRUE(writer_stop_pending);
+
+        manager->Start();
+        std::optional<LoadedSnapshot> snapshot;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!snapshot && std::chrono::steady_clock::now() < deadline) {
+            auto loaded = (*provider)->LoadLatestSnapshot(cluster);
+            if (loaded && loaded->has_value()) snapshot = std::move(**loaded);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        manager.reset();
+        backend->Release();
+        stopped.get();
+        ASSERT_FALSE(backend->TimedOut());
+        RecordProperty("snapshot_after_writer_stop", snapshot.has_value());
+
+        StandbyMetadataStore standby;
+        const auto sequence = snapshot ? snapshot->snapshot_sequence_id : 0;
+        RecordProperty("snapshot_sequence_after_writer_stop", sequence);
+        if (snapshot) {
+            ASSERT_TRUE(
+                standby.RestoreWeightMetadata(snapshot->weight_metadata));
+        }
+        OpLogApplier applier(&standby, cluster);
+        applier.Recover(sequence);
+        StandbyMetadataStore replay_all;
+        OpLogApplier replay_all_applier(&replay_all, cluster);
+        replay_all_applier.Recover(0);
+        OpLogBatchStorage storage(cluster, *backend);
+        DurablePrefix prefix;
+        ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+        ASSERT_EQ(1u, prefix.batch_id);
+        for (uint64_t id = 1; id <= prefix.batch_id; ++id) {
+            OpLogBatchRecord batch;
+            ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(id, batch));
+            for (const auto& entry : batch.entries) {
+                ASSERT_TRUE(replay_all_applier.ApplyOpLogEntry(entry));
+                if (entry.sequence_id > sequence) {
+                    ASSERT_TRUE(applier.ApplyOpLogEntry(entry));
+                }
+            }
+        }
+        const auto expected = replay_all.GetWeightMetadata(identity);
+        const auto recovered = standby.GetWeightMetadata(identity);
+        ASSERT_TRUE(expected.has_value());
+        ASSERT_TRUE(recovered.has_value())
+            << "durable Begin was omitted at snapshot sequence " << sequence;
+        EXPECT_EQ(*expected, *recovered);
+    }
+
 #ifdef STORE_USE_ETCD
     void CreateEtcdHASnapshotService(const std::string& cluster_id,
                                      const std::string& etcd_endpoints,
@@ -587,6 +698,11 @@ TEST_F(SnapshotChildProcessTest, WeightSnapshotWaitsForDurablePublication) {
 TEST_F(SnapshotChildProcessTest, WeightSnapshotStopWhilePublicationPending) {
     CheckWeightSnapshotBoundary(SnapshotBoundaryBackend::Gate::DurableTxn,
                                 true);
+}
+
+TEST_F(SnapshotChildProcessTest,
+       WeightSnapshotPreservesDurableBeginOnWriterStop) {
+    CheckWeightSnapshotAfterWriterStop();
 }
 
 TEST_F(SnapshotChildProcessTest, FormatTimestamp_MatchesExpectedFormat) {

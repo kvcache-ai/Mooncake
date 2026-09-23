@@ -162,6 +162,18 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
                 close(log_pipe[1]);
                 continue;
             }
+            // A terminal writer can release failed callers before an uncertain
+            // durable write has finished. Keep its log available for recovery.
+            if (master_service_->enable_oplog_ &&
+                (!master_service_->ordered_oplog_writer_ ||
+                 !master_service_->ordered_oplog_writer_->IsAccepting())) {
+                LOG(INFO) << "[Snapshot] Skipping snapshot while OpLog writer "
+                             "is not accepting, snapshot_id="
+                          << snapshot_id;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
             auto captured_descriptor = BuildSnapshotDescriptor(
                 snapshot_id, manifest_path, path_prefix);
             if (!captured_descriptor) {
