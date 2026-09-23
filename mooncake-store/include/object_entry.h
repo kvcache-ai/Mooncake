@@ -2,7 +2,8 @@
 
 // ObjectEntry: the per-object runtime shell. The ObjectMetadata envelope is
 // the single source of identity (user_key, group_id) and group-lease wiring;
-// the entry adds the per-key runtime state and owns the lock guarding both.
+// the entry adds the per-key runtime state, the flag marking the one
+// publication it stands for, and the lock guarding all of it.
 //
 // The lock never leaves the class: everything below the identity is reachable
 // only through WithExclusiveAccess or WithSharedAccess, which hold it for the
@@ -10,7 +11,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -58,14 +58,11 @@ class ObjectEntry {
     const std::string& key() const noexcept { return metadata_->user_key; }
     const std::string& group_id() const noexcept { return metadata_->group_id; }
 
-    // Monotonic generation assigned by ObjectIndex at route publication. It is
-    // the entry's identity for a caller that holds the key rather than the
-    // handle, since publishing again assigns a new one; re-publishing an entry
-    // renumbers it in place, so a caller reads this once and keeps the value.
-    // Comparable only inside one route, and 0 means never published: every
-    // check on a generation rejects 0.
-    [[nodiscard]] uint64_t generation() const noexcept {
-        return generation_.load(std::memory_order_relaxed);
+    // True once the route has published this entry. An entry instance stands
+    // for exactly one publication — `ObjectIndex::Insert` asserts that it is
+    // published once — so a handle names one publication and no more.
+    [[nodiscard]] bool IsPublished() const noexcept {
+        return published_.load(std::memory_order_relaxed);
     }
 
     // Runs `fn(envelope, state)` with the entry held exclusively and returns
@@ -86,13 +83,12 @@ class ObjectEntry {
     }
 
    private:
-    friend class ObjectIndex;  // assigns generation_ at route publication
+    friend class ObjectIndex;  // claims the entry at route publication
 
     std::unique_ptr<ObjectMetadata> metadata_;
-    // Atomic because publication writes it under the route lock while a holder
-    // reads it without any lock. Relaxed: the number is only compared, it
-    // carries no other state.
-    std::atomic<uint64_t> generation_{0};
+    // Atomic because publication claims it under the route lock while a holder
+    // reads it without any lock. Relaxed: the flag carries no other state.
+    std::atomic<bool> published_{false};
     // Mutable so a const entry can still be read under the shared lock.
     mutable std::shared_mutex mutex_;
     State state_ GUARDED_BY(mutex_);

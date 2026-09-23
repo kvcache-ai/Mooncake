@@ -4,13 +4,13 @@
 #include <atomic>
 #include <cassert>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -32,9 +32,9 @@ namespace mooncake {
 // tenant memory for write concurrency and is a template parameter rather than
 // a constant.
 //
-// A member records the generation of the object that registered it, so the
-// teardown of an older object of the same key leaves a newer one's membership
-// alone.
+// Membership is a set of member keys. Which publication a member belongs to is
+// settled by the caller (see Tenant::RemoveObject) before a membership is
+// dropped, so this table keeps no identity of its own.
 template <size_t StripeCount>
 class StripedGroupIndex {
    public:
@@ -45,20 +45,14 @@ class StripedGroupIndex {
     // group itself is dropped with its last member.
     //
     // Re-registering a member returns the same lease, because membership is a
-    // set and a repeat is not an error; a repeat by a newer generation replaces
-    // the stored one. An empty group_id is the ungrouped case: it joins no
-    // group and gets no lease, so no ungrouped object is ever registered here.
-    //
-    // `generation` is the entry's published one: the assertion is the only
-    // guard, and a release build that stored 0 would register a membership
-    // `RemoveMember` can never drop, since that rejects 0.
-    [[nodiscard]] std::shared_ptr<Lease> AddMember(std::string_view group_id,
-                                                   std::string_view member_key,
-                                                   uint64_t generation) {
+    // set and a repeat is not an error. An empty group_id is the ungrouped
+    // case: it joins no group and gets no lease, so no ungrouped object is ever
+    // registered here.
+    [[nodiscard]] std::shared_ptr<Lease> AddMember(
+        std::string_view group_id, std::string_view member_key) {
         if (group_id.empty()) {
             return nullptr;
         }
-        assert(generation != 0);
         auto& stripe = StripeFor(group_id);
         std::unique_lock<std::shared_mutex> lock(stripe.mutex);
         auto [it, inserted] = stripe.groups.try_emplace(std::string(group_id));
@@ -66,20 +60,15 @@ class StripedGroupIndex {
             it->second.lease = std::make_shared<Lease>();
             group_count_.fetch_add(1, std::memory_order_relaxed);
         }
-        it->second.member_keys.insert_or_assign(std::string(member_key),
-                                                generation);
+        it->second.member_keys.insert(std::string(member_key));
         return it->second.lease;
     }
 
-    // Drops a membership only when the stored generation is the one the caller
-    // recorded, so a teardown of an older object of the same key cannot take
-    // the membership a newer one registered.
+    // Drops a membership. The caller has already established that the member
+    // it is unwinding is the one the route publishes, so a teardown of an older
+    // object of the same key never reaches this call.
     [[nodiscard]] bool RemoveMember(std::string_view group_id,
-                                    std::string_view member_key,
-                                    uint64_t generation) {
-        if (generation == 0) {
-            return false;
-        }
+                                    std::string_view member_key) {
         auto& stripe = StripeFor(group_id);
         std::unique_lock<std::shared_mutex> lock(stripe.mutex);
         auto it = stripe.groups.find(group_id);
@@ -89,8 +78,7 @@ class StripedGroupIndex {
         // Heterogeneous lookup, then erase by iterator: the container has no
         // heterogeneous erase of its own.
         const auto member = it->second.member_keys.find(member_key);
-        if (member == it->second.member_keys.end() ||
-            member->second != generation) {
+        if (member == it->second.member_keys.end()) {
             return false;
         }
         it->second.member_keys.erase(member);
@@ -112,7 +100,7 @@ class StripedGroupIndex {
         std::vector<std::string> members;
         members.reserve(it->second.member_keys.size());
         for (const auto& member : it->second.member_keys) {
-            members.push_back(member.first);
+            members.push_back(member);
         }
         return members;
     }
@@ -125,9 +113,7 @@ class StripedGroupIndex {
 
    private:
     struct GroupState {
-        // Member key -> the generation that registered it.
-        std::unordered_map<std::string, uint64_t, TransparentStringHash,
-                           std::equal_to<>>
+        std::unordered_set<std::string, TransparentStringHash, std::equal_to<>>
             member_keys;
         std::shared_ptr<Lease> lease;
 

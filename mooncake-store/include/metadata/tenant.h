@@ -4,17 +4,15 @@
 // in-flight replica-action leases, the promotion-candidate index and the bound
 // quota account.
 //
-// Every method is internally synchronized: each container guards its own
-// state, and an object's fields are only touched under that entry's own lock.
-// No lock is held across calls.
+// Identity is the entry handle: an entry stands for exactly one publication, so
+// `EraseObjectIf` recognises an object by the handle a caller holds. Mutating a
+// published object goes through `WithPublishedObject`, which re-checks that
+// under the entry lock, and `RemoveObject` drops what a key carries — group
+// membership, replica-action leases, the promotion-candidate index entry.
 //
-// A handle keeps an entry alive, not current. Identity is therefore stated in
-// two ways: by handle where the caller holds one (`EraseObjectIf`), and by the
-// generation assigned at publication where it holds only the key
-// (`IsCurrent`, `RemoveObjectIfGeneration`). Everything stored under a key —
-// membership, the per-object lease index, the promotion-candidate index —
-// carries that generation, and mutating the published object of a key goes
-// through `WithPublishedObject`, which re-checks identity under the entry lock.
+// Every method synchronizes internally. Lock order: entry lock, route lock,
+// then this tenant's indexes. Only `RemoveObject` holds the route lock across
+// those indexes, and nothing takes the route lock while holding one of them.
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -53,8 +52,8 @@ class Tenant {
                 if (inserted && !group_id.empty()) {
                     // AddMember returns null only for an empty group_id, which
                     // the guard above already excluded.
-                    metadata.lease_ = group_index_.AddMember(
-                        group_id, entry->key(), entry->generation());
+                    metadata.lease_ =
+                        group_index_.AddMember(group_id, entry->key());
                     assert(metadata.lease_ != nullptr);
                 }
             });
@@ -64,12 +63,6 @@ class Tenant {
     // Null when the key is absent.
     [[nodiscard]] std::shared_ptr<ObjectEntry> Get(std::string_view key) const {
         return object_index_.Get(key);
-    }
-
-    // True while the route publishes `generation` for `key`; 0 never matches.
-    [[nodiscard]] bool IsCurrent(std::string_view key,
-                                 uint64_t generation) const {
-        return object_index_.IsCurrent(key, generation);
     }
 
     // Erases the route slot only when it still resolves to `expected`, without
@@ -84,46 +77,47 @@ class Tenant {
         return object_index_.EraseIf(expected->key(), expected);
     }
 
-    // Removes a torn-down object: its route slot, its group membership and the
-    // replica-action leases of its key. Erasing the slot and dropping the
-    // records are keyed on the same generation, so one call takes the whole of
-    // one publication or touches nothing of another — including the case where
-    // the same entry was published again and renumbered in place. The records
-    // go even when the slot was already gone, because a publish that failed
-    // after InsertObject registered them still has to be undone; the return
-    // value says whether the slot was erased.
+    // Removes a torn-down object: its route slot and what the key carries
+    // (group membership, replica-action leases, the promotion-candidate index
+    // entry). Ownership and the drop happen under one hold of the route lock,
+    // so a publication that replaces this one cannot have its records dropped
+    // in between:
+    //
+    // - the slot holds `entry`: it owns the records, so they go with the slot;
+    // - the slot holds another entry: that publication owns them, so none is
+    //   touched;
+    // - the slot is empty: no publication owns them, so they go — this undoes
+    //   the records a publish registered before it failed.
+    //
+    // Returns whether the slot was erased, which a false answer does not tell
+    // apart from the case that keeps the records. Callers hold the entry's own
+    // lock, so a publication still wiring its state cannot be torn down
+    // half-registered.
     [[nodiscard]] bool RemoveObject(const std::shared_ptr<ObjectEntry>& entry) {
         if (entry == nullptr) {
             return false;
         }
-        const uint64_t generation = entry->generation();
-        const bool erased =
-            object_index_.EraseIfGeneration(entry->key(), generation);
-        UnregisterGroupMember(entry, generation);
-        lease_table_.EraseForObject(entry->key(), generation);
-        return erased;
-    }
-
-    // For a caller that holds the key and a recorded generation rather than the
-    // handle: a completion callback, or a scan acting on what it recorded.
-    [[nodiscard]] bool RemoveObjectIfGeneration(std::string_view key,
-                                                uint64_t generation) {
-        if (generation == 0) {
-            return false;
-        }
-        const auto entry = object_index_.Get(key);
-        if (entry == nullptr || entry->generation() != generation) {
-            return false;
-        }
-        return RemoveObject(entry);
+        return object_index_.WithExclusiveRoute([&](auto& route) {
+            const auto it = route.find(entry->key());
+            if (it != route.end() && it->second != entry) {
+                return false;
+            }
+            const bool erased = it != route.end();
+            if (erased) {
+                route.erase(it);
+            }
+            UnregisterGroupMember(entry);
+            lease_table_.EraseForObject(entry->key());
+            UnindexPromotionCandidate(entry->key());
+            return erased;
+        });
     }
 
     // Runs `fn(metadata, state)` on the entry the route currently publishes for
     // `key`, under that entry's own lock, and only once it has re-checked under
-    // that lock that the slot still publishes the same generation and that the
-    // entry is not torn down. False without running `fn` otherwise, so a caller
-    // that kept a handle from before resolves the key again instead of acting
-    // on it.
+    // that lock that the slot still publishes this entry and that the entry is
+    // not torn down. False without running `fn` otherwise, so a caller that
+    // kept a handle from before resolves the key again instead of acting on it.
     //
     // The callback runs inside the entry's lock, which is not recursive: it
     // must not call back into `WithPublishedObject` for the same key, nor
@@ -137,7 +131,7 @@ class Tenant {
         return entry->WithExclusiveAccess(
             [&](ObjectMetadata& metadata, ObjectEntry::State& state) -> bool {
                 if (state.is_torn_down ||
-                    !object_index_.IsCurrent(key, entry->generation())) {
+                    !object_index_.IsCurrent(key, entry)) {
                     return false;
                 }
                 std::forward<Fn>(fn)(metadata, state);
@@ -171,16 +165,15 @@ class Tenant {
     // Drops a grouped entry's membership, without touching the route slot or
     // the leases; `RemoveObject` calls it as one step of a teardown, and
     // rebuilding membership state calls it on its own. The group and the key
-    // come from the entry, and `generation` is the one the caller captured for
-    // this operation: reading it off the entry here would race with the entry
-    // being published again, which renumbers it.
-    void UnregisterGroupMember(const std::shared_ptr<ObjectEntry>& entry,
-                               uint64_t generation) {
+    // come from the entry. Callers must have established that this entry is the
+    // one the route publishes, which is what keeps a teardown from dropping the
+    // membership a newer publication of the same key registered.
+    void UnregisterGroupMember(const std::shared_ptr<ObjectEntry>& entry) {
         const std::string& group_id = entry->group_id();
         if (group_id.empty()) {
             return;
         }
-        (void)group_index_.RemoveMember(group_id, entry->key(), generation);
+        (void)group_index_.RemoveMember(group_id, entry->key());
     }
 
     // The member keys of one group, as a snapshot to re-resolve: a group can be
@@ -225,8 +218,7 @@ class Tenant {
             if (group_id.empty()) {
                 continue;
             }
-            auto lease = group_index_.AddMember(group_id, entry->key(),
-                                                entry->generation());
+            auto lease = group_index_.AddMember(group_id, entry->key());
             // A non-empty group_id always yields a lease, as in InsertObject.
             assert(lease != nullptr);
             const auto it = max_deadline_by_group.find(group_id);
@@ -243,21 +235,16 @@ class Tenant {
     // --- In-flight replica-action leases ------------------------------------
 
     // Clears the replica-action state of one object: the pending proposal, the
-    // cooldown, and the leases of its generation. The caller passes the state
-    // it already holds under the entry's lock, so this joins a larger critical
+    // cooldown, and the leases of its key. The caller passes the state it
+    // already holds under the entry's lock, so this joins a larger critical
     // section rather than taking the entry lock again. `RemoveObject` is the
     // teardown path; this is the reset path, which leaves the object routed.
-    //
-    // Reading the entry's generation here is safe only because of that held
-    // lock: publishing the same instance again renumbers it, and a republish
-    // takes the same lock. A path without the lock captures the generation
-    // itself, the way `RemoveObject` does.
     void ResetDynamicReplicationState(
         ObjectEntry::State& state, const std::shared_ptr<ObjectEntry>& entry) {
         assert(entry != nullptr);
         state.dynamic_replication_pending.reset();
         state.dynamic_replication_cooldown = {};
-        lease_table_.EraseForObject(entry->key(), entry->generation());
+        lease_table_.EraseForObject(entry->key());
     }
 
     [[nodiscard]] std::optional<ReplicaActionLease> FindDynamicReplicationLease(
@@ -265,14 +252,14 @@ class Tenant {
         return lease_table_.Find(proposal_id);
     }
 
-    // The entry carries the key and the generation together, so a proposal
-    // cannot be registered under a pair that does not belong to one object.
+    // The entry names the object the proposal belongs to, so a proposal cannot
+    // be registered under a key that is not the entry's own.
     void PutDynamicReplicationLease(const std::shared_ptr<ObjectEntry>& entry,
                                     const UUID& proposal_id,
                                     ReplicaActionLease lease) {
         assert(entry != nullptr);
         assert(lease.key == entry->key());
-        lease_table_.Put(proposal_id, std::move(lease), entry->generation());
+        lease_table_.Put(proposal_id, std::move(lease));
     }
 
     [[nodiscard]] bool RemoveDynamicReplicationLease(const UUID& proposal_id) {
@@ -289,25 +276,18 @@ class Tenant {
     // entry's own state stays the source of truth; this only lets the retry
     // loop enumerate candidates without walking the whole route.
 
-    // `generation` is the entry's published one: the assertion is the only
-    // guard, and a release build that stored 0 would index a key that
-    // UnindexPromotionCandidate can never remove, since that rejects 0.
-    void IndexPromotionCandidate(const std::string& key, uint64_t generation) {
-        assert(generation != 0);
+    // `key` names the object whose candidate this is. A stale caller cannot
+    // unindex a newer publication's candidate: `RemoveObject` only reaches the
+    // index after it has established that the entry it is unwinding is the one
+    // the route publishes.
+    void IndexPromotionCandidate(const std::string& key) {
         std::lock_guard<std::mutex> lock(promotion_candidate_keys_mutex_);
-        promotion_candidate_keys_.insert_or_assign(key, generation);
+        promotion_candidate_keys_.insert(key);
     }
 
-    void UnindexPromotionCandidate(const std::string& key,
-                                   uint64_t generation) {
-        if (generation == 0) {
-            return;
-        }
+    void UnindexPromotionCandidate(const std::string& key) {
         std::lock_guard<std::mutex> lock(promotion_candidate_keys_mutex_);
-        const auto it = promotion_candidate_keys_.find(key);
-        if (it != promotion_candidate_keys_.end() && it->second == generation) {
-            promotion_candidate_keys_.erase(it);
-        }
+        promotion_candidate_keys_.erase(key);
     }
 
     [[nodiscard]] std::vector<std::string> PromotionCandidateKeys() const {
@@ -315,7 +295,7 @@ class Tenant {
         std::vector<std::string> keys;
         keys.reserve(promotion_candidate_keys_.size());
         for (const auto& candidate : promotion_candidate_keys_) {
-            keys.push_back(candidate.first);
+            keys.push_back(candidate);
         }
         return keys;
     }
@@ -348,8 +328,8 @@ class Tenant {
     std::atomic<TenantQuotaHandle> quota_account_{nullptr};
 
     mutable std::mutex promotion_candidate_keys_mutex_;
-    // Candidate key -> the generation that indexed it.
-    std::unordered_map<std::string, uint64_t> promotion_candidate_keys_;
+    // The keys whose published object carries a promotion candidate.
+    std::unordered_set<std::string> promotion_candidate_keys_;
 };
 
 }  // namespace metadata

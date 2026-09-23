@@ -12,8 +12,9 @@
 // id finds a lease, the object key finds the proposals in flight for it, and a
 // deadline heap orders the expiry sweep.
 //
-// Each proposal records the generation of the object it belongs to, so a
-// teardown retracts the proposals of one publication and no others.
+// Which publication a retracted proposal belonged to is settled by the caller
+// (see Tenant::RemoveObject) before it reaches this table, so the table keeps
+// no identity of its own.
 
 #include <cassert>
 #include <chrono>
@@ -26,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -49,18 +51,15 @@ class DynamicReplicationLeaseTable {
                    : std::make_optional<ReplicaActionLease>(it->second);
     }
 
-    // Record the lease, replacing any lease already held for the proposal, and
-    // remember the publication generation of the object it belongs to.
-    void Put(const UUID& proposal_id, ReplicaActionLease lease,
-             uint64_t generation) {
-        assert(generation != 0);
+    // Record the lease, replacing any lease already held for the proposal.
+    void Put(const UUID& proposal_id, ReplicaActionLease lease) {
         assert(lease.proposal_id == proposal_id);
         std::unique_lock<std::shared_mutex> lock(mutex_);
         const auto it = leases_.find(proposal_id);
         if (it != leases_.end() && it->second.key != lease.key) {
             Unindex(it->second.key, proposal_id);
         }
-        by_key_[lease.key].insert_or_assign(proposal_id, generation);
+        by_key_[lease.key].insert(proposal_id);
         const int64_t expire_at = lease.expire_at_ms_epoch;
         leases_.insert_or_assign(proposal_id, std::move(lease));
         // The deadline this replaces stays in the heap and is dropped when it
@@ -83,27 +82,16 @@ class DynamicReplicationLeaseTable {
 
     // Retract every lease for an object key, for a teardown that must not leave
     // a client acting on a key that is gone.
-    void EraseForObject(std::string_view key, uint64_t generation) {
-        if (generation == 0) {
-            return;
-        }
+    void EraseForObject(std::string_view key) {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         const auto it = by_key_.find(key);
         if (it == by_key_.end()) {
             return;
         }
-        auto proposal = it->second.begin();
-        while (proposal != it->second.end()) {
-            if (proposal->second != generation) {
-                ++proposal;
-                continue;
-            }
-            leases_.erase(proposal->first);
-            proposal = it->second.erase(proposal);
+        for (const auto& proposal_id : it->second) {
+            leases_.erase(proposal_id);
         }
-        if (it->second.empty()) {
-            by_key_.erase(it);
-        }
+        by_key_.erase(it);
     }
 
     // Drop the leases whose deadline has passed.
@@ -160,10 +148,9 @@ class DynamicReplicationLeaseTable {
 
     mutable std::shared_mutex mutex_;
     std::unordered_map<UUID, ReplicaActionLease, boost::hash<UUID>> leases_;
-    // The proposals in flight per object key: proposal -> the generation it was
-    // registered under, so a teardown retracts its own without scanning.
-    std::unordered_map<std::string,
-                       std::unordered_map<UUID, uint64_t, boost::hash<UUID>>,
+    // The proposals in flight per object key, so a teardown retracts the ones
+    // it is unwinding without scanning the table.
+    std::unordered_map<std::string, std::unordered_set<UUID, boost::hash<UUID>>,
                        TransparentStringHash, std::equal_to<>>
         by_key_;
     // One node per Put, so a repeat leaves a superseded node behind.

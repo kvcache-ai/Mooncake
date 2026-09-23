@@ -9,11 +9,6 @@
 namespace mooncake {
 namespace {
 
-// The publication generation the proposals in these tests belong to. Most cases
-// are about the table itself, so one non-zero value is enough; the one about
-// replacement uses a second.
-constexpr uint64_t kGeneration = 7;
-
 // A lease for `proposal_id` with the deadline given outright, so a suite
 // decides when it expires.
 ReplicaActionLease MakeLease(const UUID& proposal_id, const std::string& key,
@@ -39,7 +34,7 @@ TEST(DynamicReplicationLeaseTableTest, IsKeyedByProposalId) {
     // An in-flight proposal keeps the table non-empty until it is removed or
     // expires.
     const UUID proposal{1, 2};
-    table.Put(proposal, MakeLease(proposal, "k1", 0), kGeneration);
+    table.Put(proposal, MakeLease(proposal, "k1", 0));
     EXPECT_FALSE(table.Empty());
 
     auto found = table.Find(proposal);
@@ -58,15 +53,15 @@ TEST(DynamicReplicationLeaseTableTest, IsKeyedByProposalId) {
 TEST(DynamicReplicationLeaseTableTest, ReplaceMovesTheProposalToItsNewKey) {
     DynamicReplicationLeaseTable table;
     const UUID proposal{1, 2};
-    table.Put(proposal, MakeLease(proposal, "k1", 0), kGeneration);
-    table.Put(proposal, MakeLease(proposal, "k2", 0), kGeneration);
+    table.Put(proposal, MakeLease(proposal, "k1", 0));
+    table.Put(proposal, MakeLease(proposal, "k2", 0));
 
     // Retracting the old key must not touch a lease that no longer sits under
     // it, and the key the lease moved to is the one that retracts it.
-    table.EraseForObject("k1", kGeneration);
+    table.EraseForObject("k1");
     EXPECT_TRUE(table.Find(proposal).has_value());
 
-    table.EraseForObject("k2", kGeneration);
+    table.EraseForObject("k2");
     EXPECT_FALSE(table.Find(proposal).has_value());
 }
 
@@ -76,46 +71,51 @@ TEST(DynamicReplicationLeaseTableTest,
     const UUID first{1, 2};
     const UUID second{3, 4};
     const UUID other_key{5, 6};
-    table.Put(first, MakeLease(first, "k1", 0), kGeneration);
+    table.Put(first, MakeLease(first, "k1", 0));
     // Several proposals may be in flight for one key.
-    table.Put(second, MakeLease(second, "k1", 0), kGeneration);
-    table.Put(other_key, MakeLease(other_key, "k2", 0), kGeneration);
+    table.Put(second, MakeLease(second, "k1", 0));
+    table.Put(other_key, MakeLease(other_key, "k2", 0));
 
-    table.EraseForObject("k1", kGeneration);
+    table.EraseForObject("k1");
 
     EXPECT_FALSE(table.Find(first).has_value());
     EXPECT_FALSE(table.Find(second).has_value());
     EXPECT_TRUE(table.Find(other_key).has_value());
 
     // Nothing left to retract.
-    table.EraseForObject("k1", kGeneration);
+    table.EraseForObject("k1");
     EXPECT_TRUE(table.Find(other_key).has_value());
 }
 
 TEST(DynamicReplicationLeaseTableTest,
-     ErasingForAnObjectSparesANewerGeneration) {
+     ErasingForAnObjectRetractsEveryProposalOfThatKey) {
     DynamicReplicationLeaseTable table;
-    constexpr uint64_t kNewer = kGeneration + 1;
-    const UUID older{1, 2};
-    const UUID newer{3, 4};
-    table.Put(older, MakeLease(older, "k1", 0), kGeneration);
-    table.Put(newer, MakeLease(newer, "k1", 0), kNewer);
+    const UUID first{1, 2};
+    const UUID second{3, 4};
+    const UUID other_key{5, 6};
+    const UUID third_key{7, 8};
+    // Several proposals may be in flight for one key at once, so a retraction
+    // for that key takes all of them rather than one.
+    table.Put(first, MakeLease(first, "k1", 0));
+    table.Put(second, MakeLease(second, "k1", 0));
+    table.Put(other_key, MakeLease(other_key, "k2", 0));
+    table.Put(third_key, MakeLease(third_key, "k3", 0));
 
-    // A teardown of the older object retracts that object's proposal and leaves
-    // the one a newer object registered: the client is still acting on it.
-    table.EraseForObject("k1", kGeneration);
-    EXPECT_FALSE(table.Find(older).has_value());
-    EXPECT_TRUE(table.Find(newer).has_value());
+    table.EraseForObject("k1");
 
-    // A generation that registered nothing leaves the table alone, and 0 is
-    // rejected outright.
-    table.EraseForObject("k1", kNewer + 1);
-    table.EraseForObject("k1", 0);
-    EXPECT_TRUE(table.Find(newer).has_value());
+    EXPECT_FALSE(table.Find(first).has_value());
+    EXPECT_FALSE(table.Find(second).has_value());
+    EXPECT_TRUE(table.Find(other_key).has_value());
+    EXPECT_TRUE(table.Find(third_key).has_value());
 
-    table.EraseForObject("k1", kNewer);
-    EXPECT_FALSE(table.Find(newer).has_value());
-    EXPECT_TRUE(table.Empty());
+    // The retracted key indexes its proposals again, and a key the retraction
+    // never named keeps both its lease and its index entry.
+    table.Put(first, MakeLease(first, "k1", 0));
+    EXPECT_TRUE(table.Find(first).has_value());
+    table.EraseForObject("k1");
+    EXPECT_FALSE(table.Find(first).has_value());
+    EXPECT_TRUE(table.Find(other_key).has_value());
+    EXPECT_TRUE(table.Find(third_key).has_value());
 }
 
 TEST(DynamicReplicationLeaseTableTest, ErasingExpiredKeepsTheLiveOnes) {
@@ -125,10 +125,8 @@ TEST(DynamicReplicationLeaseTableTest, ErasingExpiredKeepsTheLiveOnes) {
     const UUID live{3, 4};
     // One key on purpose: the sweep has to drop the expired proposal without
     // taking the live one, or its key, out with it.
-    table.Put(expired, MakeLease(expired, "k1", EpochMillis(now) - 1),
-              kGeneration);
-    table.Put(live, MakeLease(live, "k1", EpochMillis(now) + 60'000),
-              kGeneration);
+    table.Put(expired, MakeLease(expired, "k1", EpochMillis(now) - 1));
+    table.Put(live, MakeLease(live, "k1", EpochMillis(now) + 60'000));
 
     table.EraseExpired(now);
 
@@ -136,7 +134,7 @@ TEST(DynamicReplicationLeaseTableTest, ErasingExpiredKeepsTheLiveOnes) {
     EXPECT_TRUE(table.Find(live).has_value());
 
     // The key still retracts what is left under it.
-    table.EraseForObject("k1", kGeneration);
+    table.EraseForObject("k1");
     EXPECT_FALSE(table.Find(live).has_value());
 }
 
@@ -144,10 +142,9 @@ TEST(DynamicReplicationLeaseTableTest, SweepKeepsALeaseExtendedPastTheOldOne) {
     DynamicReplicationLeaseTable table;
     const auto now = std::chrono::system_clock::now();
     const UUID proposal{1, 2};
-    table.Put(proposal, MakeLease(proposal, "k1", EpochMillis(now) + 1'000),
-              kGeneration);
+    table.Put(proposal, MakeLease(proposal, "k1", EpochMillis(now) + 1'000));
     const int64_t extended = EpochMillis(now) + 60'000;
-    table.Put(proposal, MakeLease(proposal, "k1", extended), kGeneration);
+    table.Put(proposal, MakeLease(proposal, "k1", extended));
 
     // The first deadline is still queued; it must not take the live lease out.
     table.EraseExpired(now + std::chrono::seconds(10));
@@ -164,8 +161,7 @@ TEST(DynamicReplicationLeaseTableTest, SweepToleratesARemovedLeasesDeadline) {
     DynamicReplicationLeaseTable table;
     const auto now = std::chrono::system_clock::now();
     const UUID proposal{1, 2};
-    table.Put(proposal, MakeLease(proposal, "k1", EpochMillis(now) + 1'000),
-              kGeneration);
+    table.Put(proposal, MakeLease(proposal, "k1", EpochMillis(now) + 1'000));
     ASSERT_TRUE(table.Remove(proposal));
 
     // The deadline is still queued even though the lease is gone.

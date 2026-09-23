@@ -2,7 +2,6 @@
 
 #include <cassert>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -20,9 +19,9 @@ namespace mooncake {
 // The object route for one tenant: a flat map from object key to a strong
 // ObjectEntry handle.
 //
-// A strong handle keeps the entry alive, not current. A caller holding one
-// states identity by comparing handles (EraseIf); a caller holding only the key
-// states it by the generation it recorded (IsCurrent, EraseIfGeneration).
+// Identity is the handle: a lookup that hands back the same handle names the
+// same publication, and an entry instance stands for exactly one publication,
+// so comparing handles is the whole of the identity check.
 class ObjectIndex {
    public:
     // nullptr when the key is absent. The returned handle is strong, so it
@@ -39,16 +38,21 @@ class ObjectIndex {
     //
     // The route key is the entry's own key, so the slot it lands in and the
     // key every lookup, revalidation and erase uses cannot disagree.
+    //
+    // An entry is published at most once, which is asserted below: a handle
+    // names a publication only while one instance stands for one publication,
+    // so publishing the same instance twice is a caller bug rather than a
+    // rejected duplicate.
     [[nodiscard]] bool Insert(std::shared_ptr<ObjectEntry> entry) {
         assert(entry != nullptr);
+        assert(!entry->IsPublished());
         std::unique_lock<std::shared_mutex> lock(route_lock_);
         const auto [it, inserted] =
             route_.try_emplace(entry->key(), std::move(entry));
         if (!inserted) {
             return false;
         }
-        it->second->generation_.store(++generation_counter_,
-                                      std::memory_order_relaxed);
+        it->second->published_.store(true, std::memory_order_relaxed);
         return true;
     }
 
@@ -69,31 +73,25 @@ class ObjectIndex {
         return true;
     }
 
-    // True while the route publishes `generation` for `key`; 0 never matches.
-    [[nodiscard]] bool IsCurrent(std::string_view key,
-                                 uint64_t generation) const {
-        if (generation == 0) {
+    // True while the route publishes exactly `entry` for `key`.
+    [[nodiscard]] bool IsCurrent(
+        std::string_view key, const std::shared_ptr<ObjectEntry>& entry) const {
+        if (entry == nullptr) {
             return false;
         }
         std::shared_lock<std::shared_mutex> lock(route_lock_);
         const auto it = route_.find(key);
-        return it != route_.end() && it->second->generation() == generation;
+        return it != route_.end() && it->second == entry;
     }
 
-    // Erase the slot for `key` only while it still publishes `generation`, for
-    // a caller that holds a recorded generation instead of the handle.
-    [[nodiscard]] bool EraseIfGeneration(std::string_view key,
-                                         uint64_t generation) {
-        if (generation == 0) {
-            return false;
-        }
+    // Runs `fn(route)` with the route held exclusively. The tenant layer uses
+    // this to decide which publication owns a key's records and drop those
+    // records in one section, so a publication that replaced the one being torn
+    // down cannot have its records dropped in between.
+    template <typename Fn>
+    decltype(auto) WithExclusiveRoute(Fn&& fn) {
         std::unique_lock<std::shared_mutex> lock(route_lock_);
-        const auto it = route_.find(key);
-        if (it == route_.end() || it->second->generation() != generation) {
-            return false;
-        }
-        route_.erase(it);
-        return true;
+        return std::forward<Fn>(fn)(route_);
     }
 
     [[nodiscard]] bool Contains(std::string_view key) const {
@@ -136,9 +134,6 @@ class ObjectIndex {
     std::unordered_map<std::string, std::shared_ptr<ObjectEntry>,
                        TransparentStringHash, std::equal_to<>>
         route_;
-    // Monotonic publication counter backing ObjectEntry::generation(). Only
-    // read and bumped while route_lock_ is held for writing.
-    uint64_t generation_counter_{0};
 };
 
 }  // namespace mooncake

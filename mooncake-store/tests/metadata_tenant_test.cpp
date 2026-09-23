@@ -105,21 +105,25 @@ TEST(TenantTest, EraseObjectIfHonoursTheEntryIdentity) {
     EXPECT_FALSE(tenant.EraseObjectIf(entry));
 }
 
-TEST(TenantTest, RemoveObjectDropsRouteGroupAndLeasesTogether) {
+TEST(TenantTest, RemoveObjectDropsEveryRecordOfTheEntryTheSlotHolds) {
     Tenant tenant;
     auto entry = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(entry));
     tenant.PutDynamicReplicationLease(entry, UUID{7, 8},
                                       LeaseFor(entry, UUID{7, 8}));
+    tenant.IndexPromotionCandidate("k1");
     ASSERT_FALSE(tenant.Empty());
+    ASSERT_EQ(tenant.PromotionCandidateKeys().size(), 1u);
 
+    // The slot names this entry, so every record the key carries is its own and
+    // a teardown drops all of them in one call: the group membership, the
+    // leases still in flight, the candidate index entry and the slot itself.
     EXPECT_TRUE(tenant.RemoveObject(entry));
 
-    // One call drops what a teardown otherwise drops by hand: the route slot,
-    // the group membership and the leases still in flight for that key.
     EXPECT_FALSE(tenant.ContainsObject("k1"));
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
     EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
+    EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());
     EXPECT_TRUE(tenant.Empty());
 }
 
@@ -142,7 +146,7 @@ TEST(TenantTest, RemoveObjectRequiresTheEntryStillOnTheRoute) {
     EXPECT_FALSE(tenant.RemoveObject(std::shared_ptr<ObjectEntry>{}));
 }
 
-TEST(TenantTest, RemoveObjectLeavesTheReplacementUntouched) {
+TEST(TenantTest, RemoveObjectLeavesAReplacementAndItsRecordsUntouched) {
     Tenant tenant;
     auto first = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(first));
@@ -156,64 +160,17 @@ TEST(TenantTest, RemoveObjectLeavesTheReplacementUntouched) {
     ASSERT_NE(second_lease, nullptr);
     tenant.PutDynamicReplicationLease(second, UUID{9, 10},
                                       LeaseFor(second, UUID{9, 10}));
+    tenant.IndexPromotionCandidate("k1");
 
-    // The route publishes the newer object, so the older handle owns nothing
-    // here: neither the membership nor the lease the newer object registered
-    // may be dropped.
+    // The slot holds a newer publication of the same key, so the older handle
+    // owns none of the records under it: the membership, the lease and the
+    // candidate index entry the newer object registered all stay.
     EXPECT_FALSE(tenant.RemoveObject(first));
     EXPECT_EQ(tenant.Get("k1"), second);
     EXPECT_EQ(tenant.GroupMembers("g1").size(), 1u);
     EXPECT_TRUE(tenant.FindDynamicReplicationLease(UUID{9, 10}).has_value());
+    EXPECT_EQ(tenant.PromotionCandidateKeys().size(), 1u);
     EXPECT_EQ(LeaseOf(second).get(), second_lease.get());
-}
-
-TEST(TenantTest, RemoveObjectIfGenerationRejectsAStaleGeneration) {
-    Tenant tenant;
-    auto first = test::MakeObjectEntry("k1", "g1");
-    ASSERT_TRUE(tenant.InsertObject(first));
-    const uint64_t stale = first->generation();
-    ASSERT_TRUE(tenant.RemoveObject(first));
-
-    auto second = test::MakeObjectEntry("k1", "g1");
-    ASSERT_TRUE(tenant.InsertObject(second));
-    tenant.PutDynamicReplicationLease(second, UUID{9, 10},
-                                      LeaseFor(second, UUID{9, 10}));
-
-    // The recorded generation is no longer published, so nothing is touched.
-    EXPECT_FALSE(tenant.RemoveObjectIfGeneration("k1", stale));
-    EXPECT_EQ(tenant.Get("k1"), second);
-    EXPECT_EQ(tenant.GroupMembers("g1").size(), 1u);
-    EXPECT_TRUE(tenant.FindDynamicReplicationLease(UUID{9, 10}).has_value());
-
-    // The current generation tears the object down completely.
-    EXPECT_TRUE(tenant.RemoveObjectIfGeneration("k1", second->generation()));
-    EXPECT_FALSE(tenant.ContainsObject("k1"));
-    EXPECT_TRUE(tenant.GroupMembers("g1").empty());
-    EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{9, 10}).has_value());
-
-    // A generation that was never published never matches.
-    EXPECT_FALSE(tenant.RemoveObjectIfGeneration("k1", 0));
-}
-
-TEST(TenantTest, IsCurrentRejectsTheUnpublishedGeneration) {
-    Tenant tenant;
-    auto unpublished = test::MakeObjectEntry("k1", "g1");
-    EXPECT_EQ(unpublished->generation(), 0u);
-    EXPECT_FALSE(tenant.IsCurrent("k1", unpublished->generation()));
-
-    auto first = test::MakeObjectEntry("k1", "g1");
-    ASSERT_TRUE(tenant.InsertObject(first));
-    const uint64_t first_generation = first->generation();
-    ASSERT_NE(first_generation, 0u);
-    EXPECT_TRUE(tenant.IsCurrent("k1", first_generation));
-
-    ASSERT_TRUE(tenant.RemoveObject(first));
-    EXPECT_FALSE(tenant.IsCurrent("k1", first_generation));
-
-    auto second = test::MakeObjectEntry("k1", "g1");
-    ASSERT_TRUE(tenant.InsertObject(second));
-    EXPECT_FALSE(tenant.IsCurrent("k1", first_generation));
-    EXPECT_TRUE(tenant.IsCurrent("k1", second->generation()));
 }
 
 TEST(TenantTest, WithPublishedObjectRunsOnlyOnThePublishedEntry) {
@@ -258,28 +215,29 @@ TEST(TenantTest, WithPublishedObjectRunsOnlyOnThePublishedEntry) {
         "k1", [](ObjectMetadata&, ObjectEntry::State&) {}));
 }
 
-TEST(TenantTest, UnregisterGroupMemberRequiresTheCapturedGeneration) {
+TEST(TenantTest, UnregisterGroupMemberDropsOnlyTheEntryItIsGiven) {
     Tenant tenant;
-    auto entry = test::MakeObjectEntry("k1", "g1");
-    ASSERT_TRUE(tenant.InsertObject(entry));
-    const uint64_t first_generation = entry->generation();
+    auto first = test::MakeObjectEntry("k1", "g1");
+    auto second = test::MakeObjectEntry("k2", "g1");
+    ASSERT_TRUE(tenant.InsertObject(first));
+    ASSERT_TRUE(tenant.InsertObject(second));
+    const auto group_lease = LeaseOf(first);
+    ASSERT_NE(group_lease, nullptr);
+    ASSERT_EQ(LeaseOf(second).get(), group_lease.get());
 
-    // The same entry is published again after a teardown, which renumbers it in
-    // place: the membership it just registered carries the new generation.
-    ASSERT_TRUE(tenant.RemoveObject(entry));
-    ASSERT_TRUE(tenant.InsertObject(entry));
-    const uint64_t second_generation = entry->generation();
-    ASSERT_NE(second_generation, first_generation);
+    // The entry names both the group and the member to drop, so the group keeps
+    // its other member and the one lease both of them hold.
+    tenant.UnregisterGroupMember(first);
     ASSERT_EQ(tenant.GroupMembers("g1").size(), 1u);
+    EXPECT_EQ(tenant.GroupMembers("g1")[0], "k2");
+    EXPECT_FALSE(tenant.Empty());
+    EXPECT_EQ(LeaseOf(second).get(), group_lease.get());
 
-    // A caller that captured the generation of the first publication leaves the
-    // membership, and the lease the entry holds, alone: both belong to the
-    // publication that is routed now.
-    tenant.UnregisterGroupMember(entry, first_generation);
+    // The member is already gone, so a repeat leaves the group as it is.
+    tenant.UnregisterGroupMember(first);
     EXPECT_EQ(tenant.GroupMembers("g1").size(), 1u);
-    EXPECT_NE(LeaseOf(entry), nullptr);
 
-    tenant.UnregisterGroupMember(entry, second_generation);
+    tenant.UnregisterGroupMember(second);
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
 }
 
@@ -320,22 +278,25 @@ TEST(TenantTest, AGroupKeepsOneLeaseAcrossReplacementOfItsKeys) {
     EXPECT_NE(LeaseOf(late).get(), group_lease.get());
 }
 
-TEST(TenantTest, RemoveObjectClearsAGenerationWhoseSlotIsAlreadyGone) {
+TEST(TenantTest, RemoveObjectClearsRecordsUnderAKeyWhoseSlotIsGone) {
     Tenant tenant;
     auto entry = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(entry));
     tenant.PutDynamicReplicationLease(entry, UUID{7, 8},
                                       LeaseFor(entry, UUID{7, 8}));
+    tenant.IndexPromotionCandidate("k1");
     ASSERT_FALSE(tenant.Empty());
 
     // What a publish that failed after taking the slot leaves behind: the slot
-    // is rolled back, the membership and the lease it registered are not. The
-    // teardown reports that it did not erase the slot, and still clears them.
+    // is rolled back, the membership, the lease and the candidate index entry
+    // it registered are not. Nothing is routed under the key, so no newer
+    // publication owns those records and the teardown still clears them.
     ASSERT_TRUE(tenant.EraseObjectIf(entry));
     EXPECT_FALSE(tenant.RemoveObject(entry));
     EXPECT_FALSE(tenant.ContainsObject("k1"));
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
     EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
+    EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());
     EXPECT_TRUE(tenant.Empty());
 }
 
@@ -344,7 +305,8 @@ TEST(TenantTest, AGroupSurvivesConcurrentReplacementOfItsKeys) {
     constexpr int kWriterRounds = 2000;
 
     // Writers publish both keys of one group and tear their own publication
-    // down, so a teardown of one generation runs while another is registered.
+    // down, so a teardown of one publication runs while another publication of
+    // the same group is registered.
     //
     // Nothing is asserted while they run: a reader cannot tell which group
     // instance a listed member belongs to, because the listing and the handle
@@ -404,7 +366,7 @@ TEST(TenantTest, EmptyTracksObjectsGroupsAndLeases) {
     // still non-empty until that is dropped too.
     ASSERT_TRUE(tenant.EraseObjectIf(grouped));
     EXPECT_FALSE(tenant.Empty());
-    tenant.UnregisterGroupMember(grouped, grouped->generation());
+    tenant.UnregisterGroupMember(grouped);
     EXPECT_TRUE(tenant.Empty());
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
 
@@ -424,8 +386,8 @@ TEST(TenantTest, RebuildGroupStateRegroupsTheSameMembers) {
     ASSERT_TRUE(tenant.InsertObject(second));
     // A restored tenant starts without membership, so the rebuild is what
     // re-registers these members.
-    tenant.UnregisterGroupMember(first, first->generation());
-    tenant.UnregisterGroupMember(second, second->generation());
+    tenant.UnregisterGroupMember(first);
+    tenant.UnregisterGroupMember(second);
     ASSERT_TRUE(tenant.GroupMembers("g1").empty());
 
     tenant.RebuildGroupState();
@@ -475,19 +437,19 @@ TEST(TenantTest, PromotionCandidateKeysTrackWhatWasIndexed) {
     Tenant tenant;
     auto entry = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(entry));
-    const uint64_t generation = entry->generation();
     EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());
 
-    tenant.IndexPromotionCandidate("k1", generation);
-    tenant.IndexPromotionCandidate("k2", generation);
-    tenant.IndexPromotionCandidate("k1", generation);
+    // The index holds keys, so indexing one twice leaves one entry.
+    tenant.IndexPromotionCandidate("k1");
+    tenant.IndexPromotionCandidate("k2");
+    tenant.IndexPromotionCandidate("k1");
     EXPECT_EQ(tenant.PromotionCandidateKeys().size(), 2u);
 
-    // An older generation does not unindex what this one indexed.
-    tenant.UnindexPromotionCandidate("k2", generation + 1);
+    // A key that was never indexed is not there to unindex, so nothing changes.
+    tenant.UnindexPromotionCandidate("k3");
     EXPECT_EQ(tenant.PromotionCandidateKeys().size(), 2u);
 
-    tenant.UnindexPromotionCandidate("k1", generation);
+    tenant.UnindexPromotionCandidate("k1");
     auto keys = tenant.PromotionCandidateKeys();
     ASSERT_EQ(keys.size(), 1u);
     EXPECT_EQ(keys[0], "k2");
