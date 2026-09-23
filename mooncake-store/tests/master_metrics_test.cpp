@@ -636,8 +636,7 @@ TEST_F(MasterMetricsTest, ProjectStorageUsageExposesDfsAllocatorGauges) {
     EXPECT_EQ(metrics.get_dfs_file_count(), 4);
 
     const std::string serialized = metrics.serialize_metrics();
-    EXPECT_NE(serialized.find("master_dfs_allocated_bytes"),
-              std::string::npos);
+    EXPECT_NE(serialized.find("master_dfs_allocated_bytes"), std::string::npos);
     EXPECT_NE(serialized.find("master_dfs_total_capacity_bytes"),
               std::string::npos);
     EXPECT_NE(serialized.find("master_dfs_file_count"), std::string::npos);
