@@ -2,6 +2,7 @@
 
 #include <array>
 #include <mutex>
+#include <shared_mutex>
 
 #include "weight_store_backend.h"
 
@@ -17,6 +18,12 @@ class WeightStoreManager {
    public:
     explicit WeightStoreManager(WeightStoreBackend& backend)
         : backend_(backend) {}
+
+    // A successful guard excludes append-to-publication mutations while the
+    // caller captures the OpLog boundary and weight state together.
+    std::unique_lock<std::shared_mutex> TryLockSnapshot() {
+        return std::unique_lock(mutation_mutex_, std::try_to_lock);
+    }
 
     WeightMetadataSnapshot ExportSnapshot() const {
         return weight_metadata_.ExportSnapshot();
@@ -57,6 +64,7 @@ class WeightStoreManager {
 
     WeightStoreBackend& backend_;
     WeightMetadataStore weight_metadata_;
+    std::shared_mutex mutation_mutex_;
     std::array<std::mutex, 4096> group_locks_;
 };
 

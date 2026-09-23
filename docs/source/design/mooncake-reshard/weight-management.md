@@ -162,6 +162,14 @@ carry an optional `weight_metadata` section; an older snapshot without the
 section restores empty Weight metadata while preserving ordinary KV metadata.
 Derived group indexes are rebuilt from restored metadata records.
 
+Periodic Master snapshots capture the durable log boundary and weight state
+under a shared consistency boundary. Weight mutations hold a barrier from
+log submission through in-memory publication. If a mutation is still pending,
+the snapshot skips that cycle and retries at the next interval rather than
+waiting for publication while holding the global snapshot lock. Continuous
+overlapping weight mutations can therefore postpone snapshots. Weight state
+is frozen in the parent; the forked child only serializes the frozen value.
+
 Batch-OpLog snapshots containing weight state use a version-2 manifest with a
 checksummed weight-state artifact captured at the same replay cursor as object
 and segment metadata. Clusters with no weight records or allocated weight IDs

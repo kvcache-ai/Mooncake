@@ -74,6 +74,8 @@ class MasterSnapshotManager {
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
     void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
 
+    // Direct persistence requires quiesced state. The periodic producer passes
+    // weight state frozen together with the descriptor's sequence boundary.
     tl::expected<void, SerializationError> PersistState(
         const std::string& snapshot_id);
     tl::expected<void, SerializationError> PersistState(

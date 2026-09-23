@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <thread>
 
@@ -128,19 +129,7 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
         const std::string path_prefix = snapshot_root + snapshot_id + "/";
         const std::string manifest_path =
             path_prefix + ha::kSnapshotManifestFile;
-        auto descriptor =
-            BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
-        if (!descriptor) {
-            LOG(ERROR) << "[Snapshot] Failed to build descriptor before fork, "
-                          "snapshot_id="
-                       << snapshot_id
-                       << ", code=" << toString(descriptor.error().code)
-                       << ", msg=" << descriptor.error().message;
-            close(log_pipe[0]);
-            close(log_pipe[1]);
-            continue;
-        }
-
+        std::optional<ha::SnapshotDescriptor> descriptor;
         pid_t pid;
         WeightMetadataSnapshot frozen_weight_metadata;
         {
@@ -161,6 +150,32 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
                 close(log_pipe[1]);
                 continue;
             }
+            // Never wait for publication while holding snapshot_mutex_: an
+            // earlier OpLog callback may need that mutex before it can finish.
+            auto weight_lock =
+                master_service_->weight_manager_.TryLockSnapshot();
+            if (!weight_lock.owns_lock()) {
+                LOG(INFO) << "[Snapshot] Skipping snapshot while weight "
+                             "publication is pending, snapshot_id="
+                          << snapshot_id;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
+            auto captured_descriptor = BuildSnapshotDescriptor(
+                snapshot_id, manifest_path, path_prefix);
+            if (!captured_descriptor) {
+                LOG(ERROR)
+                    << "[Snapshot] Failed to build descriptor before fork, "
+                       "snapshot_id="
+                    << snapshot_id
+                    << ", code=" << toString(captured_descriptor.error().code)
+                    << ", msg=" << captured_descriptor.error().message;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
+            descriptor = std::move(captured_descriptor.value());
             // Weight readers do not take snapshot_mutex_. Freeze their state
             // in the parent so the child never locks the inherited weight
             // mutex.
