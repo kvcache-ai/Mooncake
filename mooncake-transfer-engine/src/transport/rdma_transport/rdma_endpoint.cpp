@@ -16,7 +16,9 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <cerrno>
 #include <cstddef>
 #include <chrono>
@@ -109,9 +111,16 @@ RdmaEndPoint::~RdmaEndPoint() {
     // shutdown (e.g., process exit). Keyed on wr_depth_list_ as well:
     // construct() allocates it even for a zero-QP endpoint, whose qp_list_
     // is empty, and skipping deconstructLocked() would leak it.
-    if (!qp_list_.empty() || wr_depth_list_) {
+    if (!qp_list_.empty() || wr_depth_list_ || notify_.enabled) {
         RWSpinlock::WriteGuard guard(lock_);
-        deconstructLocked();
+        if (deconstructLocked()) {
+            // Preserve DMA buffers if QP destruction or MR deregistration
+            // fails.
+            LOG(ERROR)
+                << "Retaining notification buffers after teardown failure";
+            (void)notify_.send_buffer.release();
+            (void)notify_.recv_buffer.release();
+        }
     }
 }
 
@@ -155,6 +164,12 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         }
     }
 
+    if (context_.nativeNotifyEnabled()) {
+        int ret = constructNotification();
+        if (ret) {
+            LOG(ERROR) << "Notification QP initialization failed: " << ret;
+        }
+    }
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
     status_.store(UNCONNECTED, std::memory_order_relaxed);
     return 0;
@@ -199,6 +214,11 @@ int RdmaEndPoint::deconstruct() {
 }
 
 int RdmaEndPoint::deconstructLocked() {
+    if (notify_.enabled) {
+        int ret = closeNotification();
+        if (ret) return ret;
+    }
+    peer_notify_qp_num_ = 0;
     // Adjust cq_outstanding_ before destroying QPs, so the counter is
     // always corrected even if ibv_destroy_qp fails and we return early.
     bool displayed = false;
@@ -254,6 +274,7 @@ void RdmaEndPoint::beginDestroyLocked() {
     inactive_time_.store(getCurrentTimeInNano(), std::memory_order_relaxed);
     active_.store(false, std::memory_order_release);
     status_.store(DESTROYING, std::memory_order_release);
+    if (notify_.enabled) stopNotification();
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
     // Only endpoints that reached CONNECTED can have user WRs to flush. For
@@ -364,6 +385,263 @@ std::string RdmaEndPoint::peerNicPath() const {
     return peer_nic_path_;
 }
 
+namespace {
+bool isLocalNotificationFault(ibv_wc_status status) {
+    return status == IBV_WC_LOC_LEN_ERR || status == IBV_WC_LOC_QP_OP_ERR ||
+           status == IBV_WC_LOC_PROT_ERR || status == IBV_WC_LOC_ACCESS_ERR ||
+           status == IBV_WC_MW_BIND_ERR;
+}
+}  // namespace
+
+bool RdmaEndPoint::notificationFits(const TransferMetadata::NotifyDesc &msg) {
+    return msg.name.size() <= kNotifySlotBytes - kNotifyHeaderBytes &&
+           msg.notify_msg.size() <=
+               kNotifySlotBytes - kNotifyHeaderBytes - msg.name.size();
+}
+size_t RdmaEndPoint::encodeNotification(
+    char *slot, const TransferMetadata::NotifyDesc &msg) {
+    if (!notificationFits(msg)) return 0;
+    uint32_t name_size = msg.name.size(), msg_size = msg.notify_msg.size();
+    std::memcpy(slot, &name_size, 4);
+    std::memcpy(slot + 4, msg.name.data(), name_size);
+    std::memcpy(slot + 4 + name_size, &msg_size, 4);
+    std::memcpy(slot + kNotifyHeaderBytes + name_size, msg.notify_msg.data(),
+                msg_size);
+    return kNotifyHeaderBytes + name_size + msg_size;
+}
+bool RdmaEndPoint::decodeNotification(const char *slot, size_t bytes,
+                                      TransferMetadata::NotifyDesc &msg) {
+    if (bytes < kNotifyHeaderBytes || bytes > kNotifySlotBytes) return false;
+    uint32_t name_size = 0, msg_size = 0;
+    std::memcpy(&name_size, slot, 4);
+    if (name_size > bytes - kNotifyHeaderBytes) return false;
+    std::memcpy(&msg_size, slot + 4 + name_size, 4);
+    if (msg_size != bytes - kNotifyHeaderBytes - name_size) return false;
+    msg.name.assign(slot + 4, name_size);
+    msg.notify_msg.assign(slot + kNotifyHeaderBytes + name_size, msg_size);
+    return true;
+}
+
+int RdmaEndPoint::postNotificationReceive(size_t slot) {
+    auto &s = notify_;
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<uint64_t>(s.recv_buffer.get() +
+                                          slot * kNotifySlotBytes);
+    sge.length = kNotifySlotBytes;
+    sge.lkey = s.recv_mr->lkey;
+    ibv_recv_wr wr{}, *bad = nullptr;
+    wr.wr_id = slot;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    return ibv_post_recv(s.qp, &wr, &bad) ? ERR_ENDPOINT : 0;
+}
+int RdmaEndPoint::constructNotification() {
+    auto &s = notify_;
+    std::lock_guard<std::mutex> guard(s.mutex);
+    s.enabled = true;
+    s.error = 0;
+    s.connected = s.reconnect_needed = false;
+    s.pending = s.next_send = s.peer_qp = 0;
+    if (!context_.notify_cq_) return s.fail(ERR_CONTEXT);
+    ibv_qp_init_attr init{};
+    init.send_cq = init.recv_cq = context_.notify_cq_;
+    init.qp_type = IBV_QPT_RC;
+    init.cap.max_send_wr = init.cap.max_recv_wr = kNotifySlots;
+    init.cap.max_send_sge = init.cap.max_recv_sge = 1;
+    init.cap.max_inline_data = globalConfig().max_inline;
+    s.qp = ibv_create_qp(context_.pd(), &init);
+    if (!s.qp) return s.fail(ERR_ENDPOINT);
+    s.inline_bytes = init.cap.max_inline_data;
+    ibv_qp_attr attr{};
+    attr.qp_state = IBV_QPS_INIT;
+    attr.port_num = context_.portNum();
+    attr.pkey_index = globalConfig().pkey_index;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE;
+    if (ibv_modify_qp(s.qp, &attr,
+                      IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX |
+                          IBV_QP_ACCESS_FLAGS))
+        return s.fail(ERR_ENDPOINT);
+    s.send_buffer = std::make_unique<char[]>(kNotifySlots * kNotifySlotBytes);
+    s.recv_buffer = std::make_unique<char[]>(kNotifySlots * kNotifySlotBytes);
+    s.send_mr =
+        ibv_reg_mr(context_.pd(), s.send_buffer.get(),
+                   kNotifySlots * kNotifySlotBytes, IBV_ACCESS_LOCAL_WRITE);
+    s.recv_mr =
+        ibv_reg_mr(context_.pd(), s.recv_buffer.get(),
+                   kNotifySlots * kNotifySlotBytes, IBV_ACCESS_LOCAL_WRITE);
+    if (!s.send_mr || !s.recv_mr) return s.fail(ERR_MEMORY);
+    for (size_t slot = 0; slot < kNotifySlots; ++slot)
+        if (postNotificationReceive(slot)) return s.fail(ERR_ENDPOINT);
+    context_.registerNotifyQp(s.qp->qp_num, weak_from_this());
+    return 0;
+}
+uint32_t RdmaEndPoint::notificationQpNum() const {
+    std::lock_guard<std::mutex> guard(notify_.mutex);
+    return notify_.qp && !notify_.error ? notify_.qp->qp_num : 0;
+}
+int RdmaEndPoint::connectNotification(const ibv_gid &gid, uint32_t lid,
+                                      uint32_t peer_qp, int local_gid_index) {
+    auto &s = notify_;
+    std::lock_guard<std::mutex> guard(s.mutex);
+    if (s.error) return s.error;
+    if (s.connected)
+        return s.peer_qp == peer_qp ? 0 : s.fail(ERR_ENDPOINT, true);
+    if (!peer_qp) return s.fail(ERR_NOT_IMPLEMENTED);
+    auto &cfg = globalConfig();
+    ibv_qp_attr attr{};
+    attr.qp_state = IBV_QPS_RTR;
+    attr.path_mtu = std::min(context_.activeMTU(), cfg.mtu_length);
+    attr.dest_qp_num = peer_qp;
+    attr.rq_psn = 0;
+    attr.max_dest_rd_atomic = 1;
+    attr.min_rnr_timer = 12;
+    attr.ah_attr.is_global = 1;
+    attr.ah_attr.grh.dgid = gid;
+    attr.ah_attr.grh.sgid_index = local_gid_index;
+    attr.ah_attr.grh.hop_limit = 255;
+    attr.ah_attr.grh.traffic_class =
+        cfg.ib_traffic_class >= 0 ? cfg.ib_traffic_class : 0;
+#ifdef USE_SHCA
+    attr.ah_attr.dlid = u32_to_17(lid);
+#else
+    attr.ah_attr.dlid = static_cast<uint16_t>(lid);
+#endif
+    attr.ah_attr.sl = cfg.ib_service_level >= 0 ? cfg.ib_service_level : 0;
+    attr.ah_attr.port_num = context_.portNum();
+    if (ibv_modify_qp(s.qp, &attr,
+                      IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                          IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
+                          IBV_QP_MIN_RNR_TIMER | IBV_QP_AV))
+        return s.fail(ERR_ENDPOINT);
+    attr = {};
+    attr.qp_state = IBV_QPS_RTS;
+    attr.sq_psn = 0;
+    attr.timeout = 14;
+    attr.retry_cnt = 3;
+    attr.rnr_retry =
+        7;  // Like TENT, receiver backpressure is not a link fault.
+    attr.max_rd_atomic = 1;
+    if (ibv_modify_qp(s.qp, &attr,
+                      IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+                          IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                          IBV_QP_MAX_QP_RD_ATOMIC))
+        return s.fail(ERR_ENDPOINT);
+    s.peer_qp = peer_qp;
+    s.connected = true;
+    return 0;
+}
+int RdmaEndPoint::sendNotification(
+    const TransferMetadata::NotifyDesc &message) {
+    if (!notificationFits(message)) return ERR_NOT_IMPLEMENTED;
+    auto started = getCurrentTimeInNano();
+    while (connected() && !readyToSend()) {
+        if (static_cast<uint64_t>(getCurrentTimeInNano() - started) >
+            kWaitExistingHandshakeTimeoutNano)
+            return ERR_ENDPOINT;
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    auto &s = notify_;
+    std::unique_lock<std::mutex> lock(s.mutex, std::defer_lock);
+    {
+        RWSpinlock::ReadGuard guard(lock_);
+        if (!readyToSend()) return ERR_ENDPOINT;
+        lock.lock();
+    }
+    if (!s.enabled) return ERR_NOT_IMPLEMENTED;
+    // Retirement needs the endpoint write lock; do not hold it while waiting.
+    s.cv.wait(lock, [&s] {
+        return s.error || !s.connected || s.pending < kNotifySlots;
+    });
+    if (s.error) return s.error;
+    if (!s.connected) return ERR_NOT_IMPLEMENTED;
+    char *data =
+        s.send_buffer.get() + (s.next_send % kNotifySlots) * kNotifySlotBytes;
+    size_t bytes = encodeNotification(data, message);
+    ibv_sge sge{};
+    sge.addr = reinterpret_cast<uint64_t>(data);
+    sge.length = bytes;
+    sge.lkey = s.send_mr->lkey;
+    ibv_send_wr wr{}, *bad = nullptr;
+    wr.wr_id = s.next_send % kNotifySlots;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    if (bytes <= s.inline_bytes) wr.send_flags |= IBV_SEND_INLINE;
+    if (ibv_post_send(s.qp, &wr, &bad)) return s.fail(ERR_ENDPOINT);
+    ++s.next_send;
+    ++s.pending;
+    return 0;
+}
+void RdmaEndPoint::handleNotificationCompletion(
+    const ibv_wc &wc, std::vector<TransferMetadata::NotifyDesc> &received) {
+    auto &s = notify_;
+    std::lock_guard<std::mutex> guard(s.mutex);
+    if (!s.qp || wc.qp_num != s.qp->qp_num || s.error) return;
+    if (wc.status != IBV_WC_SUCCESS) {
+        LOG(ERROR) << "Native RDMA notify completion: "
+                   << ibv_wc_status_str(wc.status);
+        s.fail(ERR_ENDPOINT, !isLocalNotificationFault(wc.status));
+        return;
+    }
+    const size_t slot = wc.wr_id % kNotifySlots;
+    if (wc.opcode == IBV_WC_SEND && s.pending) {
+        --s.pending;
+        s.cv.notify_all();
+    } else if (wc.opcode == IBV_WC_RECV) {
+        TransferMetadata::NotifyDesc message;
+        if (!decodeNotification(s.recv_buffer.get() + slot * kNotifySlotBytes,
+                                wc.byte_len, message)) {
+            s.fail(ERR_ENDPOINT);
+            return;
+        }
+        received.push_back(std::move(message));
+        if (postNotificationReceive(slot)) s.fail(ERR_ENDPOINT);
+    } else {
+        s.fail(ERR_ENDPOINT);
+    }
+}
+void RdmaEndPoint::stopNotification() {
+    std::lock_guard<std::mutex> guard(notify_.mutex);
+    notify_.fail(ERR_ENDPOINT);
+    if (notify_.qp) {
+        ibv_qp_attr attr{};
+        attr.qp_state = IBV_QPS_ERR;
+        ibv_modify_qp(notify_.qp, &attr, IBV_QP_STATE);
+    }
+}
+int RdmaEndPoint::closeNotification() {
+    auto &s = notify_;
+    std::lock_guard<std::mutex> guard(s.mutex);
+    s.fail(ERR_ENDPOINT);
+    if (s.qp) {
+        context_.unregisterNotifyQp(s.qp->qp_num);
+        if (ibv_destroy_qp(s.qp)) return ERR_ENDPOINT;
+        s.qp = nullptr;
+    }
+    if (s.send_mr) {
+        if (ibv_dereg_mr(s.send_mr)) return ERR_MEMORY;
+        s.send_mr = nullptr;
+    }
+    if (s.recv_mr) {
+        if (ibv_dereg_mr(s.recv_mr)) return ERR_MEMORY;
+        s.recv_mr = nullptr;
+    }
+    s.send_buffer.reset();
+    s.recv_buffer.reset();
+    s.enabled = false;
+    return 0;
+}
+bool RdmaEndPoint::notificationNeedsReconnect() const {
+    std::lock_guard<std::mutex> guard(notify_.mutex);
+    return notify_.reconnect_needed;
+}
+
+void RdmaEndPoint::describeNotification(HandShakeDesc &desc) const {
+    desc.notify_qp_num = notificationQpNum();
+    desc.ctrl_channel = false;
+}
+
 int RdmaEndPoint::setupConnectionsByActive() {
     HandShakeDesc local_desc, peer_desc;
     std::string peer_server_name, peer_nic_name;
@@ -383,8 +661,9 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // loopback mode
         if (context_.nicPath() == peer_nic_path_) {
-            int ret =
-                doSetupConnection(context_.gid(), context_.lid(), qpNum());
+            int ret = doSetupConnection(context_.gid(), context_.lid(), qpNum(),
+                                        CONNECTED, nullptr, nullptr,
+                                        notificationQpNum());
             if (ret == 0) {
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
             }
@@ -449,6 +728,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
     for (;;) {
         std::vector<uint32_t> local_qp_num;
+        GidSelectionSnapshot local_gid_selection;
         {
             RWSpinlock::ReadGuard guard(lock_);
             if (qp_generation != qp_generation_) {
@@ -460,9 +740,10 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 return ERR_ENDPOINT;
             }
             local_qp_num = qpNum();
+            local_gid_selection = fillLocalHandshakeDesc(
+                context_, peer_nic_path_, local_qp_num, local_desc);
+            describeNotification(local_desc);
         }
-        auto local_gid_selection = fillLocalHandshakeDesc(
-            context_, peer_nic_path_, local_qp_num, local_desc);
         rememberAutoGidSelection(attempted_auto_gid_selections,
                                  local_gid_selection);
         peer_desc = HandShakeDesc();
@@ -546,7 +827,9 @@ int RdmaEndPoint::setupConnectionsByActive() {
             // setupConnectionsByPassive, send an explicit ready ACK after this
             // active RPC confirms that the peer's passive QPs are ready.
             if (connected()) {
-                if (peer_qp_num_list_ == peer_desc.qp_num) {
+                if ((peer_qp_num_list_ == peer_desc.qp_num &&
+                     (!notify_.enabled ||
+                      peer_notify_qp_num_ == peer_desc.notify_qp_num))) {
                     if (peer_desc.ready_ack_supported) {
                         should_send_ready_ack = true;
                         ready_ack_desc = local_desc;
@@ -604,10 +887,10 @@ int RdmaEndPoint::setupConnectionsByActive() {
                                             ? CONNECTED_WAIT_READY_ACK
                                             : CONNECTED;
                 if (!peer_desc.local_gid.empty()) {
-                    ret = doSetupConnection(peer_desc.local_gid,
-                                            peer_desc.local_lid,
-                                            peer_desc.qp_num, connected_status,
-                                            &failure_message, &failure_info);
+                    ret = doSetupConnection(
+                        peer_desc.local_gid, peer_desc.local_lid,
+                        peer_desc.qp_num, connected_status, &failure_message,
+                        &failure_info, peer_desc.notify_qp_num);
                 } else {
                     auto segment_desc =
                         context_.engine().meta()->getSegmentDescByName(
@@ -618,7 +901,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                                 ret = doSetupConnection(
                                     nic.gid, nic.lid, peer_desc.qp_num,
                                     connected_status, &failure_message,
-                                    &failure_info);
+                                    &failure_info, peer_desc.notify_qp_num);
                                 break;
                             }
                         }
@@ -723,7 +1006,9 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
             return ERR_REJECT_HANDSHAKE;
         }
 
-        if (peer_qp_num_list_ != peer_desc.qp_num) {
+        if (peer_qp_num_list_ != peer_desc.qp_num ||
+            (notify_.enabled &&
+             peer_notify_qp_num_ != peer_desc.notify_qp_num)) {
             local_desc.reply_msg =
                 "Received stale RDMA ready ACK with mismatched peer QP numbers";
             LOG(WARNING) << local_desc.reply_msg << ", ack_peer_qp_num="
@@ -742,9 +1027,12 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
 
     if (connected()) {
         // If already connected with the same peer QP info, return success
-        if (peer_qp_num_list_ == peer_desc.qp_num) {
+        if ((peer_qp_num_list_ == peer_desc.qp_num &&
+             (!notify_.enabled ||
+              peer_notify_qp_num_ == peer_desc.notify_qp_num))) {
             fillLocalHandshakeDesc(context_, peer_nic_path_, qpNum(),
                                    local_desc);
+            describeNotification(local_desc);
             if (!peer_desc.ready_ack_supported) {
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
                 status_.store(CONNECTED, std::memory_order_relaxed);
@@ -799,6 +1087,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         for (;;) {
             auto local_gid_selection = fillLocalHandshakeDesc(
                 context_, peer_nic_path_, qpNum(), local_desc);
+            describeNotification(local_desc);
             rememberAutoGidSelection(attempted_auto_gid_selections,
                                      local_gid_selection);
 
@@ -808,8 +1097,9 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                         : CONNECTED;
             int ret = doSetupConnection(peer_gid, peer_lid, peer_desc.qp_num,
                                         connected_status, &local_desc.reply_msg,
-                                        &failure_info);
+                                        &failure_info, peer_desc.notify_qp_num);
             if (ret == 0) {
+                describeNotification(local_desc);
                 if (peer_desc.ready_ack_supported) {
                     ready_wait_start_ts_.store(getCurrentTimeInNano(),
                                                std::memory_order_relaxed);
@@ -1135,7 +1425,8 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     std::vector<uint32_t> peer_qp_num_list,
                                     Status connected_status,
                                     std::string *reply_msg,
-                                    SetupConnectionFailureInfo *failure_info) {
+                                    SetupConnectionFailureInfo *failure_info,
+                                    uint32_t notify_qp_num) {
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
             "QP count mismatch in peer and local endpoints, check "
@@ -1171,6 +1462,14 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
         if (ret) return ret;
     }
 
+    if (notify_.enabled) {
+        int notify_ret = connectNotification(peer_gid_raw, peer_lid,
+                                             notify_qp_num, local_gid_index);
+        if (notify_ret && notify_ret != ERR_NOT_IMPLEMENTED)
+            LOG(ERROR) << "Notification connection setup failed: "
+                       << notify_ret;
+    }
+    peer_notify_qp_num_ = notify_qp_num;
     peer_qp_num_list_ = std::move(peer_qp_num_list);
     has_connected_ = true;
     status_.store(connected_status, std::memory_order_relaxed);

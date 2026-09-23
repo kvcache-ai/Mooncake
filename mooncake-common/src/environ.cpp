@@ -199,6 +199,7 @@ Environ::Environ(const EnvironSource& source) {
     intra_nvlink_ = ReadBool(source, "MC_INTRA_NVLINK", false);
     path_roundrobin_ = ReadBool(source, "MC_PATH_ROUNDROBIN", false);
     with_nvidia_peermem_ = ReadBool(source, "WITH_NVIDIA_PEERMEM", true);
+    rdma_data_direct_ = ReadBool(source, "MC_RDMA_DATA_DIRECT", false);
     efa_cq_threads_ = ReadInt(source, "MC_EFA_CQ_THREADS", 1);
     store_checksum_enabled_ =
         ReadBool(source, "MOONCAKE_STORE_CHECKSUM", false);
