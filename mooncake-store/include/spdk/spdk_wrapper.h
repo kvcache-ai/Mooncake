@@ -61,7 +61,6 @@ class SpdkWrapper {
     bool HasNamespaceHandleForTesting(const std::string &tr_str) const;
     bool HasProbeBufferForTesting(const std::string &tr_str) const;
 
-
     uint32_t GetBlockSize(const nof_seg_handle *seg_handle);
 
     int SubmitRequest(const nof_seg_handle *seg_handle, void *ptr, uint64_t lba,

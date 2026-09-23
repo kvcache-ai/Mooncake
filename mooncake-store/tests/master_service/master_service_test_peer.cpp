@@ -80,7 +80,6 @@ void MasterServiceTestPeer::SetNoFProbeFnForTesting(
 #endif
 }
 
-
 void MasterServiceTestPeer::SetNoFProbeReleaseFnForTesting(
     MasterService::NoFProbeReleaseFn fn) {
 #ifdef USE_NOF

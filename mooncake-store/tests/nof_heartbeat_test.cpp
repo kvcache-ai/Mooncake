@@ -271,7 +271,6 @@ TEST_F(NoFHeartbeatTest, OnlyFailedSegmentIsUnmounted) {
     }
 }
 
-
 TEST_F(NoFHeartbeatTest, ExplicitUnmountReleasesProbeResources) {
     auto service = CreateService(/*heartbeat_interval_sec=*/30,
                                  /*probe_timeout_ms=*/50,

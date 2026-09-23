@@ -504,7 +504,6 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
     return probe_buffer.get();
 }
 
-
 void SpdkWrapper::CloseNofSegment(const std::string &tr_str) {
     if (tr_str.empty()) {
         return;

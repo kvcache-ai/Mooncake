@@ -757,7 +757,6 @@ MasterService::~MasterService() {
     client_liveness_records_.clear();
 }
 
-
 void MasterService::ReleaseNoFProbeResources(const std::string& te_endpoint) {
 #ifdef USE_NOF
     if (te_endpoint.empty()) {
@@ -3222,7 +3221,8 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
         nof_heartbeat_states_.erase(segment_id);
     }
     // Drop SpdkWrapper probe resources only if no remount still owns endpoint.
-    if (!te_endpoint.empty() && !nof_segment_manager_.HasEndpoint(te_endpoint)) {
+    if (!te_endpoint.empty() &&
+        !nof_segment_manager_.HasEndpoint(te_endpoint)) {
         ReleaseNoFProbeResources(te_endpoint);
     }
     return {};
@@ -12464,7 +12464,8 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         nof_heartbeat_states_.erase(snapshot.segment_id);
     }
     const std::string& te_endpoint = snapshot.segment.te_endpoint;
-    if (!te_endpoint.empty() && !nof_segment_manager_.HasEndpoint(te_endpoint)) {
+    if (!te_endpoint.empty() &&
+        !nof_segment_manager_.HasEndpoint(te_endpoint)) {
         ReleaseNoFProbeResources(te_endpoint);
     }
     MasterMetricManager::instance()
