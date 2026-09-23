@@ -707,8 +707,9 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
-    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    if (!desc) desc = std::make_shared<SegmentDesc>();
+    auto desc = std::make_shared<SegmentDesc>();
+    auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (old_desc) *desc = *old_desc;
     desc->name = local_server_name_;
     // Store RDMA server name for dual-NIC setups; when it differs from
     // local_server_name_ the peer will use it for NIC path construction.

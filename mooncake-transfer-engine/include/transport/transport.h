@@ -126,6 +126,14 @@ class Transport {
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
+        // Non-owning pointer into the process-lifetime NIC-path intern pool.
+        // When set, peerNicPath() returns *interned_peer_nic_path so the
+        // mapping path does not allocate a per-slice std::string.
+        const std::string *interned_peer_nic_path = nullptr;
+        const std::string &peerNicPath() const {
+            return interned_peer_nic_path ? *interned_peer_nic_path
+                                          : peer_nic_path;
+        }
         std::string source_location;
         SliceStatus status;
         TransferTask *task;
@@ -323,6 +331,7 @@ class Transport {
             auto cleanup = slice->cleanup_callback;
             slice->cleanup_callback = nullptr;
             if (cleanup) cleanup(slice);
+            slice->interned_peer_nic_path = nullptr;
 
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
