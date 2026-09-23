@@ -1774,6 +1774,14 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
         CHECK_STATUS(selectOptimalDevice(source, target, slice));
     else
         CHECK_STATUS(selectFallbackDevice(source, target, slice));
+    // Cache the RailMonitor pointer as soon as select* succeeds, BEFORE the
+    // rkey bounds check below: select* may have armed a probe/trial via
+    // admit(), and any later failure (rkey out of bounds, a pre-wire cancel)
+    // must be able to cancelProbe() on the rail it selected. Assigning this
+    // after the check left rail_monitor null on the OOB path, so a Half-Open
+    // trial was stranded -- the rail stayed armed with nothing on the wire.
+    slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
+                                           target.segment->machine_id);
     // Keys are NicID-indexed. A peer running an older build publishes a
     // compacted rkey vector, so a NicID from its device_list can point past the
     // end; fail the slice instead of reading out of bounds.
@@ -1787,11 +1795,6 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
             "Selected device has no registered memory key" LOC_MARK);
     slice->source_lkey = lkeys[slice->source_dev_id];
     slice->target_rkey = rkeys[slice->target_dev_id];
-    // Cache the RailMonitor pointer so asyncPollCq / disableEndpoint can
-    // update rail state without a segment lookup or string-keyed map
-    // lookup on the hot path.
-    slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
-                                           target.segment->machine_id);
     // Stash identifiers for GPUDirect reachability learning in asyncPollCq.
     // The name pointers alias stable Topology::NicEntry / segment storage and
     // remain valid for the slice's lifetime.

@@ -95,13 +95,6 @@ class MasterServiceTestPeer;
 // container and must not be iterating it.
 inline constexpr size_t kShrinkMinBucketCount = 1024;
 
-// Minimum number of metadata entries a ClearStaleHandles sweep must erase
-// before it pays for a malloc_trim(0). The trim walks glibc's arenas and
-// madvise(MADV_DONTNEED)s their free tops; on a small unmount (hundreds of
-// keys) the cost exceeds the benefit, so we gate it. A full node offline
-// erases millions of keys and always crosses this threshold.
-inline constexpr size_t kMallocTrimThreshold = 100000;
-
 template <typename UnorderedContainer>
 void ShrinkBucketsIfSparse(UnorderedContainer& container) {
     if (container.bucket_count() > kShrinkMinBucketCount &&
@@ -131,8 +124,8 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 
 class MasterService {
     friend class test::MasterServiceTestPeer;
-    friend class MasterSnapshotManager;  // Allow access to internal state for
-                                         // snapshot
+    friend class MasterSnapshotManager;    // Allow access to internal state for
+                                           // snapshot
     friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
@@ -140,11 +133,6 @@ class MasterService {
    public:
     using NoFProbeFn =
         std::function<bool(const std::string&, uint32_t, std::string*)>;
-    // Reclaims free-list memory from glibc malloc and returns it to the OS.
-    // Default points to ::malloc_trim; tests inject a spy to observe calls.
-    // malloc_trim(pad) returns 0 on failure, non-zero on success; we model the
-    // return as int to match the libc signature.
-    using MallocTrimFn = std::function<int(size_t)>;
     using DurableFinalizeCallback =
         std::function<void(const OpLogEntry& durable_entry)>;
     using BatchOpLogWriterFactory =
@@ -1613,15 +1601,15 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                 // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const double eviction_ratio_;                     // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
     // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
     // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
     // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
     // sufficient once quotas partition the pool.
     const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
-    const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -2000,12 +1988,6 @@ class MasterService {
     static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
-
-    // Reclaim glibc free-list memory after large metadata sweeps. Set once at
-    // construction (defaults to ::malloc_trim); tests inject a spy. Not
-    // guarded by a mutex: it is set before the cleanup worker runs and never
-    // mutated concurrently with a sweep in tests (PauseReplicaCleanup first).
-    MallocTrimFn malloc_trim_fn_;
 
     // if high availability features enabled
     const bool enable_ha_;

@@ -73,15 +73,6 @@ class MasterServiceTestPeer {
 
     void SetNoFProbeFnForTesting(MasterService::NoFProbeFn fn);
 
-    // Inject a malloc_trim spy for testing. Returns the previous fn so tests
-    // can restore it. See ClearStaleHandlesReclaimsRssAfterLargeSweep.
-    MasterService::MallocTrimFn SetMallocTrimFnForTesting(
-        MasterService::MallocTrimFn fn) {
-        MasterService::MallocTrimFn prev = std::move(service_.malloc_trim_fn_);
-        service_.malloc_trim_fn_ = std::move(fn);
-        return prev;
-    }
-
     size_t GetMountedNoFSegmentCountForTesting();
 
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
