@@ -15,6 +15,9 @@
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
+/python/mooncake/async_store.py @ykwd @stmatengss @zxpdemonio
+/python/tests/store/async_store_integration.py @ykwd @stmatengss @zxpdemonio
+/python/tests/store/test_async_store.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/buffer_pool.py @ykwd @stmatengss
 /python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_config.py @ykwd @stmatengss

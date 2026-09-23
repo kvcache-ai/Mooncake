@@ -38,6 +38,9 @@ function(add_ha_test name)
 endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
+add_store_test(weight_management_contract_test
+               weight_management_contract_test.cpp)
+add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
@@ -141,6 +144,8 @@ endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(batch_replica_clear_tenant_rpc_test
+               batch_replica_clear_tenant_rpc_test.cpp)
 add_test(
   NAME object_checksum_client_test
   COMMAND
@@ -236,6 +241,12 @@ add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(allocator_metric_test allocator_metric_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
 add_store_test(dfs_posix_test dfs_posix_test.cpp)
+add_store_test(dfs_immutable_bucket_allocator_test
+               dfs_immutable_bucket_allocator_test.cpp)
+add_store_test(dfs_immutable_bucket_backend_test
+               dfs_immutable_bucket_backend_test.cpp)
+add_store_test(dfs_immutable_bucket_client_test
+               dfs_immutable_bucket_client_test.cpp)
 add_store_test(distributed_storage_config_test
                distributed_storage_config_test.cpp)
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
@@ -315,6 +326,7 @@ add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
+add_store_test(dummy_client_probe_key_test dummy_client_probe_key_test.cpp)
 add_test(
   NAME dummy_client_object_checksum_test
   COMMAND

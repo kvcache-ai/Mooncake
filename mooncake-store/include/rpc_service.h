@@ -40,10 +40,20 @@ class WrappedMasterService {
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
 
+    // Point-in-time existence check: shares the ExistKey lookup path but
+    // grants no read lease, so a `true` result does not protect the object
+    // from eviction.
+    tl::expected<bool, ErrorCode> ProbeKey(
+        const std::string& key, const std::string& tenant_id = "default");
+
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
         const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
@@ -54,7 +64,8 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
         const std::vector<std::string>& object_keys, const UUID& client_id,
-        const std::string& segment_name);
+        const std::string& segment_name,
+        const std::string& tenant_id = "default");
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
