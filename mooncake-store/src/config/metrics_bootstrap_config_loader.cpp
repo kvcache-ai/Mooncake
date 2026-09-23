@@ -1,5 +1,8 @@
 #include "metrics_bootstrap_config_loader.h"
 
+#include <limits>
+#include <stdexcept>
+
 #include "default_config.h"
 
 namespace mooncake {
@@ -29,6 +32,10 @@ MetricsBootstrapConfig ResolveMetricsBootstrapConfig(
     }
     if (command_line.host.has_value()) {
         result.host = *command_line.host;
+    }
+    if (result.port > std::numeric_limits<uint16_t>::max()) {
+        throw std::invalid_argument(
+            "metrics_port must be in the range 0..65535");
     }
     return result;
 }

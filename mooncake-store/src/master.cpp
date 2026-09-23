@@ -1546,8 +1546,14 @@ int main(int argc, char* argv[]) {
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
-    master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
-        loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
+    try {
+        master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
+            loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Invalid metrics bootstrap configuration: "
+                   << error.what();
+        return 1;
+    }
     try {
         InitClientLivenessConf(loaded_default_config, master_config);
     } catch (const std::invalid_argument& error) {

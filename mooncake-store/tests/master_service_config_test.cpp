@@ -76,6 +76,31 @@ TEST_F(MetricsBootstrapConfigTest, LoadsExistingFlatYamlAndJsonKeys) {
     EXPECT_EQ(from_json.host, "127.0.0.2");
 }
 
+TEST_F(MetricsBootstrapConfigTest, AcceptsPortRangeBoundaries) {
+    const auto yaml = LoadConfig(".yaml", "metrics_port: 0\n");
+    EXPECT_EQ(ResolveMetricsBootstrapConfig(yaml.get(), {}).port, 0u);
+
+    const auto json = LoadConfig(".json", R"({"metrics_port":65535})");
+    EXPECT_EQ(ResolveMetricsBootstrapConfig(json.get(), {}).port, 65535u);
+
+    MetricsBootstrapCommandLineOverrides command_line;
+    command_line.port = 0;
+    EXPECT_EQ(ResolveMetricsBootstrapConfig(nullptr, command_line).port, 0u);
+    command_line.port = 65535;
+    EXPECT_EQ(ResolveMetricsBootstrapConfig(nullptr, command_line).port,
+              65535u);
+}
+
+TEST_F(MetricsBootstrapConfigTest, RejectsOutOfRangeYamlAndJsonPorts) {
+    const auto yaml = LoadConfig(".yaml", "metrics_port: 65536\n");
+    EXPECT_THROW(ResolveMetricsBootstrapConfig(yaml.get(), {}),
+                 std::invalid_argument);
+
+    const auto json = LoadConfig(".json", R"({"metrics_port":4294967295})");
+    EXPECT_THROW(ResolveMetricsBootstrapConfig(json.get(), {}),
+                 std::invalid_argument);
+}
+
 TEST_F(MetricsBootstrapConfigTest,
        ExplicitCommandLineValuesOverrideFileValues) {
     const auto file =
@@ -109,14 +134,16 @@ TEST_F(MetricsBootstrapConfigTest, AbsentCommandLineValuesPreserveFileValues) {
     EXPECT_EQ(resolved.host, "configured-host");
 }
 
-TEST_F(MetricsBootstrapConfigTest,
-       PreservesExistingUnsignedPortOverrideBehavior) {
+TEST_F(MetricsBootstrapConfigTest, RejectsOutOfRangeCommandLinePort) {
     MetricsBootstrapCommandLineOverrides command_line;
+    command_line.port = 65536;
+    EXPECT_THROW(ResolveMetricsBootstrapConfig(nullptr, command_line),
+                 std::invalid_argument);
+
+    // A negative int32 flag becomes UINT32_MAX at the existing CLI bridge.
     command_line.port = UINT32_MAX;
-
-    const auto resolved = ResolveMetricsBootstrapConfig(nullptr, command_line);
-
-    EXPECT_EQ(resolved.port, UINT32_MAX);
+    EXPECT_THROW(ResolveMetricsBootstrapConfig(nullptr, command_line),
+                 std::invalid_argument);
 }
 
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
@@ -200,7 +227,7 @@ TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {
     MasterConfig master_config{};
     master_config.metrics = {
         .enabled = false,
-        .port = UINT32_MAX,
+        .port = 65535,
         .host = "127.0.0.7",
     };
 
@@ -208,7 +235,7 @@ TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {
     const auto metrics = supervisor_config.metrics.Get();
 
     EXPECT_FALSE(metrics.enabled);
-    EXPECT_EQ(metrics.port, UINT32_MAX);
+    EXPECT_EQ(metrics.port, 65535u);
     EXPECT_EQ(metrics.host, "127.0.0.7");
 }
 
@@ -217,7 +244,7 @@ TEST(MasterServiceConfigTest,
     MasterConfig master_config{};
     master_config.metrics = {
         .enabled = false,
-        .port = UINT32_MAX,
+        .port = 65535,
         .host = "127.0.0.8",
     };
 
