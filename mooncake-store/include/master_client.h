@@ -105,6 +105,8 @@ class MasterClient {
           ha_probe_client_accessor_(
               GetStoreRpcClientIoContextPool(),
               detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
+          heartbeat_client_accessor_(GetStoreRpcClientIoContextPool(),
+                                     detail::MakeMasterRpcClientPoolConfig()),
           client_id_(client_id),
           tenant_id_(std::move(tenant_id)),
           metrics_(metrics) {}
@@ -724,6 +726,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
         Args&&... args);
 
+    void ConnectHeartbeatServer(const std::string& master_addr)
+        REQUIRES(connect_mutex_);
+
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_pool(
         RpcClientPool& client_accessor, Args&&... args);
@@ -750,6 +755,9 @@ class MasterClient {
     RpcClientPool client_accessor_;
     RpcClientPool ha_control_client_accessor_;
     RpcClientPool ha_probe_client_accessor_;
+    // Set on Connect when the master serves Ping on a separate server.
+    RpcClientPool heartbeat_client_accessor_;
+    std::atomic<bool> use_heartbeat_client_{false};
     RpcDrainGuard rpc_drain_;
 
     // The client identification.

@@ -203,6 +203,11 @@ struct RpcNameTraits<&WrappedMasterService::Ping> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetHeartbeatRpcPort> {
+    static constexpr const char* value = "GetHeartbeatRpcPort";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
     static constexpr const char* value = "GetFsdir";
 };
@@ -487,6 +492,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     timer.LogRequest("master_addr=", master_addr);
 
     MutexLocker lock(&connect_mutex_);
+    use_heartbeat_client_.store(false);
     const bool use_ha_control_pool =
         ha_connection_policy_enabled_.load(std::memory_order_acquire);
     if (use_ha_control_pool) {
@@ -521,9 +527,34 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         client_accessor_.GetOrCreateClientPool(master_addr);
         ha_control_client_accessor_.GetOrCreateClientPool(master_addr);
     }
+    ConnectHeartbeatServer(master_addr);
     client_addr_param_ = master_addr;
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
+}
+
+void MasterClient::ConnectHeartbeatServer(const std::string& master_addr) {
+    // An older master does not have this RPC; Ping then stays on the main
+    // server, which always serves it.
+    auto port =
+        invoke_rpc<&WrappedMasterService::GetHeartbeatRpcPort, uint32_t>();
+    const auto host_end = master_addr.rfind(':');
+    if (!port.has_value() || port.value() == 0 ||
+        host_end == std::string::npos) {
+        return;
+    }
+    const std::string heartbeat_addr =
+        master_addr.substr(0, host_end + 1) + std::to_string(port.value());
+    heartbeat_client_accessor_.GetOrCreateClientPool(heartbeat_addr);
+    auto ready =
+        invoke_rpc_with_pool<&WrappedMasterService::ServiceReady, std::string>(
+            heartbeat_client_accessor_);
+    if (!ready.has_value()) {
+        LOG(WARNING) << "Heartbeat RPC server " << heartbeat_addr
+                     << " is unreachable, pinging the main server instead";
+        return;
+    }
+    use_heartbeat_client_.store(true);
 }
 
 tl::expected<bool, ErrorCode> MasterClient::ExistKey(
@@ -995,10 +1026,14 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
     std::shared_ptr<RpcClientPool::ClientPool> ping_pool;
     {
         MutexLocker lock(&connect_mutex_);
-        ping_pool =
-            ha_connection_policy_enabled_.load(std::memory_order_acquire)
-                ? ha_control_client_accessor_.GetClientPool()
-                : client_accessor_.GetClientPool();
+        if (use_heartbeat_client_.load()) {
+            ping_pool = heartbeat_client_accessor_.GetClientPool();
+        } else if (ha_connection_policy_enabled_.load(
+                       std::memory_order_acquire)) {
+            ping_pool = ha_control_client_accessor_.GetClientPool();
+        } else {
+            ping_pool = client_accessor_.GetClientPool();
+        }
     }
     auto result =
         invoke_rpc_with_client_pool<&WrappedMasterService::Ping, PingResponse>(

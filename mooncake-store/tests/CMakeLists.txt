@@ -299,6 +299,7 @@ add_ha_test(batch_oplog_snapshot_rebootstrap_test
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
+add_store_test(heartbeat_rpc_server_test heartbeat_rpc_server_test.cpp)
 add_store_test(nvme_kv_connector_config_test nvme_kv/connector_config_test.cpp)
 add_store_test(ha_cluster_namespace_config_test
                ha_cluster_namespace_config_test.cpp)

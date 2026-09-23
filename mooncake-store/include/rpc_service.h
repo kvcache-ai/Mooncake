@@ -201,6 +201,10 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    // 0 when Ping is served only on the main RPC server.
+    tl::expected<uint32_t, ErrorCode> GetHeartbeatRpcPort();
+    void SetHeartbeatRpcPort(uint32_t port) { heartbeat_rpc_port_ = port; }
+
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
 
     tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
@@ -357,9 +361,16 @@ class WrappedMasterService {
 
    private:
     MasterService master_service_;
+    std::atomic<uint32_t> heartbeat_rpc_port_{0};
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                         mooncake::WrappedMasterService& wrapped_master_service);
+
+// For a server whose io threads serve nothing but heartbeats, so a long
+// handler on the main server cannot keep a Ping from being read.
+void RegisterHeartbeatRpcService(
+    coro_rpc::coro_rpc_server& server,
+    mooncake::WrappedMasterService& wrapped_master_service);
 
 }  // namespace mooncake
