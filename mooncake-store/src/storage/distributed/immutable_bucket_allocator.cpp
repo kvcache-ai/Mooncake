@@ -408,6 +408,10 @@ uint64_t ImmutableBucketAllocator::GetTotalCapacity() const {
     return bucket_capacity_ * static_cast<uint64_t>(max_bucket_count_);
 }
 
+uint64_t ImmutableBucketAllocator::GetFileCount() const {
+    return static_cast<uint64_t>(GetBucketCount());
+}
+
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionLocked(bool force_one) {
     PendingEviction pending;

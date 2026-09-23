@@ -784,10 +784,19 @@ void MasterService::StopBatchOpLogWriter() {
 }
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
-    return {
+    TieredStorageUsageSnapshot snapshot{
         .memory = segment_manager_.GetMemoryUsageSnapshot(),
         .nof = nof_segment_manager_.GetUsageSnapshot(),
     };
+    if (enable_dfs_ && dfs_allocator_ && dfs_allocator_->IsInitialized()) {
+        snapshot.dfs = {
+            .enabled = true,
+            .used_bytes = dfs_allocator_->GetUsedBytes(),
+            .capacity_bytes = dfs_allocator_->GetTotalCapacity(),
+            .file_count = dfs_allocator_->GetFileCount(),
+        };
+    }
+    return snapshot;
 }
 
 bool MasterService::IsTenantQuotaEnabled() const {
