@@ -21,6 +21,10 @@
 #include <cuda_runtime_api.h>
 #endif
 
+#ifdef MOONCAKE_TEST_XPU_H2D
+#include <sycl/sycl.hpp>
+#endif
+
 #include "config.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
@@ -583,6 +587,66 @@ TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
               cudaSuccess);
     EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
                            source.begin() + kSourceOffset));
+}
+#endif
+
+#ifdef MOONCAKE_TEST_XPU_H2D
+// Acceptance for XPU store staging: an object written straight from Intel GPU
+// USM (allocated the way PyTorch does, outside the Store) round-trips
+// byte-equal through the Store back into a second GPU buffer, with the VRAM
+// <-> host staging handled by the XPU accelerator device and TENT.
+TEST_F(RealClientTest, XpuDeviceBufferPutGetRoundTrips) {
+    std::optional<sycl::device> gpu;
+    for (const auto& d : sycl::device::get_devices()) {
+        if (d.is_gpu() && d.has(sycl::aspect::usm_device_allocations)) {
+            gpu = d;
+            break;
+        }
+    }
+    if (!gpu) GTEST_SKIP() << "XPU device is unavailable";
+    sycl::context ctx = gpu->get_platform().ext_oneapi_get_default_context();
+    sycl::queue queue(ctx, *gpu);
+
+    StartMasterAndSetupClient();
+
+    constexpr size_t kSize = 1 << 20;
+    std::vector<char> source(kSize);
+    std::mt19937 rng(7);
+    for (auto& byte : source) byte = static_cast<char>(rng());
+
+    auto* gpu_source =
+        static_cast<char*>(sycl::malloc_device(kSize, *gpu, ctx));
+    auto* gpu_destination =
+        static_cast<char*>(sycl::malloc_device(kSize, *gpu, ctx));
+    ASSERT_NE(gpu_source, nullptr);
+    ASSERT_NE(gpu_destination, nullptr);
+    queue.memcpy(gpu_source, source.data(), kSize).wait();
+    queue.memset(gpu_destination, 0, kSize).wait();
+
+    ASSERT_EQ(py_client_->register_buffer(gpu_source, kSize), 0);
+    ASSERT_EQ(py_client_->register_buffer(gpu_destination, kSize), 0);
+
+    const std::string key = "xpu_roundtrip";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    EXPECT_EQ(py_client_->put_from(key, gpu_source, kSize, config), 0);
+
+    // Host-side view of the stored object must equal the GPU source.
+    auto handle = py_client_->get_buffer(key);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_EQ(handle->size(), kSize);
+    EXPECT_EQ(std::memcmp(handle->ptr(), source.data(), kSize), 0);
+
+    EXPECT_EQ(py_client_->get_into(key, gpu_destination, kSize),
+              static_cast<int64_t>(kSize));
+    std::vector<char> actual(kSize);
+    queue.memcpy(actual.data(), gpu_destination, kSize).wait();
+    EXPECT_EQ(actual, source);
+
+    EXPECT_EQ(py_client_->unregister_buffer(gpu_source), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(gpu_destination), 0);
+    sycl::free(gpu_source, ctx);
+    sycl::free(gpu_destination, ctx);
 }
 #endif
 
