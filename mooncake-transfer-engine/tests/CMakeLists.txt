@@ -236,7 +236,30 @@ if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
-  add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
+  add_test(NAME nvlink_transport_test
+           COMMAND ${CMAKE_COMMAND} -E env GTEST_FILTER=NvlinkTransportTest.*
+                   $<TARGET_FILE:nvlink_transport_test>)
+  set_tests_properties(nvlink_transport_test PROPERTIES LABELS "nvlink_gpu")
+
+  if(USE_CUDA AND NOT USE_HIP)
+    add_test(
+      NAME nvlink_host_numa_registration_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env --unset=MC_USE_NVLINK_IPC
+        GTEST_FILTER=NvlinkHostNumaRegistrationTest.*
+        $<TARGET_FILE:nvlink_transport_test>)
+    set_tests_properties(nvlink_host_numa_registration_test
+                         PROPERTIES LABELS "nvlink_vmm_unit")
+
+    add_executable(nvlink_host_numa_allocation_test
+                   ${WORKSPACE}/nvlink_host_numa_allocation_test.cpp)
+    target_link_libraries(nvlink_host_numa_allocation_test
+                          PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME nvlink_host_numa_allocation_test
+             COMMAND nvlink_host_numa_allocation_test)
+    set_tests_properties(nvlink_host_numa_allocation_test
+                         PROPERTIES LABELS "nvlink_vmm_unit")
+  endif()
 endif()
 
 if(USE_HIP)
