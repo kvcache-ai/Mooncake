@@ -116,27 +116,27 @@ TEST(QpPoolLayoutTest, PerPoolLinkLayerQosOverridesDefaults) {
         {{"latency", 2, 0, 3, 96}, {"bulk", 2, 0, 7, 128}}, 4);
     ASSERT_TRUE(layout.valid);
 
-    auto latency0 = resolveQpLinkLayerQos(
-        layout.segments, /*qp_index=*/0, /*default_service_level=*/1,
-        /*default_traffic_class=*/2);
+    auto latency0 = resolveQpLinkLayerQos(layout.segments, /*qp_index=*/0,
+                                          /*default_service_level=*/1,
+                                          /*default_traffic_class=*/2);
     EXPECT_EQ(latency0.service_level, 3);
     EXPECT_EQ(latency0.traffic_class, 96);
 
-    auto latency1 = resolveQpLinkLayerQos(
-        layout.segments, /*qp_index=*/1, /*default_service_level=*/1,
-        /*default_traffic_class=*/2);
+    auto latency1 = resolveQpLinkLayerQos(layout.segments, /*qp_index=*/1,
+                                          /*default_service_level=*/1,
+                                          /*default_traffic_class=*/2);
     EXPECT_EQ(latency1.service_level, 3);
     EXPECT_EQ(latency1.traffic_class, 96);
 
-    auto bulk0 = resolveQpLinkLayerQos(
-        layout.segments, /*qp_index=*/2, /*default_service_level=*/1,
-        /*default_traffic_class=*/2);
+    auto bulk0 = resolveQpLinkLayerQos(layout.segments, /*qp_index=*/2,
+                                       /*default_service_level=*/1,
+                                       /*default_traffic_class=*/2);
     EXPECT_EQ(bulk0.service_level, 7);
     EXPECT_EQ(bulk0.traffic_class, 128);
 
-    auto bulk1 = resolveQpLinkLayerQos(
-        layout.segments, /*qp_index=*/3, /*default_service_level=*/1,
-        /*default_traffic_class=*/2);
+    auto bulk1 = resolveQpLinkLayerQos(layout.segments, /*qp_index=*/3,
+                                       /*default_service_level=*/1,
+                                       /*default_traffic_class=*/2);
     EXPECT_EQ(bulk1.service_level, 7);
     EXPECT_EQ(bulk1.traffic_class, 128);
 }
@@ -146,15 +146,15 @@ TEST(QpPoolLayoutTest, MissingPoolQosFieldsFallBackIndependently) {
         {{"sl-only", 1, 0, 5, -1}, {"tc-only", 1, 0, -1, 144}}, 2);
     ASSERT_TRUE(layout.valid);
 
-    auto sl_only = resolveQpLinkLayerQos(
-        layout.segments, /*qp_index=*/0, /*default_service_level=*/1,
-        /*default_traffic_class=*/2);
+    auto sl_only = resolveQpLinkLayerQos(layout.segments, /*qp_index=*/0,
+                                         /*default_service_level=*/1,
+                                         /*default_traffic_class=*/2);
     EXPECT_EQ(sl_only.service_level, 5);
     EXPECT_EQ(sl_only.traffic_class, 2);
 
-    auto tc_only = resolveQpLinkLayerQos(
-        layout.segments, /*qp_index=*/1, /*default_service_level=*/1,
-        /*default_traffic_class=*/2);
+    auto tc_only = resolveQpLinkLayerQos(layout.segments, /*qp_index=*/1,
+                                         /*default_service_level=*/1,
+                                         /*default_traffic_class=*/2);
     EXPECT_EQ(tc_only.service_level, 1);
     EXPECT_EQ(tc_only.traffic_class, 144);
 }
@@ -241,15 +241,15 @@ TEST(SelectQpInPoolTest, ResultAlwaysInRange) {
 TEST(QpPoolWorkerRoutingTest, NamedPoolSelectsOwningWorker) {
     auto segs = twoPools();  // kv=[0,4), ctrl=[4,6)
 
-    auto ctrl_from_worker0 = selectQpPoolRoute(
-        segs, "ctrl", /*candidate=*/0, /*total_qp=*/6,
-        /*num_workers=*/6, /*fallback_worker=*/0);
+    auto ctrl_from_worker0 =
+        selectQpPoolRoute(segs, "ctrl", /*candidate=*/0, /*total_qp=*/6,
+                          /*num_workers=*/6, /*fallback_worker=*/0);
     EXPECT_EQ(ctrl_from_worker0.qp_index, 4);
     EXPECT_EQ(ctrl_from_worker0.worker_id, 4);
 
-    auto ctrl_from_worker1 = selectQpPoolRoute(
-        segs, "ctrl", /*candidate=*/1, /*total_qp=*/6,
-        /*num_workers=*/6, /*fallback_worker=*/1);
+    auto ctrl_from_worker1 =
+        selectQpPoolRoute(segs, "ctrl", /*candidate=*/1, /*total_qp=*/6,
+                          /*num_workers=*/6, /*fallback_worker=*/1);
     EXPECT_EQ(ctrl_from_worker1.qp_index, 5);
     EXPECT_EQ(ctrl_from_worker1.worker_id, 5);
 
@@ -271,9 +271,9 @@ TEST(QpPoolWorkerRoutingTest, FallsBackWhenNoStableOwnerExists) {
     ASSERT_TRUE(layout.valid);
     layout.segments[0].begin = 1;
 
-    auto route = selectQpPoolRoute(
-        layout.segments, "misaligned", /*candidate=*/5, /*total_qp=*/6,
-        /*num_workers=*/6, /*fallback_worker=*/5);
+    auto route = selectQpPoolRoute(layout.segments, "misaligned",
+                                   /*candidate=*/5, /*total_qp=*/6,
+                                   /*num_workers=*/6, /*fallback_worker=*/5);
 
     EXPECT_EQ(route.qp_index, 2);
     EXPECT_EQ(route.worker_id, 5);
@@ -297,8 +297,7 @@ TEST(QpPoolWorkerRoutingTest, MixedBatchGroupsSlicesByPool) {
     RdmaSlice ctrl1{};
     ctrl1.task = &ctrl_task;
 
-    auto groups =
-        groupSlicesByQpPool({&kv0, &ctrl0, &kv1, &default0, &ctrl1});
+    auto groups = groupSlicesByQpPool({&kv0, &ctrl0, &kv1, &default0, &ctrl1});
 
     ASSERT_EQ(groups.size(), static_cast<size_t>(3));
     EXPECT_EQ(groups[0].pool, "kv");

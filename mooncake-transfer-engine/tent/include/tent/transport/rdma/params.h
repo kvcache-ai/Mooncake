@@ -148,13 +148,12 @@ inline QpLinkLayerQos resolveQpLinkLayerQos(
     const std::vector<QpPoolSegment>& segments, int qp_index,
     uint8_t default_service_level, uint8_t default_traffic_class) {
     const QpPoolSegment* pool = findQpPoolSegment(segments, qp_index);
-    return QpLinkLayerQos{
-        (pool && pool->service_level >= 0)
-            ? static_cast<uint8_t>(pool->service_level)
-            : default_service_level,
-        (pool && pool->traffic_class >= 0)
-            ? static_cast<uint8_t>(pool->traffic_class)
-            : default_traffic_class};
+    return QpLinkLayerQos{(pool && pool->service_level >= 0)
+                              ? static_cast<uint8_t>(pool->service_level)
+                              : default_service_level,
+                          (pool && pool->traffic_class >= 0)
+                              ? static_cast<uint8_t>(pool->traffic_class)
+                              : default_traffic_class};
 }
 
 // Pure QP router used by RdmaEndPoint::submitSlices (RFC #2568 step 3). Given

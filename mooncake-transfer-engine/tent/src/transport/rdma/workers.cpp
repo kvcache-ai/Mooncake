@@ -809,7 +809,7 @@ void Workers::asyncPostSend() {
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 discountFromOwner(worker, slice);
                 updateSliceStatus(slice, CANCELED);
-                continue;
+                return;
             }
             slice->retry_count++;
             if (slice->retry_count >=
@@ -849,8 +849,8 @@ void Workers::asyncPostSend() {
         // device's backlog holding these bytes for good.
         if (!qp_pool_routing) {
             const uint64_t post_ts = getCurrentTimeInNano();
-            int num_submitted = endpoint->submitSlices(
-                slices, tl_wid, [&](RdmaSlice* posted) {
+            int num_submitted =
+                endpoint->submitSlices(slices, tl_wid, [&](RdmaSlice* posted) {
                     markPosted(worker, posted, post_ts);
                 });
             for (int id = 0; id < num_submitted; ++id) {

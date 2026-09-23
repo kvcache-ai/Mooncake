@@ -723,8 +723,8 @@ int RdmaEndPoint::resetConnection(const std::string& reason) {
     return 0;
 }
 
-int RdmaEndPoint::selectQpOwnerWorker(const std::string& qp_pool,
-                                      int candidate, size_t num_workers) {
+int RdmaEndPoint::selectQpOwnerWorker(const std::string& qp_pool, int candidate,
+                                      size_t num_workers) {
     RWSpinlock::ReadGuard guard(lock_);
     if (qp_list_.empty()) return candidate;
     return selectQpPoolRoute(qp_pool_segments_, qp_pool, candidate,
@@ -972,9 +972,9 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     // Resolve link-layer QoS for this QP. When it belongs to a pool that
     // overrides SL/TC, use the pool's values; otherwise fall back to the global
     // endpoint SL/TC (unchanged default behavior).
-    const auto qos = resolveQpLinkLayerQos(
-        qp_pool_segments_, qp_index, params_->service_level,
-        params_->traffic_class);
+    const auto qos =
+        resolveQpLinkLayerQos(qp_pool_segments_, qp_index,
+                              params_->service_level, params_->traffic_class);
 
     // RESET -> INIT
     ibv_qp_attr attr;

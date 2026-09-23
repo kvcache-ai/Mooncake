@@ -46,9 +46,10 @@ inline int ownerWorkerForQpIndex(int qp_index, size_t num_workers,
     return qp_index % static_cast<int>(num_workers);
 }
 
-inline QpPoolRoute selectQpPoolRoute(
-    const std::vector<QpPoolSegment>& segments, const std::string& qp_pool,
-    int candidate, int total_qp, size_t num_workers, int fallback_worker) {
+inline QpPoolRoute selectQpPoolRoute(const std::vector<QpPoolSegment>& segments,
+                                     const std::string& qp_pool, int candidate,
+                                     int total_qp, size_t num_workers,
+                                     int fallback_worker) {
     if (total_qp <= 0) return QpPoolRoute{-1, fallback_worker};
     if (candidate < 0) candidate = 0;
     const int qp_index = selectQpInPool(segments, qp_pool, candidate, total_qp);
@@ -56,8 +57,8 @@ inline QpPoolRoute selectQpPoolRoute(
 
     const auto stable_route = [&](int worker_id) -> QpPoolRoute {
         int routed_qp = selectQpInPool(segments, qp_pool, worker_id, total_qp);
-        int owner = ownerWorkerForQpIndex(routed_qp, num_workers,
-                                          fallback_worker);
+        int owner =
+            ownerWorkerForQpIndex(routed_qp, num_workers, fallback_worker);
         return QpPoolRoute{routed_qp, owner == worker_id ? worker_id : -1};
     };
 
