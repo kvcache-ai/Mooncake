@@ -231,11 +231,11 @@ class MasterServiceTestPeer {
         return service.root_fs_dir_;
     }
 
-    static auto& SegmentManager(MasterService& service) {
-        return service.segment_manager_;
+    static auto& SegmentPool(MasterService& service) {
+        return service.segment_pool_;
     }
-    static const auto& SegmentManager(const MasterService& service) {
-        return service.segment_manager_;
+    static const auto& SegmentPool(const MasterService& service) {
+        return service.segment_pool_;
     }
 
     static auto& SnapshotCatalogStore(MasterService& service) {

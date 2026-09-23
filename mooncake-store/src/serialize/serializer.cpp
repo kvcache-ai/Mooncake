@@ -7,7 +7,9 @@
 #include "ha/snapshot/allocator_snapshot_codec.h"
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
-#include "master_service.h"
+#include "replica.h"
+#include "segment/pool_read_access.h"
+#include "segment.h"
 #include "common/zstd_util.h"
 
 namespace mooncake {
@@ -526,13 +528,420 @@ auto Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
 
     auto offset = allocation_array.via.array.ptr[0].as<uint32_t>();
     auto metadata = allocation_array.via.array.ptr[1].as<uint32_t>();
-    offset_allocator::OffsetAllocation allocation(offset, metadata);
+    if (!allocator || requested_size == 0) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL, "invalid offset allocation handle"));
+    }
+    // A raw constructor would let a corrupt node index reach the allocator's
+    // free path. Use the recovery API to validate ownership and bounds first.
+    auto restored =
+        allocator->createHandleAtNode(metadata, real_base, requested_size);
+    if (!restored || restored->m_allocation.getOffset() != offset) {
+        // This is only a borrowed reconstruction of an existing allocation;
+        // rejecting its redundant offset must not free that allocation.
+        if (restored) restored->m_allocator.reset();
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "offset allocation handle does not match restored allocator"));
+    }
+    return std::make_shared<offset_allocator::OffsetAllocationHandle>(
+        std::move(*restored));
+}
 
-    // Create a new OffsetAllocationHandle object
-    auto handle = std::make_shared<offset_allocator::OffsetAllocationHandle>(
-        allocator, allocation, real_base, requested_size);
+tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
+    const AllocatedBuffer& buffer, const SegmentPool& segment_pool,
+    MsgpackPacker& packer) {
+    const auto allocator = buffer.getAllocator();
+    // Snapshot encoding runs in a forked child. Never acquire the inherited
+    // pool mutex here: a vanished parent thread may have held its write lock.
+    const MountedRegion* region = nullptr;
+    for (const auto& mounted : segment_pool.catalog_.Regions()) {
+        const auto* resource = segment_pool.GetResource(mounted);
+        if (resource && resource->allocator() == allocator) {
+            region = &mounted;
+            break;
+        }
+    }
+    if (!region || region->kind != RegionKind::HOST_MEMORY) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::SERIALIZE_FAIL,
+            "serialize AllocatedBuffer has no snapshot-compatible region"));
+    }
+    return SerializeWithRegionId(buffer, region->segment.id, packer);
+}
 
-    return handle;
+tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
+    const AllocatedBuffer& buffer, const SegmentPool::ReadAccess& segment_view,
+    MsgpackPacker& packer) {
+    const auto allocator = buffer.getAllocator();
+    for (const auto& mounted : segment_view.Catalog().Regions()) {
+        if (mounted.kind == RegionKind::HOST_MEMORY && allocator &&
+            segment_view.GetAllocator(mounted.segment.id) == allocator) {
+            return SerializeWithRegionId(buffer, mounted.segment.id, packer);
+        }
+    }
+    return tl::unexpected(SerializationError(
+        ErrorCode::SERIALIZE_FAIL,
+        "serialize AllocatedBuffer has no snapshot-compatible region"));
+}
+
+tl::expected<void, SerializationError>
+Serializer<AllocatedBuffer>::SerializeWithRegionId(
+    const AllocatedBuffer& buffer, const UUID& region_id,
+    MsgpackPacker& packer) {
+    packer.pack_array(5);
+    packer.pack(static_cast<uint64_t>(buffer.size_));
+    packer.pack(reinterpret_cast<uint64_t>(buffer.buffer_ptr_));
+    packer.pack(UuidToString(region_id));
+
+    // Serialize offset_handle_ (if exists)
+    if (buffer.offset_handle_.has_value()) {
+        // Mark offset_handle exists
+        packer.pack(true);
+        auto handle_result =
+            Serializer<offset_allocator::OffsetAllocationHandle>::serialize(
+                buffer.offset_handle_.value(), packer);
+        if (!handle_result) {
+            return tl::unexpected(handle_result.error());
+        }
+    } else {
+        // Mark offset_handle does not exist
+        packer.pack(false);
+        packer.pack_nil();
+    }
+
+    return {};
+}
+
+auto Serializer<AllocatedBuffer>::deserialize(
+    const msgpack::object& obj, const SegmentPool::ReadAccess& segment_view)
+    -> tl::expected<PointerType, SerializationError> {
+    // Check if object type is array (consistent with serialize_msgpack)
+    if (obj.type != msgpack::type::ARRAY) {
+        return tl::unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "deserialize_msgpack AllocatedBuffer invalid "
+                               "msgpack data, expected array"));
+    }
+
+    // Verify array size is correct (should have 5 elements: size, buffer_ptr,
+    // segment_id, has_offset_handle, offset_handle)
+    if (obj.via.array.size != 5) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize_msgpack AllocatedBuffer invalid array "
+                        "size: expected 5, got {}",
+                        obj.via.array.size)));
+    }
+
+    auto* array_items = obj.via.array.ptr;
+
+    // Deserialize basic properties
+    // std::string segment_name = array_items[0].as<std::string>();
+    auto size = static_cast<size_t>(array_items[0].as<uint64_t>());
+    void* buffer_ptr = reinterpret_cast<void*>(array_items[1].as<uint64_t>());
+    // auto status = static_cast<BufStatus>(array_items[3].as<int32_t>());
+
+    // Get segment_id and find corresponding allocator
+    std::string segment_id = array_items[2].as<std::string>();
+    UUID segment_uuid;
+    bool success = StringToUuid(segment_id, segment_uuid);
+    if (!success) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize_msgpack AllocatedBuffer invalid segment "
+                        "ID format: {}",
+                        segment_id)));
+    }
+
+    const auto* mounted_region = segment_view.Catalog().Find(segment_uuid);
+    if (!mounted_region) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize AllocatedBuffer unknown segment {}",
+                        segment_id)));
+    }
+    // Draining/gracefully-unmounting regions retain readable allocations.
+    // Discarded replicas can also refer to an immediate unmount in progress.
+    std::shared_ptr<BufferAllocatorBase> allocator =
+        segment_view.GetAllocator(segment_uuid);
+    // Check if allocator is valid
+    if (!allocator) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize_msgpack AllocatedBuffer invalid allocator "
+                        "for segment {}",
+                        segment_id)));
+    }
+
+    const auto address = reinterpret_cast<uintptr_t>(buffer_ptr);
+    const auto& segment = mounted_region->segment;
+    if (size == 0 || address < segment.base ||
+        address - segment.base >= segment.size ||
+        size > segment.size - (address - segment.base)) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "allocated buffer lies outside its mounted region"));
+    }
+
+    auto offset_allocator =
+        std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
+    const auto& handle_object = array_items[4];
+    if (!offset_allocator || !array_items[3].as<bool>() ||
+        handle_object.type != msgpack::type::ARRAY ||
+        handle_object.via.array.size != 3 ||
+        handle_object.via.array.ptr[0].as<uint64_t>() != address ||
+        handle_object.via.array.ptr[1].as<uint64_t>() != size) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "allocated buffer has a missing or inconsistent offset handle"));
+    }
+    auto handle_result =
+        Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
+            handle_object, offset_allocator->getOffsetAllocator());
+    if (!handle_result) return tl::unexpected(handle_result.error());
+    std::optional<offset_allocator::OffsetAllocationHandle> offsetHandle(
+        std::move(**handle_result));
+
+    // Create AllocatedBuffer object
+    auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
+                                                    std::move(offsetHandle));
+    if (!segment_view.BindBufferToSegment(segment_uuid, *buffer)) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize AllocatedBuffer cannot bind to its region"));
+    }
+    // buffer->status = status;
+
+    return buffer;
+}
+
+template <typename SegmentAccess>
+tl::expected<void, SerializationError> Serializer<Replica>::SerializeImpl(
+    const Replica& replica, const SegmentAccess& segment_access,
+    MsgpackPacker& packer) {
+    // Use unified array structure to pack Replica
+    // Format: [id(uint64), status(int16), replica_type(int8), payload]
+    packer.pack_array(4);
+
+    // 1. Serialize id_ member variable
+    packer.pack(static_cast<uint64_t>(replica.id_));
+
+    // 2. Serialize status_ member variable
+    packer.pack(static_cast<int16_t>(replica.status_));
+
+    // 3. Serialize replica type
+    auto replica_type = replica.type();
+    packer.pack(static_cast<int8_t>(replica_type));
+
+    // 4. Serialize specific data by type
+    switch (replica_type) {
+        case ReplicaType::MEMORY: {
+            const auto* mem_data =
+                std::get_if<MemoryReplicaData>(&replica.data_);
+            if (!mem_data || !mem_data->buffer) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    fmt::format("serialize_msgpack Replica memory buffer_ptr "
+                                "is nullptr")));
+            }
+            auto result = Serializer<AllocatedBuffer>::serialize(
+                *mem_data->buffer, segment_access, packer);
+            if (!result) {
+                return tl::unexpected(result.error());
+            }
+            break;
+        }
+        case ReplicaType::DISK: {
+            const auto* disk_data =
+                std::get_if<DiskReplicaData>(&replica.data_);
+            if (!disk_data) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "serialize_msgpack Replica missing DiskReplicaData"));
+            }
+            // Format: [file_path, object_size]
+            packer.pack_array(2);
+            packer.pack(disk_data->file_path);
+            packer.pack(static_cast<uint64_t>(disk_data->object_size));
+            break;
+        }
+        case ReplicaType::LOCAL_DISK: {
+            const auto* local_data =
+                std::get_if<LocalDiskReplicaData>(&replica.data_);
+            if (!local_data) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "serialize_msgpack Replica missing LocalDiskReplicaData"));
+            }
+            // Format: [client_id_str, object_size, transport_endpoint]
+            packer.pack_array(3);
+            packer.pack(UuidToString(local_data->client_id));
+            packer.pack(static_cast<uint64_t>(local_data->object_size));
+            packer.pack(local_data->transport_endpoint);
+            break;
+        }
+        case ReplicaType::DFS: {
+            const auto* dfs_data = std::get_if<DfsReplicaData>(&replica.data_);
+            if (!dfs_data) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "serialize_msgpack Replica missing DfsReplicaData"));
+            }
+            // Format: [file_path, offset, object_size, aligned_size, shard_idx]
+            packer.pack_array(5);
+            packer.pack(dfs_data->descriptor.file_path);
+            packer.pack(static_cast<uint64_t>(dfs_data->descriptor.offset));
+            packer.pack(
+                static_cast<uint64_t>(dfs_data->descriptor.object_size));
+            packer.pack(
+                static_cast<uint64_t>(dfs_data->descriptor.aligned_size));
+            packer.pack(static_cast<int32_t>(dfs_data->descriptor.shard_idx));
+            break;
+        }
+        default:
+            return tl::unexpected(SerializationError(
+                ErrorCode::SERIALIZE_UNSUPPORTED,
+                "snapshot does not support this replica type"));
+    }
+
+    return {};
+}
+
+tl::expected<void, SerializationError> Serializer<Replica>::serialize(
+    const Replica& replica, const SegmentPool& segment_pool,
+    MsgpackPacker& packer) {
+    return SerializeImpl(replica, segment_pool, packer);
+}
+
+tl::expected<void, SerializationError> Serializer<Replica>::serialize(
+    const Replica& replica, const SegmentPool::ReadAccess& segment_view,
+    MsgpackPacker& packer) {
+    return SerializeImpl(replica, segment_view, packer);
+}
+
+auto Serializer<Replica>::deserialize(
+    const msgpack::object& obj, const SegmentPool::ReadAccess& segment_view)
+    -> tl::expected<PointerType, SerializationError> {
+    // Check if object type is array (consistent with serialize)
+    if (obj.type != msgpack::type::ARRAY) {
+        return tl::unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "deserialize_msgpack Replica invalid msgpack "
+                               "data, expected array"));
+    }
+
+    // Verify array size is correct (should have 4 elements: id, status,
+    // replica_type, payload)
+    if (obj.via.array.size != 4) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize_msgpack Replica invalid array size: "
+                        "expected 4, got {}",
+                        obj.via.array.size)));
+    }
+
+    auto* array_items = obj.via.array.ptr;
+
+    // 1. Deserialize id_ member variable
+    auto id = static_cast<ReplicaID>(array_items[0].as<uint64_t>());
+
+    // 2. Deserialize status_ member variable
+    auto status = static_cast<ReplicaStatus>(array_items[1].as<int16_t>());
+
+    // 3. Deserialize replica_type
+    auto replica_type_code = array_items[2].as<int8_t>();
+
+    // 4. Parse payload by type
+    std::shared_ptr<Replica> replica;
+    switch (replica_type_code) {
+        case static_cast<int8_t>(ReplicaType::MEMORY): {
+            // MEMORY: payload is AllocatedBuffer
+            auto buffer_result = Serializer<AllocatedBuffer>::deserialize(
+                array_items[3], segment_view);
+            if (!buffer_result) {
+                return tl::unexpected(buffer_result.error());
+            }
+            replica = std::make_shared<Replica>(
+                std::move(buffer_result.value()), status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::DISK): {
+            const auto& payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 2) {
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "deserialize_msgpack Replica DISK "
+                                       "payload is not valid array[2]"));
+            }
+            auto* payload_items = payload.via.array.ptr;
+            std::string file_path = payload_items[0].as<std::string>();
+            uint64_t object_size = payload_items[1].as<uint64_t>();
+
+            replica = std::make_shared<Replica>(std::move(file_path),
+                                                object_size, status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
+            const auto& payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 3) {
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "deserialize_msgpack Replica LOCAL_DISK "
+                                       "payload is not valid array[3]"));
+            }
+            auto* payload_items = payload.via.array.ptr;
+            std::string client_id_str = payload_items[0].as<std::string>();
+            uint64_t object_size = payload_items[1].as<uint64_t>();
+            std::string transport_endpoint = payload_items[2].as<std::string>();
+
+            UUID client_id;
+            if (!StringToUuid(client_id_str, client_id)) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    fmt::format("deserialize_msgpack Replica invalid client_id "
+                                "UUID: {}",
+                                client_id_str)));
+            }
+
+            replica = std::make_shared<Replica>(
+                client_id, object_size, std::move(transport_endpoint), status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::DFS): {
+            const auto& payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 5) {
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "deserialize_msgpack Replica DFS "
+                                       "payload is not valid array[5]"));
+            }
+            auto* payload_items = payload.via.array.ptr;
+            DistributedFSDescriptor descriptor;
+            descriptor.file_path = payload_items[0].as<std::string>();
+            descriptor.offset = payload_items[1].as<uint64_t>();
+            descriptor.object_size = payload_items[2].as<uint64_t>();
+            descriptor.aligned_size = payload_items[3].as<uint64_t>();
+            descriptor.shard_idx = payload_items[4].as<int32_t>();
+
+            replica = std::make_shared<Replica>(std::move(descriptor), status);
+            break;
+        }
+        default:
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format("deserialize Replica invalid replica type: {}",
+                            replica_type_code)));
+    }
+
+    // Restore the original id (overwrite the auto-generated one)
+    // Note: refcnt_ is not restored, it remains 0 (default value)
+    replica->id_ = id;
+
+    return replica;
 }
 
 tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(

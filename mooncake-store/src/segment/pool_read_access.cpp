@@ -23,6 +23,16 @@ std::shared_ptr<BufferAllocatorBase> SegmentPool::ReadAccess::GetAllocator(
     return resource ? resource->allocator() : nullptr;
 }
 
+bool SegmentPool::ReadAccess::BindBufferToSegment(
+    const UUID& region_id, AllocatedBuffer& buffer) const {
+    const auto* mounted = catalog_.Find(region_id);
+    const auto* resource = mounted ? GetResource(*mounted) : nullptr;
+    if (!resource || resource->allocator() != buffer.getAllocator())
+        return false;
+    resource->candidate->BindBuffer(buffer);
+    return true;
+}
+
 ErrorCode SegmentPool::ReadAccess::QueryAllocationCandidates(
     std::string_view name, AllocationCandidateKind kind, size_t& used,
     size_t& capacity) const {

@@ -123,6 +123,24 @@ void* AllocatedBuffer::get_vaddr_from_cxl() {
     return reinterpret_cast<void*>(offset_raw + DEFAULT_CXL_BASE);
 }
 
+std::unique_ptr<AllocatedBuffer> AllocateBoundTo(
+    BufferAllocatorBase& allocator, const SegmentLifetime& lifetime,
+    size_t size) {
+    if (!lifetime.CanAllocate()) {
+        return nullptr;
+    }
+    auto buffer = allocator.allocate(size);
+    if (!buffer) {
+        return nullptr;
+    }
+    buffer->bindSegmentLifetime(lifetime);
+    if (!lifetime.CanAllocate()) {
+        // The region went away, or changed owner, while allocating.
+        return nullptr;
+    }
+    return buffer;
+}
+
 // Define operator<< using public accessors or get_descriptor if appropriate
 std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
     return os << "AllocatedBuffer: { "

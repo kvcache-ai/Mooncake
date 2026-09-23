@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -9,8 +13,9 @@
 #include "ha/snapshot/master_snapshot_codec.h"
 #include "master_config.h"
 #include "master_service.h"
+#include "segment/pool_read_access.h"
+#include "segment/pool_write_access.h"
 #include "master_service/master_service_test_peer.h"
-#include "segment.h"
 #include "task_manager.h"
 #include "tenant_id.h"
 #include "common/zstd_util.h"
@@ -35,10 +40,41 @@ class MasterSnapshotCodecTest : public ::testing::Test {
     // Assemble the codec state view through the shared test peer.
     static MasterSnapshotStateView MakeStateView(MasterService& service) {
         return MasterSnapshotStateView(
-            service, MasterServiceTestPeer::SegmentManager(service),
+            service, MasterServiceTestPeer::SegmentPool(service),
             MasterServiceTestPeer::LocalSsdManager(service),
-            MasterServiceTestPeer::NofSegmentManager(service),
             MasterServiceTestPeer::TaskManager(service));
+    }
+
+    static int EncodeInForkWithPoolLocked(MasterService& service) {
+        std::unique_lock snapshot_lock(
+            MasterServiceTestPeer::SnapshotMutex(service));
+        auto pool_lock =
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        const pid_t child = fork();
+        if (child == 0) {
+            alarm(5);
+            MasterSnapshotCodec codec;
+            auto view = MakeStateView(service);
+            _exit(codec.Encode(view).has_value() ? 0 : 1);
+        }
+        if (child < 0) return -1;
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+
+    static std::shared_ptr<BufferAllocatorBase> RetireSegmentPool(
+        MasterService& service, const UUID& segment_id) {
+        auto allocator = MasterServiceTestPeer::SegmentPool(service)
+                             .AcquireReadAccess()
+                             .GetAllocator(segment_id);
+        MasterServiceTestPeer::SegmentPool(service)
+            .AcquireWriteAccess()
+            .Clear();
+        return allocator;
     }
 
     std::unique_ptr<MasterService> master_service_;
@@ -114,6 +150,13 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
         << "Encode failed: " << encode_result.error().message;
     EXPECT_FALSE(encode_result.value().segments.empty());
 
+    // Neither resource capture nor MEMORY replica encoding may acquire the
+    // inherited pool mutex in a forked snapshot child.
+    const int child_status = EncodeInForkWithPoolLocked(*master_service_);
+    ASSERT_NE(child_status, -1);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    EXPECT_EQ(WEXITSTATUS(child_status), 0);
+
     // Decode into a fresh service. This exercises the segments-before-metadata
     // restore order.
     auto target_service = MakeMasterService();
@@ -127,6 +170,42 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
     ASSERT_TRUE(get_result.has_value())
         << "GetReplicaList failed: " << static_cast<int>(get_result.error());
     EXPECT_EQ(get_result.value().replicas.size(), 1u);
+
+    // A restored buffer must retain its region's validity binding, not merely
+    // a weak allocator handle. Retaining the allocator after pool retirement
+    // must not leave the restored replica readable.
+    auto retained_allocator = RetireSegmentPool(*target_service, segment.id);
+    ASSERT_NE(retained_allocator, nullptr);
+    EXPECT_FALSE(target_service->GetReplicaList(kKey, kTenant).has_value());
+}
+
+TEST_F(MasterSnapshotCodecTest,
+       SharedNameOwnersCanRemountAfterSnapshotRestore) {
+    Segment first;
+    first.id = generate_uuid();
+    first.name = "shared-codec-segment";
+    first.base = 0x300000000ULL;
+    first.size = 16 * 1024 * 1024;
+    first.te_endpoint = "codec-owner-a";
+    first.host_id = "codec-host";
+    Segment second = first;
+    second.id = generate_uuid();
+    second.base += first.size;
+    second.te_endpoint = "codec-owner-b";
+    const UUID first_owner = generate_uuid();
+    const UUID second_owner = generate_uuid();
+    ASSERT_TRUE(master_service_->MountSegment(first, first_owner));
+    ASSERT_TRUE(master_service_->MountSegment(second, second_owner));
+
+    MasterSnapshotCodec codec;
+    auto state = MakeStateView(*master_service_);
+    auto encoded = codec.Encode(state);
+    ASSERT_TRUE(encoded) << encoded.error().message;
+    auto restored = MakeMasterService();
+    ASSERT_TRUE(codec.Decode(restored.get(), *encoded));
+    EXPECT_TRUE(restored->ReMountSegment({first}, first_owner));
+    EXPECT_TRUE(restored->ReMountSegment({second}, second_owner));
+    EXPECT_FALSE(restored->ReMountSegment({first}, second_owner));
 }
 
 TEST_F(MasterSnapshotCodecTest, DecodeWithCorruptPayloadFails) {
