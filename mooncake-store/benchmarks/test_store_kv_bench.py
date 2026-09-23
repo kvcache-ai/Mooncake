@@ -234,7 +234,7 @@ class RemoveExistenceErrorTest(unittest.TestCase):
         ):
             with self.subTest(expected=expected, removed=removed, exists=exists):
                 store.remove.return_value = removed
-                store.isExist.return_value = exists
+                store.is_exist.return_value = exists
                 result, _, code = session.metadata_operation("remove", 1, expected)
                 self.assertEqual(result.request_ok, ok)
                 if exists < 0:
@@ -245,7 +245,7 @@ class RemoveExistenceErrorTest(unittest.TestCase):
         store = Mock()
         store.setup.return_value = 0
         store.remove.return_value = -1
-        store.isExist.return_value = -1
+        store.is_exist.return_value = -1
         with TemporaryDirectory() as directory:
             argv = [
                 "store_kv_bench.py",

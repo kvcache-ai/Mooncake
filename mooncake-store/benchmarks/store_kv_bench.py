@@ -531,7 +531,7 @@ class StoreSession:
             success = result_code >= 0 and actual_present == expected_present
         elif operation == "remove":
             result_code = self.store.remove(key)
-            existence_result = self.store.isExist(key)
+            existence_result = self.store.is_exist(key)
             actual_present = existence_result == 1
             success = existence_result == 0 and (
                 result_code == 0 or not expected_present
