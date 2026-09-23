@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <random>
 
 #include "common.h"
 #include "config.h"
@@ -28,6 +29,18 @@
 #include "transfer_metadata_plugin.h"
 
 namespace mooncake {
+static std::string makeCommandCapability() {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::random_device random;
+    std::string token(32, '0');
+    for (size_t i = 0; i < token.size(); i += 2) {
+        const auto byte = static_cast<unsigned char>(random());
+        token[i] = kHex[byte >> 4];
+        token[i + 1] = kHex[byte & 0xf];
+    }
+    return token;
+}
+
 static uint64_t currentWallTimeInMicroseconds() {
     const int64_t now_ns = getCurrentTimeInNano();
     if (now_ns <= 0) return 1;
@@ -46,7 +59,8 @@ static uint64_t nextWallTimeMetadataVersion(uint64_t local_version,
 static bool sameRpcMetaDesc(const TransferMetadata::RpcMetaDesc &lhs,
                             const TransferMetadata::RpcMetaDesc &rhs) {
     if (lhs.ip_or_host_name != rhs.ip_or_host_name ||
-        lhs.rpc_port != rhs.rpc_port) {
+        lhs.rpc_port != rhs.rpc_port ||
+        lhs.command_capability != rhs.command_capability) {
         return false;
     }
 #ifdef USE_BAREX
@@ -187,6 +201,8 @@ struct TransferHandshakeUtil {
             root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
             root["ctrl_channel"] = desc.ctrl_channel;
         }
+        if (!desc.command_capability.empty())
+            root["command_capability"] = desc.command_capability;
         root["reply_msg"] = desc.reply_msg;
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
@@ -246,6 +262,12 @@ struct TransferHandshakeUtil {
         if (root.isMember("ctrl_channel") && root["ctrl_channel"].isBool()) {
             desc.ctrl_channel = root["ctrl_channel"].asBool();
         }
+        if (root.isMember("command_capability") &&
+            root["command_capability"].isString()) {
+            desc.command_capability = root["command_capability"].asString();
+        } else {
+            desc.command_capability.clear();
+        }
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
@@ -269,6 +291,7 @@ struct TransferHandshakeUtil {
 
 TransferMetadata::TransferMetadata(const std::string &conn_string) {
     next_segment_id_.store(1);
+    command_capability_ = makeCommandCapability();
 
     std::string protocol = extractProtocolFromConnString(conn_string);
     std::string custom_key;
@@ -1777,6 +1800,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
         desc.metadata_version = nextWallTimeMetadataVersion(
             desc.metadata_version, published_version);
     }
+    desc.command_capability = command_capability_;
     local_rpc_meta_ = desc;
 
     if (p2p_handshake_mode_) {
@@ -1804,6 +1828,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     Json::Value rpcMetaJSON;
     rpcMetaJSON["ip_or_host_name"] = desc.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt>(desc.rpc_port);
+    rpcMetaJSON["command_capability"] = desc.command_capability;
     rpcMetaJSON["metadata_version"] =
         static_cast<Json::UInt64>(desc.metadata_version);
     if (!storage_plugin_->set(rpc_meta_prefix_ + server_name, rpcMetaJSON)) {
@@ -1842,6 +1867,8 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
         if (existing["ip_or_host_name"].asString() ==
                 local_rpc_meta_.ip_or_host_name &&
             existing["rpc_port"].asUInt() == local_rpc_meta_.rpc_port &&
+            existing["command_capability"].asString() ==
+                local_rpc_meta_.command_capability &&
             existing_has_version) {
             local_rpc_meta_.metadata_version =
                 std::max(local_rpc_meta_.metadata_version, published_version);
@@ -1855,6 +1882,7 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
     Json::Value rpcMetaJSON;
     rpcMetaJSON["ip_or_host_name"] = local_rpc_meta_.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt>(local_rpc_meta_.rpc_port);
+    rpcMetaJSON["command_capability"] = local_rpc_meta_.command_capability;
     rpcMetaJSON["metadata_version"] =
         static_cast<Json::UInt64>(local_rpc_meta_.metadata_version);
     if (!storage_plugin_->set(full_key, rpcMetaJSON)) {
@@ -1890,6 +1918,7 @@ int TransferMetadata::getRpcMetaEntryInternal(const std::string &server_name,
         desc.ip_or_host_name = ip;
         desc.rpc_port = port;
         desc.metadata_version = 0;
+        desc.command_capability.clear();
     } else {
         Json::Value rpcMetaJSON;
         if (!storage_plugin_->get(rpc_meta_prefix_ + server_name,
@@ -1899,6 +1928,11 @@ int TransferMetadata::getRpcMetaEntryInternal(const std::string &server_name,
         }
         desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
         desc.rpc_port = (uint16_t)rpcMetaJSON["rpc_port"].asUInt();
+        if (rpcMetaJSON["command_capability"].isString())
+            desc.command_capability =
+                rpcMetaJSON["command_capability"].asString();
+        else
+            desc.command_capability.clear();
         if (rpcMetaJSON.isMember("metadata_version") &&
             rpcMetaJSON["metadata_version"].isUInt64()) {
             desc.metadata_version = rpcMetaJSON["metadata_version"].asUInt64();
@@ -1917,8 +1951,8 @@ int TransferMetadata::getRpcMetaEntryInternal(const std::string &server_name,
 int TransferMetadata::startHandshakeDaemon(
     OnReceiveHandShake on_receive_handshake, uint16_t listen_port, int sockfd) {
     handshake_plugin_->registerOnConnectionCallBack(
-        [on_receive_handshake](const Json::Value &peer,
-                               Json::Value &local) -> int {
+        [this, on_receive_handshake](const Json::Value &peer,
+                                     Json::Value &local) -> int {
             HandShakeDesc local_desc, peer_desc;
             if (TransferHandshakeUtil::decode(peer, peer_desc)) {
                 local_desc.reply_msg = "Invalid handshake notify_rq_depth";
@@ -1940,6 +1974,7 @@ int TransferMetadata::startHandshakeDaemon(
                     return 0;
                 }
             }
+            local_desc.command_capability = command_capability_;
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
         });
@@ -1981,6 +2016,11 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
                    << peer_desc.reply_msg;
         return ERR_METADATA;
     }
+    if (!peer_desc.command_capability.empty()) {
+        RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+        rpc_meta_map_[peer_server_name].command_capability =
+            peer_desc.command_capability;
+    }
     return 0;
 }
 
@@ -2015,6 +2055,45 @@ int TransferMetadata::sendProbe(const std::string &peer_server_name) {
                                            peer_location.rpc_port, local, peer);
     if (ret) return ret;
     return 0;
+}
+
+void TransferMetadata::registerOnCommandCallBack(OnReceiveCommand callback) {
+    {
+        std::unique_lock<std::shared_mutex> guard(command_mutex_);
+        on_command_callback_ = std::move(callback);
+    }
+    if (!handshake_plugin_) return;
+    handshake_plugin_->registerOnCommandCallBack(
+        [this](const std::string &peer_address, const std::string &wire_request,
+               std::string &response) {
+            std::shared_lock<std::shared_mutex> guard(command_mutex_);
+            if (!on_command_callback_ ||
+                wire_request.size() < command_capability_.size() ||
+                wire_request.compare(0, command_capability_.size(),
+                                     command_capability_) != 0) {
+                return;
+            }
+            on_command_callback_(
+                peer_address, wire_request.substr(command_capability_.size()),
+                response);
+        });
+}
+
+int TransferMetadata::sendCommand(const std::string &peer_server_name,
+                                  const std::string &request,
+                                  std::string &response) {
+    RpcMetaDesc peer_location;
+    if (getRpcMetaEntry(peer_server_name, peer_location)) return ERR_METADATA;
+    if (peer_location.command_capability.empty()) return ERR_NOT_IMPLEMENTED;
+    if (peer_location.command_capability.size() >
+            kMaxTransferCommandLength - sizeof(uint8_t) ||
+        request.size() > kMaxTransferCommandLength - sizeof(uint8_t) -
+                             peer_location.command_capability.size())
+        return ERR_INVALID_ARGUMENT;
+    return handshake_plugin_->sendCommand(
+        peer_location.ip_or_host_name, peer_location.rpc_port,
+        local_rpc_meta_.ip_or_host_name,
+        peer_location.command_capability + request, response);
 }
 
 }  // namespace mooncake

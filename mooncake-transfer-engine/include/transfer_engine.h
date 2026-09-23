@@ -174,7 +174,26 @@ class TransferEngine {
         std::span<const size_t> remote_offsets;
         std::span<const size_t> lengths;
         std::function<void(size_t, const Status&)> on_fragment_complete;
+        // Replaces per-fragment callbacks for contiguous completion runs.
+        std::function<void(size_t, size_t, const Status&)>
+            on_fragment_batch_complete = {};
     };
+
+    struct ScatterStagingBuffer {
+        void* data = nullptr;
+        size_t capacity = 0;
+        std::shared_ptr<void> owner;
+
+        explicit operator bool() const {
+            return data != nullptr && capacity != 0 && owner != nullptr;
+        }
+    };
+
+    using ScatterStagingAllocator = std::function<ScatterStagingBuffer(size_t)>;
+
+    // Supplies already-registered host memory for owner-side scatter gather.
+    // Clearing the allocator waits for in-flight gather commands to drain.
+    void setScatterStagingAllocator(ScatterStagingAllocator allocator);
 
     class ScatterTransferOperation {
        public:

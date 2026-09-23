@@ -808,6 +808,57 @@ TEST(TransferMetadataVersionTest, P2PRpcMetaKeepsLegacyVersionZero) {
     EXPECT_EQ(metadata.localRpcMeta().metadata_version, 0U);
 }
 
+TEST(TransferMetadataCommandTest, AuthenticatedBinaryCommandRoundTrips) {
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int server_sockfd = -1;
+    const uint16_t server_port = findAvailableTcpPort(server_sockfd);
+    ASSERT_GT(server_port, 0);
+    const std::string server_name = "127.0.0.1:" + std::to_string(server_port);
+    TransferMetadata::RpcMetaDesc server_rpc{};
+    server_rpc.ip_or_host_name = "127.0.0.1";
+    server_rpc.rpc_port = server_port;
+    server_rpc.sockfd = server_sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(server_name, server_rpc), 0);
+    ASSERT_EQ(server.startHandshakeDaemon({}, server_port, server_sockfd), 0);
+
+    const std::string request("scatter\0plan", 12);
+    const std::string expected_response("done\0ok", 7);
+    server.registerOnCommandCallBack([&](const std::string &peer,
+                                         const std::string &command,
+                                         std::string &response) {
+        EXPECT_EQ(peer.substr(0, peer.find(':')), "127.0.0.1");
+        EXPECT_EQ(command, request);
+        response = expected_response;
+    });
+
+    int client_sockfd = -1;
+    const uint16_t client_port = findAvailableTcpPort(client_sockfd);
+    ASSERT_GT(client_port, 0);
+    const std::string client_name = "127.0.0.1:" + std::to_string(client_port);
+    TransferMetadata::RpcMetaDesc client_rpc{};
+    client_rpc.ip_or_host_name = "127.0.0.1";
+    client_rpc.rpc_port = client_port;
+    client_rpc.sockfd = client_sockfd;
+    ASSERT_EQ(client.addRpcMetaEntry(client_name, client_rpc), 0);
+
+    std::string response;
+    EXPECT_EQ(client.sendCommand(server_name, request, response),
+              ERR_NOT_IMPLEMENTED);
+
+    TransferMetadata::HandShakeDesc handshake_request, handshake_response;
+    ASSERT_EQ(client.sendHandshake(server_name, handshake_request,
+                                   handshake_response),
+              0);
+    ASSERT_EQ(client.sendCommand(server_name, request, response), 0);
+    EXPECT_EQ(response, expected_response);
+
+    const std::string oversized(kMaxTransferCommandLength, 'x');
+    EXPECT_EQ(client.sendCommand(server_name, oversized, response),
+              ERR_INVALID_ARGUMENT);
+}
+
 TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {
     constexpr uint64_t kRemoteAddr = 0x1000;
     constexpr uint64_t kLocalOnlyAddr = 0x2000;
