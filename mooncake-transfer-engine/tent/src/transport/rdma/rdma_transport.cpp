@@ -251,13 +251,14 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
     // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
     // ib_core), so the amdgpu module itself is the presence signal.
+    // Hygon: the hycu driver provides the same peer-memory support.
     std::ifstream modules("/proc/modules");
     std::string line;
     while (std::getline(modules, line)) {
         const auto name_end = line.find(' ');
         const auto name =
             name_end == std::string::npos ? line : line.substr(0, name_end);
-        if (name == "nvidia_peermem" || name == "amdgpu") {
+        if (name == "nvidia_peermem" || name == "amdgpu" || name == "hycu") {
             return true;
         }
     }
@@ -735,7 +736,7 @@ Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
 }
 
 Status RdmaTransport::refreshLocalDeviceDesc(const std::string& device_name,
-                                             uint16_t lid,
+                                             uint32_t lid,
                                              const std::string& gid) {
     if (!metadata_)
         return Status::InvalidArgument(
@@ -743,7 +744,7 @@ Status RdmaTransport::refreshLocalDeviceDesc(const std::string& device_name,
 
     auto& manager = metadata_->segmentManager();
     bool existed = false;
-    uint16_t previous_lid = 0;
+    uint32_t previous_lid = 0;
     std::string previous_gid;
     CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
         if (segment.type != SegmentType::Memory)
@@ -881,7 +882,8 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
-                                                         int device_id) {
+                                                         int device_id,
+                                                         Status* failure) {
     std::string rpc_server_addr, target_seg_name, target_dev_name,
         target_nic_path_name;
 
@@ -909,6 +911,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
 
     if (!status.ok()) {
         LOG(ERROR) << status.ToString();
+        if (failure) *failure = status;
         return nullptr;
     }
 
@@ -922,6 +925,10 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         }
     }
     if (!context) {
+        if (failure) {
+            *failure =
+                Status::DeviceNotFound("No enabled RDMA context" LOC_MARK);
+        }
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
@@ -929,6 +936,10 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
+        if (failure) {
+            *failure =
+                Status::InternalError("Cannot allocate endpoint" LOC_MARK);
+        }
         return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
@@ -942,21 +953,39 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                 LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
                            << status.ToString();
             }
+            if (failure) *failure = status;
             return nullptr;
         }
     }
     return endpoint;
 }
 
+Status RdmaTransport::notifyStatusForEndpointFailure(const Status& failure) {
+    if (failure.IsRpcServiceError()) {
+        return Status::RpcServiceError(
+            "RDMA notification endpoint bootstrap failed; peer control "
+            "plane unreachable, not falling back to RPC: " +
+            std::string{failure.message()} + LOC_MARK);
+    }
+    return Status::DeviceNotFound("RDMA notification endpoint unavailable: " +
+                                  std::string{failure.message()} + LOC_MARK);
+}
+
 Status RdmaTransport::sendNotification(SegmentID target_id,
                                        const Notification& notify) {
-    auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID);
-    if (!endpoint) {
-        return Status::InternalError(
-            "Endpoint not found for notification" LOC_MARK);
-    }
+    // Both failures below mean nothing left this host. Unless the bootstrap
+    // RPC itself failed (see notifyStatusForEndpointFailure), the engine may
+    // still reach the peer over the control plane, so they are reported with
+    // codes TransferEngineImpl::sendNotification() recognizes as "channel
+    // unavailable" rather than as a generic internal error.
+    Status failure;
+    auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID, &failure);
+    if (!endpoint) return notifyStatusForEndpointFailure(failure);
+    // Notify QP not connected (the peer has none, or it was disabled after a
+    // fault), or the post itself was refused.
     if (!endpoint->sendNotification(notify.name, notify.msg)) {
-        return Status::InternalError("Failed to send notification" LOC_MARK);
+        return Status::RdmaError(
+            "RDMA notification channel unavailable" LOC_MARK);
     }
     return Status::OK();
 }

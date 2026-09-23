@@ -21,6 +21,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <atomic>
 #include <cassert>
@@ -195,6 +198,7 @@ static inline std::string gidBytesToString(const uint8_t* raw) {
 // 3) RoCEv2/IB + no network device
 // 4) first non-zero GID (any type)
 static inline GidNetworkState getBestGidIndex(const std::string& device_name,
+                                              const IbvSymbols& verbs,
                                               struct ibv_context* context,
                                               ibv_port_attr& port_attr,
                                               uint8_t port, int& gid_index) {
@@ -210,7 +214,7 @@ static inline GidNetworkState getBestGidIndex(const std::string& device_name,
             << device_name << " port " << (int)port;
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
-        if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
+        if (QueryGidEx(verbs, context, port, i, &gid_entry)) {
             continue;  // Skip invalid GID entries
         }
 
@@ -696,7 +700,8 @@ RdmaAddressRefreshResult RdmaContext::refreshAddress(
 
     int next_gid_index = params_->device.gid_index;
     if (next_gid_index < 0) {
-        if (getBestGidIndex(device_name_, native_context_, port_attr, port,
+        if (getBestGidIndex(device_name_, verbs_, native_context_, port_attr,
+                            port,
                             next_gid_index) == GidNetworkState::GID_NOT_FOUND) {
             LOG(WARNING) << "No suitable GID found while refreshing "
                          << device_name_ << "/" << static_cast<int>(port);
@@ -724,8 +729,13 @@ RdmaAddressRefreshResult RdmaContext::refreshAddress(
         return RdmaAddressRefreshResult::FAILED;
     }
 
-    RdmaAddressSnapshot next_address{
-        port_attr.lid, gidBytesToString(next_gid.raw), next_gid_index};
+#ifdef USE_SHCA
+    const uint32_t next_lid = u17_to_32(port_attr.lid);
+#else
+    const uint32_t next_lid = port_attr.lid;
+#endif
+    RdmaAddressSnapshot next_address{next_lid, gidBytesToString(next_gid.raw),
+                                     next_gid_index};
     if (current) *current = next_address;
     const bool changed = next_address.lid != old_address.lid ||
                          next_address.gid != old_address.gid ||
@@ -831,7 +841,7 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     if (params_->verbose) {
         for (int i = 0; i < port_attr.gid_tbl_len; i++) {
             struct ibv_gid_entry entry;
-            if (ibv_query_gid_ex(context.get(), port, i, &entry, 0)) {
+            if (QueryGidEx(verbs_, context.get(), port, i, &entry)) {
                 PLOG(WARNING)
                     << "Scan: Unable to query GID " << i << " on device "
                     << device_name << " port " << port;
@@ -850,8 +860,9 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     if (gid_index_ < 0) {
         // Auto-select GID
         int found_gid_index = -1;
-        GidNetworkState gid_state = getBestGidIndex(
-            device_name, context.get(), port_attr, port, found_gid_index);
+        GidNetworkState gid_state =
+            getBestGidIndex(device_name, verbs_, context.get(), port_attr, port,
+                            found_gid_index);
         if (gid_state == GidNetworkState::GID_NOT_FOUND) {
             LOG(ERROR) << "No valid GID found for device " << device_name
                        << " port " << static_cast<int>(port);
@@ -886,8 +897,8 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
             has_issues = true;
         }
 
-        if (ibv_query_gid_ex(context.get(), port, gid_index_, &user_gid_entry,
-                             0) == 0) {
+        if (QueryGidEx(verbs_, context.get(), port, gid_index_,
+                       &user_gid_entry) == 0) {
             bool is_ipv4 =
                 ipv6_addr_v4mapped((struct in6_addr*)user_gid_entry.gid.raw);
             bool is_roce_v2 = user_gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2;
@@ -932,7 +943,11 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     }
 
     native_context_ = context.release();
+#ifdef USE_SHCA
+    lid_ = u17_to_32(port_attr.lid);
+#else
     lid_ = port_attr.lid;
+#endif
     recordPortSpeed(port_attr);
     queryEffectiveSpeed();
     return 0;

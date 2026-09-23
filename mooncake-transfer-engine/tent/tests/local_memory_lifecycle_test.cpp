@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -115,6 +116,68 @@ TEST(LocalMemoryLifecycle, SegmentInfoReplacesPreviouslyReportedBuffers) {
     ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
     EXPECT_TRUE(info.buffers.empty())
         << "An unregistered buffer must not survive a segment-info refresh";
+}
+
+TEST(LocalMemoryLifecycle, ShmAcceptsDefaultAllocationLocation) {
+    auto config = makeConfig();
+    config->set("transports/shm/enable", true);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    void* address = nullptr;
+    auto status = engine.allocateLocalMemory(&address, 4096, kWildcardLocation);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    std::memset(address, 0x5a, 4096);
+    EXPECT_TRUE(engine.freeLocalMemory(address).ok());
+}
+
+TEST(LocalMemoryLifecycle, DefaultHostOptionsAllocateUsableSharedMemory) {
+    auto config = makeConfig();
+    config->set("transports/shm/enable", true);
+    TransferEngineImpl target(config);
+    TransferEngineImpl initiator(config);
+    ASSERT_TRUE(target.available());
+    ASSERT_TRUE(initiator.available());
+
+    MemoryOptions target_options;
+    MemoryOptions source_options;
+    source_options.location = "cpu:0";
+    void* source = nullptr;
+    void* destination = nullptr;
+    constexpr size_t kSize = 4096;
+    auto status = target.allocateLocalMemory(&source, kSize, target_options);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    status = initiator.allocateLocalMemory(&destination, kSize, source_options);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(target_options.type, SHM);
+    EXPECT_EQ(source_options.type, SHM);
+    EXPECT_EQ(target_options.location, kWildcardLocation);
+    EXPECT_EQ(source_options.location, "cpu:0");
+    ASSERT_FALSE(target_options.shm_path.empty());
+    ASSERT_TRUE(
+        target.registerLocalMemory({source}, {kSize}, target_options).ok());
+    ASSERT_TRUE(
+        initiator.registerLocalMemory({destination}, {kSize}, source_options)
+            .ok());
+    std::memset(source, 0x6b, kSize);
+    std::memset(destination, 0, kSize);
+
+    SegmentID peer;
+    ASSERT_TRUE(initiator.openSegment(peer, target.getSegmentName()).ok());
+    Request request;
+    request.opcode = Request::READ;
+    request.source = destination;
+    request.target_id = peer;
+    request.target_offset = reinterpret_cast<uint64_t>(source);
+    request.length = kSize;
+    ASSERT_TRUE(initiator.transferSync({request}).ok());
+    EXPECT_EQ(std::memcmp(source, destination, kSize), 0);
+
+    EXPECT_TRUE(initiator.closeSegment(peer).ok());
+    EXPECT_TRUE(initiator.unregisterLocalMemory(destination).ok());
+    EXPECT_TRUE(target.unregisterLocalMemory(source).ok());
+    EXPECT_TRUE(initiator.freeLocalMemory(destination).ok());
+    EXPECT_TRUE(target.freeLocalMemory(source).ok());
 }
 
 }  // namespace

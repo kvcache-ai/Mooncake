@@ -70,6 +70,8 @@ struct MasterSnapshotPayloads;
 
 class EtcdOpLogStore;
 class DfsGlobalAllocator;
+class DfsAllocatorInterface;
+class ImmutableBucketAllocator;
 
 // Forward declarations
 class AllocationStrategy;
@@ -241,6 +243,18 @@ class MasterService {
         -> tl::expected<bool, ErrorCode>;
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+        const std::vector<std::string>& keys, const TenantId& tenant_id);
+
+    /**
+     * @brief Point-in-time existence check that grants no read lease.
+     *        A `true` result only means the object existed at the time of
+     *        the call; it may be evicted before a subsequent Get.
+     * @return ErrorCode::OK if exists, otherwise return other ErrorCode
+     */
+    auto ProbeKey(const std::string& key, const TenantId& tenant_id)
+        -> tl::expected<bool, ErrorCode>;
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
         const std::vector<std::string>& keys, const TenantId& tenant_id);
 
     /**
@@ -926,6 +940,15 @@ class MasterService {
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
 
+    // Shared lookup path for ExistKey/ProbeKey (and their batch variants).
+    // When grant_lease is false, the check acquires no read lease and is a
+    // point-in-time existence probe only.
+    auto ExistKeyImpl(const std::string& key, const TenantId& tenant_id,
+                      bool grant_lease) -> tl::expected<bool, ErrorCode>;
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyImpl(
+        const std::vector<std::string>& keys, const TenantId& tenant_id,
+        bool grant_lease);
+
     // Restore master state
     void RestoreState();
     void ResetStateAfterFailedRestoreAttempt();
@@ -1454,7 +1477,8 @@ class MasterService {
     // before the old metadata is removed.
     auto AllocateReplicas(const std::string& key, uint64_t value_length,
                           const ReplicateConfig& config,
-                          const std::string& writer_host_id)
+                          const std::string& writer_host_id,
+                          bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
@@ -1479,7 +1503,8 @@ class MasterService {
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
-            committed_soft_pin_timeout = std::nullopt)
+            committed_soft_pin_timeout = std::nullopt,
+        bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -1491,6 +1516,10 @@ class MasterService {
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
+    void RunShardDfsEviction();
+    void RunBucketDfsEviction();
+    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -2178,7 +2207,13 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
+    std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
+    DfsGlobalAllocator* shard_allocator_{nullptr};
+    ImmutableBucketAllocator* bucket_allocator_{nullptr};
+    // Serializes allocation-failure recovery so concurrent writers can reuse
+    // capacity made available by the first recovery instead of each evicting
+    // a different frozen bucket.
+    std::mutex dfs_bucket_recovery_mutex_;
 
     // Segment management
     SegmentManager segment_manager_;

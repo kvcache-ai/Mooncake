@@ -188,6 +188,17 @@ target_include_directories(local_notification_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME local_notification_test COMMAND local_notification_test)
 
+# Notification fallback: an unavailable RDMA notification channel falls back
+# to the next transport and then to the control-plane RPC, and receive drains
+# every transport. Loopback only, no NIC required.
+add_executable(tent_notification_fallback_test notification_fallback_test.cpp)
+target_link_libraries(tent_notification_fallback_test
+                      PRIVATE gtest gtest_main tent_link_group)
+target_include_directories(tent_notification_fallback_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_notification_fallback_test
+         COMMAND tent_notification_fallback_test)
+
 add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
 target_link_libraries(transfer_engine_config_override_test
@@ -726,6 +737,25 @@ if(USE_XPU)
   target_include_directories(tent_xpu_platform_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_xpu_platform_test COMMAND tent_xpu_platform_test)
+
+  # XPU staging transport test: drives XpuTransport's VRAM<->host staging hop
+  # through the active XpuPlatform (Platform::getLoader()). Like the platform
+  # test it links libsycl via tent_link_group and skips when no SYCL device is
+  # visible.
+  add_executable(tent_xpu_transport_test xpu/xpu_transport_test.cpp)
+  target_link_libraries(tent_xpu_transport_test PRIVATE gtest gtest_main
+                                                        tent_link_group)
+  target_include_directories(tent_xpu_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_xpu_transport_test COMMAND tent_xpu_transport_test)
+
+  add_executable(tent_xpu_engine_test xpu/xpu_engine_test.cpp)
+  target_link_libraries(tent_xpu_engine_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+  target_include_directories(tent_xpu_engine_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_xpu_engine_test COMMAND tent_xpu_engine_test)
+  set_tests_properties(tent_xpu_engine_test PROPERTIES TIMEOUT 300)
 endif()
 
 # NOT registered via add_test: the test needs a real CUDA device (it exports a
