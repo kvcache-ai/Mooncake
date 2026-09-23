@@ -422,6 +422,7 @@ add_ha_test(ha_metric_manager_test ha/standby/ha_metric_manager_test.cpp)
 add_ha_test(hot_standby_service_test ha/standby/hot_standby_service_test.cpp)
 add_ha_test(standby_metadata_store_test
             ha/standby/standby_metadata_store_test.cpp)
+add_ha_test(orphaned_segments_test ha/standby/orphaned_segments_test.cpp)
 add_ha_test(hot_standby_snapshot_bootstrap_test
             ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
