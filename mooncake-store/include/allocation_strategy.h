@@ -57,10 +57,10 @@ class AllocatorManager {
     std::shared_ptr<SegmentAllocatorRegistration> addAllocator(
         const std::string& name,
         const std::shared_ptr<BufferAllocatorBase>& allocator,
-        std::shared_ptr<ClientLivenessRecord> client_liveness) {
+        ClientSessionSharedPtr owner_session) {
         auto registration = std::shared_ptr<SegmentAllocatorRegistration>(
             new SegmentAllocatorRegistration(allocator,
-                                             std::move(client_liveness)));
+                                             std::move(owner_session)));
         addRegistration(name, registration);
         return registration;
     }
@@ -164,7 +164,7 @@ class AllocatorManager {
             const auto& registrations = allocators_.at(name);
             if (std::any_of(registrations.begin(), registrations.end(),
                             [](const auto& registration) {
-                                return registration->IsServing();
+                                return registration->IsAllocatable();
                             })) {
                 serving_names.push_back(name);
             }
@@ -598,7 +598,7 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
         uint64_t total_capacity = 0;
         uint64_t total_free = 0;
         for (const auto& registration : *allocators) {
-            if (!registration->IsServing()) {
+            if (!registration->IsAllocatable()) {
                 continue;
             }
             const auto buffer_allocator = registration->GetAllocator();
@@ -680,7 +680,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
 
         std::unique_ptr<AllocatedBuffer> buffer;
         for (const auto& registration : *cxl_allocators) {
-            if (registration->IsServing()) {
+            if (registration->IsAllocatable()) {
                 buffer = registration->Allocate(slice_length);
                 if (buffer) {
                     break;

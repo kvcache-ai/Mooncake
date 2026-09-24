@@ -1526,6 +1526,54 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result.error());
 }
 
+TEST_F(MasterServiceTest, StaleCleanupUsesLocalDiskSessionState) {
+    MasterService service;
+    // Drive liveness synchronously, without the offboarding worker removing
+    // replicas before the generic stale-handle sweep can inspect them.
+    StopClientSessionsForTest(service);
+    auto memory_segment = MakeSegment("cleanup_memory_owner");
+    const UUID memory_owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(memory_segment, memory_owner).has_value());
+    const auto key =
+        PutObjectOnSegment(service, memory_owner, memory_segment.name);
+
+    auto disk_segment = MakeSegment("cleanup_disk_owner", 0x400000000);
+    const UUID disk_owner = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(disk_segment, disk_owner).has_value());
+    Replica disk(disk_owner, 1024, "disk-endpoint", ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service.AddReplica(disk_owner, key, TenantId::Default(), disk)
+                    .has_value());
+    const auto record = FindClientLivenessForTest(service, disk_owner);
+    ASSERT_TRUE(record);
+
+    const auto expect_replica_count = [&](size_t count) {
+        auto result = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->replicas.size(), count);
+    };
+    ClearInvalidHandlesForTest(service);
+    expect_replica_count(2);
+
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::hours(1)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ClearInvalidHandlesForTest(service);
+    // Recover after sweeping so the read API exposes the retained disk replica.
+    ASSERT_EQ(record->Observe(now),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    expect_replica_count(2);
+
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    ClearInvalidHandlesForTest(service);
+    expect_replica_count(1);
+}
+
 TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
@@ -3206,7 +3254,6 @@ TEST_F(MasterServiceTest, ReMountDoesNotRecoverSuspectedClient) {
         liveness->Evaluate(ClientLivenessRecord::Clock::now(),
                            std::chrono::seconds::zero(), std::chrono::hours(1)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
 
     ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
     EXPECT_EQ(liveness->state(), ClientLivenessState::SUSPECTED);
@@ -3232,7 +3279,6 @@ TEST_F(MasterServiceTest,
         liveness->Evaluate(ClientLivenessRecord::Clock::now(),
                            std::chrono::seconds::zero(), std::chrono::hours(1)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
 
     auto upsert =
         service.UpsertStart(client_id, key, TenantId::Default(), 1024, config);
@@ -3260,14 +3306,9 @@ TEST_F(MasterServiceTest,
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
+    job.retired_session = liveness;
 
     ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
-    EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_TRUE(job.prepared_segments.empty());
     EXPECT_TRUE(job.metadata_cleanup_accepted);
     EXPECT_TRUE(job.local_ssd_unregistered);
@@ -3295,28 +3336,23 @@ TEST_F(MasterServiceTest,
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = FindClientLivenessForTest(service, client_id);
-    ASSERT_TRUE(job.liveness);
-    job.pending_prepare_segments = {
-        {.segment_id = prepared_segment.id,
-         .segment_name = prepared_segment.name,
-         .transport_endpoint = prepared_segment.te_endpoint},
-        {.segment_id = blocked_segment.id,
-         .segment_name = blocked_segment.name,
-         .transport_endpoint = blocked_segment.te_endpoint}};
+    job.retired_session = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(job.retired_session);
 
+    // The job names only the incarnation; each attempt finds the segments the
+    // client still owns. One of them is held by another unmount, so the job
+    // prepares the other and waits.
     ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
     ASSERT_EQ(job.prepared_segments.size(), 1u);
-    ASSERT_EQ(job.pending_prepare_segments.size(), 1u);
     EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
-    EXPECT_EQ(job.pending_prepare_segments.front().segment_id,
-              blocked_segment.id);
+    EXPECT_FALSE(job.metadata_cleanup_accepted);
     const auto retained_capacity =
         job.prepared_segments.front().metrics_dec_capacity;
 
+    // Its own prepared segment is still mounted, but must not be prepared, or
+    // mistaken for another unmount's, a second time.
     ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
     ASSERT_EQ(job.prepared_segments.size(), 1u);
-    ASSERT_EQ(job.pending_prepare_segments.size(), 1u);
     EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
     EXPECT_EQ(job.prepared_segments.front().metrics_dec_capacity,
               retained_capacity);
@@ -3326,8 +3362,136 @@ TEST_F(MasterServiceTest,
                                  blocked_metrics_dec_capacity));
     ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
     EXPECT_TRUE(job.prepared_segments.empty());
-    EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+}
+
+TEST_F(MasterServiceTest, SessionManagerOwnsOffboardingShutdown) {
+    for (bool finish_cleanup : {false, true}) {
+        SCOPED_TRACE(finish_cleanup);
+        MasterServiceConfig config;
+        config.client_active_ttl_sec = 1;
+        config.client_suspicion_ttl_sec = 1;
+        MasterService service(config);
+        const UUID client_id = generate_uuid();
+        auto segment = MakeSegment("session_shutdown_segment");
+        ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+        size_t capacity = 0;
+        ASSERT_EQ(ErrorCode::OK,
+                  PrepareUnmountSegmentForTest(service, segment.id, capacity));
+
+        // UNMOUNTING keeps the automatically scheduled cleanup retrying.
+        WaitUntil([&] { return HasPendingOffboardingForTest(service); },
+                  std::chrono::seconds(10));
+        QuiesceClientSessionsForTest(service);
+        ASSERT_TRUE(HasPendingOffboardingForTest(service));
+        if (finish_cleanup) {
+            ASSERT_EQ(ErrorCode::OK,
+                      CommitUnmountSegmentForTest(service, segment.id,
+                                                  client_id, capacity));
+            // Quiesce stops monitoring, not the cleanup worker or barrier.
+            WaitUntil([&] { return !HasPendingOffboardingForTest(service); },
+                      std::chrono::seconds(10));
+            EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+        }
+        StopClientSessionsForTest(service);
+        // A job dropped at shutdown leaves its OFFLINE session registered, so
+        // the barrier outlives the worker instead of lifting over a partial
+        // cleanup.
+        EXPECT_EQ(HasPendingOffboardingForTest(service), !finish_cleanup);
+        if (!finish_cleanup) {
+            ASSERT_EQ(ErrorCode::OK,
+                      CommitUnmountSegmentForTest(service, segment.id,
+                                                  client_id, capacity));
+        }
+    }
+}
+
+// Manual fault-injection experiment for #3936; excluded from normal test runs.
+TEST_F(MasterServiceTest, DISABLED_Repro3936RemountKeepsHealthyPings) {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    MasterServiceConfig config;
+    config.client_active_ttl_sec = 1;
+    config.client_suspicion_ttl_sec = 1;
+    MasterService service(config);
+    constexpr size_t count = 4;
+    std::vector<UUID> clients;
+    std::vector<Segment> segments;
+    std::vector<std::shared_ptr<ClientLivenessRecord>> records;
+    for (size_t i = 0; i < count; ++i) {
+        clients.push_back(generate_uuid());
+        segments.push_back(MakeSegment("repro3936_" + std::to_string(i)));
+        ASSERT_TRUE(service.MountSegment(segments.back(), clients.back()));
+        ASSERT_TRUE(service.ReMountSegment({segments.back()}, clients.back()));
+        records.push_back(FindClientLivenessForTest(service, clients.back()));
+        PutObjectOnSegment(service, clients.back(), segments.back().name);
+    }
+    const auto initial_keys = service.GetKeyCount();
+    std::atomic<bool> running{true};
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> need_remount{0};
+    std::atomic<int64_t> max_latency_ms{0};
+    std::vector<std::thread> pingers;
+    for (const auto& client : clients) {
+        pingers.emplace_back([&, client] {
+            while (running.load()) {
+                const auto start = Clock::now();
+                const auto result = service.Ping(client);
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now() - start)
+                        .count();
+                auto previous = max_latency_ms.load();
+                while (
+                    elapsed > previous &&
+                    !max_latency_ms.compare_exchange_weak(previous, elapsed)) {
+                }
+                if (!result || result->client_status != ClientStatus::OK) {
+                    ++need_remount;
+                }
+                ++completed;
+                std::this_thread::sleep_for(20ms);
+            }
+        });
+    }
+    std::this_thread::sleep_for(200ms);
+    const auto baseline = completed.load();
+    // A real remount holds only its per-incarnation registration lock here.
+    // Holding snapshot_mutex_ models a slow restore/snapshot critical section.
+    std::unique_lock snapshot_lock(
+        MasterServiceTestPeer::SnapshotMutex(service));
+    bool remount_ok = false;
+    std::thread remounter([&] {
+        remount_ok =
+            service.ReMountSegment({segments[0]}, clients[0]).has_value();
+    });
+    std::this_thread::sleep_for(200ms);
+    const auto before_stall = completed.load();
+    std::this_thread::sleep_for(4s);
+    const auto during_stall = completed.load();
+    snapshot_lock.unlock();
+    remounter.join();
+    std::this_thread::sleep_for(3s);
+    running.store(false);
+    for (auto& pinger : pingers) pinger.join();
+    size_t offline = 0;
+    for (const auto& record : records) {
+        offline += record->state() == ClientLivenessState::OFFLINE;
+    }
+    const auto final_keys = service.GetKeyCount();
+    std::cout << "REPRO3936 baseline_pings=" << baseline
+              << " pings_during_4s_stall=" << during_stall - before_stall
+              << " max_ping_ms=" << max_latency_ms.load()
+              << " need_remount=" << need_remount.load()
+              << " offline=" << offline << "/" << count
+              << " keys=" << initial_keys << "->" << final_keys << std::endl;
+    EXPECT_GT(baseline, 0u);
+    EXPECT_TRUE(remount_ok);
+    EXPECT_GT(during_stall - before_stall, 100u);
+    EXPECT_LT(max_latency_ms.load(), 1000);
+    EXPECT_EQ(offline, 0u);
+    EXPECT_EQ(final_keys, initial_keys);
+    EXPECT_EQ(need_remount.load(), 0u);
 }
 
 }  // namespace mooncake::test

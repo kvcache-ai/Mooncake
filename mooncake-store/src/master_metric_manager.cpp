@@ -1003,21 +1003,6 @@ void MasterMetricManager::on_client_liveness_record_removed(
     }
 }
 
-void MasterMetricManager::reset_client_liveness_metrics(
-    int64_t active_records) {
-    client_liveness_active_clients_.dec(
-        client_liveness_active_clients_.value());
-    client_liveness_suspected_clients_.dec(
-        client_liveness_suspected_clients_.value());
-    client_liveness_offline_clients_.dec(
-        client_liveness_offline_clients_.value());
-    pending_client_offboarding_jobs_metric_.dec(
-        pending_client_offboarding_jobs_metric_.value());
-    if (active_records > 0) {
-        client_liveness_active_clients_.inc(active_records);
-    }
-}
-
 void MasterMetricManager::inc_client_offboarding_queue_depth(int64_t jobs) {
     pending_client_offboarding_jobs_metric_.inc(jobs);
 }

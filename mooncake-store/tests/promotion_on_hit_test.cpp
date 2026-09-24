@@ -100,8 +100,10 @@ class PromotionOnHitTest : public ::testing::Test {
 
     static void MarkClientOfflineForTesting(MasterService* service,
                                             const UUID& client_id) {
-        auto record =
-            MasterServiceTestPeer(*service).FindClientRecord(client_id);
+        // Isolate replica visibility from asynchronous resource offboarding.
+        MasterServiceTestPeer::ClientSessions(*service).Stop();
+        auto record = ClientSessionRegistryTestPeer::Find(
+            MasterServiceTestPeer::ClientSessions(*service), client_id);
         ASSERT_TRUE(record);
         const auto now = ClientLivenessRecord::Clock::now();
         ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
