@@ -182,8 +182,6 @@ class Buffer:
         return wrapped_hook
 
     def connect(self, is_update: bool = False):
-        from mooncake import ep
-
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
             # torchada maps the CUDA device namespace to MUSA when enabled.
@@ -204,12 +202,11 @@ class Buffer:
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
 
-            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
-
             if is_update:
                 self.runtime.update_local_qpns()
 
             local_qpns = self.runtime.get_local_qpns()
+            all_to_all_size = len(local_qpns) // self.group_size
             local_qpns = list(
                 torch.unbind(
                     torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
@@ -406,8 +403,11 @@ class Buffer:
 
         if use_fp8 is None:
             use_fp8 = not _USE_MACA
-        elif _USE_MACA and use_fp8:
-            raise NotImplementedError("FP8 dispatch is not supported on MACA")
+
+        if _USE_MACA:
+            assert not (
+                async_finish and return_recv_hook
+            ), "MACA does not support async_finish and return_recv_hook together"
 
         # MUSA and MACA use split SEND/RECV launches because they do not expose
         # CUDA cooperative-grid synchronization. Only MACA adds a phase fence.
@@ -463,7 +463,10 @@ class Buffer:
             )
             # The dispatch SEND phase resets every local-expert counter before
             # the RECV phase reads it, so this output need not be pre-cleared.
-            packed_recv_count = torch.empty(
+            # The legacy kernel accumulates receive offsets with atomicAdd.
+            # Rank 1's local-expert counters are not reset by the send phase,
+            # so they must start from zero on every dispatch.
+            packed_recv_count = torch.zeros(
                 (num_local_experts,), dtype=torch.int32, device=x.device
             )
             packed_recv_src_info = torch.empty(
@@ -491,6 +494,12 @@ class Buffer:
                     dtype=torch.float32,
                     device=x.device,
                 ).transpose(1, 2)
+            # The MACA split path requests the native receive hook even when
+            # the caller did not.  Native EP forbids async+hook together;
+            # the wrapper owns completion through the phase-fence hook.
+            native_async_finish = async_finish and not (
+                _USE_SPLIT_SEND_RECV and runtime_return_recv_hook
+            )
             event, hook = self.runtime.dispatch(
                 x.data_ptr(),
                 topk_idx.data_ptr(),
@@ -507,7 +516,7 @@ class Buffer:
                 packed_recv_count.data_ptr(),
                 packed_recv_src_info.data_ptr(),
                 packed_recv_layout_range.data_ptr(),
-                async_finish,
+                native_async_finish,
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
             )
@@ -536,7 +545,9 @@ class Buffer:
             (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x,
             packed_recv_count,
             handle,
-            EventOverlap(event, tensors_to_record if async_finish or return_recv_hook else None),
+            EventOverlap(
+                event, tensors_to_record if async_finish or return_recv_hook else None
+            ),
             hook,
         )
 
@@ -556,6 +567,11 @@ class Buffer:
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         if zero_copy:
             raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
+
+        if _USE_MACA:
+            assert not (
+                async_finish and return_recv_hook
+            ), "MACA does not support async_finish and return_recv_hook together"
 
         assert x.dim() == 3 and x.is_contiguous()
         assert x.dtype == torch.bfloat16
@@ -642,6 +658,9 @@ class Buffer:
                 assert out.size(0) == topk_weights.size(0)
                 assert out.size(1) == hidden
                 assert out.dtype == x.dtype
+            native_async_finish = async_finish and not (
+                _USE_SPLIT_SEND_RECV and runtime_return_recv_hook
+            )
             event, hook = self.runtime.combine(
                 x.data_ptr(),
                 topk_idx.data_ptr(),
@@ -658,7 +677,7 @@ class Buffer:
                 timeout_us,
                 zero_copy,
                 combined_x.data_ptr(),
-                async_finish,
+                native_async_finish,
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
             )
@@ -677,7 +696,9 @@ class Buffer:
         )
         return (
             combined_x,
-            EventOverlap(event, tensors_to_record if async_finish or return_recv_hook else None),
+            EventOverlap(
+                event, tensors_to_record if async_finish or return_recv_hook else None
+            ),
             hook,
         )
 
