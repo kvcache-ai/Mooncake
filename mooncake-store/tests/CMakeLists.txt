@@ -322,6 +322,7 @@ add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
 add_store_test(fileread_worker_pool_config_test
                fileread_worker_pool_config_test.cpp)
+add_store_test(nof_debug_config_test nof_debug_config_test.cpp)
 add_store_test(fileread_worker_pool_test fileread_worker_pool_test.cpp)
 if(MOONCAKE_OSS_ADAPTER_ENABLED)
   target_compile_definitions(file_storage_test PRIVATE HAVE_OSS_ADAPTER)
