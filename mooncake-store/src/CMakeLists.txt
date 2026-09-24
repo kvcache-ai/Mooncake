@@ -19,6 +19,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    config/cxl_bootstrap_config_loader.cpp
     config/ha_cluster_namespace_config.cpp
     config/local_file_snapshot_config.cpp
     config/metrics_bootstrap_config_loader.cpp
