@@ -3,11 +3,13 @@
 // parameter of StripedGroupIndex, so each point instantiates its own table and
 // the printed size is the per-tenant cost of that count.
 //
-// A round walks every group once with the same member name, so an iteration
-// registers one member and (once the first rounds have filled the window) drops
-// one, keeping membership bounded instead of growing a set per group for the
-// whole run. The names are built once per thread, so the rate is the table's
-// own cost rather than string construction.
+// A round walks every group once and slides a window of kMembersPerGroup member
+// names over it: the name entering the window is registered and, once the first
+// rounds have filled it, the name leaving it is dropped. Every group therefore
+// stays live with a bounded membership, and an iteration measures one register
+// and one drop against an existing group rather than a group being created and
+// dropped. The names are built once per thread, so the rate is the table's own
+// cost rather than string construction.
 
 #include <atomic>
 #include <chrono>
@@ -43,20 +45,24 @@ void RunPoint(int threads) {
             for (size_t i = 0; i < kGroupsPerThread; ++i) {
                 groups.push_back(prefix + std::to_string(i));
             }
+            // Twice the window, so the name leaving the window is never the
+            // one entering it.
             std::vector<std::string> members;
-            members.reserve(kMembersPerGroup);
-            for (size_t i = 0; i < kMembersPerGroup; ++i) {
+            members.reserve(2 * kMembersPerGroup);
+            for (size_t i = 0; i < 2 * kMembersPerGroup; ++i) {
                 members.push_back("member_" + std::to_string(i));
             }
 
             uint64_t writes = 0;
             uint64_t round = 0;
             while (!stop.load(std::memory_order_relaxed)) {
-                const std::string& member = members[round % kMembersPerGroup];
+                const std::string& entering = members[round % members.size()];
+                const std::string& leaving =
+                    members[(round + kMembersPerGroup) % members.size()];
                 for (size_t group = 0; group < kGroupsPerThread; ++group) {
-                    (void)index.AddMember(groups[group], member);
+                    (void)index.AddMember(groups[group], entering);
                     if (round >= kMembersPerGroup) {
-                        (void)index.RemoveMember(groups[group], member);
+                        (void)index.RemoveMember(groups[group], leaving);
                     }
                     ++writes;
                     if (stop.load(std::memory_order_relaxed)) {

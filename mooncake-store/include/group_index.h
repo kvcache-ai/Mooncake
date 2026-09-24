@@ -148,9 +148,10 @@ class StripedGroupIndex {
 
 // 64 stripes: the shipped default. Striping trades per-tenant memory for write
 // concurrency, a stripe costing ~120 bytes: 7.7 kB per tenant here against
-// 30.7 kB at 256. One stripe serializes a tenant's grouped writes (about 20x
-// fewer member writes per second than 64 stripes at 32 threads), and past 64
-// each doubling buys less, about a third from 64 to 128 and a sixth on to 256.
+// 30.7 kB at 256. One stripe serializes a tenant's grouped writes: with 16
+// writer threads on an 8-core, 16-thread host, 64 stripes sustain about 18x the
+// member writes per second of one stripe, and each doubling past 64 buys less,
+// about half again at 128 and a third again at 256.
 // A grouping-heavy workload can raise the count by instantiating the template
 // with a larger one. Measurements are in
 // benchmarks/group_index_contention_bench.cpp.
