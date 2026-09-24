@@ -212,13 +212,22 @@ bool FileStorageConfig::Validate() const {
     // storage_filepath may be a comma-separated multi-disk list. ValidatePath
     // stats a single path and would reject the raw list string (stat of
     // "/d0,/d1" is ENOENT), so validate each root on its own.
-    const auto paths = SplitCommaList(storage_filepath);
-    if (paths.empty()) {
+    if (TrimAsciiWhitespace(storage_filepath).empty()) {
         LOG(ERROR) << "FileStorageConfig: storage_filepath must not be empty";
         return false;
     }
-    for (const std::string_view path : paths) {
-        if (!ValidatePath(std::string(path))) {
+    // Every entry names one disk, so dropping an empty one would silently run
+    // on fewer disks than the list has entries.
+    const auto paths =
+        SplitAsciiList(storage_filepath, ',', /*keep_empty=*/true);
+    for (size_t i = 0; i < paths.size(); ++i) {
+        if (paths[i].empty()) {
+            LOG(ERROR) << "FileStorageConfig: storage_filepath='"
+                       << storage_filepath << "' has an empty entry at "
+                       << "position " << i;
+            return false;
+        }
+        if (!ValidatePath(std::string(paths[i]))) {
             return false;
         }
     }

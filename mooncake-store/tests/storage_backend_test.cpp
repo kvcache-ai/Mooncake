@@ -5324,15 +5324,29 @@ int64_t DirectoryBytes(const std::string& dir) {
 
 }  // namespace
 
-TEST_F(StorageBackendTest, MultiDiskSplitCommaList) {
-    EXPECT_TRUE(SplitCommaList("").empty());
-    EXPECT_EQ(SplitCommaList("/d0").size(), 1u);
-    EXPECT_EQ(SplitCommaList("/d0,/d1,/d2").size(), 3u);
-    // Whitespace around entries is trimmed and empty segments are dropped, so
-    // a stray trailing comma cannot create a phantom disk rooted at "".
-    EXPECT_EQ(SplitCommaList(" /d0 , /d1 ").at(1), "/d1");
-    EXPECT_EQ(SplitCommaList("/d0,,/d1").size(), 2u);
-    EXPECT_EQ(SplitCommaList("/d0,").size(), 1u);
+TEST_F(StorageBackendTest, MultiDiskSplitAsciiList) {
+    EXPECT_TRUE(SplitAsciiList("", ',').empty());
+    EXPECT_EQ(SplitAsciiList("/d0", ',').size(), 1u);
+    EXPECT_EQ(SplitAsciiList("/d0,/d1,/d2", ',').size(), 3u);
+    // Whitespace around entries is trimmed and empty segments are dropped.
+    EXPECT_EQ(SplitAsciiList(" /d0 , /d1 ", ',').at(1), "/d1");
+    EXPECT_EQ(SplitAsciiList("/d0,,/d1", ',').size(), 2u);
+    EXPECT_EQ(SplitAsciiList("/d0,", ',').size(), 1u);
+
+    // keep_empty preserves positions, so a caller can tell a missing entry
+    // apart from a shorter list.
+    EXPECT_EQ(SplitAsciiList("a,,b", ',', /*keep_empty=*/true),
+              (std::vector<std::string_view>{"a", "", "b"}));
+    EXPECT_EQ(SplitAsciiList(" a , , b ", ',', /*keep_empty=*/true),
+              (std::vector<std::string_view>{"a", "", "b"}));
+    EXPECT_EQ(SplitAsciiList("a,", ',', /*keep_empty=*/true),
+              (std::vector<std::string_view>{"a", ""}));
+    EXPECT_EQ(SplitAsciiList(",a", ',', /*keep_empty=*/true),
+              (std::vector<std::string_view>{"", "a"}));
+
+    // Only the requested delimiter splits.
+    EXPECT_EQ(SplitAsciiList("a,b; c", ';'),
+              (std::vector<std::string_view>{"a,b", "c"}));
 }
 
 // Two live clients that share any one disk would collide on that disk's bucket
@@ -5607,32 +5621,44 @@ TEST_F(StorageBackendTest,
     EXPECT_EQ(CountMetaFiles(data_path + "/small"), 1);
 }
 
-// The per-disk quota list is positionally aligned with the disks, so a single
-// unparsable entry must invalidate the whole list. Skipping just that entry
-// would shift every later disk onto its neighbour's quota — a silent
-// misconfiguration that only shows up as unexplained eviction behaviour.
-TEST_F(StorageBackendTest, MultiDiskQuotaListDroppedWhenAnyEntryIsUnparsable) {
+// The per-disk quota list is positionally aligned with the disks, so an empty
+// or unparsable entry must fail startup. Skipping it would shift every later
+// disk onto its neighbour's quota ("100,,300" would read as {100, 300}), and
+// falling back to the scalar quota would silently ignore the configuration.
+TEST_F(StorageBackendTest, MultiDiskQuotaListRejectsEmptyOrUnparsableEntry) {
     const char* kEnv = "MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST";
 
     setenv(kEnv, "100,200,300", 1);
     auto good = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(good.max_total_size_per_disk,
+    ASSERT_TRUE(good.has_value());
+    EXPECT_EQ(good->max_total_size_per_disk,
               (std::vector<int64_t>{100, 200, 300}));
 
-    setenv(kEnv, "100,abc,300", 1);
-    auto bad = BucketBackendConfig::FromEnvironment();
-    EXPECT_TRUE(bad.max_total_size_per_disk.empty())
-        << "a partially parsed list would misalign every disk after the bad "
-           "entry";
+    for (const char* value :
+         {"100,abc,300", "100,,300", "100, ,300", ",100,200", "100,200,300,"}) {
+        setenv(kEnv, value, 1);
+        auto bad = BucketBackendConfig::FromEnvironment();
+        ASSERT_FALSE(bad.has_value()) << value;
+        EXPECT_EQ(bad.error(), ErrorCode::INVALID_PARAMS) << value;
+    }
+
+    for (const char* value : {"", "  "}) {
+        setenv(kEnv, value, 1);
+        auto blank = BucketBackendConfig::FromEnvironment();
+        ASSERT_TRUE(blank.has_value()) << "'" << value << "'";
+        EXPECT_TRUE(blank->max_total_size_per_disk.empty());
+    }
 
     unsetenv(kEnv);
     auto absent = BucketBackendConfig::FromEnvironment();
-    EXPECT_TRUE(absent.max_total_size_per_disk.empty());
+    ASSERT_TRUE(absent.has_value());
+    EXPECT_TRUE(absent->max_total_size_per_disk.empty());
 }
 
-// A quota list shorter than the disk list reuses its last entry, so one value
-// configures every disk identically.
-TEST_F(StorageBackendTest, MultiDiskShortQuotaListReusesLastEntry) {
+// The quota list is matched to the disks by position, so any length other
+// than one entry per disk is ambiguous: "100,200" on three disks could be a
+// forgotten entry anywhere. Init must refuse it rather than guess.
+TEST_F(StorageBackendTest, MultiDiskInitRejectsQuotaListLengthMismatch) {
     fs::create_directories(data_path + "/q0");
     fs::create_directories(data_path + "/q1");
     fs::create_directories(data_path + "/q2");
@@ -5641,16 +5667,28 @@ TEST_F(StorageBackendTest, MultiDiskShortQuotaListReusesLastEntry) {
     config.storage_filepath =
         data_path + "/q0," + data_path + "/q1," + data_path + "/q2";
     BucketBackendConfig bucket_config;
-    bucket_config.max_total_size_per_disk = {16 * 1024 * 1024,
-                                             32 * 1024 * 1024};
     bucket_config.bucket_size_limit = 1 * 1024 * 1024;
     bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
 
+    for (const std::vector<int64_t>& quotas : std::vector<std::vector<int64_t>>{
+             {16 * 1024 * 1024},
+             {16 * 1024 * 1024, 32 * 1024 * 1024},
+             {16 * 1024 * 1024, 32 * 1024 * 1024, 48 * 1024 * 1024,
+              64 * 1024 * 1024}}) {
+        bucket_config.max_total_size_per_disk = quotas;
+        BucketStorageBackend backend(config, bucket_config);
+        auto init = backend.Init();
+        ASSERT_FALSE(init.has_value()) << quotas.size() << " entries";
+        EXPECT_EQ(init.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    bucket_config.max_total_size_per_disk = {16 * 1024 * 1024, 32 * 1024 * 1024,
+                                             48 * 1024 * 1024};
     BucketStorageBackend backend(config, bucket_config);
     ASSERT_TRUE(backend.Init());
     EXPECT_EQ(backend.DiskQuotasForTest(),
               (std::vector<int64_t>{16 * 1024 * 1024, 32 * 1024 * 1024,
-                                    32 * 1024 * 1024}));
+                                    48 * 1024 * 1024}));
 }
 
 // Two roots that resolve to the same directory (or nest) would let both disks
@@ -5812,6 +5850,52 @@ TEST_F(StorageBackendTest, MultiDiskValidateAcceptsCommaListStorageFilepath) {
     FileStorageConfig single = config;
     single.storage_filepath = data_path + "/v0";
     EXPECT_TRUE(single.Validate());
+}
+
+// Every path entry names one disk, so dropping an empty one would silently run
+// on fewer disks than the list has entries. Validate() must reject it wherever
+// it appears.
+TEST_F(StorageBackendTest, MultiDiskValidateRejectsEmptyStoragePathEntry) {
+    fs::create_directories(data_path + "/v0");
+    fs::create_directories(data_path + "/v1");
+
+    FileStorageConfig config;
+    config.total_keys_limit = 1000000;
+    config.total_size_limit = 1024 * 1024 * 1024;
+    config.heartbeat_interval_seconds = 5;
+
+    const std::string v0 = data_path + "/v0";
+    const std::string v1 = data_path + "/v1";
+    for (const std::string& value :
+         {v0 + ",," + v1, v0 + ",", "," + v0, v0 + ", ," + v1}) {
+        config.storage_filepath = value;
+        EXPECT_FALSE(config.Validate()) << value;
+    }
+
+    config.storage_filepath = v0 + " , " + v1;
+    EXPECT_TRUE(config.Validate());
+}
+
+// Callers such as benchmarks construct the backend without Validate(), so
+// Init() must reject an empty root on its own instead of dropping it.
+TEST_F(StorageBackendTest, MultiDiskInitRejectsEmptyStorageRoot) {
+    fs::create_directories(data_path + "/r0");
+    fs::create_directories(data_path + "/r1");
+    const std::string r0 = data_path + "/r0";
+    const std::string r1 = data_path + "/r1";
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    for (const std::string& value : {r0 + ",," + r1, r0 + ",", "," + r0}) {
+        FileStorageConfig config;
+        config.storage_filepath = value;
+        BucketStorageBackend backend(config, bucket_config);
+        auto init = backend.Init();
+        ASSERT_FALSE(init.has_value()) << value;
+        EXPECT_EQ(init.error(), ErrorCode::INVALID_PARAMS) << value;
+    }
 }
 
 // total_size_limit is a separate knob from the per-disk quotas, and it is what

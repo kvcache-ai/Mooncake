@@ -218,16 +218,13 @@ inline constexpr uint32_t kOffsetAllocatorPersistVersion = 3;
 // The disk roots a deployment spans, derived from the authoritative
 // storage_filepath rather than the FileStorageConfig::storage_paths cache:
 // callers that overwrite storage_filepath after FromEnvironment() leave that
-// cache stale. Never empty, so its size is safe to use as a divisor.
+// cache stale. Never empty, so its size is safe to use as a divisor. Empty
+// entries are kept so that BucketStorageBackend::Init() can reject them
+// rather than silently running on fewer disks.
 inline std::vector<std::string> ResolveOffloadDiskPaths(
     const std::string& storage_filepath) {
     const std::vector<std::string_view> tokens =
-        SplitCommaList(storage_filepath);
-    if (tokens.empty()) {
-        // Nothing splittable (including the empty string) still means one
-        // disk, rooted at whatever was configured.
-        return {storage_filepath};
-    }
+        SplitAsciiList(storage_filepath, ',', /*keep_empty=*/true);
     return std::vector<std::string>(tokens.begin(), tokens.end());
 }
 

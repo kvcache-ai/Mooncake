@@ -1523,18 +1523,12 @@ BucketStorageBackend::BucketStorageBackend(
         ResolveOffloadDiskPaths(file_storage_config_.storage_filepath);
     const auto& per_disk = bucket_backend_config_.max_total_size_per_disk;
     disks_.resize(disk_paths_.size());
+    // Init() rejects a per-disk list of the wrong length; guard the indexing
+    // here so construction itself stays safe.
+    const bool use_per_disk = per_disk.size() == disks_.size();
     for (size_t i = 0; i < disks_.size(); ++i) {
-        // A short list reuses its last entry, so a single value configures
-        // every disk identically.
         disks_[i].max_total_size =
-            per_disk.empty() ? bucket_backend_config_.max_total_size
-                             : per_disk[std::min(i, per_disk.size() - 1)];
-    }
-    if (per_disk.size() > 1 && per_disk.size() != disk_paths_.size()) {
-        LOG(WARNING) << "max_total_size_per_disk has " << per_disk.size()
-                     << " entries but " << disk_paths_.size()
-                     << " disks are configured; the last entry is reused for "
-                        "the remaining disks.";
+            use_per_disk ? per_disk[i] : bucket_backend_config_.max_total_size;
     }
 
     // Allocate aligned buffer for O_DIRECT I/O operations
@@ -2019,6 +2013,29 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             disk.cached_disk_bytes = -1;
         }
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
+
+        // Every entry names one disk, so skipping an empty one would silently
+        // run on fewer disks than the list has entries.
+        for (size_t i = 0; i < disk_paths_.size(); ++i) {
+            if (disk_paths_[i].empty()) {
+                LOG(ERROR) << "storage_filepath='"
+                           << file_storage_config_.storage_filepath
+                           << "' has an empty entry at position " << i;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+
+        // The per-disk quota list is matched to the disks by position, so a
+        // length mismatch cannot be resolved without guessing which disk an
+        // entry was meant for.
+        const auto& per_disk = bucket_backend_config_.max_total_size_per_disk;
+        if (!per_disk.empty() && per_disk.size() != disk_paths_.size()) {
+            LOG(ERROR) << "max_total_size_per_disk has " << per_disk.size()
+                       << " entries but " << disk_paths_.size()
+                       << " disks are configured; the list needs exactly one "
+                          "entry per disk.";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
         // Create and normalise the roots before scanning anything. Two entries
         // that resolve to the same directory, or one nested inside another,
@@ -5886,12 +5903,15 @@ CreateStorageBackend(const FileStorageConfig& config) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-            if (!bucket_backend_config.Validate()) {
+            if (!bucket_backend_config) {
+                return tl::make_unexpected(bucket_backend_config.error());
+            }
+            if (!bucket_backend_config->Validate()) {
                 throw std::invalid_argument(
                     "Invalid StorageBackend configuration");
             }
             return std::make_shared<BucketStorageBackend>(
-                config, bucket_backend_config);
+                config, *bucket_backend_config);
         }
         case StorageBackendType::kFilePerKey: {
             auto file_per_key_backend_config =

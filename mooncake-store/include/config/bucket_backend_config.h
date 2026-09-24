@@ -4,6 +4,10 @@
 #include <ostream>
 #include <vector>
 
+#include <ylt/util/tl/expected.hpp>
+
+#include "types.h"
+
 namespace mooncake {
 
 enum class BucketEvictionPolicy {
@@ -65,13 +69,23 @@ struct BucketBackendConfig {
 
     // Per-disk quotas, positionally aligned with the disks parsed out of
     // FileStorageConfig::storage_filepath. Empty => broadcast the scalar
-    // max_total_size to every disk. A list shorter than the disk count
-    // reuses its last entry for the remaining disks.
+    // max_total_size to every disk. Otherwise it must have exactly one entry
+    // per disk; BucketStorageBackend::Init() rejects any other length.
     std::vector<int64_t> max_total_size_per_disk;
 
     bool Validate() const;
 
-    static BucketBackendConfig FromEnvironment();
+    /**
+     * @brief Build the configuration from MOONCAKE_OFFLOAD_BUCKET_* variables.
+     *
+     * Scalar variables that fail to parse fall back to their defaults with a
+     * warning. The per-disk quota list is stricter because it is positionally
+     * aligned with the disks: an empty or unparsable entry is an error.
+     *
+     * @return The configuration; INVALID_PARAMS if the per-disk quota list
+     *         has an empty or unparsable entry.
+     */
+    static tl::expected<BucketBackendConfig, ErrorCode> FromEnvironment();
 };
 
 }  // namespace mooncake

@@ -158,7 +158,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes, applied **per disk**. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
-| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` | empty | Per-disk eviction thresholds as a comma-separated list, positionally aligned with the paths in `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. Empty applies `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` to every disk. See {ref}`Multiple disks <ssd-offload-multiple-disks>` |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` | empty | Per-disk eviction thresholds as a comma-separated list, positionally aligned with the paths in `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; when set, it needs exactly one entry per path. Empty applies `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` to every disk. See {ref}`Multiple disks <ssd-offload-multiple-disks>` |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`, applied **per disk** when several are configured. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
@@ -169,7 +169,10 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 
 `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` accepts a comma-separated list of storage
 roots, so one real client can offload across every SSD on the machine instead of
-being capped by the capacity and bandwidth of a single drive:
+being capped by the capacity and bandwidth of a single drive. Empty entries,
+such as `/nvme0/a,,/nvme1/a` or a trailing comma, are rejected at startup
+rather than skipped, so the client never runs on fewer disks than the list has
+entries:
 
 ```bash
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
@@ -204,13 +207,14 @@ export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST=$((200 * 1024 * 1024 * 1024))
   `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` accounting, so a busy disk evicts
   without disturbing the others.
 - **Per-disk quotas** come from `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST`
-  when set. Entries must be positive, and are matched to paths by position; a
-  shorter list reuses its last entry for the remaining disks. Because the
-  alignment is positional, a single unparsable entry invalidates the whole list:
-  the backend logs an error and falls back to the scalar
-  `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` rather than silently shifting disks
-  onto their neighbour's quota. When neither is set and an eviction policy is
-  enabled, each disk defaults to 90% of *its own* physical capacity.
+  when set. Entries are matched to paths by position, so the list must have
+  exactly one positive entry per path. Because a wrong guess would silently put
+  a disk on its neighbour's quota, the backend refuses to start on an empty or
+  unparsable entry (such as `100,,300` or a trailing comma) and on a list whose
+  length differs from the number of paths, logging the reason. To give every
+  disk the same quota, use `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` instead.
+  When neither is set and an eviction policy is enabled, each disk defaults to
+  90% of *its own* physical capacity.
 - **On restart**, each root is scanned and every bucket is re-bound to the disk
   its metadata file was found on. The disk assignment is not persisted, so
   existing offloaded data stays readable with no migration step — but reordering
