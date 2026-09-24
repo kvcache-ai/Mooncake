@@ -230,7 +230,7 @@ if(NOT SKBUILD)
   if(WITH_STORE)
     install(
       FILES
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_store_service.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_config.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli_client.py"
