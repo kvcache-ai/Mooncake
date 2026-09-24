@@ -8,7 +8,6 @@
 
 #include "client_wrapper.h"
 #include "types.h"
-#include "utils.h"
 #include "e2e_utils.h"
 
 // Command line flags

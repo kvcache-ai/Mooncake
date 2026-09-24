@@ -59,6 +59,7 @@ class Transport {
 
     struct TransferRequest {
         enum OpCode { READ, WRITE };
+        enum Priority { PRIO_HIGH = 0, PRIO_MEDIUM = 1, PRIO_LOW = 2 };
 
         static constexpr uint64_t kNoTaskGroup = 0;
 
@@ -72,6 +73,8 @@ class Transport {
         int transport_hint = 0;
         // Adjacent requests in a group may be scheduled as one unit.
         uint64_t task_group_id = kNoTaskGroup;
+        // TENT transport selection priority; ignored by classic TE.
+        int priority = PRIO_MEDIUM;
     };
 
     enum TransferStatusEnum {
@@ -387,6 +390,8 @@ class Transport {
         std::atomic<bool> has_failure{false};
         std::atomic<bool> is_finished{
             false};  // Completion flag for wait predicate
+        // Completion events do not populate the status-query byte cache.
+        std::atomic<bool> status_cached{false};
         std::atomic<uint64_t> finished_transfer_bytes{0};
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
@@ -414,6 +419,9 @@ class Transport {
     virtual Status submitTransfer(
         BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
 
+    // Implementations must publish every slice synchronously before this
+    // method returns. After any return status, no worker may append or publish
+    // additional slices for these tasks.
     virtual Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(

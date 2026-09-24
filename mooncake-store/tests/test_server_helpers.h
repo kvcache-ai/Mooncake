@@ -3,8 +3,8 @@
 #include <string>
 #include <ylt/util/tl/expected.hpp>
 
+#include "common/network.h"
 #include "embedded_master.h"
-#include "utils.h"
 
 namespace mooncake {
 namespace testing {

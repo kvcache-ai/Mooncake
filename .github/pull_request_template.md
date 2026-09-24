@@ -6,6 +6,7 @@
 
 - [ ] Transfer Engine (`mooncake-transfer-engine`)
 - [ ] Mooncake Store (`mooncake-store`)
+- [ ] Mooncake Conductor (`mooncake-conductor`)
 - [ ] Reshard (`mooncake-reshard`)
 - [ ] Mooncake EP (`mooncake-ep`)
 - [ ] Mooncake PG (`mooncake-pg`)

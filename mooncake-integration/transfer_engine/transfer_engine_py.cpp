@@ -15,9 +15,12 @@
 #include "transfer_engine_py.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
-#include <numeric>
 #include <fstream>
+#include <limits>
+#include <mutex>
+#include <numeric>
 
 #include <pybind11/stl.h>
 #include "shared_segment_py.h"
@@ -57,14 +60,93 @@ static void* (*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
 
+enum class ScatterTransferCompletionStatus : int {
+    COMPLETED = 0,
+    FAILED_DRAINED = -1,
+    COMPLETION_UNKNOWN = -2,
+};
+
+class ScatterTransferTicket {
+   public:
+    explicit ScatterTransferTicket(
+        std::shared_ptr<TransferEngine::ScatterTransferOperation> operation)
+        : operation_(std::move(operation)) {}
+
+    static std::shared_ptr<ScatterTransferTicket> terminal(
+        ScatterTransferCompletionStatus status) {
+        auto ticket = std::shared_ptr<ScatterTransferTicket>(
+            new ScatterTransferTicket(nullptr));
+        ticket->status_ = status;
+        ticket->drained_ = true;
+        return ticket;
+    }
+
+    ScatterTransferCompletionStatus status() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return status_;
+    }
+
+    bool drained() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return drained_;
+    }
+
+    ScatterTransferCompletionStatus drain(uint64_t timeout_ms) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (drained_) return status_;
+        if (!operation_) {
+            status_ = ScatterTransferCompletionStatus::FAILED_DRAINED;
+            drained_ = true;
+            return status_;
+        }
+
+        constexpr uint64_t kNanosPerMillis = 1000 * 1000;
+        const auto max_milliseconds =
+            static_cast<uint64_t>(std::chrono::nanoseconds::max().count()) /
+            kNanosPerMillis;
+        const auto bounded_timeout = std::chrono::milliseconds(
+            timeout_ms > max_milliseconds ? max_milliseconds : timeout_ms);
+        Status result = operation_->waitFor(bounded_timeout);
+        if (result.IsClock()) {
+            return ScatterTransferCompletionStatus::COMPLETION_UNKNOWN;
+        }
+
+        status_ = result.ok() ? ScatterTransferCompletionStatus::COMPLETED
+                              : ScatterTransferCompletionStatus::FAILED_DRAINED;
+        drained_ = true;
+        operation_.reset();
+        return status_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::shared_ptr<TransferEngine::ScatterTransferOperation> operation_;
+    ScatterTransferCompletionStatus status_ =
+        ScatterTransferCompletionStatus::COMPLETION_UNKNOWN;
+    bool drained_ = false;
+};
+
+namespace {
+
+uint64_t nanosToCeilingMillis(uint64_t timeout_ns) {
+    constexpr uint64_t kNanosPerMillis = 1000 * 1000;
+    if (timeout_ns >
+        std::numeric_limits<uint64_t>::max() - (kNanosPerMillis - 1)) {
+        return std::numeric_limits<uint64_t>::max() / kNanosPerMillis;
+    }
+    return (timeout_ns + kNanosPerMillis - 1) / kNanosPerMillis;
+}
+
+}  // namespace
+
 //  Handle allocateMemory function pointer based on protocol
-void initMemoryAllocator(const char* protocol) {
+static bool initMemoryAllocator(const char* protocol) {
     if (allocateMemory != nullptr) {
         LOG(WARNING) << "Memory allocator already initialized with: "
                      << g_protocol;
-        return;
+        return true;
     }
-    g_protocol = protocol;
+    if (protocol == nullptr) protocol = "";
     if (strcmp(protocol, "nvlink") == 0) {
 #ifdef USE_MNNVL
         allocateMemory = [](size_t s) -> void* {
@@ -76,6 +158,7 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
+        return false;
 #endif
     } else if (strcmp(protocol, "musa") == 0) {
 #ifdef USE_MUSA
@@ -100,6 +183,7 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected HIP memory allocator";
 #else
         LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON";
+        return false;
 #endif
     } else if (strcmp(protocol, "nvlink_intra") == 0) {
 #ifdef USE_INTRA_NVLINK
@@ -113,12 +197,26 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
+        return false;
 #endif
     } else {
-        allocateMemory = malloc;
+        // Ascend SVM (_devmm_mem_remote_map) requires a 64KB page-aligned
+        // src_va. Fallback protocols (rdma/tcp/ascend) use posix_memalign to
+        // guarantee 64KB alignment, otherwise aclrtHostRegister fails with
+        // EINVAL on a misaligned address.
+        allocateMemory = [](size_t s) -> void* {
+            void* p = nullptr;
+            if (posix_memalign(&p, 64 * 1024, s) != 0) {
+                return nullptr;
+            }
+            return p;
+        };
         freeMemory = free;
-        LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
+        LOG(WARNING) << "Using 64KB-aligned malloc/free for protocol: "
+                     << protocol;
     }
+    g_protocol = protocol;
+    return true;
 }
 
 TransferEnginePy::TransferEnginePy() {
@@ -189,8 +287,6 @@ int TransferEnginePy::initialize(const char* local_hostname,
                                  const char* metadata_server,
                                  const char* protocol,
                                  const char* device_name) {
-    initMemoryAllocator(protocol);
-
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
                          device_name, conn_string.first.c_str());
@@ -201,11 +297,12 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* protocol,
                                     const char* device_name,
                                     const char* metadata_type) {
-    if (strcmp(protocol, "xgmi") == 0) {
+    if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
         return -1;
     }
+    if (!initMemoryAllocator(protocol)) return -1;
 
     std::string proto = protocol ? std::string(protocol) : "";
     std::string conn_string = buildConnString(metadata_type, metadata_server);
@@ -244,13 +341,13 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
-        int ret =
-            engine_->init(conn_string, local_hostname,
-                          hostname_port.first.c_str(), hostname_port.second);
+        int ret = engine_->init(conn_string, local_hostname,
+                                hostname_port.first.c_str(),
+                                hostname_port.second, proto);
         if (ret) return -1;
     } else {
         // the last two params are unused
-        int ret = engine_->init(conn_string, local_hostname, "", 0);
+        int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
         if (ret) return -1;
     }
 
@@ -339,6 +436,10 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
+    if (allocateMemory == nullptr || freeMemory == nullptr) {
+        LOG(ERROR) << "Memory allocator is not initialized";
+        return nullptr;
+    }
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
@@ -460,6 +561,119 @@ int TransferEnginePy::batchTransferSyncRead(
                              transport_hint);
 }
 
+std::shared_ptr<ScatterTransferTicket>
+TransferEnginePy::scatterTransferSyncWriteWithTicket(
+    const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths) {
+    return scatterTransferSyncWithTicket(
+        endpoint, local_base_addresses, local_capacities, remote_base_addresses,
+        remote_capacities, local_offsets, remote_offsets, lengths,
+        TransferOpcode::WRITE);
+}
+
+std::shared_ptr<ScatterTransferTicket>
+TransferEnginePy::scatterTransferSyncReadWithTicket(
+    const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths) {
+    return scatterTransferSyncWithTicket(
+        endpoint, local_base_addresses, local_capacities, remote_base_addresses,
+        remote_capacities, local_offsets, remote_offsets, lengths,
+        TransferOpcode::READ);
+}
+
+std::shared_ptr<ScatterTransferTicket>
+TransferEnginePy::scatterTransferSyncWithTicket(
+    const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths, TransferOpcode opcode) {
+    pybind11::gil_scoped_release release;
+    const size_t range_count = local_base_addresses.size();
+    if (local_capacities.size() != range_count ||
+        remote_base_addresses.size() != range_count ||
+        remote_capacities.size() != range_count ||
+        local_offsets.size() != range_count ||
+        remote_offsets.size() != range_count || lengths.size() != range_count) {
+        LOG(ERROR) << "Scatter transfer range arrays have different sizes";
+        return ScatterTransferTicket::terminal(
+            ScatterTransferCompletionStatus::FAILED_DRAINED);
+    }
+
+    std::vector<TransferEngine::ScatterTransferRange> ranges;
+    ranges.reserve(range_count);
+    uint64_t total_length = 0;
+    for (size_t i = 0; i < range_count; ++i) {
+        constexpr auto kMaxLocalAddress = std::numeric_limits<uintptr_t>::max();
+        if (local_capacities[i] > kMaxLocalAddress ||
+            local_base_addresses[i] >
+                kMaxLocalAddress -
+                    static_cast<uintptr_t>(local_capacities[i])) {
+            LOG(ERROR) << "Scatter transfer local allocation range overflows "
+                          "the address space at range "
+                       << i;
+            return ScatterTransferTicket::terminal(
+                ScatterTransferCompletionStatus::FAILED_DRAINED);
+        }
+        const size_t fragment_count = local_offsets[i].size();
+        if (remote_offsets[i].size() != fragment_count ||
+            lengths[i].size() != fragment_count) {
+            LOG(ERROR) << "Scatter transfer fragment arrays have different "
+                          "sizes at range "
+                       << i;
+            return ScatterTransferTicket::terminal(
+                ScatterTransferCompletionStatus::FAILED_DRAINED);
+        }
+
+        TransferEngine::ScatterTransferRange range;
+        range.opcode = opcode == TransferOpcode::WRITE ? TransferRequest::WRITE
+                                                       : TransferRequest::READ;
+        range.remote_segment = endpoint;
+        range.remote_base_offset = remote_base_addresses[i];
+        range.remote_size = remote_capacities[i];
+        range.local_buffer = reinterpret_cast<void*>(local_base_addresses[i]);
+        range.local_capacity = local_capacities[i];
+        range.local_offsets = local_offsets[i];
+        range.remote_offsets = remote_offsets[i];
+        range.lengths = lengths[i];
+        ranges.push_back(std::move(range));
+
+        for (size_t length : lengths[i]) {
+            if (length > std::numeric_limits<uint64_t>::max() - total_length) {
+                total_length = std::numeric_limits<uint64_t>::max();
+                break;
+            }
+            total_length += length;
+        }
+    }
+
+    auto operation = std::make_shared<TransferEngine::ScatterTransferOperation>(
+        engine_->submitScatter(ranges));
+    auto ticket = std::make_shared<ScatterTransferTicket>(operation);
+    const uint64_t timeout_ns =
+        total_length >
+                std::numeric_limits<uint64_t>::max() - transfer_timeout_nsec_
+            ? std::numeric_limits<uint64_t>::max()
+            : transfer_timeout_nsec_ + total_length;
+    ticket->drain(nanosToCeilingMillis(timeout_ns));
+    return ticket;
+}
+
 batch_id_t TransferEnginePy::batchTransferAsyncWrite(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
@@ -528,6 +742,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, {entry});
         if (!s.ok()) {
+            engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
                 LOG(WARNING)
@@ -535,14 +750,20 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                     << ", CheckSegmentStatus not ok, ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
-                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                // Under MC_USE_TENT there is no classic metadata object
+                // (getMetadata() returns nullptr); TENT invalidates its own
+                // segment cache inside closeSegment(). Guard the classic-only
+                // cleanup so evicting a dead peer's handle cannot dereference
+                // a null metadata pointer. Refs #3995 (P0-stale-handle).
+                if (auto metadata = engine_->getMetadata())
+                    metadata->removeSegmentDesc(target_hostname);
                 handle_map_.erase(target_hostname);
             }
             return -1;
         }
 
-        TransferStatus status;
         bool completed = false;
+        TransferStatus status;
         while (!completed) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
@@ -554,8 +775,10 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
+                engine_->freeBatchID(batch_id);
                 completed = true;
             }
+            if (completed) break;
             auto current_ts = getCurrentTimeInNano();
             const int64_t timeout =
                 transfer_timeout_nsec_ + length;  // 1GiB per second
@@ -564,6 +787,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                           << current_ts - start_ts << "ns, local buffer "
                           << (void*)buffer << " remote buffer "
                           << (void*)peer_buffer_address << " length " << length;
+                engine_->freeBatchID(batch_id);
                 return -1;
             }
         }
@@ -584,7 +808,11 @@ int TransferEnginePy::batchTransferSync(
             handle = handle_map_[target_hostname];
         } else {
             handle = engine_->openSegment(target_hostname);
-            if (handle == (Transport::SegmentHandle)-1) return -1;
+            if (handle == (Transport::SegmentHandle)-1) {
+                LOG(ERROR) << "batchTransferSync: openSegment failed for "
+                           << target_hostname;
+                return -1;
+            }
             handle_map_[target_hostname] = handle;
         }
     }
@@ -626,6 +854,10 @@ int TransferEnginePy::batchTransferSync(
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
+            LOG(ERROR) << "batchTransferSync: submitTransfer failed for "
+                       << target_hostname << " (batch of " << batch_size
+                       << " requests, " << total_length
+                       << " bytes): " << s.ToString();
             engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
@@ -634,15 +866,20 @@ int TransferEnginePy::batchTransferSync(
                     << ", CheckSegmentStatus not ok, ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
-                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                // Under MC_USE_TENT there is no classic metadata object
+                // (getMetadata() returns nullptr); TENT invalidates its own
+                // segment cache inside closeSegment(). Guard the classic-only
+                // cleanup so evicting a dead peer's handle cannot dereference
+                // a null metadata pointer. Refs #3995 (P0-stale-handle).
+                if (auto metadata = engine_->getMetadata())
+                    metadata->removeSegmentDesc(target_hostname);
                 handle_map_.erase(target_hostname);
             }
             return -1;
         }
 
-        TransferStatus status;
         bool completed = false;
-        bool already_freed = false;
+        TransferStatus status;
         while (!completed) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
@@ -650,13 +887,18 @@ int TransferEnginePy::batchTransferSync(
                 engine_->freeBatchID(batch_id);
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
+                LOG(ERROR) << "batchTransferSync: transfer FAILED for "
+                           << target_hostname << " (batch of " << batch_size
+                           << " requests, " << total_length
+                           << " bytes) on retry " << retry << "/" << max_retry;
                 engine_->freeBatchID(batch_id);
-                already_freed = true;
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
+                engine_->freeBatchID(batch_id);
                 completed = true;
             }
+            if (completed) break;
             auto current_ts = getCurrentTimeInNano();
             const int64_t timeout =
                 transfer_timeout_nsec_ + total_length;  // 1GiB per second
@@ -666,13 +908,14 @@ int TransferEnginePy::batchTransferSync(
                 // TODO: as @doujiang24 mentioned, early free(while there are
                 // still waiting tasks) the batch_id may fail and cause memory
                 // leak(a known issue).
-                if (!already_freed) {
-                    engine_->freeBatchID(batch_id);
-                }
+                engine_->freeBatchID(batch_id);
                 return -1;
             }
         }
     }
+    LOG(ERROR) << "batchTransferSync: all " << max_retry
+               << " retries exhausted for " << target_hostname << " (batch of "
+               << batch_size << " requests, " << total_length << " bytes)";
     return -1;
 }
 
@@ -1105,13 +1348,16 @@ int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string& segment_name) {
+    pybind11::gil_scoped_release release;
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
-    auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
-    if (!segment_desc || segment_desc->buffers.empty()) {
+    if (segment_id ==
+        static_cast<Transport::SegmentHandle>(ERR_INVALID_ARGUMENT))
         return 0;
-    }
-    return segment_desc->buffers[0].addr;
+    std::vector<SegmentBufferInfo> buffers;
+    if (engine_->getSegmentBuffers(segment_id, buffers) != 0 || buffers.empty())
+        return 0;
+    return buffers.front().addr;
 }
 
 std::string TransferEnginePy::getLocalTopology(const char* device_name) {
@@ -1122,13 +1368,12 @@ std::string TransferEnginePy::getLocalTopology(const char* device_name) {
         getenv("MC_USE_TENT") != nullptr || getenv("MC_USE_TEV1") != nullptr;
 #ifdef USE_TENT
     if (use_tent) {
-        // The classic shim (TransferEngine(true, filter)) silently drops the
-        // filter on the TENT path and builds its own Config in init(), so
-        // inject the whitelist via the per-instance Config that TENT's public
-        // constructor already accepts. Avoids touching the process-global
-        // MC_TE_FILTERS env var (racey under concurrent callers, leaked on
-        // throw). Note: if MC_TE_FILTERS is also set in env, loadFromEnv()
-        // inside TransferEngineImpl will override this — env takes priority.
+        // This helper only needs topology, so use the native TENT Config path
+        // directly instead of constructing the classic compatibility shim.
+        // Keep the filter per-instance and avoid the process-global
+        // MC_TE_FILTERS environment variable, which is unsafe for concurrent
+        // callers. Explicit Config values take precedence over environment
+        // defaults inside TransferEngineImpl.
         auto conf = std::make_shared<mooncake::tent::Config>();
         conf->set("metadata_type", "p2p");
         if (!device_name_safe.empty()) {
@@ -1173,6 +1418,15 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
     if (!engine_) return -1;
     pybind11::gil_scoped_release release;
+
+    if (engine_->isUsingTent()) {
+        auto handle = engine_->openSegment(peer_server_name);
+        if (handle == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
+            return -1;
+        auto liveness = engine_->probePeerAliveByID(handle);
+        return static_cast<int>(liveness);
+    }
+
     return engine_->getMetadata()->sendProbe(peer_server_name);
 }
 
@@ -1233,6 +1487,32 @@ PYBIND11_MODULE(engine, m) {
         .value("Write", TransferEnginePy::TransferOpcode::WRITE)
         .export_values();
 
+    py::enum_<ScatterTransferCompletionStatus>(
+        m, "ScatterTransferCompletionStatus")
+        .value("COMPLETED", ScatterTransferCompletionStatus::COMPLETED)
+        .value("FAILED_DRAINED",
+               ScatterTransferCompletionStatus::FAILED_DRAINED)
+        .value("COMPLETION_UNKNOWN",
+               ScatterTransferCompletionStatus::COMPLETION_UNKNOWN);
+
+    py::class_<ScatterTransferTicket, std::shared_ptr<ScatterTransferTicket>>(
+        m, "ScatterTransferTicket",
+        "Keeps a scatter operation alive until native DMA is drained.")
+        .def_property_readonly("status",
+                               [](const ScatterTransferTicket& ticket) {
+                                   py::gil_scoped_release release;
+                                   return ticket.status();
+                               })
+        .def_property_readonly("drained",
+                               [](const ScatterTransferTicket& ticket) {
+                                   py::gil_scoped_release release;
+                                   return ticket.drained();
+                               })
+        .def("drain", [](ScatterTransferTicket& ticket, uint64_t timeout_ms) {
+            py::gil_scoped_release release;
+            return ticket.drain(timeout_ms);
+        });
+
     py::class_<TransferEnginePy::TransferNotify>(m, "TransferNotify")
         .def(py::init<>())
         .def(py::init<const std::string&, const std::string&>(),
@@ -1267,6 +1547,20 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("transport_hint") = "")
+            .def("scatter_transfer_sync_write_with_ticket",
+                 &TransferEnginePy::scatterTransferSyncWriteWithTicket,
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
+            .def("scatter_transfer_sync_read_with_ticket",
+                 &TransferEnginePy::scatterTransferSyncReadWithTicket,
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
             .def("batch_transfer_async_write",
                  &TransferEnginePy::batchTransferAsyncWrite,
                  py::arg("target_hostname"), py::arg("buffers"),

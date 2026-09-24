@@ -15,7 +15,7 @@ namespace mooncake {
 // In-process master used by tests and by opt-in enable_embedded_master.
 // When enabled, a store client starts this master in the same process so no
 // external mooncake_master is required. This is not a user-facing deployment
-// mode.
+// mode. All listeners bind to the IPv4 loopback address.
 class EmbeddedMaster {
    public:
     EmbeddedMaster() = default;

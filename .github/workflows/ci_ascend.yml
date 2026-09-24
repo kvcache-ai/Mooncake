@@ -45,12 +45,13 @@ jobs:
         fetch-depth: 1
         persist-credentials: false
 
-    - name: Retry checkout via GitHub mirror
+    # Mirror is only a git transport fallback. Keep retry on actions/checkout so
+    # pull_request_target fork checks still run; do not fetch with raw git.
+    - name: Configure GitHub mirror rewrite
       if: steps.checkout_code.outcome == 'failure'
       shell: bash
       env:
         ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
-        CHECKOUT_REF: ${{ inputs.checkout_ref || github.sha }}
       run: |
         set -euo pipefail
 
@@ -83,27 +84,21 @@ jobs:
 
         workdir="${GITHUB_WORKSPACE}"
         git config --global --add safe.directory "$workdir"
+        find "$workdir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-        for base in "${candidates[@]}"; do
-          mirror_url="${base}https://github.com/${GITHUB_REPOSITORY}.git"
-          echo "Retrying checkout with ${mirror_url}"
+        # insteadOf only rewrites github.com fetches; checkout still runs
+        # assertSafePrCheckout before any git network I/O.
+        mirror_base="${candidates[0]}"
+        echo "Rewriting https://github.com/ to ${mirror_base}https://github.com/"
+        git config --global url."${mirror_base}https://github.com/".insteadOf "https://github.com/"
 
-          find "$workdir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-          git init "$workdir"
-          git -C "$workdir" remote add origin "$mirror_url"
-
-          if git -C "$workdir" fetch --depth=1 origin "$CHECKOUT_REF" && \
-             git -C "$workdir" checkout --force --detach FETCH_HEAD; then
-            echo "Mirror checkout succeeded via ${base}"
-            exit 0
-          fi
-
-          echo "Mirror checkout failed via ${base}"
-          rm -rf "$workdir/.git"
-        done
-
-        echo "Direct GitHub checkout failed and all mirror retries failed"
-        exit 1
+    - name: Retry checkout via GitHub mirror
+      if: steps.checkout_code.outcome == 'failure'
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.checkout_ref || github.sha }}
+        fetch-depth: 1
+        persist-credentials: false
 
     - name: Configure CMake
       shell: bash

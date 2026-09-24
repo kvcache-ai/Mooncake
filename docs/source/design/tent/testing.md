@@ -179,3 +179,24 @@ and CUDA stubs would bypass the fakes.
 Concurrency tests that touch shared runtime maps should also be run
 under ThreadSanitizer (`-fsanitize=thread`). Which binaries those are
 belongs in the test sources, not here.
+
+## What belongs in this suite
+
+Tests should call production functions or the public engine API. Do not
+reimplement a state machine in the test file and assert against that
+copy. Enum assignment, `std::atomic` store/load, and `Config::get/set`
+without going through `install()` / `TransferEngineImpl` do not lock
+runtime behavior.
+
+Binaries that are not ctest:
+
+- `tent_metrics_example` — HTTP metrics demo
+- `deadline_promotion_bench` — hot-path microbenchmark
+- `tent/benchmark/hip_bandwidth_bench.cpp` — standalone `hipcc` HIP
+  bandwidth sweep; CMake does not build it
+
+Hardware data-path tests (`tent_rdma_transport_test` roundtrip,
+`tent_nvlink_transport_test`, Sunrise, MPComm) skip or are omitted from
+ctest when the device is missing. That skip is expected; a green
+`cuda-off` run does not mean those paths were exercised. `tent_nvlink_transport_test`
+is built when CUDA is on but is not registered with ctest.

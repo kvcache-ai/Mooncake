@@ -133,7 +133,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory |
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
-| `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES` | `0` | Size of the additional preallocated pinned-host arena for same-process SSD-to-GPU restores. See the constraints below |
+| `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES` | `0` | Size of the additional preallocated pinned-host arena for same-process SSD-to-GPU restores and DFS ranged-session reads into device memory. See the constraints below |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
@@ -147,7 +147,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 
 The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO` and `MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO` are also accepted. The high watermark must be greater than the low watermark.
 
-The pinned restore quota is separate from `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`; it does not convert the normal FileStorage arena to pinned memory. It is allocated only when `MC_STORE_MEMCPY=1`, and selected only when the current process owns the SSD replica and the restore destination is GPU memory. Tensor payload ranges are copied from their source offset without an additional FileStorage staging allocation. Remote, CPU-destination, and io_uring reads continue to use the existing path. If the pinned quota is exhausted, the request uses the normal restore arena; if the quota cannot be pinned at startup, the optimization remains disabled. The file-per-key backend may still use its own temporary pageable buffer internally; the bucket and offset-allocator backends can read into the supplied restore buffer directly.
+The pinned restore quota is separate from `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`; it does not convert the normal FileStorage arena to pinned memory. It is allocated only when `MC_STORE_MEMCPY=1`. The arena is selected when the current process owns the SSD replica and the restore destination is GPU memory, and is also used as request-scoped staging for DFS ranged-session reads into device memory. Tensor payload ranges are copied from their source offset without an additional FileStorage staging allocation. Remote and CPU-destination reads continue to use the existing path. If the pinned quota is exhausted, the request uses the normal client buffer arena; if the quota cannot be pinned at startup, the optimization remains disabled. io_uring disables the pinned restore arena. The file-per-key backend may still use its own temporary pageable buffer internally; the bucket and offset-allocator backends can read into the supplied restore buffer directly.
 
 ### Bucket backend settings
 
@@ -159,7 +159,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
-| `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`. `0` disables it. Its scope depends on the deployment — see below. |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
 
 ### File-per-key backend settings
@@ -231,10 +231,9 @@ Eviction is two-phase: the bucket is removed from metadata and master is notifie
 
 `MAX_TOTAL_SIZE` bounds a *logical* in-memory counter (`data_size + meta_size` summed per object). It undercounts real disk usage: it ignores filesystem block rounding, and a bucket file stays on disk until *every* object in it is evicted while the counter drops per object. `MAX_PHYSICAL_BYTES` instead measures the *real* on-disk bytes (`du`-equivalent), so prefer it when you must not exceed a hard physical limit — most importantly a Kubernetes `emptyDir` with a `sizeLimit`, which the kubelet enforces by the volume's actual `du` usage and evicts the pod when exceeded.
 
-**Scope depends on the deployment.** `MAX_PHYSICAL_BYTES` scans this backend's own `ssd_offload_path`, so its meaning changes with the directory layout:
+**Ownership and scope.** LOCAL_DISK allows **one live client per** `ssd_offload_path` / `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. A second live client fails `Init()` with `storage_path already held by another live client`. Do **not** point several TP ranks at the same path — use **per-rank / per-client directories** (or separate disks). See the ownership contract in [SSD Offload design](../../design/store/ssd-offload.md).
 
-- **Shared directory** — all TP ranks point at the same path (SGLang's current default). Each rank scans the whole directory, so the cap bounds the **combined** usage of all ranks. Set it to the total capacity you must stay under (e.g. the `emptyDir` `sizeLimit`).
-- **Per-rank directory or separate disks** — each rank scans only its own files, so the cap bounds **each rank individually**. Set it to the per-rank budget (e.g. `sizeLimit / N` when N ranks share one volume via separate subdirectories, or the disk capacity when each rank has its own disk).
+`MAX_PHYSICAL_BYTES` scans this backend's own path. With the required per-rank layout, the cap bounds **each rank individually**. Set it to the per-rank budget (e.g. `sizeLimit / N` when N ranks share one volume via separate subdirectories, or the disk capacity when each rank has its own disk). A shared offload directory across live clients is no longer a supported deployment shape.
 
 > A cap on the *global* sum across ranks that holds under any layout (including ranks on separate disks) cannot be done by a per-directory scan and would require master-side aggregation; it is not part of this feature.
 
@@ -286,7 +285,7 @@ mooncake_master \
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((200 * 1024 * 1024 * 1024))  # 200 GB
-export MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES=$((200 * 1024 * 1024 * 1024)) # optional; shared dir: total cap. per-rank dir: per-rank cap
+export MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES=$((200 * 1024 * 1024 * 1024)) # optional; per-rank dir: per-rank cap
 export MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS=500 # optional
 export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
 
@@ -305,6 +304,7 @@ mooncake_client \
 ## Notes
 
 - `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected.
+- Each live Real Client needs its **own** offload directory. Sharing one path across TP ranks fails at `Init()` under the LOCAL_DISK ownership lock.
 - On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible. `offset_allocator_storage_backend` does not support restart recovery.
 - Eviction only notifies the master and deletes local files; objects replicated on other nodes are unaffected.
 - Each machine requires its own real client process. In multi-node deployments, ensure `--host` and `--port` are correctly set so nodes can reach each other.

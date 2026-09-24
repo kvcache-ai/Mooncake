@@ -247,7 +247,7 @@ class TestStandaloneEnvVarE2E(unittest.TestCase):
             LOCAL_BUFFER_SIZE,
             _protocol(),
             _device_name(),
-            "127.0.0.1:50051",
+            "",
         )
         self.assertEqual(ret, 0)
         key = f"standalone_env_{os.getpid()}_{time.time_ns()}"

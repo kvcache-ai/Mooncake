@@ -10,7 +10,7 @@
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_URING
 #include "file_interface.h"
@@ -49,10 +49,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
-    if (config_.storage_backend_type == StorageBackendType::kDistributed) {
-        config_.enable_dfs = true;
-    }
-    if (!config.Validate()) {
+    if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
@@ -89,7 +86,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
-        if (client_) {
+        config_.enable_dfs = !distributed_backend->UsesObjectStorage();
+        if (config_.enable_dfs && client_) {
             client_->SetDfsStorageBackend(distributed_backend);
         }
     }
@@ -470,11 +468,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
 
         auto offload_start = std::chrono::steady_clock::now();
+        std::unordered_set<std::string> reported_keys;
+        reported_keys.reserve(host_batch_object.size());
         auto bucket_complete_handler =
-            [this, offload_start, complete_handler](
+            [this, offload_start, complete_handler, &reported_keys](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
             auto res = complete_handler(keys, metadatas);
+            if (res == ErrorCode::OK) {
+                reported_keys.insert(keys.begin(), keys.end());
+            }
             if (res == ErrorCode::OK && ssd_metric_) {
                 auto elapsed_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -504,6 +507,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
             pinned_buffer_pool_->Release(std::move(buf));
+        }
+        if (offload_res) {
+            // A successful batch may skip duplicates or individual writes.
+            // Only the completion callback's keys were reported to Master;
+            // NACK the rest to release their tasks and source replica refs.
+            for (const auto& [key, _] : host_batch_object) {
+                if (reported_keys.find(key) == reported_keys.end()) {
+                    failed_tasks.push_back(task_by_storage_key.at(key));
+                }
+            }
         }
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
@@ -1176,6 +1189,14 @@ void FileStorage::ClientBufferGCThreadFunc() {
             std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
+}
+
+tl::expected<bool, ErrorCode> FileStorage::Exists(const std::string& key) {
+    if (!storage_backend_) {
+        LOG(ERROR) << "Storage backend is not initialized. Call Init() first.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return storage_backend_->IsExist(key);
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {

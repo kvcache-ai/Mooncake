@@ -11,10 +11,10 @@
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "common/network.h"
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
 #include "types.h"
-#include "utils.h"
 
 namespace mooncake {
 
@@ -77,17 +77,22 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
                 LOG(ERROR) << "Failed to start embedded HTTP metadata server "
                               "on port "
                            << http_metadata_port_;
-                meta_server_.reset();
+                Stop();
                 return false;
             }
         }
 
         server_ = std::make_unique<coro_rpc::coro_rpc_server>(
-            /*thread_num=*/4, /*port=*/rpc_port_, /*address=*/"0.0.0.0",
+            /*thread_num=*/4, /*port=*/rpc_port_, /*address=*/"127.0.0.1",
             std::chrono::seconds(0), /*tcp_no_delay=*/true);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
+#ifdef YLT_ENABLE_IBV
             server_->init_ibv();
+#else
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
         }
 
         uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
@@ -150,14 +155,12 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
         wrapped_ = std::make_shared<WrappedMasterService>(wms_cfg);
         admin_server_ = std::make_unique<MasterAdminServer>(
             static_cast<uint16_t>(http_metrics_port_),
-            /*enable_metric_reporting=*/false);
+            /*enable_metric_reporting=*/false, /*http_host=*/"127.0.0.1");
         if (!admin_server_->Start()) {
             LOG(ERROR) << "Failed to start embedded master admin server on "
                           "port "
                        << http_metrics_port_;
-            admin_server_.reset();
-            wrapped_.reset();
-            server_.reset();
+            Stop();
             return false;
         }
         admin_server_->SetRuntimeState(ha::MasterRuntimeState::kServing);
@@ -169,10 +172,7 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start embedded master RPC server on port "
                        << rpc_port_;
-            admin_server_->Stop();
-            admin_server_.reset();
-            wrapped_.reset();
-            server_.reset();
+            Stop();
             return false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -199,8 +199,8 @@ void EmbeddedMaster::Stop() {
     if (server_) {
         server_->stop();
         server_.reset();
-        wrapped_.reset();
     }
+    wrapped_.reset();
     if (meta_server_) {
         meta_server_->stop();
         meta_server_.reset();
