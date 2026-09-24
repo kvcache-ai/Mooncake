@@ -38,6 +38,16 @@ if(ENABLE_ASAN)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
 endif()
 
+option(ENABLE_TSAN "enable thread sanitizer" OFF)
+
+if(ENABLE_TSAN)
+  if(ENABLE_ASAN)
+    message(FATAL_ERROR "ENABLE_TSAN and ENABLE_ASAN cannot be combined")
+  endif()
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=thread")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=thread")
+endif()
+
 # keep debuginfo by default
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "RelWithDebInfo")
