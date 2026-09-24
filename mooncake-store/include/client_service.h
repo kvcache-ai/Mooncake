@@ -14,6 +14,7 @@
 #include <chrono>
 #include <unordered_set>
 
+#include "client_buffer.h"
 #include "client_metric.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
@@ -781,6 +782,9 @@ class Client {
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
 
+    void SetNofStagingAllocator(
+        std::shared_ptr<ClientBufferAllocator> allocator);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -942,6 +946,13 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
+    tl::expected<BufferHandle, ErrorCode> AllocateNofStagingBuffer(
+        const std::vector<Slice>& slices);
+    tl::expected<BufferHandle, ErrorCode> StageSlicesToHost(
+        const std::vector<Slice>& slices);
+    static ErrorCode CopyHostToSlices(const BufferHandle& buffer,
+                                      const std::vector<Slice>& slices);
+
     // Client identification
     const UUID client_id_;
 
@@ -951,6 +962,7 @@ class Client {
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
+    std::shared_ptr<ClientBufferAllocator> nof_staging_allocator_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
