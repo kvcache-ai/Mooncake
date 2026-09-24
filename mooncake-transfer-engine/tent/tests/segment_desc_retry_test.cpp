@@ -53,6 +53,21 @@ class SegmentDescRetryTest : public ::testing::Test {
         return result;
     }
 
+    int NotifySegmentUpdateAndWait() {
+        auto failures = std::make_shared<std::atomic<int>>(0);
+        ControlClient::notifySegmentUpdatedAsync(
+            addr_, "segment-name", [failures] { failures->fetch_add(1); });
+
+        auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (failures.use_count() != 1 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(1ms);
+        }
+
+        EXPECT_EQ(failures.use_count(), 1);
+        return failures->load();
+    }
+
     Status StartServer(const std::string& epoch) {
         server_ = std::make_unique<CoroRpcAgent>();
         CHECK_STATUS(server_->registerFunction(
@@ -68,6 +83,11 @@ class SegmentDescRetryTest : public ::testing::Test {
             Notify, [this](const std::string_view&, std::string&) {
                 notifications_.fetch_add(1);
                 throw std::runtime_error("after notification side effect");
+            }));
+        CHECK_STATUS(server_->registerFunction(
+            NotifySegmentUpdated,
+            [this](const std::string_view&, std::string&) {
+                segment_updates_.fetch_add(1);
             }));
         const auto requested_port = port_;
         CHECK_STATUS(server_->start(port_));
@@ -99,6 +119,7 @@ class SegmentDescRetryTest : public ::testing::Test {
     std::string addr_;
     std::atomic<int> metadata_calls_{0};
     std::atomic<int> notifications_{0};
+    std::atomic<int> segment_updates_{0};
     std::atomic<bool> fail_metadata_{false};
     std::promise<void> warmed_;
     std::promise<void> resume_;
@@ -208,6 +229,34 @@ TEST_F(SegmentDescRetryTest, NotificationSideEffectIsNotReplayed) {
             ControlClient::notify(addr_, Notification{"test", "once"});
         EXPECT_TRUE(status.IsRpcServiceError()) << status.ToString();
         EXPECT_EQ(notifications_.load(), 1);
+    });
+}
+
+TEST_F(SegmentDescRetryTest, SegmentUpdateNotificationRecoversAcrossRestarts) {
+    WithFreshCaller([&] {
+        ASSERT_TRUE(StartServer("epoch1").ok());
+        const auto warm = Read();
+        ASSERT_TRUE(warm.status.ok()) << warm.status.ToString();
+        ASSERT_EQ(warm.response, "epoch1");
+
+        for (int restart = 1; restart <= 2; ++restart) {
+            ASSERT_TRUE(RestartServer().ok());
+            EXPECT_EQ(NotifySegmentUpdateAndWait(), 0);
+            EXPECT_EQ(segment_updates_.load(), restart);
+        }
+    });
+}
+
+TEST_F(SegmentDescRetryTest, SegmentUpdateNotificationReportsDeadPeer) {
+    WithFreshCaller([&] {
+        ASSERT_TRUE(StartServer("epoch1").ok());
+        const auto warm = Read();
+        ASSERT_TRUE(warm.status.ok()) << warm.status.ToString();
+        server_.reset();
+        std::this_thread::sleep_for(100ms);
+
+        EXPECT_EQ(NotifySegmentUpdateAndWait(), 1);
+        EXPECT_EQ(segment_updates_.load(), 0);
     });
 }
 
