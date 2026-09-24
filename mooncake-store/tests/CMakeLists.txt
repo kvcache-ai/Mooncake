@@ -41,6 +41,7 @@ add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)
 add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)
+add_store_test(weight_revision_lease_test weight_revision_lease_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
@@ -74,6 +75,8 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_weight_management_test
+               master_service_weight_management_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
@@ -200,7 +203,8 @@ add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(object_entry_test object_entry_test.cpp)
 add_store_test(object_index_test object_index_test.cpp)
-add_store_test(dynamic_replication_lease_table_test dynamic_replication_lease_table_test.cpp)
+add_store_test(dynamic_replication_lease_table_test
+               dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)

@@ -41,6 +41,7 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "weight_store_manager.h"
 #include "master_config.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
@@ -124,6 +125,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  */
 
 class MasterService {
+    friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
@@ -154,6 +156,24 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+
+    WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request) const;
+    WeightMetadataStore::Result<ListWeightRevisionsResponse>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
@@ -882,7 +902,8 @@ class MasterService {
     tl::expected<void, ErrorCode> RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const WeightMetadataSnapshot& weight_metadata = {});
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         BatchOpLogPromotionHandoff handoff,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
@@ -934,7 +955,8 @@ class MasterService {
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
-        std::optional<ReplicaID> expected_max_replica_id);
+        std::optional<ReplicaID> expected_max_replica_id,
+        const WeightMetadataSnapshot* legacy_weight_metadata);
 
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
@@ -1098,6 +1120,8 @@ class MasterService {
         std::unordered_map<std::string, GroupState> groups GUARDED_BY(mutex);
     };
     GroupDomain group_domain_;
+    MasterStoreBackend weight_backend_{*this};
+    WeightStoreManager weight_manager_{weight_backend_};
 
     class SoftPinDeadlineIndex {
         friend class test::MasterServiceTestPeer;
@@ -1874,7 +1898,8 @@ class MasterService {
         MetadataSerializer(MasterService* service) : service_(service) {}
 
         // Serialize metadata of all shards
-        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+        tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
+            const WeightMetadataSnapshot* frozen_weight_metadata = nullptr);
 
         tl::expected<void, SerializationError> Deserialize(
             const std::vector<uint8_t>& data);
@@ -2163,6 +2188,7 @@ class MasterService {
     static int64_t DynamicReplicationNowMs();
 
     const bool enable_oplog_;
+    const bool weight_management_mutations_enabled_;
     const uint32_t oplog_batch_max_entries_;
 
     // cluster id for persistent sub directory

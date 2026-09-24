@@ -215,6 +215,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_offload_(config.enable_offload),
       enable_oplog_(config.enable_ha && config.enable_oplog &&
                     config.ha_backend_type == "etcd"),
+      weight_management_mutations_enabled_(
+          !enable_oplog_ ||
+          config.weight_management_oplog_capability_confirmed),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
@@ -1677,6 +1680,50 @@ std::shared_ptr<Lease> MasterService::RegisterGroupMember(
     }
     it->second.member_keys.insert(key);
     return it->second.lease;
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::BeginWeightImport(const BeginWeightImportRequest& request) {
+    return weight_manager_.BeginWeightImport(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::CommitWeightImport(const CommitWeightImportRequest& request) {
+    return weight_manager_.CommitWeightImport(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::AbortWeightImport(const AbortWeightImportRequest& request) {
+    return weight_manager_.AbortWeightImport(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionView>
+MasterService::GetWeightRevision(
+    const GetWeightRevisionRequest& request) const {
+    return weight_manager_.GetWeightRevision(request);
+}
+
+WeightMetadataStore::Result<ListWeightRevisionsResponse>
+MasterService::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request) const {
+    return weight_manager_.ListWeightRevisions(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+MasterService::AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request) {
+    return weight_manager_.AcquireWeightRevisionLease(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+MasterService::RenewWeightRevisionLease(
+    const RenewWeightRevisionLeaseRequest& request) {
+    return weight_manager_.RenewWeightRevisionLease(request);
+}
+
+WeightMetadataStore::Result<void> MasterService::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request) {
+    return weight_manager_.ReleaseWeightRevisionLease(request);
 }
 
 void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
@@ -3455,9 +3502,11 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const WeightMetadataSnapshot& weight_metadata) {
     return RestoreFromStandbyState(&objects, nullptr, initial_oplog_sequence_id,
-                                   segments, objects.size(), std::nullopt);
+                                   segments, objects.size(), std::nullopt,
+                                   &weight_metadata);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
@@ -3470,7 +3519,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
     return RestoreFromStandbyState(nullptr, std::move(handoff.metadata_store),
                                    handoff.applied_cursor.last_seq,
                                    handoff.segments, chunk_object_count,
-                                   handoff.max_replica_id);
+                                   handoff.max_replica_id, nullptr);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
@@ -3478,14 +3527,22 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     std::unique_ptr<StandbyMetadataStore> metadata_store,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
-    std::optional<ReplicaID> expected_max_replica_id) {
+    std::optional<ReplicaID> expected_max_replica_id,
+    const WeightMetadataSnapshot* legacy_weight_metadata) {
     if (enable_dfs_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: DFS allocator state "
                       "restoration is not supported";
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     if ((legacy_objects == nullptr) == (metadata_store == nullptr) ||
-        (metadata_store && chunk_object_count == 0)) {
+        (metadata_store && chunk_object_count == 0) ||
+        (legacy_objects && legacy_weight_metadata == nullptr)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const WeightMetadataSnapshot weight_metadata =
+        metadata_store ? metadata_store->SnapshotWeightMetadata()
+                       : *legacy_weight_metadata;
+    if (!ValidateWeightMetadataSnapshot(weight_metadata)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     // The ordered writer initializes its sequence from durable_prefix.
@@ -3886,6 +3943,12 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
 
     if (enable_multi_tenants_) {
         RebuildTenantQuotaUsageFromMetadata();
+    }
+
+    auto restored_weight_metadata =
+        weight_manager_.RestoreSnapshot(weight_metadata);
+    if (!restored_weight_metadata) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     LOG(INFO) << "Restored from standby: " << restored_object_count
@@ -12882,13 +12945,14 @@ void MasterService::NofHeartbeatThreadFunc() {
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>
-MasterService::MetadataSerializer::Serialize() {
+MasterService::MetadataSerializer::Serialize(
+    const WeightMetadataSnapshot* frozen_weight_metadata) {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
-    // Create top-level map with 3 fields: "shards", "discarded_replicas",
-    // "replica_next_id"
-    packer.pack_map(3);
+    // Weight metadata is optional on decode so snapshots produced before weight
+    // management remain valid.
+    packer.pack_map(4);
 
     // 1. Serialize metadata shards
     packer.pack("shards");
@@ -12969,6 +13033,18 @@ MasterService::MetadataSerializer::Serialize() {
     packer.pack("replica_next_id");
     packer.pack(static_cast<uint64_t>(Replica::next_id_.load()));
 
+    packer.pack("weight_metadata");
+    WeightMetadataSnapshot live_weight_metadata;
+    if (frozen_weight_metadata == nullptr) {
+        live_weight_metadata = service_->weight_manager_.ExportSnapshot();
+        frozen_weight_metadata = &live_weight_metadata;
+    }
+    const auto encoded_weight_metadata =
+        struct_pack::serialize(*frozen_weight_metadata);
+    packer.pack_bin(encoded_weight_metadata.size());
+    packer.pack_bin_body(encoded_weight_metadata.data(),
+                         encoded_weight_metadata.size());
+
     return std::vector<uint8_t>(
         reinterpret_cast<const uint8_t*>(sbuf.data()),
         reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
@@ -12997,11 +13073,10 @@ MasterService::MetadataSerializer::Deserialize(
                                "Invalid MessagePack format: expected map"));
     }
 
-    // Expected format: top-level map with "shards", "discarded_replicas",
-    // and "replica_next_id"
     const msgpack::object* shards_obj = nullptr;
     const msgpack::object* discarded_replicas_obj = nullptr;
     const msgpack::object* replica_next_id_obj = nullptr;
+    const msgpack::object* weight_metadata_obj = nullptr;
 
     // Extract fields from top-level map
     for (uint32_t i = 0; i < obj.via.map.size; ++i) {
@@ -13014,6 +13089,8 @@ MasterService::MetadataSerializer::Deserialize(
                 discarded_replicas_obj = &obj.via.map.ptr[i].val;
             } else if (key == "replica_next_id") {
                 replica_next_id_obj = &obj.via.map.ptr[i].val;
+            } else if (key == "weight_metadata") {
+                weight_metadata_obj = &obj.via.map.ptr[i].val;
             }
         }
     }
@@ -13022,6 +13099,28 @@ MasterService::MetadataSerializer::Deserialize(
     if (shards_obj == nullptr) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL, "Missing 'shards' field"));
+    }
+
+    WeightMetadataSnapshot weight_metadata;
+    if (weight_metadata_obj != nullptr) {
+        if (weight_metadata_obj->type != msgpack::type::BIN) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Invalid MessagePack format: weight_metadata must be binary"));
+        }
+        const std::string encoded(weight_metadata_obj->via.bin.ptr,
+                                  weight_metadata_obj->via.bin.ptr +
+                                      weight_metadata_obj->via.bin.size);
+        if (struct_pack::deserialize_to(weight_metadata, encoded) !=
+            struct_pack::errc::ok) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Failed to deserialize weight_metadata snapshot"));
+        }
+    }
+    if (!ValidateWeightMetadataSnapshot(weight_metadata)) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL, "Invalid weight_metadata snapshot"));
     }
 
     // Iterate and deserialize each shard
@@ -13100,6 +13199,14 @@ MasterService::MetadataSerializer::Deserialize(
     auto next_id = replica_next_id_obj->as<uint64_t>();
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
+
+    // Old snapshots restore an empty weight domain only after decoding
+    // succeeds.
+    auto restored = service_->weight_manager_.RestoreSnapshot(weight_metadata);
+    if (!restored) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL, "Invalid weight_metadata snapshot"));
+    }
     // Migrate old-format snapshots: re-route objects to their hash(tenant, key)
     // shards before rebuilding the group domain (which is derived from
     // metadata).
@@ -13110,6 +13217,7 @@ MasterService::MetadataSerializer::Deserialize(
 }
 
 void MasterService::MetadataSerializer::Reset() {
+    service_->weight_manager_.Clear();
     service_->soft_pin_deadline_index_.Clear();
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();

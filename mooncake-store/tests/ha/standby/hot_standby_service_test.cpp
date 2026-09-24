@@ -285,6 +285,58 @@ bool WaitForState(HotStandbyService& service, StandbyState state,
     return service.GetState() == state;
 }
 
+WeightMetadataSnapshot MakeWeightMetadataSnapshot() {
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    return WeightMetadataSnapshot{
+        .metadata = {WeightRevisionMetadata{
+            .identity = identity,
+            .manifest =
+                WeightManifestReference{
+                    .manifest_key =
+                        "weights/production/llama-70b/step-100/7/manifest",
+                    .manifest_sha256 = std::string(64, 'a'),
+                    .payload_group_id = MakeWeightPayloadGroupId(identity),
+                    .payload_keys_sha256 = std::string(64, 'b'),
+                    .payload_count = 1,
+                    .logical_bytes = 1024,
+                },
+            .availability = WeightAvailabilityState::READY,
+            .residency = WeightResidencyState::HOT,
+            .operation = WeightOperationState::EVICTING,
+            .operation_id = 3,
+            .metadata_generation = 4,
+            .created_at_ms = 100,
+            .updated_at_ms = 200,
+        }},
+        .leases = {WeightRevisionLease{
+            .lease_id = 5,
+            .identity = identity,
+            .holder = "worker-0",
+            .expires_at_ms = 300,
+            .fenced_metadata_generation = 2,
+        }},
+        .operations = {WeightResidencyOperation{
+            .operation_id = 3,
+            .identity = identity,
+            .operation = WeightOperationState::EVICTING,
+            .target_residency = WeightResidencyState::COLD,
+            .fenced_metadata_generation = 4,
+            .started_at_ms = 150,
+            .updated_at_ms = 200,
+            .cursor = {},
+            .message = {},
+        }},
+        .next_lease_id = 6,
+        .next_operation_id = 4,
+    };
+}
+
 }  // namespace
 
 class HotStandbyServiceTest : public ::testing::Test {
@@ -750,6 +802,83 @@ TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_SnapshotOnly) {
     // Segment registry is empty because snapshot-only standby has no
     // oplog_applier
     EXPECT_TRUE(snapshot.segments.empty());
+}
+
+TEST_F(HotStandbyServiceTest, SnapshotWeightMetadataSurvivesPromotionExport) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+    LoadedSnapshot loaded;
+    loaded.snapshot_id = "weight-snapshot";
+    loaded.snapshot_sequence_id = 42;
+    loaded.weight_metadata = MakeWeightMetadataSnapshot();
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(std::move(loaded))));
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+
+    StandbySnapshot exported;
+    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(exported));
+    ASSERT_TRUE(exported.weight_metadata.has_value());
+    EXPECT_EQ(MakeWeightMetadataSnapshot(), exported.weight_metadata.value());
+}
+
+TEST_F(HotStandbyServiceTest, AppliesNewerWeightMetadataOpLogAfterSnapshot) {
+    const std::string cluster_id = "weight-snapshot-catch-up";
+    auto backend = std::make_shared<FakeCaptureHaKvBackend>();
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpBatchKvBackendForTesting(backend);
+
+    auto baseline_weight_metadata = MakeWeightMetadataSnapshot();
+    baseline_weight_metadata.leases.clear();
+    baseline_weight_metadata.operations.clear();
+    baseline_weight_metadata.next_lease_id = 1;
+    baseline_weight_metadata.next_operation_id = 1;
+    auto& baseline_metadata = baseline_weight_metadata.metadata.front();
+    baseline_metadata.availability = WeightAvailabilityState::IMPORTING;
+    baseline_metadata.residency = WeightResidencyState::UNKNOWN;
+    baseline_metadata.operation = WeightOperationState::NONE;
+    baseline_metadata.operation_id = 0;
+    baseline_metadata.metadata_generation = 1;
+    baseline_metadata.updated_at_ms = 100;
+    LoadedSnapshot loaded;
+    loaded.snapshot_id = "weight-baseline";
+    loaded.snapshot_sequence_id = 1;
+    loaded.weight_metadata = baseline_weight_metadata;
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(std::move(loaded))));
+
+    auto ready = baseline_metadata;
+    ready.availability = WeightAvailabilityState::READY;
+    ready.residency = WeightResidencyState::HOT;
+    ready.metadata_generation = 2;
+    ready.updated_at_ms = 200;
+    const auto encoded = struct_pack::serialize(ready);
+    auto batch = MakeCaptureBatch(1, 2, OpType::WEIGHT_METADATA_UPSERT,
+                                  MakeWeightRevisionMetadataKey(ready.identity),
+                                  std::string(encoded.begin(), encoded.end()));
+    batch.entries.front().tenant_id = ready.identity.tenant_id;
+    ASSERT_EQ(ErrorCode::OK, backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                                          EncodeOpLogBatchRecord(batch)));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id),
+                     EncodeDurablePrefix({.batch_id = 1, .last_seq = 2})));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id));
+    for (int i = 0; i < 100 && service_->GetLatestAppliedSequenceId() < 2;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    ASSERT_EQ(2u, service_->GetLatestAppliedSequenceId());
+
+    StandbySnapshot promoted;
+    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(promoted));
+    ASSERT_TRUE(promoted.weight_metadata.has_value());
+    ASSERT_EQ(1u, promoted.weight_metadata->metadata.size());
+    EXPECT_EQ(ready, promoted.weight_metadata->metadata.front());
 }
 
 TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {

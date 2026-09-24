@@ -346,6 +346,9 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
             "Enable HA metadata replication through batch-record OpLog");
+DEFINE_bool(weight_management_oplog_capability_confirmed, false,
+            "Confirm every configured OpLog standby supports weight metadata "
+            "and lease entry types before enabling weight mutations");
 DEFINE_bool(enable_oplog_snapshot, false,
             "Enable standby batch OpLog snapshot production");
 DEFINE_uint64(snapshot_chunk_object_count, 1000000,
@@ -667,6 +670,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cluster_id);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
                            FLAGS_enable_oplog);
+    default_config.GetBool(
+        "weight_management_oplog_capability_confirmed",
+        &master_config.weight_management_oplog_capability_confirmed,
+        FLAGS_weight_management_oplog_capability_confirmed);
     default_config.GetBool("enable_oplog_snapshot",
                            &master_config.enable_oplog_snapshot,
                            FLAGS_enable_oplog_snapshot);
@@ -1155,6 +1162,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_oplog = FLAGS_enable_oplog;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "weight_management_oplog_capability_confirmed", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.weight_management_oplog_capability_confirmed =
+            FLAGS_weight_management_oplog_capability_confirmed;
     }
     if ((google::GetCommandLineFlagInfo("enable_oplog_snapshot", &info) &&
          !info.is_default) ||
@@ -1684,6 +1698,8 @@ int main(int argc, char* argv[]) {
         << master_config.tenant_eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_oplog=" << master_config.enable_oplog
+        << ", weight_management_oplog_capability_confirmed="
+        << master_config.weight_management_oplog_capability_confirmed
         << ", enable_oplog_snapshot=" << master_config.enable_oplog_snapshot
         << ", snapshot_chunk_object_count="
         << master_config.snapshot_chunk_object_count
