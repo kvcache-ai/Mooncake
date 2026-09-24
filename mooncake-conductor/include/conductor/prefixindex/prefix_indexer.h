@@ -24,12 +24,14 @@ struct RegistrationResult {
 };
 
 struct BlockPresence {
-    std::set<EngineOwner> gpu_owners;
-    std::set<SharedObjectOwner> cpu_owners;
-    std::set<SharedObjectOwner> disk_owners;
+    std::set<EngineOwner> npu_owners;
+    std::set<EngineOwner> cpu_local_owners;
+    std::set<SharedObjectOwner> cpu_share_owners;
+    std::set<TierOwner> disk_owners;
 
     bool Empty() const {
-        return gpu_owners.empty() && cpu_owners.empty() && disk_owners.empty();
+        return npu_owners.empty() && cpu_local_owners.empty() &&
+               cpu_share_owners.empty() && disk_owners.empty();
     }
 };
 
@@ -61,8 +63,9 @@ struct ContextState {
 };
 
 struct RankCacheHitResult {
-    int64_t gpu = 0;
-    int64_t cpu = 0;
+    int64_t npu = 0;
+    int64_t cpu_local = 0;
+    int64_t cpu_share = 0;
     int64_t disk = 0;
 
     bool operator==(const RankCacheHitResult&) const = default;
@@ -72,8 +75,9 @@ struct CacheHitResult {
     int64_t longest_match_tokens = 0;
     std::map<int64_t, int64_t> dp;
     std::map<int64_t, RankCacheHitResult> rank_matches;
-    int64_t gpu = 0;
-    int64_t cpu = 0;
+    int64_t npu = 0;
+    int64_t cpu_local = 0;
+    int64_t cpu_share = 0;
     int64_t disk = 0;
 };
 
@@ -106,9 +110,9 @@ class PrefixCacheTable {
     std::string Unregister(const ContextKey& context,
                            const std::string& instance_id, int64_t dp_rank);
 
-    std::string StoreGpu(const GpuMutation& mutation);
-    std::string RemoveGpu(const GpuMutation& mutation);
-    std::string ClearGpu(const GpuClear& clear);
+    std::string StoreEngine(const EngineMutation& mutation);
+    std::string RemoveEngine(const EngineMutation& mutation);
+    std::string ClearEngine(const EngineClear& clear);
 
     std::string StoreShared(const SharedMutation& mutation);
     std::string RemoveShared(const SharedMutation& mutation);
@@ -129,7 +133,8 @@ class PrefixCacheTable {
 
     mutable std::shared_mutex context_map_mutex_;
     std::unordered_map<ContextKey, std::shared_ptr<ContextState>> contexts_;
-    const size_t block_limit_ = kDefaultMaxBlocks;
+    // Fixed for production; tests may set it before any context is registered.
+    size_t block_limit_ = kDefaultMaxBlocks;
 };
 
 }  // namespace mooncake::conductor::prefixindex

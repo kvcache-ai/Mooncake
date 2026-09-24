@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <variant>
 
 #include "conductor/common/types.h"
 
@@ -28,7 +29,7 @@ struct ProjectedPrefix {
     auto operator<=>(const ProjectedPrefix&) const = default;
 };
 
-enum class StorageTier { kGpu, kCpu, kDisk };
+enum class StorageTier { kNpu, kCpuLocal, kCpuShare, kDisk };
 
 struct EngineOwner {
     std::string source_stream;
@@ -46,6 +47,9 @@ struct SharedObjectOwner {
     auto operator<=>(const SharedObjectOwner&) const = default;
 };
 
+// A storage medium does not imply that another engine can access it.
+using TierOwner = std::variant<EngineOwner, SharedObjectOwner>;
+
 struct EngineRegistration {
     ContextKey context;
     HashProfile profile;
@@ -55,28 +59,32 @@ struct EngineRegistration {
     std::optional<int64_t> cache_group;
 };
 
-struct GpuMutation {
+struct EngineMutation {
     ContextKey context;
     std::vector<ProjectedPrefix> prefixes;
     EngineOwner owner;
     int64_t effective_block_size = 0;
     std::optional<int64_t> cache_group;
+    StorageTier tier = StorageTier::kNpu;
 };
 
 struct SharedMutation {
     ContextKey context;
     std::vector<ProjectedPrefix> prefixes;
-    StorageTier tier = StorageTier::kCpu;
+    StorageTier tier = StorageTier::kCpuShare;
     SharedObjectOwner owner;
     int64_t effective_block_size = 0;
     std::optional<int64_t> cache_group;
 };
 
-struct GpuClear {
+struct EngineClear {
     ContextKey context;
     EngineOwner owner;
     int64_t effective_block_size = 0;
     std::optional<int64_t> cache_group;
+    // Explicit nullopt clears all local tiers; the default clears only NPU.
+    // Shared Store ownership is never affected.
+    std::optional<StorageTier> tier = StorageTier::kNpu;
 };
 
 struct SharedClear {

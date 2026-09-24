@@ -1148,7 +1148,7 @@ TEST(DecodeSglangEventBatch, AcceptsOmittedMediumAndBigramTokens) {
     EXPECT_FALSE(removed->medium.has_value());
 }
 
-TEST(DecodeSglangEventBatch, RejectsMooncakeMapEventsForProtocolFallback) {
+TEST(DecodeSglangEventBatch, RejectsMooncakeMapEvents) {
     const std::string payload = PackMooncakeBatch(
         1, [](Packer& packer) { PackMooncakeStored(packer); });
 
