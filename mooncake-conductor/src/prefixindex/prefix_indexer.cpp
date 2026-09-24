@@ -193,6 +193,21 @@ int64_t TokensForBlocks(size_t block_count, int64_t block_size) {
     return static_cast<int64_t>(block_count) * block_size;
 }
 
+// Tokens reusable from a matched run of blocks. The SGLang chains end in a
+// partial block, so a run that reaches the last block covers only the tokens
+// the query actually carries. Reporting a whole block there would hand the
+// router reusable tokens that no indexed block holds, and the engine would
+// then skip recomputing slots whose KV belongs to some other request.
+int64_t MatchedTokens(size_t block_count, int64_t block_size,
+                      size_t queried_tokens) {
+    const int64_t queried =
+        queried_tokens >
+                static_cast<size_t>(std::numeric_limits<int64_t>::max())
+            ? std::numeric_limits<int64_t>::max()
+            : static_cast<int64_t>(queried_tokens);
+    return std::min(TokensForBlocks(block_count, block_size), queried);
+}
+
 }  // namespace
 
 RegistrationResult PrefixCacheTable::ValidateRegistration(
@@ -473,6 +488,14 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         return results;
     }
     const size_t block_count = chain->BlockCount();
+    // Reusable logical KV positions carried by this query. The bigram chains
+    // hash token pairs, so n raw tokens cover n - 1 positions and the chain is
+    // built over that length. Capping at the raw count there would still let a
+    // full match report one position no indexed block holds.
+    const size_t queried_tokens =
+        (state->profile.strategy == "sglang_bigram" && !token_ids.empty())
+            ? token_ids.size() - 1
+            : token_ids.size();
 
     // Resolve the optional filter and copy rank sets before probing. The copies
     // remain valid while the probe releases and reacquires state.mutex.
@@ -559,17 +582,20 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
             advance_cursor(cursor, gpu_present);
 
             RankCacheHitResult rank_match;
-            rank_match.gpu = TokensForBlocks(cursor, context.block_size);
+            rank_match.gpu =
+                MatchedTokens(cursor, context.block_size, queried_tokens);
 
             advance_cursor(cursor, [](const BlockPresence& block) {
                 return !block.cpu_owners.empty();
             });
-            rank_match.cpu = TokensForBlocks(cursor, context.block_size);
+            rank_match.cpu =
+                MatchedTokens(cursor, context.block_size, queried_tokens);
 
             advance_cursor(cursor, [](const BlockPresence& block) {
                 return !block.disk_owners.empty();
             });
-            rank_match.disk = TokensForBlocks(cursor, context.block_size);
+            rank_match.disk =
+                MatchedTokens(cursor, context.block_size, queried_tokens);
 
             result.dp.emplace(rank, rank_match.gpu);
             result.rank_matches.emplace(rank, rank_match);

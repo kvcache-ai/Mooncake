@@ -139,7 +139,7 @@ class StoreSessionMetadataTest(unittest.TestCase):
             def get(self, key):
                 return self.values.get(key, b"")
 
-            def isExist(self, key):
+            def is_exist(self, key):
                 return int(key in self.values)
 
             def remove(self, key):
@@ -182,7 +182,7 @@ class StoreSessionMetadataTest(unittest.TestCase):
             def get(self, key):
                 return self.values.get(key, b"")
 
-            def isExist(self, key):
+            def is_exist(self, key):
                 return int(key in self.values)
 
             def remove(self, key):
@@ -217,6 +217,61 @@ class StoreSessionMetadataTest(unittest.TestCase):
         summary = json.loads((output_dir / "summary.json").read_text())
         self.assertTrue(summary["ok"])
         self.assertEqual(summary["journal_records"], 5)
+
+
+class RemoveExistenceErrorTest(unittest.TestCase):
+    def test_remove_requires_a_successful_absence_check(self):
+        args = bench.build_parser().parse_args(["--scenario=mixed_metadata"])
+        store = Mock()
+        session = bench.StoreSession(args, 0, bench.PayloadFactory(4096, b"x"), store)
+        for expected, removed, exists, ok in (
+            (True, 0, -1, False),
+            (False, -1, -1, False),
+            (False, 0, -1, False),
+            (True, 0, 0, True),
+            (False, -1, 0, True),
+            (True, 0, 1, False),
+        ):
+            with self.subTest(expected=expected, removed=removed, exists=exists):
+                store.remove.return_value = removed
+                store.is_exist.return_value = exists
+                result, _, code = session.metadata_operation("remove", 1, expected)
+                self.assertEqual(result.request_ok, ok)
+                if exists < 0:
+                    self.assertEqual(code, exists)
+                    self.assertEqual(result.error_counts[exists], 1)
+
+    def test_cli_records_failed_probe_in_summary_and_journal(self):
+        store = Mock()
+        store.setup.return_value = 0
+        store.remove.return_value = -1
+        store.is_exist.return_value = -1
+        with TemporaryDirectory() as directory:
+            argv = [
+                "store_kv_bench.py",
+                "--scenario=mixed_metadata",
+                "--nr-objects=1",
+                "--put-pct=0",
+                "--get-pct=0",
+                "--exist-pct=0",
+                "--remove-pct=100",
+                "--output-dir",
+                directory,
+            ]
+            with (
+                patch.object(bench, "MooncakeDistributedStore", return_value=store),
+                patch.object(sys, "argv", argv),
+            ):
+                code = bench.main()
+            summary = json.loads((Path(directory) / "summary.json").read_text())
+            journal = bench.read_replay(Path(directory) / "journal.jsonl")
+            self.assertEqual(code, 22)
+            self.assertFalse(summary["ok"])
+            self.assertEqual(summary["overall"]["failed_kvs"], 1)
+            self.assertEqual(len(journal), 1)
+            self.assertFalse(journal[0]["ok"])
+            self.assertEqual(journal[0]["result"], -1)
+            store.close.assert_called_once()
 
 
 class WorkerFailureTest(unittest.TestCase):

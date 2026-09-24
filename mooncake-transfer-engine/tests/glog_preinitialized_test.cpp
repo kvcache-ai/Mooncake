@@ -18,6 +18,7 @@
 #include <cstdlib>
 
 #include "config.h"
+#include "glog_compat.h"
 
 // MOONCAKE_GLOG_HAS_IS_INITIALIZED is provided by FindGLOG.cmake through the
 // glog::glog INTERFACE compile definitions. It is 1 only when glog >= 0.6.0,
@@ -75,6 +76,26 @@ TEST_F(GlogPreinitializedTest, LoadGlobalConfigReusesHostLogging) {
     // rather than re-initializing glog.
     EXPECT_TRUE(testGlogInitialized());
     EXPECT_EQ(FLAGS_log_dir, ".");
+}
+
+TEST_F(GlogPreinitializedTest, MainPathInitNoOpAfterStaticConfigInit) {
+    // Reproduces the standalone mooncake_client / mooncake_master startup
+    // order: a static initializer (rdma_transport/worker_pool.cpp evaluates
+    // globalConfig()) runs loadGlobalConfig() before main(), which
+    // initializes glog from MC_LOG_DIR and sets FLAGS_log_dir. main()'s
+    // !FLAGS_log_dir.empty() branch then used to call
+    // google::InitGoogleLogging() a second time and CHECK-fail on
+    // glog >= 0.6.0 ("You called InitGoogleLogging() twice!").
+    ASSERT_EQ(::setenv("MC_LOG_DIR", ".", 1), 0);
+
+    GlobalConfig config;
+    loadGlobalConfig(config);  // as the static initializer does
+    ASSERT_TRUE(testGlogInitialized());
+    ASSERT_EQ(FLAGS_log_dir, ".");
+
+    // The main()-path call must be a no-op instead of CHECK-failing.
+    mooncake::InitGoogleLoggingOnce("standalone-main");
+    EXPECT_TRUE(testGlogInitialized());
 }
 
 }  // namespace

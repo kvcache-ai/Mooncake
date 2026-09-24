@@ -24,11 +24,13 @@ namespace mooncake {
 class TransferEngineImpl;
 class TransferEngineImplTestPeer;
 class MultiTransportTestPeer;
+class MultiTransportBatchTestPeer;
 
 class MultiTransport {
     friend class TransferEngineImpl;
     friend class TransferEngineImplTestPeer;
     friend class MultiTransportTestPeer;
+    friend class MultiTransportBatchTestPeer;
 
    public:
     using BatchID = Transport::BatchID;
@@ -98,7 +100,16 @@ class MultiTransport {
                           const std::vector<TransferRequest> &entries,
                           std::vector<size_t> *task_sizes);
 
-    Status selectTransport(const TransferRequest &entry, Transport *&transport);
+    Status selectTransports(const std::vector<TransferRequest> &entries,
+                            std::vector<Transport *> &transports);
+
+    // If `allows_reuse` is non-null it is written on every return. True means
+    // this segment's transport is a function of `target_id` only, so the
+    // caller may reuse the returned pointer for later requests with the same
+    // `target_id`. False for mixed-protocol segments (comma in `protocol`) and
+    // invalid IDs. Passing nullptr skips the flag.
+    Status selectTransport(const TransferRequest &entry, Transport *&transport,
+                           bool *allows_reuse = nullptr);
 
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_selectTransport(const TransferRequest &entry,

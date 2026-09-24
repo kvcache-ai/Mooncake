@@ -17,13 +17,14 @@
 #include "offset_allocator/offset_allocator.h"
 #include "replica.h"
 #include "storage/distributed/fs_adapter.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 #include "types.h"
 
 namespace mooncake {
 
 struct DistributedStorageConfig;
 
-class DfsGlobalAllocator {
+class ShardAllocator final : public DfsAllocatorInterface {
    public:
     struct EvictionCandidate {
         std::string key;
@@ -50,7 +51,7 @@ class DfsGlobalAllocator {
         }
 
        private:
-        friend class DfsGlobalAllocator;
+        friend class ShardAllocator;
 
         struct PreparedAllocation {
             EvictionCandidate candidate;
@@ -58,21 +59,24 @@ class DfsGlobalAllocator {
             uint64_t bytes = 0;
         };
 
-        explicit PendingEviction(DfsGlobalAllocator* owner) : owner_(owner) {}
+        explicit PendingEviction(ShardAllocator* owner) : owner_(owner) {}
 
-        DfsGlobalAllocator* owner_ = nullptr;
+        ShardAllocator* owner_ = nullptr;
         std::vector<EvictionCandidate> candidates_;
         std::vector<PreparedAllocation> prepared_;
     };
 
-    DfsGlobalAllocator() = default;
-    ~DfsGlobalAllocator();
+    ShardAllocator() = default;
+    ~ShardAllocator() override;
 
-    DfsGlobalAllocator(const DfsGlobalAllocator&) = delete;
-    DfsGlobalAllocator& operator=(const DfsGlobalAllocator&) = delete;
+    ShardAllocator(const ShardAllocator&) = delete;
+    ShardAllocator& operator=(const ShardAllocator&) = delete;
 
-    tl::expected<void, ErrorCode> Init(const DistributedStorageConfig& config);
-    bool IsInitialized() const {
+    DfsAllocatorType Type() const override { return DfsAllocatorType::SHARD; }
+
+    tl::expected<void, ErrorCode> Init(
+        const DistributedStorageConfig& config) override;
+    bool IsInitialized() const override {
         return initialized_.load(std::memory_order_acquire);
     }
 
@@ -83,7 +87,13 @@ class DfsGlobalAllocator {
     int GetShardCount() const;
 
     tl::expected<DistributedFSDescriptor, ErrorCode> Allocate(
-        const std::string& key, uint64_t size);
+        const std::string& key, uint64_t size) override;
+    std::vector<BatchAllocateResult> BatchAllocate(
+        const std::vector<BatchAllocateRequest>& requests) override;
+    void Free(const std::string& key,
+              const DistributedFSDescriptor& descriptor) override;
+    void UpdateAccess(const std::string& key,
+                      const DistributedFSDescriptor& descriptor) override;
     void Free(uint64_t offset, uint64_t aligned_size, int shard_idx,
               const std::string& key);
     void UpdateAccess(const std::string& key, int shard_idx, uint64_t offset);
@@ -93,10 +103,12 @@ class DfsGlobalAllocator {
     void ResolvePreparedEviction(PendingEviction&& pending,
                                  const std::vector<bool>& accepted);
 
-    bool IsEvictionEnabled() const { return eviction_enabled_; }
-    std::chrono::seconds GetEvictionCheckInterval() const {
+    bool IsEvictionEnabled() const override { return eviction_enabled_; }
+    std::chrono::seconds GetEvictionCheckInterval() const override {
         return eviction_check_interval_;
     }
+    uint64_t GetUsedBytes() const override;
+    uint64_t GetTotalCapacity() const override;
 
     static std::string FormatShardIdx(int idx, int shard_count);
 

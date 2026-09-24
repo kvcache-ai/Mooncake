@@ -1,4 +1,4 @@
-#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/shard_allocator.h"
 
 #include <algorithm>
 #include <charconv>
@@ -20,23 +20,23 @@
 
 namespace mooncake {
 
-DfsGlobalAllocator::PendingEviction::~PendingEviction() {
+ShardAllocator::PendingEviction::~PendingEviction() {
     if (owner_ != nullptr) {
         owner_->RestorePreparedEviction(std::move(*this));
     }
 }
 
-DfsGlobalAllocator::PendingEviction::PendingEviction(
+ShardAllocator::PendingEviction::PendingEviction(
     PendingEviction&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)),
       candidates_(std::move(other.candidates_)),
       prepared_(std::move(other.prepared_)) {}
 
-DfsGlobalAllocator::~DfsGlobalAllocator() {
+ShardAllocator::~ShardAllocator() {
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
 
-tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
+tl::expected<void, ErrorCode> ShardAllocator::Init(
     const DistributedStorageConfig& config) {
     std::lock_guard expansion_lock(expansion_mutex_);
     if (initialized_.load(std::memory_order_acquire)) return {};
@@ -154,14 +154,13 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
     return {};
 }
 
-int DfsGlobalAllocator::GetShardCount() const {
+int ShardAllocator::GetShardCount() const {
     const auto shards =
         std::atomic_load_explicit(&shards_, std::memory_order_acquire);
     return shards ? static_cast<int>(shards->size()) : 0;
 }
 
-tl::expected<int, ErrorCode> DfsGlobalAllocator::ExpandShards(
-    int target_count) {
+tl::expected<int, ErrorCode> ShardAllocator::ExpandShards(int target_count) {
     std::lock_guard expansion_lock(expansion_mutex_);
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -202,9 +201,9 @@ tl::expected<int, ErrorCode> DfsGlobalAllocator::ExpandShards(
     return target_count;
 }
 
-tl::expected<std::shared_ptr<DfsGlobalAllocator::ShardState>, ErrorCode>
-DfsGlobalAllocator::CreateShard(const std::string& path,
-                                std::vector<std::string>& created_files) {
+tl::expected<std::shared_ptr<ShardAllocator::ShardState>, ErrorCode>
+ShardAllocator::CreateShard(const std::string& path,
+                            std::vector<std::string>& created_files) {
     auto exists = fs_adapter_->FileExists(path);
     if (!exists) return tl::make_unexpected(exists.error());
     if (*exists) {
@@ -242,7 +241,7 @@ DfsGlobalAllocator::CreateShard(const std::string& path,
     return shard;
 }
 
-void DfsGlobalAllocator::CleanupCreatedFiles(
+void ShardAllocator::CleanupCreatedFiles(
     const std::vector<std::string>& created_files) {
     for (const auto& path : created_files) {
         auto result = fs_adapter_->DeleteFile(path);
@@ -253,7 +252,7 @@ void DfsGlobalAllocator::CleanupCreatedFiles(
     }
 }
 
-tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(
+tl::expected<DistributedFSDescriptor, ErrorCode> ShardAllocator::Allocate(
     const std::string& key, uint64_t size) {
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -300,8 +299,79 @@ tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
-void DfsGlobalAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
-                              int shard_idx, const std::string& key) {
+std::vector<BatchAllocateResult> ShardAllocator::BatchAllocate(
+    const std::vector<BatchAllocateRequest>& requests) {
+    std::vector<BatchAllocateResult> results;
+    results.reserve(requests.size());
+    for (const auto& request : requests) {
+        results.push_back(
+            BatchAllocateResult{request.key, {}, false, ErrorCode::OK});
+    }
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto descriptor = Allocate(requests[i].key, requests[i].size);
+        if (descriptor) {
+            results[i].descriptor = std::move(*descriptor);
+            results[i].success = true;
+            continue;
+        }
+
+        const ErrorCode error = descriptor.error();
+        for (size_t j = i; j > 0; --j) {
+            auto& allocated = results[j - 1];
+            if (allocated.success) {
+                Free(allocated.key, allocated.descriptor);
+            }
+        }
+        for (auto& result : results) {
+            result.descriptor = {};
+            result.success = false;
+            result.error = error;
+        }
+        return results;
+    }
+    return results;
+}
+
+void ShardAllocator::Free(const std::string& key,
+                          const DistributedFSDescriptor& descriptor) {
+    Free(descriptor.offset, descriptor.aligned_size, descriptor.shard_idx, key);
+}
+
+void ShardAllocator::UpdateAccess(const std::string& key,
+                                  const DistributedFSDescriptor& descriptor) {
+    UpdateAccess(key, descriptor.shard_idx, descriptor.offset);
+}
+
+uint64_t ShardAllocator::GetUsedBytes() const {
+    uint64_t used = 0;
+    const auto shards =
+        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    if (!shards) return 0;
+    for (const auto& shard : *shards) {
+        if (!shard) continue;
+        std::shared_lock lock(shard->handle_mutex);
+        const auto report = shard->allocator->storageReport();
+        const uint64_t free_space =
+            std::min<uint64_t>(report.totalFreeSpace, shard->capacity);
+        used += shard->capacity - free_space;
+    }
+    return used;
+}
+
+uint64_t ShardAllocator::GetTotalCapacity() const {
+    uint64_t total = 0;
+    const auto shards =
+        std::atomic_load_explicit(&shards_, std::memory_order_acquire);
+    if (!shards) return 0;
+    for (const auto& shard : *shards) {
+        if (shard) total += shard->capacity;
+    }
+    return total;
+}
+
+void ShardAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
+                          int shard_idx, const std::string& key) {
     if (!initialized_.load(std::memory_order_acquire)) return;
     const auto shards =
         std::atomic_load_explicit(&shards_, std::memory_order_acquire);
@@ -327,8 +397,8 @@ void DfsGlobalAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
     shard.offset_to_handle.erase(it);
 }
 
-void DfsGlobalAllocator::UpdateAccess(const std::string& key, int shard_idx,
-                                      uint64_t offset) {
+void ShardAllocator::UpdateAccess(const std::string& key, int shard_idx,
+                                  uint64_t offset) {
     if (!initialized_.load(std::memory_order_acquire)) return;
     const auto shards =
         std::atomic_load_explicit(&shards_, std::memory_order_acquire);
@@ -356,7 +426,7 @@ void DfsGlobalAllocator::UpdateAccess(const std::string& key, int shard_idx,
     }
 }
 
-DfsGlobalAllocator::PendingEviction DfsGlobalAllocator::PrepareEviction() {
+ShardAllocator::PendingEviction ShardAllocator::PrepareEviction() {
     PendingEviction pending(this);
     if (!initialized_.load(std::memory_order_acquire)) return pending;
 
@@ -373,7 +443,7 @@ DfsGlobalAllocator::PendingEviction DfsGlobalAllocator::PrepareEviction() {
     return pending;
 }
 
-void DfsGlobalAllocator::CommitPreparedEviction(PendingEviction&& pending) {
+void ShardAllocator::CommitPreparedEviction(PendingEviction&& pending) {
     if (pending.owner_ != this) return;
     const auto shards =
         std::atomic_load_explicit(&shards_, std::memory_order_acquire);
@@ -400,7 +470,7 @@ void DfsGlobalAllocator::CommitPreparedEviction(PendingEviction&& pending) {
     pending.owner_ = nullptr;
 }
 
-void DfsGlobalAllocator::RestorePreparedEviction(PendingEviction&& pending) {
+void ShardAllocator::RestorePreparedEviction(PendingEviction&& pending) {
     if (pending.owner_ != this) return;
     const auto shards =
         std::atomic_load_explicit(&shards_, std::memory_order_acquire);
@@ -437,7 +507,7 @@ void DfsGlobalAllocator::RestorePreparedEviction(PendingEviction&& pending) {
     pending.owner_ = nullptr;
 }
 
-void DfsGlobalAllocator::ResolvePreparedEviction(
+void ShardAllocator::ResolvePreparedEviction(
     PendingEviction&& pending, const std::vector<bool>& accepted) {
     if (pending.owner_ != this) return;
     const auto shards =
@@ -502,7 +572,7 @@ void DfsGlobalAllocator::ResolvePreparedEviction(
     pending.owner_ = nullptr;
 }
 
-std::string DfsGlobalAllocator::FormatShardIdx(int idx, int /*shard_count*/) {
+std::string ShardAllocator::FormatShardIdx(int idx, int /*shard_count*/) {
     // Retain the second argument for source compatibility. New filenames are
     // independent of total count; discovered legacy filenames stay unchanged.
     constexpr int width = 2;
@@ -511,7 +581,7 @@ std::string DfsGlobalAllocator::FormatShardIdx(int idx, int /*shard_count*/) {
     return oss.str();
 }
 
-void DfsGlobalAllocator::QueuePendingFree(
+void ShardAllocator::QueuePendingFree(
     ShardState& shard, const std::shared_ptr<OffsetAllocationHandle>& handle,
     uint64_t bytes, std::chrono::steady_clock::time_point when) {
     if (!handle) return;
@@ -521,7 +591,7 @@ void DfsGlobalAllocator::QueuePendingFree(
     shard.pending_free_bytes += bytes;
 }
 
-void DfsGlobalAllocator::CleanupExpiredPendingFrees(
+void ShardAllocator::CleanupExpiredPendingFrees(
     ShardState& shard, std::chrono::steady_clock::time_point now) {
     std::lock_guard pending_lock(shard.pending_mutex);
     while (!shard.pending_free.empty() &&
@@ -536,7 +606,7 @@ void DfsGlobalAllocator::CleanupExpiredPendingFrees(
     }
 }
 
-double DfsGlobalAllocator::EffectiveUsage(ShardState& shard) {
+double ShardAllocator::EffectiveUsage(ShardState& shard) {
     uint64_t physical_free = 0;
     {
         std::shared_lock lock(shard.handle_mutex);
@@ -560,9 +630,8 @@ double DfsGlobalAllocator::EffectiveUsage(ShardState& shard) {
                      static_cast<double>(shard.capacity);
 }
 
-void DfsGlobalAllocator::PrepareEvictionFromShard(ShardState& shard,
-                                                  int shard_idx,
-                                                  PendingEviction& pending) {
+void ShardAllocator::PrepareEvictionFromShard(ShardState& shard, int shard_idx,
+                                              PendingEviction& pending) {
     const double usage = EffectiveUsage(shard);
     uint64_t prepared_bytes = 0;
     std::lock_guard lru_lock(shard.lru_mutex);
@@ -615,7 +684,7 @@ void DfsGlobalAllocator::PrepareEvictionFromShard(ShardState& shard,
     }
 }
 
-uint64_t DfsGlobalAllocator::AlignSize(uint64_t size) const {
+uint64_t ShardAllocator::AlignSize(uint64_t size) const {
     return (size + alignment_ - 1) & ~(alignment_ - 1);
 }
 

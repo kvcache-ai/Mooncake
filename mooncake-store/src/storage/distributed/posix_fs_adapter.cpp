@@ -181,6 +181,16 @@ tl::expected<int, ErrorCode> PosixFsAdapter::OpenFile(const std::string& path) {
     return fd;
 }
 
+tl::expected<int, ErrorCode> PosixFsAdapter::OpenExistingFile(
+    const std::string& path) {
+    int fd;
+    do {
+        fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) return tl::make_unexpected(ReadOpenError());
+    return fd;
+}
+
 tl::expected<void, ErrorCode> PosixFsAdapter::CloseFile(int fd) {
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
     if (::close(fd) != 0) {
@@ -213,7 +223,10 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::WriteAt(int fd,
     if (!valid) return tl::make_unexpected(valid.error());
     if (iovcnt == 0) return size_t{0};
 
-    ssize_t ret = ::pwritev(fd, iov, iovcnt, static_cast<off_t>(offset));
+    ssize_t ret;
+    do {
+        ret = ::pwritev(fd, iov, iovcnt, static_cast<off_t>(offset));
+    } while (ret < 0 && errno == EINTR);
     if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     return static_cast<size_t>(ret);
 }
@@ -228,7 +241,10 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::ReadAt(int fd, iovec* iov,
     if (!valid) return tl::make_unexpected(valid.error());
     if (iovcnt == 0) return size_t{0};
 
-    ssize_t ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
+    ssize_t ret;
+    do {
+        ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
+    } while (ret < 0 && errno == EINTR);
     if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     return static_cast<size_t>(ret);
 }

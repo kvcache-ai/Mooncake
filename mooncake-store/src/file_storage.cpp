@@ -468,11 +468,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
 
         auto offload_start = std::chrono::steady_clock::now();
+        std::unordered_set<std::string> reported_keys;
+        reported_keys.reserve(host_batch_object.size());
         auto bucket_complete_handler =
-            [this, offload_start, complete_handler](
+            [this, offload_start, complete_handler, &reported_keys](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
             auto res = complete_handler(keys, metadatas);
+            if (res == ErrorCode::OK) {
+                reported_keys.insert(keys.begin(), keys.end());
+            }
             if (res == ErrorCode::OK && ssd_metric_) {
                 auto elapsed_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -502,6 +507,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
             pinned_buffer_pool_->Release(std::move(buf));
+        }
+        if (offload_res) {
+            // A successful batch may skip duplicates or individual writes.
+            // Only the completion callback's keys were reported to Master;
+            // NACK the rest to release their tasks and source replica refs.
+            for (const auto& [key, _] : host_batch_object) {
+                if (reported_keys.find(key) == reported_keys.end()) {
+                    failed_tasks.push_back(task_by_storage_key.at(key));
+                }
+            }
         }
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -83,6 +84,92 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
 
 
+def test_http_metadata_service_has_one_authoritative_source(
+    tmp_path: Path,
+) -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    test_root = REPOSITORY_ROOT / "python" / "tests" / "services"
+    legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
+
+    module = package_root / "http_metadata_server.py"
+    assert module.is_file()
+    assert not (legacy_package_root / module.name).exists()
+    assert (test_root / "test_http_metadata_server.py").is_file()
+    assert not (legacy_test_root / "test_http_metadata_server.py").exists()
+
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    legacy_project = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+    entry_point = "mooncake.http_metadata_server:main"
+    assert project["project"]["scripts"]["mooncake_http_metadata_server"] == entry_point
+    assert (
+        legacy_project["project"]["scripts"]["mooncake_http_metadata_server"]
+        == entry_point
+    )
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    assert "../python/mooncake/http_metadata_server.py" in integration_cmake
+    assert "../mooncake-wheel/mooncake/http_metadata_server.py" not in integration_cmake
+
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    migrated_modules = (
+        legacy_build_script.split("MIGRATED_PYTHON_MODULES=(", 1)[1]
+        .split(")", 1)[0]
+        .split()
+    )
+    assert "http_metadata_server.py" in migrated_modules
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(REPOSITORY_ROOT / "python"),
+            str(REPOSITORY_ROOT / "mooncake-wheel"),
+        ]
+    )
+    environment["PYTHONNOUSERSITE"] = "1"
+    import_check = f"""
+from pathlib import Path
+import mooncake.http_metadata_server as service
+
+assert Path(service.__file__).resolve() == Path({str(module)!r}).resolve()
+assert service.KVBootstrapServer is not None
+"""
+    subprocess.run(
+        [sys.executable, "-c", import_check],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+    )
+
+
+def test_async_store_has_one_authoritative_source() -> None:
+    canonical_module = REPOSITORY_ROOT / "python" / "mooncake" / "async_store.py"
+    legacy_module = (
+        REPOSITORY_ROOT / "mooncake-integration" / "store" / "async_store.py"
+    )
+
+    assert canonical_module.is_file()
+    assert not legacy_module.exists()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "test_async_store.py"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "async_store_integration.py"
+    ).is_file()
+    assert not (REPOSITORY_ROOT / "scripts" / "test_async_store.py").exists()
+
+    cmake = (REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt").read_text()
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert '../python/mooncake/async_store.py"' in cmake
+    assert 'CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py"' not in cmake
+    assert "cp python/mooncake/async_store.py " in legacy_builder
+    assert "cp mooncake-integration/store/async_store.py " not in legacy_builder
+
+
 def test_ep_modules_have_one_authoritative_source() -> None:
     package_root = REPOSITORY_ROOT / "python" / "mooncake"
     legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
@@ -155,7 +242,6 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
     # Modules still supplied from the legacy tree at build time. Phase 2 should
     # migrate these into python/mooncake and drop the DIRECTORY rule above.
     for module in (
-        "http_metadata_server.py",
         "mooncake_store_service.py",
         "mooncake_connector_v1.py",
         "vllm_v1_proxy_server.py",

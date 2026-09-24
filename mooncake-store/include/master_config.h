@@ -6,6 +6,7 @@
 
 #include <glog/logging.h>
 
+#include "config/metrics_bootstrap_config.h"
 #include "config_helper.h"
 #include "types.h"
 
@@ -92,9 +93,7 @@ inline std::string ResolveConfiguredHABackendConnstring(
 
 // The configuration for the master server
 struct MasterConfig {
-    bool enable_metric_reporting;
-    uint32_t metrics_port;
-    std::string metrics_host;
+    MetricsBootstrapConfig metrics;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
@@ -125,6 +124,7 @@ struct MasterConfig {
 
     // OpLog store configuration
     bool enable_oplog = false;
+    bool weight_management_oplog_capability_confirmed = false;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
@@ -234,8 +234,7 @@ struct MasterConfig {
 class MasterServiceSupervisorConfig {
    public:
     // no default values (required parameters) - using RequiredParam
-    RequiredParam<bool> enable_metric_reporting{"enable_metric_reporting"};
-    RequiredParam<int> metrics_port{"metrics_port"};
+    RequiredParam<MetricsBootstrapConfig> metrics{"metrics"};
     RequiredParam<int64_t> default_kv_lease_ttl{"default_kv_lease_ttl"};
     RequiredParam<int64_t> default_kv_soft_pin_ttl{"default_kv_soft_pin_ttl"};
     RequiredParam<bool> allow_evict_soft_pinned_objects{
@@ -263,7 +262,6 @@ class MasterServiceSupervisorConfig {
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";
-    std::string metrics_host = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
@@ -272,6 +270,7 @@ class MasterServiceSupervisorConfig {
     std::string etcd_endpoints = "0.0.0.0:2379";
     // OpLog store configuration
     bool enable_oplog = false;
+    bool weight_management_oplog_capability_confirmed = false;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
@@ -355,9 +354,7 @@ class MasterServiceSupervisorConfig {
     // From MasterConfig
     MasterServiceSupervisorConfig(const MasterConfig& config) {
         // Set required parameters using RequiredParam
-        enable_metric_reporting = config.enable_metric_reporting;
-        metrics_port = static_cast<int>(config.metrics_port);
-        metrics_host = config.metrics_host;
+        metrics = config.metrics;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
@@ -417,6 +414,8 @@ class MasterServiceSupervisorConfig {
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         enable_oplog = config.enable_oplog;
+        weight_management_oplog_capability_confirmed =
+            config.weight_management_oplog_capability_confirmed;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -495,11 +494,8 @@ class MasterServiceSupervisorConfig {
     // to avoid unexpected errors in the future.
     void validate() const {
         // Validate that all required parameters are set
-        if (!enable_metric_reporting.IsSet()) {
-            throw std::runtime_error("enable_metric_reporting is not set");
-        }
-        if (!metrics_port.IsSet()) {
-            throw std::runtime_error("metrics_port is not set");
+        if (!metrics.IsSet()) {
+            throw std::runtime_error("metrics is not set");
         }
         if (!default_kv_lease_ttl.IsSet()) {
             throw std::runtime_error("default_kv_lease_ttl is not set");
@@ -609,6 +605,7 @@ class WrappedMasterServiceConfig {
     std::string ha_backend_connstring;
     // OpLog store configuration
     bool enable_oplog = false;
+    bool weight_management_oplog_capability_confirmed = false;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
@@ -662,8 +659,8 @@ class WrappedMasterServiceConfig {
         max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
-        enable_metric_reporting = config.enable_metric_reporting;
-        http_port = static_cast<uint16_t>(config.metrics_port);
+        enable_metric_reporting = config.metrics.enabled;
+        http_port = static_cast<uint16_t>(config.metrics.port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
@@ -712,6 +709,8 @@ class WrappedMasterServiceConfig {
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
         enable_oplog = config.enable_oplog;
+        weight_management_oplog_capability_confirmed =
+            config.weight_management_oplog_capability_confirmed;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -782,6 +781,8 @@ class WrappedMasterServiceConfig {
     WrappedMasterServiceConfig(const MasterServiceSupervisorConfig& config,
                                ViewVersionId view_version_param)
         : WrappedMasterServiceConfig() {
+        const auto metrics = config.metrics.Get();
+
         // Set required parameters using assignment operator
         default_kv_lease_ttl = config.default_kv_lease_ttl;
 
@@ -790,8 +791,8 @@ class WrappedMasterServiceConfig {
         max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
-        enable_metric_reporting = config.enable_metric_reporting;
-        http_port = static_cast<uint16_t>(config.metrics_port);
+        enable_metric_reporting = metrics.enabled;
+        http_port = static_cast<uint16_t>(metrics.port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         tenant_eviction_high_watermark_ratio =
@@ -841,6 +842,8 @@ class WrappedMasterServiceConfig {
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
         enable_oplog = config.enable_oplog;
+        weight_management_oplog_capability_confirmed =
+            config.weight_management_oplog_capability_confirmed;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -915,6 +918,7 @@ class MasterServiceConfigBuilder {
     std::string ha_backend_connstring_;
     // OpLog store configuration
     bool enable_oplog_ = false;
+    bool weight_management_oplog_capability_confirmed_ = false;
     bool enable_oplog_snapshot_ = false;
     uint64_t snapshot_chunk_object_count_ = 1000000;
     int oplog_poll_interval_ms_ = 1000;
@@ -1068,6 +1072,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_oplog(bool enable) {
         enable_oplog_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder&
+    set_weight_management_oplog_capability_confirmed(bool confirmed) {
+        weight_management_oplog_capability_confirmed_ = confirmed;
         return *this;
     }
 
@@ -1338,6 +1348,7 @@ class MasterServiceConfig {
     std::string ha_backend_connstring;
     // OpLog store configuration
     bool enable_oplog = false;
+    bool weight_management_oplog_capability_confirmed = false;
     bool enable_oplog_snapshot = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
@@ -1435,6 +1446,8 @@ class MasterServiceConfig {
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         enable_oplog = config.enable_oplog;
+        weight_management_oplog_capability_confirmed =
+            config.weight_management_oplog_capability_confirmed;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -1516,6 +1529,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.enable_oplog = enable_oplog_;
+    config.weight_management_oplog_capability_confirmed =
+        weight_management_oplog_capability_confirmed_;
     config.enable_oplog_snapshot = enable_oplog_snapshot_;
     config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
