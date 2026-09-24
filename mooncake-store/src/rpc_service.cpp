@@ -180,7 +180,8 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ProbeKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchProbeKey(
-    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
+    const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchProbeKey");
     timer.LogRequest("keys_count=", keys.size());
 
@@ -188,7 +189,8 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchProbeKey(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchProbeKey(keys, resolved_tenant_id);
+            return master_service_.BatchProbeKey(policy, keys,
+                                                 resolved_tenant_id);
         });
 }
 
