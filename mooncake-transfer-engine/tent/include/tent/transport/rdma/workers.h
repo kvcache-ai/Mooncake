@@ -54,7 +54,7 @@ class Workers {
     friend class RdmaTransportTestPeer;
 
    public:
-    static constexpr size_t kCapacity = 1024 * 8;
+    static constexpr size_t kCapacity = 1024 * 64;
     using BoundedSliceQueue = BoundedMPSCQueue<RdmaSliceList, kCapacity>;
 
    public:
@@ -75,6 +75,10 @@ class Workers {
     Status submit(RdmaSlice* slice);
 
     Status submit(RdmaSliceList& slice_list, int worker_id = -1);
+
+    // Atomically admit one list per worker: no real list is published unless
+    // every non-empty target queue has first reserved a slot.
+    Status admitBatch(std::vector<RdmaSliceList>& slice_lists);
 
     Status cancel(RdmaTask* task);
 
