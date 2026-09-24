@@ -292,10 +292,14 @@ if(USE_SUPA)
   link_directories(${BIREN_HOME}/supa/lib ${BIREN_HOME}/brumd/lib)
   # Resolve the runtime library by name: older SUPA SDKs ship libsupa.so with a
   # separate libsupart.so, while newer SDKs ship a single libsupa-runtime.so.
-  find_library(SUPA_RUNTIME_LIBRARY
-               NAMES supa supa-runtime
-               PATHS ${BIREN_HOME}/supa/lib)
-  find_library(SUPA_PART_LIBRARY NAMES supart PATHS ${BIREN_HOME}/supa/lib)
+  find_library(
+    SUPA_RUNTIME_LIBRARY
+    NAMES supa supa-runtime
+    PATHS ${BIREN_HOME}/supa/lib)
+  find_library(
+    SUPA_PART_LIBRARY
+    NAMES supart
+    PATHS ${BIREN_HOME}/supa/lib)
   if(NOT SUPA_RUNTIME_LIBRARY)
     message(
       FATAL_ERROR
