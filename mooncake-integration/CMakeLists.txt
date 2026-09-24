@@ -105,6 +105,28 @@ if(WITH_TE)
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
     set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      # Interpose native submission only in this test to cancel real TENT tasks
+      # whose batch IDs are private to the Python synchronous wrapper.
+      add_library(tent_sync_cancel_injector SHARED
+                  tests/tent_sync_cancel_injector.cpp)
+      # Resolve runtime methods from the engine module loaded by the test;
+      # linking another static TENT runtime here would duplicate its registries.
+      target_link_libraries(tent_sync_cancel_injector
+                            PRIVATE tent_interface yalantinglibs::yalantinglibs)
+      add_test(
+        NAME tent_python_sync_canceled_test
+        COMMAND
+          ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MC_TRANSFER_TIMEOUT=5
+          MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+          LD_PRELOAD=$<TARGET_FILE:tent_sync_cancel_injector>
+          TENT_CANCEL_INJECTOR=$<TARGET_FILE:tent_sync_cancel_injector>
+          PYTHONPATH=$<TARGET_FILE_DIR:engine>
+          LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_sync_canceled.py)
+      set_tests_properties(tent_python_sync_canceled_test PROPERTIES TIMEOUT 45)
+    endif()
   endif()
 endif()
 
