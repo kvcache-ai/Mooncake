@@ -9,9 +9,10 @@ target_include_directories(tent_diagnostic_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_diagnostic_test COMMAND tent_diagnostic_test)
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME tent_cli_test
-         COMMAND ${CMAKE_COMMAND} "-DTENT_CLI=$<TARGET_FILE:tent_cli>" -P
-                 ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.cmake)
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py
+                 $<TARGET_FILE:tent_cli>)
 
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)

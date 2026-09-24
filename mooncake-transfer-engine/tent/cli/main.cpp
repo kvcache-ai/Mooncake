@@ -13,57 +13,42 @@
 // limitations under the License.
 
 #include <iostream>
-#include <string_view>
 
+#include "CLI11.hpp"
 #include "tent/diagnostics/diagnostic.h"
 
 namespace diagnostics = mooncake::tent::diagnostics;
 
-namespace {
+int main(int argc, char** argv) {
+    CLI::App app{"Tent CLI", "tent"};
+    app.failure_message(CLI::FailureMessage::help);
+    auto* diagnostics_command =
+        app.add_subcommand("diagnostics", "Run offline diagnostics");
+    auto* version_command = diagnostics_command->add_subcommand(
+        "version", "Show build and feature information");
+    bool json = false;
+    version_command->add_flag("--json", json, "Emit JSON");
 
-void printUsage(std::ostream& output) {
-    output << "Usage: tent <command> [options]\n"
-           << "Commands:\n"
-           << "  diagnostics  Run offline diagnostics\n";
-}
-
-void printDiagnosticsUsage(std::ostream& output) {
-    output << "Usage: tent diagnostics version [--json]\n";
-}
-
-int runDiagnostics(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        printDiagnosticsUsage(std::cout);
-        return 0;
+    try {
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError& error) {
+        app.exit(error);
+        return error.get_exit_code() == 0 ? 0 : 2;
     }
-    if (argc < 2 || std::string_view(argv[1]) != "version") {
-        printDiagnosticsUsage(std::cerr);
+    if (!*diagnostics_command) {
+        std::cerr << app.help();
         return 2;
     }
-    if (argc > 3 || (argc == 3 && std::string_view(argv[2]) != "--json")) {
-        printDiagnosticsUsage(std::cerr);
+    if (!*version_command) {
+        std::cerr << diagnostics_command->help();
         return 2;
     }
 
     const auto snapshot = diagnostics::makeVersionSnapshot();
-    if (argc == 3) {
+    if (json) {
         std::cout << diagnostics::renderJson(snapshot) << '\n';
     } else {
         std::cout << diagnostics::renderText(snapshot);
     }
     return diagnostics::diagnosticExitCode(snapshot);
-}
-
-}  // namespace
-
-int main(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        printUsage(std::cout);
-        return 0;
-    }
-    if (argc >= 2 && std::string_view(argv[1]) == "diagnostics") {
-        return runDiagnostics(argc - 1, argv + 1);
-    }
-    printUsage(std::cerr);
-    return 2;
 }
