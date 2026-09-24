@@ -11,12 +11,10 @@ independent tensor-level management metadata.
 
 ## Delivery Status
 
-The first implementation stage introduces the weight-management contracts and
-the standalone `WeightMetadataStore` state machine. Master integration, HA
-replication, managed payload-group operations, and client RPCs are delivered
-as follow-up changes. The state machine is intentionally independent of tensor
-geometry and physical placement so those integrations do not redefine its
-metadata contract.
+This stage integrates weight imports, publication, and revision leases with
+Master and HA replication and recovery. Managed payload-group reclamation,
+residency migration, and client RPCs are delivered as follow-up changes. The
+state machine remains independent of tensor geometry and physical placement.
 
 ## Authority Model
 
@@ -57,6 +55,11 @@ A revision is addressed by:
 ```text
 (tenant_id, namespace, resource_id, revision, weight_generation)
 ```
+
+When multi-tenancy is disabled, the Master accepts only the `default` tenant
+for weight imports. It rejects another tenant rather than silently changing
+the revision identity while writing its OpLog entry. With multi-tenancy
+enabled, the identity retains its tenant throughout publication and replay.
 
 Its manifest object key is canonical:
 
@@ -123,6 +126,10 @@ reads and validates the manifest, plans ranges, and executes Store-to-runtime
 transfers. The caller renews short leases until all transfer work reaches a
 terminal state and releases the lease on both success and failure.
 
+Renewal never shortens an existing lease: the new expiry is the later of the
+current expiry and the renewal time plus the requested TTL. An expired lease
+cannot be renewed.
+
 A live revision lease blocks deletion and residency operations that could
 remove the last readable replica. Revision leases do not replace framework
 allocation guards, runtime binding generations, or Store's per-object read
@@ -155,6 +162,34 @@ carry an optional `weight_metadata` section; an older snapshot without the
 section restores empty Weight metadata while preserving ordinary KV metadata.
 Derived group indexes are rebuilt from restored metadata records.
 
+Periodic Master snapshots capture the durable log boundary and weight state
+under a shared consistency boundary. Weight mutations hold a barrier from
+log submission through in-memory publication. If a mutation is still pending,
+the snapshot skips that cycle and retries at the next interval rather than
+waiting for publication while holding the global snapshot lock. Continuous
+overlapping weight mutations can therefore postpone snapshots. Weight state
+is frozen in the parent; the forked child only serializes the frozen value.
+Snapshots also skip capture when the OpLog writer is not accepting writes:
+a failed caller may have an uncertain durable outcome, which must remain
+recoverable from the log rather than be skipped by a new snapshot boundary.
+
+Batch-OpLog snapshots containing weight state use a version-2 manifest with a
+checksummed weight-state artifact captured at the same replay cursor as object
+and segment metadata. Clusters with no weight records or allocated weight IDs
+continue to emit version-1 snapshots.
+Recovery validates and restores that state before applying the remaining OpLog.
+The snapshot validator, pruning coordinator, and garbage collector require the
+artifact to be intact before allowing log reclamation. Version-1 snapshots
+remain readable and restore empty weight state; they cannot recover weight
+history that was already omitted and compacted.
+
+Weight mutations wait for durable publication or a terminal writer error,
+without a separate publication timeout. A terminal failure cannot be followed
+by a late in-memory publication of the same request. A shutdown error does not
+prove that an in-flight write is absent from the durable log; recovery may
+still replay it, so callers must query the revision before retrying an
+uncertain operation.
+
 Clusters using HA plus the etcd batch OpLog fail closed for weight-management
 mutations unless the operator sets
 `weight_management_oplog_capability_confirmed=true`. Set it only after every
@@ -162,6 +197,17 @@ configured standby runs a version that understands all weight metadata and
 lease OpLog entries. This is an explicit rolling-upgrade capability assertion,
 not automatic standby discovery. Reads and ordinary KV operations are not
 gated by it.
+
+The capability flag admits new mutations; it is not a rollback switch.
+Disabling it does not remove existing weight state, including state loaded
+through snapshot restore or standby promotion. Such a cluster still requires
+readers that support its weight OpLog and snapshot formats.
+
+The metadata-only OpLog payload in this stage accepts revisions without an
+active residency operation (`operation=NONE`, `operation_id=0`). The applier
+rejects an active operation reference rather than accepting metadata whose
+operation record cannot be replicated. Residency operation publication and
+atomic replication of metadata with its operation record are follow-up work.
 
 ## Serving-System Boundary
 

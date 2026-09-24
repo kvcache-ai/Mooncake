@@ -18,6 +18,11 @@ on:
         required: false
         default: '["3.10", "3.12"]'
         type: string
+      version_override:
+        description: 'Optional wheel version override for nightly snapshots'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build-wheel-rocm:
@@ -160,6 +165,17 @@ jobs:
       id: generate_tag
       shell: bash
       run: echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> "$GITHUB_OUTPUT"
+
+    - name: Apply wheel version override
+      if: ${{ inputs.version_override != '' }}
+      shell: bash
+      env:
+        VERSION_OVERRIDE: ${{ inputs.version_override }}
+      run: |
+        set -euo pipefail
+        sed -i "s/^version = .*/version = \"${VERSION_OVERRIDE}\"/" \
+          mooncake-wheel/pyproject.toml
+        grep '^version = ' mooncake-wheel/pyproject.toml
 
     - name: Build Python wheel
       shell: bash

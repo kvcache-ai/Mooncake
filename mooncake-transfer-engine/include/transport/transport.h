@@ -419,6 +419,9 @@ class Transport {
     virtual Status submitTransfer(
         BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
 
+    // Implementations must publish every slice synchronously before this
+    // method returns. After any return status, no worker may append or publish
+    // additional slices for these tasks.
     virtual Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(

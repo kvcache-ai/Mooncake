@@ -89,7 +89,10 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                 descriptor->manifest_crc32c)
             return ErrorCode::INTERNAL_ERROR;
         auto manifest = ha::DecodeBatchOpLogSnapshotManifest(manifest_json);
-        if (!manifest || manifest->snapshot_id != descriptor->snapshot_id ||
+        if (!manifest ||
+            manifest->schema_version != descriptor->schema_version ||
+            manifest->snapshot_format != descriptor->snapshot_format ||
+            manifest->snapshot_id != descriptor->snapshot_id ||
             manifest->segments.stored_size == 0 ||
             manifest->segments.key != ha::BuildBatchOpLogSnapshotSegmentsKey(
                                           root_, descriptor->snapshot_id) ||
@@ -104,6 +107,14 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                                  root_, descriptor->snapshot_id, i) ||
                 !VerifyObject(store_, chunk.key, chunk.stored_size,
                               chunk.crc32c))
+                return ErrorCode::INTERNAL_ERROR;
+        }
+        if (manifest->weight_metadata) {
+            const auto& weights = *manifest->weight_metadata;
+            if (weights.key != ha::BuildBatchOpLogSnapshotWeightMetadataKey(
+                                   root_, descriptor->snapshot_id) ||
+                !VerifyObject(store_, weights.key, weights.stored_size,
+                              weights.crc32c))
                 return ErrorCode::INTERNAL_ERROR;
         }
         protected_prefixes.insert(prefix);

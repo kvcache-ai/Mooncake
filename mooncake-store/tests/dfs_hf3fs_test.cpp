@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "hf3fs/hf3fs.h"
-#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/hf3fs_adapter.h"
 #include "storage_backend.h"
@@ -158,7 +158,7 @@ TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
     const std::string key = "hf3fs_backend_key";
     const std::string shard_path = test_dir_->file(
         "dfs_shard_" +
-        DfsGlobalAllocator::FormatShardIdx(0, distributed_config.shard_count) +
+        ShardAllocator::FormatShardIdx(0, distributed_config.shard_count) +
         ".data");
     DistributedFSDescriptor descriptor{shard_path, 0, write_buf.size(),
                                        write_buf.size(), 0};

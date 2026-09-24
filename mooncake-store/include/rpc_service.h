@@ -64,7 +64,8 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
         const std::vector<std::string>& object_keys, const UUID& client_id,
-        const std::string& segment_name);
+        const std::string& segment_name,
+        const std::string& tenant_id = "default");
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
@@ -279,7 +280,8 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> RestoreFromStandby(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const WeightMetadataSnapshot& weight_metadata = {});
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         BatchOpLogPromotionHandoff handoff,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
