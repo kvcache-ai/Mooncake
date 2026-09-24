@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 #include <iterator>
+#include <limits>
 #include <time.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -460,13 +461,18 @@ class RandomAllocationStrategy : public AllocationStrategy {
  */
 class RankedAllocationStrategy : public RandomAllocationStrategy {
    protected:
+    // Ranks candidate segments by `score` (higher first) and allocates in that
+    // order. By default only kCandidateMultiplier * remaining segments,
+    // starting at a random index, are scored; `rank_all_segments` scores every
+    // segment instead, for policies whose choice must be a global optimum.
     template <typename ScoreFn>
     tl::expected<std::vector<Replica>, ErrorCode> AllocateRanked(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num,
         const std::vector<std::string>& preferred_segments,
         const std::set<std::string>& excluded_segments,
-        const ReplicaType replica_type, ScoreFn&& score) {
+        const ReplicaType replica_type, ScoreFn&& score,
+        bool rank_all_segments = false) {
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -499,7 +505,9 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
 
         const size_t remaining = replica_num - replicas.size();
         const size_t sample_count =
-            std::min(kCandidateMultiplier * remaining, names.size());
+            rank_all_segments
+                ? names.size()
+                : std::min(kCandidateMultiplier * remaining, names.size());
         const size_t start_idx = randomIndex(names.size());
 
         struct Candidate {
@@ -518,10 +526,12 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
             candidates.push_back({idx, score(name)});
         }
 
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& lhs, const Candidate& rhs) {
-                      return lhs.score > rhs.score;
-                  });
+        // stable_sort keeps the random start order among equal scores, so
+        // ties do not systematically favor low segment indices.
+        std::stable_sort(candidates.begin(), candidates.end(),
+                         [](const Candidate& lhs, const Candidate& rhs) {
+                             return lhs.score > rhs.score;
+                         });
         for (const auto& candidate : candidates) {
             if (replicas.size() >= replica_num) {
                 break;
@@ -613,6 +623,85 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
         }
         return static_cast<double>(total_free) /
                static_cast<double>(total_capacity);
+    }
+};
+
+/**
+ * @brief Best-fit allocation strategy for mixed-size workloads.
+ *
+ * Each replica goes to the segment whose largest contiguous free region is
+ * the smallest one that still fits the request. Small objects thus fill
+ * partially used segments instead of carving holes into the emptiest ones,
+ * and large contiguous regions stay available for large objects. Spreading
+ * strategies (random, free_ratio_first) leave every segment with medium-sized
+ * holes, so a large allocation can fail while the cluster still reports
+ * plenty of free space; this is the failure mode of RL data-plane offload,
+ * where object sizes span several orders of magnitude and objects are removed
+ * explicitly rather than evicted.
+ *
+ * Every segment is ranked (no candidate sampling), because the choice has to
+ * be the global tightest fit. The cost is one largest-free-region query per
+ * segment per allocation: a short mutex-protected bin lookup for
+ * OffsetBufferAllocator. Segments whose allocator cannot report a largest free
+ * region rank last; segments too small for the request rank after those and
+ * are only tried if everything else fails. Preferred segments, distinct
+ * segments per replica, and best-effort semantics come from AllocateRanked.
+ */
+class BestFitAllocationStrategy final : public RankedAllocationStrategy {
+   public:
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        return AllocateRanked(
+            allocator_manager, slice_length, replica_num, preferred_segments,
+            excluded_segments, replica_type,
+            [&](const std::string& name) {
+                const size_t largest =
+                    GetSegmentLargestFreeRegion(allocator_manager, name);
+                if (largest == kAllocatorUnknownFreeSpace) {
+                    return std::numeric_limits<double>::lowest();
+                }
+                if (largest < slice_length) {
+                    return -std::numeric_limits<double>::infinity();
+                }
+                // Higher score = tighter fit.
+                return -static_cast<double>(largest - slice_length);
+            },
+            /*rank_all_segments=*/true);
+    }
+
+   private:
+    // Largest contiguous free region over the allocators of a segment, or
+    // kAllocatorUnknownFreeSpace when no allocator can report one.
+    static size_t GetSegmentLargestFreeRegion(
+        const AllocatorManager& allocator_manager, const std::string& name) {
+        const auto* allocators = allocator_manager.getAllocators(name);
+        if (!allocators) {
+            return 0;
+        }
+        size_t largest = 0;
+        bool known = false;
+        for (const auto& registration : *allocators) {
+            if (!registration->IsServing()) {
+                continue;
+            }
+            const auto allocator = registration->GetAllocator();
+            if (!allocator) {
+                continue;
+            }
+            const size_t region = allocator->getLargestFreeRegion();
+            if (region == kAllocatorUnknownFreeSpace) {
+                continue;
+            }
+            known = true;
+            largest = std::max(largest, region);
+        }
+        return known ? largest : kAllocatorUnknownFreeSpace;
     }
 };
 
@@ -724,6 +813,8 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
                 local_ssd);
         case AllocationStrategyType::LOCAL_FIRST:
             return std::make_shared<RandomAllocationStrategy>();
+        case AllocationStrategyType::BEST_FIT:
+            return std::make_shared<BestFitAllocationStrategy>();
         default:
             return std::make_shared<RandomAllocationStrategy>();
     }

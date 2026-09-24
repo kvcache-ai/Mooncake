@@ -39,6 +39,17 @@ target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
 
+# Add variable-length allocation benchmark executable, for workloads whose
+# object sizes span several octaves (e.g. RL data-plane offload): mixed-size
+# churn, recorded trace replay, and a large-allocation probe, across the
+# production and bench-only strategies
+add_executable(variable_length_allocation_bench
+               variable_length_allocation_bench.cpp)
+target_link_libraries(
+  variable_length_allocation_bench
+  PRIVATE mooncake_store cachelib_memory_allocator gflags::gflags glog::glog
+          pthread)
+
 # Add NoF worker pool benchmark executable
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
