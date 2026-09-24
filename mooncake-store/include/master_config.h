@@ -6,6 +6,7 @@
 
 #include <glog/logging.h>
 
+#include "config/cxl_bootstrap_config.h"
 #include "config/metrics_bootstrap_config.h"
 #include "config_helper.h"
 #include "types.h"
@@ -93,6 +94,7 @@ inline std::string ResolveConfiguredHABackendConnstring(
 
 // The configuration for the master server
 struct MasterConfig {
+    CxlBootstrapConfig cxl;
     MetricsBootstrapConfig metrics;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
@@ -187,10 +189,6 @@ struct MasterConfig {
     uint64_t pending_task_timeout_sec;
     uint64_t processing_task_timeout_sec;
     uint32_t max_retry_attempts;
-    std::string cxl_path;
-    size_t cxl_size;
-    bool enable_cxl = false;
-
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
@@ -480,9 +478,9 @@ class MasterServiceSupervisorConfig {
         processing_task_timeout_sec = config.processing_task_timeout_sec;
         max_retry_attempts = config.max_retry_attempts;
 
-        cxl_path = config.cxl_path;
-        cxl_size = config.cxl_size;
-        enable_cxl = config.enable_cxl;
+        cxl_path = config.cxl.path;
+        cxl_size = config.cxl.size;
+        enable_cxl = config.cxl.enabled;
 
         pod_name = config.pod_name;
         pod_namespace = config.pod_namespace;
@@ -772,9 +770,9 @@ class WrappedMasterServiceConfig {
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
         max_retry_attempts = config.max_retry_attempts;
-        cxl_path = config.cxl_path;
-        cxl_size = config.cxl_size;
-        enable_cxl = config.enable_cxl;
+        cxl_path = config.cxl.path;
+        cxl_size = config.cxl.size;
+        enable_cxl = config.cxl.enabled;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
