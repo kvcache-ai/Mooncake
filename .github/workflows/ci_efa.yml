@@ -4,7 +4,7 @@ on:
   workflow_call: {}
 
 # No EFA hardware is required to build. PR validation covers the CUDA and
-# non-CUDA variants with one Python version each, plus one arm64 build;
+# non-CUDA variants with one Python version each on x86_64 and arm64;
 # releases use the full matrix.
 jobs:
   build-wheel-efa:
@@ -19,6 +19,9 @@ jobs:
             python-version: "3.10"
           - variant: cuda13
             python-version: "3.12"
+            architecture: arm64
+          - variant: non-cuda
+            python-version: "3.10"
             architecture: arm64
     uses: ./.github/workflows/_build-efa-wheel.yaml
     with:
