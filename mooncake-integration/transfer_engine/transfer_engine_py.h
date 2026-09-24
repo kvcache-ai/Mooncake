@@ -239,6 +239,9 @@ class TransferEnginePy {
 
     char *allocateRawBuffer(size_t capacity);
 
+    void invalidateCachedSegment(const char *target_hostname,
+                                 Transport::SegmentHandle handle);
+
     int findClassId(size_t size);
 
     int doBuddyAllocate(int class_id);
