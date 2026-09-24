@@ -6,6 +6,9 @@ if [ "$RESERVE_RPC_PORT" = true ]; then
   sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
 fi
 args=(--parallel "$(nproc)" --output-on-failure)
+if [ -n "${CTEST_LABEL_EXCLUDE:-}" ]; then
+  args+=(--label-exclude "$CTEST_LABEL_EXCLUDE")
+fi
 if [ -n "$JUNIT_REPORT" ]; then
   report="$GITHUB_WORKSPACE/$JUNIT_REPORT"
   mkdir -p "$(dirname "$report")"

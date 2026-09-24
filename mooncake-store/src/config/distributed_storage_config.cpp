@@ -3,12 +3,31 @@
 #include <glog/logging.h>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <sstream>
+#include <string_view>
 
 #include "environ.h"
 #include "environment_variables.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 
 namespace mooncake {
+
+std::optional<DfsAllocatorType> ParseDfsAllocatorType(std::string_view name) {
+    if (name == "shard") return DfsAllocatorType::SHARD;
+    if (name == "bucket") return DfsAllocatorType::BUCKET;
+    return std::nullopt;
+}
+
+const char* ToString(DfsAllocatorType type) {
+    switch (type) {
+        case DfsAllocatorType::SHARD:
+            return "shard";
+        case DfsAllocatorType::BUCKET:
+            return "bucket";
+    }
+    return "unknown";
+}
 
 bool DistributedStorageConfig::Validate() const {
     if (fsdir.empty()) {
@@ -30,20 +49,39 @@ bool DistributedStorageConfig::Validate() const {
     if (fs_adapter_type == "oss") {
         return true;
     }
-    if (shard_count <= 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
+    const auto parsed_allocator = ParseDfsAllocatorType(allocator_type);
+    if (!parsed_allocator) {
+        LOG(ERROR) << "DistributedStorageConfig: unsupported allocator_type: "
+                   << allocator_type;
         return false;
     }
-    if (shard_capacity == 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must > 0";
-        return false;
-    }
+    // alignment is shared by both allocators.
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
         LOG(ERROR) << "DistributedStorageConfig: alignment must be power of 2";
         return false;
     }
-    if (shard_capacity % alignment != 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must align";
+    if (*parsed_allocator == DfsAllocatorType::SHARD) {
+        if (shard_count <= 0) {
+            LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
+            return false;
+        }
+        if (shard_capacity == 0) {
+            LOG(ERROR) << "DistributedStorageConfig: shard_capacity must > 0";
+            return false;
+        }
+        if (shard_capacity % alignment != 0) {
+            LOG(ERROR) << "DistributedStorageConfig: shard_capacity must align";
+            return false;
+        }
+    }
+    if (*parsed_allocator == DfsAllocatorType::BUCKET &&
+        (bucket_capacity == 0 || bucket_capacity % alignment != 0 ||
+         bucket_capacity >
+             static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+         max_bucket_count <= 0 ||
+         bucket_capacity > std::numeric_limits<uint64_t>::max() /
+                               static_cast<uint64_t>(max_bucket_count))) {
+        LOG(ERROR) << "DistributedStorageConfig: invalid bucket capacity/count";
         return false;
     }
     if (!single_tenant) {
@@ -102,6 +140,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_DISTRIBUTED_FS_TYPE, config.fs_adapter_type);
     config.fs_adapter_type =
         Environ::ReadOr(Variables::MOONCAKE_DFS_FS_ADAPTER, legacy_fs_adapter);
+    config.allocator_type = Environ::ReadOr(Variables::MOONCAKE_DFS_ALLOCATOR,
+                                            config.allocator_type);
     config.enable_health_check =
         Environ::ReadOr(Variables::MOONCAKE_DISTRIBUTED_HEALTH_CHECK,
                         config.enable_health_check);
@@ -109,6 +149,10 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
                                          config.shard_count);
     config.shard_capacity = Environ::ReadOr(
         Variables::MOONCAKE_DFS_SHARD_CAPACITY, config.shard_capacity);
+    config.bucket_capacity = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_BUCKET_CAPACITY, config.bucket_capacity);
+    config.max_bucket_count = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT, config.max_bucket_count);
     config.alignment =
         Environ::ReadOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
     config.single_tenant = Environ::ReadOr(
@@ -137,10 +181,13 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
 std::string DistributedStorageConfig::FormatStr() const {
     std::ostringstream oss;
     oss << "fsdir=" << fsdir << ", fs_adapter_type=" << fs_adapter_type
+        << ", allocator_type=" << allocator_type
         << ", enable_health_check=" << enable_health_check
         << ", shard_count=" << shard_count
-        << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment
-        << ", single_tenant=" << single_tenant
+        << ", shard_capacity=" << shard_capacity
+        << ", bucket_capacity=" << bucket_capacity
+        << ", max_bucket_count=" << max_bucket_count
+        << ", alignment=" << alignment << ", single_tenant=" << single_tenant
         << ", eviction_enabled=" << eviction_enabled
         << ", eviction_high_watermark=" << eviction_high_watermark
         << ", eviction_low_watermark=" << eviction_low_watermark

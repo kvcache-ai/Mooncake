@@ -147,14 +147,8 @@ Status MultiTransport::submitTransfer(
     }
 
     std::vector<Transport*> transports;
-    transports.reserve(entries.size());
-    for (const auto& request : entries) {
-        Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
-        assert(transport);
-        transports.push_back(transport);
-    }
+    auto select_status = selectTransports(entries, transports);
+    if (!select_status.ok()) return select_status;
 
     auto& task_list = batch_desc.task_list;
     task_list.reserve(task_list.size() + entries.size());
@@ -594,13 +588,57 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     return transport;
 }
 
+Status MultiTransport::selectTransports(
+    const std::vector<TransferRequest>& entries,
+    std::vector<Transport*>& transports) {
+    transports.clear();
+    transports.reserve(entries.size());
+    Transport* reused_transport = nullptr;
+    Transport::SegmentID reused_target = 0;
+    bool reuse_allowed = false;
+    const bool metacache = globalConfig().metacache;
+    for (const auto& request : entries) {
+        Transport* transport = nullptr;
+        // Reuse only address-independent routes within this submission. Mixed
+        // protocol segments must still resolve each address independently, and
+        // disabling the metadata cache must retain the explicit refresh
+        // behavior. This restores MultiTransport routing (protocol to
+        // Transport*), not RDMA's per-target SegmentDesc fetch inside
+        // submitTransferTask.
+        if (reuse_allowed && reused_transport && metacache &&
+            request.target_id == reused_target) {
+            transport = reused_transport;
+        } else {
+            auto status = selectTransport(request, transport, &reuse_allowed);
+            if (!status.ok()) return status;
+            assert(transport);
+            reused_transport = transport;
+            reused_target = request.target_id;
+        }
+        transports.push_back(transport);
+    }
+    return Status::OK();
+}
+
 Status MultiTransport::selectTransport(const TransferRequest& entry,
-                                       Transport*& transport) {
+                                       Transport*& transport,
+                                       bool* allows_reuse) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
+        if (allows_reuse) *allows_reuse = false;
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Offset-based routing is only compiled for mixed-protocol segments.
+    // A homogeneous batch can reuse this Transport*.
+    if (allows_reuse) {
+        *allows_reuse =
+            target_segment_desc->protocol.find(',') == std::string::npos;
+    }
+#else
+    if (allows_reuse) *allows_reuse = true;
+#endif
 
     auto proto = target_segment_desc->protocol;
 #ifdef ENABLE_MULTI_PROTOCOL

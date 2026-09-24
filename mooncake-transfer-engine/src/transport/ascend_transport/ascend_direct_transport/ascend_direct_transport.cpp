@@ -378,6 +378,16 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     if (type_ret != 0) {
         return type_ret;
     }
+    if (use_fabric_mem_ && ascend_is_direct_vmm_memory(addr, length)) {
+        // Direct ACL VMM allocations bypass adxl::MallocMem and are not known
+        // to ADXL's allocation bookkeeping, so they must be registered as
+        // device memory. adxl::MallocMem allocations keep MEM_HOST: ADXL
+        // exports them through its own host-memory path. The gate is this TE's
+        // own fabric flag, not the process-wide allocation table: a co-located
+        // non-fabric TE has no fabric-enabled ADXL engine, so it must keep
+        // treating that memory as host.
+        mem_type = adxl::MEM_DEVICE;
+    }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {

@@ -69,7 +69,9 @@ struct MasterSnapshotPayloads;
 }  // namespace ha
 
 class EtcdOpLogStore;
-class DfsGlobalAllocator;
+class ShardAllocator;
+class DfsAllocatorInterface;
+class ImmutableBucketAllocator;
 
 // Forward declarations
 class AllocationStrategy;
@@ -78,7 +80,6 @@ class HaKvBackend;
 class HttpMetadataServer;
 class OpLogBatchStorage;
 class OrderedOpLogWriter;
-struct MetadataStoragePlugin;
 
 namespace test {
 class MasterServiceTestPeer;
@@ -1475,7 +1476,8 @@ class MasterService {
     // before the old metadata is removed.
     auto AllocateReplicas(const std::string& key, uint64_t value_length,
                           const ReplicateConfig& config,
-                          const std::string& writer_host_id)
+                          const std::string& writer_host_id,
+                          bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
@@ -1500,7 +1502,8 @@ class MasterService {
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
-            committed_soft_pin_timeout = std::nullopt)
+            committed_soft_pin_timeout = std::nullopt,
+        bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -1512,6 +1515,10 @@ class MasterService {
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
+    void RunShardDfsEviction();
+    void RunBucketDfsEviction();
+    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -2175,9 +2182,10 @@ class MasterService {
     // nullptr means cleanup is disabled
     HttpMetadataServer* http_metadata_server_{nullptr};
 
-    // Remote HTTP metadata client, used when the metadata server is deployed
-    // separately. nullptr = no remote cleanup (co-located prefers the pointer).
-    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
+    // Remote HTTP metadata server URL, used when the metadata server is
+    // deployed separately. Empty = no remote cleanup (co-located prefers the
+    // pointer).
+    std::string http_metadata_remote_url_;
 
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;
@@ -2191,6 +2199,9 @@ class MasterService {
     std::vector<std::string> http_metadata_cleanup_queue_;
 
     void HttpMetadataCleanupThreadFunc();
+    // Sends an HTTP DELETE for one key to the remote metadata server; true on
+    // success.
+    bool removeRemoteHttpMetadataKey(const std::string& key) const;
 
     // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
     // segment. For the co-located case this is synchronous (no network I/O);
@@ -2199,7 +2210,13 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
+    std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
+    ShardAllocator* shard_allocator_{nullptr};
+    ImmutableBucketAllocator* bucket_allocator_{nullptr};
+    // Serializes allocation-failure recovery so concurrent writers can reuse
+    // capacity made available by the first recovery instead of each evicting
+    // a different frozen bucket.
+    std::mutex dfs_bucket_recovery_mutex_;
 
     // Segment management
     SegmentManager segment_manager_;

@@ -6,7 +6,16 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 
-set(YLT_ENABLE_IBV ON CACHE BOOL "Enable yalantinglibs ibverbs support")
+if(APPLE)
+  # macOS has no usable ibverbs; build yalantinglibs RPC over TCP only.
+  set(YLT_ENABLE_IBV
+      OFF
+      CACHE BOOL "Enable yalantinglibs ibverbs support")
+else()
+  set(YLT_ENABLE_IBV
+      ON
+      CACHE BOOL "Enable yalantinglibs ibverbs support")
+endif()
 
 set(YLT_COMMIT 7801bc9ad9021781f15217552214e325a1cf7373)
 FetchContent_Declare(
