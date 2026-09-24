@@ -394,7 +394,9 @@ TEST_F(MasterServiceSSDSnapshotTest, EvictObject) {
     }
     ASSERT_GT(success_gets, 1024 * 16);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    // CI runners need headroom past kv_lease_ttl; failures clustered at ~4s
+    // wall time when the wait sat exactly on the lease edge (#4136).
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 2000));
     // service_->RemoveAll();
 }
 
