@@ -267,6 +267,47 @@ TEST_F(RealClientHugepageRegisterTest,
     EXPECT_EQ(ShmHelper::getInstance()->free(base), 0);
 }
 
+// An effective max_mr_size smaller than one huge page must be rejected on the
+// HugeTLB path. registerLocalMemoryInternal rounds the chunk limit down to the
+// buffer's huge-page size; floor(1MB / 2MB) * 2MB == 0, so no page-aligned MR
+// chunk can be formed and it returns ERR_INVALID_ARGUMENT before any
+// ibv_reg_mr. This is the discriminating mirror of the regular-page test
+// (RealClientRegularPageRegisterTest.SubPageMaxMrSizeNotRejected), where the
+// same sub-page-sized max_mr_size is instead accepted: on huge pages the limit
+// is a genuine misconfiguration and must be refused; on regular pages the
+// hardware splits at any boundary and the request is valid. The request is
+// refused before any ibv_reg_mr, so it leaves no fork-protection residue.
+TEST_F(RealClientHugepageRegisterTest, SubHugepageMaxMrSizeIsRejected) {
+    if (protocol_ != std::string("rdma")) {
+        GTEST_SKIP() << "chunk registration is exercised on the RDMA path only";
+    }
+
+    // 8MB segment = 4 hugepages (2MB each).
+    const size_t kSegmentSize = 8 * 1024 * 1024;
+    void* base = ShmHelper::getInstance()->allocate(kSegmentSize);
+    ASSERT_NE(base, nullptr);
+    ASSERT_TRUE(ShmHelper::getInstance()->is_hugepage());
+
+    // 1MB effective max_mr_size is below one 2MB huge page; the 0.5MB logical
+    // size is widened to the physical segment first, then rejected because the
+    // limit cannot be aligned down to a huge page.
+    const size_t kLogicalSize = 512 * 1024;
+    const uint64_t saved_max_mr_size = globalConfig().max_mr_size;
+    globalConfig().max_mr_size = 1 * 1024 * 1024;
+
+    const int rc = client_->register_buffer(base, kLogicalSize);
+
+    globalConfig().max_mr_size = saved_max_mr_size;
+
+    EXPECT_NE(rc, 0)
+        << "an effective max_mr_size below one huge page must be rejected";
+    if (rc == 0) {
+        EXPECT_EQ(client_->unregister_buffer(base), 0);
+    }
+
+    EXPECT_EQ(ShmHelper::getInstance()->free(base), 0);
+}
+
 // Sub-range registrations are not special-cased: an interior pointer is
 // registered exactly as passed. On RDMA (ibv_fork_init active) a misaligned
 // interior sub-range of a hugetlb VMA fails with EINVAL; on TCP there is no

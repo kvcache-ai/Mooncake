@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
@@ -356,27 +357,45 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
     // are address-range based, so each chunk gets the correct key).
     size_t chunk_limit = (size_t)globalConfig().max_mr_size;
-    // Round the chunk limit down to the buffer's page size before splitting.
-    // Otherwise a non-page-aligned effective max_mr_size (e.g. a hand-set
-    // MC_MAX_MR_SIZE) produces chunk boundaries that fall inside a HugeTLB
-    // page. ibv_fork_init() then makes ibv_reg_mr()/pre-touch run MADV_DONTFORK
-    // on that range, and the kernel refuses to split a hugetlb VMA at a
-    // non-hugepage-aligned boundary, failing with EINVAL. Aligning the limit
-    // down keeps every chunk (and thus every pre-touch block) page-aligned.
-    // A limit smaller than one page cannot yield a page-aligned chunk at all,
-    // so report the conflict instead of silently registering an oversized or
-    // misaligned MR.
+    // Round the chunk limit down to the buffer's page size before splitting,
+    // but ONLY for HugeTLB-backed buffers (page size larger than the base
+    // page). A non-page-aligned effective max_mr_size (e.g. a hand-set
+    // MC_MAX_MR_SIZE) would otherwise produce chunk boundaries that fall
+    // inside a HugeTLB page. ibv_fork_init() then makes ibv_reg_mr()/pre-touch
+    // run MADV_DONTFORK on that range, and the kernel refuses to split a
+    // hugetlb VMA at a non-hugepage-aligned boundary, failing with EINVAL.
+    // Aligning the limit down keeps every chunk (and thus every pre-touch
+    // block) page-aligned. A limit smaller than one huge page cannot yield a
+    // page-aligned chunk at all, so report the conflict instead of silently
+    // registering an oversized or misaligned MR.
+    //
+    // Regular base pages (and THP, which reports the base page in
+    // KernelPageSize) can be split at any boundary, so this alignment and the
+    // rejection must NOT run for them: the kernel splits ordinary VMAs freely,
+    // so a within-limit registration always succeeds on the hardware. Running
+    // the round-down there would (a) falsely reject a registration when
+    // MC_MAX_MR_SIZE is set below one base page and (b) force needless extra
+    // chunking when the limit is not a page multiple. Gating on the page size
+    // confines the fix to the HugeTLB case that actually needs it.
+    //
+    // Compare against the runtime base page size from sysconf(_SC_PAGESIZE)
+    // rather than a hardcoded 4 KiB: on a larger-base-page platform (e.g. an
+    // ARM64 kernel built with 64 KiB pages) every ordinary mapping reports that
+    // base page in KernelPageSize, so a fixed 4 KiB threshold would misclassify
+    // a regular buffer as HugeTLB and reintroduce the false rejection there.
     const size_t buffer_page_size = detectBufferPageSize(addr);
-    if (chunk_limit > 0 && buffer_page_size > 0) {
+    static const size_t base_page_size =
+        static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    if (chunk_limit > 0 && buffer_page_size > base_page_size) {
         const size_t aligned_limit =
             chunk_limit / buffer_page_size * buffer_page_size;
         if (aligned_limit == 0) {
             LOG(ERROR) << "Effective max_mr_size " << chunk_limit
-                       << " is smaller than the buffer page size "
+                       << " is smaller than the HugeTLB page size "
                        << buffer_page_size
                        << "; cannot form a page-aligned MR chunk. Raise "
-                          "MC_MAX_MR_SIZE to at least one page, or check it "
-                          "against the device max_mr_size and the hugepage "
+                          "MC_MAX_MR_SIZE to at least one huge page, or check "
+                          "it against the device max_mr_size and the hugepage "
                           "configuration.";
             return ERR_INVALID_ARGUMENT;
         }
