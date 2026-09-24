@@ -1,87 +1,301 @@
 # Quick Start
 
-This document describes how to quickly start using Mooncake Transfer Engine and Mooncake Store.
+Get up and running with Mooncake in minutes.
 
-## Before using Mooncake
+This guide walks you through the entire flow of getting started with Mooncake:
 
-Install the following prerequisites before running any Mooncake component:
-- Python 3.10 or later; a virtual environment is recommended.
-- RDMA driver and SDK (for example, Mellanox OFED), if you plan to use RDMA for data transfer.
-- CUDA 12.1 or later, if the package is built with `-DUSE_CUDA` (disabled by default). For most CUDA-enabled use cases, such as RDMA-based KV cache transfer between GPUs or between GPU and DRAM, NVIDIA GPUDirect support is also required. *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
-- Cambricon Neuware, if the package is built with `-DUSE_MLU`. By default Mooncake looks for Neuware under `NEUWARE_HOME` or `/usr/local/neuware`.
-- Hygon DTK SDK, if the package is built with `-DUSE_HYGON`. By default Mooncake looks for DTK under `DTK_HOME` or `/opt/dtk`.
-- Iluvatar CoreX SDK, if the package is built with `-DUSE_COREX`. By default Mooncake looks for CoreX under `COREX_HOME` or `/usr/local/corex`.
+1. **Install** Mooncake
+2. **Start** the Store master and **Send a request** with the Python Store API
+
+Serving-framework users can then connect SGLang, vLLM or other systems.
+
+## Prerequisites
+
+- **Python**: 3.10 or later; a virtual environment is recommended.
+- **RDMA**: an RDMA driver and SDK (for example, Mellanox OFED), if you plan to use RDMA for data transfer. On ScaleFabric SHCA systems, install `shca-tools` and build with `-DUSE_SHCA=ON`.
+- **CUDA**: 12.1 or later. For most CUDA-enabled use cases, such as RDMA-based KV cache transfer between GPUs or between GPU and DRAM, NVIDIA GPUDirect support is also required. You may install CUDA from [the NVIDIA downloads page](https://developer.nvidia.com/cuda-downloads).
+
+```{note}
+The default pip, build and Docker paths target NVIDIA CUDA. For other
+platforms, see [Other Platforms](#other-platforms) below.
+```
+
 
 ## Installation
 
-Install the Mooncake package from PyPI. The same package provides:
+The same package provides:
 
 - Mooncake Store Python bindings for vLLM and SGLang HiCache integrations.
 - Transfer Engine Python bindings and runtime components for direct
   `mooncake.engine.TransferEngine` usage.
 
-**For CUDA-enabled systems:**
+::::{tab-set}
 
-- CUDA < 13.0
+:::{tab-item} pip / uv
+We recommend using **uv** for faster installation:
+
+```bash
+pip install --upgrade pip
+pip install uv
+uv pip install mooncake-transfer-engine
+```
+
+Plain `pip` also works:
+
 ```bash
 pip install mooncake-transfer-engine
 ```
 
-- CUDA >= 13.0
+```{tip}
+The default wheel targets CUDA 12.1–12.9 and includes Mooncake-EP and GPU
+topology detection. For CUDA 13.0/13.1, install
+`mooncake-transfer-engine-cuda13` instead.
+```
+:::
+
+:::{tab-item} From Source
+Clone the repository and build the default configuration:
+
 ```bash
-pip install mooncake-transfer-engine-cuda13
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+
+mkdir build
+cd build
+cmake ..
+make -j
+sudo make install
 ```
 
-**For non-CUDA systems:**
+For CUDA, VRAM segments, NVMe-oF, and other backend flags, see the
+[Build Guide](build.md).
+:::
+
+:::{tab-item} Docker
+Published images are available on Docker Hub at
+[kvcacheai/mooncake](https://hub.docker.com/r/kvcacheai/mooncake).
+
 ```bash
+docker run --net=host \
+    --ipc=host \
+    --ulimit memlock=-1 \
+    kvcacheai/mooncake:latest \
+    mooncake_master
+```
+
+For details, see
+[Use Mooncake in Docker Containers](build.md#use-mooncake-in-docker-containers).
+:::
+
+::::
+
+```{note}
+If users encounter problems such as missing `lib*.so`, first install the
+corresponding system runtime libraries. If the issue persists, uninstall the
+package and [build the binaries manually](build.md).
+```
+
+## Other Platforms
+
+The default path above targets NVIDIA CUDA. Use the matching wheel or source
+build for other platforms. Install only one variant in an environment.
+
+::::{tab-set}
+
+:::{tab-item} Non-CUDA
+**Prerequisites**
+
+- Python 3.10 or later.
+- Ubuntu runtime libraries: `libcurl4`, `libibverbs1`, `rdma-core`,
+  `librdmacm1`, `libnuma1`, and `liburing2`.
+
+**Installation**
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
 pip install mooncake-transfer-engine-non-cuda
 ```
+:::
 
-**For NPU systems:**
+:::{tab-item} Ascend NPU
+**Prerequisites**
+
+- Python 3.10 or later.
+- Ascend CANN Toolkit. Source `/usr/local/Ascend/cann/set_env.sh` before
+  running Mooncake. Ascend Direct (ADXL/HIXL) is the recommended path.
+
+**Installation**
+
 ```bash
 pip install mooncake-transfer-engine-npu
+source /usr/local/Ascend/cann/set_env.sh
 ```
 
-> **Important**:
-> - The CUDA version (`mooncake-transfer-engine`) includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+.
-> - The non-CUDA version (`mooncake-transfer-engine-non-cuda`) is for environments without CUDA dependencies, but it still needs system runtime libraries such as `libcurl4`, `libibverbs1`, `rdma-core`, `librdmacm1`, `libnuma1`, and `liburing2` on Ubuntu. In a fresh environment, run `sudo apt-get update` before installing them:
->   ```bash
->   sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
->   ```
-> - MLU support is currently available through source builds with `-DUSE_MLU=ON`; there is no dedicated prebuilt MLU wheel yet.
-> - If users encounter problems such as missing `lib*.so`, first install the corresponding system runtime libraries. If the issue persists, uninstall the package and build the binaries manually.
+See [Ascend Direct Transport](../design/transfer-engine/transport/ascend_direct_transport.md)
+for the recommended path. The legacy backend is documented in
+[Ascend Transport](../design/transfer-engine/transport/ascend_transport.md).
+For mixed GPU/NPU transfers, see
+[Heterogeneous Ascend Transport](../design/transfer-engine/transport/heterogeneous_ascend.md).
+There are also two detailed Chinese guides:
+[Mooncake KVPool guide](https://gitcode.com/cann/hixl/wiki/Mooncake%20KVPool%E6%8C%87%E5%8D%97.md)
+and
+[Mooncake NPU guide](https://gitcode.com/cann/hixl/wiki/Mooncake%EF%BC%88NPU%20%E7%89%88%EF%BC%89%E5%AE%8C%E6%95%B4%E6%8C%87%E5%8D%97.md).
+:::
 
-## Connect vLLM or SGLang
+:::{tab-item} AMD ROCm
+**Prerequisites**
 
-Choose the integration path that matches your serving deployment.
+- Python 3.10 or later.
+- ROCm / HIP SDK, with `hipcc` and runtime libraries on `PATH` (for example
+  `/opt/rocm`).
 
-### PD Disaggregation
+**Installation**
 
-PD disaggregation paths use Mooncake Transfer Engine for direct KV transfer
-between prefill and decode workers. Configure these paths through the serving
-framework guides, not by calling Transfer Engine APIs directly:
+```bash
+pip install mooncake-transfer-engine-rocm
+```
+:::
 
-- [SGLang Integration Overview](examples/sglang-integration/index.md)
-- [vLLM Integration Overview](examples/vllm-integration/index.md)
+:::{tab-item} Moore Threads MUSA
+**Prerequisites**
 
-### Mooncake Store
+- Python 3.10 or later.
+- MUSA SDK. Add `/usr/local/musa/lib` to `LIBRARY_PATH` and `LD_LIBRARY_PATH`.
+- `mthreads-peermem` for GPUDirect RDMA.
 
-Mooncake Store provides distributed KV cache storage for vLLM and SGLang
-HiCache:
+**Installation**
 
-| Framework | Use case | Setup guide |
-|-----------|----------|-------------|
-| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](examples/sglang-integration/hicache-quick-start.md) |
-| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](examples/vllm-integration/kv-cache-storage.md) |
+```bash
+pip install mooncake-transfer-engine-musa
+```
+:::
 
-The serving framework guides include the required Mooncake Store service
-startup and connector configuration for each path.
+:::{tab-item} AWS EFA
+**Prerequisites**
 
-## Optional Python Smoke Test
+- An AWS instance with EFA (for example p5 or p6).
+- AWS EFA driver and libfabric. Verify with `fi_info -p efa`, and keep
+  `/opt/amazon/efa/lib` on `LD_LIBRARY_PATH`.
+- CUDA 12.1–12.9 or CUDA 13 if you use the GPU-aware EFA wheels.
 
-If you want to verify the Store Python API without a serving framework, run this
-single-node `put`/`get` example after starting `mooncake_master`. It uses
-`P2PHANDSHAKE`, so no separate Transfer Engine metadata service is required.
+**Installation**
+
+```bash
+# GPU memory transfers with CUDA 12
+pip install mooncake-transfer-engine-efa
+
+# GPU memory transfers with CUDA 13
+pip install mooncake-transfer-engine-efa-cuda13
+
+# CPU/DRAM-only transfers
+pip install mooncake-transfer-engine-efa-non-cuda
+```
+
+See the [EFA transport guide](../design/transfer-engine/transport/efa_transport.md)
+for prerequisites and configuration.
+:::
+
+:::{tab-item} Cambricon MLU
+**Prerequisites**
+
+- Python 3.10 or later.
+- Cambricon Neuware SDK. Set `NEUWARE_HOME`, or use the default
+  `/usr/local/neuware`. There is no dedicated prebuilt MLU wheel yet.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_MLU=ON
+make -j
+sudo make install
+```
+:::
+
+:::{tab-item} MetaX MACA
+**Prerequisites**
+
+- Python 3.10 or later.
+- MACA SDK. Set `MACA_HOME`, or use the default `/opt/maca`.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_MACA=ON
+make -j
+sudo make install
+```
+:::
+
+:::{tab-item} Hygon DCU
+**Prerequisites**
+
+- Python 3.10 or later.
+- Hygon DTK SDK. Set `DTK_HOME`, or use the default `/opt/dtk`.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_HYGON=ON
+make -j
+sudo make install
+```
+:::
+
+:::{tab-item} Iluvatar CoreX
+**Prerequisites**
+
+- Python 3.10 or later.
+- Iluvatar CoreX SDK. Set `COREX_HOME`, or use the default `/usr/local/corex`.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_COREX=ON
+make -j
+sudo make install
+```
+:::
+
+::::
+
+## Start Mooncake Store
+
+If you installed with pip or from source, start the master service:
+
+```bash
+mooncake_master
+```
+
+Wait until you see a line like this in the logs:
+
+```
+Master service started on port 50051, max_threads=4, ...
+```
+
+The default RPC port is `50051`. Skip this step if the Docker command above is
+already running `mooncake_master`.
+
+## Send Your First Request
+
+Run this single-node `put`/`get` example after `mooncake_master` is running. This example uses `P2PHANDSHAKE`, so no separate Transfer Engine metadata service is required.
 
 ```python
 from mooncake.store import MooncakeDistributedStore
@@ -104,6 +318,29 @@ print(data.decode())  # Output: Hello, Mooncake Store!
 
 store.close()
 ```
+
+## Connect vLLM or SGLang
+
+Choose the integration path that matches your serving deployment.
+
+### PD Disaggregation
+
+PD disaggregation paths use Mooncake Transfer Engine for direct KV transfer
+between prefill and decode workers. Configure these paths through the serving
+framework guides, not by calling Transfer Engine APIs directly:
+
+- [SGLang Disaggregated Serving with MooncakeTransferEngine](../deployment/integrations/sglang/pd-disaggregation.md)
+- [Disaggregated Prefill-Decode with MooncakeConnector](../deployment/integrations/vllm/disagg-prefill-decode.md)
+
+### Distributed KV Cache Pooling
+
+Mooncake Store provides distributed KV cache storage for vLLM and SGLang
+HiCache:
+
+| Framework | Use case | Setup guide |
+|-----------|----------|-------------|
+| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](../deployment/integrations/sglang/hicache-quick-start.md) |
+| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](../deployment/integrations/vllm/kv-cache-storage.md) |
 
 ## AI Coding Assistant Skills
 
@@ -132,5 +369,5 @@ For production deployment, standalone store services, high availability,
 allocation strategies, SSD offload, and runtime tuning, continue to the
 [Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md).
 
-For API details, see the [Mooncake Store Python API](../python-api-reference/mooncake-store.md)
-and [Mooncake Store design](../design/mooncake-store.md).
+For API details, see the [Mooncake Store Python API](../api-reference/python/mooncake-store.md)
+and [Mooncake Store design](../design/store/mooncake-store.md).

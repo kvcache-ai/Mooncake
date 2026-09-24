@@ -1,7 +1,6 @@
 project(MooncakeStore VERSION 2.0.0)
 
-option(ENABLE_KV_EVENTS
-       "Build master KV events ZMQ publisher (requires libzmq when ON)" OFF)
+set(MOONCAKE_STORE_INCLUDE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 # Extract version components for C++ usage
 set(MOONCAKE_STORE_VERSION ${PROJECT_VERSION})
@@ -46,30 +45,40 @@ if (STORE_USE_K8S_LEASE)
     set(K8S_LEASE_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/k8s-lease/libk8s_lease_wrapper.so)
 endif()
 
-if (STORE_USE_REDIS)
-    find_path(MOONCAKE_STORE_HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
-    find_library(MOONCAKE_STORE_HIREDIS_LIBRARY hiredis REQUIRED)
-    message(STATUS "Redis HA backend: Enabled")
+if(TARGET Mooncake::liburing)
+  message(STATUS "io_uring: Enabled for mooncake_store")
+else()
+  message(STATUS "io_uring: Disabled (liburing not found)")
+endif()
+
+if(STORE_USE_REDIS)
+  message(STATUS "Redis HA backend: Enabled")
 endif()
 
 if (NOT STORE_USE_ETCD AND NOT STORE_USE_REDIS AND NOT STORE_USE_K8S_LEASE)
     message(STATUS "Store HA backends are disabled")
 endif()
 
-# Add include directories
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/fake_include
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/mooncake-store/proto/
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/
-    ${CMAKE_CURRENT_BINARY_DIR}/include/
-    ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/include
-    ${ETCD_WRAPPER_INCLUDE}
-)
-
 # Add subdirectories
 add_subdirectory(src)
+
+if (STORE_USE_ETCD)
+    add_subdirectory(tools)
+endif()
+
+# Test-only private access support, also used by the eviction benchmark. Never
+# link this library into the production master service.
+if(BUILD_UNIT_TESTS OR BUILD_BENCHMARK)
+  add_library(master_service_test_peer STATIC
+              tests/master_service/master_service_test_peer.cpp)
+  target_include_directories(master_service_test_peer
+                             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  target_link_libraries(master_service_test_peer PUBLIC mooncake_store)
+  if(USE_NOF)
+    target_include_directories(master_service_test_peer
+                               PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  endif()
+endif()
 
 if (BUILD_UNIT_TESTS)
     add_subdirectory(tests)

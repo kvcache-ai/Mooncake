@@ -1,4 +1,4 @@
-# Mooncake Conductor Architecture
+# Conductor Architecture
 
 ## Overview
 
@@ -68,8 +68,10 @@ Within each context, Conductor stores:
   per-instance access metadata;
 - a DP-rank set used to report rank-level hit information.
 
-The current implementation computes complete-block prefix hashes from token IDs
-and ignores trailing partial blocks during `/query`.
+The vLLM strategy computes complete-block prefix hashes from token IDs and
+ignores trailing partial blocks during `/query`. The SGLang strategies also hash
+the trailing partial block, so a match that reaches it is reported as the number
+of tokens the request actually carries, never as a whole block.
 
 ## Event flow
 
@@ -178,5 +180,5 @@ mooncake-conductor/
 +-- CMakeLists.txt
 ```
 
-See [Indexer API](./indexer-api-design.md) for the HTTP API and KV Events wire
+See [Indexer API](../../api-reference/http/conductor-indexer.md) for the HTTP API and KV Events wire
 format.

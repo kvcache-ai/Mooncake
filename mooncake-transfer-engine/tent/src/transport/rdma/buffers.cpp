@@ -141,6 +141,11 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                 context->registerMemReg((void*)desc.addr, desc.length, access);
         }
     }
+    // NicID-keyed like context_list_, not compacted: slice dispatch subscripts
+    // these with a dev_id from the topology, so gaps must stay in place.
+    // Devices with no context contribute a zero key that is never selected.
+    desc.lkey.assign(context_list_.size(), 0);
+    desc.rkey.assign(context_list_.size(), 0);
     for (size_t id = 0; id < context_list_.size(); ++id) {
         if (!context_list_[id]) continue;
         if (!mem_reg_list[id]) {
@@ -149,8 +154,8 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         }
         staging.mem_reg_map[context_list_[id]] = mem_reg_list[id];
         auto keys = context_list_[id]->queryMemRegKey(mem_reg_list[id]);
-        desc.lkey.push_back(keys.first);
-        desc.rkey.push_back(keys.second);
+        desc.lkey[id] = keys.first;
+        desc.rkey[id] = keys.second;
     }
     staging.options = options;
     RWSpinlock::WriteGuard guard(lock_);

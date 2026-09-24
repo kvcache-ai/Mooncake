@@ -20,13 +20,13 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <future>
 #include <limits>
-#include <set>
 #include <sstream>
 
 #include "tent/common/status.h"
@@ -35,6 +35,7 @@
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/common/utils/random.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -52,6 +53,8 @@ namespace mooncake {
 namespace tent {
 
 namespace {
+
+constexpr uint64_t kDefaultRdmaQuiesceTimeoutNs = 10000000000ull;
 
 uint16_t getRdmaBindDefaultPort(const Config& config) {
     constexpr const char* kKey = "rpc_server_port";
@@ -245,10 +248,17 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     if (disable_gpu_direct) {
         return false;
     }
+    // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
+    // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
+    // ib_core), so the amdgpu module itself is the presence signal.
+    // Hygon: the hycu driver provides the same peer-memory support.
     std::ifstream modules("/proc/modules");
     std::string line;
     while (std::getline(modules, line)) {
-        if (line.find("nvidia_peermem") != std::string::npos) {
+        const auto name_end = line.find(' ');
+        const auto name =
+            name_end == std::string::npos ? line : line.substr(0, name_end);
+        if (name == "nvidia_peermem" || name == "amdgpu" || name == "hycu") {
             return true;
         }
     }
@@ -261,6 +271,36 @@ RdmaTransport::RdmaTransport()
       notify_poll_interval_us_(10) {}  // Start at 10us
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
+
+size_t RdmaTransport::initializeContexts() {
+    context_set_.clear();
+    context_name_lookup_.clear();
+    // One slot per NicID: dev_id arrives as a NicID and subscripts both this
+    // and BufferDesc::lkey, so a compacted layout would name the wrong RNIC.
+    // Skipped NICs keep an inert context, which consumers reject via status().
+    context_set_.reserve(local_topology_->getNicCount());
+    size_t context_count = 0;
+    for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
+        auto entry = local_topology_->getNicEntry(i);
+        if (entry->type == Topology::NIC_RDMA) {
+            auto context = std::make_shared<RdmaContext>(*this);
+            if (context->construct(entry->name, params_) == 0) {
+                context_name_lookup_[entry->name] = i;
+                ++context_count;
+                local_buffer_manager_.addDevice(context.get());
+                context_set_.push_back(std::move(context));
+                continue;
+            }
+            LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
+                         << "of initialization failure";
+        }
+        // A never-constructed context, not the one whose construct() failed:
+        // the slot only has to stand in for the NicID, so it should not carry
+        // a device name or an endpoint store it will never use.
+        context_set_.push_back(std::make_shared<RdmaContext>(*this));
+    }
+    return context_count;
+}
 
 Status RdmaTransport::install(std::string& local_segment_name,
                               std::shared_ptr<ControlService> metadata,
@@ -307,22 +347,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
     }
 
     local_buffer_manager_.setTopology(local_topology);
-    context_set_.clear();
-    for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
-        auto entry = local_topology_->getNicEntry(i);
-        if (entry->type != Topology::NIC_RDMA) continue;
-        auto context = std::make_shared<RdmaContext>(*this);
-        int ret = context->construct(entry->name, params_);
-        if (ret) {
-            LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
-                         << "of initialization failure";
-            continue;
-        }
-        context_name_lookup_[entry->name] = context_set_.size();
-        context_set_.push_back(context);
-        local_buffer_manager_.addDevice(context.get());
-    }
-    const bool context_empty = context_set_.empty();
+    const bool context_empty = initializeContexts() == 0;
     const bool topology_empty = local_topology_->empty();
     if (context_empty || topology_empty) {
         const char* error_message = "No RDMA device initialized successfully";
@@ -356,7 +381,38 @@ Status RdmaTransport::install(std::string& local_segment_name,
     return Status::OK();
 }
 
+Status RdmaTransport::quiesce() {
+    uint64_t timeout_ns = kDefaultRdmaQuiesceTimeoutNs;
+    if (conf_) {
+        timeout_ns = conf_->get("transports/rdma/max_timeout_ns", timeout_ns);
+    }
+    Status drain = Status::OK();
+    if (workers_) {
+        drain = workers_->quiesce(timeout_ns);
+        if (!drain.ok()) {
+            LOG(ERROR) << "RDMA workers quiesce failed: " << drain.ToString();
+        }
+    }
+    const Status sync =
+        Platform::getLoader().synchronizeDevices(local_topology_.get());
+    if (!sync.ok()) {
+        LOG(WARNING) << "RDMA dest-GPU sync during quiesce failed: "
+                     << sync.ToString();
+    }
+    return drain;
+}
+
 Status RdmaTransport::uninstall() {
+    // ControlService may still receive BootstrapRdma RPCs while uninstall is
+    // running. Unregister and drain the callback before destroying workers,
+    // contexts, and other state used by onSetupRdmaConnections(). Keep this
+    // outside installed_ so partially-installed transports are covered too.
+    if (metadata_) metadata_->setBootstrapRdmaCallback(nullptr);
+
+    // Drain CQ and dest-GPU visibility while MRs and QPs are still alive.
+    // Idempotent when deconstruct() already called quiesce().
+    (void)quiesce();
+
     if (installed_) {
         // Stop notification worker thread
         notify_worker_running_ = false;
@@ -365,6 +421,14 @@ Status RdmaTransport::uninstall() {
         }
 
         workers_.reset();
+        // Workers joined: nothing can name an orphan any more.
+        {
+            std::lock_guard<std::mutex> guard(orphan_slice_mutex_);
+            for (auto& orphan : orphan_slices_)
+                RdmaSliceStorage::Get().deallocate(orphan.slice);
+            orphan_slices_.clear();
+            orphans_pending_.store(false, std::memory_order_release);
+        }
         metadata_.reset();
         local_buffer_manager_.clear();
         context_set_.clear();
@@ -389,24 +453,43 @@ Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
     if (!rdma_batch)
         return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
+    // Settle what an earlier free left behind before adding to it: an orphan
+    // whose handler has since finished is freed here rather than waiting for
+    // the monitor's next second.
+    if (orphans_pending_.load(std::memory_order_acquire))
+        reapOrphanSlices(/*on_tick=*/false);
     for (auto* task : rdma_batch->task_list) {
         task->deref();  // Release batch's reference to the task
     }
     rdma_batch->task_list.clear();
+    // A slice still owed a completion cannot go back to the slab: its
+    // address is a live work-request id, and the next transfer would get
+    // that storage, so the stale completion would resolve somebody else's
+    // slice and report bytes that never moved. The batch being terminal
+    // does not rule this out -- a timeout resolves a slice while its work
+    // request is live. Hand those over; the batch itself is freed now.
+    std::vector<OrphanSlice> orphans;
     for (auto slice : rdma_batch->slice_chain) {
         while (slice) {
             auto next = slice->next;
-            RdmaSliceStorage::Get().deallocate(slice);
+            if (slice->completions_owed.load(std::memory_order_acquire) > 0) {
+                slice->next = nullptr;  // it leaves the chain behind
+                orphans.push_back({slice, 0});
+            } else {
+                RdmaSliceStorage::Get().deallocate(slice);
+            }
             slice = next;
         }
+    }
+    if (!orphans.empty()) {
+        std::lock_guard<std::mutex> guard(orphan_slice_mutex_);
+        orphan_slices_.insert(orphan_slices_.end(), orphans.begin(),
+                              orphans.end());
+        orphans_pending_.store(true, std::memory_order_release);
     }
     Slab<RdmaSubBatch>::Get().deallocate(rdma_batch);
     batch = nullptr;
     return Status::OK();
-}
-
-static inline uint64_t roundup(uint64_t a, uint64_t b) {
-    return (a % b == 0) ? a : (a / b + 1) * b;
 }
 
 Status RdmaTransport::submitTransferTasks(
@@ -437,28 +520,21 @@ Status RdmaTransport::submitTransferTasks(
         auto* task = RdmaTaskStorage::Get().allocate();
         rdma_batch->task_list.push_back(task);
         task->request = request;
+        task->device_mask = rdma_batch->device_mask;
         task->qp_pool = rdma_batch->qp_pool;  // RFC #2568 step 3
         task->num_slices = 0;
         task->status_word = PENDING;
         task->transferred_bytes = 0;
+        task->success_slices.store(0, std::memory_order_relaxed);
+        task->resolved_slices.store(0, std::memory_order_relaxed);
+        task->first_error = PENDING;
+        task->cancel_requested.store(false, std::memory_order_relaxed);
         task->ref();  // Batch holds a reference to the task
 
-        const double merge_ratio = 0.25;
-        uint64_t base_block = default_block_size;
-        uint64_t num_slices = (request.length + base_block - 1) / base_block;
-        num_slices = std::max<uint64_t>(
-            1, std::min<uint64_t>(num_slices, max_slice_count));
-
-        if (num_slices > 1) {
-            uint64_t tail = request.length % base_block;
-            if (tail > 0 &&
-                tail < static_cast<uint64_t>(base_block * merge_ratio)) {
-                num_slices = std::max<uint64_t>(1, num_slices - 1);
-            }
-        }
-
-        uint64_t block_size = roundup(
-            (request.length + num_slices - 1) / num_slices, default_block_size);
+        const auto plan =
+            planRdmaSlices(request.length, default_block_size, max_slice_count);
+        const uint64_t block_size = plan.block_size;
+        const uint64_t num_slices = plan.count;
 
         std::vector<int> slice_dev_ids;
         // Only if a single request is enough, we perform aggregated allocation
@@ -484,14 +560,22 @@ Status RdmaTransport::submitTransferTasks(
 
         uint64_t offset = 0;
         for (uint64_t slice_idx = 0; slice_idx < num_slices; ++slice_idx) {
-            uint64_t length =
-                std::min<uint64_t>(request.length - offset, block_size);
+            // The last slice takes what is left, which is a block plus a
+            // folded-in tail when the plan folded one; every other slice is
+            // exactly a block. See planRdmaSlices().
+            uint64_t length = (slice_idx + 1 == num_slices)
+                                  ? request.length - offset
+                                  : block_size;
             auto slice = RdmaSliceStorage::Get().allocate();
             slice->source_addr = (char*)request.source + offset;
             slice->target_addr = request.target_offset + offset;
             slice->length = length;
             slice->task = task;
             slice->retry_count = 0;
+            slice->last_fallback_idx = -1;
+            slice->charged_dev = -1;
+            slice->posted_dev = -1;
+            slice->counted_lane = -1;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
             slice->next = nullptr;
@@ -499,8 +583,10 @@ Status RdmaTransport::submitTransferTasks(
             slice->priority = request.priority;  // Copy priority from request
             task->num_slices++;
             task->ref();  // Each slice holds a reference to the task
-            if (slice_idx < slice_dev_ids.size())
+            if (slice_idx < slice_dev_ids.size()) {
                 slice->source_dev_id = slice_dev_ids[slice_idx];
+                slice->charged_dev = slice->source_dev_id;
+            }
             offset += length;
             int part_id = next_worker_idx % num_workers;
             auto& list = slice_lists[part_id];
@@ -525,6 +611,60 @@ Status RdmaTransport::submitTransferTasks(
     return Status::OK();
 }
 
+void RdmaTransport::reapOrphanSlices(bool on_tick) {
+    // Taken whole so the scan runs outside the lock: expired() reaches the
+    // endpoint's control block, which is a cache miss per slice once a spell
+    // of timeouts has filled this up. Survivors are compacted in place and
+    // the same buffer goes back, so a tick allocates nothing. A batch freed
+    // meanwhile appends to the emptied vector; those are kept too, and
+    // nothing here reads the order.
+    std::vector<OrphanSlice> taken;
+    {
+        std::lock_guard<std::mutex> guard(orphan_slice_mutex_);
+        taken.swap(orphan_slices_);
+    }
+    if (taken.empty()) return;
+
+    size_t kept = 0;
+    size_t warned = 0;
+    for (auto& orphan : taken) {
+        auto* slice = orphan.slice;
+        // The completion has been handled, or its endpoint is gone -- a
+        // provider clears a queue pair's completions when it is destroyed
+        // (mlx5 and mlx4 do), so none can name this slice afterwards.
+        // Exactly zero: a handler pays on its way out and submitSlices()
+        // counts the post under the queue pair lock that handler needs, so
+        // the count never goes negative; if it ever did, holding on is the
+        // safe way to be wrong.
+        const int owed =
+            slice->completions_owed.load(std::memory_order_acquire);
+        if (owed == 0 || slice->ep_weak_ptr.expired()) {
+            RdmaSliceStorage::Get().deallocate(slice);
+            continue;
+        }
+        // Still held, so its endpoint is still alive: a queue pair the
+        // teardown has not destroyed. Say so once, then keep holding -- an
+        // age cap would free a slice the completion queue may yet name.
+        if (on_tick && ++orphan.passes == orphan_warn_after_passes_) {
+            ++warned;
+            LOG(WARNING) << "Orphaned slice " << slice << " still owes " << owed
+                         << " completion(s) after " << orphan.passes
+                         << " reap passes and its endpoint is still alive; "
+                            "held until the queue pair is destroyed -- see "
+                            "the endpoint teardown log for why it is not";
+        }
+        taken[kept++] = orphan;
+    }
+    taken.resize(kept);
+
+    std::lock_guard<std::mutex> guard(orphan_slice_mutex_);
+    orphan_warnings_ += warned;
+    if (!orphan_slices_.empty())
+        taken.insert(taken.end(), orphan_slices_.begin(), orphan_slices_.end());
+    orphan_slices_.swap(taken);
+    orphans_pending_.store(!orphan_slices_.empty(), std::memory_order_release);
+}
+
 Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                         TransferStatus& status) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
@@ -534,6 +674,23 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
     auto* task = rdma_batch->task_list[task_id];
     status = TransferStatus{task->status_word, task->transferred_bytes};
     return Status::OK();
+}
+
+Status RdmaTransport::cancelTransferTask(SubBatchRef batch, int task_id) {
+    auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
+    if (!rdma_batch) {
+        return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
+    }
+    if (task_id < 0 || task_id >= (int)rdma_batch->task_list.size()) {
+        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
+    }
+    auto* task = rdma_batch->task_list[task_id];
+    if (task->status_word != PENDING) return Status::OK();
+    return workers_->cancel(task);
+}
+
+Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    return workers_->getDeviceSelector()->getNicLoadStats(stats);
 }
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
@@ -578,6 +735,67 @@ Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
     return local_buffer_manager_.removeBuffer(desc);
 }
 
+Status RdmaTransport::refreshLocalDeviceDesc(const std::string& device_name,
+                                             uint32_t lid,
+                                             const std::string& gid) {
+    if (!metadata_)
+        return Status::InvalidArgument(
+            "RDMA metadata is not initialized" LOC_MARK);
+
+    auto& manager = metadata_->segmentManager();
+    bool existed = false;
+    uint32_t previous_lid = 0;
+    std::string previous_gid;
+    CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        if (segment.type != SegmentType::Memory)
+            return Status::InvalidArgument(
+                "Local segment is not a memory segment" LOC_MARK);
+        auto* device = segment.findDevice(device_name);
+        if (!device) {
+            auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+            DeviceDesc added;
+            added.name = device_name;
+            added.lid = lid;
+            added.gid = gid;
+            detail.devices.push_back(std::move(added));
+            return Status::OK();
+        }
+        existed = true;
+        previous_lid = device->lid;
+        previous_gid = device->gid;
+        device->lid = lid;
+        device->gid = gid;
+        return Status::OK();
+    }));
+
+    auto status = manager.synchronizeLocal();
+    if (status.ok()) return status;
+
+    auto rollback = manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        if (segment.type != SegmentType::Memory)
+            return Status::InvalidArgument(
+                "Local segment is not a memory segment" LOC_MARK);
+        auto& devices = std::get<MemorySegmentDesc>(segment.detail).devices;
+        auto it = std::find_if(devices.begin(), devices.end(),
+                               [&](const DeviceDesc& device) {
+                                   return device.name == device_name;
+                               });
+        if (it == devices.end()) return Status::OK();
+        if (!existed) {
+            devices.erase(it);
+        } else {
+            it->lid = previous_lid;
+            it->gid = previous_gid;
+        }
+        return Status::OK();
+    });
+    if (!rollback.ok()) {
+        LOG(ERROR) << "Failed to roll back RDMA address metadata for "
+                   << device_name << ": " << rollback.ToString();
+    }
+    return status;
+}
+
 Status RdmaTransport::setupLocalSegment() {
     auto& manager = metadata_->segmentManager();
     CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
@@ -591,8 +809,9 @@ Status RdmaTransport::setupLocalSegment() {
             if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
             DeviceDesc device_desc;
             device_desc.name = context->name();
-            device_desc.lid = context->lid();
-            device_desc.gid = context->gid();
+            const auto address = context->address();
+            device_desc.lid = address.lid;
+            device_desc.gid = address.gid;
             detail.devices.push_back(device_desc);
         }
         return Status::OK();
@@ -612,38 +831,59 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     }
     auto index = context_name_lookup_[local_nic_name];
     auto context = context_set_[index];
-    if (context->status() == RdmaContext::DEVICE_DISABLED) {
+    auto ctx_status = context->status();
+    if (ctx_status != RdmaContext::DEVICE_ENABLED) {
         std::stringstream ss;
-        ss << "Device is down: " << peer_desc.local_nic_path;
+        ss << "Device is not ready: " << peer_desc.local_nic_path;
         LOG(ERROR) << ss.str();
         local_desc.reply_msg = ss.str();
         return -1;
     }
-    auto endpoint =
-        context->endpointStore()->getOrInsert(peer_desc.local_nic_path);
-    if (!endpoint) {
-        std::stringstream ss;
-        ss << "Cannot allocate endpoint: " << peer_desc.local_nic_path;
-        LOG(ERROR) << ss.str();
-        local_desc.reply_msg = ss.str();
-        return -1;
-    }
-    auto status = endpoint->accept(peer_desc, local_desc);
-    if (!status.ok()) {
-        if (endpoint->status() == RdmaEndPoint::EP_DESTROYING ||
-            endpoint->status() == RdmaEndPoint::EP_DESTROYED) {
-            context->endpointStore()->remove(endpoint.get());
+    // Endpoints are never reset. A peer process that reused the same nic path
+    // (same IP:port after a restart) hits an EP_READY endpoint whose QPs no
+    // longer exist. accept() retires it and the next getOrInsert() creates a
+    // fresh one. Do that retry inside this RPC so the initiator receives a
+    // valid GID instead of an empty bootstrap reply.
+    auto store = context->endpointStore();
+    constexpr int kMaxAcceptAttempts = 2;
+    for (int attempt = 0; attempt < kMaxAcceptAttempts; ++attempt) {
+        auto endpoint = store->getOrInsert(peer_desc.local_nic_path);
+        if (!endpoint) {
+            std::stringstream ss;
+            ss << "Cannot allocate endpoint: " << peer_desc.local_nic_path;
+            LOG(ERROR) << ss.str();
+            local_desc.reply_msg = ss.str();
+            return -1;
+        }
+        local_desc = BootstrapDesc();
+        auto status = endpoint->accept(peer_desc, local_desc);
+        if (status.ok()) {
+            local_desc.reply_msg.clear();
+            return 0;
+        }
+        const auto ep_status = endpoint->status();
+        const bool retired = ep_status == RdmaEndPoint::EP_DESTROYING ||
+                             ep_status == RdmaEndPoint::EP_DESTROYED;
+        if (retired) {
+            store->remove(endpoint.get());
+            if (attempt + 1 < kMaxAcceptAttempts) {
+                LOG(INFO) << "Retrying RDMA bootstrap after retiring stale "
+                             "endpoint for "
+                          << peer_desc.local_nic_path;
+                continue;
+            }
         }
         LOG(ERROR) << status.ToString();
         local_desc.reply_msg = status.ToString();
         return -1;
     }
 
-    return 0;
+    return -1;
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
-                                                         int device_id) {
+                                                         int device_id,
+                                                         Status* failure) {
     std::string rpc_server_addr, target_seg_name, target_dev_name,
         target_nic_path_name;
 
@@ -671,11 +911,24 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
 
     if (!status.ok()) {
         LOG(ERROR) << status.ToString();
+        if (failure) *failure = status;
         return nullptr;
     }
 
-    auto context = context_set_[0].get();
-    if (context->status() != RdmaContext::DEVICE_ENABLED) {
+    // context_set_ is NicID-indexed, so slot 0 may be inert; take the first
+    // enabled context instead.
+    RdmaContext* context = nullptr;
+    for (auto& ctx : context_set_) {
+        if (ctx->status() == RdmaContext::DEVICE_ENABLED) {
+            context = ctx.get();
+            break;
+        }
+    }
+    if (!context) {
+        if (failure) {
+            *failure =
+                Status::DeviceNotFound("No enabled RDMA context" LOC_MARK);
+        }
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
@@ -683,6 +936,10 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
+        if (failure) {
+            *failure =
+                Status::InternalError("Cannot allocate endpoint" LOC_MARK);
+        }
         return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
@@ -696,21 +953,39 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                 LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
                            << status.ToString();
             }
+            if (failure) *failure = status;
             return nullptr;
         }
     }
     return endpoint;
 }
 
+Status RdmaTransport::notifyStatusForEndpointFailure(const Status& failure) {
+    if (failure.IsRpcServiceError()) {
+        return Status::RpcServiceError(
+            "RDMA notification endpoint bootstrap failed; peer control "
+            "plane unreachable, not falling back to RPC: " +
+            std::string{failure.message()} + LOC_MARK);
+    }
+    return Status::DeviceNotFound("RDMA notification endpoint unavailable: " +
+                                  std::string{failure.message()} + LOC_MARK);
+}
+
 Status RdmaTransport::sendNotification(SegmentID target_id,
                                        const Notification& notify) {
-    auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID);
-    if (!endpoint) {
-        return Status::InternalError(
-            "Endpoint not found for notification" LOC_MARK);
-    }
+    // Both failures below mean nothing left this host. Unless the bootstrap
+    // RPC itself failed (see notifyStatusForEndpointFailure), the engine may
+    // still reach the peer over the control plane, so they are reported with
+    // codes TransferEngineImpl::sendNotification() recognizes as "channel
+    // unavailable" rather than as a generic internal error.
+    Status failure;
+    auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID, &failure);
+    if (!endpoint) return notifyStatusForEndpointFailure(failure);
+    // Notify QP not connected (the peer has none, or it was disabled after a
+    // fault), or the post itself was refused.
     if (!endpoint->sendNotification(notify.name, notify.msg)) {
-        return Status::InternalError("Failed to send notification" LOC_MARK);
+        return Status::RdmaError(
+            "RDMA notification channel unavailable" LOC_MARK);
     }
     return Status::OK();
 }
@@ -730,6 +1005,38 @@ void RdmaTransport::addNotificationToQueue(const std::string& name,
                                            const std::string& msg) {
     std::lock_guard<std::mutex> lock(notify_mutex_);
     notify_list_.emplace_back(name, msg);
+}
+
+namespace {
+// The notify QP carries its own host-memory send/recv buffers, so a local
+// length/protection/WQE fault is confined to notification state. The data QPs
+// of the same endpoint use separate WRs and MRs.
+bool isNotifyLocalFault(ibv_wc_status status) {
+    switch (status) {
+        case IBV_WC_LOC_LEN_ERR:
+        case IBV_WC_LOC_QP_OP_ERR:
+        case IBV_WC_LOC_PROT_ERR:
+        case IBV_WC_LOC_ACCESS_ERR:
+        case IBV_WC_MW_BIND_ERR:
+            return true;
+        default:
+            return false;
+    }
+}
+}  // namespace
+
+RdmaTransport::NotifyCompletionAction RdmaTransport::classifyNotifyCompletion(
+    ibv_wc_status status, bool endpoint_alive, bool endpoint_ready) {
+    // Every WR still posted on a retiring endpoint's notify QP flushes, which
+    // is expected and must stay quiet.
+    if (status == IBV_WC_WR_FLUSH_ERR && !endpoint_ready) {
+        return NotifyCompletionAction::SkipSilently;
+    }
+    if (!endpoint_alive) return NotifyCompletionAction::ReportOnly;
+    if (isNotifyLocalFault(status)) {
+        return NotifyCompletionAction::DisableNotification;
+    }
+    return NotifyCompletionAction::RetireEndpoint;
 }
 
 int RdmaTransport::processNotifyCompletions() {
@@ -752,9 +1059,10 @@ int RdmaTransport::processNotifyCompletions() {
 
         // Process each completion
         for (int i = 0; i < completed; ++i) {
-            // Find endpoint by QP number before interpreting errors. A flush
-            // completion after endpoint unpublication is expected during
-            // retirement and should not flood logs.
+            // Find endpoint by QP number before interpreting errors. The QP
+            // stays published while the endpoint retires, so notifications
+            // that landed before the retirement are still handed out; the
+            // flushes that follow are told apart by the endpoint's state.
             std::shared_ptr<RdmaEndPoint> endpoint;
             {
                 RWSpinlock::ReadGuard guard(notify_endpoint_map_lock_);
@@ -764,14 +1072,46 @@ int RdmaTransport::processNotifyCompletions() {
                 }
             }
 
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                if (wc[i].status == IBV_WC_WR_FLUSH_ERR &&
-                    (!endpoint ||
-                     endpoint->status() != RdmaEndPoint::EP_READY)) {
-                    continue;
+            // Released only once this completion has been consumed: the
+            // recv payload copied out of its slot, or the send / error path
+            // finished. finishDestroy() waits for this count and
+            // deconstructUnlocked() then frees the recv MR, so releasing it
+            // earlier would let the buffers go while the CQE is still in
+            // this batch. The ring depth and the CQ's completion order keep
+            // that from happening today; this makes it hold by construction,
+            // the way acknowledge() releases wr_depth on the data QPs only
+            // after the completion is handled.
+            struct NotifyInflightRelease {
+                RdmaEndPoint* ep;
+                ~NotifyInflightRelease() {
+                    if (ep) ep->noteNotifyCompletion();
                 }
+            } inflight_release{endpoint.get()};
+
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                // A failed completion leaves this notify QP unusable for good
+                // and only the endpoint lifecycle builds a new one, so left
+                // alone the endpoint stays EP_READY and every later
+                // sendNotification() silently flushes. Retiring it also moves
+                // the data QPs to ERR, so that is reserved for faults which may
+                // mean the peer restarted or the path died. A notify QP that
+                // is retiring or already disabled only flushes from here on,
+                // and those completions stay quiet.
+                const bool endpoint_ready =
+                    endpoint && endpoint->status() == RdmaEndPoint::EP_READY &&
+                    endpoint->notifyConnected();
+                auto action = classifyNotifyCompletion(
+                    wc[i].status, endpoint != nullptr, endpoint_ready);
+                if (action == NotifyCompletionAction::SkipSilently) continue;
+
                 LOG(ERROR) << "Notification completion failed: " << wc[i].status
                            << ", qp_num=" << wc[i].qp_num;
+                if (action == NotifyCompletionAction::DisableNotification) {
+                    endpoint->disableNotification(
+                        "notify QP local completion error");
+                } else if (action == NotifyCompletionAction::RetireEndpoint) {
+                    endpoint->resetConnection("notify QP completion error");
+                }
                 continue;
             }
 
@@ -811,5 +1151,17 @@ void RdmaTransport::notifyWorkerThread() {
         usleep(notify_poll_interval_us_);
     }
 }
+
+double RdmaTransport::getEstimatedBandwidth() const {
+    if (!workers_) return -1.0;
+    auto* sel = workers_->getDeviceSelector();
+    if (!sel) return -1.0;
+    // The transmit estimate, not the selection EWMA: the admission queue
+    // asks "how fast do bytes move once they are sent", and adds the wait
+    // behind earlier work itself (DeadlineMlu's bytes_ahead), so the rate
+    // must not fold that wait in the way the selection sample does.
+    return sel->getAggregateTransmitBandwidth();
+}
+
 }  // namespace tent
 }  // namespace mooncake

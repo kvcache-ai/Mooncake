@@ -40,6 +40,8 @@ struct TopologyEntry {
     std::vector<std::string> preferred_hca;
     std::vector<std::string> avail_hca;
 
+    bool operator==(const TopologyEntry &other) const = default;
+
     Json::Value toJson() const {
         Json::Value matrix(Json::arrayValue);
         Json::Value hca_list(Json::arrayValue);
@@ -83,6 +85,9 @@ class Topology {
     std::string toString() const;
 
     Json::Value toJson() const;
+
+    bool operator==(const Topology &other) const;
+    bool operator!=(const Topology &other) const { return !(*this == other); }
 
     int selectDevice(const std::string storage_type, int retry_count = 0);
     int selectDevice(const std::string storage_type, std::string_view hint,

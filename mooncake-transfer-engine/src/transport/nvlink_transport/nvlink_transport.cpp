@@ -20,10 +20,15 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
+#include <limits>
+#include <map>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #include "common.h"
@@ -84,11 +89,18 @@ class PerDeviceStreamPool {
                   std::to_string(prop.pciBusID) + ":" +
                   std::to_string(prop.pciDeviceID);
         }
-        const char *visible = getenv("CUDA_VISIBLE_DEVICES");
+        const char *visible =
+#ifdef USE_MUSA
+            getenv("MUSA_VISIBLE_DEVICES");
+        constexpr const char *visible_name = "MUSA_VISIBLE_DEVICES";
+#else
+            getenv("CUDA_VISIBLE_DEVICES");
+        constexpr const char *visible_name = "CUDA_VISIBLE_DEVICES";
+#endif
         LOG(INFO) << "NvlinkTransport: NVLink CUDA stream created on device "
-                  << device_id << " [physical: " << pci
-                  << "] CUDA_VISIBLE_DEVICES="
-                  << (visible ? visible : "(not set)") << " pid=" << getpid();
+                  << device_id << " [physical: " << pci << "] " << visible_name
+                  << "=" << (visible ? visible : "(not set)")
+                  << " pid=" << getpid();
         pool_[device_id] = entry;
         return entry;
     }
@@ -155,6 +167,37 @@ static cudaEvent_t getCallerSyncEvent() {
     return tl_device_event_pool.getOrCreate(current_device);
 }
 
+// cudaMemcpyAsync is issued against the current device context on MUSA.  Keep
+// the caller's device intact while submitting work to a per-device stream.
+class ScopedCudaDevice {
+   public:
+    explicit ScopedCudaDevice(int device) {
+        status_ = cudaGetDevice(&saved_device_);
+        if (status_ != cudaSuccess) return;
+        if (saved_device_ != device) {
+            status_ = cudaSetDevice(device);
+            changed_ = status_ == cudaSuccess;
+        }
+    }
+
+    ~ScopedCudaDevice() {
+        if (changed_) {
+            cudaError_t err = cudaSetDevice(saved_device_);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "NvlinkTransport: failed to restore device "
+                           << saved_device_ << ": " << cudaGetErrorString(err);
+            }
+        }
+    }
+
+    bool ok() const { return status_ == cudaSuccess; }
+
+   private:
+    int saved_device_{-1};
+    cudaError_t status_{cudaSuccess};
+    bool changed_{false};
+};
+
 static int getDeviceForPointer(const void *ptr) {
     cudaPointerAttributes attr;
     if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
@@ -164,13 +207,39 @@ static int getDeviceForPointer(const void *ptr) {
     return (attr.type == cudaMemoryTypeDevice) ? attr.device : -1;
 }
 
-static CudaStreamEntry getStreamForRequest(const void *source) {
-    int device_id = getDeviceForPointer(source);
-    if (device_id < 0) {
-        cudaGetDevice(&device_id);
-        if (device_id < 0) device_id = 0;
+class DefaultNvlinkTransportPolicy final : public GpuIpcTransportPolicy {
+   public:
+    const char *protocol() const override { return "nvlink"; }
+    const char *displayName() const override { return "NvlinkTransport"; }
+
+    int selectStreamDevice(const void *local_buffer, const void * /*source*/,
+                           const void * /*destination*/) const override {
+        int device_id = getDeviceForPointer(local_buffer);
+        if (device_id < 0) cudaGetDevice(&device_id);
+        return device_id < 0 ? 0 : device_id;
     }
-    return tl_device_stream_pool.getOrCreate(device_id);
+
+    cudaError_t openIpcMemHandle(void **address, cudaIpcMemHandle_t handle,
+                                 const std::string & /*location*/,
+                                 int &opened_device) const override {
+        // Keep the legacy CUDA path byte-for-byte in terms of context
+        // ownership.  The recorded device is only needed by policies (MUSA)
+        // whose IPC close operation is context-sensitive.
+        opened_device = -1;
+        return cudaIpcOpenMemHandle(address, handle,
+                                    cudaIpcMemLazyEnablePeerAccess);
+    }
+
+    cudaError_t closeIpcMemHandle(void *address,
+                                  int /*opened_device*/) const override {
+        return cudaIpcCloseMemHandle(address);
+    }
+};
+
+static std::shared_ptr<GpuIpcTransportPolicy> makeDefaultNvlinkPolicy() {
+    static std::shared_ptr<GpuIpcTransportPolicy> policy =
+        std::make_shared<DefaultNvlinkTransportPolicy>();
+    return policy;
 }
 
 }  // anonymous namespace
@@ -190,11 +259,42 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
                               const std::vector<void *> &srcs,
                               const std::vector<void *> &dsts,
                               const std::vector<size_t> &sizes,
-                              cudaStream_t stream) {
+                              const GpuIpcTransportPolicy *policy,
+                              cudaStream_t stream, int stream_device) {
     if (slices.empty()) return;
 
     const size_t count = slices.size();
-    cudaError_t err = cudaSuccess;
+
+    // A vendor policy may provide a lower-CPU batch primitive.  MUSA uses
+    // muMemoryTransferBatchAsync here; CUDA keeps the existing runtime paths
+    // below.  A handled failure is terminal for this group: retrying with
+    // per-slice copies could duplicate operations already accepted by the
+    // driver.
+    if (policy) {
+        size_t fail_index = std::numeric_limits<size_t>::max();
+        if (policy->submitBatchCopies(srcs, dsts, sizes, stream, fail_index)) {
+            if (fail_index == count) {
+                for (size_t i = 0; i < count; ++i) {
+                    slices[i]->status = Slice::POSTED;
+                    slices[i]->local.cuda_stream = (void *)stream;
+                    slices[i]->local.cuda_device = stream_device;
+                }
+            } else {
+                const size_t posted = fail_index < count ? fail_index : 0;
+                for (size_t i = 0; i < posted; ++i) {
+                    slices[i]->status = Slice::POSTED;
+                    slices[i]->local.cuda_stream = (void *)stream;
+                    slices[i]->local.cuda_device = stream_device;
+                }
+                for (size_t i = posted; i < count; ++i) {
+                    if (slices[i]->status == Slice::PENDING) {
+                        slices[i]->markFailed();
+                    }
+                }
+            }
+            return;
+        }
+    }
 
     // Log the active memcpy path once per process lifetime
     static const bool logged_once = [] {
@@ -213,6 +313,7 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
     (void)logged_once;
 
 #if CUDART_VERSION >= 12080
+    cudaError_t err = cudaSuccess;
     // srcAccessOrderStream is REQUIRED for P2P copies — without it, the GPU
     // does not insert necessary memory barriers for cross-device access,
     // resulting in segmentation faults. The caller also establishes a
@@ -246,6 +347,7 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         for (size_t i = 0; i < count; ++i) {
             slices[i]->status = Slice::POSTED;
             slices[i]->local.cuda_stream = (void *)stream;
+            slices[i]->local.cuda_device = stream_device;
         }
     }
 #elif CUDART_VERSION >= 12080
@@ -265,14 +367,19 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
             LOG(ERROR) << "NvlinkTransport: cudaMemcpyBatchAsync "
                        << "failed: " << cudaGetErrorString(err);
         }
-        // Copies [0, fail_idx) were submitted successfully → POSTED.
+        // Copies [0, fail_idx) were submitted successfully → POSTED.  The
+        // runtime does not guarantee a useful index on every error; an
+        // out-of-range value therefore means that no slice is safe to mark
+        // POSTED.
         // Copy [fail_idx] failed → FAILED.
         // Copies (fail_idx, count) were never submitted → FAILED.
-        for (size_t i = 0; i < fail_idx; ++i) {
+        const size_t posted = fail_idx < count ? fail_idx : 0;
+        for (size_t i = 0; i < posted; ++i) {
             slices[i]->status = Slice::POSTED;
             slices[i]->local.cuda_stream = (void *)stream;
+            slices[i]->local.cuda_device = stream_device;
         }
-        for (size_t i = fail_idx; i < count; ++i) {
+        for (size_t i = posted; i < count; ++i) {
             if (slices[i]->status == Slice::PENDING) {
                 slices[i]->markFailed();
             }
@@ -281,6 +388,7 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         for (size_t i = 0; i < count; ++i) {
             slices[i]->status = Slice::POSTED;
             slices[i]->local.cuda_stream = (void *)stream;
+            slices[i]->local.cuda_device = stream_device;
         }
     }
 #else
@@ -297,9 +405,154 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         }
         slices[i]->status = Slice::POSTED;
         slices[i]->local.cuda_stream = (void *)stream;
+        slices[i]->local.cuda_device = stream_device;
     }
     return;  // Slice states already set above
 #endif
+}
+
+struct CopyGroup {
+    std::vector<Slice *> slices;
+    std::vector<void *> srcs;
+    std::vector<void *> dsts;
+    std::vector<size_t> sizes;
+    cudaStream_t stream{nullptr};
+};
+
+// A single Mooncake batch may contain requests targeting different GPU
+// ordinals.  MUSA groups by its policy-selected destination device so every
+// copy uses the matching stream/context.  NVIDIA intentionally keeps its
+// legacy behavior: one stream selected from the first request-local buffer.
+static bool submitBatchMemcpyByDevice(
+    const std::shared_ptr<GpuIpcTransportPolicy> &policy,
+    const std::vector<Slice *> &slices, const std::vector<void *> &srcs,
+    const std::vector<void *> &dsts, const std::vector<size_t> &sizes,
+    std::string &error) {
+    if (slices.empty()) return true;
+    if (srcs.size() != slices.size() || dsts.size() != slices.size() ||
+        sizes.size() != slices.size()) {
+        error =
+            std::string(policy->displayName()) + ": invalid copy vector sizes";
+        return false;
+    }
+
+    auto fail_pending = [](const std::vector<Slice *> &failed_slices) {
+        for (Slice *slice : failed_slices) {
+            if (slice && slice->status == Slice::PENDING) slice->markFailed();
+        }
+    };
+
+    auto prepare_stream = [&](int device, cudaStream_t &stream) {
+        CudaStreamEntry stream_entry =
+            tl_device_stream_pool.getOrCreate(device);
+        if (!stream_entry.stream) {
+            error = std::string(policy->displayName()) +
+                    ": failed to create transfer stream on device " +
+                    std::to_string(device);
+            return false;
+        }
+        if (policy->requiresStreamDeviceGuard()) {
+            ScopedCudaDevice guard(device);
+            if (!guard.ok()) {
+                error = std::string(policy->displayName()) +
+                        ": failed to select transfer device " +
+                        std::to_string(device);
+                return false;
+            }
+        }
+        stream = stream_entry.stream;
+        return true;
+    };
+
+    auto submit_group =
+        [&](int device, const std::vector<Slice *> &group_slices,
+            const std::vector<void *> &group_srcs,
+            const std::vector<void *> &group_dsts,
+            const std::vector<size_t> &group_sizes, cudaStream_t stream) {
+            if (policy->requiresStreamDeviceGuard()) {
+                ScopedCudaDevice guard(device);
+                if (!guard.ok()) {
+                    error = std::string(policy->displayName()) +
+                            ": failed to select transfer device " +
+                            std::to_string(device);
+                    return false;
+                }
+                submitBatchMemcpy(group_slices, group_srcs, group_dsts,
+                                  group_sizes, policy.get(), stream, device);
+                return true;
+            }
+            submitBatchMemcpy(group_slices, group_srcs, group_dsts, group_sizes,
+                              policy.get(), stream, device);
+            return true;
+        };
+
+    // Preserve the NVLink hot path and avoid allocation/copy overhead for the
+    // common MUSA case where every entry selects the same destination device.
+    int first_device = policy->selectStreamDevice(slices.front()->source_addr,
+                                                  srcs.front(), dsts.front());
+    if (first_device < 0) {
+        error = std::string(policy->displayName()) +
+                ": policy returned an invalid stream device";
+        fail_pending(slices);
+        return false;
+    }
+
+    bool homogeneous = true;
+    std::vector<int> devices;
+    if (policy->groupTransfersByDevice()) {
+        devices.reserve(slices.size());
+        devices.push_back(first_device);
+        for (size_t i = 1; i < slices.size(); ++i) {
+            int device = policy->selectStreamDevice(slices[i]->source_addr,
+                                                    srcs[i], dsts[i]);
+            if (device < 0) {
+                error = std::string(policy->displayName()) +
+                        ": policy returned an invalid stream device";
+                fail_pending(slices);
+                return false;
+            }
+            devices.push_back(device);
+            homogeneous = homogeneous && device == first_device;
+        }
+    }
+
+    if (!policy->groupTransfersByDevice() || homogeneous) {
+        cudaStream_t stream = nullptr;
+        if (!prepare_stream(first_device, stream) ||
+            !submit_group(first_device, slices, srcs, dsts, sizes, stream)) {
+            fail_pending(slices);
+            return false;
+        }
+        return true;
+    }
+
+    std::map<int, CopyGroup> groups;
+    auto append_to_group = [&](size_t i, int device) {
+        auto &group = groups[device];
+        group.slices.push_back(slices[i]);
+        group.srcs.push_back(srcs[i]);
+        group.dsts.push_back(dsts[i]);
+        group.sizes.push_back(sizes[i]);
+    };
+    for (size_t i = 0; i < slices.size(); ++i) append_to_group(i, devices[i]);
+
+    // Preflight every stream/context before submitting any group, so a setup
+    // failure cannot leave a mixed-device task half POSTED and half PENDING.
+    for (auto &[device, group] : groups) {
+        if (!prepare_stream(device, group.stream)) {
+            fail_pending(slices);
+            return false;
+        }
+    }
+
+    for (auto &[device, group] : groups) {
+        if (!submit_group(device, group.slices, group.srcs, group.dsts,
+                          group.sizes, group.stream)) {
+            fail_pending(slices);
+            return false;
+        }
+    }
+    return true;
 }
 
 static int getNumDevices() {
@@ -392,7 +645,14 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     return true;
 }
 
-NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
+NvlinkTransport::NvlinkTransport()
+    : NvlinkTransport(makeDefaultNvlinkPolicy(), supportFabricMem()) {}
+
+NvlinkTransport::NvlinkTransport(std::shared_ptr<GpuIpcTransportPolicy> policy,
+                                 bool use_fabric_mem)
+    : use_fabric_mem_(use_fabric_mem), policy_(std::move(policy)) {
+    if (!policy_) LOG(FATAL) << "NvlinkTransport requires a runtime policy";
+}
 //     int num_devices = getNumDevices();
 //     if (globalConfig().trace) {
 //         LOG(INFO) << "NvlinkTransport: use_fabric_mem_:" << use_fabric_mem_
@@ -427,10 +687,41 @@ NvlinkTransport::~NvlinkTransport() {
         }
     } else {
         for (auto &entry : remap_entries_) {
-            cudaIpcCloseMemHandle(entry.second.shm_addr);
+            cudaError_t close_err = policy_->closeIpcMemHandle(
+                entry.second.shm_addr, entry.second.device_id);
+            if (close_err != cudaSuccess) {
+                LOG(ERROR) << policy_->displayName()
+                           << ": cudaIpcCloseMemHandle failed: "
+                           << cudaGetErrorString(close_err);
+            }
         }
     }
     remap_entries_.clear();
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    for (auto it = host_numa_registration_handles_.begin();
+         it != host_numa_registration_handles_.end();) {
+        void *address = (it++)->first;
+        const int rc = unregisterHostNumaMemoryLocked(
+            address, true,
+            [this](void *base, bool update) {
+                return metadata_
+                           ? metadata_->removeLocalMemoryBuffer(base, update)
+                           : ERR_METADATA;
+            },
+            [this]() {
+                return metadata_ ? metadata_->updateLocalSegmentDesc()
+                                 : ERR_METADATA;
+            });
+        if (rc != 0) {
+            // Destruction cannot offer a retry. Keep the registry pin so the
+            // allocation cannot unmap a range whose cleanup is incomplete.
+            LOG(ERROR) << "NvlinkTransport: HOST_NUMA cleanup incomplete for "
+                       << address << ": " << rc
+                       << "; unregister before destroying the transport";
+        }
+    }
+#endif
 }
 
 int NvlinkTransport::install(std::string &local_server_name,
@@ -442,7 +733,24 @@ int NvlinkTransport::install(std::string &local_server_name,
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "nvlink";
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (policy_->preserveExistingMetadata()) {
+        auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        if (old_desc) *desc = *old_desc;
+        desc->name = local_server_name_;
+        if (desc->protocol.empty()) {
+            desc->protocol = policy_->protocol();
+        } else if (desc->protocol.find(policy_->protocol()) ==
+                   std::string::npos) {
+            desc->protocol += ",";
+            desc->protocol += policy_->protocol();
+        }
+    } else {
+        desc->protocol = policy_->protocol();
+    }
+#else
+    desc->protocol = policy_->protocol();
+#endif
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -462,12 +770,6 @@ Status NvlinkTransport::submitTransfer(
 
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
-
-    // Get per-device transfer stream for the source buffer's device.
-    CudaStreamEntry stream_entry =
-        getStreamForRequest(entries.empty() ? nullptr : entries[0].source);
-    cudaStream_t stream = stream_entry.stream;
-    if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
 
     // Synchronize with the caller's GPU work (e.g., PyTorch gather operations)
     // that produced the source data. We use cudaEventSynchronize (CPU-blocking)
@@ -529,8 +831,13 @@ Status NvlinkTransport::submitTransfer(
         slices.push_back(slice);
     }
 
-    // Phase 2: Submit all memcpy operations
-    submitBatchMemcpy(slices, srcs, dsts, sizes, stream);
+    // Phase 2: Let the backend choose the submission device after IPC address
+    // relocation, grouping a mixed-target batch by the selected device.
+    std::string submit_error;
+    if (!submitBatchMemcpyByDevice(policy_, slices, srcs, dsts, sizes,
+                                   submit_error)) {
+        return Status::Context(submit_error);
+    }
 
     return Status::OK();
 }
@@ -545,20 +852,31 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    // Poll POSTED slices for async completion via cudaStreamQuery.
-    // Cache the query result per stream to avoid redundant driver calls.
-    // With SGLang-side torch.cuda.device(gpu_id), the calling thread's
-    // active device matches the stream's device, so no device switching
-    // is needed.
-    std::unordered_map<cudaStream_t, cudaError_t> stream_status_cache;
+    // Poll POSTED slices for async completion via cudaStreamQuery.  MUSA's
+    // destination-owned stream may differ from the caller's current device;
+    // its policy switches context for the query while CUDA keeps the legacy
+    // direct-query behavior.
+    std::map<int, std::unordered_map<cudaStream_t, cudaError_t>>
+        stream_status_cache;
     for (auto *slice : task.slice_list) {
         if (slice && slice->status == Slice::POSTED) {
             cudaStream_t stream = (cudaStream_t)slice->local.cuda_stream;
-            auto it = stream_status_cache.find(stream);
+            const int stream_device = slice->local.cuda_device;
+            auto &device_cache = stream_status_cache[stream_device];
+            auto it = device_cache.find(stream);
             cudaError_t cuda_err;
-            if (it == stream_status_cache.end()) {
-                cuda_err = cudaStreamQuery(stream);
-                stream_status_cache[stream] = cuda_err;
+            if (it == device_cache.end()) {
+                if (policy_->requiresStreamDeviceGuard()) {
+                    ScopedCudaDevice guard(stream_device);
+                    if (!guard.ok()) {
+                        slice->markFailed();
+                        continue;
+                    }
+                    cuda_err = cudaStreamQuery(stream);
+                } else {
+                    cuda_err = cudaStreamQuery(stream);
+                }
+                device_cache[stream] = cuda_err;
             } else {
                 cuda_err = it->second;
             }
@@ -569,9 +887,13 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             }
         }
     }
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
@@ -587,11 +909,6 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status NvlinkTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    // Get per-device transfer stream. See submitTransfer() for rationale.
-    CudaStreamEntry stream_entry = getStreamForRequest(
-        task_list.empty() ? nullptr : task_list[0]->request->source);
-    cudaStream_t stream = stream_entry.stream;
-    if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
     // Synchronize with caller's GPU work via cudaEventSynchronize.
     cudaEvent_t sync_event = getCallerSyncEvent();
     cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
@@ -650,8 +967,12 @@ Status NvlinkTransport::submitTransferTask(
         slices.push_back(slice);
     }
 
-    // Phase 2: Submit all memcpy operations
-    submitBatchMemcpy(slices, srcs, dsts, sizes, stream);
+    // Phase 2: See submitTransfer() for backend-specific stream grouping.
+    std::string submit_error;
+    if (!submitBatchMemcpyByDevice(policy_, slices, srcs, dsts, sizes,
+                                   submit_error)) {
+        return Status::Context(submit_error);
+    }
 
     return Status::OK();
 }
@@ -689,11 +1010,28 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         BufferDesc desc;
         desc.addr = (uint64_t)addr;
         desc.length = length;
-        desc.name = location;
+        desc.name = policy_->normalizeMemoryLocation(addr, location);
         desc.shm_name =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (policy_->preserveExistingMetadata())
+            desc.protocol = policy_->protocol();
+#endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     } else {
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+        const auto host_numa_result = registerHostNumaMemoryLocked(
+            addr, length, location, update_metadata,
+            [this](const BufferDesc &desc, bool update) {
+                return metadata_->addLocalMemoryBuffer(desc, update);
+            },
+            [this](void *base, bool update) {
+                return metadata_->removeLocalMemoryBuffer(base, update);
+            },
+            [this]() { return metadata_->updateLocalSegmentDesc(); });
+        if (host_numa_result) return *host_numa_result;
+#endif
+
         CUmemGenericAllocationHandle handle;
         auto result = cuMemRetainAllocationHandle(&handle, addr);
         if (result != CUDA_SUCCESS) {
@@ -730,15 +1068,252 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         BufferDesc desc;
         desc.addr = (uint64_t)real_addr;  // (uint64_t)addr;
         desc.length = real_size;          // length;
-        desc.name = location;
+        desc.name = policy_->normalizeMemoryLocation(addr, location);
         desc.shm_name =
             serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (policy_->preserveExistingMetadata())
+            desc.protocol = policy_->protocol();
+#endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 }
 
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+std::optional<int> NvlinkTransport::registerHostNumaMemoryLocked(
+    void *addr, size_t length, const std::string &location,
+    bool update_metadata, const AddLocalMemoryBufferOp &add_buffer,
+    const RemoveLocalMemoryBufferOp &remove_buffer,
+    const UpdateLocalSegmentDescOp &update_segment) {
+    auto previous = host_numa_registration_handles_.find(addr);
+    if (previous != host_numa_registration_handles_.end()) {
+        if (previous->second.registration_succeeded ||
+            previous->second.length != length)
+            return ERR_ADDRESS_OVERLAPPED;
+    }
+
+    NvlinkHostNumaAllocation::DriverApi driver_api;
+    using OwnedRangeResult = NvlinkHostNumaAllocation::OwnedRangeResult;
+    const auto range =
+        NvlinkHostNumaAllocation::AcquireOwnedRange(addr, length, &driver_api);
+    if (range == OwnedRangeResult::kNotOwned) {
+        if (previous != host_numa_registration_handles_.end())
+            return ERR_INVALID_ARGUMENT;
+        return std::nullopt;
+    }
+    if (range == OwnedRangeResult::kError) return ERR_MEMORY;
+    if (range != OwnedRangeResult::kPinned) return ERR_INVALID_ARGUMENT;
+
+    if (previous != host_numa_registration_handles_.end()) {
+        // Keep the new pin across old cleanup, so Release cannot recycle the
+        // VA between attempts. Deferred publication cannot waive old cleanup.
+        const int rc = unregisterHostNumaMemoryLocked(addr, true, remove_buffer,
+                                                      update_segment);
+        if (rc != 0) {
+            NvlinkHostNumaAllocation::ReleaseOwnedRange(addr, length);
+            return rc;
+        }
+    }
+
+    try {
+        HostNumaRegistration pending;
+        pending.api = std::move(driver_api);
+        pending.length = length;
+        const bool inserted =
+            host_numa_registration_handles_.emplace(addr, std::move(pending))
+                .second;
+        if (!inserted) {
+            NvlinkHostNumaAllocation::ReleaseOwnedRange(addr, length);
+            return ERR_ADDRESS_OVERLAPPED;
+        }
+    } catch (...) {
+        NvlinkHostNumaAllocation::ReleaseOwnedRange(addr, length);
+        return ERR_MEMORY;
+    }
+
+    auto registration = host_numa_registration_handles_.find(addr);
+    CUmemGenericAllocationHandle handle;
+    const auto &api = registration->second.api;
+    CUresult result = api.mem_retain_allocation_handle(&handle, addr);
+    if (result != CUDA_SUCCESS) {
+        LOG(WARNING) << "NvlinkTransport: failed to retain the exact HOST_NUMA "
+                        "allocation handle for "
+                     << addr << ": " << result;
+        const int cleanup_rc = unregisterHostNumaMemoryLocked(
+            addr, false, remove_buffer, update_segment);
+        if (cleanup_rc != 0)
+            LOG(ERROR) << "NvlinkTransport: HOST_NUMA pin cleanup failed: "
+                       << cleanup_rc;
+        return ERR_MEMORY;
+    }
+    registration->second.handle = handle;
+    registration->second.handle_owned = true;
+
+    CUmemFabricHandle export_handle;
+    result = api.mem_export_to_shareable_handle(&export_handle, handle,
+                                                CU_MEM_HANDLE_TYPE_FABRIC, 0);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: failed to export the exact HOST_NUMA "
+                      "allocation handle for "
+                   << addr << ": " << result;
+        const int cleanup_rc = unregisterHostNumaMemoryLocked(
+            addr, false, remove_buffer, update_segment);
+        if (cleanup_rc != 0) {
+            LOG(ERROR) << "NvlinkTransport: failed to release retained "
+                          "HOST_NUMA handle after export failure for "
+                       << addr << ": " << cleanup_rc;
+        }
+        return ERR_MEMORY;
+    }
+
+    BufferDesc desc;
+    desc.addr = reinterpret_cast<uint64_t>(addr);
+    desc.length = length;
+    desc.name = location;
+    desc.shm_name =
+        serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+    registration->second.metadata_removed_locally = false;
+    registration->second.metadata_cleanup_complete = false;
+
+    const int publication_rc = add_buffer(desc, update_metadata);
+    if (publication_rc == 0) {
+        registration->second.registration_succeeded = true;
+        return 0;
+    }
+
+    const int rollback_rc = unregisterHostNumaMemoryLocked(
+        addr, update_metadata, remove_buffer, update_segment);
+    if (rollback_rc != 0) {
+        LOG(ERROR) << "NvlinkTransport: failed to roll back exact HOST_NUMA "
+                      "registration for "
+                   << addr << ": " << rollback_rc;
+    }
+    return publication_rc;
+}
+
+int NvlinkTransport::unregisterHostNumaMemoryLocked(
+    void *addr, bool update_metadata,
+    const RemoveLocalMemoryBufferOp &remove_buffer,
+    const UpdateLocalSegmentDescOp &update_segment) {
+    auto registration = host_numa_registration_handles_.find(addr);
+    if (registration == host_numa_registration_handles_.end())
+        return ERR_ADDRESS_NOT_REGISTERED;
+
+    if (!registration->second.metadata_removed_locally) {
+        const int rc = remove_buffer(addr, update_metadata);
+        if (rc == ERR_ADDRESS_NOT_REGISTERED) {
+            registration->second.metadata_removed_locally = true;
+            if (update_metadata) {
+                const int update_rc = update_segment();
+                if (update_rc != 0) return update_rc;
+            }
+            registration->second.metadata_cleanup_complete = update_metadata;
+        } else if (rc != 0) {
+            // removeLocalMemoryBuffer updates the local descriptor before it
+            // attempts external publication.
+            registration->second.metadata_removed_locally = true;
+            return rc;
+        } else {
+            registration->second.metadata_removed_locally = true;
+            registration->second.metadata_cleanup_complete = update_metadata;
+        }
+    } else if (!registration->second.metadata_cleanup_complete) {
+        if (!update_metadata) return 0;
+        const int rc = update_segment();
+        if (rc != 0) return rc;
+        registration->second.metadata_cleanup_complete = true;
+    }
+
+    // Deferred deletion is not permission to unmap the allocation. The batch
+    // publisher (or a later unregister with update_metadata=true) completes it.
+    if (!registration->second.metadata_cleanup_complete) return 0;
+
+    // Project policy treats a non-success result as retaining this reference,
+    // so the registration record remains available for a later retry.
+    if (registration->second.handle_owned) {
+        CUresult result =
+            registration->second.api.mem_release(registration->second.handle);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR)
+                << "NvlinkTransport: failed to release retained HOST_NUMA "
+                   "registration handle for "
+                << addr << ": " << result;
+            return ERR_MEMORY;
+        }
+        registration->second.handle_owned = false;
+    }
+    if (!NvlinkHostNumaAllocation::ReleaseOwnedRange(
+            addr, registration->second.length))
+        return ERR_MEMORY;
+    host_numa_registration_handles_.erase(registration);
+    return 0;
+}
+
+int NvlinkTransport::unregisterHostNumaMemoryBatchLocked(
+    const std::vector<void *> &addr_list,
+    const RemoveLocalMemoryBufferOp &remove_buffer,
+    const UpdateLocalSegmentDescOp &update_segment) {
+    int first_error = 0;
+    bool needs_publication = false;
+    for (void *addr : addr_list) {
+        auto registration = host_numa_registration_handles_.find(addr);
+        int rc = 0;
+        if (registration != host_numa_registration_handles_.end()) {
+            // Completed publication need not be repeated after a release
+            // failure. Other records wait for the single batch publication.
+            if (!registration->second.metadata_cleanup_complete) {
+                rc = unregisterHostNumaMemoryLocked(addr, false, remove_buffer,
+                                                    update_segment);
+                needs_publication = true;
+            }
+        } else if (!NvlinkHostNumaAllocation::IsOwnedRangeBase(addr)) {
+            // Keep legacy address/error semantics. Owned addresses without a
+            // record are already done, including on a partial-batch retry.
+            rc = remove_buffer(addr, false);
+            needs_publication = true;
+        }
+        if (rc != 0 && first_error == 0) first_error = rc;
+    }
+
+    if (needs_publication) {
+        const int rc = update_segment();
+        if (rc != 0) return first_error ? first_error : rc;
+        for (void *addr : addr_list) {
+            auto registration = host_numa_registration_handles_.find(addr);
+            if (registration != host_numa_registration_handles_.end() &&
+                registration->second.metadata_removed_locally)
+                registration->second.metadata_cleanup_complete = true;
+        }
+    }
+
+    std::unordered_set<void *> finalized;
+    for (void *addr : addr_list) {
+        if (!finalized.insert(addr).second) continue;
+        if (host_numa_registration_handles_.count(addr) == 0) continue;
+        const int rc = unregisterHostNumaMemoryLocked(
+            addr, false, remove_buffer, update_segment);
+        if (rc != 0 && first_error == 0) first_error = rc;
+    }
+    return first_error;
+}
+#endif
+
 int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+    std::unique_lock<std::mutex> lock(register_mutex_);
+    if (host_numa_registration_handles_.count(addr) == 0) {
+        lock.unlock();
+        return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    }
+    return unregisterHostNumaMemoryLocked(
+        addr, update_metadata,
+        [this](void *base, bool update) {
+            return metadata_->removeLocalMemoryBuffer(base, update);
+        },
+        [this]() { return metadata_->updateLocalSegmentDesc(); });
+#else
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+#endif
 }
 
 int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
@@ -768,17 +1343,21 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     cudaIpcMemHandle_t handle;
                     memcpy(&handle, output_buffer.data(), sizeof(handle));
                     void *shm_addr = nullptr;
-                    cudaError_t err = cudaIpcOpenMemHandle(
-                        &shm_addr, handle, cudaIpcMemLazyEnablePeerAccess);
+                    int ipc_device = -1;
+                    cudaError_t err = policy_->openIpcMemHandle(
+                        &shm_addr, handle, entry.name, ipc_device);
                     if (err != cudaSuccess) {
-                        LOG(ERROR)
-                            << "NvlinkTransport: cudaIpcOpenMemHandle failed: "
-                            << cudaGetErrorString(err);
+                        LOG(ERROR) << policy_->displayName()
+                                   << ": cudaIpcOpenMemHandle failed: "
+                                   << cudaGetErrorString(err);
                         return -1;
                     }
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = entry.length;
+#ifdef USE_MUSA
+                    shm_entry.device_id = ipc_device;
+#endif
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&
@@ -855,15 +1434,33 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 int NvlinkTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {
-    for (auto &buffer : buffer_list)
-        registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+    for (auto &buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int NvlinkTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    for (auto &addr : addr_list) unregisterLocalMemory(addr, false);
-    return metadata_->updateLocalSegmentDesc();
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    return unregisterHostNumaMemoryBatchLocked(
+        addr_list,
+        [this](void *base, bool update) {
+            return metadata_->removeLocalMemoryBuffer(base, update);
+        },
+        [this]() { return metadata_->updateLocalSegmentDesc(); });
+#else
+    int first_error = 0;
+    for (auto &addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret && !first_error) first_error = ret;
+    }
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
+#endif
 }
 
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {

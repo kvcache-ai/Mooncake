@@ -65,6 +65,11 @@ class StorageFile {
      * @brief Destructor
      * @note Automatically closes the file and releases resources
      */
+    virtual tl::expected<void, ErrorCode> datasync() { return {}; }
+
+    // Prevent destructor from unlinking the arena file on write failure.
+    void SetDeleteOnWriteFail(bool v) { delete_on_write_fail_ = v; }
+
     virtual ~StorageFile() = default;
 
     /**
@@ -150,6 +155,7 @@ class StorageFile {
     ErrorCode get_error_code() { return error_code_; }
 
    protected:
+    bool delete_on_write_fail_ = true;
     std::string filename_;
     int fd_;
     ErrorCode error_code_{ErrorCode::OK};
@@ -159,6 +165,8 @@ class StorageFile {
 class PosixFile : public StorageFile {
    public:
     PosixFile(const std::string &filename, int fd);
+
+    tl::expected<void, ErrorCode> datasync() override;
     ~PosixFile() override;
 
     tl::expected<size_t, ErrorCode> write(const std::string &buffer,
@@ -176,12 +184,11 @@ class PosixFile : public StorageFile {
 #ifdef USE_URING
 /**
  * @class UringFile
- * @brief StorageFile backed by a process-wide shared io_uring ring.
+ * @brief StorageFile backed by a thread-local io_uring ring.
  *
- * All UringFile instances share a single SharedUringRing singleton, so
- * construction and destruction only register/unregister an fd slot — no
- * per-file io_uring_queue_init / io_uring_queue_exit (no mmap/munmap,
- * no TLB shootdown).
+ * UringFile instances used by the same thread share one ring. Each thread
+ * lazily creates its own ring, avoiding cross-thread submission locks and
+ * per-file io_uring_queue_init / io_uring_queue_exit.
  */
 class UringFile : public StorageFile {
    public:
@@ -214,12 +221,15 @@ class UringFile : public StorageFile {
         void *buf;
         size_t len;
         off_t off;
+        size_t bytes_read = 0;
+        ErrorCode error = ErrorCode::OK;
+        bool completed = false;
     };
-    tl::expected<size_t, ErrorCode> batch_read(const ReadDesc *descs, int cnt);
+    tl::expected<void, ErrorCode> batch_read(ReadDesc *descs, int cnt);
 
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.
-    tl::expected<void, ErrorCode> datasync();
+    tl::expected<void, ErrorCode> datasync() override;
 
     // Buffer registration — delegates to the shared ring (process-wide).
     // Static variant: no file instance needed. Must be called once from a

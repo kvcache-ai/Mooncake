@@ -10,7 +10,14 @@
 #include <utility>
 #include <vector>
 
+#include <asio/executor_work_guard.hpp>
 #include <glog/logging.h>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
+#include <ylt/coro_io/coro_io.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
@@ -21,6 +28,7 @@
 #include "master_metric_manager.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -171,31 +179,33 @@ std::string EscapePrometheusLabel(std::string_view input) {
     return escaped;
 }
 
+struct HttpDfsShardCountResponse {
+    bool success{true};
+    int shard_count{0};
+};
+YLT_REFL(HttpDfsShardCountResponse, success, shard_count);
+
 struct HttpTenantQuotaSnapshot {
     std::string tenant_id;
     uint64_t requested_quota_bytes{0};
     uint64_t effective_quota_bytes{0};
-    uint64_t used_bytes{0};
-    uint64_t reserved_bytes{0};
-    uint64_t committed_count{0};
-    uint64_t metadata_object_count{0};
+    uint64_t charged_bytes{0};
+    bool admission_closed{true};
     bool over_quota{false};
     bool has_explicit_policy{false};
 };
 YLT_REFL(HttpTenantQuotaSnapshot, tenant_id, requested_quota_bytes,
-         effective_quota_bytes, used_bytes, reserved_bytes, committed_count,
-         metadata_object_count, over_quota, has_explicit_policy);
+         effective_quota_bytes, charged_bytes, admission_closed, over_quota,
+         has_explicit_policy);
 
 HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
     const TenantQuotaSnapshot& snapshot) {
     return HttpTenantQuotaSnapshot{
-        .tenant_id = snapshot.tenant_id,
+        .tenant_id = snapshot.tenant_id.value(),
         .requested_quota_bytes = snapshot.requested_quota_bytes,
         .effective_quota_bytes = snapshot.effective_quota_bytes,
-        .used_bytes = snapshot.used_bytes,
-        .reserved_bytes = snapshot.reserved_bytes,
-        .committed_count = snapshot.committed_count,
-        .metadata_object_count = snapshot.metadata_object_count,
+        .charged_bytes = snapshot.charged_bytes,
+        .admission_closed = snapshot.admission_closed,
         .over_quota = snapshot.over_quota,
         .has_explicit_policy = snapshot.has_explicit_policy,
     };
@@ -230,11 +240,11 @@ tl::expected<std::string, ErrorCode> ParseAdminTenantId(
     if (tenant_id_view.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    std::string tenant_id = NormalizeTenantId(std::string(tenant_id_view));
-    if (!IsValidTenantId(tenant_id)) {
+    TenantId tenant_id{std::string(tenant_id_view)};
+    if (!tenant_id.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return tenant_id;
+    return tenant_id.value();
 }
 
 tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
@@ -252,10 +262,12 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
 }  // namespace
 
 MasterAdminServer::MasterAdminServer(uint16_t http_port,
-                                     bool enable_metric_reporting)
+                                     bool enable_metric_reporting,
+                                     std::string http_host)
     : http_port_(http_port),
+      http_host_(std::move(http_host)),
       enable_metric_reporting_(enable_metric_reporting),
-      http_server_(4, http_port) {}
+      http_server_(4, http_port, http_host_) {}
 
 MasterAdminServer::~MasterAdminServer() { Stop(); }
 
@@ -268,8 +280,8 @@ bool MasterAdminServer::Start() {
 
     auto ec = http_server_.async_start();
     if (ec.hasResult()) {
-        LOG(ERROR) << "Failed to start master admin server on port "
-                   << http_port_;
+        LOG(ERROR) << "Failed to start master admin server on " << http_host_
+                   << ":" << http_port_ << ": " << ec.value().message();
         return false;
     }
 
@@ -278,6 +290,7 @@ bool MasterAdminServer::Start() {
         metric_report_running_.store(true);
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_.load()) {
+                RefreshStorageMetrics();
                 const auto snapshot = SnapshotState();
                 std::ostringstream log_stream;
                 log_stream << "Master Admin Metrics: role="
@@ -336,16 +349,32 @@ void MasterAdminServer::SetObservedLeader(
 
 void MasterAdminServer::SetServiceDelegate(
     std::shared_ptr<WrappedMasterService> service) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    service_ = std::move(service);
-    if (!service_) {
-        service_available_ = false;
+    std::lock_guard<std::mutex> refresh_lock(storage_metrics_refresh_mutex_);
+    bool clear_storage_metrics = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        service_ = std::move(service);
+        if (!service_) {
+            service_available_ = false;
+        }
+        clear_storage_metrics = !service_available_;
+    }
+    if (clear_storage_metrics) {
+        MasterMetricManager::instance().project_storage_usage({});
     }
 }
 
 void MasterAdminServer::SetServiceAvailable(bool available) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    service_available_ = available && service_ != nullptr;
+    std::lock_guard<std::mutex> refresh_lock(storage_metrics_refresh_mutex_);
+    bool service_available = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        service_available_ = available && service_ != nullptr;
+        service_available = service_available_;
+    }
+    if (!service_available) {
+        MasterMetricManager::instance().project_storage_usage({});
+    }
 }
 
 MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
@@ -359,6 +388,7 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
 }
 
 std::string MasterAdminServer::BuildMetricsText() const {
+    RefreshStorageMetrics();
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
@@ -391,18 +421,12 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
         << "# HELP mooncake_tenant_quota_effective_bytes Effective tenant "
            "quota in bytes\n"
         << "# TYPE mooncake_tenant_quota_effective_bytes gauge\n"
-        << "# HELP mooncake_tenant_quota_used_bytes Tenant committed quota "
-           "usage in bytes\n"
-        << "# TYPE mooncake_tenant_quota_used_bytes gauge\n"
-        << "# HELP mooncake_tenant_quota_reserved_bytes Tenant reserved quota "
-           "usage in bytes\n"
-        << "# TYPE mooncake_tenant_quota_reserved_bytes gauge\n"
-        << "# HELP mooncake_tenant_quota_committed_count Tenant committed "
-           "object count\n"
-        << "# TYPE mooncake_tenant_quota_committed_count gauge\n"
-        << "# HELP mooncake_tenant_quota_metadata_object_count Tenant "
-           "metadata object count\n"
-        << "# TYPE mooncake_tenant_quota_metadata_object_count gauge\n"
+        << "# HELP mooncake_tenant_quota_charged_bytes Tenant quota charge in "
+           "bytes\n"
+        << "# TYPE mooncake_tenant_quota_charged_bytes gauge\n"
+        << "# HELP mooncake_tenant_quota_admission_closed Tenant quota "
+           "admission-closed flag\n"
+        << "# TYPE mooncake_tenant_quota_admission_closed gauge\n"
         << "# HELP mooncake_tenant_quota_over_quota Tenant over-quota flag\n"
         << "# TYPE mooncake_tenant_quota_over_quota gauge\n"
         << "# HELP mooncake_tenant_quota_explicit_policy Tenant explicit "
@@ -411,22 +435,18 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
     for (const auto& snapshot : snapshots) {
         requested_sum += snapshot.requested_quota_bytes;
         effective_sum += snapshot.effective_quota_bytes;
-        const auto tenant = EscapePrometheusLabel(snapshot.tenant_id);
+        const auto tenant = EscapePrometheusLabel(snapshot.tenant_id.value());
         tenant_metrics << "mooncake_tenant_quota_requested_bytes{tenant_id=\""
                        << tenant << "\"} " << snapshot.requested_quota_bytes
                        << "\n";
         tenant_metrics << "mooncake_tenant_quota_effective_bytes{tenant_id=\""
                        << tenant << "\"} " << snapshot.effective_quota_bytes
                        << "\n";
-        tenant_metrics << "mooncake_tenant_quota_used_bytes{tenant_id=\""
-                       << tenant << "\"} " << snapshot.used_bytes << "\n";
-        tenant_metrics << "mooncake_tenant_quota_reserved_bytes{tenant_id=\""
-                       << tenant << "\"} " << snapshot.reserved_bytes << "\n";
-        tenant_metrics << "mooncake_tenant_quota_committed_count{tenant_id=\""
-                       << tenant << "\"} " << snapshot.committed_count << "\n";
-        tenant_metrics
-            << "mooncake_tenant_quota_metadata_object_count{tenant_id=\""
-            << tenant << "\"} " << snapshot.metadata_object_count << "\n";
+        tenant_metrics << "mooncake_tenant_quota_charged_bytes{tenant_id=\""
+                       << tenant << "\"} " << snapshot.charged_bytes << "\n";
+        tenant_metrics << "mooncake_tenant_quota_admission_closed{tenant_id=\""
+                       << tenant << "\"} "
+                       << (snapshot.admission_closed ? 1 : 0) << "\n";
         tenant_metrics << "mooncake_tenant_quota_over_quota{tenant_id=\""
                        << tenant << "\"} " << (snapshot.over_quota ? 1 : 0)
                        << "\n";
@@ -454,6 +474,7 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
 }
 
 std::string MasterAdminServer::BuildMetricsSummaryText() const {
+    RefreshStorageMetrics();
     const auto snapshot = SnapshotState();
     std::ostringstream oss;
     oss << "role=" << ha::MasterRuntimeRoleToString(snapshot.state)
@@ -494,6 +515,20 @@ void MasterAdminServer::HandleHealth(coro_http::coro_http_request&,
     WriteJsonResponse(resp, coro_http::status_type::ok, payload);
 }
 
+struct HttpVersionResponse {
+    std::string version;
+    std::string display_version;
+};
+YLT_REFL(HttpVersionResponse, version, display_version);
+
+void MasterAdminServer::HandleVersion(coro_http::coro_http_request&,
+                                      coro_http::coro_http_response& resp) {
+    WriteJsonResponse(
+        resp, coro_http::status_type::ok,
+        HttpVersionResponse{.version = GetMooncakeStoreVersion(),
+                            .display_version = MOONCAKE_DISPLAY_VERSION});
+}
+
 struct HttpLeaderResponse {
     bool present{false};
     std::optional<std::string> leader_address;
@@ -520,6 +555,15 @@ std::shared_ptr<WrappedMasterService> MasterAdminServer::GetActiveService()
         return nullptr;
     }
     return snapshot.service;
+}
+
+void MasterAdminServer::RefreshStorageMetrics() const {
+    std::lock_guard<std::mutex> refresh_lock(storage_metrics_refresh_mutex_);
+    const auto runtime = SnapshotState();
+    const auto storage = runtime.service_available && runtime.service
+                             ? runtime.service->GetStorageUsageSnapshot()
+                             : TieredStorageUsageSnapshot{};
+    MasterMetricManager::instance().project_storage_usage(storage);
 }
 
 template <typename Handler>
@@ -567,10 +611,10 @@ struct HttpKvEventsStatusResponse {
     uint64_t published_batches{0};
     uint64_t published_events{0};
     uint64_t dropped_events{0};
-    uint64_t skipped_unparsed_keys{0};
+    uint64_t skipped_keyless_events{0};
 };
 YLT_REFL(HttpKvEventsStatusResponse, enabled, published_batches,
-         published_events, dropped_events, skipped_unparsed_keys);
+         published_events, dropped_events, skipped_keyless_events);
 
 void MasterAdminServer::HandleKvEventsStatus(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
@@ -582,7 +626,7 @@ void MasterAdminServer::HandleKvEventsStatus(
             payload.published_batches = stats.published_batches;
             payload.published_events = stats.published_events;
             payload.dropped_events = stats.dropped_events;
-            payload.skipped_unparsed_keys = stats.skipped_unparsed_keys;
+            payload.skipped_keyless_events = stats.skipped_keyless_events;
             WriteJsonResponse(resp, coro_http::status_type::ok, payload);
         });
 }
@@ -772,6 +816,87 @@ struct HttpCreateDrainJobResponse {
 };
 YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
          error_message);
+
+void MasterAdminServer::HandleGetDfsShardCount(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->GetDfsShardCount();
+        if (!result) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpDfsShardCountResponse{true, *result});
+    });
+}
+
+async_simple::coro::Lazy<void> MasterAdminServer::HandleExpandDfsShards(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    Json::CharReaderBuilder builder;
+    builder["rejectDupKeys"] = true;
+    builder["failIfExtra"] = true;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    Json::Value body;
+    std::string errors;
+    const auto text = req.get_body();
+    const bool parsed =
+        reader->parse(text.data(), text.data() + text.size(), &body, &errors);
+    if (!parsed || !body.isObject() || !body.isMember("shard_count") ||
+        (body["shard_count"].type() != Json::intValue &&
+         body["shard_count"].type() != Json::uintValue) ||
+        !body["shard_count"].isInt() || body["shard_count"].asInt() <= 0) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "shard_count must be an integer in [1, INT_MAX]");
+        co_return;
+    }
+    const int shard_count = body["shard_count"].asInt();
+    auto service = GetActiveService();
+    if (!service) {
+        SetServiceUnavailable(resp, "Master service is not available");
+        co_return;
+    }
+    auto running = dfs_expansion_running_;
+    if (running->exchange(true)) {
+        WriteErrorResponse(resp, coro_http::status_type::conflict,
+                           ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+                           "A DFS expansion is already in progress");
+        co_return;
+    }
+    struct ResetRunning {
+        std::shared_ptr<std::atomic<bool>> flag;
+        ~ResetRunning() { flag->store(false); }
+    } reset{running};
+    // Filesystem preparation can block, especially on a shared filesystem.
+    // Retain the HTTP executor until the worker finishes: server stop() drains
+    // that executor, but does not wait for the global blocking pool itself.
+    const auto io_executor =
+        req.get_conn()->get_executor()->get_asio_executor();
+    auto work = asio::make_work_guard(io_executor);
+    // Keep the owning callable and pending operation in the coroutine frame.
+    auto expand = [service, shard_count]() {
+        return service->ExpandDfsShards(shard_count);
+    };
+    auto pending = coro_io::post(expand);
+    auto completion = co_await std::move(pending);
+    // post() resumes on the worker. Response/socket handling must return to
+    // the connection's executor before releasing its outstanding work.
+    co_await coro_io::dispatch(io_executor);
+    if (completion.hasError()) {
+        WriteErrorResponse(resp, coro_http::status_type::internal_server_error,
+                           ErrorCode::INTERNAL_ERROR);
+        co_return;
+    }
+    auto result = std::move(completion).value();
+    if (!result) {
+        WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                           result.error());
+        co_return;
+    }
+    WriteJsonResponse(resp, coro_http::status_type::ok,
+                      HttpDfsShardCountResponse{true, *result});
+}
 
 void MasterAdminServer::HandleCreateDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
@@ -1109,10 +1234,12 @@ void MasterAdminServer::HandleUpsertTenantQuota(
                            ErrorCode::INVALID_PARAMS, body_result.error());
         return;
     }
-    if (body_result->requested_quota_bytes == 0) {
+    if (body_result->requested_quota_bytes == 0 ||
+        body_result->requested_quota_bytes >
+            TenantQuotaAccount::kMaxChargedBytes) {
         WriteErrorResponse(resp, coro_http::status_type::bad_request,
                            ErrorCode::INVALID_PARAMS,
-                           "Tenant quota must be positive");
+                           "Tenant quota must be in [1, 2^63 - 1] bytes");
         return;
     }
 
@@ -1157,6 +1284,33 @@ void MasterAdminServer::HandleDeleteTenantQuota(
     });
 }
 
+struct HttpRemoveAllResponse {
+    bool success{true};
+    long removed_count{0};
+};
+YLT_REFL(HttpRemoveAllResponse, success, removed_count);
+
+void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
+                                        coro_http::coro_http_response& resp) {
+    bool force = false;
+    if (auto it = req.get_query_value("force"); !it.empty()) {
+        force = (it == "true" || it == "1");
+    }
+    std::string tenant_id;
+    if (auto it = req.get_query_value("tenant_id"); !it.empty()) {
+        tenant_id = std::string(it);
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        // Empty tenant_id => clear all tenants; pass "" so WrappedMasterService
+        // dispatches to the global (broadcast) RemoveAll, not the "default"
+        // tenant-scoped one.
+        long count = service->RemoveAll(force, tenant_id);
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpRemoveAllResponse{.removed_count = count});
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1172,6 +1326,10 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/health", [this](coro_http_request& req, coro_http_response& resp) {
             HandleHealth(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/version", [this](coro_http_request& req, coro_http_response& resp) {
+            HandleVersion(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/role", [this](coro_http_request& req, coro_http_response& resp) {
@@ -1215,6 +1373,16 @@ void MasterAdminServer::RegisterHandler() {
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleQuerySegment(req, resp);
         });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/dfs/shard_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetDfsShardCount(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/dfs/shard_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            return HandleExpandDfsShards(req, resp);
+        });
     http_server_.set_http_handler<POST>(
         "/api/v1/drain_jobs",
         [this](coro_http_request& req, coro_http_response& resp) {
@@ -1254,6 +1422,11 @@ void MasterAdminServer::RegisterHandler() {
         "/batch_query_keys",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleBatchQueryKeys(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/remove_all",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleRemoveAll(req, resp);
         });
 }
 }  // namespace mooncake

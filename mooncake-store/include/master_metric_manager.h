@@ -3,14 +3,20 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 
+#include "allocator_metric.h"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
 
+#include "client_liveness.h"
+
 namespace mooncake {
+
+struct TieredStorageUsageSnapshot;
 
 class MasterMetricManager {
    public:
@@ -29,7 +35,6 @@ class MasterMetricManager {
     void inc_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_mem_capacity();
-    double get_global_mem_used_ratio(void);
 
     void inc_mem_cache_hit_nums(int64_t val = 1);
     void inc_file_cache_hit_nums(int64_t val = 1);
@@ -55,7 +60,14 @@ class MasterMetricManager {
     void inc_total_nof_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_nof_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_nof_capacity();
-    double get_global_nof_used_ratio(void);
+
+    /**
+     * @brief Refresh storage gauges from authoritative allocator snapshots.
+     *
+     * This is an observability projection. Business code must use the domain
+     * snapshots directly and must not read the resulting gauges.
+     */
+    void project_storage_usage(const TieredStorageUsageSnapshot& snapshot);
 
     enum class CacheHitStat {
         MEMORY_HITS,
@@ -81,28 +93,27 @@ class MasterMetricManager {
     CacheHitStatDict calculate_cache_stats();
 
     // Memory Storage Metrics
-    void inc_allocated_mem_size(int64_t val = 1);
-    void dec_allocated_mem_size(int64_t val = 1);
-    void inc_total_mem_capacity(int64_t val = 1);
-    void dec_total_mem_capacity(int64_t val = 1);
     int64_t get_allocated_mem_size();
     int64_t get_total_mem_capacity();
-    double get_segment_mem_used_ratio(const std::string& segment);
     void reset_segment_allocated_mem_size(const std::string& segment);
     void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);
     int64_t get_segment_total_mem_capacity(const std::string& segment);
 
+    // Remove per-segment memory labels only when both usage and capacity are
+    // zero. Allocator destruction and capacity release retry cleanup when
+    // retained resources are released. Cleanup is best-effort: the zero check
+    // and removal are not atomic with concurrent updates, avoiding a global
+    // lock on the allocation hot path.
+    void remove_segment_metrics(const std::string& segment);
+
     // NoF segment Metrics
-    void inc_allocated_nof_size(int64_t val = 1);
-    void dec_allocated_nof_size(int64_t val = 1);
-    void inc_total_nof_capacity(int64_t val = 1);
-    void dec_total_nof_capacity(int64_t val = 1);
     int64_t get_allocated_nof_size();
     int64_t get_total_nof_capacity();
-    double get_segment_nof_used_ratio(const std::string& segment);
     int64_t get_segment_allocated_nof_size(const std::string& segment);
     int64_t get_segment_total_nof_capacity(const std::string& segment);
+    // Remove all per-segment NoF metric labels for the given segment.
+    void remove_nof_segment_metrics(const std::string& segment);
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);
@@ -130,6 +141,17 @@ class MasterMetricManager {
     void inc_active_clients(int64_t val = 1);
     void dec_active_clients(int64_t val = 1);
     int64_t get_active_clients();
+    void client_liveness_record_created();
+    void client_liveness_became_suspected();
+    void client_liveness_recovered();
+    void client_liveness_became_offline();
+    void on_client_liveness_record_removed(ClientLivenessState state);
+    void reset_client_liveness_metrics(int64_t active_records = 0);
+    void inc_client_offboarding_queue_depth(int64_t jobs = 1);
+    void dec_client_offboarding_queue_depth(int64_t jobs = 1);
+    void inc_client_offboarding_retry();
+    void inc_client_offboarding_alert();
+    void observe_client_offboarding_duration_ms(int64_t duration_ms);
 
     // Snapshot Metrics
     void set_snapshot_duration_ms(int64_t size);
@@ -139,7 +161,9 @@ class MasterMetricManager {
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
+    void inc_put_start_object_already_exists(int64_t val = 1);
     void inc_put_start_alloc_failures(int64_t val = 1);
+    void inc_put_start_partial_allocations(int64_t val = 1);
     void inc_put_end_requests(int64_t val = 1);
     void inc_put_end_failures(int64_t val = 1);
     void inc_put_revoke_requests(int64_t val = 1);
@@ -191,6 +215,7 @@ class MasterMetricManager {
     void inc_batch_get_replica_list_partial_success(int64_t failed_items);
     void inc_batch_put_start_requests(int64_t items);
     void inc_batch_put_start_failures(int64_t failed_items);
+    void inc_batch_put_start_object_already_exists(int64_t items);
     void inc_batch_put_start_partial_success(int64_t failed_items);
     void inc_batch_put_end_requests(int64_t items);
     void inc_batch_put_end_failures(int64_t failed_items);
@@ -202,7 +227,9 @@ class MasterMetricManager {
     // Operation Statistics Getters
     int64_t get_put_start_requests();
     int64_t get_put_start_failures();
+    int64_t get_put_start_object_already_exists();
     int64_t get_put_start_alloc_failures();
+    int64_t get_put_start_partial_allocations();
     int64_t get_put_end_requests();
     int64_t get_put_end_failures();
     int64_t get_put_revoke_requests();
@@ -251,6 +278,7 @@ class MasterMetricManager {
     int64_t get_batch_get_replica_list_failed_items();
     int64_t get_batch_put_start_requests();
     int64_t get_batch_put_start_failures();
+    int64_t get_batch_put_start_object_already_exists();
     int64_t get_batch_put_start_partial_successes();
     int64_t get_batch_put_start_items();
     int64_t get_batch_put_start_failed_items();
@@ -310,6 +338,7 @@ class MasterMetricManager {
     void inc_promotion_completed_bytes(int64_t bytes);
     void inc_promotion_expired(int64_t val = 1);
     void inc_promotion_failed(int64_t val = 1);
+    void inc_promotion_execution_gave_up(int64_t val = 1);
     void inc_promotion_cancelled(int64_t val = 1);
     void inc_promotion_rejected_frequency(int64_t val = 1);
     void inc_promotion_rejected_watermark(int64_t val = 1);
@@ -320,6 +349,22 @@ class MasterMetricManager {
                                  const std::string& reason, int64_t val = 1);
     void inc_tenant_evict_bytes(const std::string& tenant_id, int64_t bytes);
 
+    // Promotion retry candidate metrics
+    void inc_promotion_candidate_recorded(int64_t val = 1);
+    void inc_promotion_candidate_admitted(int64_t val = 1);
+    void inc_promotion_candidate_admission_rejected(int64_t val = 1);
+    void inc_promotion_candidate_expired_evaluated(int64_t val = 1);
+    void inc_promotion_candidate_expired_unevaluated(int64_t val = 1);
+    void inc_promotion_candidate_dropped_limit(int64_t val = 1);
+
+    // SSD Offload Task Metrics (per store worker via client_id label)
+    void inc_offload_enqueued(const std::string& client_id, int64_t val = 1);
+    void inc_offload_completed(const std::string& client_id, int64_t val = 1);
+    void inc_offload_failed(const std::string& client_id, int64_t val = 1);
+    void inc_offload_cancelled(const std::string& client_id, int64_t val = 1);
+    void inc_offload_enqueue_rejected(const std::string& client_id,
+                                      int64_t val = 1);
+
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
     int64_t get_promotion_admitted();
@@ -327,10 +372,17 @@ class MasterMetricManager {
     int64_t get_promotion_completed_bytes();
     int64_t get_promotion_expired();
     int64_t get_promotion_failed();
+    int64_t get_promotion_execution_gave_up();
     int64_t get_promotion_cancelled();
     int64_t get_promotion_rejected_frequency();
     int64_t get_promotion_rejected_watermark();
     int64_t get_promotion_rejected_cap();
+    int64_t get_promotion_candidate_recorded();
+    int64_t get_promotion_candidate_admitted();
+    int64_t get_promotion_candidate_admission_rejected();
+    int64_t get_promotion_candidate_expired_evaluated();
+    int64_t get_promotion_candidate_expired_unevaluated();
+    int64_t get_promotion_candidate_dropped_limit();
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     void inc_copy_start_requests(int64_t val = 1);
@@ -418,6 +470,7 @@ class MasterMetricManager {
         int64_t put_starts = 0;
         int64_t put_start_fails = 0;
         int64_t put_start_alloc_fails = 0;
+        int64_t put_start_partial_allocs = 0;
         int64_t put_ends = 0;
         int64_t put_end_fails = 0;
         int64_t put_revoke_requests = 0;
@@ -513,6 +566,12 @@ class MasterMetricManager {
     std::mutex summary_snapshot_mutex_;
     SummarySnapshot summary_snapshot_;
 
+    std::mutex storage_projection_mutex_;
+    std::set<std::string> projected_mem_segments_;
+    std::set<std::string> projected_nof_segments_;
+
+    AllocatorMetric allocator_metric_;
+
     // Memory Storage Metrics
     ylt::metric::gauge_t
         mem_allocated_size_;  // Overall memory usage update for gauge
@@ -549,11 +608,23 @@ class MasterMetricManager {
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;
+    ylt::metric::gauge_t client_liveness_active_clients_;
+    ylt::metric::gauge_t client_liveness_suspected_clients_;
+    ylt::metric::gauge_t client_liveness_offline_clients_;
+    ylt::metric::counter_t client_liveness_suspected_transitions_;
+    ylt::metric::counter_t client_liveness_recoveries_;
+    ylt::metric::counter_t client_liveness_offline_transitions_;
+    ylt::metric::gauge_t pending_client_offboarding_jobs_metric_;
+    ylt::metric::histogram_t client_offboarding_duration_ms_;
+    ylt::metric::counter_t client_offboarding_retries_;
+    ylt::metric::counter_t client_offboarding_alerts_;
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;
     ylt::metric::counter_t put_start_failures_;
+    ylt::metric::counter_t put_start_object_already_exists_;
     ylt::metric::counter_t put_start_alloc_failures_;
+    ylt::metric::counter_t put_start_partial_allocations_;
     ylt::metric::counter_t put_end_requests_;
     ylt::metric::counter_t put_end_failures_;
     ylt::metric::counter_t put_revoke_requests_;
@@ -613,6 +684,7 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_get_replica_list_failed_items_;
     ylt::metric::counter_t batch_put_start_requests_;
     ylt::metric::counter_t batch_put_start_failures_;
+    ylt::metric::counter_t batch_put_start_object_already_exists_;
     ylt::metric::counter_t batch_put_start_partial_successes_;
     ylt::metric::counter_t batch_put_start_items_;
     ylt::metric::counter_t batch_put_start_failed_items_;
@@ -678,13 +750,28 @@ class MasterMetricManager {
     ylt::metric::counter_t promotion_completed_bytes_;
     ylt::metric::counter_t promotion_expired_;
     ylt::metric::counter_t promotion_failed_;
+    ylt::metric::counter_t promotion_execution_gave_up_;
     ylt::metric::counter_t promotion_cancelled_;
     ylt::metric::counter_t promotion_rejected_frequency_;
     ylt::metric::counter_t promotion_rejected_watermark_;
     ylt::metric::counter_t promotion_rejected_cap_;
+    // Promotion retry candidate metrics
+    ylt::metric::counter_t promotion_candidate_recorded_;
+    ylt::metric::counter_t promotion_candidate_admitted_;
+    ylt::metric::counter_t promotion_candidate_admission_rejected_;
+    ylt::metric::counter_t promotion_candidate_expired_evaluated_;
+    ylt::metric::counter_t promotion_candidate_expired_unevaluated_;
+    ylt::metric::counter_t promotion_candidate_dropped_limit_;
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
+
+    // SSD Offload Task Metrics
+    ylt::metric::dynamic_counter_1t offload_enqueued_total_;
+    ylt::metric::dynamic_counter_1t offload_completed_total_;
+    ylt::metric::dynamic_counter_1t offload_failed_total_;
+    ylt::metric::dynamic_counter_1t offload_cancelled_total_;
+    ylt::metric::dynamic_counter_1t offload_enqueue_rejected_total_;
 
     // Snapshot Metrics
     ylt::metric::histogram_t snapshot_duration_ms_;
@@ -717,6 +804,16 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    // Build Info Metric
+    // Prometheus "info" pattern: the value carries no meaning and is always 1,
+    // the version strings are exposed as labels so dashboards and alerts can
+    // group or filter by the running build. The label values are compile-time
+    // constants, so this is a single-series gauge with static labels rather
+    // than a dynamic-label metric.
+    // Shares the `mooncake_build_info` name with the client-side metric; the
+    // two are told apart by the scrape target's job/instance labels.
+    ylt::metric::gauge_t build_info_;
 };
 
 }  // namespace mooncake

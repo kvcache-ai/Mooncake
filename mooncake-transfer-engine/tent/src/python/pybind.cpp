@@ -29,6 +29,19 @@
 namespace py = pybind11;
 using namespace mooncake::tent;
 
+// The enumerators below are exposed to Python as plain integers, so their
+// values are a compatibility contract shared with the C API macros. Pin them
+// here so that any divergence is a build failure instead of a protocol break
+// that only shows up between mismatched peers.
+static_assert(static_cast<int>(TransportType::UB) == TRANSPORT_UB,
+              "UB wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::MPCOMM) == TRANSPORT_MPCOMM,
+              "MPCOMM wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::HP_TCP) == TRANSPORT_HP_TCP,
+              "HP_TCP wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::XPU) == TRANSPORT_XPU,
+              "XPU wire value must match the C API macro");
+
 // =============================================================================
 // Custom Exception Hierarchy
 // =============================================================================
@@ -86,6 +99,7 @@ static void ThrowStatus(const Status& s, const char* where) {
         case Status::Code::kMetadataError:
             throw MetadataError(full_msg);
         case Status::Code::kRpcServiceError:
+        case Status::Code::kRpcConnectionError:
             throw RpcServiceError(full_msg);
         case Status::Code::kNotImplemented:
             throw NotImplementedError(full_msg);
@@ -300,6 +314,11 @@ PYBIND11_MODULE(tent, m) {
         .value("TCP", TransportType::TCP)
         .value("AscendDirect", TransportType::AscendDirect)
         .value("SUNRISE_LINK", TransportType::SUNRISE_LINK)
+        .value("TPU", TransportType::TPU)
+        .value("UB", TransportType::UB)
+        .value("MPCOMM", TransportType::MPCOMM)
+        .value("HP_TCP", TransportType::HP_TCP)
+        .value("XPU", TransportType::XPU)
         .export_values();
 
     py::enum_<IntentType>(m, "IntentType")
@@ -406,7 +425,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](MemoryGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     py::class_<BatchGuard>(m, "BatchGuard")
@@ -418,7 +436,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](BatchGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     // -------------------------------------------------------------------------
@@ -434,6 +451,9 @@ PYBIND11_MODULE(tent, m) {
         .def("get_segment_name", &TransferEngine::getSegmentName)
         .def("get_rpc_server_address", &TransferEngine::getRpcServerAddress)
         .def("get_rpc_server_port", &TransferEngine::getRpcServerPort)
+        .def("get_local_topology", &TransferEngine::getLocalTopologyString,
+             "Dump local topology as native TENT JSON (nics/mems with "
+             "rank0/1/2)")
 
         // ---------------------------------------------------------------------
         // export/import: out param -> return
@@ -544,7 +564,8 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "allocate_memory_guard");
                 return std::make_unique<MemoryGuard>(&self, addr, size);
             },
-            py::arg("size"), py::arg("location") = kWildcardLocation)
+            py::arg("size"), py::arg("location") = kWildcardLocation,
+            py::keep_alive<0, 1>())
 
         .def(
             "allocate_memory_guard_ex",
@@ -556,7 +577,7 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "allocate_memory_guard_ex");
                 return std::make_unique<MemoryGuard>(&self, addr, size);
             },
-            py::arg("size"), py::arg("options"))
+            py::arg("size"), py::arg("options"), py::keep_alive<0, 1>())
 
         // ---------------------------------------------------------------------
         // register/unregister single
@@ -661,7 +682,7 @@ PYBIND11_MODULE(tent, m) {
                 }
                 return std::make_unique<BatchGuard>(&self, batch_id);
             },
-            py::arg("batch_size"))
+            py::arg("batch_size"), py::keep_alive<0, 1>())
 
         // ---------------------------------------------------------------------
         // submitTransfer overloads
@@ -702,6 +723,15 @@ PYBIND11_MODULE(tent, m) {
             },
             py::arg("batch_id"), py::arg("request_list"), py::arg("name"),
             py::arg("message"))
+
+        .def(
+            "cancel_transfer",
+            [](TransferEngine& self, uint64_t batch_id, size_t task_id) {
+                py::gil_scoped_release release;
+                auto s = self.cancelTransfer((BatchID)batch_id, task_id);
+                ThrowStatus(s, "cancel_transfer");
+            },
+            py::arg("batch_id"), py::arg("task_id"))
 
         // ---------------------------------------------------------------------
         // notification send/receive

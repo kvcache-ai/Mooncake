@@ -27,6 +27,7 @@
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -41,6 +42,16 @@
 
 namespace mooncake {
 namespace tent {
+// libnuma fills the cache numa_node_to_cpus() reads lazily and without locking,
+// so concurrent first callers each allocate it and all but one are orphaned --
+// a leak LeakSanitizer reports. Workers bind every thread at startup, so they
+// hit that window. An inline function, not a static local: bindToSocket() has
+// internal linkage, so a static local would be per-TU.
+inline std::mutex &numaNodeCpuCacheMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 static inline int bindToSocket(int socket_id) {
     if (numa_available() < 0) {
         LOG(WARNING) << "The platform does not support NUMA";
@@ -51,7 +62,10 @@ static inline int bindToSocket(int socket_id) {
     if (socket_id < 0 || socket_id >= numa_num_configured_nodes())
         socket_id = 0;
     struct bitmask *cpu_list = numa_allocate_cpumask();
-    numa_node_to_cpus(socket_id, cpu_list);
+    {
+        std::lock_guard<std::mutex> guard(numaNodeCpuCacheMutex());
+        numa_node_to_cpus(socket_id, cpu_list);
+    }
     int nr_possible_cpus = numa_num_possible_cpus();
     int nr_cpus = 0;
     for (int cpu = 0; cpu < nr_possible_cpus; ++cpu) {

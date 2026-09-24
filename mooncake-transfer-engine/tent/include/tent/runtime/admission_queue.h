@@ -51,12 +51,13 @@ struct QueueLimits {
     // it does not admit/reject or otherwise change what gets dispatched.
     bool deadline_aware{false};
     // Opt-in deadline-infeasible drop (RFC #2519 step 3). Local-decode MLU
-    // threshold θ_local. 0 (default) disables drop entirely — behavior is the
-    // step-2 EDF ordering (or FIFO). When > 0 (e.g. 1.5) and a bandwidth
-    // provider is set, an owner whose predicted MLU
-    // (= predicted_transfer_time / remaining_window) reaches this threshold is
-    // dropped instead of dispatched, and on_local_decode_suggested is raised so
-    // the caller can recompute locally. Requires deadline_aware = true.
+    // threshold θ_local. <= 0 (default 0) disables drop entirely — behavior is
+    // the step-2 EDF ordering (or FIFO). When > 0 (e.g. 1.5) and a bandwidth
+    // provider is set, an owner whose predicted MLU (see DeadlineMlu:
+    // (eligible bytes already dispatched + length) / bandwidth, over the
+    // remaining window) reaches this threshold is dropped instead of
+    // dispatched, and on_local_decode_suggested is raised so the caller can
+    // recompute locally. Requires deadline_aware = true.
     double mlu_local_threshold{0.0};
     // Opt-in deadline proximity promotion. When > 0, pickForDispatch promotes
     // queued owners whose remaining slack (deadline_ns - now) is below this
@@ -74,6 +75,13 @@ struct QueueOwnerInput {
     std::vector<size_t> derived_task_ids;
     Request request{};
     QueueOwnerKind kind{QueueOwnerKind::User};
+    // True only when the caller has established that this owner's transfer
+    // time is governed by the installed bandwidth provider -- for the RDMA
+    // wiring, the aggregate transmit estimate over the local NICs. Default
+    // false keeps degradation explicitly opt-in so a new enqueue path cannot
+    // accidentally predict an MNNVL/TCP/staging transfer, whose completion
+    // time that estimate says nothing about, from an RDMA wire rate.
+    bool degradation_eligible{false};
 };
 
 struct QueueSubmit {
@@ -91,9 +99,13 @@ struct DegradationHooks {
     std::function<void(const Request&)> on_local_decode_suggested;
 };
 
-// Returns the predicted transfer bandwidth in bytes/second, or <= 0 if unknown
-// (in which case the drop decision is skipped). Injected by the owner so the
-// admission queue does not depend on the device-selection layer directly.
+// Returns the rate at which the bytes of a degradation-eligible owner move on
+// the wire, in bytes/second, or <= 0 if unknown (in which case the drop
+// decision is skipped). This is a transmit rate, not a rate that folds in the
+// wait behind other work: queueing enters the prediction separately, as
+// DeadlineMlu's `bytes_ahead`. The RDMA wiring supplies the sum of the local
+// NICs' transmit estimates. Injected by the owner so the admission queue does
+// not depend on the device-selection layer directly.
 using BandwidthProvider = std::function<double()>;
 
 // Returns "now" as a steady-clock timestamp in nanoseconds, matching the units
@@ -134,6 +146,11 @@ class LocalTransferAdmissionQueue {
 
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
 
+    // Cancel an owner that has not entered the dispatch window. Idempotent for
+    // an owner already canceled; dispatching owners must be canceled through
+    // their selected transport instead.
+    Status cancel(QueueOwnerId owner_id);
+
     Status retireBatch(uint64_t batch_token);
 
     Status resolveOwner(uint64_t batch_token, size_t public_task_id,
@@ -146,6 +163,9 @@ class LocalTransferAdmissionQueue {
 
     size_t outstandingBytes() const;
 
+    // Bytes of degradation-eligible owners currently Dispatching.
+    size_t dispatchingBytes() const;
+
    private:
     enum class QueueState {
         Queued,
@@ -157,6 +177,7 @@ class LocalTransferAdmissionQueue {
         uint64_t batch_token{0};
         Request request{};
         QueueOwnerKind kind{QueueOwnerKind::User};
+        bool degradation_eligible{false};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
@@ -171,6 +192,10 @@ class LocalTransferAdmissionQueue {
     size_t outstanding_bytes_{0};
     size_t outstanding_user_owners_{0};
     size_t outstanding_user_bytes_{0};
+    // Bytes of degradation-eligible owners dispatched and not yet completed:
+    // the queue-ahead term of the step-3 drop prediction. Owners on other
+    // transports share the queue but not the provider's bandwidth.
+    size_t dispatching_bytes_{0};
 
     // RFC #2519 step 3 degradation policy (all optional / opt-in).
     BandwidthProvider bandwidth_provider_;

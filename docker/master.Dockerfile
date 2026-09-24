@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1
 
+# Keep docker/master.Dockerfile and docker/master-cuda13.Dockerfile in sync: they must
+# differ ONLY in the three CUDA-flavor lines (the cudalibs FROM, the libcudart COPY and
+# the pip package name). The publish workflow diffs them with those lines normalized.
+
 # Stage cudalibs: take stub libcuda and libcudart from the CUDA devel image
 FROM nvidia/cuda:12.8.1-devel-ubuntu22.04@sha256:a99a1860ba8e2916e5c3e73b72ec4c4301653a84586e05bfc9a2aa2d58027e97 AS cudalibs
 
@@ -11,9 +15,20 @@ FROM python:3.12-slim-trixie@sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315
 ARG MOONCAKE_VERSION
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
-# Install runtime system libraries and tini
+# Install runtime system libraries and tini.
+# ibverbs-providers ships /usr/lib/<triplet>/libmlx5.so.1 plus the libibverbs provider
+# plugins, and both are required:
+#   - at load time, because since 0.3.12 engine.so / store.so / mooncake_master carry a
+#     hard DT_NEEDED on libmlx5.so.1 (the transport links mlx5 for the IBGDA / mlx5dv
+#     DevX path) and auditwheel deliberately does not vendor RDMA libraries into the
+#     wheel -- without it `import mooncake.engine` fails outright, even for TCP-only use;
+#   - at run time, because libibverbs claims devices through those provider plugins:
+#     without the package ibv_get_device_list() returns 0 devices even when the mlx5
+#     devices are visible in /sys/class/infiniband and /dev/infiniband is passed in.
+# It must come from apt next to libibverbs1: both are built from the rdma-core source
+# package and share a private provider ABI, so their versions have to match.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libibverbs1 libnuma1 libcurl4t64 libstdc++6 tini \
+        ca-certificates libibverbs1 ibverbs-providers libnuma1 libcurl4t64 libstdc++6 tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy stub libcuda and libcudart into the loader's default path, refresh the link cache

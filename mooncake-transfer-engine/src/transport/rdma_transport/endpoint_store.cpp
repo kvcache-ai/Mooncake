@@ -47,12 +47,17 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpointByPtr(
 }
 
 std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
-    const std::string &peer_nic_path, RdmaContext *context) {
+    const std::string &peer_nic_path, RdmaContext *context, ibv_cq *cq) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     if (endpoint_map_.find(peer_nic_path) != endpoint_map_.end()) {
         LOG(INFO) << "Endpoint " << peer_nic_path
                   << " already exists in FIFOEndpointStore";
         return endpoint_map_[peer_nic_path];
+    }
+    if (!cq) {
+        LOG(ERROR) << "Cannot insert endpoint " << peer_nic_path
+                   << ": completion queue is null";
+        return nullptr;
     }
     auto endpoint = std::make_shared<RdmaEndPoint>(*context);
     if (!endpoint) {
@@ -60,9 +65,8 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
         return nullptr;
     }
     auto &config = globalConfig();
-    int ret =
-        endpoint->construct(context->cq(), config.num_qp_per_ep, config.max_sge,
-                            config.max_wr, config.max_inline);
+    int ret = endpoint->construct(cq, config.num_qp_per_ep, config.max_sge,
+                                  config.max_wr, config.max_inline);
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();
@@ -80,8 +84,9 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     auto iter = endpoint_map_.find(peer_nic_path);
     // Begin two-phase destruction: mark endpoint as destroying and move QPs
     // to ERR state so inflight WRs are flushed to CQ. The endpoint is moved
-    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() once
-    // all outstanding WRs have been drained.
+    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() only
+    // after all outstanding WRs have been drained. Timed-out endpoints remain
+    // retired in waiting_list_ rather than being force-freed.
     if (iter != endpoint_map_.end()) {
         waiting_list_len_++;
         iter->second->beginDestroy();
@@ -94,13 +99,15 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     return 0;
 }
 
-int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr,
+                                           std::string *deleted_peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     // Find endpoint by pointer
     for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
          ++iter) {
         if (iter->second.get() == endpoint_ptr) {
             std::string peer_nic_path = iter->first;
+            if (deleted_peer_nic_path) *deleted_peer_nic_path = peer_nic_path;
             waiting_list_len_++;
             iter->second->beginDestroy();
             waiting_list_.insert(iter->second);
@@ -142,10 +149,24 @@ void FIFOEndpointStore::reclaimEndpoint() {
 size_t FIFOEndpointStore::getSize() { return endpoint_map_.size(); }
 
 int FIFOEndpointStore::destroyQPs() {
-    for (auto &kv : endpoint_map_) {
-        kv.second->destroyQP();
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    int ret = 0;
+
+    // Always transition QPs to ERR before destroy to flush inflight WRs.
+    for (auto &endpoint : waiting_list_) {
+        endpoint->beginDestroy();
     }
-    return 0;
+    for (auto &kv : endpoint_map_) {
+        kv.second->beginDestroy();
+    }
+
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->destroyQP()) ret = -1;
+    }
+    for (auto &kv : endpoint_map_) {
+        if (kv.second->destroyQP()) ret = -1;
+    }
+    return ret;
 }
 
 int FIFOEndpointStore::disconnectQPs() {
@@ -204,12 +225,17 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpointByPtr(
 }
 
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
-    const std::string &peer_nic_path, RdmaContext *context) {
+    const std::string &peer_nic_path, RdmaContext *context, ibv_cq *cq) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     if (endpoint_map_.find(peer_nic_path) != endpoint_map_.end()) {
         LOG(INFO) << "Endpoint " << peer_nic_path
                   << " already exists in SIEVEEndpointStore";
         return endpoint_map_[peer_nic_path].first;
+    }
+    if (!cq) {
+        LOG(ERROR) << "Cannot insert endpoint " << peer_nic_path
+                   << ": completion queue is null";
+        return nullptr;
     }
     auto endpoint = std::make_shared<RdmaEndPoint>(*context);
     if (!endpoint) {
@@ -217,9 +243,8 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
         return nullptr;
     }
     auto &config = globalConfig();
-    int ret =
-        endpoint->construct(context->cq(), config.num_qp_per_ep, config.max_sge,
-                            config.max_wr, config.max_inline);
+    int ret = endpoint->construct(cq, config.num_qp_per_ep, config.max_sge,
+                                  config.max_wr, config.max_inline);
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();
@@ -236,8 +261,9 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     auto iter = endpoint_map_.find(peer_nic_path);
     // Begin two-phase destruction: mark endpoint as destroying and move QPs
     // to ERR state so inflight WRs are flushed to CQ. The endpoint is moved
-    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() once
-    // all outstanding WRs have been drained.
+    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() only
+    // after all outstanding WRs have been drained. Timed-out endpoints remain
+    // retired in waiting_list_ rather than being force-freed.
     if (iter != endpoint_map_.end()) {
         iter->second.first->beginDestroy();
         waiting_list_len_++;
@@ -254,13 +280,15 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     return 0;
 }
 
-int SIEVEEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+int SIEVEEndpointStore::deleteEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr, std::string *deleted_peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     // Find endpoint by pointer
     for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
          ++iter) {
         if (iter->second.first.get() == endpoint_ptr) {
             std::string peer_nic_path = iter->first;
+            if (deleted_peer_nic_path) *deleted_peer_nic_path = peer_nic_path;
             iter->second.first->beginDestroy();
             waiting_list_len_++;
             waiting_list_.insert(iter->second.first);
@@ -318,9 +346,22 @@ void SIEVEEndpointStore::reclaimEndpoint() {
 }
 
 int SIEVEEndpointStore::destroyQPs() {
-    for (auto &endpoint : waiting_list_) endpoint->destroyQP();
-    for (auto &kv : endpoint_map_) kv.second.first->destroyQP();
-    return 0;
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    int ret = 0;
+
+    // Always transition QPs to ERR before destroy to flush inflight WRs.
+    for (auto &endpoint : waiting_list_) {
+        endpoint->beginDestroy();
+    }
+    for (auto &kv : endpoint_map_) {
+        kv.second.first->beginDestroy();
+    }
+
+    for (auto &endpoint : waiting_list_)
+        if (endpoint->destroyQP()) ret = -1;
+    for (auto &kv : endpoint_map_)
+        if (kv.second.first->destroyQP()) ret = -1;
+    return ret;
 }
 
 int SIEVEEndpointStore::disconnectQPs() {
@@ -344,6 +385,14 @@ void SIEVEEndpointStore::testOnlyInsertWaiting(
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     waiting_list_.insert(ep);
     waiting_list_len_++;
+}
+
+void SIEVEEndpointStore::testOnlyInsertEndpoint(
+    const std::string &peer_nic_path, std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    endpoint_map_[peer_nic_path] = std::make_pair(ep, true);
+    fifo_list_.push_front(peer_nic_path);
+    fifo_map_[peer_nic_path] = fifo_list_.begin();
 }
 
 size_t SIEVEEndpointStore::getTotalQPNumber() {

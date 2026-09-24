@@ -103,7 +103,8 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 ```C++
 struct ReplicateConfig {
     size_t replica_num{1};                    // 对象的总副本数
-    bool with_soft_pin{false};               // 是否为该对象启用软固定机制
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE}; // 软固定状态转换
+    std::optional<uint64_t> soft_pin_ttl_ms{}; // ENABLE 时可覆盖默认 TTL
     std::string preferred_segment{};         // 首选的分配段
 };
 ```
@@ -612,7 +613,7 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
 
 ### 替换策略
 
-当 `PutStart` 请求因内存不足而失败，或者当后台线程检测到空间使用率达到配置的高水位线（默认 95%，可通过 `-eviction_high_watermark_ratio` 配置）时，会触发一次替换任务，通过换出一部分对象来释放空间（默认 5%，可通过 `-eviction_ratio` 配置）。与 `Remove` 类似，被换出的对象仅仅会被标记为已删除，不需要进行数据传输。
+当 `PutStart` 请求因内存不足而失败，或者当后台线程检测到空间使用率达到配置的高水位线（默认 90%，可通过 `-eviction_high_watermark_ratio` 配置）时，会触发一次替换任务，通过换出一部分对象来释放空间（默认 5%，可通过 `-eviction_ratio` 配置）。与 `Remove` 类似，被换出的对象仅仅会被标记为已删除，不需要进行数据传输。
 
 目前采用的是一种近似的 LRU 策略，即尽可能优先换出最近最少被访问的对象。为了避免数据竞争和数据损坏，正在被客户端读取或写入的对象不会被换出。因此，拥有租约或尚未被 `PutEnd` 请求标记为 complete 的对象不会被换出。
 
@@ -622,17 +623,21 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
 
 然而，如果在 `Get` 操作完成读取数据之前租约已过期，该操作将被视为失败，并且不会返回任何数据，以防止潜在的数据损坏。
 
-默认的租约时间为 5 秒，并可通过 `master_service` 的启动参数进行配置。
+默认的租约时间为 10 秒，并可通过 `master_service` 的启动参数进行配置。
 
 ### 软固定机制
 
 对于重要且频繁使用的对象，例如 system prompt，Mooncake Store 提供了软固定（soft pin）机制。在执行 `Put` 操作时，可以选择为特定的对象开启软固定机制。在执行替换任务时，系统会优先替换未被软固定的对象。仅当内存不足且没有其他对象可以被替换时，才会替换被软固定的对象。
 
-如果某个软固定的对象长时间未被访问，其软固定状态将被解除。而后当该对象再次被访问时，它将自动重新进入软固定状态。
+soft pin 生命周期从首个副本变为可读时开始。deadline 到达后，对象降级为普通 Cache；后续访问只授予普通读租约，不会重新启用 soft pin。后续写入仍可显式重新启用。
 
-`master_service` 中有两个与软固定机制相关的启动参数：
+soft pin 是仅在运行时生效的淘汰优先级状态，不会持久化到快照或 HA OpLog。恢复或 Standby 提升后，恢复出的对象将降级为普通 Cache；快照中的兼容字段仅用于保持格式，恢复时会被忽略。
 
-* `default_kv_soft_pin_ttl`：表示一个被软固定的对象在多长时间（毫秒）未被访问后会自动解除软固定状态。默认值为`30 分钟`。
+`master_service` 中有三个与软固定机制相关的启动参数：
+
+* `default_kv_soft_pin_ttl`：未显式传入 TTL 时使用的固定软固定生命周期。默认值为 `30 分钟`，访问不会续期。
+
+* `max_kv_soft_pin_ttl`：Master 接受的请求级 soft pin TTL 上限。默认值为 `24 小时`。
 
 * `allow_evict_soft_pinned_objects`：是否允许替换已被软固定的对象。默认值为 `true`。
 
@@ -661,7 +666,8 @@ Mooncake Store 提供了**首选段分配**功能，允许用户为对象分配�
 ```cpp
 struct ReplicateConfig {
     size_t replica_num{1};                    // 对象的总副本数
-    bool with_soft_pin{false};               // 是否为该对象启用软固定机制
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE}; // 软固定状态转换
+    std::optional<uint64_t> soft_pin_ttl_ms{}; // ENABLE 时可覆盖默认 TTL
     std::string preferred_segment{};         // 首选的分配段
 };
 ```
@@ -747,7 +753,7 @@ HTTP 元数据服务器可通过以下参数进行配置：
 
 ## Mooncake Store Python API
 
-**完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html)
+**完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html)
 
 
 ## 编译及使用方法

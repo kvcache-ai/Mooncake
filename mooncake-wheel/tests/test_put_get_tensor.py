@@ -3,36 +3,50 @@ import struct
 import unittest
 import os
 import time
-import threading
-import random
+
+try:
+    import torch as _torch
+except Exception:
+    _torch = None
+
 from mooncake.store import MooncakeDistributedStore
+from mooncake.structured_object_store import (
+    MISSING,
+    _choose_leaf_codec,
+    _escape_key,
+    infer_structure,
+)
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
-DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
+DEFAULT_DEFAULT_KV_LEASE_TTL = 5000  # 5000 milliseconds
 # Use environment variable if set, otherwise use default
-default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
+default_kv_lease_ttl = int(
+    os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL)
+)
+
+
+def cuda_available():
+    return _torch is not None and _torch.cuda.is_available()
+
 
 # Define a test class for serialization
 class TestClass:
     def __init__(self, version=1, shape=(1, 2, 3)):
         self.version = version
         self.shape = shape
-    
-    def serialize_into(self, buffer):
-        struct.pack_into("i", buffer, 0, self.version)
-        struct.pack_into("3i", buffer, 4, *self.shape)
-        
+
     def serialize_into(self):
         version_bytes = struct.pack("i", self.version)
         shape_bytes = struct.pack("3i", *self.shape)
         return (version_bytes, shape_bytes)
-        
+
     def deserialize_from(buffer):
         version = struct.unpack_from("i", buffer, 0)[0]
         shape = struct.unpack_from("3i", buffer, 4)
         return TestClass(version, shape)
-         
+
+
 def get_client(store):
     """Initialize and setup the distributed store client."""
     protocol = os.getenv("PROTOCOL", "tcp")
@@ -40,19 +54,19 @@ def get_client(store):
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
-    local_buffer_size = 512 * 1024 * 1024     # 512 MB
+    local_buffer_size = 512 * 1024 * 1024  # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-    
+
     retcode = store.setup(
-        local_hostname, 
-        metadata_server, 
+        local_hostname,
+        metadata_server,
         global_segment_size,
-        local_buffer_size, 
-        protocol, 
+        local_buffer_size,
+        protocol,
         device_name,
-        master_server_address
+        master_server_address,
     )
-    
+
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
 
@@ -80,7 +94,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.allclose(tensor, retrieved))
 
         # Int tensor
-        tensor_int = torch.tensor([1,2,3,4], dtype=torch.int32)
+        tensor_int = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
         key_int = "test_tensor_int"
         result = self.store.put_tensor(key_int, tensor_int)
         self.assertEqual(result, 0)
@@ -119,6 +133,126 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(key_bool)
         self.store.remove(key_rand)
 
+    def test_batch_tensor_default_config(self):
+        import torch
+
+        prefix = f"test_batch_tensor_default_{os.getpid()}"
+        keys = [f"{prefix}_{i}" for i in range(2)]
+        tensors = [
+            torch.arange(16, dtype=torch.float32).reshape(4, 4),
+            torch.arange(24, dtype=torch.int64).reshape(2, 3, 4),
+        ]
+        self.assertEqual(self.store.batch_put_tensor(keys, tensors), [0, 0])
+        for key, tensor in zip(keys, tensors):
+            self.assertTrue(torch.equal(self.store.get_tensor(key), tensor))
+            self.store.remove(key)
+
+        upsert_keys = [f"{prefix}_upsert_{i}" for i in range(2)]
+        upsert_tensors = [
+            torch.arange(8, dtype=torch.float32),
+            torch.arange(12, dtype=torch.int32),
+        ]
+        self.assertEqual(
+            self.store.batch_upsert_tensor(upsert_keys, upsert_tensors), [0, 0]
+        )
+        for key, tensor in zip(upsert_keys, upsert_tensors):
+            self.assertTrue(torch.equal(self.store.get_tensor(key), tensor))
+            self.store.remove(key)
+
+    @unittest.skipUnless(cuda_available(), "CUDA is not available")
+    def test_cuda_local_copy_paths(self):
+        """Test CUDA source writes and CUDA destination reads."""
+        import torch
+
+        prefix = f"test_cuda_local_copy_{os.getpid()}"
+        put_key = f"{prefix}_put"
+        upsert_key = f"{prefix}_upsert"
+        raw_key = f"{prefix}_raw"
+
+        tensor = torch.arange(16, dtype=torch.float32, device="cuda")
+        torch.cuda.synchronize()
+        self.assertEqual(self.store.put_tensor(put_key, tensor), 0)
+        self.assertEqual(self.store.upsert_tensor(upsert_key, tensor), 0)
+        self.assertTrue(torch.equal(self.store.get_tensor(put_key), tensor.cpu()))
+        self.assertTrue(torch.equal(self.store.get_tensor(upsert_key), tensor.cpu()))
+
+        # RealClient writes directly to a registered CUDA destination.
+        cuda_destination = torch.empty_like(tensor)
+        destination_bytes = tensor.numel() * tensor.element_size()
+        self.assertEqual(
+            self.store.register_buffer(cuda_destination.data_ptr(), destination_bytes),
+            0,
+        )
+        try:
+            self.assertEqual(
+                self.store.get_tensor_into_cuda(put_key, cuda_destination),
+                destination_bytes,
+            )
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(cuda_destination, tensor))
+        finally:
+            self.store.unregister_buffer(cuda_destination.data_ptr())
+
+        batch_put_keys = [f"{prefix}_batch_put_{i}" for i in range(2)]
+        batch_upsert_keys = [f"{prefix}_batch_upsert_{i}" for i in range(2)]
+        batch_tensors = [
+            torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4),
+            torch.arange(24, dtype=torch.int64, device="cuda").reshape(2, 3, 4),
+        ]
+        torch.cuda.synchronize()
+        self.assertEqual(
+            self.store.batch_put_tensor(batch_put_keys, batch_tensors), [0, 0]
+        )
+        self.assertEqual(
+            self.store.batch_upsert_tensor(batch_upsert_keys, batch_tensors),
+            [0, 0],
+        )
+        batch_destinations = [torch.empty_like(value) for value in batch_tensors]
+        destination_bytes = [
+            value.numel() * value.element_size() for value in batch_tensors
+        ]
+        for destination, size in zip(batch_destinations, destination_bytes):
+            self.assertEqual(
+                self.store.register_buffer(destination.data_ptr(), size), 0
+            )
+        try:
+            self.assertEqual(
+                self.store.batch_get_tensor_into_cuda(
+                    batch_put_keys, batch_destinations
+                ),
+                destination_bytes,
+            )
+            torch.cuda.synchronize()
+            for destination, expected in zip(batch_destinations, batch_tensors):
+                self.assertTrue(torch.equal(destination, expected))
+        finally:
+            for destination in batch_destinations:
+                self.store.unregister_buffer(destination.data_ptr())
+        for key, expected_tensor in zip(batch_put_keys, batch_tensors):
+            self.assertTrue(
+                torch.equal(self.store.get_tensor(key), expected_tensor.cpu())
+            )
+        for key, expected_tensor in zip(batch_upsert_keys, batch_tensors):
+            self.assertTrue(
+                torch.equal(self.store.get_tensor(key), expected_tensor.cpu())
+            )
+
+        raw = bytes(range(32))
+        self.assertEqual(self.store.put(raw_key, raw), 0)
+
+        dst = torch.empty(len(raw), dtype=torch.uint8, device="cuda")
+        self.assertEqual(
+            self.store.get_into(raw_key, dst.data_ptr(), len(raw)), len(raw)
+        )
+        expected = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
+        self.assertTrue(torch.equal(dst, expected))
+
+        self.store.remove(put_key)
+        self.store.remove(upsert_key)
+        for key in batch_put_keys + batch_upsert_keys:
+            self.store.remove(key)
+        self.store.remove(raw_key)
+
     def test_put_get_tensor_with_metadata(self):
         """Test storing and retrieving PyTorch tensors with metadata using put_tensor_with_metadata/get_tensor_with_metadata."""
         import torch
@@ -136,9 +270,11 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.allclose(tensor_2d, retrieved_tensor))
 
         # Test with 3D int tensor
-        tensor_3d = torch.tensor([[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.int64)
+        tensor_3d = torch.tensor(
+            [[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.int64
+        )
         key_3d = "test_tensor_with_metadata_3d"
-        
+
         result = self.store.put_tensor(key_3d, tensor_3d)
         self.assertEqual(result, 0)
 
@@ -152,7 +288,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(key_2d)
         self.store.remove(key_3d)
 
-             
     def _assert_empty_tensor_equal(self, expected, actual):
         import torch
 
@@ -206,7 +341,9 @@ class TestDistributedObjectStore(unittest.TestCase):
             retrieved = self.store.get_tensor_into(key, buffer_ptr, buffer_size)
             self._assert_empty_tensor_equal(tensor, retrieved)
 
-            self.assertEqual(self.store.put_tensor_from(key_from, buffer_ptr, total_length), 0)
+            self.assertEqual(
+                self.store.put_tensor_from(key_from, buffer_ptr, total_length), 0
+            )
             self._assert_empty_tensor_equal(tensor, self.store.get_tensor(key_from))
         finally:
             self.store.unregister_buffer(buffer_ptr)
@@ -223,7 +360,9 @@ class TestDistributedObjectStore(unittest.TestCase):
         split_dim = 0
 
         self.assertEqual(
-            self.store.put_tensor_with_tp(key, tensor, tp_size=tp_size, split_dim=split_dim),
+            self.store.put_tensor_with_tp(
+                key, tensor, tp_size=tp_size, split_dim=split_dim
+            ),
             0,
         )
         for rank in range(tp_size):
@@ -235,31 +374,32 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.store.remove(f"{key}_tp_{rank}")
 
 
-from mooncake.structured_object_store import (
-    MISSING,
-    _choose_leaf_codec,
-    _escape_key,
-    infer_structure,
-)
-
-
 class TestCodecInference(unittest.TestCase):
-
     def test_tensor(self):
         import torch
+
         d = _choose_leaf_codec([torch.tensor([1, 2]), torch.tensor([3])])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
 
-    def test_tensor_mixed_dtype_rejected(self):
+    def test_tensor_mixed_dtype(self):
         import torch
-        d = _choose_leaf_codec([torch.tensor([1], dtype=torch.float32), torch.tensor([1], dtype=torch.int64)])
-        self.assertFalse(d.accepted)
 
-    def test_tensor_mixed_ndim_rejected(self):
-        import torch
-        d = _choose_leaf_codec([torch.tensor([1]), torch.tensor([[1, 2]])])
+        d = _choose_leaf_codec(
+            [
+                torch.tensor([1], dtype=torch.float32),
+                torch.tensor([1], dtype=torch.int64),
+            ]
+        )
         self.assertFalse(d.accepted)
+        self.assertEqual(d.codec, "ragged_tensor")
+
+    def test_tensor_mixed_ndim(self):
+        import torch
+
+        d = _choose_leaf_codec([torch.tensor([1]), torch.tensor([[1, 2]])])
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "ragged_tensor")
 
     def test_numeric_sequence(self):
         d = _choose_leaf_codec([[1, 2, 3], [4, 5]])
@@ -294,7 +434,7 @@ class TestCodecInference(unittest.TestCase):
     def test_fallback(self):
         d = _choose_leaf_codec([object(), object()])
         self.assertFalse(d.accepted)
-        self.assertEqual(d.codec, "pickle_ragged_fallback")
+        self.assertEqual(d.codec, "msgpack_ragged")
 
     def test_with_nulls(self):
         d = _choose_leaf_codec(["hello", None, "world"])
@@ -424,5 +564,5 @@ class TestCodecInference(unittest.TestCase):
             infer_structure("r", [deep, deep], [], [])
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

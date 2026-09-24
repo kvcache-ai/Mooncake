@@ -18,6 +18,7 @@
 #include <hip/hip_runtime.h>
 #include <numa.h>
 #include <glog/logging.h>
+#include <vector>
 
 namespace mooncake {
 namespace tent {
@@ -25,7 +26,7 @@ namespace tent {
 Status RocmPlatform::allocate(void** pptr, size_t size,
                               MemoryOptions& options) {
     LocationParser location(options.location);
-    if (location.type() == "rocm") {
+    if (isAmdGpuLocationType(location.type())) {
         int hip_dev = 0;
         CHECK_HIP(hipGetDevice(&hip_dev));
         CHECK_HIP(hipSetDevice(location.index()));
@@ -56,10 +57,72 @@ Status RocmPlatform::free(void* ptr, size_t size) {
 }
 
 Status RocmPlatform::copy(void* dst, void* src, size_t length) {
+    // hipMemcpyAsync routes the copy through its stream's device context, so
+    // the stream must live on the device owning the device-side buffer.
+    // Control-plane RPC worker threads sit on device 0 while a registered
+    // buffer may live on device R; taking the stream from the buffer's device
+    // routes the copy correctly without mutating the calling thread's current
+    // device. Host-only copies keep the current device.
+    int device_id = getPointerDeviceId(dst);
+    if (device_id == HIPStreamPool::kCurrentDevice) {
+        device_id = getPointerDeviceId(src);
+    }
+
     HIPStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream));
+    CHECK_STATUS(getStreamFromPool(stream, device_id));
     CHECK_HIP(hipMemcpyAsync(dst, src, length, hipMemcpyDefault, stream.get()));
     CHECK_HIP(hipStreamSynchronize(stream.get()));
+    return Status::OK();
+}
+
+Status RocmPlatform::synchronizeDevices(const Topology* topology) {
+    const std::vector<int> devices =
+        topologyDeviceIndices(topology, Topology::MEM_ROCM);
+    if (devices.empty()) return Status::OK();
+
+    int device_count = 0;
+    hipError_t err = hipGetDeviceCount(&device_count);
+    if (err != hipSuccess || device_count <= 0) {
+        if (err != hipSuccess) {
+            LOG(WARNING) << "RocmPlatform::synchronizeDevices "
+                            "hipGetDeviceCount failed: "
+                         << hipGetErrorString(err);
+            (void)hipGetLastError();
+        }
+        return Status::OK();
+    }
+
+    int saved = 0;
+    const bool have_saved = hipGetDevice(&saved) == hipSuccess;
+    if (!have_saved) (void)hipGetLastError();
+
+    for (int device : devices) {
+        if (device >= device_count) continue;
+        err = hipSetDevice(device);
+        if (err != hipSuccess) {
+            LOG(WARNING) << "RocmPlatform::synchronizeDevices hipSetDevice("
+                         << device << ") failed: " << hipGetErrorString(err);
+            (void)hipGetLastError();
+            continue;
+        }
+        err = hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            LOG(WARNING)
+                << "RocmPlatform::synchronizeDevices hipDeviceSynchronize "
+                   "device "
+                << device << " failed: " << hipGetErrorString(err);
+            (void)hipGetLastError();
+        }
+    }
+    if (have_saved) {
+        err = hipSetDevice(saved);
+        if (err != hipSuccess) {
+            LOG(WARNING)
+                << "RocmPlatform::synchronizeDevices restore hipSetDevice("
+                << saved << ") failed: " << hipGetErrorString(err);
+            (void)hipGetLastError();
+        }
+    }
     return Status::OK();
 }
 

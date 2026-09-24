@@ -1,15 +1,30 @@
 #pragma once
 
-#include <string>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
+#include <optional>
+#include <string>
+
+#include "environment_variable.h"
+#include "environment_value_parser.h"
 
 namespace mooncake {
+
+class EnvironSource {
+   public:
+    virtual ~EnvironSource() = default;
+    virtual const char* Get(const char* name) const = 0;
+};
 
 class Environ {
    public:
     // Singleton access
     static Environ& Get();
+
+    // Construct from an injected source. Production code should use Get();
+    // this constructor allows tests to provide deterministic environment data.
+    explicit Environ(const EnvironSource& source);
 
     // Getters for Environment Variables
     int GetNumCqPerCtx() const { return num_cq_per_ctx_; }
@@ -50,43 +65,63 @@ class Environ {
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
+    bool GetRdmaDataDirect() const { return rdma_data_direct_; }
     int GetEfaCqThreads() const { return efa_cq_threads_; }
+    bool GetStoreChecksumEnabled() const { return store_checksum_enabled_; }
 
-    // AWS / S3 client configuration
-    std::string GetAwsRegion() const { return aws_region_; }
-    std::string GetAwsS3Endpoint() const { return aws_s3_endpoint_; }
-    std::string GetAwsBucketName() const { return aws_bucket_name_; }
-    std::string GetAwsAccessKeyId() const { return aws_access_key_id_; }
-    std::string GetAwsSecretAccessKey() const { return aws_secret_access_key_; }
-    bool GetAwsUseVirtualAddressing() const {
-        return aws_use_virtual_addressing_;
+    uint32_t GetRpcClientIoThreads() const { return rpc_client_io_threads_; }
+    uint32_t GetStoreRpcClientIoThreads() const {
+        return store_rpc_client_io_threads_;
     }
-    bool GetAwsUseHttps() const { return aws_use_https_; }
-    // Empty string means "unset" — s3_helper keeps the AWS SDK default in
-    // that case. Parsing to AWS enums is done by the consumer.
-    std::string GetAwsRequestChecksumCalculation() const {
-        return aws_request_checksum_calculation_;
+    uint32_t GetTransferEngineRpcClientIoThreads() const {
+        return transfer_engine_rpc_client_io_threads_;
     }
-    std::string GetAwsResponseChecksumValidation() const {
-        return aws_response_checksum_validation_;
-    }
-    int64_t GetAwsConnectTimeoutMs() const { return aws_connect_timeout_ms_; }
-    int64_t GetAwsRequestTimeoutMs() const { return aws_request_timeout_ms_; }
 
-    // Helper method to get int from env
+    // Helper methods to get numeric values from env
     static int GetInt(const char* name, int default_value);
     static int64_t GetInt64(const char* name, int64_t default_value);
+    static uint32_t GetUInt32(const char* name, uint32_t default_value);
+    static uint64_t GetUInt64(const char* name, uint64_t default_value);
+    static double GetDouble(const char* name, double default_value);
     // Helper method to get size_t from env
     static size_t GetSizeT(const char* name, size_t default_value);
-    // Helper method to get bool from env (checks for "1", "true", "TRUE")
+    // Helper method to get a canonical boolean from env. Invalid values use the
+    // caller-provided default.
     static bool GetBool(const char* name, bool default_value);
     // Helper method to get string from env
     static std::string GetString(const char* name,
                                  const std::string& default_value);
 
-   private:
-    Environ();
+    // Read a typed variable definition from the process environment. Missing
+    // or invalid typed values return nullopt; string variables preserve an
+    // explicitly empty value.
+    template <typename T>
+    static std::optional<T> Read(const EnvironmentVariable<T>& variable) {
+        const char* value = std::getenv(variable.name);
+        if (value == nullptr) {
+            return std::nullopt;
+        }
+        return TryParseEnvironmentValue<T>(value);
+    }
 
+    template <typename T>
+    static T ReadOr(const EnvironmentVariable<T>& variable, T default_value) {
+        const char* value = std::getenv(variable.name);
+        if (value == nullptr) {
+            return default_value;
+        }
+
+        const auto parsed = TryParseEnvironmentValue<T>(value);
+        if (parsed.has_value()) {
+            return *parsed;
+        }
+        std::cerr << "[Mooncake] Warning: invalid value '" << value
+                  << "' for env " << variable.name << ", using default "
+                  << default_value << std::endl;
+        return default_value;
+    }
+
+   private:
     // Member variables
     int num_cq_per_ctx_;
     int num_comp_channels_per_ctx_;
@@ -124,20 +159,12 @@ class Environ {
     bool intra_nvlink_;
     bool path_roundrobin_;
     bool with_nvidia_peermem_;
+    bool rdma_data_direct_;
     int efa_cq_threads_;
-
-    // AWS / S3 client configuration
-    std::string aws_region_;
-    std::string aws_s3_endpoint_;
-    std::string aws_bucket_name_;
-    std::string aws_access_key_id_;
-    std::string aws_secret_access_key_;
-    bool aws_use_virtual_addressing_;
-    bool aws_use_https_;
-    std::string aws_request_checksum_calculation_;
-    std::string aws_response_checksum_validation_;
-    int64_t aws_connect_timeout_ms_;
-    int64_t aws_request_timeout_ms_;
+    bool store_checksum_enabled_;
+    uint32_t rpc_client_io_threads_;
+    uint32_t store_rpc_client_io_threads_;
+    uint32_t transfer_engine_rpc_client_io_threads_;
 };
 
 }  // namespace mooncake

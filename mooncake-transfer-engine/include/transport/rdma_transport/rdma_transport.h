@@ -23,6 +23,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -43,6 +45,7 @@ class RdmaTransport : public Transport {
     friend class RdmaContext;
     friend class RdmaEndPoint;
     friend class RdmaTransportTestPeer;
+    friend class RdmaNotificationTestPeer;
     friend class WorkerPool;
 
    public:
@@ -60,6 +63,11 @@ class RdmaTransport : public Transport {
                 std::shared_ptr<Topology> topo) override;
 
     const char *getName() const override { return "rdma"; }
+
+    // Ordinary RDMA's native notification channel. Success means the SEND
+    // was posted locally, not that the remote application consumed it.
+    int sendNativeNotify(const std::string &peer_server_name,
+                         const TransferMetadata::NotifyDesc &notify);
 
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location, bool remote_accessible,
@@ -92,6 +100,8 @@ class RdmaTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
+    bool supportsGroupedScatter() const override { return true; }
+
     Status getTransferStatus(BatchID batch_id,
                              std::vector<TransferStatus> &status);
 
@@ -103,18 +113,18 @@ class RdmaTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
-    int refreshLocalDeviceDesc(const std::string &device_name, uint16_t lid,
+    int refreshLocalDeviceDesc(const std::string &device_name, uint32_t lid,
                                const std::string &gid);
 
     int preTouchMemory(void *addr, size_t length);
 
    public:
-    int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
-                               HandShakeDesc &local_desc);
+    virtual int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
+                                       HandShakeDesc &local_desc);
 
-    int sendHandshake(const std::string &peer_server_name,
-                      const HandShakeDesc &local_desc,
-                      HandShakeDesc &peer_desc) {
+    virtual int sendHandshake(const std::string &peer_server_name,
+                              const HandShakeDesc &local_desc,
+                              HandShakeDesc &peer_desc) {
         return metadata_->sendHandshake(peer_server_name, local_desc,
                                         peer_desc);
     }
@@ -124,16 +134,22 @@ class RdmaTransport : public Transport {
 
     int startHandshakeDaemon(std::string &local_server_name);
 
+    void notifyWorkerThread();
+
    public:
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
-                            int &buffer_id, int &device_id, int retry_cnt = 0);
+                            int &buffer_id, int &device_id, int retry_cnt = 0,
+                            int hint_buffer_id = -1, int hint_device_id = -1);
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             std::string_view hint, int &buffer_id,
-                            int &device_id, int retry_cnt = 0);
+                            int &device_id, int retry_cnt = 0,
+                            int hint_buffer_id = -1, int hint_device_id = -1);
     static int selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
                                       size_t length, std::string_view local_hca,
                                       int &buffer_id, int &device_id,
-                                      int retry_cnt = 0);
+                                      int retry_cnt = 0,
+                                      int hint_buffer_id = -1,
+                                      int hint_device_id = -1);
 
     const std::vector<std::shared_ptr<RdmaContext>> &getContextList() const {
         return context_list_;
@@ -141,6 +157,8 @@ class RdmaTransport : public Transport {
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
+    std::atomic<bool> notify_running_{false};
+    std::thread notify_worker_;
     std::shared_ptr<Topology> local_topology_;
     // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
     // rdma_server_name_ holds the RDMA-reachable address (e.g.
@@ -148,6 +166,13 @@ class RdmaTransport : public Transport {
     // local_server_name_ keeps the TCP-reachable address for P2P routing.
     std::string rdma_server_name_;
     std::mutex local_desc_lock_;
+    // Mooncake#2017: buffers larger than the device max_mr_size are split into
+    // multiple sub-max_mr_size MRs (one BufferDesc per chunk) so that
+    // ibv_reg_mr is never silently truncated. unregisterLocalMemory() only
+    // receives the base addr, so remember each base buffer's chunk
+    // start-addresses for cleanup.
+    std::mutex chunk_map_mutex_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
 };
 
 using TransferRequest = Transport::TransferRequest;

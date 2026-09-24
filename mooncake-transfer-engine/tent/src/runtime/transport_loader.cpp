@@ -15,9 +15,14 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/shm/shm_transport.h"
 #include "tent/transport/tcp/tcp_transport.h"
+#include "tent/transport/hp_tcp/hp_tcp_transport.h"
 
 #ifdef USE_RDMA
 #include "tent/transport/rdma/rdma_transport.h"
+#endif
+
+#ifdef USE_UB
+#include "tent/transport/ub/ub_transport.h"
 #endif
 
 #ifdef USE_CUDA
@@ -45,6 +50,14 @@
 #include "tent/transport/tpu/tpu_transport.h"
 #endif
 
+#ifdef USE_XPU
+#include "tent/transport/xpu/xpu_transport.h"
+#endif
+
+#ifdef USE_MPCOMM
+#include "tent/transport/mpcomm/mpcomm_transport.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -52,7 +65,12 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
 
-    // TODO affect the end-to-end performance because it is not numa aware
+    if (hp_tcp_transport_config_.enabled)
+        transport_list_[HP_TCP] = std::make_shared<HighPerformanceTcpTransport>(
+            hp_tcp_transport_config_.params);
+
+    // SHM is opt-in: default false because the current path is not NUMA-aware
+    // (see tent/config/transfer-engine.json for an example that enables it).
     if (conf_->get("transports/shm/enable", false))
         transport_list_[SHM] = std::make_shared<ShmTransport>();
 
@@ -60,6 +78,13 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/rdma/enable", true) &&
         topology_->getNicCount(Topology::NIC_RDMA)) {
         transport_list_[RDMA] = std::make_shared<RdmaTransport>();
+    }
+#endif
+
+#ifdef USE_UB
+    if (conf_->get("transports/ub/enable", false) &&
+        topology_->getNicCount(Topology::NIC_UB)) {
+        transport_list_[UB] = std::make_shared<UbTransport>();
     }
 #endif
 
@@ -101,6 +126,16 @@ Status TransferEngineImpl::loadTransports() {
 #ifdef USE_TPU
     if (conf_->get("transports/tpu/enable", true))
         transport_list_[TPU] = std::make_shared<TpuTransport>();
+#endif
+
+#ifdef USE_XPU
+    if (conf_->get("transports/xpu/enable", true))
+        transport_list_[XPU] = std::make_shared<XpuTransport>();
+#endif
+
+#ifdef USE_MPCOMM
+    if (conf_->get("transports/mpcomm/enable", true))
+        transport_list_[MPCOMM] = std::make_shared<MpcommTransport>();
 #endif
 
     return Status::OK();

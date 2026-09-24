@@ -8,6 +8,9 @@
 
 namespace mooncake {
 namespace device {
+
+void EnsureCudaLikeAcceleratorDeviceLinked() {}
+
 namespace {
 
 void FreeCudaLikePinnedHostBuffer(void* addr) { cudaFreeHost(addr); }

@@ -13,7 +13,7 @@ This document describes how to build Mooncake.
 
 Install common build dependencies first. A stable Internet connection is
 required because the script installs system packages, initializes submodules,
-installs Go, and builds/installs yalantinglibs.
+and installs Go.
 
 ```bash
 sudo bash dependencies.sh
@@ -25,6 +25,34 @@ Then build and install Mooncake:
 mkdir build
 cd build
 cmake ..
+make -j
+sudo make install
+```
+
+### Build with VRAM Segment
+
+To enable VRAM Segment, install CUDA toolkit and build Mooncake with
+`USE_VRAM_SEGMENT` enabled:
+
+```bash
+sudo bash dependencies.sh
+
+mkdir build
+cd build
+cmake .. -DUSE_VRAM_SEGMENT=ON
+make -j
+sudo make install
+```
+
+If NVLink is available in your environment, you can also enable it
+with `-DUSE_INTRA_NVLINK=ON`:
+
+```bash
+sudo bash dependencies.sh
+
+mkdir build
+cd build
+cmake .. -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
 make -j
 sudo make install
 ```
@@ -47,6 +75,38 @@ sudo make install
 `-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
 `-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
 
+### RISC-V Build
+
+Mooncake supports native 64-bit RISC-V Linux builds with `USE_RISCV` enabled.
+The option keeps regular Release optimizations but disables interprocedural
+optimization for the Python extensions, avoiding the excessive memory use of
+full GNU LTO on RISC-V build hosts. The build also detects whether 16-byte
+atomic operations require `libatomic` and links it automatically.
+
+The following configuration builds the C++, Python, and Rust components while
+disabling every component that requires Go:
+
+```bash
+mkdir build-riscv
+cd build-riscv
+cmake -G Ninja .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_RISCV=ON \
+  -DWITH_STORE_GO=OFF \
+  -DWITH_P2P_STORE=OFF \
+  -DUSE_ETCD=OFF \
+  -DSTORE_USE_ETCD=OFF \
+  -DSTORE_USE_K8S_LEASE=OFF \
+  -DBUILD_UNIT_TESTS=OFF \
+  -DBUILD_EXAMPLES=OFF \
+  -DBUILD_BENCHMARK=OFF
+cmake --build . --parallel 4
+```
+
+Adjust the parallel job count for the available memory. The example uses four
+jobs because optimized C++ and Python binding translation units can each need
+several gigabytes of memory on RISC-V.
+
 ### Hardware Backend Setup
 
 Run `sudo bash dependencies.sh` before using any of these backend-specific build
@@ -56,6 +116,8 @@ environment setup must be prepared separately.
 | Hardware / backend | Build option | External SDK / setup | Environment and notes |
 | --- | --- | --- | --- |
 | NVIDIA CUDA / GPUDirect | `-DUSE_CUDA=ON` | Install CUDA 12.1+ and enable `nvidia-fs` for cuFile builds. | Add CUDA libraries to `LIBRARY_PATH` and `LD_LIBRARY_PATH`, for example `/usr/local/cuda/lib64`. |
+| NVIDIA NCCL DeviceTransport | `-DUSE_NCCL_DEVICE=ON` | Install NCCL 2.30.4+ with `nccl_device.h`. Requires CUDA. | Disabled by default. Enabling it directly links NCCL into the EP extensions, so importing `mooncake.ep` requires a matching runtime `libnccl` even when the NCCL transport is not selected. Set `NCCL_ROOT` when NCCL is outside the standard search paths. |
+| NVIDIA NCCL host RMA (WRITE only) | `-DUSE_NCCL_HOST=ON` | Install NCCL 2.30.4+. Requires CUDA. | Set `NCCL_ROOT` when NCCL is outside the standard search paths. Install NCCL as the only transport in a `TransferEngine(false)` instance before registering buffers. Peers must register matching buffer sizes in the same order. It has no multi-transport fallback and supports WRITE requests only because NCCL 2.30 has no public host Get operation. |
 | NVIDIA Multi-Node NVLink | `-DUSE_MNNVL=ON` | Requires CUDA. | Also set `-DUSE_CUDA=ON`. Not used with MUSA, HIP, or MACA builds. |
 | Moore Threads MUSA | `-DUSE_MUSA=ON` | Install MUSA SDK and `mthreads-peermem` for GPUDirect RDMA. | Add `/usr/local/musa/lib` to `LIBRARY_PATH` and `LD_LIBRARY_PATH`. |
 | Cambricon MLU | `-DUSE_MLU=ON` | Install Cambricon Neuware SDK. | Set `NEUWARE_HOME`, or pass `-DNEUWARE_ROOT=/path/to/neuware`. Use `-DMLU_INCLUDE_DIR` and `-DMLU_LIB_DIR` for custom layouts. |
@@ -64,7 +126,32 @@ environment setup must be prepared separately.
 | Huawei Ascend UBSHMEM | `-DUSE_UBSHMEM=ON` | Install Ascend CANN Toolkit. Requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5. | Source the CANN `set_env.sh` before configuring CMake. |
 | AMD HIP / ROCm | `-DUSE_HIP=ON` | Install ROCm/HIP SDK. | Ensure HIP compiler, headers, and runtime libraries are visible to CMake. |
 | Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Use `-DDTK_INCLUDE_DIR` and `-DDTK_LIB_DIR` for custom layouts. |
+| ScaleFabric SHCA | `-DUSE_SHCA=ON` | Install `shca-tools`. | Supports Transfer Engine/TENT RDMA paths only; Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
+
+```{admonition} NCCL host RMA constraints
+:class: important
+The first valid NCCL host WRITE freezes the ordered CUDA-buffer catalog before
+bootstrap. Registration and unregistration are not allowed afterward, even if
+bootstrap fails. Session initialization is attempted once for each
+endpoint/device pair. If the session reaches a terminal failure, it retains the
+error and subsequent transfers fail without retrying bootstrap. Recovery
+requires destroying and recreating the NCCL-only `TransferEngine` on both
+peers, then registering the buffers again. A one-sided restart is unsupported.
+Same-engine targets remain unsupported and should use
+the intra-node NVLink/P2P transport.
+```
+
+```{admonition} NCCL DeviceTransport version contract
+:class: important
+Mooncake currently requires NCCL Device API device code, whether AOT-compiled
+or JIT-compiled, to use NCCL headers that exactly match the loaded runtime
+`libnccl.so`. `NcclTransport::initialize()` rejects a mismatch. After upgrading
+NCCL, rebuild Mooncake and every AOT CUDA kernel that includes
+`transport/device/nccl_device.cuh`. Invalidate and regenerate any cached NCCL
+Device API JIT kernels before running. This is required for the current GIN
+device-code model, which is not cross-version compatible.
+```
 
 ```{admonition} GPU-Direct RDMA
 :class: note
@@ -121,6 +208,20 @@ sudo docker run --gpus all \
 The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not defaults. The arena remains disabled unless you explicitly enable it, and if you enable it via gflag without an env override the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. When you want the baseline direct-`mmap()` path instead of the arena, set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) and omit `MC_MMAP_ARENA_POOL_SIZE`. Set it before the first Mooncake mmap-buffer allocation in the process. If you build the image from source with `docker/mooncake.Dockerfile`, that source-built image also installs the helper as `mooncake-hicache-sizing`.
 Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. When `MC_STORE_USE_HUGEPAGE=1` is set, both the arena path and the direct-`mmap()` fallback path require HugeTLB pages. Mooncake will not silently degrade that explicit hugepage request to regular pages.
 
+For RDMA Store segments backed by HugeTLB, page population is automatically
+deferred until immediately before transfer-engine registration and
+parallelized across CPU threads:
+
+```bash
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+```
+
+Direct mappings use a generic worker pool. NUMA-segmented mappings bind each
+worker to the node associated with its memory region. The mmap arena keeps its
+eager population behavior; set `MC_DISABLE_MMAP_ARENA=1` if an arena was
+otherwise enabled and deferred direct-mmap population is desired.
+
 ## Advanced Compile Options
 The following options can be passed to `cmake ..`.
 
@@ -129,6 +230,8 @@ The following options can be passed to `cmake ..`.
 | Option | Default | Description |
 | --- | --- | --- |
 | `-DUSE_CUDA=ON/OFF` | `OFF` | Enable GPU memory support, including GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport. Required when transferring GPU memory, even when using TCP. |
+| `-DUSE_NCCL_DEVICE=ON/OFF` | `OFF` | Enable the NCCL DeviceTransport backend. Requires CUDA and NCCL 2.30.4+ with `nccl_device.h`. NCCL-enabled EP extensions require a matching runtime `libnccl` at import time, and AOT- and JIT-compiled NCCL device code must use headers that exactly match that runtime. |
+| `-DUSE_NCCL_HOST=ON/OFF` | `OFF` | Enable the experimental, WRITE-only NCCL host RMA transport. Requires CUDA and NCCL 2.30.4+, must be installed before its buffers are registered, and must be the engine's only installed transport. |
 | `-DUSE_MNNVL=ON/OFF` | `OFF` | Enable Multi-Node NVLink transport. Requires `-DUSE_CUDA=ON`; not used with MUSA, HIP, or MACA builds. |
 | `-DUSE_MUSA=ON/OFF` | `OFF` | Enable Moore Threads GPU support via MUSA. |
 | `-DUSE_MACA=ON/OFF` | `OFF` | Enable MetaX (Muxi) GPU support via MACA. |
@@ -136,10 +239,14 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_HYGON=ON/OFF` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
+| `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
+| `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
 | `-DUSE_UBSHMEM=ON/OFF` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |
 | `-DUSE_INTRA_NVLINK=ON/OFF` | `OFF` | Enable intranode NVLink transport. |
+| `-DUSE_VRAM_SEGMENT=ON/OFF` | `OFF` | Enable create VRAM Segment instead of (default) DRAM Segment. |
 | `-DUSE_CXL=ON/OFF` | `OFF` | Enable CXL support. |
+| `-DUSE_MPCOMM=ON/OFF` | `OFF` | Enable the MPComm transport in TENT (multi-NIC memory pooling over RDMA). Requires `-DUSE_TENT=ON` and `-DMPCOMM_ROOT=<prefix>`. See [MPComm Transport](../design/transfer-engine/transport/mpcomm_transport.md). |
 
 ### Vendor SDK Path Overrides
 
@@ -158,12 +265,13 @@ The following options can be passed to `cmake ..`.
 | `-DNEUWARE_ROOT=/path/to/neuware` | `-DUSE_MLU=ON` | Override the Neuware SDK root. `NEUWARE_HOME` is also honored; default is `/usr/local/neuware`. |
 | `-DMLU_INCLUDE_DIR=/path/to/include` | `-DUSE_MLU=ON` | Override the Neuware include directory. |
 | `-DMLU_LIB_DIR=/path/to/lib64` | `-DUSE_MLU=ON` | Override the Neuware library directory. |
+| `-DMPCOMM_ROOT=/path/to/mpcomm` | `-DUSE_MPCOMM=ON` | **Required.** MPComm install prefix; must contain `include/mpcomm.h` and `lib/libmpcomm.so`. Configuration fails if unset or if either file is missing. |
 
 ### Transport and Metadata Options
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/efa_transport.md). |
+| `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/transport/efa_transport.md). |
 | `-DUSE_NOF=ON/OFF` | `OFF` | Build Mooncake Store with NVMe-oF SSD pool support. Use `sudo bash dependencies.sh --with-spdk` before enabling it. |
 | `-DUSE_REDIS=ON/OFF` | `OFF` | Enable Redis-based metadata service for Transfer Engine. Requires hiredis. |
 | `-DUSE_HTTP=ON/OFF` | `ON` | Enable HTTP-based metadata service. |
@@ -179,10 +287,11 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_TE=ON/OFF` | `ON` | Build the Mooncake Transfer Engine component and sample code. |
 | `-DWITH_STORE=ON/OFF` | `ON` | Build the Mooncake Store component. |
 | `-DWITH_STORE_GO=ON/OFF` | `OFF` | Build Go bindings for Mooncake Store when `-DWITH_STORE=ON`. |
+| `-DWITH_CONDUCTOR=ON/OFF` | `OFF` | Build the Mooncake Conductor service. |
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
-| `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust interface and sample code. |
+| `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust library (`transfer_engine_rust`), tests, and sample benchmark. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
-| `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.12.1"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
+| `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.13.0"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
 
 ### Build Behavior Options
 

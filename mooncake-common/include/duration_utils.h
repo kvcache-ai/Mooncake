@@ -1,24 +1,14 @@
 #pragma once
 
-#include <cctype>
 #include <cstdint>
 #include <limits>
 #include <string>
 #include <string_view>
 
-namespace mooncake {
+#include "ascii_string.h"
+#include "integer_parser.h"
 
-inline std::string_view TrimAsciiWhitespace(std::string_view value) {
-    while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.front()))) {
-        value.remove_prefix(1);
-    }
-    while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.back()))) {
-        value.remove_suffix(1);
-    }
-    return value;
-}
+namespace mooncake {
 
 inline bool ParseDurationMs(std::string_view value, uint64_t* result,
                             std::string* error = nullptr) {
@@ -41,8 +31,8 @@ inline bool ParseDurationMs(std::string_view value, uint64_t* result,
     }
 
     size_t number_end = 0;
-    while (number_end < trimmed.size() &&
-           std::isdigit(static_cast<unsigned char>(trimmed[number_end]))) {
+    while (number_end < trimmed.size() && trimmed[number_end] >= '0' &&
+           trimmed[number_end] <= '9') {
         ++number_end;
     }
 
@@ -52,23 +42,14 @@ inline bool ParseDurationMs(std::string_view value, uint64_t* result,
             "s, m, or h as the unit suffix");
     }
 
-    uint64_t numeric_value = 0;
-    for (size_t i = 0; i < number_end; ++i) {
-        const uint64_t digit = static_cast<uint64_t>(trimmed[i] - '0');
-        if (numeric_value >
-            (std::numeric_limits<uint64_t>::max() - digit) / 10) {
-            return set_error("duration value is too large");
-        }
-        numeric_value = numeric_value * 10 + digit;
+    const auto numeric_value =
+        TryParseInteger<uint64_t>(trimmed.substr(0, number_end));
+    if (!numeric_value.has_value()) {
+        return set_error("duration value is too large");
     }
 
     std::string_view suffix = TrimAsciiWhitespace(trimmed.substr(number_end));
-    std::string normalized_suffix;
-    normalized_suffix.reserve(suffix.size());
-    for (char ch : suffix) {
-        normalized_suffix.push_back(
-            static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-    }
+    const std::string normalized_suffix = AsciiToLower(suffix);
 
     uint64_t multiplier = 1;
     if (normalized_suffix.empty() || normalized_suffix == "ms") {
@@ -84,11 +65,11 @@ inline bool ParseDurationMs(std::string_view value, uint64_t* result,
                          "'; supported units are ms, s, m, and h");
     }
 
-    if (numeric_value > std::numeric_limits<uint64_t>::max() / multiplier) {
+    if (*numeric_value > std::numeric_limits<uint64_t>::max() / multiplier) {
         return set_error("duration value is too large after unit conversion");
     }
 
-    *result = numeric_value * multiplier;
+    *result = *numeric_value * multiplier;
     return true;
 }
 

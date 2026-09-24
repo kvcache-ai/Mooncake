@@ -9,17 +9,20 @@ jobs:
   # manylinux2_28 for the toolchain only (USE_CUDA=OFF); keeps the glibc floor
   # aligned with the CUDA wheels.
   build:
+    if: ${{ !contains(github.ref_name, '-') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            artifact-prefix: mooncake-wheel-non-cuda
+          - architecture: arm64
+            artifact-prefix: mooncake-wheel-non-cuda-arm64
     uses: ./.github/workflows/_build-wheel.yaml
     with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda12.8
-      cuda: container
-      build-with-ep: '0'
-      variant-flag: NON_CUDA_BUILD
-      cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
-        -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: mooncake-wheel-non-cuda
+      variant: non-cuda
+      architecture: ${{ matrix.architecture }}
+      artifact-prefix: ${{ matrix.artifact-prefix }}
 
   publish-release:
     if: ${{ !contains(github.ref_name, '-') }}
@@ -29,6 +32,6 @@ jobs:
       id-token: write
     uses: ./.github/workflows/_publish-wheel.yaml
     with:
-      artifact-pattern: 'mooncake-wheel-non-cuda*'
+      artifact-pattern: 'mooncake-wheel-non-cuda-*'
     secrets:
       pypi-token: ${{ secrets.PYPI_API_TOKEN }}

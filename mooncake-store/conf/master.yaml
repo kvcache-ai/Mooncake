@@ -1,17 +1,43 @@
 enable_metric_reporting: true
 metrics_port: 9003
 rpc_port: 50051
-rpc_thread_num: 4
+rpc_thread_num: 16
 rpc_address: "0.0.0.0"
 rpc_interface: ""
 rpc_conn_timeout_seconds: 0
 rpc_enable_tcp_no_delay: true
 
-default_kv_lease_ttl: 5000
+default_kv_lease_ttl: 10000
 default_kv_soft_pin_ttl: 1800000
+max_kv_soft_pin_ttl: 86400000
 allow_evict_soft_pinned_objects: true
 eviction_ratio: 0.1
+# Overrides the 0.90 code default. A value of 1.0 disables proactive
+# usage-ratio eviction; allocation-failure-triggered eviction remains enabled.
 eviction_high_watermark_ratio: 1.0
+
+# Per-tenant eviction watermark, as a fraction of each tenant's OWN effective
+# quota. Defaults to 0.9 in code, mirroring eviction_high_watermark_ratio; set
+# 0.0 to disable the pass and keep the historical behaviour.
+#
+# Only relevant with enable_multi_tenants. This pass is the only mechanism that
+# frees space for a tenant -- admission never evicts, it rejects with
+# TENANT_QUOTA_EXCEEDED and lets this pass build the headroom for the retry.
+#
+# Because effective quotas sum to exactly the pool capacity, at most one
+# tenant's share can exceed eviction_high_watermark_ratio; every other tenant
+# reaches its own ceiling before the pool crosses the pool-wide watermark, so
+# without this nothing ever reclaims on its behalf.
+tenant_eviction_high_watermark_ratio: 0.9
+
+# Dynamic MEMORY replica fanout is disabled by default. Replica removal is
+# driven by the existing memory eviction/reclaim path; when a dynamic replica
+# is evicted, Master records a short recreate cooldown so hot-read admission
+# does not immediately add the same capacity back.
+dynamic_replication_mode: "off"
+dynamic_replication_heat_window_seconds: 10
+dynamic_replication_admission_qps_threshold: 0.8
+dynamic_replication_max_memory_replicas: 2
 
 enable_multi_tenants: false
 tenant_quota_connector_type: "file"
@@ -22,7 +48,20 @@ etcd_endpoints: "http://localhost:2379"
 root_fs_dir: ""
 cluster_id: "mooncake_cluster"
 memory_allocator: "offset"
-client_live_ttl_sec: 60
+client_active_ttl_sec: 60
+client_suspicion_ttl_sec: 60
+
+# OpLog store configuration for HA hot-standby replication
+enable_oplog: false
+# Confirm all configured standbys support weight metadata and lease entries.
+weight_management_oplog_capability_confirmed: false
+enable_oplog_snapshot: false
+# Maximum objects per standby batch OpLog snapshot chunk
+snapshot_chunk_object_count: 1000000
+# Batch standby base polling/retry delay in milliseconds
+oplog_poll_interval_ms: 1000
+# Maximum consecutive retryable batch-standby failure window in seconds
+batch_oplog_retry_timeout_sec: 180
 
 enable_http_metadata_server: false
 http_metadata_server_host: "0.0.0.0"

@@ -63,14 +63,14 @@ class Transport {
         std::function<void(BatchID)> notify_progress;
     };
 
-    using SubBatchRef = SubBatch *;
+    using SubBatchRef = SubBatch*;
 
    public:
     Transport() = default;
 
     virtual ~Transport() = default;
 
-    virtual Status install(std::string &local_segment_name,
+    virtual Status install(std::string& local_segment_name,
                            std::shared_ptr<ControlService> metadata,
                            std::shared_ptr<Topology> local_topology,
                            std::shared_ptr<Config> conf = nullptr) {
@@ -79,76 +79,117 @@ class Transport {
 
     virtual Status uninstall() { return Status::OK(); }
 
+    // Called before registered ranges and sub-batches are reclaimed.  Most
+    // transports have no background work; transports with async I/O use this
+    // barrier to settle work while their buffer registry is still alive.
+    virtual Status quiesce() { return Status::OK(); }
+
     virtual const Capabilities capabilities() const { return caps; }
 
-    virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size) {
+    virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size) {
         return Status::NotImplemented(
             "allocateSubBatch not implemented" LOC_MARK);
     }
 
-    virtual Status freeSubBatch(SubBatchRef &batch) {
+    virtual Status freeSubBatch(SubBatchRef& batch) {
         return Status::NotImplemented("freeSubBatch not implemented" LOC_MARK);
     }
 
+    // Submission contract (all-or-nothing): on an error return, no request
+    // from request_list may have been dispatched and the sub-batch must be
+    // left exactly as it was before the call (no tasks appended, no work
+    // queued). A transport that starts accepting requests and then hits an
+    // error must roll back its partial state before returning. This lets the
+    // engine fail the whole submission over to another transport without
+    // double-executing an accepted prefix or losing track of the original
+    // sub-batch. Transports that validate requests incrementally must
+    // validate every request before dispatching any of them.
     virtual Status submitTransferTasks(
-        SubBatchRef batch, const std::vector<Request> &request_list) {
+        SubBatchRef batch, const std::vector<Request>& request_list) {
         return Status::NotImplemented(
             "submitTransferTasks not implemented" LOC_MARK);
     }
 
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
-                                     TransferStatus &status) {
+                                     TransferStatus& status) {
         return Status::NotImplemented(
             "getTransferStatus not implemented" LOC_MARK);
     }
 
-    virtual Status allocateLocalMemory(void **addr, size_t size,
-                                       MemoryOptions &options) {
+    virtual Status retryTransferTask(SubBatchRef batch, int task_id,
+                                     const Request& request) {
+        return Status::NotImplemented(
+            "retryTransferTask not implemented" LOC_MARK);
+    }
+
+    // Cancellation is best effort: implementations must prevent work that has
+    // not reached the device from being submitted, but work already posted to
+    // a device may still complete. Callers must continue polling until the
+    // task reaches a terminal state.
+    virtual bool supportsCancellation() const { return false; }
+
+    virtual Status cancelTransferTask(SubBatchRef batch, int task_id) {
+        return Status::NotImplemented(
+            "cancelTransferTask not implemented" LOC_MARK);
+    }
+
+    virtual Status allocateLocalMemory(void** addr, size_t size,
+                                       MemoryOptions& options) {
         return Platform::getLoader().allocate(addr, size, options);
     }
 
-    virtual Status freeLocalMemory(void *addr, size_t size) {
+    virtual Status freeLocalMemory(void* addr, size_t size) {
         return Platform::getLoader().free(addr, size);
     }
 
     // Pre-registration warm-up that pins pages before NUMA probing.
     // Returns true if pages were successfully pinned (caller may skip
     // prefault). Default: no-op, returns false.
-    virtual bool warmupMemory(void *addr, size_t length) { return false; }
+    virtual bool warmupMemory(void* addr, size_t length) { return false; }
 
-    virtual Status addMemoryBuffer(BufferDesc &desc,
-                                   const MemoryOptions &options) {
+    virtual Status addMemoryBuffer(BufferDesc& desc,
+                                   const MemoryOptions& options) {
         return Status::NotImplemented(
             "addMemoryBuffer not implemented" LOC_MARK);
     }
 
-    virtual Status addMemoryBuffer(std::vector<BufferDesc> &desc_list,
-                                   const MemoryOptions &options) {
-        for (auto &desc : desc_list) {
+    virtual Status addMemoryBuffer(std::vector<BufferDesc>& desc_list,
+                                   const MemoryOptions& options) {
+        for (auto& desc : desc_list) {
             CHECK_STATUS(addMemoryBuffer(desc, options));
         }
         return Status::OK();
     }
 
-    virtual Status removeMemoryBuffer(BufferDesc &desc) {
+    virtual Status removeMemoryBuffer(BufferDesc& desc) {
         return Status::NotImplemented(
             "removeMemoryBuffer not implemented" LOC_MARK);
     }
 
+    // Some transports keep private local-only registrations that must not be
+    // advertised through BufferDesc::transports.
+    virtual bool tracksLocalBuffer(const BufferDesc&) const { return false; }
+
     virtual bool supportNotification() const { return false; }
 
     virtual Status sendNotification(SegmentID target_id,
-                                    const Notification &notify) {
+                                    const Notification& notify) {
         return Status::NotImplemented(
             "sendNotification not implemented" LOC_MARK);
     }
 
-    virtual Status receiveNotification(std::vector<Notification> &notify_list) {
+    virtual Status receiveNotification(std::vector<Notification>& notify_list) {
         return Status::NotImplemented(
             "receiveNotification not implemented" LOC_MARK);
     }
 
-    virtual const char *getName() const { return "<generic>"; }
+    virtual const char* getName() const { return "<generic>"; }
+
+    virtual double getEstimatedBandwidth() const { return -1.0; }
+
+    virtual Status getNicLoadStats(std::vector<NicLoadStats>&) const {
+        return Status::OK();
+    }
 
    protected:
     Capabilities caps;

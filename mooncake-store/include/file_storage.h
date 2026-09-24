@@ -18,6 +18,32 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> Init();
 
+    void RemoveAll();
+
+    /**
+     * @brief Deregisters this store's disk tier from the master, then waits out
+     * a grace period so offload reads already in flight can finish.
+     *
+     * Meant for a shutdown hook that runs before the process is signalled. Once
+     * this returns, the master no longer names this store as the owner of any
+     * offloaded key, so a reader gets a clean miss instead of a peer that is
+     * about to disappear. Unlike a memory replica, which the NIC serves without
+     * the process, a disk replica is read and pushed by this process -- hence
+     * the grace period rather than an immediate exit.
+     *
+     * Latches offloading off first: the heartbeat re-mounts the segment
+     * whenever the master answers SEGMENT_NOT_FOUND, which would otherwise
+     * undo this within one heartbeat interval. The latch and the
+     * deregistration happen under offloading_mutex_, the lock the heartbeat
+     * holds across its master RPCs, so a tick that read the latch before it
+     * was set cannot resume after the deregistration and re-mount: it either
+     * finished before the drain latched, or it re-checks the latch when it
+     * acquires the lock. The latch is not reversible on success; the process
+     * is expected to exit.
+     */
+    tl::expected<void, ErrorCode> DrainLocalDiskSegment(
+        uint64_t grace_period_ms);
+
     /**
      * @brief Result of BatchGet operation containing batch_id and buffer
      * pointers.
@@ -25,6 +51,14 @@ class FileStorage {
     struct BatchGetResult {
         uint64_t batch_id;
         std::vector<uint64_t> pointers;
+    };
+
+    struct LocalBatchResult {
+        std::vector<uint64_t> pointers;
+
+       private:
+        friend class FileStorage;
+        std::shared_ptr<void> owner;
     };
 
     /**
@@ -39,6 +73,33 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
+    tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+
+    [[nodiscard]] bool HasPinnedRestoreArena() const {
+        return pinned_restore_arena_allocator_ != nullptr;
+    }
+
+    // Allocate request-scoped staging from the fixed-capacity accelerator-
+    // pinned restore arena. The returned handle releases its sub-allocation
+    // back to the arena; FileStorage retains ownership of the backing memory.
+    [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
+        size_t size) {
+        if (!pinned_restore_arena_allocator_) return std::nullopt;
+        return pinned_restore_arena_allocator_->allocate(size);
+    }
+
+    /**
+     * @brief Reports whether the backend still holds an entry for the key.
+     *
+     * Answers existence only, without allocating read buffers. After a
+     * physical wipe the per-key backend's filesystem lookup and the bucket
+     * backend's in-memory index both report false, which is exactly the
+     * divergence a dangling-replica probe needs to detect.
+     */
+    tl::expected<bool, ErrorCode> Exists(const std::string& key);
+
     FileStorageConfig config_;
 
     /**
@@ -52,6 +113,14 @@ class FileStorage {
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
+    // TEST_F bodies are generated subclasses and do not inherit the fixture's
+    // friendship, so the dangling-replica tests are friended by their
+    // generated class names (plain friend, no gtest include in a production
+    // header).
+    friend class
+        FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
+    friend class
+        FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -78,13 +147,35 @@ class FileStorage {
         const std::vector<OffloadTaskItem>& offloading_objects);
 
     /**
+     * @brief Classifies a BatchOffload error as affecting only the current
+     * bucket rather than the whole offload cycle.
+     *
+     * Such an error means the bucket's keys simply cannot be persisted this
+     * round; OffloadObjects reports them back to the master as failed (so their
+     * offloading tasks and source-replica refcounts are released) and continues
+     * with the remaining buckets, instead of aborting the entire cycle.
+     *
+     *   - INVALID_READ: source data for these keys could not be read/staged.
+     *   - OBJECT_ALREADY_EXISTS: the key(s) were already offloaded, or are
+     *     being offloaded concurrently. The bucket backend rejects the whole
+     *     bucket atomically by design (see BucketStorageBackend::BatchOffload
+     *     and its PrepareEviction duplicate guard). Treating this as fatal
+     *     aborted the cycle, leaked offloading tasks, and left master/SSD
+     *     metadata inconsistent, which surfaced as spurious INVALID_KEY on the
+     *     read path (issue #2827).
+     */
+    static bool IsPerBucketSoftOffloadError(ErrorCode error);
+
+    /**
      * @brief Performs a heartbeat operation for the FileStorage component.
      * 1. Sends object status (e.g., access frequency, size) to the master via
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
-     * 4. Pulls and processes any pending L2->L1 promotion tasks queued by the
-     *    master (mirror of step 1+2 in the reverse direction).
+     * 4. If offload work was returned, pulls and processes any pending L2->L1
+     *    promotion tasks queued by the master (mirror of step 1+2 in the
+     *    reverse direction).
+     * 5. Runs proactive local-disk watermark eviction.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
@@ -103,6 +194,11 @@ class FileStorage {
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
+    tl::expected<void, ErrorCode> RunDiskWatermarkEviction();
+
+    tl::expected<void, ErrorCode> NotifyEvictedDiskReplicas(
+        const std::vector<std::string>& evicted_keys);
+
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
 
@@ -113,8 +209,12 @@ class FileStorage {
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 
     tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> AllocateBatch(
-        const std::vector<std::string>& keys,
-        const std::vector<int64_t>& sizes);
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        ClientBufferAllocator& allocator);
+
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatch(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool prefer_pinned);
 
     void ClientBufferGCThreadFunc();
 
@@ -128,8 +228,10 @@ class FileStorage {
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
-    // Pinned host memory pool for GPU D2H staging in OffloadObjects
+    // Pinned memory for GPU staging and SSD-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    PinnedBufferPool::Buffer pinned_restore_arena_;
+    std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;
@@ -145,6 +247,13 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
+    // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the
+    // heartbeat -- which would otherwise re-mount the segment the drain just
+    // deregistered -- and aborts an in-flight metadata rescan. Checked at
+    // Heartbeat entry (fast path, also guards the rescan-retry block) and
+    // again under offloading_mutex_ before the heartbeat RPC, because a tick
+    // parked on that lock passed the entry check before the drain latched.
+    std::atomic<bool> draining_{false};
 };
 
 }  // namespace mooncake

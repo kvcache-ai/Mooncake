@@ -1,0 +1,6 @@
+{
+  "include": ["invalid_contract_usage.py"],
+  "extraPaths": ["../../python"],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "strict"
+}

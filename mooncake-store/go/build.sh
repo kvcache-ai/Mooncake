@@ -35,14 +35,27 @@ CGO_CFLAGS="-I${REPO_ROOT}/mooncake-store/include"
 CGO_CFLAGS+=" -I${REPO_ROOT}/mooncake-transfer-engine/include"
 
 # CGo linker flags — link against mooncake_store, transfer_engine, and deps
+# master_service.cpp (inside libmooncake_store.a) calls into LocalSsdManager,
+# which lives in its own static archive under local_ssd/. It is built
+# unconditionally and is a required dependency of mooncake_store, so link it
+# inside the group where cyclic references resolve.
 CGO_LDFLAGS="-L${BUILD_DIR}/mooncake-store/src"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-store/src/cachelib_memory_allocator"
+CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-store/src/local_ssd"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src/common/base"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/src"
-CGO_LDFLAGS+=" -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -lmooncake_common -lxxhash -lyaml-cpp"
+CGO_LDFLAGS+=" -Wl,--start-group -lmooncake_store -lmooncake_local_ssd -lcachelib_memory_allocator -ltransfer_engine -lbase -lmooncake_common -Wl,--end-group"
+CGO_LDFLAGS+=" -lasio -lxxhash -lyaml-cpp"
 CGO_LDFLAGS+=" -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -lm"
+
+# OSS adapter request signing uses OpenSSL HMAC (EVP_sha256). Static archives
+# carry no transitive deps, so the Go link needs libcrypto explicitly when the
+# adapter was compiled in (CURL + OpenSSL found at CMake time).
+if grep -q '^MOONCAKE_OSS_ADAPTER_ENABLED:INTERNAL=TRUE$' "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+    CGO_LDFLAGS+=" -lcrypto"
+fi
 
 if [ -d "/usr/local/cuda/lib64" ]; then
     CGO_LDFLAGS+=" -L/usr/local/cuda/lib64 -lcudart"

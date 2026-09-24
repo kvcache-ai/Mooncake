@@ -1,5 +1,7 @@
 #include "tenant_quota_policy_store.h"
 
+#include "tenant_quota.h"
+
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -27,7 +29,7 @@ namespace mooncake {
 namespace {
 
 bool IsValidTenantQuotaName(const std::string& name) {
-    return IsValidTenantId(name);
+    return !name.empty() && TenantId(name).IsValid();
 }
 
 std::string ErrnoMessage(const std::string& action, const std::string& path) {
@@ -211,7 +213,12 @@ tl::expected<uint64_t, std::string> ParseTenantQuotaBytes(
     if (number > std::numeric_limits<uint64_t>::max() / multiplier) {
         return tl::make_unexpected("quota byte value overflows uint64");
     }
-    return number * multiplier;
+    const uint64_t quota_bytes = number * multiplier;
+    if (quota_bytes > TenantQuotaAccount::kMaxChargedBytes) {
+        return tl::make_unexpected(
+            "quota exceeds maximum supported tenant charge");
+    }
+    return quota_bytes;
 }
 
 tl::expected<TenantQuotaPolicySnapshot, std::string> ParseTenantQuotaPolicyYaml(
@@ -273,7 +280,8 @@ tl::expected<TenantQuotaPolicySnapshot, std::string> ParseTenantQuotaPolicyYaml(
         if (!IsValidTenantQuotaName(name)) {
             return tl::make_unexpected("invalid tenant name '" + name + "'");
         }
-        name = NormalizeTenantId(name);
+        const TenantId tenant_id(std::move(name));
+        name = tenant_id.value();
         if (!IsValidTenantQuotaName(name)) {
             return tl::make_unexpected("invalid tenant name '" + name + "'");
         }

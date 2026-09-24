@@ -56,6 +56,7 @@ struct RdmaSubBatch : public Transport::SubBatch {
 class RdmaTransport : public Transport {
     friend class Workers;
     friend class RdmaEndPoint;
+    friend class RdmaTransportTestPeer;
 
    public:
     RdmaTransport();
@@ -69,6 +70,8 @@ class RdmaTransport : public Transport {
 
     virtual Status uninstall();
 
+    Status quiesce() override;
+
     virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size);
 
     virtual Status freeSubBatch(SubBatchRef& batch);
@@ -78,6 +81,10 @@ class RdmaTransport : public Transport {
 
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
                                      TransferStatus& status);
+
+    bool supportsCancellation() const override { return true; }
+
+    Status cancelTransferTask(SubBatchRef batch, int task_id) override;
 
     virtual Status addMemoryBuffer(BufferDesc& desc,
                                    const MemoryOptions& options);
@@ -90,6 +97,9 @@ class RdmaTransport : public Transport {
     bool warmupMemory(void* addr, size_t length) override;
 
     virtual const char* getName() const { return "rdma"; }
+
+    double getEstimatedBandwidth() const override;
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const override;
 
     virtual bool supportNotification() const override { return true; }
 
@@ -114,7 +124,27 @@ class RdmaTransport : public Transport {
    public:
     Status setupLocalSegment();
 
+    // Update one RNIC's published address after a GID/LID change. The local
+    // descriptor is rolled back if registry synchronization fails.
+    Status refreshLocalDeviceDesc(const std::string& device_name, uint32_t lid,
+                                  const std::string& gid);
+
     std::shared_ptr<Config> config() const { return conf_; }
+
+   private:
+    // Builds context_set_ with one slot per NicID; returns how many RNICs
+    // came up. Remaining slots hold inert contexts.
+    size_t initializeContexts();
+
+    // Free orphaned slices whose completion has been handled, or whose
+    // endpoint is gone. Driven by the monitor tick and, so a straggler is
+    // not held for a whole second, by freeSubBatch(). Two callers at once
+    // are fine: each takes the list whole, so they scan disjoint sets.
+    // uninstall()'s drain runs after the monitor is joined and takes the
+    // same mutex as a reap from a batch free. Only the monitor's call
+    // passes `on_tick`: it alone ages an orphan toward its warning, since
+    // batch frees come as fast as the caller likes.
+    void reapOrphanSlices(bool on_tick);
 
    private:
     bool installed_;
@@ -138,17 +168,66 @@ class RdmaTransport : public Transport {
     std::vector<Notification> notify_list_;
     std::condition_variable notify_cv_;
 
+    // Slices outliving the batch they belonged to because the completion
+    // queue can still name them. Owned here until that is no longer true.
+    // `passes` counts reap ticks survived: an orphan is only ever held while
+    // its endpoint is alive, so one that lingers means a queue pair is not
+    // being destroyed, and that is reported once per slice.
+    struct OrphanSlice {
+        RdmaSlice* slice;
+        uint32_t passes;
+    };
+    std::mutex orphan_slice_mutex_;
+    std::vector<OrphanSlice> orphan_slices_;
+    // Whether orphan_slices_ has anything in it, published under the mutex
+    // above. freeSubBatch() reads it on every batch free and would put every
+    // caller thread on that one mutex for what is almost always an empty
+    // list.
+    std::atomic<bool> orphans_pending_{false};
+    uint32_t orphan_warn_after_passes_{60};  // ~60 s at the 1 Hz tick
+    size_t orphan_warnings_{0};              // reaper-owned; test-visible
+
     // Map QP number to Endpoint for notification processing
     RWSpinlock notify_endpoint_map_lock_;
     std::unordered_map<uint32_t, std::weak_ptr<RdmaEndPoint>>
         notify_qp_to_endpoint_;
 
+    enum class NotifyCompletionAction {
+        SkipSilently,         // expected flush from a retiring or gone endpoint
+        ReportOnly,           // no live endpoint left to act on
+        DisableNotification,  // fault confined to the notify QP
+        RetireEndpoint,       // the peer or the path may be gone
+    };
+
+    // Decides what a failed notification completion costs. Only defined for
+    // error completions; endpoint_ready means the endpoint is still EP_READY
+    // and its notifications are still connected (a retiring or disabled
+    // notify QP only flushes from then on).
+    static NotifyCompletionAction classifyNotifyCompletion(ibv_wc_status status,
+                                                           bool endpoint_alive,
+                                                           bool endpoint_ready);
+
     // Register/unregister notification QP (called by Endpoint)
     void registerNotifyQp(uint32_t qp_num,
                           const std::shared_ptr<RdmaEndPoint>& endpoint);
     void unregisterNotifyQp(uint32_t qp_num);
+    // Returns nullptr when no ready endpoint to the peer's device could be
+    // handed out; `failure`, when given, receives why (the segment lookup or
+    // connect() status as is, DeviceNotFound for no enabled context,
+    // InternalError for an allocation failure).
     std::shared_ptr<RdmaEndPoint> getEndpoint(SegmentID target_id,
-                                              int device_id);
+                                              int device_id,
+                                              Status* failure = nullptr);
+
+    // Maps the reason getEndpoint() could not hand out a notify-capable
+    // endpoint to what sendNotification() reports. A bootstrap RPC that
+    // failed means the peer's control plane is unreachable, so the RPC
+    // fallback would only wait out a second timeout on the polling thread:
+    // report RpcServiceError, which TransferEngineImpl does not fall back
+    // on. Everything else (no context, allocation, QP setup) leaves the
+    // control plane reachable and stays DeviceNotFound, i.e. eligible for
+    // the RPC leg.
+    static Status notifyStatusForEndpointFailure(const Status& failure);
 
     // Notification worker thread
     void notifyWorkerThread();

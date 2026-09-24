@@ -13,6 +13,8 @@
 #   -a, --all             Format all C/C++ files in the project
 #   -b, --base <branch>   Base branch to compare against (default: origin/main)
 #   -c, --check           Check mode: only report files that need formatting
+#       --staged          Format only added/modified lines staged for commit
+#       --changed-lines   Check lines changed relative to base (requires --check)
 #   -h, --help            Show this help message
 #
 # Examples:
@@ -20,6 +22,8 @@
 #   ./scripts/code_format.sh --all              # Format all C/C++ files
 #   ./scripts/code_format.sh -b origin/dev      # Compare against origin/dev
 #   ./scripts/code_format.sh --check            # Check without modifying files
+#   ./scripts/code_format.sh --staged file.cpp  # Format staged lines (pre-commit)
+#   ./scripts/code_format.sh --changed-lines --check  # Check PR-changed lines
 # =============================================================================
 
 set -e
@@ -28,11 +32,15 @@ set -e
 BASE_BRANCH="origin/main"
 CHECK_MODE=false
 ALL_MODE=false
+STAGED_MODE=false
+CHANGED_LINES_MODE=false
+INPUT_FILES=()
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # File extensions to format
 FILE_EXTENSIONS="\.(h|hpp|cpp|cu|cuh|c|cc|cxx)$"
+GIT_CLANG_FORMAT_EXTENSIONS="h,hpp,cpp,cu,cuh,c,cc,cxx"
 
 # Directories to exclude (add more patterns as needed)
 EXCLUDE_DIRS=(
@@ -100,6 +108,26 @@ find_clang_format() {
     return 1
 }
 
+# Find the LLVM git integration helper. The versioned binary is preferred, but
+# an unversioned helper is safe because clang-format 20 is passed via --binary.
+find_git_clang_format() {
+    local candidates=("git-clang-format-20" "git-clang-format")
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if command -v "${candidate}" &> /dev/null; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    {
+        print_error "A compatible git-clang-format helper was not found."
+        print_info "Install the clang-format 20 package, which provides git-clang-format-20."
+        echo "  sudo apt-get install -y clang-format-20"
+    } >&2
+    return 1
+}
+
 # Parse command line arguments
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -116,15 +144,139 @@ parse_args() {
                 CHECK_MODE=true
                 shift
                 ;;
+            --staged)
+                STAGED_MODE=true
+                shift
+                ;;
+            --changed-lines)
+                CHANGED_LINES_MODE=true
+                shift
+                ;;
             -h|--help)
                 usage
                 ;;
-            *)
+            --)
+                shift
+                INPUT_FILES+=("$@")
+                break
+                ;;
+            -*)
                 print_error "Unknown option: $1"
                 usage
                 ;;
+            *)
+                INPUT_FILES+=("$1")
+                shift
+                ;;
         esac
     done
+
+    if ${ALL_MODE} && ${STAGED_MODE}; then
+        print_error "--all and --staged cannot be used together."
+        exit 1
+    fi
+    if ${ALL_MODE} && ${CHANGED_LINES_MODE}; then
+        print_error "--all and --changed-lines cannot be used together."
+        exit 1
+    fi
+    if ${STAGED_MODE} && ${CHANGED_LINES_MODE}; then
+        print_error "--staged and --changed-lines cannot be used together."
+        exit 1
+    fi
+    if ${CHANGED_LINES_MODE} && ! ${CHECK_MODE}; then
+        print_error "--changed-lines requires --check."
+        exit 1
+    fi
+}
+
+# Delegate changed-line selection and index handling to LLVM's git integration.
+# A strict guard is retained because git-clang-format only checks for unstaged
+# changes when formatting would actually rewrite a file.
+format_selected_lines() {
+    local clang_format="$1"
+    local git_clang_format="$2"
+    shift 2
+
+    # With no explicit filenames, Git pathspecs select supported C/C++ files.
+    # Exclude pathspecs keep vendored sources out in both automatic and explicit
+    # modes without discovering and filtering files in this script.
+    if [[ $# -eq 0 ]]; then
+        set -- '*.c' '*.cc' '*.cpp' '*.cxx' '*.cu' '*.cuh' '*.h' '*.hpp'
+    fi
+    local paths=(
+        "$@"
+        ':(exclude,glob)**/cachelib_memory_allocator/**'
+        ':(exclude,glob)**/thirdparty/**'
+    )
+
+    print_info "Using $(${clang_format} --version)"
+    if ${STAGED_MODE}; then
+        print_info "Formatting only staged C/C++ line ranges"
+    else
+        print_info "Formatting only C/C++ line ranges changed against ${BASE_BRANCH}"
+    fi
+    echo ""
+
+    if ${STAGED_MODE}; then
+        local git_status
+        if ! git_status=$(git -C "${PROJECT_ROOT}" status --porcelain=v1 \
+            --untracked-files=no -- "${paths[@]}"); then
+            print_error "Could not inspect staged and unstaged changes."
+            return 1
+        fi
+        # Both porcelain status columns are populated when the same file has
+        # changes in the index and the working tree.
+        if printf '%s\n' "${git_status}" | grep -q '^[^ ][^ ]'; then
+            print_error "Cannot process staged lines because a staged file also has unstaged changes."
+            print_info "Stage or stash the unstaged changes, then retry."
+            return 1
+        fi
+    else
+        if ! git -C "${PROJECT_ROOT}" diff --quiet --no-ext-diff HEAD -- \
+            "${paths[@]}"; then
+            print_error "Cannot process committed lines because a selected file has uncommitted changes."
+            print_info "Commit or stash the local changes, then retry."
+            return 1
+        fi
+    fi
+
+    local command=(
+        "${git_clang_format}"
+        --binary "${clang_format}"
+        --style file
+        --extensions "${GIT_CLANG_FORMAT_EXTENSIONS}"
+    )
+    if ${CHECK_MODE}; then
+        command+=(--diff)
+    fi
+    if ${STAGED_MODE}; then
+        command+=(--staged)
+    else
+        # LLVM 20 implements --diff_from_common_commit with a triple-dot
+        # revision passed to diff-tree, which can produce an empty patch.
+        # Resolve the merge base first and pass two concrete commits instead.
+        local base_commit
+        if ! base_commit=$(git -C "${PROJECT_ROOT}" merge-base \
+            "${BASE_BRANCH}" HEAD); then
+            print_error "Could not determine a merge base for '${BASE_BRANCH}' and HEAD."
+            return 1
+        fi
+        command+=("${base_commit}" HEAD)
+    fi
+    command+=(-- "${paths[@]}")
+
+    local status=0
+    (
+        cd "${PROJECT_ROOT}"
+        "${command[@]}"
+    ) || status=$?
+
+    # git-clang-format returns 1 after successfully applying a rewrite. Treat
+    # that as success in apply mode; in check mode it means a diff was found.
+    if ! ${CHECK_MODE} && [[ ${status} -eq 1 ]]; then
+        return 0
+    fi
+    return "${status}"
 }
 
 # Get list of all C/C++ files in the project
@@ -266,6 +418,22 @@ main() {
     local clang_format
     if ! clang_format="$(find_clang_format)"; then
         exit 1
+    fi
+
+    if ${STAGED_MODE} || ${CHANGED_LINES_MODE}; then
+        if ${CHANGED_LINES_MODE} &&
+            ! git -C "${PROJECT_ROOT}" rev-parse --verify "${BASE_BRANCH}" &> /dev/null; then
+            print_error "Base branch '${BASE_BRANCH}' not found."
+            exit 1
+        fi
+
+        local git_clang_format
+        if ! git_clang_format="$(find_git_clang_format)"; then
+            exit 1
+        fi
+        format_selected_lines "${clang_format}" "${git_clang_format}" \
+            "${INPUT_FILES[@]}"
+        return
     fi
 
     # Get files to format

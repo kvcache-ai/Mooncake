@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -10,13 +11,15 @@
 
 #include <ylt/coro_http/coro_http_client.hpp>
 
-#include "utils.h"
+#include "common/network.h"
 #include "master_admin_service.h"
 #include "master_service.h"
+#include "segment.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
 #include "master_metric_manager.h"
+#include "version.h"
 
 namespace mooncake::test {
 
@@ -50,7 +53,6 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     // Mem Storage Metrics
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
 
     // File Storage Metrics
     ASSERT_EQ(metrics.get_allocated_file_size(), 0);
@@ -62,8 +64,13 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
 
     // Operation Statistics
     ASSERT_EQ(metrics.get_put_start_requests(), 0);
+    ASSERT_EQ(metrics.get_put_start_object_already_exists(), 0);
+    EXPECT_NE(metrics.serialize_metrics().find(
+                  "master_put_start_object_already_exists_total 0\n"),
+              std::string::npos);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
     ASSERT_EQ(metrics.get_put_start_alloc_failures(), 0);
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), 0);
     ASSERT_EQ(metrics.get_put_end_requests(), 0);
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 0);
@@ -114,6 +121,10 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 0);
     ASSERT_EQ(metrics.get_batch_put_start_requests(), 0);
     ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);
+    ASSERT_EQ(metrics.get_batch_put_start_object_already_exists(), 0);
+    EXPECT_NE(metrics.serialize_metrics().find(
+                  "master_batch_put_start_object_already_exists_total 0\n"),
+              std::string::npos);
     ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 0);
     ASSERT_EQ(metrics.get_batch_put_start_items(), 0);
     ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 0);
@@ -132,6 +143,21 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_put_start_discard_cnt(), 0);
     ASSERT_EQ(metrics.get_put_start_release_cnt(), 0);
     ASSERT_EQ(metrics.get_put_start_discarded_staging_size(), 0);
+}
+
+TEST_F(MasterMetricsTest, ClientOffboardingMetricsAreExported) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.inc_client_offboarding_alert();
+    const auto serialized = metrics.serialize_metrics();
+
+    EXPECT_NE(serialized.find("master_client_liveness_active_clients"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_client_offboarding_queue_depth"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_client_offboarding_retries_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_client_offboarding_alerts_total"),
+              std::string::npos);
 }
 
 TEST_F(MasterMetricsTest, BasicRequestTest) {
@@ -164,11 +190,9 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_TRUE(mount_result.has_value());
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), kSegmentSize);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               kSegmentSize);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
     ASSERT_EQ(metrics.get_mount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_mount_segment_failures(), 0);
 
@@ -201,7 +225,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
               value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
-    auto put_end_result = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result = service_.PutEnd(
+        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
@@ -237,7 +262,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     auto put_start_result3 =
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result3.has_value());
-    auto put_end_result2 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result2 = service_.PutEnd(
+        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(1, service_.RemoveAll());
@@ -251,23 +277,137 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     auto put_start_result4 =
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result4.has_value());
-    auto put_end_result3 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result3 = service_.PutEnd(
+        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result3.has_value());
     auto unmount_result = service_.UnmountSegment(segment_id, client_id);
     ASSERT_TRUE(unmount_result.has_value());
     ASSERT_EQ(metrics.get_unmount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_unmount_segment_failures(), 0);
+    ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+
+    // Unmount removes the segment capacity synchronously, but invalid replica
+    // metadata and its allocation metrics are reclaimed by the background
+    // cleanup worker.
+    const auto cleanup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while ((metrics.get_key_count() != 0 ||
+            metrics.get_allocated_mem_size() != 0 ||
+            metrics.get_segment_allocated_mem_size(segment.name) != 0) &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
-    ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
-    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
+}
 
-    // check segment mem used ratio for non-existent segment
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(""), 0.0);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
+TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t capacity_before = metrics.get_total_mem_capacity();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "teardown_test_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    UUID client_id = generate_uuid();
+
+    {
+        WrappedMasterServiceConfig service_config;
+        service_config.default_kv_lease_ttl = 100;
+        service_config.enable_metric_reporting = false;
+        WrappedMasterService service(service_config);
+        ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+        ASSERT_EQ(metrics.get_total_mem_capacity(),
+                  capacity_before + static_cast<int64_t>(segment.size));
+        ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+                  static_cast<int64_t>(segment.size));
+    }
+
+    // Destroying the service while the segment is still mounted (as happens
+    // when a master loses leadership) must release the segment's capacity
+    // contribution; MasterMetricManager outlives the service instance.
+    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_before);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+}
+
+TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
+    auto& metrics = MasterMetricManager::instance();
+
+    // Mount a segment through the accounted path so the gauge is non-zero.
+    SegmentManager source_manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "snapshot_reader_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    UUID client_id = generate_uuid();
+    ASSERT_EQ(source_manager.getSegmentAccess().MountSegment(
+                  segment, client_id,
+                  std::make_shared<ClientLivenessRecord>(
+                      ClientLivenessRecord::Clock::now())),
+              ErrorCode::OK);
+    const int64_t capacity_after_mount = metrics.get_total_mem_capacity();
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+              static_cast<int64_t>(segment.size));
+
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+    std::shared_ptr<BufferAllocatorBase> source_allocator;
+    {
+        auto access = source_manager.getSegmentAccess();
+        source_allocator = access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(source_allocator, nullptr);
+    auto source_buffer = source_allocator->allocate(kAllocationSize);
+    ASSERT_NE(source_buffer, nullptr);
+
+    auto snapshot =
+        SegmentSerializer(&source_manager).Serialize(LocalSsdPersistedState{});
+    ASSERT_TRUE(snapshot.has_value());
+
+    {
+        // Deserialize into a temporary reader (as
+        // CatalogBackedSnapshotProvider does). The reader's records never
+        // contributed to the capacity metrics, so destroying it must leave
+        // the gauges untouched.
+        SegmentManager reader(BufferAllocatorType::OFFSET);
+        SegmentSerializer reader_serializer(&reader);
+        ASSERT_TRUE(
+            reader_serializer.Deserialize(snapshot.value()).has_value());
+        const auto restored_usage = reader.GetMemoryUsageSnapshot();
+        const auto restored_aggregate = reader.GetMemoryUsage();
+        EXPECT_EQ(restored_usage.used_bytes, kAllocationSize);
+        EXPECT_EQ(restored_usage.capacity_bytes, segment.size);
+        EXPECT_DOUBLE_EQ(restored_usage.used_ratio(), 0.25);
+        EXPECT_EQ(restored_aggregate.used_bytes, kAllocationSize);
+        EXPECT_EQ(restored_aggregate.capacity_bytes, segment.size);
+        EXPECT_DOUBLE_EQ(restored_aggregate.used_ratio(), 0.25);
+        ASSERT_EQ(restored_usage.segments.size(), 1u);
+        EXPECT_EQ(restored_usage.segments.at(segment.name).used_bytes,
+                  kAllocationSize);
+
+        reader_serializer.Reset();
+        EXPECT_EQ(reader.GetMemoryUsage().used_bytes, 0u);
+        EXPECT_EQ(reader.GetMemoryUsage().capacity_bytes, 0u);
+    }
+    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_after_mount);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+              static_cast<int64_t>(segment.size));
+
+    // Unmount to restore the gauges for the other tests.
+    source_buffer.reset();
+    {
+        auto access = source_manager.getSegmentAccess();
+        size_t dec_capacity = 0;
+        ASSERT_EQ(access.PrepareUnmountSegment(segment.id, dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(
+            access.CommitUnmountSegment(segment.id, client_id, dec_capacity),
+            ErrorCode::OK);
+    }
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
 }
 
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
@@ -360,7 +500,8 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     auto put_start_result1 =
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result1.has_value());
-    auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result1 = service_.PutEnd(
+        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result1.has_value());
     auto stats_dict = metrics.calculate_cache_stats();
 
@@ -403,6 +544,14 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 }
 
 TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
+    TieredStorageUsageSnapshot stale_storage;
+    stale_storage.memory.used_bytes = 4096;
+    stale_storage.memory.capacity_bytes = 8192;
+    stale_storage.memory.segments["stale_leader_segment"] = {4096, 8192};
+    auto& metrics = MasterMetricManager::instance();
+    metrics.project_storage_usage(stale_storage);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 4096);
+
     const int http_port = getFreeTcpPort();
     MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
                                    /*enable_metric_reporting=*/false);
@@ -420,6 +569,17 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
     auto status_resp = FetchUrl(http_port, "/ha_status");
     EXPECT_EQ(status_resp.http_status, 200);
     EXPECT_EQ(status_resp.body, "standby");
+
+    auto metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size("stale_leader_segment"),
+              0);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity("stale_leader_segment"),
+              0);
+    EXPECT_EQ(metrics_resp.body.find("stale_leader_segment"),
+              std::string::npos);
 
     auto leader_resp = FetchUrl(http_port, "/leader");
     EXPECT_EQ(leader_resp.http_status, 200);
@@ -440,6 +600,36 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
     admin_server.Stop();
 }
 
+TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
+    auto& metrics = MasterMetricManager::instance();
+    const std::string mem_segment = "projected_removed_mem_segment";
+    const std::string nof_segment = "projected_removed_nof_segment";
+
+    TieredStorageUsageSnapshot snapshot;
+    snapshot.memory.used_bytes = 4096;
+    snapshot.memory.capacity_bytes = 8192;
+    snapshot.memory.segments[mem_segment] = {4096, 8192};
+    snapshot.nof.used_bytes = 1024;
+    snapshot.nof.capacity_bytes = 4096;
+    snapshot.nof.segments[nof_segment] = {1024, 4096};
+    metrics.project_storage_usage(snapshot);
+
+    const std::string with_labels = metrics.serialize_metrics();
+    EXPECT_NE(with_labels.find("segment=\"" + mem_segment + "\""),
+              std::string::npos);
+    EXPECT_NE(with_labels.find("segment=\"" + nof_segment + "\""),
+              std::string::npos);
+
+    metrics.project_storage_usage({});
+    const std::string after = metrics.serialize_metrics();
+    EXPECT_EQ(after.find("segment=\"" + mem_segment + "\""), std::string::npos);
+    EXPECT_EQ(after.find("segment=\"" + nof_segment + "\""), std::string::npos);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_allocated_nof_size(), 0);
+    EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
+}
+
 TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = 100;
@@ -453,6 +643,13 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     segment.size = 8 * 1024 * 1024;
     UUID client_id = generate_uuid();
     ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    constexpr size_t kAllocationSize = 4096;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "admin_metrics_projection_key",
+                               kAllocationSize, config)
+                    .has_value());
 
     const int http_port = getFreeTcpPort();
     MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
@@ -461,6 +658,55 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     admin_server.SetRuntimeState(ha::MasterRuntimeState::kServing);
     admin_server.SetServiceDelegate(service);
     admin_server.SetServiceAvailable(true);
+
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_mem_size();
+    metrics.reset_total_mem_capacity();
+    metrics.reset_segment_allocated_mem_size(segment.name);
+    metrics.reset_segment_total_mem_capacity(segment.name);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
+
+    auto metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_NE(metrics_resp.body.find("master_allocated_bytes 4096"),
+              std::string::npos);
+    EXPECT_NE(metrics_resp.body.find("master_total_capacity_bytes 8388608"),
+              std::string::npos);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), kAllocationSize);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), segment.size);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
+              kAllocationSize);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+              segment.size);
+
+    // Losing service availability must clear the old leader projection even
+    // while the delegate remains installed. A concurrent refresh is
+    // serialized with this transition and cannot restore stale values.
+    admin_server.SetServiceAvailable(false);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    {
+        const std::string serialized = metrics.serialize_metrics();
+        EXPECT_EQ(serialized.find("segment=\"" + segment.name + "\""),
+                  std::string::npos);
+    }
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+
+    metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_NE(metrics_resp.body.find("master_allocated_bytes 0"),
+              std::string::npos);
+    EXPECT_NE(metrics_resp.body.find("master_total_capacity_bytes 0"),
+              std::string::npos);
+    EXPECT_EQ(metrics_resp.body.find("segment=\"" + segment.name + "\""),
+              std::string::npos);
+    admin_server.SetServiceAvailable(true);
+    metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), kAllocationSize);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), segment.size);
 
     auto segments_resp = FetchUrl(http_port, "/get_all_segments");
     EXPECT_EQ(segments_resp.http_status, 200);
@@ -481,6 +727,12 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
               std::string::npos);
     EXPECT_NE(detail_resp.body.find("\"allocator_capacity_bytes\""),
               std::string::npos);
+
+    ASSERT_TRUE(service
+                    ->PutRevoke(client_id, "admin_metrics_projection_key",
+                                ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
 
     admin_server.Stop();
 }
@@ -541,7 +793,12 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 3);
 
     // Test BatchPutEnd request
-    auto batch_put_end_result = service_.BatchPutEnd(client_id, keys);
+    std::vector<ObjectMeta> object_metas;
+    object_metas.reserve(keys.size());
+    for (const auto& key : keys) {
+        object_metas.emplace_back(ObjectMeta{key, std::nullopt});
+    }
+    auto batch_put_end_result = service_.BatchPutEnd(client_id, object_metas);
     ASSERT_EQ(batch_put_end_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_put_end_requests(), 1);
     ASSERT_EQ(metrics.get_batch_put_end_partial_successes(), 0);
@@ -609,9 +866,10 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
                                     const std::string& key) {
     ReplicateConfig cfg;
     cfg.replica_num = 1;
-    auto put_start = svc.PutStart(client_id, key, "default", value_size, cfg);
+    auto put_start =
+        svc.PutStart(client_id, key, TenantId::Default(), value_size, cfg);
     if (!put_start) return "";
-    svc.PutEnd(client_id, key, "default", ReplicaType::MEMORY);
+    svc.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY);
 
     StorageObjectMetadata meta;
     meta.data_size = static_cast<int64_t>(value_size);
@@ -656,7 +914,7 @@ TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
     EXPECT_EQ(metrics.get_allocated_file_size(), baseline + kValueSize);
 
     // After removing the key the LocalDiskReplica is destroyed; gauge resets.
-    ASSERT_TRUE(svc.Remove(key, "default").has_value());
+    ASSERT_TRUE(svc.Remove(key, TenantId::Default()).has_value());
     EXPECT_EQ(metrics.get_allocated_file_size(), baseline);
 }
 
@@ -754,7 +1012,7 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
               std::string::npos);
     EXPECT_NE(
         window_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
-                            "keys=3, size=4.00 KB"),
+                            "PartialAlloc=0, keys=3, size=4.00 KB"),
         std::string::npos);
     EXPECT_NE(window_summary.find("Mem Eviction: Success/Attempts=1/2, "
                                   "keys=3, size=4.00 KB"),
@@ -767,7 +1025,7 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
         metrics.get_summary_string_and_update_snapshot();
     EXPECT_NE(
         reported_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
-                              "keys=3, size=4.00 KB"),
+                              "PartialAlloc=0, keys=3, size=4.00 KB"),
         std::string::npos);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -775,7 +1033,8 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
         metrics.get_summary_string_and_update_snapshot();
     EXPECT_NE(idle_summary.find("PutStart=0.00/0.00"), std::string::npos);
     EXPECT_NE(idle_summary.find("Eviction: Success/Attempts=1/2, "
-                                "AllocFail=0, keys=3, size=4.00 KB"),
+                                "AllocFail=0, PartialAlloc=0, keys=3, "
+                                "size=4.00 KB"),
               std::string::npos);
     EXPECT_NE(idle_summary.find("Mem Eviction: Success/Attempts=1/2, "
                                 "keys=3, size=4.00 KB"),
@@ -834,7 +1093,8 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     auto put_start_result =
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result = service_.PutEnd(
+        client_id, ObjectMeta{key, std::nullopt}, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // After PutEnd: MEMORY_TOTAL should increment by 1.
@@ -927,6 +1187,227 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     // Clean up.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     service_.Remove(ssd_only_key, "default");
+}
+
+// Build info is an "info"-style metric: the value is always 1 and the version
+// strings are carried by labels, so serialization must emit a single series
+// containing both version labels.
+TEST_F(MasterMetricsTest, BuildInfoMetricIsSerialized) {
+    auto& metrics = MasterMetricManager::instance();
+
+    const std::string serialized = metrics.serialize_metrics();
+
+    ASSERT_NE(serialized.find("mooncake_build_info"), std::string::npos)
+        << "build info metric missing from serialized output";
+    // Label order inside the series is not asserted: only the presence of both
+    // labels with the compiled-in values matters for scraping and grouping.
+    EXPECT_NE(serialized.find("version=\"" + GetMooncakeStoreVersion() + "\""),
+              std::string::npos)
+        << "RPC handshake version missing from build info labels";
+    EXPECT_NE(serialized.find("display_version=\"" +
+                              std::string(MOONCAKE_DISPLAY_VERSION) + "\""),
+              std::string::npos)
+        << "display version missing from build info labels";
+
+    // The series value is fixed at 1; extract the number after the closing
+    // brace of the build info series to confirm it is exposed as such.
+    const auto metric_pos = serialized.find("mooncake_build_info{");
+    ASSERT_NE(metric_pos, std::string::npos)
+        << "build info metric has no labelled series";
+    const auto brace_end = serialized.find('}', metric_pos);
+    ASSERT_NE(brace_end, std::string::npos);
+    const auto line_end = serialized.find('\n', brace_end);
+    const std::string value_part =
+        serialized.substr(brace_end + 1, line_end == std::string::npos
+                                             ? std::string::npos
+                                             : line_end - brace_end - 1);
+    EXPECT_NE(value_part.find('1'), std::string::npos)
+        << "build info value should be 1, got:" << value_part;
+}
+
+// Verify the five SSD offload lifecycle counters increment per client_id
+// label. MasterMetricManager is a process-wide singleton without reset APIs,
+// so the test uses unique client_id labels whose values are determined solely
+// by this test, independent of cumulative singleton state from other tests.
+TEST_F(MasterMetricsTest, OffloadCountersIncrementByClient) {
+    auto& mm = MasterMetricManager::instance();
+    const std::string cid_a = "offload-metric-test-a";
+    const std::string cid_b = "offload-metric-test-b";
+
+    mm.inc_offload_enqueued(cid_a, 10);
+    mm.inc_offload_enqueued(cid_b, 5);
+    mm.inc_offload_completed(cid_a, 7);
+    mm.inc_offload_failed(cid_a, 2);
+    mm.inc_offload_cancelled(cid_a, 1);
+    mm.inc_offload_enqueue_rejected(cid_b, 3);
+
+    const std::string out = mm.serialize_metrics();
+    EXPECT_NE(out.find("master_offload_enqueued_total{client_id=\"offload-"
+                       "metric-test-a\"} 10"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_enqueued_total{client_id=\"offload-"
+                       "metric-test-b\"} 5"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_completed_total{client_id=\"offload-"
+                       "metric-test-a\"} 7"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_failed_total{client_id=\"offload-metric-"
+                       "test-a\"} 2"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_cancelled_total{client_id=\"offload-"
+                       "metric-test-a\"} 1"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_enqueue_rejected_total{client_id="
+                       "\"offload-metric-test-b\"} 3"),
+              std::string::npos);
+}
+
+// Capture only the removed diagnostics; generic verbose RPC tracing remains.
+class DuplicatePutLogSink : public google::LogSink {
+   public:
+    DuplicatePutLogSink() : old_verbosity_(FLAGS_v) {
+        google::AddLogSink(this);
+    }
+    ~DuplicatePutLogSink() override {
+        google::RemoveLogSink(this);
+        FLAGS_v = old_verbosity_;
+    }
+    void send(google::LogSeverity, const char*, const char*, int,
+              const struct ::tm*, const char* message,
+              size_t message_len) override {
+        const std::string text(message, message_len);
+        if (text.find("info=object_already_exists") != std::string::npos ||
+            (text.find("BatchPutStart failed for key[") != std::string::npos &&
+             text.find("OBJECT_ALREADY_EXISTS") != std::string::npos)) {
+            duplicate_logs.fetch_add(1);
+        }
+        if (text.find("BatchPutStart: keys.size()=") != std::string::npos) {
+            other_errors.fetch_add(1);
+        }
+    }
+    std::atomic<int> duplicate_logs{0};
+    std::atomic<int> other_errors{0};
+
+   private:
+    int old_verbosity_;
+};
+
+TEST_F(MasterMetricsTest, DuplicatePutResponsesCountItemsWithoutPerKeyLogs) {
+    auto& metrics = MasterMetricManager::instance();
+    DuplicatePutLogSink sink;
+    // Cover both verbosity levels and both batch placement paths.
+    for (int verbosity : {0, 1}) {
+        FLAGS_v = verbosity;
+        for (bool same_node : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "v=" << verbosity << ", same_node=" << same_node);
+            WrappedMasterServiceConfig service_config;
+            service_config.default_kv_lease_ttl = 100;
+            service_config.enable_metric_reporting = false;
+            WrappedMasterService service(service_config);
+            const auto client_id = generate_uuid();
+            Segment segment;
+            segment.id = generate_uuid();
+            segment.name = "duplicate_metric_segment";
+            segment.base = 0x300000000;
+            segment.size = 16 * 1024 * 1024;
+            ASSERT_TRUE(service.MountSegment(segment, client_id));
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.prefer_alloc_in_same_node = same_node;
+            const auto single_baseline =
+                metrics.get_put_start_object_already_exists();
+            const auto batch_baseline =
+                metrics.get_batch_put_start_object_already_exists();
+            auto expect_duplicates = [&](int64_t single, int64_t batch) {
+                EXPECT_EQ(metrics.get_put_start_object_already_exists(),
+                          single_baseline + single);
+                EXPECT_EQ(metrics.get_batch_put_start_object_already_exists(),
+                          batch_baseline + batch);
+            };
+            const auto single_failures = metrics.get_put_start_failures();
+            const auto batch_failures = metrics.get_batch_put_start_failures();
+            const auto partial =
+                metrics.get_batch_put_start_partial_successes();
+
+            ASSERT_TRUE(service.PutStart(client_id, "existing", 1024, config));
+            ASSERT_TRUE(service.PutEnd(client_id,
+                                       ObjectMeta{"existing", std::nullopt},
+                                       ReplicaType::MEMORY));
+            expect_duplicates(0, 0);
+            auto duplicate =
+                service.PutStart(client_id, "existing", 1024, config);
+            ASSERT_FALSE(duplicate);
+            EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+            expect_duplicates(1, 0);
+            EXPECT_EQ(metrics.get_put_start_failures(), single_failures + 1);
+
+            auto all = service.BatchPutStart(
+                client_id, {"existing", "existing"}, {1024, 1024}, config);
+            ASSERT_EQ(all.size(), 2);
+            for (const auto& result : all) {
+                ASSERT_FALSE(result);
+                EXPECT_EQ(result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+            }
+            expect_duplicates(1, 2);
+            EXPECT_EQ(metrics.get_batch_put_start_failures(),
+                      batch_failures + 1);
+
+            auto mixed = service.BatchPutStart(client_id, {"existing", "new"},
+                                               {1024, 1024}, config);
+            ASSERT_EQ(mixed.size(), 2);
+            ASSERT_FALSE(mixed[0]);
+            EXPECT_EQ(mixed[0].error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+            EXPECT_TRUE(mixed[1]);
+            expect_duplicates(1, 3);
+            EXPECT_EQ(metrics.get_batch_put_start_partial_successes(),
+                      partial + 1);
+
+            // Also count an unfinished duplicate and another attempt at the
+            // key.
+            auto processing = service.PutStart(client_id, "new", 1024, config);
+            ASSERT_FALSE(processing);
+            EXPECT_EQ(processing.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+            expect_duplicates(2, 3);
+            auto invalid =
+                service.BatchPutStart(client_id, {"existing"}, {}, config);
+            ASSERT_EQ(invalid.size(), 1);
+            ASSERT_FALSE(invalid[0]);
+            EXPECT_EQ(invalid[0].error(), ErrorCode::INVALID_PARAMS);
+            EXPECT_TRUE(
+                service.BatchPutStart(client_id, {}, {}, config).empty());
+            expect_duplicates(2, 3);
+        }
+    }
+    EXPECT_EQ(sink.duplicate_logs.load(), 0);
+    EXPECT_EQ(sink.other_errors.load(), 4);
+
+    const std::string sample =
+        "master_put_start_object_already_exists_total " +
+        std::to_string(metrics.get_put_start_object_already_exists()) + "\n";
+    const std::string batch_sample =
+        "master_batch_put_start_object_already_exists_total " +
+        std::to_string(metrics.get_batch_put_start_object_already_exists()) +
+        "\n";
+    const auto serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find(batch_sample), std::string::npos);
+    EXPECT_NE(serialized.find(
+                  "# TYPE master_batch_put_start_object_already_exists_total "
+                  "counter"),
+              std::string::npos);
+    EXPECT_NE(serialized.find(sample), std::string::npos);
+    EXPECT_NE(
+        serialized.find(
+            "# TYPE master_put_start_object_already_exists_total counter"),
+        std::string::npos);
+    const int port = getFreeTcpPort();
+    MasterAdminServer admin_server(static_cast<uint16_t>(port),
+                                   /*enable_metric_reporting=*/false);
+    ASSERT_TRUE(admin_server.Start());
+    const auto response = FetchUrl(port, "/metrics");
+    EXPECT_EQ(response.http_status, 200);
+    EXPECT_NE(response.body.find(sample), std::string::npos);
+    EXPECT_NE(response.body.find(batch_sample), std::string::npos);
 }
 
 }  // namespace mooncake::test

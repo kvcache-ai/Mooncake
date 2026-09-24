@@ -15,14 +15,25 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <span>
+#include <string>
+#include <vector>
+
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+class ShutdownToken;
 class TransferEngineImpl;
 namespace tent {
+class Config;
 class TransferEngine;
 };
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
@@ -30,6 +41,11 @@ class TransferEngine;
 namespace device {
 class P2pTransport;
 class RdmaTransport;
+}  // namespace device
+#endif
+#ifdef USE_NCCL_DEVICE
+namespace device {
+class NcclTransport;
 }  // namespace device
 #endif
 using TransferRequest = Transport::TransferRequest;
@@ -40,10 +56,22 @@ using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
+using NicLoadStats = Transport::NicLoadStats;
+
+struct SegmentBufferInfo {
+    uint64_t addr;
+    uint64_t length;
+    std::string location;
+};
 
 enum class PeerLiveness : uint8_t {
     Alive = 0,
     Unreachable = 1,
+};
+
+struct AutoDiscoverConfig {
+    bool enabled = false;
+    std::string protocol;
 };
 
 class TransferEngine {
@@ -72,9 +100,9 @@ class TransferEngine {
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
 
-    TransferEngine(TransferEngine&&) = default;
+    TransferEngine(TransferEngine&& other) noexcept;
 
-    TransferEngine& operator=(TransferEngine&&) = default;
+    TransferEngine& operator=(TransferEngine&& other) noexcept;
 
     ~TransferEngine();
 
@@ -82,6 +110,11 @@ class TransferEngine {
              const std::string& local_server_name,
              const std::string& ip_or_host_name = "",
              uint64_t rpc_port = 12345);
+
+    int init(const std::string& metadata_conn_string,
+             const std::string& local_server_name,
+             const std::string& ip_or_host_name, uint64_t rpc_port,
+             const std::string& protocol);
 
     int freeEngine();
 
@@ -97,6 +130,12 @@ class TransferEngine {
 
     SegmentHandle openSegment(const std::string& segment_name);
 
+    // Replace buffers with a snapshot of the segment's memory buffers.
+    // Return 0 on success (including an empty segment), or a negative ERR_*.
+    // On error, buffers is empty. Does not close the segment handle.
+    int getSegmentBuffers(SegmentHandle handle,
+                          std::vector<SegmentBufferInfo>& buffers);
+
     Status CheckSegmentStatus(SegmentID sid);
 
     int closeSegment(SegmentHandle handle);
@@ -108,10 +147,70 @@ class TransferEngine {
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
+    // Allocate shared memory that ShmTransport can export to same-host peers.
+    // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
+    // Caller must registerLocalMemory before remote access. Returns nullptr
+    // on failure. Default: POSIX /dev/shm. With
+    // SharedMemoryOptions.use_hugepage and hugepage_size 2MB/512MB/1GB:
+    // matching hugetlbfs (no silent tmpfs fallback).
+    void* allocateSharedMemory(size_t length);
+    void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
+
+    int freeSharedMemory(void* addr);
+
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
+
+    struct ScatterTransferRange {
+        TransferRequest::OpCode opcode;
+        std::string remote_segment;
+        uint64_t remote_base_offset;
+        size_t remote_size;
+        void* local_buffer;
+        size_t local_capacity;
+        std::span<const size_t> local_offsets;
+        std::span<const size_t> remote_offsets;
+        std::span<const size_t> lengths;
+        std::function<void(size_t, const Status&)> on_fragment_complete;
+    };
+
+    class ScatterTransferOperation {
+       public:
+        ScatterTransferOperation(ScatterTransferOperation&&) noexcept;
+        ScatterTransferOperation& operator=(
+            ScatterTransferOperation&&) noexcept;
+
+        // Destruction waits for physical completion before releasing state.
+        ~ScatterTransferOperation();
+
+        ScatterTransferOperation(const ScatterTransferOperation&) = delete;
+        ScatterTransferOperation& operator=(const ScatterTransferOperation&) =
+            delete;
+
+        // Single-consumer operation: do not wait concurrently or from a
+        // fragment completion callback.
+        Status wait();
+
+        // A wait timeout does not cancel the transfer. Keep this operation and
+        // its CPU/GPU buffers alive until a later wait reaches completion.
+        Status waitFor(std::chrono::nanoseconds timeout);
+
+       private:
+        class Impl;
+        explicit ScatterTransferOperation(std::unique_ptr<Impl> impl);
+        std::unique_ptr<Impl> impl_;
+        friend class TransferEngine;
+    };
+
+    // Under TENT, scatter pins a direct transport route that supports
+    // post-submit cancellation. Non-cancellable and staged routes are
+    // rejected before transport work is published; runtime queue admission
+    // and automatic failover are not used for this operation.
+    ScatterTransferOperation submitScatter(
+        const std::vector<ScatterTransferRange>& ranges);
+    Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
 
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
@@ -148,6 +247,8 @@ class TransferEngine {
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
+    // RDMA success means queued on the notification QP, not remote delivery.
+    // Completion errors are processed asynchronously; TCP fallback is sync.
     int sendNotifyByID(SegmentID target_id,
                        TransferMetadata::NotifyDesc notify_msg);
 
@@ -161,6 +262,8 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
+
     Transport* getTransport(const std::string& proto);
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
@@ -173,12 +276,17 @@ class TransferEngine {
     device::RdmaTransport* getOrCreateRdmaTransport(
         const std::vector<std::string>& device_filter = {});
 #endif
+#ifdef USE_NCCL_DEVICE
+    // NCCL is CUDA-only and independent of the host network transport.
+    device::NcclTransport* getOrCreateNcclTransport();
+#endif
 
     /**
-     * @brief Check if TCP is the only installed transport.
+     * @brief Check if TCP is the only installed host transport.
      *
-     * When only TCP transport is available (no RDMA, NVLink, etc.),
-     * local memcpy is preferred over TCP loopback for same-host transfers.
+     * When only TCP is available (no RDMA, NVLink, etc.), local memcpy is
+     * preferred over TCP loopback for same-host transfers. POSIX SHM is
+     * intra-node only and does not change this classification.
      */
     bool isTcpOnly() const;
 
@@ -189,6 +297,7 @@ class TransferEngine {
     bool checkOverlap(void* addr, uint64_t length);
 
     void setAutoDiscover(bool auto_discover);
+    void setAutoDiscover(const AutoDiscoverConfig& config);
 
     void* getBaseAddr();
 
@@ -198,12 +307,30 @@ class TransferEngine {
 
     std::shared_ptr<Topology> getLocalTopology();
 
+    // String dump of the live local topology. Under TENT this is the native
+    // {"nics","mems"} JSON (with rank0/1/2). Under classic TE it is the
+    // priority-matrix JSON.
+    std::string getLocalTopologyString();
+
+    void enableGracefulShutdown();
     std::string showLinks(bool json = false) const;
 
    private:
+    Status submitScatterTransfer(BatchID batch_id,
+                                 const std::vector<TransferRequest>& entries);
+
+    std::shared_ptr<mooncake::tent::Config> buildTentConfig(
+        const std::string& metadata_conn_string,
+        const std::string& local_server_name) const;
+
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::shared_ptr<ShutdownToken> shutdown_token_;
+    // Classic callers provide this through TransferEngine(auto_discover,
+    // filter) before init() creates the native TENT engine.
+    std::vector<std::string> tent_device_filter_;
     bool use_tent_{false};
+    friend class TransferEngineImplTestPeer;
 };
 }  // namespace mooncake
 

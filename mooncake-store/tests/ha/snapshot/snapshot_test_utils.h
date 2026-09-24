@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,7 +22,7 @@
 #include "segment.h"
 #include "serialize/serializer.h"
 #include "types.h"
-#include "utils/zstd_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake::test {
 
@@ -53,13 +54,15 @@ struct CatalogBackendParam {
 //   kDataTypeAndHardPinned:
 //                    9 + replica_count, data_type plus trailing hard_pinned
 //   kWithGroupId:    10 + replica_count, data_type + hard_pinned + group_id
-//                    (the current writer format)
+//   kWithObjectChecksum:
+//                    11 + replica_count, current writer fields + checksum
 enum class SnapshotMetadataFormat {
     kLegacy,
     kDataTypeOnly,
     kHardPinnedOnly,
     kDataTypeAndHardPinned,
     kWithGroupId,
+    kWithObjectChecksum,
 };
 
 class ScopedEnvVar {
@@ -139,7 +142,7 @@ inline void PackDiskReplica(
 inline std::vector<uint8_t> BuildSegmentsPayload() {
     SegmentManager segment_manager(BufferAllocatorType::OFFSET);
     SegmentSerializer serializer(&segment_manager);
-    auto serialized = serializer.Serialize();
+    auto serialized = serializer.Serialize(LocalSsdPersistedState{});
     if (!serialized) {
         throw std::runtime_error(serialized.error().message);
     }
@@ -167,28 +170,36 @@ inline std::vector<uint8_t> WrapShardIntoMetadataRoot(
     return ToByteVector(root_buffer);
 }
 
-inline std::vector<uint8_t> BuildMetadataPayload(
-    const UUID& client_id, std::string_view object_key = kDefaultTestObjectKey,
+inline std::vector<uint8_t> BuildMetadataPayloadWithClientIdString(
+    std::string_view client_id,
+    std::string_view object_key = kDefaultTestObjectKey,
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
     uint64_t object_size = kDefaultTestObjectSize,
     uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
     uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
-    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
+    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy,
+    std::optional<uint64_t> soft_pin_deadline_ms = std::nullopt) {
     const bool include_data_type =
         format == SnapshotMetadataFormat::kDataTypeOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
     const bool include_hard_pinned =
         format == SnapshotMetadataFormat::kHardPinnedOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
     const bool include_group_id =
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
+    const bool include_object_checksum =
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
     constexpr uint32_t kReplicaCount = 1;
     // 7 leading fields + replicas + optional data_type/hard_pinned/group_id.
     const size_t array_size = 7 + kReplicaCount + (include_data_type ? 1 : 0) +
                               (include_hard_pinned ? 1 : 0) +
-                              (include_group_id ? 1 : 0);
+                              (include_group_id ? 1 : 0) +
+                              (include_object_checksum ? 1 : 0);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
@@ -199,12 +210,12 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     shard_packer.pack(std::string(object_key));
 
     shard_packer.pack_array(array_size);
-    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(std::string(client_id));
     shard_packer.pack(put_start_time_ms);
     shard_packer.pack(object_size);
     shard_packer.pack(lease_timeout_ms);
-    shard_packer.pack(false);
-    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(soft_pin_deadline_ms.has_value());
+    shard_packer.pack(soft_pin_deadline_ms.value_or(0));
     shard_packer.pack(kReplicaCount);
     if (include_data_type) {
         shard_packer.pack(static_cast<uint8_t>(ObjectDataType::TENSOR));
@@ -216,8 +227,24 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     if (include_group_id) {
         shard_packer.pack(std::string("test-group"));
     }
+    if (include_object_checksum) {
+        shard_packer.pack(uint64_t{0x123456789ABCDEF0ULL});
+    }
 
     return WrapShardIntoMetadataRoot(shard_buffer);
+}
+
+inline std::vector<uint8_t> BuildMetadataPayload(
+    const UUID& client_id, std::string_view object_key = kDefaultTestObjectKey,
+    std::string_view disk_file_path = kDefaultTestDiskFilePath,
+    uint64_t object_size = kDefaultTestObjectSize,
+    uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
+    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
+    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy,
+    std::optional<uint64_t> soft_pin_deadline_ms = std::nullopt) {
+    return BuildMetadataPayloadWithClientIdString(
+        UuidToString(client_id), object_key, disk_file_path, object_size,
+        put_start_time_ms, lease_timeout_ms, format, soft_pin_deadline_ms);
 }
 
 // Builds a metadata payload whose declared replica_count field is set to
@@ -337,12 +364,14 @@ inline tl::expected<void, std::string> PublishSnapshotPayload(
     std::string_view object_key = kDefaultTestObjectKey,
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
     uint64_t object_size = kDefaultTestObjectSize,
-    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
+    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy,
+    std::optional<uint64_t> soft_pin_deadline_ms = std::nullopt) {
     return PublishSnapshotPayloadBytes(
         object_store, catalog_store, descriptor,
         BuildMetadataPayload(client_id, object_key, disk_file_path, object_size,
                              kDefaultTestPutStartTimeMs,
-                             kDefaultTestLeaseTimeoutMs, format));
+                             kDefaultTestLeaseTimeoutMs, format,
+                             soft_pin_deadline_ms));
 }
 
 }  // namespace mooncake::test

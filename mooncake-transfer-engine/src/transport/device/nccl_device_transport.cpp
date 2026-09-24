@@ -1,0 +1,710 @@
+// Copyright 2026 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "transport/device/nccl_device_transport.h"
+
+#include <cuda_runtime.h>
+#include <glog/logging.h>
+#include <nccl.h>
+#include <nccl_device.h>
+
+#include <cstring>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
+
+#if NCCL_VERSION_CODE < 23004
+#error "Mooncake NCCL DeviceTransport requires NCCL 2.30.4 or newer"
+#endif
+
+namespace mooncake {
+namespace device {
+namespace {
+
+int reportNcclError(ncclResult_t result, const char* operation) {
+    if (result == ncclSuccess) return 0;
+    LOG(ERROR) << "[Device NCCL] " << operation
+               << " failed: " << ncclGetErrorString(result);
+    return -1;
+}
+
+int reportCudaError(cudaError_t result, const char* operation) {
+    if (result == cudaSuccess) return 0;
+    LOG(ERROR) << "[Device NCCL] " << operation
+               << " failed: " << cudaGetErrorString(result);
+    return -1;
+}
+
+NcclGinBackend toGinBackend(ncclGinType_t type) {
+    switch (type) {
+        case NCCL_GIN_TYPE_PROXY:
+            return NcclGinBackend::kProxy;
+        case NCCL_GIN_TYPE_GDAKI:
+            return NcclGinBackend::kGdaki;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 6)
+        case NCCL_GIN_TYPE_GPI:
+            return NcclGinBackend::kGpi;
+#endif
+        case NCCL_GIN_TYPE_NONE:
+        default:
+            return NcclGinBackend::kNone;
+    }
+}
+
+const char* ginBackendName(NcclGinBackend backend) {
+    switch (backend) {
+        case NcclGinBackend::kProxy:
+            return "proxy";
+        case NcclGinBackend::kGdaki:
+            return "gdaki";
+        case NcclGinBackend::kGpi:
+            return "gpi";
+        case NcclGinBackend::kNone:
+        default:
+            return "none";
+    }
+}
+
+bool validGinConnectionType(NcclGinConnectionType type) {
+    return type == NcclGinConnectionType::kNone ||
+           type == NcclGinConnectionType::kFull ||
+           type == NcclGinConnectionType::kRail;
+}
+
+ncclGinConnectionType_t toNativeGinConnectionType(NcclGinConnectionType type) {
+    switch (type) {
+        case NcclGinConnectionType::kFull:
+            return NCCL_GIN_CONNECTION_FULL;
+        case NcclGinConnectionType::kRail:
+            return NCCL_GIN_CONNECTION_RAIL;
+        case NcclGinConnectionType::kNone:
+        default:
+            return NCCL_GIN_CONNECTION_NONE;
+    }
+}
+
+const char* ginConnectionTypeName(NcclGinConnectionType type) {
+    switch (type) {
+        case NcclGinConnectionType::kFull:
+            return "full";
+        case NcclGinConnectionType::kRail:
+            return "rail";
+        case NcclGinConnectionType::kNone:
+        default:
+            return "none";
+    }
+}
+
+bool decodeUniqueId(const std::vector<int32_t>& encoded, ncclUniqueId* id) {
+    const size_t words =
+        (sizeof(ncclUniqueId) + sizeof(int32_t) - 1) / sizeof(int32_t);
+    if (!id || encoded.size() != words) return false;
+    std::memcpy(id, encoded.data(), sizeof(*id));
+    return true;
+}
+
+}  // namespace
+
+class NcclDeviceTransportImpl final : public NcclTransport {
+   public:
+    ~NcclDeviceTransportImpl() override { abort(); }
+
+    std::vector<int32_t> createUniqueId() override {
+        ncclUniqueId id{};
+        if (reportNcclError(ncclGetUniqueId(&id), "ncclGetUniqueId") != 0) {
+            return {};
+        }
+
+        const size_t words =
+            (sizeof(id) + sizeof(int32_t) - 1) / sizeof(int32_t);
+        std::vector<int32_t> encoded(words, 0);
+        std::memcpy(encoded.data(), &id, sizeof(id));
+        return encoded;
+    }
+
+    int initialize(const NcclTransportConfig& config,
+                   const std::vector<int32_t>& unique_id) override {
+        if (initialized_) {
+            LOG(ERROR) << "[Device NCCL] transport is already initialized";
+            return -1;
+        }
+        if (config.num_ranks <= 0 || config.rank < 0 ||
+            config.rank >= config.num_ranks || config.gin_context_count < 0 ||
+            (config.enable_gin && config.gin_context_count == 0) ||
+            (config.enable_gin &&
+             config.gin_connection_type == NcclGinConnectionType::kNone) ||
+            !validGinConnectionType(config.gin_connection_type) ||
+            config.gin_context_count > std::numeric_limits<int>::max() / 2 ||
+            config.gin_queue_depth < 0 || config.gin_signal_count < 0 ||
+            config.gin_traffic_class < -1 || config.lsa_barrier_count < 0) {
+            LOG(ERROR) << "[Device NCCL] invalid communicator configuration";
+            return -1;
+        }
+
+        ncclUniqueId id{};
+        if (!decodeUniqueId(unique_id, &id)) {
+            LOG(ERROR) << "[Device NCCL] invalid NCCL unique ID size";
+            return -1;
+        }
+
+        int runtime_version = 0;
+        if (reportNcclError(ncclGetVersion(&runtime_version),
+                            "ncclGetVersion") != 0) {
+            return -1;
+        }
+        if (runtime_version != NCCL_VERSION_CODE) {
+            LOG(ERROR)
+                << "[Device NCCL] Device API requires matching compile-time "
+                   "and runtime NCCL versions: compiled="
+                << NCCL_VERSION_CODE << " runtime=" << runtime_version
+                << ". Rebuild Mooncake against the runtime NCCL installation, "
+                   "and rebuild AOT NCCL device kernels or invalidate and "
+                   "re-JIT cached NCCL Device API kernels";
+            return -1;
+        }
+
+        int cuda_device = -1;
+        if (reportCudaError(cudaGetDevice(&cuda_device), "cudaGetDevice") !=
+            0) {
+            return -1;
+        }
+
+        if (reportNcclError(
+                ncclCommInitRank(&comm_, config.num_ranks, id, config.rank),
+                "ncclCommInitRank") != 0) {
+            comm_ = nullptr;
+            return -1;
+        }
+
+        // Establish the smallest possible rank-wide status path immediately
+        // after communicator creation. While this CUDA/NCCL control path stays
+        // healthy, subsequent capability decisions can be made uniformly.
+        if (reportCudaError(cudaStreamCreateWithFlags(&control_stream_,
+                                                      cudaStreamNonBlocking),
+                            "cudaStreamCreateWithFlags(control)") != 0 ||
+            reportCudaError(
+                cudaMalloc(reinterpret_cast<void**>(&collective_status_),
+                           sizeof(int)),
+                "cudaMalloc(collective status)") != 0) {
+            abortPartialInitialization();
+            return -1;
+        }
+
+        ncclCommProperties_t comm_properties = NCCL_COMM_PROPERTIES_INITIALIZER;
+        bool local_capabilities_valid =
+            reportNcclError(ncclCommQueryProperties(comm_, &comm_properties),
+                            "ncclCommQueryProperties") == 0;
+        if (local_capabilities_valid && !comm_properties.deviceApiSupport) {
+            LOG(ERROR) << "[Device NCCL] communicator does not support the "
+                          "device API";
+            local_capabilities_valid = false;
+        }
+        if (local_capabilities_valid && config.require_lsa_multimem &&
+            !comm_properties.multimemSupport) {
+            LOG(ERROR) << "[Device NCCL] LSA multimem was required but is "
+                          "not supported";
+            local_capabilities_valid = false;
+        }
+        const ncclGinType_t selected_gin_type =
+            config.gin_connection_type == NcclGinConnectionType::kRail
+                ? comm_properties.railedGinType
+                : comm_properties.ginType;
+        if (local_capabilities_valid && config.enable_gin &&
+            selected_gin_type == NCCL_GIN_TYPE_NONE) {
+            LOG(ERROR) << "[Device NCCL] "
+                       << ginConnectionTypeName(config.gin_connection_type)
+                       << " GIN connectivity was requested but is unavailable";
+            local_capabilities_valid = false;
+        }
+        if (!collectiveAllSucceeded(local_capabilities_valid)) {
+            LOG(ERROR) << "[Device NCCL] required Device API capabilities are "
+                          "unavailable on one or more ranks";
+            abortPartialInitialization();
+            return -1;
+        }
+
+        ncclDevCommRequirements_t requirements =
+            NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+        requirements.lsaMultimem = config.require_lsa_multimem;
+        requirements.lsaBarrierCount = config.lsa_barrier_count;
+        requirements.ginContextCount =
+            config.enable_gin ? config.gin_context_count : 0;
+        requirements.ginConnectionType =
+            config.enable_gin
+                ? toNativeGinConnectionType(config.gin_connection_type)
+                : NCCL_GIN_CONNECTION_NONE;
+        requirements.ginExclusiveContexts =
+            config.enable_gin && config.gin_exclusive_contexts;
+        requirements.ginQueueDepth =
+            config.enable_gin ? config.gin_queue_depth : 0;
+        requirements.ginSignalCount =
+            config.enable_gin ? config.gin_signal_count : 0;
+        if (config.enable_gin && config.gin_traffic_class >= 0) {
+            requirements.ginTrafficClass = config.gin_traffic_class;
+        }
+
+        const bool local_dev_comm_valid =
+            reportNcclError(ncclDevCommCreate(comm_, &requirements, &dev_comm_),
+                            "ncclDevCommCreate") == 0;
+        // Record rank-local ownership before group agreement so the abort path
+        // destroys a successful local create even if another rank failed.
+        dev_comm_created_ = local_dev_comm_valid;
+        if (!collectiveAllSucceeded(local_dev_comm_valid)) {
+            LOG(ERROR) << "[Device NCCL] device communicator creation failed "
+                          "on one or more ranks";
+            abortPartialInitialization();
+            return -1;
+        }
+
+        const bool local_gin_resources_valid =
+            !config.enable_gin ||
+            (dev_comm_.ginConnectionCount > 0 && dev_comm_.ginContextCount > 0);
+        if (!local_gin_resources_valid) {
+            LOG(ERROR) << "[Device NCCL] communicator did not provide the "
+                       << "requested "
+                       << ginConnectionTypeName(config.gin_connection_type)
+                       << " GIN resources";
+        }
+        if (!collectiveAllSucceeded(local_gin_resources_valid)) {
+            LOG(ERROR) << "[Device NCCL] requested GIN resources are missing "
+                          "on one or more ranks";
+            abortPartialInitialization();
+            return -1;
+        }
+
+        bool local_device_comm_ready =
+            reportCudaError(cudaMalloc(reinterpret_cast<void**>(&device_comm_),
+                                       sizeof(dev_comm_)),
+                            "cudaMalloc(device communicator)") == 0;
+        if (local_device_comm_ready) {
+            local_device_comm_ready =
+                reportCudaError(
+                    cudaMemcpy(device_comm_, &dev_comm_, sizeof(dev_comm_),
+                               cudaMemcpyHostToDevice),
+                    "cudaMemcpy(device communicator)") == 0;
+        }
+
+        if (!collectiveAllSucceeded(local_device_comm_ready)) {
+            LOG(ERROR) << "[Device NCCL] device communicator setup failed on "
+                          "one or more ranks";
+            abortPartialInitialization();
+            return -1;
+        }
+
+        properties_.runtime_version = runtime_version;
+        properties_.rank = comm_properties.rank;
+        properties_.num_ranks = comm_properties.nRanks;
+        properties_.cuda_device = comm_properties.cudaDev;
+        properties_.device_api_supported = comm_properties.deviceApiSupport;
+        properties_.multimem_supported = comm_properties.multimemSupport;
+        properties_.lsa_multimem_enabled = config.require_lsa_multimem;
+        properties_.lsa_team_count = comm_properties.nLsaTeams;
+        lsa_topology_.rank = dev_comm_.lsaRank;
+        lsa_topology_.size = dev_comm_.lsaSize;
+        lsa_topology_.first_rank = dev_comm_.rank - dev_comm_.lsaRank;
+        properties_.lsa_barrier_count = config.lsa_barrier_count;
+        properties_.gin_enabled = config.enable_gin;
+        properties_.gin_connection_type = config.enable_gin
+                                              ? config.gin_connection_type
+                                              : NcclGinConnectionType::kNone;
+        properties_.gin_backend = toGinBackend(
+            config.enable_gin ? selected_gin_type : NCCL_GIN_TYPE_NONE);
+        properties_.gin_connection_count = dev_comm_.ginConnectionCount;
+        properties_.gin_context_count =
+            static_cast<int>(dev_comm_.ginContextCount);
+        initialized_ = true;
+
+        LOG(INFO) << "[Device NCCL] initialized rank=" << properties_.rank
+                  << "/" << properties_.num_ranks
+                  << " cuda_device=" << properties_.cuda_device
+                  << " lsa_teams=" << properties_.lsa_team_count
+                  << " lsa_rank=" << lsa_topology_.rank << "/"
+                  << lsa_topology_.size
+                  << " lsa_first_rank=" << lsa_topology_.first_rank
+                  << " multimem=" << properties_.lsa_multimem_enabled
+                  << " lsa_barriers=" << properties_.lsa_barrier_count
+                  << " gin_backend=" << ginBackendName(properties_.gin_backend)
+                  << " gin_connection_type="
+                  << ginConnectionTypeName(properties_.gin_connection_type)
+                  << " gin_connections=" << properties_.gin_connection_count
+                  << " gin_contexts=" << properties_.gin_context_count;
+        return 0;
+    }
+
+    bool allRanksSucceeded(bool local_success) override {
+        if (!initialized_) {
+            LOG(ERROR) << "[Device NCCL] collective status agreement requires "
+                          "initialization";
+            return false;
+        }
+        return collectiveAllSucceeded(local_success);
+    }
+
+    void* allocateBuffer(size_t bytes) override {
+        if (bytes == 0) {
+            LOG(ERROR) << "[Device NCCL] cannot allocate a zero-sized buffer";
+            return nullptr;
+        }
+
+        void* ptr = nullptr;
+        if (reportNcclError(ncclMemAlloc(&ptr, bytes), "ncclMemAlloc") != 0) {
+            return nullptr;
+        }
+
+        allocations_.insert(ptr);
+        return ptr;
+    }
+
+    int freeBuffer(void* ptr) override {
+        if (!ptr) return 0;
+
+        for (const auto& entry : registrations_) {
+            if (entry.second.ptr == ptr) {
+                LOG(ERROR) << "[Device NCCL] deregister the buffer before "
+                              "freeing its allocation";
+                return -1;
+            }
+        }
+
+        auto it = allocations_.find(ptr);
+        if (it == allocations_.end()) {
+            LOG(ERROR) << "[Device NCCL] buffer was not allocated by this "
+                          "transport";
+            return -1;
+        }
+        if (reportNcclError(ncclMemFree(ptr), "ncclMemFree") != 0) {
+            return -1;
+        }
+        allocations_.erase(it);
+        return 0;
+    }
+
+    int registerBuffer(void* ptr, size_t bytes,
+                       NcclBufferRegistration* registration) override {
+        if (!ptr || bytes == 0 || !registration || registration->valid()) {
+            LOG(ERROR) << "[Device NCCL] invalid buffer registration";
+            return -1;
+        }
+        if (!initialized_) {
+            LOG(ERROR) << "[Device NCCL] initialize before registering a "
+                          "buffer";
+            return -1;
+        }
+
+        ncclWindow_t window = nullptr;
+        if (reportNcclError(
+                ncclCommWindowRegister(
+                    comm_, ptr, bytes, &window,
+                    NCCL_WIN_COLL_SYMMETRIC | NCCL_WIN_STRICT_ORDERING),
+                "ncclCommWindowRegister") != 0) {
+            return -1;
+        }
+
+        if (next_registration_id_ == 0) {
+            LOG(ERROR) << "[Device NCCL] registration ID space exhausted";
+            ncclCommWindowDeregister(comm_, window);
+            return -1;
+        }
+        const uint64_t id = next_registration_id_++;
+        registrations_.emplace(id, WindowRecord{window, ptr, bytes});
+        registration->id_ = id;
+        return 0;
+    }
+
+    int deregisterBuffer(NcclBufferRegistration* registration) override {
+        if (!registration || !registration->valid()) return 0;
+
+        auto it = registrations_.find(registration->id_);
+        if (it == registrations_.end()) {
+            LOG(ERROR) << "[Device NCCL] unknown buffer registration";
+            return -1;
+        }
+        if (reportNcclError(ncclCommWindowDeregister(comm_, it->second.window),
+                            "ncclCommWindowDeregister") != 0) {
+            return -1;
+        }
+        registrations_.erase(it);
+        registration->id_ = 0;
+        return 0;
+    }
+
+    int allocateAndRegisterBuffer(
+        size_t bytes, void** ptr,
+        NcclBufferRegistration* registration) override {
+        if (!initialized_ || bytes == 0 || !ptr || !registration ||
+            registration->valid()) {
+            LOG(ERROR) << "[Device NCCL] invalid collective buffer request";
+            return -1;
+        }
+
+        *ptr = nullptr;
+        void* local_ptr = allocateBuffer(bytes);
+        const bool all_allocated = allRanksSucceeded(local_ptr != nullptr);
+        if (!all_allocated) {
+            if (local_ptr) freeBuffer(local_ptr);
+            return -1;
+        }
+
+        // A GIN VA-signal address must not be accessed through ordinary CUDA
+        // loads or stores after its window has been registered. Initialize the
+        // entire allocation while it is still plain NCCL memory so callers can
+        // safely reserve any subrange for GIN-only signals.
+        const int zero_status = reportCudaError(
+            cudaMemsetAsync(local_ptr, 0, bytes, control_stream_),
+            "cudaMemsetAsync(collective buffer)");
+        const bool all_zeroed = allRanksSucceeded(zero_status == 0);
+        if (!all_zeroed) {
+            freeBuffer(local_ptr);
+            return -1;
+        }
+
+        NcclBufferRegistration local_registration;
+        const int register_status =
+            registerBuffer(local_ptr, bytes, &local_registration);
+        const bool all_registered = allRanksSucceeded(register_status == 0);
+        if (!all_registered) {
+            if (local_registration.valid())
+                deregisterBuffer(&local_registration);
+            freeBuffer(local_ptr);
+            return -1;
+        }
+
+        *ptr = local_ptr;
+        *registration = local_registration;
+        return 0;
+    }
+
+    NcclDeviceContext deviceContext(
+        const NcclBufferRegistration& registration) const override {
+        NcclDeviceContext context;
+        if (!initialized_ || !registration.valid()) return context;
+
+        const auto it = registrations_.find(registration.id_);
+        if (it == registrations_.end()) {
+            LOG(ERROR) << "[Device NCCL] unknown buffer registration";
+            return context;
+        }
+
+        context.native_comm_ = device_comm_;
+        static_assert(
+            sizeof(dev_comm_) <= NcclDeviceContext::kNativeCommCapacity,
+            "Increase embedded NCCL device communicator capacity");
+        static_assert(
+            alignof(ncclDevComm_t) <= NcclDeviceContext::kNativeCommAlignment,
+            "Update embedded NCCL device communicator alignment");
+        std::memcpy(context.native_comm_storage_, &dev_comm_,
+                    sizeof(dev_comm_));
+        context.native_window_ = it->second.window;
+        context.local_base_ = it->second.ptr;
+        context.rank_ = properties_.rank;
+        context.gin_context_count_ = properties_.gin_context_count;
+        context.gin_enabled_ = properties_.gin_enabled;
+        context.gin_connections_railed_ =
+            properties_.gin_connection_type == NcclGinConnectionType::kRail;
+        context.lsa_multimem_enabled_ = properties_.lsa_multimem_enabled;
+        return context;
+    }
+
+    NcclTransportProperties properties() const override { return properties_; }
+
+    NcclLsaTopology lsaTopology() const override { return lsa_topology_; }
+
+    bool initialized() const override { return initialized_; }
+
+    int shutdown() override {
+        int status = 0;
+
+        if (comm_) {
+            for (const auto& entry : registrations_) {
+                if (reportNcclError(
+                        ncclCommWindowDeregister(comm_, entry.second.window),
+                        "ncclCommWindowDeregister") != 0) {
+                    status = -1;
+                }
+            }
+        }
+        registrations_.clear();
+
+        for (void* ptr : allocations_) {
+            if (reportNcclError(ncclMemFree(ptr), "ncclMemFree") != 0) {
+                status = -1;
+            }
+        }
+        allocations_.clear();
+
+        if (collective_status_) {
+            if (reportCudaError(cudaFree(collective_status_),
+                                "cudaFree(collective status)") != 0) {
+                status = -1;
+            }
+            collective_status_ = nullptr;
+        }
+        if (control_stream_) {
+            if (reportCudaError(cudaStreamDestroy(control_stream_),
+                                "cudaStreamDestroy(control)") != 0) {
+                status = -1;
+            }
+            control_stream_ = nullptr;
+        }
+        if (device_comm_) {
+            if (reportCudaError(cudaFree(device_comm_),
+                                "cudaFree(device communicator)") != 0) {
+                status = -1;
+            }
+            device_comm_ = nullptr;
+        }
+
+        if (dev_comm_created_) {
+            if (reportNcclError(ncclDevCommDestroy(comm_, &dev_comm_),
+                                "ncclDevCommDestroy") != 0) {
+                status = -1;
+            }
+            dev_comm_created_ = false;
+            dev_comm_ = {};
+        }
+        if (comm_) {
+            if (reportNcclError(ncclCommDestroy(comm_), "ncclCommDestroy") !=
+                0) {
+                status = -1;
+            }
+            comm_ = nullptr;
+        }
+        initialized_ = false;
+        next_registration_id_ = 1;
+        properties_ = {};
+        lsa_topology_ = {};
+        return status;
+    }
+
+    int abort() override {
+        int status = 0;
+
+        // Window and device-communicator resources are local to this rank, but
+        // still require the host communicator handle. Release them before
+        // aborting that handle. Errors are best effort here: an obsolete
+        // generation must never keep recovery waiting on failed peers.
+        if (comm_) {
+            for (const auto& entry : registrations_) {
+                if (reportNcclError(
+                        ncclCommWindowDeregister(comm_, entry.second.window),
+                        "ncclCommWindowDeregister(abort)") != 0) {
+                    status = -1;
+                }
+            }
+        }
+        registrations_.clear();
+
+        if (dev_comm_created_) {
+            if (reportNcclError(ncclDevCommDestroy(comm_, &dev_comm_),
+                                "ncclDevCommDestroy(abort)") != 0) {
+                status = -1;
+            }
+            dev_comm_created_ = false;
+            dev_comm_ = {};
+        }
+        if (comm_) {
+            if (reportNcclError(ncclCommAbort(comm_), "ncclCommAbort") != 0) {
+                status = -1;
+            }
+            comm_ = nullptr;
+        }
+
+        for (void* ptr : allocations_) {
+            if (reportNcclError(ncclMemFree(ptr), "ncclMemFree(abort)") != 0) {
+                status = -1;
+            }
+        }
+        allocations_.clear();
+
+        if (collective_status_) {
+            if (reportCudaError(cudaFree(collective_status_),
+                                "cudaFree(collective status, abort)") != 0) {
+                status = -1;
+            }
+            collective_status_ = nullptr;
+        }
+        if (control_stream_) {
+            if (reportCudaError(cudaStreamDestroy(control_stream_),
+                                "cudaStreamDestroy(control, abort)") != 0) {
+                status = -1;
+            }
+            control_stream_ = nullptr;
+        }
+        if (device_comm_) {
+            if (reportCudaError(cudaFree(device_comm_),
+                                "cudaFree(device communicator, abort)") != 0) {
+                status = -1;
+            }
+            device_comm_ = nullptr;
+        }
+
+        initialized_ = false;
+        next_registration_id_ = 1;
+        properties_ = {};
+        lsa_topology_ = {};
+        return status;
+    }
+
+   private:
+    struct WindowRecord {
+        ncclWindow_t window;
+        void* ptr;
+        size_t bytes;
+    };
+
+    bool collectiveAllSucceeded(bool local_success) {
+        int value = local_success ? 1 : 0;
+        if (reportCudaError(
+                cudaMemcpyAsync(collective_status_, &value, sizeof(value),
+                                cudaMemcpyHostToDevice, control_stream_),
+                "cudaMemcpyAsync(collective status H2D)") != 0 ||
+            reportNcclError(
+                ncclAllReduce(collective_status_, collective_status_, 1,
+                              ncclInt, ncclMin, comm_, control_stream_),
+                "ncclAllReduce(collective status)") != 0 ||
+            reportCudaError(
+                cudaMemcpyAsync(&value, collective_status_, sizeof(value),
+                                cudaMemcpyDeviceToHost, control_stream_),
+                "cudaMemcpyAsync(collective status D2H)") != 0 ||
+            reportCudaError(cudaStreamSynchronize(control_stream_),
+                            "cudaStreamSynchronize(collective status)") != 0) {
+            return false;
+        }
+        return value != 0;
+    }
+
+    void abortPartialInitialization() { (void)abort(); }
+
+    ncclComm_t comm_ = nullptr;
+    ncclDevComm_t dev_comm_{};
+    ncclDevComm_t* device_comm_ = nullptr;
+    bool dev_comm_created_ = false;
+    bool initialized_ = false;
+
+    cudaStream_t control_stream_ = nullptr;
+    int* collective_status_ = nullptr;
+
+    uint64_t next_registration_id_ = 1;
+    std::unordered_map<uint64_t, WindowRecord> registrations_;
+    std::unordered_set<void*> allocations_;
+    NcclTransportProperties properties_;
+    NcclLsaTopology lsa_topology_;
+};
+
+std::unique_ptr<NcclTransport> createNcclDeviceTransport() {
+    return std::make_unique<NcclDeviceTransportImpl>();
+}
+
+}  // namespace device
+}  // namespace mooncake

@@ -34,7 +34,6 @@ jobs:
       contents: write
 
     env:
-      BUILD_WITH_EP: "0"
       NPU_BUILD: "1"
 
     steps:

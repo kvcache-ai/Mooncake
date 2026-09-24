@@ -14,6 +14,9 @@
 
 #include "config.h"
 
+#include "glog_compat.h"
+
+#include <charconv>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -127,7 +130,9 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* port_env = std::getenv("MC_IB_PORT");
     if (port_env) {
         int val = atoi(port_env);
-        if (val >= 0 && val < 256)
+        // IB port numbers are 1-based. Accepting 0 made ibv_query_port fail on
+        // every device, disabling the whole topology.
+        if (val > 0 && val < 256)
             config.port = uint8_t(val);
         else
             LOG(WARNING) << "Ignore value from environment variable MC_IB_PORT";
@@ -205,10 +210,12 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* max_wr_env = std::getenv("MC_MAX_WR");
     if (max_wr_env) {
         size_t val = atoi(max_wr_env);
-        if (val > 0 && val <= UINT16_MAX)
+        if (val > 0 && val <= UINT16_MAX) {
             config.max_wr = val;
-        else
+            config.max_wr_from_env = true;
+        } else {
             LOG(WARNING) << "Ignore value from environment variable MC_MAX_WR";
+        }
     }
 
     const char* max_inline_env = std::getenv("MC_MAX_INLINE");
@@ -317,6 +324,27 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.metacache = false;
     }
 
+    const char* te_metadata_refresh_interval_seconds =
+        std::getenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS");
+    if (te_metadata_refresh_interval_seconds) {
+        try {
+            int val = std::stoi(te_metadata_refresh_interval_seconds);
+            if (val >= 0) {
+                config.te_metadata_refresh_interval_seconds =
+                    static_cast<uint64_t>(val);
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_TE_METADATA_REFRESH_INTERVAL_SECONDS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_TE_METADATA_REFRESH_INTERVAL_SECONDS "
+                            "environment "
+                            "value: "
+                         << te_metadata_refresh_interval_seconds
+                         << ". Error: " << e.what();
+        }
+    }
+
     const char* handshake_listen_backlog =
         std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_listen_backlog) {
@@ -346,6 +374,24 @@ void loadGlobalConfig(GlobalConfig& config) {
                             "MC_HANDSHAKE_CONNECT_TIMEOUT";
     }
 
+    const char* rdma_rail_pause_seconds =
+        std::getenv("MC_RDMA_RAIL_PAUSE_SECONDS");
+    if (rdma_rail_pause_seconds) {
+        try {
+            int val = std::stoi(rdma_rail_pause_seconds);
+            if (val > 0 && val < 3600) {
+                config.rdma_rail_pause_seconds = static_cast<uint64_t>(val);
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_RDMA_RAIL_PAUSE_SECONDS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_RDMA_RAIL_PAUSE_SECONDS environment "
+                            "value: "
+                         << rdma_rail_pause_seconds << ". Error: " << e.what();
+        }
+    }
+
     const char* log_level = std::getenv("MC_LOG_LEVEL");
     config.trace = false;
     if (log_level) {
@@ -372,9 +418,61 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
     }
 
+    const char* conn_pause_ttl_env = std::getenv("MC_CONN_PAUSE_TTL_MS");
+    if (conn_pause_ttl_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0. 0 is a valid explicit "disable";
+        // negative / out-of-range / garbage are rejected, preserving the
+        // default.
+        int val = 0;
+        const char* end = conn_pause_ttl_env + strlen(conn_pause_ttl_env);
+        auto [ptr, ec] = std::from_chars(conn_pause_ttl_env, end, val);
+        if (ec == std::errc() && ptr == end) {
+            if (val >= 0 && val <= 600000) {
+                config.conn_pause_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONN_PAUSE_TTL_MS, value "
+                             << conn_pause_ttl_env
+                             << " out of range (should be 0-600000)";
+            }
+        } else {
+            LOG(WARNING) << "Invalid MC_CONN_PAUSE_TTL_MS environment value: "
+                         << conn_pause_ttl_env
+                         << ". Expected an integer in range 0-600000";
+        }
+    }
+
+    const char* context_pause_ttl_env = std::getenv("MC_CONTEXT_PAUSE_TTL_MS");
+    if (context_pause_ttl_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0 and re-enable the legacy latch.
+        // Non-positive, out-of-range and garbage values are rejected.
+        int val = 0;
+        const char* end = context_pause_ttl_env + strlen(context_pause_ttl_env);
+        auto [ptr, ec] = std::from_chars(context_pause_ttl_env, end, val);
+        if (ec == std::errc() && ptr == end) {
+            if (val >= 1 && val <= 600000) {
+                config.context_pause_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONTEXT_PAUSE_TTL_MS, value "
+                             << context_pause_ttl_env
+                             << " out of range (should be 1-600000)";
+            }
+        } else {
+            LOG(WARNING)
+                << "Invalid MC_CONTEXT_PAUSE_TTL_MS environment value: "
+                << context_pause_ttl_env
+                << ". Expected an integer in range 1-600000";
+        }
+    }
+
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
-        google::InitGoogleLogging("mooncake-transfer-engine");
+        // Skip initialization when the caller (host program) has already
+        // initialized glog — see glog_compat.h.
+        mooncake::InitGoogleLoggingOnce("mooncake-transfer-engine");
         std::error_code ec;
         if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
@@ -453,6 +551,73 @@ void loadGlobalConfig(GlobalConfig& config) {
                            config.log_rdma_slice_affinity);
     }
 
+    const char* track_rdma_posted_slices_env =
+        std::getenv("MC_TRACK_RDMA_POSTED_SLICES");
+    if (track_rdma_posted_slices_env) {
+        parseBoolConfigEnv(track_rdma_posted_slices_env,
+                           "MC_TRACK_RDMA_POSTED_SLICES",
+                           config.track_rdma_posted_slices);
+    }
+
+    const char* use_rdma_twosided_env = std::getenv("MC_USE_RDMA_TWOSIDED");
+    if (use_rdma_twosided_env) {
+        parseBoolConfigEnv(use_rdma_twosided_env, "MC_USE_RDMA_TWOSIDED",
+                           config.use_rdma_twosided);
+    }
+
+    const char* rdma_notify_enabled_env = std::getenv("MC_RDMA_NOTIFY_ENABLED");
+    if (rdma_notify_enabled_env) {
+        parseBoolConfigEnv(rdma_notify_enabled_env, "MC_RDMA_NOTIFY_ENABLED",
+                           config.rdma_notify_enabled);
+    }
+    const char* rdma_notify_recv_count_env =
+        std::getenv("MC_RDMA_NOTIFY_RECV_COUNT");
+    if (rdma_notify_recv_count_env) {
+        int val = atoi(rdma_notify_recv_count_env);
+        if (val > 0 && val <= 4096)
+            config.rdma_notify_recv_count = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_RECV_COUNT";
+    }
+    const char* rdma_notify_buffer_size_env =
+        std::getenv("MC_RDMA_NOTIFY_BUFFER_SIZE");
+    if (rdma_notify_buffer_size_env) {
+        int val = atoi(rdma_notify_buffer_size_env);
+        if (val >= 256 && val <= 65536)
+            config.rdma_notify_buffer_size = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_BUFFER_SIZE";
+    }
+    const char* rdma_notify_max_pending_sends_env =
+        std::getenv("MC_RDMA_NOTIFY_MAX_PENDING_SENDS");
+    if (rdma_notify_max_pending_sends_env) {
+        int val = atoi(rdma_notify_max_pending_sends_env);
+        if (val > 0 && val <= 4096)
+            config.rdma_notify_max_pending_sends = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_MAX_PENDING_SENDS";
+    }
+    const char* rdma_notify_oob_fallback_env =
+        std::getenv("MC_RDMA_NOTIFY_OOB_FALLBACK");
+    if (rdma_notify_oob_fallback_env) {
+        parseBoolConfigEnv(rdma_notify_oob_fallback_env,
+                           "MC_RDMA_NOTIFY_OOB_FALLBACK",
+                           config.rdma_notify_oob_fallback);
+    }
+    const char* rdma_notify_connect_timeout_env =
+        std::getenv("MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS");
+    if (rdma_notify_connect_timeout_env) {
+        int val = atoi(rdma_notify_connect_timeout_env);
+        if (val >= 100 && val <= 600000)
+            config.rdma_notify_connect_timeout_ms = static_cast<uint32_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS";
+    }
+
     const char* enable_parallel_reg_mr =
         std::getenv("MC_ENABLE_PARALLEL_REG_MR");
     if (enable_parallel_reg_mr) {
@@ -462,6 +627,38 @@ void loadGlobalConfig(GlobalConfig& config) {
         } else {
             LOG(WARNING) << "Ignore value from environment variable "
                             "MC_ENABLE_PARALLEL_REG_MR";
+        }
+    }
+
+    const char* max_concurrent_reg_mr = std::getenv("MC_MAX_CONCURRENT_REG_MR");
+    if (max_concurrent_reg_mr) {
+        // Robust parse (not atol): a non-numeric typo must keep the default
+        // rather than silently resolve to 0, which here means "no cap" and so
+        // would read as a deliberate request for the old unbounded behavior.
+        // 0 is a valid explicit way to ask for no cap; negative and garbage are
+        // rejected.
+        size_t val = 0;
+        const char* end = max_concurrent_reg_mr + strlen(max_concurrent_reg_mr);
+        auto [ptr, ec] = std::from_chars(max_concurrent_reg_mr, end, val);
+        if (ec == std::errc() && ptr == end) {
+            config.max_concurrent_reg_mr = val;
+        } else {
+            LOG(WARNING) << "Invalid MC_MAX_CONCURRENT_REG_MR environment "
+                            "value: "
+                         << max_concurrent_reg_mr << ", keeping default";
+        }
+    }
+
+    const char* efa_nic_selection = std::getenv("MC_EFA_NIC_SELECTION");
+    if (efa_nic_selection) {
+        if (strcasecmp(efa_nic_selection, "all") == 0) {
+            config.efa_nic_selection = EfaNicSelection::ALL;
+        } else if (strcasecmp(efa_nic_selection, "local") == 0) {
+            config.efa_nic_selection = EfaNicSelection::LOCAL;
+        } else {
+            LOG(WARNING) << "Invalid MC_EFA_NIC_SELECTION environment value: "
+                         << efa_nic_selection
+                         << ", expected all|local, keeping default";
         }
     }
 
@@ -629,8 +826,14 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
+    LOG(INFO) << "efa_nic_selection = "
+              << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
+                                                                     : "all");
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
+    LOG(INFO) << "te_metadata_refresh_interval_seconds = "
+              << config.te_metadata_refresh_interval_seconds;
+    LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
@@ -645,6 +848,18 @@ void dumpGlobalConfig() {
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
+    LOG(INFO) << "track_rdma_posted_slices = "
+              << (config.track_rdma_posted_slices ? "true" : "false");
+    LOG(INFO) << "use_rdma_twosided = "
+              << (config.use_rdma_twosided ? "true" : "false");
+    LOG(INFO) << "rdma_notify_enabled = "
+              << (config.rdma_notify_enabled ? "true" : "false");
+    LOG(INFO) << "rdma_notify_recv_count = " << config.rdma_notify_recv_count;
+    LOG(INFO) << "rdma_notify_buffer_size = " << config.rdma_notify_buffer_size;
+    LOG(INFO) << "rdma_notify_max_pending_sends = "
+              << config.rdma_notify_max_pending_sends;
+    LOG(INFO) << "rdma_notify_oob_fallback = "
+              << (config.rdma_notify_oob_fallback ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

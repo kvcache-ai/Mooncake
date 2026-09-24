@@ -49,6 +49,7 @@ Mooncake Store may generate various types of errors during execution. For most A
 |                          | OBJECT_HAS_LEASE (-706)        | Object has lease                                                                                          |
 |                          | LEASE_EXPIRED (-707)           | Lease expired before data transfer completed                                                              |
 | Transfer                 | TRANSFER_FAIL (-800)           | Transfer operation failed                                                                                 |
+| Checksum                 | CHECKSUM_MISMATCH (-801)       | Retrieved object data does not match its stored checksum                                                  |
 | RPC                      | RPC_FAIL (-900)                | RPC operation failed                                                                                      |
 | High Availability        | ETCD_OPERATION_ERROR (-1000)   | etcd operation failed                                                                                     |
 |                          | ETCD_KEY_NOT_EXIST (-1001)     | Key not found in etcd                                                                                    |
@@ -63,3 +64,6 @@ Mooncake Store may generate various types of errors during execution. For most A
 |                          | FILE_INVALID_BUFFER (-1104)    | File buffer is wrong                                                                                      |
 |                          | FILE_LOCK_FAIL (-1105)         | File lock operation failed                                                                                |
 |                          | FILE_INVALID_HANDLE (-1106)    | Invalid file handle                                                                                       |
+| Task / Job               | TASK_NOT_FOUND (-1400)         | Task ID not found, or a completed task has already been pruned from the master's in-memory history       |
+|                          | TASK_PENDING_LIMIT_EXCEEDED (-1401) | The master-side pending task queue is full and cannot accept another task                           |
+|                          | JOB_NOT_FOUND (-1402)          | Job ID not found                                                                                          |

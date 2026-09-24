@@ -73,9 +73,9 @@ TENT extends the classic Mooncake Transfer Engine by moving transport selection,
 
 The design favors predictable behavior and operational simplicity over manual tuning and static configuration.
 
-## TENT C++ API Reference 
+## TENT C++ API Reference
 
-[TENT C++ API Reference](cpp-api.md)
+[TENT C++ API Reference](../../api-reference/cpp/tent.md)
 
 ## TENT Metrics System
 
@@ -91,6 +91,14 @@ metrics
 :maxdepth: 1
 
 transport-selector
+:::
+
+## TENT High-Performance TCP
+
+:::{toctree}
+:maxdepth: 1
+
+hp-tcp
 :::
 
 ## TENT Quality of Service
@@ -109,10 +117,26 @@ qos
 slice-spraying
 :::
 
+## TENT Deadline Scheduling
+
+:::{toctree}
+:maxdepth: 1
+
+deadline-scheduling
+:::
+
 ## TENT Failover
 
 :::{toctree}
 :maxdepth: 1
 
 failover
+:::
+
+## TENT Testing
+
+:::{toctree}
+:maxdepth: 1
+
+testing
 :::

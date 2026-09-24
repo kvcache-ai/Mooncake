@@ -1,6 +1,8 @@
 import sys
 import platform
-from setuptools import setup, Distribution
+
+import numpy as np
+from setuptools import setup, Distribution, Extension
 from wheel.bdist_wheel import bdist_wheel
 
 # ---------------------------------------------------------------------------
@@ -162,10 +164,24 @@ class CustomBdistWheel(bdist_wheel):
         self.plat_name = get_platform()
 
 
+
+# ---------------------------------------------------------------------------
+# C extensions
+# ---------------------------------------------------------------------------
+_fast_copy_ext = Extension(
+    "mooncake._fast_copy",
+    sources=["mooncake/_fast_copy.c"],
+    include_dirs=[np.get_include()],
+    extra_compile_args=["-O2", "-pthread"],
+    extra_link_args=["-lpthread"],
+)
+
+
 # ---------------------------------------------------------------------------
 # setup()
 # ---------------------------------------------------------------------------
 setup(
     distclass=BinaryDistribution,
     cmdclass={"bdist_wheel": CustomBdistWheel},
+    ext_modules=[_fast_copy_ext],
 )

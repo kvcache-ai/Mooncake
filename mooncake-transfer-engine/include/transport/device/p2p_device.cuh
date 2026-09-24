@@ -19,7 +19,11 @@ struct P2PContext {
 
 __device__ __forceinline__ bool mc_p2p_available(const P2PContext& ctx,
                                                  int dst_rank) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    return ctx.peer_ptrs[dst_rank] != nullptr;
+#else
     return ctx.available[dst_rank] != 0 && ctx.peer_ptrs[dst_rank] != nullptr;
+#endif
 }
 
 // Translate a local pointer (within the GDR buffer) to the peer's mapped VA.

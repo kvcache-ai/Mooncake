@@ -200,6 +200,11 @@ class AllocationClass {
     // @return  new allocation. This cannot fail.
     void* addSlabAndAllocate(Slab* slab);
 
+    // Restores one slab on a new allocator. Listed chunk indexes stay
+    // occupied; every other chunk becomes normally allocatable.
+    bool importSlab(Slab* slab,
+                    const std::vector<uint32_t>& occupiedChunkIndexes);
+
     // Releasing a slab is a two step process.
     // 1. Mark a slab for release, by calling `startSlabRelease`.
     // 2. Free all the activeAllocations

@@ -76,15 +76,14 @@ const Json::Value* FindProtocolDescValue(const Json::Value& root) {
     }
     return nullptr;
 }
-}  // namespace
 
-bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
+bool ParseGlobalResourceConfigObject(const char* config_str,
+                                     Json::Value& root) {
     if (config_str == nullptr || config_str[0] == '\0') {
         return false;
     }
     Json::CharReaderBuilder builder;
     builder["collectComments"] = false;
-    Json::Value root;
     std::string errs;
     const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
     if (!reader->parse(config_str, config_str + std::strlen(config_str), &root,
@@ -96,6 +95,15 @@ bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
     }
     if (!root.isObject()) {
         LOG(WARNING) << "ASCEND_GLOBAL_RESOURCE_CONFIG must be a JSON object";
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
+    Json::Value root;
+    if (!ParseGlobalResourceConfigObject(config_str, root)) {
         return false;
     }
     const Json::Value* protocol_desc = FindProtocolDescValue(root);

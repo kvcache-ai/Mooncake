@@ -1,9 +1,12 @@
 file(GLOB XPORT_SOURCES "*.cpp")
 
 add_subdirectory(rdma_transport)
+add_subdirectory(rdma_twosided)
 add_subdirectory(rpc_communicator)
-add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>
-                             $<TARGET_OBJECTS:rpc_communicator>)
+add_library(
+  transport OBJECT
+  ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>
+  $<TARGET_OBJECTS:rdma_twosided> $<TARGET_OBJECTS:rpc_communicator>)
 target_link_libraries(
   transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog
                     pthread)
@@ -28,10 +31,18 @@ if(USE_NVMEOF)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvmeof_transport>)
 endif()
 
+if(USE_NCCL_HOST)
+  add_subdirectory(nccl_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:nccl_host_transport>)
+endif()
+
 if(USE_CXL)
   add_subdirectory(cxl_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
 endif()
+
+add_subdirectory(shm_transport)
+target_sources(transport PUBLIC $<TARGET_OBJECTS:shm_transport>)
 
 if(USE_ASCEND_DIRECT)
   add_subdirectory(ascend_transport)
@@ -55,12 +66,17 @@ if(USE_MACA)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:maca_transport>)
 endif()
 
+if(USE_MUSA)
+  add_subdirectory(musa_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:musa_transport>)
+endif()
+
 if(USE_SUNRISE)
   add_subdirectory(sunrise_link)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:sunrise_link_transport>)
 endif()
 
-if(USE_MNNVL AND NOT USE_HIP)
+if(USE_MUSA OR (USE_MNNVL AND NOT USE_HIP))
   add_subdirectory(nvlink_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
 endif()
@@ -87,12 +103,24 @@ if(USE_CXI)
   target_link_libraries(transport PRIVATE fabric)
 endif()
 
-if(USE_CUDA OR USE_MUSA OR USE_MACA)
+if(USE_CUDA
+   OR USE_MUSA
+   OR USE_MACA)
   add_subdirectory(device)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:device_transport>)
   # device_transport (ibgda_device_transport.cpp / mlx5gda.cpp) calls libmlx5
   # DevX symbols (mlx5dv_devx_*, mlx5dv_init_obj) directly.
-  if((USE_CUDA OR USE_MUSA) AND NOT USE_CXI)
+  if((USE_CUDA OR USE_MUSA OR USE_MACA) AND NOT USE_CXI)
     target_link_libraries(transport PUBLIC mlx5)
   endif()
+  if(USE_CUDA AND MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+    target_compile_definitions(device_transport PRIVATE _GNU_SOURCE)
+    target_link_libraries(transport PUBLIC ${CMAKE_DL_LIBS})
+  endif()
+endif()
+
+if(USE_FLAGCX)
+  add_subdirectory(flagcx_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:flagcx_transport>)
+  target_link_libraries(transport PRIVATE FlagCX::flagcx)
 endif()

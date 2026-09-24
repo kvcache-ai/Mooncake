@@ -315,6 +315,7 @@ mooncake_master --default_kv_lease_ttl=5000
 - `MC_STORE_MEMCPY`: Enable local memcpy optimization (set to "1")
 - `MC_STORE_CLIENT_METRIC`: Enable client metrics (enabled by default)
 - `MC_YLT_LOG_LEVEL`: Log level (trace/debug/info/warn/error/critical)
+- `MOONCAKE_STORE_CHECKSUM`: Enable diagnostic object-level CRC-64 checks (set to "1" before creating any writer or reader client)
 
 ## Common Patterns
 
@@ -472,6 +473,17 @@ result = store.register_buffer(buffer_ptr, size)
 if result != 0:
     raise RuntimeError(f"Failed to register buffer: {result}")
 ```
+
+### Corrupted Data or Garbled Output
+```python
+# Set this before importing Mooncake or creating any Store client.
+import os
+os.environ["MOONCAKE_STORE_CHECKSUM"] = "1"
+
+from mooncake.store import MooncakeDistributedStore
+```
+
+Enable the switch on every writer and reader client process, then reproduce with full-object `put`/`upsert` and `get` operations. Treat `CHECKSUM_MISMATCH` (-801) as a failed read and do not use the destination buffer. Objects without checksum metadata and range reads are not verified. This mode scans object data, stages GPU buffers to host memory, and disables the local hot cache, so use it only for diagnosis.
 
 ### Service Connectivity
 ```bash

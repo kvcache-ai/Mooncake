@@ -1,3 +1,4 @@
+#include "allocator.h"
 #include "offset_allocator/offset_allocator.h"
 #include "mutex.h"
 #include "serializer.h"
@@ -5,6 +6,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <functional>
+#include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <random>
@@ -283,6 +288,49 @@ class OffsetAllocatorTest : public ::testing::Test {
 
     void TearDown() override {}
 
+    void lockAllocator(const std::shared_ptr<OffsetAllocator>& allocator) {
+        allocator->m_mutex.lock();
+    }
+
+    void unlockAllocator(const std::shared_ptr<OffsetAllocator>& allocator) {
+        allocator->m_mutex.unlock();
+    }
+
+    bool isLargestFreeRegionHintTightened(
+        const std::shared_ptr<OffsetAllocator>& allocator) {
+        MutexLocker lock(&allocator->m_mutex);
+        return allocator->m_largest_free_region_tightened;
+    }
+
+    bool canAllocateWithoutFastFail(
+        const std::shared_ptr<OffsetAllocator>& allocator, size_t size) {
+        MutexLocker lock(&allocator->m_mutex);
+        const uint64_t quantum = uint64_t{1} << allocator->m_multiplier_bits;
+        if (size == 0 ||
+            size > std::numeric_limits<uint64_t>::max() - (quantum - 1)) {
+            return false;
+        }
+        const uint64_t normalized_size = (size + quantum - 1) / quantum;
+        if (!allocator->m_allocator ||
+            normalized_size > allocator->m_allocator->m_size) {
+            return false;
+        }
+
+        auto allocation = allocator->m_allocator->allocate(
+            static_cast<uint32>(normalized_size));
+        if (allocation.isNoSpace()) {
+            return false;
+        }
+        allocator->m_allocator->free(allocation);
+        allocator->refreshLargestFreeRegion();
+        return true;
+    }
+
+    uint64_t multiplierBits(
+        const std::shared_ptr<OffsetAllocator>& allocator) const {
+        return allocator->m_multiplier_bits;
+    }
+
     OffsetAllocationHandle copyHandleWithNewAllocator(
         const OffsetAllocationHandle& handle,
         const std::shared_ptr<OffsetAllocator>& new_allocator) {
@@ -296,6 +344,171 @@ class OffsetAllocatorTest : public ::testing::Test {
         handle.getHandle().m_allocator = new_allocator;
     }
 
+    // Corruptions used by SnapshotValidationRejectsInconsistentLayout. TEST_F
+    // bodies live in a derived class, so the layout access stays in fixture
+    // members, which hold __Allocator's friendship.
+    enum class LayoutFault {
+        kNone,
+        kBinIndexOutOfRange,
+        kUsedNodeInBinList,
+        kFreeStorageMismatch,
+        kFreeOffsetTooLarge,
+        kFreeOffsetTooSmall,
+        kDuplicateSpareNode,
+        kSpareNodeIsLive,
+        kUnclassifiedNode,
+        kNodeOffsetShifted,
+        kNeighborChainBroken,
+        kBinBitWithoutList,
+        kUsedNodeZeroSize,
+        kUsedNodeNotBinBoundary,
+        kBinCycle,
+        kNeighborOutOfRange,
+        kNodeCapacityZero,
+        kNodeCapacityTooLarge,
+        kFreeOffsetOutOfRange,
+        kNodeStorageTooShort,
+        kNodeStorageTooLong,
+        kFreeNodeStorageTooLong,
+    };
+
+    static uint32 firstUsedNode(const __Allocator& layout) {
+        for (uint32 i = 0; i < layout.m_current_capacity; ++i) {
+            if (layout.m_nodes[i].used) {
+                return i;
+            }
+        }
+        return __Allocator::Node::unused;
+    }
+
+    static void applyLayoutFault(__Allocator& layout, LayoutFault fault) {
+        const uint32 used = firstUsedNode(layout);
+        ASSERT_NE(used, __Allocator::Node::unused);
+        switch (fault) {
+            case LayoutFault::kNone:
+                break;
+            case LayoutFault::kUsedNodeZeroSize:
+                layout.m_nodes[used].dataSize = 0;
+                break;
+            case LayoutFault::kUsedNodeNotBinBoundary:
+                ++layout.m_nodes[used].dataSize;
+                break;
+            case LayoutFault::kBinCycle:
+                for (uint32 bin = 0; bin < NUM_LEAF_BINS; ++bin) {
+                    const uint32 head = layout.m_binIndices[bin];
+                    if (head != __Allocator::Node::unused) {
+                        layout.m_nodes[head].binListNext = head;
+                        return;
+                    }
+                }
+                FAIL() << "no free bin to corrupt";
+                break;
+            case LayoutFault::kNeighborOutOfRange:
+                layout.m_nodes[used].neighborNext = layout.m_current_capacity;
+                break;
+            case LayoutFault::kNodeCapacityZero:
+                layout.m_current_capacity = 0;
+                break;
+            case LayoutFault::kNodeCapacityTooLarge:
+                layout.m_max_capacity = OffsetAllocatorSnapshot::kMaxNodes + 1;
+                break;
+            case LayoutFault::kFreeOffsetOutOfRange:
+                layout.m_freeOffset = layout.m_current_capacity + 1;
+                break;
+            case LayoutFault::kNodeStorageTooShort:
+                layout.m_nodes.clear();
+                break;
+            case LayoutFault::kNodeStorageTooLong:
+                layout.m_nodes.emplace_back();
+                break;
+            case LayoutFault::kFreeNodeStorageTooLong:
+                layout.m_freeNodes.push_back(0);
+                break;
+            case LayoutFault::kBinIndexOutOfRange:
+                layout.m_binIndices[0] = layout.m_current_capacity;
+                break;
+            case LayoutFault::kUsedNodeInBinList: {
+                uint32 empty_bin = NUM_LEAF_BINS;
+                for (uint32 bin = 0; bin < NUM_LEAF_BINS; ++bin) {
+                    if (layout.m_binIndices[bin] == __Allocator::Node::unused) {
+                        empty_bin = bin;
+                        break;
+                    }
+                }
+                ASSERT_NE(empty_bin, NUM_LEAF_BINS);
+                layout.m_binIndices[empty_bin] = used;
+                layout.m_nodes[used].binListNext = __Allocator::Node::unused;
+                layout.m_nodes[used].binListPrev = __Allocator::Node::unused;
+                layout.m_usedBins[empty_bin >> TOP_BINS_INDEX_SHIFT] |=
+                    uint8{1} << (empty_bin & LEAF_BINS_INDEX_MASK);
+                layout.m_usedBinsTop |= uint32{1}
+                                        << (empty_bin >> TOP_BINS_INDEX_SHIFT);
+                break;
+            }
+            case LayoutFault::kFreeStorageMismatch:
+                ++layout.m_freeStorage;
+                break;
+            case LayoutFault::kFreeOffsetTooLarge:
+                ++layout.m_freeOffset;
+                break;
+            case LayoutFault::kFreeOffsetTooSmall:
+                --layout.m_freeOffset;
+                break;
+            case LayoutFault::kDuplicateSpareNode:
+                ASSERT_LT(layout.m_freeOffset + 1, layout.m_current_capacity);
+                layout.m_freeNodes[layout.m_freeOffset + 1] =
+                    layout.m_freeNodes[layout.m_freeOffset];
+                break;
+            case LayoutFault::kSpareNodeIsLive:
+                layout.m_freeNodes[layout.m_freeOffset] = used;
+                break;
+            case LayoutFault::kUnclassifiedNode:
+                layout.m_nodes[used].used = false;
+                break;
+            case LayoutFault::kNodeOffsetShifted:
+                ++layout.m_nodes[used].dataOffset;
+                break;
+            case LayoutFault::kNeighborChainBroken:
+                layout.m_nodes[used].neighborNext = __Allocator::Node::unused;
+                break;
+            case LayoutFault::kBinBitWithoutList:
+                for (uint32 bin = 0; bin < NUM_LEAF_BINS; ++bin) {
+                    if (layout.m_binIndices[bin] == __Allocator::Node::unused) {
+                        layout.m_usedBins[bin >> TOP_BINS_INDEX_SHIFT] |=
+                            uint8{1} << (bin & LEAF_BINS_INDEX_MASK);
+                        return;
+                    }
+                }
+                FAIL() << "no empty bin to corrupt";
+                break;
+        }
+    }
+
+    static bool layoutPassesValidation(
+        const std::shared_ptr<OffsetAllocator>& allocator, LayoutFault fault) {
+        auto snapshot = allocator->CaptureSnapshot();
+        applyLayoutFault(*snapshot.layout, fault);
+        return snapshot.Validate().has_value();
+    }
+
+    // End-to-end: the store level factory must refuse to install the same
+    // broken layout the validator rejects.
+    static ErrorCode restoreBufferAllocatorAfterLayoutFault(
+        const std::shared_ptr<OffsetAllocator>& allocator, LayoutFault fault) {
+        auto state = allocator->CaptureSnapshot();
+        applyLayoutFault(*state.layout, fault);
+        OffsetBufferAllocatorSnapshot snapshot{
+            .segment_name = "segment",
+            .base = static_cast<size_t>(state.base),
+            .capacity = state.capacity,
+            .used_bytes = state.allocated_size,
+            .transport_endpoint = "endpoint",
+            .allocation_state = std::move(state),
+        };
+        auto restored = OffsetBufferAllocator::Restore(std::move(snapshot));
+        return restored ? ErrorCode::OK : restored.error();
+    }
+
     void assertAllocatorEQ(const std::shared_ptr<OffsetAllocator>& a,
                            const std::shared_ptr<OffsetAllocator>& b) {
         MutexLocker lock_a(&a->m_mutex);
@@ -306,6 +519,15 @@ class OffsetAllocatorTest : public ::testing::Test {
         ASSERT_EQ(a->m_capacity, b->m_capacity);
         ASSERT_EQ(a->m_allocated_size, b->m_allocated_size);
         ASSERT_EQ(a->m_allocated_num, b->m_allocated_num);
+        const uint64_t actual_largest_a =
+            a->m_allocator->storageReport().largestFreeRegion
+            << a->m_multiplier_bits;
+        const uint64_t actual_largest_b =
+            b->m_allocator->storageReport().largestFreeRegion
+            << b->m_multiplier_bits;
+        ASSERT_EQ(actual_largest_a, actual_largest_b);
+        ASSERT_GE(a->getLargestFreeRegion(), actual_largest_a);
+        ASSERT_GE(b->getLargestFreeRegion(), actual_largest_b);
 
         // Compare __Allocator member variables
         ASSERT_EQ(a->m_allocator->m_size, b->m_allocator->m_size);
@@ -514,6 +736,182 @@ TEST_F(OffsetAllocatorTest, AllocationFailure) {
     auto handle =
         allocator->allocate(2 * ALLOCATOR_SIZE);  // 2GB > 1GB available
     EXPECT_FALSE(handle.has_value());
+}
+
+TEST_F(OffsetAllocatorTest, FreeReturnsMergedRegionSize) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024;
+    constexpr uint32 MAX_ALLOCS = 8;
+    constexpr uint32 BLOCK_SIZE = 128;
+    __Allocator allocator(ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    const auto first = allocator.allocate(BLOCK_SIZE);
+    const auto second = allocator.allocate(BLOCK_SIZE);
+    const auto third = allocator.allocate(BLOCK_SIZE);
+    ASSERT_FALSE(first.isNoSpace());
+    ASSERT_FALSE(second.isNoSpace());
+    ASSERT_FALSE(third.isNoSpace());
+
+    EXPECT_EQ(allocator.free(first), BLOCK_SIZE);
+    EXPECT_EQ(allocator.free(third), ALLOCATOR_SIZE - 2 * BLOCK_SIZE);
+    EXPECT_EQ(allocator.free(second), ALLOCATOR_SIZE);
+}
+
+TEST_F(OffsetAllocatorTest, FreeReturnsZeroWhenMetadataCapacityIsExhausted) {
+    constexpr uint32 ALLOCATOR_SIZE = 384;
+    constexpr uint32 MAX_ALLOCS = 3;
+    constexpr uint32 BLOCK_SIZE = 128;
+    __Allocator allocator(ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    const auto first = allocator.allocate(BLOCK_SIZE);
+    const auto second = allocator.allocate(BLOCK_SIZE);
+    ASSERT_FALSE(first.isNoSpace());
+    ASSERT_FALSE(second.isNoSpace());
+
+    EXPECT_EQ(allocator.free(first), 0);
+    EXPECT_EQ(allocator.storageReport().largestFreeRegion, 0);
+}
+
+TEST_F(OffsetAllocatorTest,
+       LargestFreeRegionHintTightensOnFailureAndRaisesOnFree) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto allocator =
+        OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    const uint64_t initial_largest = allocator->getLargestFreeRegion();
+    EXPECT_EQ(initial_largest, allocator->storageReport().largestFreeRegion);
+
+    auto handle = allocator->allocate(ALLOCATOR_SIZE / 2);
+    ASSERT_TRUE(handle.has_value());
+    const uint64_t actual_largest =
+        allocator->storageReport().largestFreeRegion;
+    ASSERT_LT(actual_largest, initial_largest);
+
+    // A successful allocation can leave the hint conservatively high so the
+    // success path does not need to publish a new atomic value.
+    EXPECT_EQ(allocator->getLargestFreeRegion(), initial_largest);
+
+    // The first request that passes the hint but fails in the allocator
+    // tightens it for subsequent requests.
+    EXPECT_FALSE(allocator->allocate(actual_largest + 1).has_value());
+    EXPECT_EQ(allocator->getLargestFreeRegion(), actual_largest);
+
+    handle.reset();
+    EXPECT_EQ(allocator->getLargestFreeRegion(),
+              allocator->storageReport().largestFreeRegion);
+    EXPECT_EQ(allocator->getLargestFreeRegion(), ALLOCATOR_SIZE);
+}
+
+TEST_F(OffsetAllocatorTest, HintMaintenanceActivatesOnlyAfterFailure) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto allocator =
+        OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    EXPECT_FALSE(isLargestFreeRegionHintTightened(allocator));
+    auto handle = allocator->allocate(ALLOCATOR_SIZE / 2);
+    ASSERT_TRUE(handle.has_value());
+    EXPECT_FALSE(isLargestFreeRegionHintTightened(allocator));
+
+    const uint64_t actual_largest =
+        allocator->storageReport().largestFreeRegion;
+    ASSERT_FALSE(allocator->allocate(actual_largest + 1).has_value());
+    EXPECT_TRUE(isLargestFreeRegionHintTightened(allocator));
+
+    handle.reset();
+    EXPECT_FALSE(isLargestFreeRegionHintTightened(allocator));
+    EXPECT_EQ(allocator->getLargestFreeRegion(), ALLOCATOR_SIZE);
+}
+
+TEST_F(OffsetAllocatorTest,
+       HintMaintenanceUsesScaledAllocatorCapacityWhenFullyFreed) {
+    const uint64_t internal_capacity = bin_sizes[NUM_BINS - 1];
+    const uint64_t allocator_size = 2 * internal_capacity + 1;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto allocator =
+        OffsetAllocator::create(0, allocator_size, MAX_ALLOCS, MAX_ALLOCS);
+
+    const uint64_t maximum_free_region = allocator->getLargestFreeRegion();
+    ASSERT_LT(maximum_free_region, allocator_size);
+    auto handle = allocator->allocate(maximum_free_region / 2);
+    ASSERT_TRUE(handle.has_value());
+
+    const uint64_t actual_largest =
+        allocator->storageReport().largestFreeRegion;
+    ASSERT_FALSE(allocator->allocate(actual_largest + 1).has_value());
+    ASSERT_TRUE(isLargestFreeRegionHintTightened(allocator));
+
+    handle.reset();
+    EXPECT_FALSE(isLargestFreeRegionHintTightened(allocator));
+    EXPECT_EQ(allocator->getLargestFreeRegion(), maximum_free_region);
+}
+
+TEST_F(OffsetAllocatorTest, ImpossibleAllocationDoesNotAcquireMutex) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto allocator =
+        OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+    auto full_handle = allocator->allocate(ALLOCATOR_SIZE);
+    ASSERT_TRUE(full_handle.has_value());
+
+    // The first failed request observes the exact allocator state and tightens
+    // the conservative hint.
+    ASSERT_FALSE(allocator->allocate(1).has_value());
+    ASSERT_EQ(allocator->getLargestFreeRegion(), 0);
+
+    lockAllocator(allocator);
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    auto result = std::async(std::launch::async, [&] {
+        started.set_value();
+        return allocator->allocate(1);
+    });
+    started_future.wait();
+    const auto status = result.wait_for(std::chrono::seconds(1));
+    unlockAllocator(allocator);
+
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_FALSE(result.get().has_value());
+}
+
+TEST_F(OffsetAllocatorTest, FastFailMatchesAllocatorAcrossBinBoundaries) {
+    constexpr uint32 MAX_ALLOCS = 8;
+    for (uint32 i = 16; i + 1 < NUM_BINS; ++i) {
+        const uint64_t capacity = static_cast<uint64_t>(bin_sizes[i + 1]) - 1;
+        const uint64_t request_size = static_cast<uint64_t>(bin_sizes[i]) + 1;
+        auto allocator =
+            OffsetAllocator::create(0, capacity, MAX_ALLOCS, MAX_ALLOCS);
+
+        ASSERT_EQ(allocator->getLargestFreeRegion(), bin_sizes[i])
+            << "bin index=" << i;
+        ASSERT_FALSE(canAllocateWithoutFastFail(allocator, request_size))
+            << "bin index=" << i;
+        EXPECT_FALSE(allocator->allocate(request_size).has_value())
+            << "bin index=" << i;
+    }
+}
+
+TEST_F(OffsetAllocatorTest, FastFailMatchesAllocatorWithMultipliers) {
+    constexpr uint32 MAX_ALLOCS = 8;
+    constexpr uint32 PREVIOUS_BIN_INDEX = NUM_BINS - 2;
+    const uint64_t INTERNAL_CAPACITY =
+        static_cast<uint64_t>(bin_sizes[NUM_BINS - 1]) - 1;
+
+    for (uint64_t multiplier_bits = 1; multiplier_bits <= 4;
+         ++multiplier_bits) {
+        const uint64_t capacity = INTERNAL_CAPACITY << multiplier_bits;
+        auto allocator =
+            OffsetAllocator::create(0, capacity, MAX_ALLOCS, MAX_ALLOCS);
+        const uint64_t largest_free_region =
+            static_cast<uint64_t>(bin_sizes[PREVIOUS_BIN_INDEX])
+            << multiplier_bits;
+        const uint64_t request_size = largest_free_region + 1;
+
+        ASSERT_EQ(multiplierBits(allocator), multiplier_bits);
+        ASSERT_EQ(allocator->getLargestFreeRegion(), largest_free_region);
+        ASSERT_FALSE(canAllocateWithoutFastFail(allocator, request_size));
+        EXPECT_FALSE(allocator->allocate(request_size).has_value());
+    }
 }
 
 // Test multiple allocations
@@ -1422,6 +1820,29 @@ TEST_F(OffsetAllocatorTest, SerializationOneElementAllocator) {
     testSerializeAllocator(alloc_a, handles);
 }
 
+TEST_F(OffsetAllocatorTest, DeserializedHintRaisesWhenAllocationsAreFreed) {
+    constexpr size_t ALLOCATOR_SIZE = 1024;
+    constexpr size_t BLOCK_SIZE = ALLOCATOR_SIZE / 2;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto original =
+        OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    auto handle = original->allocate(BLOCK_SIZE);
+    ASSERT_TRUE(handle.has_value());
+
+    std::vector<SerializedByte> buffer;
+    ASSERT_EQ(serialize_to(original, buffer), ErrorCode::OK);
+    auto restored = deserialize_from<OffsetAllocator>(buffer);
+    ASSERT_NE(restored, nullptr);
+
+    std::optional<OffsetAllocationHandle> restored_handle(
+        copyHandleWithNewAllocator(*handle, restored));
+    restored_handle.reset();
+
+    EXPECT_EQ(restored->getLargestFreeRegion(), ALLOCATOR_SIZE);
+    EXPECT_TRUE(restored->allocate(ALLOCATOR_SIZE).has_value());
+}
+
 TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
     // The size multiplier is larger than 1 when the allocator size is larger
     // than MAX_BIN_SIZE.
@@ -1599,6 +2020,173 @@ TEST_F(OffsetAllocatorTest, ChainedAllocationAndDeserialization) {
         // Substitute the handles with the deserialized allocator.
         for (auto& handle : handles) {
             substituteWithNewAllocator(handle, new_alloc);
+        }
+    }
+}
+
+// A persisted layout is only installed when it is internally consistent, so a
+// corrupt layout cannot produce overlapping allocations, dangling bin links or
+// a free stack that hands the same node out twice. Both snapshot validation
+// and the lowest-level restore factory reject the same corruptions.
+TEST_F(OffsetAllocatorTest, SnapshotValidationRejectsInconsistentLayout) {
+    constexpr uint64_t kBase = 0x100000000ULL;
+    constexpr size_t kSize = 16U * 1024 * 1024;
+    auto allocator = OffsetAllocator::create(kBase, kSize);
+    ASSERT_NE(allocator, nullptr);
+    auto first = allocator->allocate(4096);
+    auto second = allocator->allocate(4096);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+
+    auto clean = allocator->CaptureSnapshot();
+    ASSERT_TRUE(clean.Validate().has_value());
+    EXPECT_EQ(clean.allocated_num, 2U);
+    EXPECT_EQ(clean.allocated_size, 8192U);
+
+    const std::vector<LayoutFault> faults{
+        LayoutFault::kBinIndexOutOfRange,
+        LayoutFault::kUsedNodeInBinList,
+        LayoutFault::kFreeStorageMismatch,
+        LayoutFault::kFreeOffsetTooLarge,
+        LayoutFault::kFreeOffsetTooSmall,
+        LayoutFault::kDuplicateSpareNode,
+        LayoutFault::kSpareNodeIsLive,
+        LayoutFault::kUnclassifiedNode,
+        LayoutFault::kNodeOffsetShifted,
+        LayoutFault::kNeighborChainBroken,
+        LayoutFault::kBinBitWithoutList,
+        LayoutFault::kUsedNodeZeroSize,
+        LayoutFault::kUsedNodeNotBinBoundary,
+        LayoutFault::kBinCycle,
+        LayoutFault::kNeighborOutOfRange,
+        LayoutFault::kNodeCapacityZero,
+        LayoutFault::kNodeCapacityTooLarge,
+        LayoutFault::kFreeOffsetOutOfRange,
+        LayoutFault::kNodeStorageTooShort,
+        LayoutFault::kNodeStorageTooLong,
+        LayoutFault::kFreeNodeStorageTooLong,
+    };
+    for (const auto fault : faults) {
+        SCOPED_TRACE(static_cast<int>(fault));
+        EXPECT_FALSE(layoutPassesValidation(allocator, fault));
+        auto snapshot = allocator->CaptureSnapshot();
+        applyLayoutFault(*snapshot.layout, fault);
+        const auto valid = snapshot.Validate();
+        ASSERT_FALSE(valid.has_value());
+        EXPECT_FALSE(valid.error().empty());
+        auto restored = OffsetAllocator::Restore(std::move(snapshot));
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_EQ(restored.error(), valid.error());
+        EXPECT_EQ(restoreBufferAllocatorAfterLayoutFault(allocator, fault),
+                  ErrorCode::INVALID_PARAMS);
+    }
+
+    // Rejected layouts must not disturb the allocator they came from.
+    EXPECT_TRUE(layoutPassesValidation(allocator, LayoutFault::kNone));
+}
+
+TEST_F(OffsetAllocatorTest,
+       SnapshotValidationRejectsHeaderAndAccountingFaults) {
+    auto allocator = OffsetAllocator::create(0x100000000ULL, 16U << 20, 16, 32);
+    auto first = allocator->allocate(4096);
+    auto second = allocator->allocate(4096);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    struct Fault {
+        const char* diagnostic;
+        std::function<void(OffsetAllocatorSnapshot&)> apply;
+    };
+    const std::vector<Fault> faults{
+        {"layout", [](auto& s) { s.layout.reset(); }},
+        {"bounds", [](auto& s) { s.capacity = 0; }},
+        {"bounds",
+         [](auto& s) { s.base = std::numeric_limits<uint64_t>::max(); }},
+        {"multiplier_bits", [](auto& s) { s.multiplier_bits = 64; }},
+        {"multiplier_bits",
+         [](auto& s) {
+             s.multiplier_bits = std::numeric_limits<uint64_t>::max();
+         }},
+        {"multiplier_bits", [](auto& s) { s.multiplier_bits = 1; }},
+        {"layout size", [](auto& s) { ++s.capacity; }},
+        {"allocated_num", [](auto& s) { s.allocated_num = 0; }},
+        {"allocated_num", [](auto& s) { ++s.allocated_num; }},
+        {"allocated_size", [](auto& s) { s.allocated_size = 0; }},
+        {"allocated_size", [](auto& s) { s.allocated_size = 7681; }},
+        {"allocated_size", [](auto& s) { s.allocated_size = 8193; }},
+    };
+    for (const auto& fault : faults) {
+        SCOPED_TRACE(fault.diagnostic);
+        auto snapshot = allocator->CaptureSnapshot();
+        fault.apply(snapshot);
+        const auto valid = snapshot.Validate();
+        ASSERT_FALSE(valid.has_value());
+        EXPECT_NE(valid.error().find(fault.diagnostic), std::string::npos);
+        auto restored = OffsetAllocator::Restore(std::move(snapshot));
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_EQ(restored.error(), valid.error());
+    }
+}
+
+TEST_F(OffsetAllocatorTest, SnapshotCapacityPreflightRejectsInvalidFields) {
+    const auto validate = OffsetAllocatorSnapshot::ValidateNodeCapacity;
+    EXPECT_TRUE(validate(1024, 16, OffsetAllocatorSnapshot::kMaxNodes, 1));
+    EXPECT_TRUE(validate(1024, OffsetAllocatorSnapshot::kMaxNodes,
+                         OffsetAllocatorSnapshot::kMaxNodes,
+                         OffsetAllocatorSnapshot::kMaxNodes));
+    EXPECT_FALSE(validate(0, 16, 32, 1));
+    EXPECT_FALSE(validate(1024, 0, 32, 0));
+    EXPECT_FALSE(validate(1024, 16, 0, 1));
+    EXPECT_FALSE(validate(1024, 33, 32, 1));
+    EXPECT_FALSE(validate(1024, 16, OffsetAllocatorSnapshot::kMaxNodes + 1, 1));
+    EXPECT_FALSE(validate(1024, 16, 32, 17));
+}
+
+TEST_F(OffsetAllocatorTest, SnapshotValidationAcceptsRoundingAndBoundsUsage) {
+    for (const uint64_t capacity : {uint64_t{16} << 20, uint64_t{32} << 30}) {
+        SCOPED_TRACE(capacity);
+        auto allocator =
+            OffsetAllocator::create(0x100000000ULL, capacity, 16, 32);
+        auto allocation = allocator->allocate(4097);
+        ASSERT_TRUE(allocation.has_value());
+        auto snapshot = allocator->CaptureSnapshot();
+        ASSERT_TRUE(snapshot.Validate().has_value());
+        EXPECT_EQ(snapshot.allocated_size, 4097U);
+        auto restored = OffsetAllocator::Restore(std::move(snapshot));
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_EQ((*restored)->get_metrics().allocated_size_, 4097U);
+        EXPECT_EQ((*restored)->get_metrics().allocated_num_, 1U);
+
+#ifndef OFFSET_ALLOCATOR_NOT_ROUND_UP
+        // A 4097-byte request consumes 4608 bytes. Both bin rounding and the
+        // large allocator's unit shift allow [4097, 4608], not arbitrary values
+        // below the occupied size. Exact original requests cannot be recovered
+        // from the layout alone.
+        for (const uint64_t requested : {4096U, 4097U, 4608U, 4609U}) {
+            auto candidate = allocator->CaptureSnapshot();
+            candidate.allocated_size = requested;
+            EXPECT_EQ(candidate.Validate().has_value(),
+                      requested >= 4097 && requested <= 4608);
+        }
+#endif
+    }
+}
+
+TEST_F(OffsetAllocatorTest,
+       SnapshotValidationAcceptsEmptyFullAndSmallAllocations) {
+    auto allocator = OffsetAllocator::create(0, 16, 16, 32);
+    EXPECT_TRUE(allocator->CaptureSnapshot().Validate().has_value());
+    auto full = allocator->allocate(16);
+    ASSERT_TRUE(full.has_value());
+    EXPECT_TRUE(allocator->CaptureSnapshot().Validate().has_value());
+    full.reset();
+    EXPECT_TRUE(allocator->CaptureSnapshot().Validate().has_value());
+
+    for (const uint64_t capacity : {uint64_t{16} << 20, uint64_t{32} << 30}) {
+        auto small = OffsetAllocator::create(0, capacity, 16, 32);
+        for (const size_t requested : {1U, 7U, 8U, 9U}) {
+            auto allocation = small->allocate(requested);
+            ASSERT_TRUE(allocation.has_value());
+            EXPECT_TRUE(small->CaptureSnapshot().Validate().has_value());
         }
     }
 }

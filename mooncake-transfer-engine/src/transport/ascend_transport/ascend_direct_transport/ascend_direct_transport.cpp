@@ -47,6 +47,41 @@ int32_t ResolveCurrentEngineId(bool agent_mode) {
     return current_device_id;
 }
 
+int ResolveAscendMemType(const std::string &location, void *addr,
+                         adxl::MemType &mem_type) {
+    if (location.starts_with("cpu")) {
+        mem_type = adxl::MEM_HOST;
+        return 0;
+    }
+    if (location.starts_with("npu")) {
+        mem_type = adxl::MEM_DEVICE;
+        return 0;
+    }
+    if (location != kWildcardLocation) {
+        LOG(ERROR) << "location:" << location << " is not supported.";
+        return ERR_INVALID_ARGUMENT;
+    }
+    aclrtPtrAttributes attributes;
+    CHECK_ACL(aclrtPointerGetAttributes(addr, &attributes));
+    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+        mem_type = adxl::MEM_HOST;
+    } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+        mem_type = adxl::MEM_DEVICE;
+    } else {
+        LOG(INFO) << "mem addr:" << addr
+                  << " can not be recognized, try set to host mem.";
+        mem_type = adxl::MEM_HOST;
+    }
+    return 0;
+}
+
+int StampBufferDeviceId(TransferMetadata::BufferDesc &buffer_desc) {
+    int32_t device_id = -1;
+    CHECK_ACL(aclrtGetDevice(&device_id));
+    buffer_desc.device_id = device_id;
+    return 0;
+}
+
 void InitializeSlice(const Transport::TransferRequest &request,
                      int32_t current_engine_id, Transport::TransferTask *task,
                      Transport::Slice *slice) {
@@ -295,9 +330,13 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
@@ -329,27 +368,25 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     buffer_desc.name = location;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = (uint64_t)length;
+    int stamp_ret = StampBufferDeviceId(buffer_desc);
+    if (stamp_ret != 0) {
+        return stamp_ret;
+    }
 
     adxl::MemType mem_type;
-    if (location.starts_with("cpu")) {
-        mem_type = adxl::MEM_HOST;
-    } else if (location.starts_with("npu")) {
+    int type_ret = ResolveAscendMemType(location, addr, mem_type);
+    if (type_ret != 0) {
+        return type_ret;
+    }
+    if (use_fabric_mem_ && ascend_is_direct_vmm_memory(addr, length)) {
+        // Direct ACL VMM allocations bypass adxl::MallocMem and are not known
+        // to ADXL's allocation bookkeeping, so they must be registered as
+        // device memory. adxl::MallocMem allocations keep MEM_HOST: ADXL
+        // exports them through its own host-memory path. The gate is this TE's
+        // own fabric flag, not the process-wide allocation table: a co-located
+        // non-fabric TE has no fabric-enabled ADXL engine, so it must keep
+        // treating that memory as host.
         mem_type = adxl::MEM_DEVICE;
-    } else if (location == kWildcardLocation) {
-        aclrtPtrAttributes attributes;
-        CHECK_ACL(aclrtPointerGetAttributes(addr, &attributes));
-        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-            mem_type = adxl::MEM_HOST;
-        } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
-            mem_type = adxl::MEM_DEVICE;
-        } else {
-            LOG(INFO) << "mem addr:" << addr
-                      << " can not be recognized, try set to host mem.";
-            mem_type = adxl::MEM_HOST;
-        }
-    } else {
-        LOG(ERROR) << "location:" << location << " is not supported.";
-        return ERR_INVALID_ARGUMENT;
     }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
@@ -359,8 +396,7 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     const int register_ret = transfer_executor_->registerMem(
-        addr, length, mem_type, transfer_executor_->getUseBufferPool(),
-        roce_mode_, agent_mode_);
+        addr, length, mem_type, transfer_executor_->getUseBufferPool());
     if (register_ret == 0) {
         return 0;
     }
@@ -420,16 +456,18 @@ int AscendDirectTransport::unregisterLocalMemoryBatch(
                  "with addr count: "
               << addr_list.size();
 
+    int first_error = 0;
     for (void *addr : addr_list) {
         int ret = unregisterLocalMemory(addr, false);
         if (ret != 0) {
             LOG(ERROR) << "Failed to unregister memory in batch, addr: "
                        << addr;
-            return ret;
+            if (!first_error) first_error = ret;
         }
     }
 
     // Update metadata once for the entire batch
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 }  // namespace mooncake

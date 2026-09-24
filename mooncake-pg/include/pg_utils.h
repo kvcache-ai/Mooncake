@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include <chrono>
-#include <thread>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 // For PAUSE macro
 #include <transfer_engine.h>
@@ -181,6 +181,15 @@ class BackoffWaiter {
     uint32_t yield_count_{0};
     std::chrono::microseconds current_sleep_;
 };
+
+template <class... Ts>
+struct overloaded : Ts... {
+    using Ts::operator()...;
+};
+
+template <class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
+
 }  // namespace mooncake
 
 #endif

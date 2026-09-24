@@ -306,7 +306,7 @@ int BarexTransport::registerLocalMemoryBatch(
         if (ret) {
             LOG(ERROR) << "BarexTransport: Failed to register memory: addr "
                        << buffer.addr << " length " << buffer.length;
-            return ERR_ADDRESS_NOT_REGISTERED;
+            return ret;
         }
     }
 
@@ -323,13 +323,17 @@ int BarexTransport::unregisterLocalMemoryBatch(
             }));
     }
 
+    int first_error = 0;
     for (size_t i = 0; i < addr_list.size(); ++i) {
-        if (results[i].get())
+        int ret = results[i].get();
+        if (ret) {
             LOG(WARNING) << "BarexTransport: Failed to unregister memory: addr "
                          << addr_list[i];
+            if (!first_error) first_error = ret;
+        }
     }
-
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 Status BarexTransport::submitTransfer(
@@ -1169,8 +1173,13 @@ Status BarexTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
-                for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
+                // Do not deallocate slices already queued in slices_to_post
+                // here: every slice is also recorded in its owning
+                // TransferTask::slice_list right after allocation, and
+                // ~TransferTask() returns everything in slice_list to the
+                // cache exactly once. Deallocating here double-frees them
+                // into ThreadLocalSliceCache, letting a later allocate()
+                // hand the same Slice* to two unrelated transfers.
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
@@ -1196,9 +1205,13 @@ Status BarexTransport::getTransferStatus(BatchID batch_id,
     status.resize(task_count);
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto &task = batch_desc.task_list[task_id];
-        status[task_id].transferred_bytes = task.transferred_bytes;
-        uint64_t success_slice_count = task.success_slice_count;
-        uint64_t failed_slice_count = task.failed_slice_count;
+        uint64_t success_slice_count =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        uint64_t failed_slice_count =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        // Completion counters publish the preceding byte updates.
+        status[task_id].transferred_bytes =
+            __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
         if (success_slice_count + failed_slice_count == task.slice_count) {
             if (failed_slice_count) {
                 status[task_id].s = TransferStatusEnum::FAILED;
@@ -1223,9 +1236,13 @@ Status BarexTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count)
             status.s = TransferStatusEnum::FAILED;

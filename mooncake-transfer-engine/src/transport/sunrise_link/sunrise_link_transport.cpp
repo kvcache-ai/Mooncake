@@ -418,15 +418,22 @@ int SunriseLinkTransport::unregisterLocalMemory(void* addr,
 int SunriseLinkTransport::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
     for (const auto& buffer : buffer_list) {
-        registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
     }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int SunriseLinkTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    for (auto* addr : addr_list) unregisterLocalMemory(addr, false);
-    return metadata_->updateLocalSegmentDesc();
+    int first_error = 0;
+    for (auto* addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret && !first_error) first_error = ret;
+    }
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 int SunriseLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
@@ -741,9 +748,13 @@ Status SunriseLinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
 
     auto& task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         status.s = failed_slice_count ? TransferStatusEnum::FAILED
                                       : TransferStatusEnum::COMPLETED;

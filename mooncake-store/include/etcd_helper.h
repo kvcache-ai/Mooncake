@@ -1,7 +1,10 @@
 #pragma once
 
 #include <glog/logging.h>
+#include <ylt/util/tl/expected.hpp>
+
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "types.h"
@@ -28,8 +31,9 @@ class EtcdHelper {
 
     /*
      * @brief Reset the global store etcd client and reconnect to the given
-     *        endpoints. This cancels active store watches/keepalives in the Go
-     *        wrapper and creates a fresh clientv3.Client.
+     *        endpoints. This cancels active store watches and maintenance
+     *        sessions. Each lease keep-alive uses an independent client and
+     *        continues.
      * @param etcd_endpoints: The endpoints of the etcd store client.
      * @return: Error code.
      */
@@ -61,6 +65,15 @@ class EtcdHelper {
                                      EtcdLeaseId lease_id,
                                      EtcdRevisionId& revision_id);
 
+    static ErrorCode AcquireMaintenanceSession(std::string_view key,
+                                               int64_t lease_ttl,
+                                               int64_t& session_handle,
+                                               EtcdLeaseId& lease_id,
+                                               EtcdRevisionId& create_revision);
+    static ErrorCode CloseMaintenanceSession(int64_t session_handle);
+    static tl::expected<bool, ErrorCode> MaintenanceSessionAlive(
+        int64_t session_handle);
+
     /*
      * @brief Batch create key-value pairs in a single transaction.
      *        Fails if any key already exists.
@@ -70,6 +83,36 @@ class EtcdHelper {
      */
     static ErrorCode BatchCreate(const std::vector<std::string>& keys,
                                  const std::vector<std::string>& values);
+
+    enum class TxnCompareKind {
+        kValueEquals = 0,
+        kKeyNotExists = 1,
+        // Compare the key's creation revision to expected_revision.
+        kCreateRevisionEquals = 2,
+    };
+
+    struct TxnCompare {
+        std::string key;
+        TxnCompareKind kind{TxnCompareKind::kValueEquals};
+        std::string expected_value;
+        // Used only by kCreateRevisionEquals.
+        EtcdRevisionId expected_revision{0};
+    };
+
+    struct TxnPut {
+        std::string key;
+        std::string value;
+        bool preserve_lease{false};
+    };
+
+    /*
+     * @brief Execute an etcd transaction with compare predicates and put
+     * operations.
+     * @return: OK on success; ETCD_TRANSACTION_FAIL when compare predicates
+     * fail.
+     */
+    static ErrorCode TxnCompareAndPut(const std::vector<TxnCompare>& compares,
+                                      const std::vector<TxnPut>& puts);
 
     /*
      * @brief Grant a lease from the etcd.

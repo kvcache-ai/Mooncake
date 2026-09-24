@@ -4,6 +4,7 @@
 #include <chrono>
 #include <map>
 #include <ostream>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -13,48 +14,22 @@
 
 #include "allocation_strategy.h"
 #include "allocator.h"
+#include "local_ssd/persisted_state.h"
 #include "rpc_types.h"
+#include "segment/status.h"
+#include "segment/usage.h"
+#include "storage_usage.h"
 #include "types.h"
 
 namespace mooncake {
 using HostSegmentIndex =
     std::map<std::string, std::map<std::string, std::set<UUID>>>;
 
-/**
- * @brief Status of a mounted segment in master
- */
-enum class SegmentStatus {
-    UNDEFINED = 0,  // Uninitialized
-    OK,             // Segment is mounted and available for allocation
-    DRAINING,       // Segment remains readable but accepts no new allocations
-    DRAINED,        // Segment has been drained and awaits unmount
-    GRACEFULLY_UNMOUNTING,  // Readable, no new allocations, timer running
-    UNMOUNTING,             // Segment is under unmounting
-};
-
-/**
- * @brief Stream operator for SegmentStatus
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const SegmentStatus& status) noexcept {
-    static const std::unordered_map<SegmentStatus, std::string_view>
-        status_strings{
-            {SegmentStatus::UNDEFINED, "UNDEFINED"},
-            {SegmentStatus::OK, "OK"},
-            {SegmentStatus::DRAINING, "DRAINING"},
-            {SegmentStatus::DRAINED, "DRAINED"},
-            {SegmentStatus::GRACEFULLY_UNMOUNTING, "GRACEFULLY_UNMOUNTING"},
-            {SegmentStatus::UNMOUNTING, "UNMOUNTING"}};
-
-    os << (status_strings.count(status) ? status_strings.at(status)
-                                        : "UNKNOWN");
-    return os;
-}
-
 struct MountedSegment {
     Segment segment;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    std::shared_ptr<SegmentAllocatorRegistration> allocator_registration;
 };
 
 struct MountedNoFSegment {
@@ -62,6 +37,7 @@ struct MountedNoFSegment {
     UUID client_id;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    std::shared_ptr<SegmentAllocatorRegistration> allocator_registration;
 };
 
 struct MountedNoFSegmentSnapshot {
@@ -87,29 +63,6 @@ inline std::ostream& operator<<(
     return os;
 }
 
-struct LocalDiskSegment {
-    mutable Mutex offloading_mutex_;
-    bool enable_offloading;
-    int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
-    std::atomic<int64_t> ssd_used_bytes{0};
-    std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
-        offloading_mutex_) offloading_objects;
-    // Promotion-on-hit pending work for this client. Populated by master's
-    // TryPushPromotionQueue when a Get hits a LOCAL_DISK-only key on this
-    // client. Drained by PromotionObjectHeartbeat. Same locking as
-    // offloading_objects (offloading_mutex_).
-    std::unordered_map<std::string, PromotionTaskItem> GUARDED_BY(
-        offloading_mutex_) promotion_objects;
-    explicit LocalDiskSegment(bool enable_offloading)
-        : enable_offloading(enable_offloading) {}
-
-    LocalDiskSegment(const LocalDiskSegment&) = delete;
-    LocalDiskSegment& operator=(const LocalDiskSegment&) = delete;
-
-    LocalDiskSegment(LocalDiskSegment&&) = delete;
-    LocalDiskSegment& operator=(LocalDiskSegment&&) = delete;
-};
-
 // Forward declarations
 class SegmentManager;
 
@@ -129,10 +82,9 @@ class ScopedSegmentAccess {
     /**
      * @brief Mount a segment
      */
-    ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
-
-    ErrorCode MountLocalDiskSegment(const UUID& client_id,
-                                    bool enable_offloading);
+    ErrorCode MountSegment(
+        const Segment& segment, const UUID& client_id,
+        std::shared_ptr<ClientLivenessRecord> client_liveness);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -140,8 +92,25 @@ class ScopedSegmentAccess {
      * errors. When encounters unsolvable errors, the segment will not be
      * mounted while the return value will be OK.
      */
-    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
-                             const UUID& client_id);
+    ErrorCode ReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        std::shared_ptr<ClientLivenessRecord> client_liveness);
+
+    ErrorCode ValidateRemountSegment(const Segment& segment,
+                                     const UUID& client_id) const;
+
+    bool GetSegment(const UUID& segment_id, Segment& segment) const;
+
+    struct AllocatorReplacement {
+        UUID segment_id;
+        std::shared_ptr<BufferAllocatorBase> expected;
+        std::shared_ptr<BufferAllocatorBase> replacement;
+    };
+    bool ReplaceAllocators(
+        const std::vector<AllocatorReplacement>& replacements);
+
+    std::shared_ptr<BufferAllocatorBase> GetAllocator(
+        const UUID& segment_id) const;
 
     /**
      * @brief Prepare to unmount a segment by deleting its allocator
@@ -160,13 +129,28 @@ class ScopedSegmentAccess {
      */
     ErrorCode CommitUnmountSegment(const UUID& segment_id,
                                    const UUID& client_id,
-                                   const size_t& metrics_dec_capacity);
+                                   const size_t& metrics_dec_capacity,
+                                   bool retain_name_registration = false);
+
+    void ReleaseUnmountedSegmentName(const UUID& segment_id,
+                                     const std::string& segment_name);
 
     /**
      * @brief Get all the segments of a client
      */
     ErrorCode GetClientSegments(const UUID& client_id,
                                 std::vector<Segment>& segments) const;
+
+    /**
+     * @brief Rebind restored client-owned segment resources to a fresh
+     *        liveness record. Segment snapshots intentionally do not persist
+     *        record implementation state.
+     */
+    void BindClientLiveness(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& client_liveness);
+    void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
+    [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**
      * @brief Get the names of all the segments
@@ -233,13 +217,10 @@ class ScopedSegmentAccess {
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
 
-    /**
-     * @brief Remove the local disk segment entry for a client.
-     * Called when a client expires to clean up its local disk segment.
-     */
-    void UnmountLocalDiskSegment(const UUID& client_id);
-
    private:
+    void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,
+                                        const std::string& segment_name);
+
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
 };
@@ -325,57 +306,33 @@ class ScopedAllocatorAccess {
                                    std::shared_mutex& mutex)
         : allocator_manager_(allocator_manager), lock_(mutex) {}
 
-    explicit ScopedAllocatorAccess(const AllocatorManager& allocator_manager,
-                                   const HostSegmentIndex& segments_by_host,
-                                   std::shared_mutex& mutex)
+    explicit ScopedAllocatorAccess(
+        const AllocatorManager& allocator_manager,
+        const HostSegmentIndex& segments_by_host,
+        const std::unordered_map<std::string, UUID>& client_by_name,
+        std::shared_mutex& mutex)
         : allocator_manager_(allocator_manager),
           segments_by_host_(&segments_by_host),
+          client_by_name_(&client_by_name),
           lock_(mutex) {}
 
-    const AllocatorManager& getAllocatorManager() { return allocator_manager_; }
+    const AllocatorManager& getAllocatorManager() const {
+        return allocator_manager_;
+    }
+
+    AllocatorManager SnapshotAllocatorManager() const {
+        return allocator_manager_.Snapshot(client_by_name_);
+    }
 
     std::vector<std::string> GetHostOrderedSegments(
         const std::string& writer_host_id, const std::string& key) const;
 
+    std::optional<UUID> GetOwnerClientId(const std::string& segment_name) const;
+
    private:
     const AllocatorManager& allocator_manager_;
     const HostSegmentIndex* segments_by_host_{nullptr};
-    std::shared_lock<std::shared_mutex> lock_;
-};
-
-/**
- * @brief RAII-style access to LocalDiskOffloadingQueues for thread-safe
- * LocalDiskOffloadingQueue usage
- */
-class ScopedLocalDiskSegmentAccess : public SsdMetricsProvider {
-   public:
-    explicit ScopedLocalDiskSegmentAccess(
-        std::unordered_map<std::string, UUID>& client_by_name,
-        std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
-                           boost::hash<UUID>>& client_local_disk_segment,
-        std::shared_mutex& mutex)
-        : client_by_name_(client_by_name),
-          client_local_disk_segment_(client_local_disk_segment),
-          lock_(mutex) {}
-
-    const std::unordered_map<std::string, UUID>& getClientByName() {
-        return client_by_name_;
-    }
-
-    std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
-                       boost::hash<UUID>>&
-    getClientLocalDiskSegment() {
-        return client_local_disk_segment_;
-    }
-
-    int64_t getSsdTotalCapacity(const std::string& segment_name) const override;
-    int64_t getSsdUsedBytes(const std::string& segment_name) const override;
-
-   private:
-    const std::unordered_map<std::string, UUID>&
-        client_by_name_;  // segment name -> client_id
-    std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
-                       boost::hash<UUID>>& client_local_disk_segment_;
+    const std::unordered_map<std::string, UUID>* client_by_name_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -408,9 +365,10 @@ class SegmentSerializer {
     explicit SegmentSerializer(SegmentManager* segment_manager)
         : segment_manager_(segment_manager) {}
 
-    tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+    tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
+        const LocalSsdPersistedState& local_ssd_state);
 
-    tl::expected<void, SerializationError> Deserialize(
+    tl::expected<LocalSsdPersistedState, SerializationError> Deserialize(
         const std::vector<uint8_t>& data);
 
     void Reset();
@@ -431,6 +389,18 @@ class SegmentManager {
         : memory_allocator_(memory_allocator), enable_cxl_(enable_cxl) {}
 
     /**
+     * @brief Releases the capacity metric contribution of segments that
+     *        are still mounted. Intended to be called when the owning
+     *        MasterService is torn down: MasterMetricManager outlives
+     *        MasterService instances (e.g. across HA leadership changes).
+     *        This is deliberately not done in the destructor, because other
+     *        SegmentManager instances (such as the temporary snapshot
+     *        readers) hold deserialized records that never contributed to
+     *        the metrics and must not release them.
+     */
+    void releaseCapacityMetrics();
+
+    /**
      * @brief Get RAII-style access to segment management operations
      * @return ScopedSegmentAccess object that holds the lock
      */
@@ -444,20 +414,44 @@ class SegmentManager {
      */
     ScopedAllocatorAccess getAllocatorAccess() {
         return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
-                                     segment_mutex_);
-    }
-
-    ScopedLocalDiskSegmentAccess getLocalDiskSegmentAccess() {
-        return ScopedLocalDiskSegmentAccess(
-            client_by_name_, client_local_disk_segment_, segment_mutex_);
+                                     client_by_name_, segment_mutex_);
     }
 
     SegmentView getView() const { return SegmentView(this); }
 
-    void initializeCxlAllocator(const std::string& cxl_path,
-                                const size_t cxl_size);
+    /**
+     * @brief Return current DRAM usage derived from mounted allocators.
+     *
+     * Shared allocators (for example the global CXL allocator) are counted
+     * once even when they are referenced by multiple mounted segments.
+     */
+    [[nodiscard]] StorageUsageSnapshot GetMemoryUsageSnapshot() const;
+
+    /**
+     * @brief Return aggregate DRAM usage in O(1) without segment_mutex_.
+     *
+     * Best-effort: used/capacity may tear briefly across mount/unmount,
+     * matching the previous metric-gauge watermark reads. An unmounted
+     * allocator may remain in the aggregate until in-flight allocate or
+     * deallocate calls drain and the last shared_ptr is dropped.
+     */
+    [[nodiscard]] StorageUsage GetMemoryUsage() const noexcept {
+        return usage_tracker_->GetUsage();
+    }
+
+    ErrorCode initializeCxlAllocator(const std::string& cxl_path,
+                                     size_t cxl_size);
+
+    // Endpoint-based segment queries (for standby restore)
+    bool HasSegmentByEndpoint(const std::string& endpoint) const;
+    bool GetSegmentBasicInfo(const UUID& segment_id, std::string& segment_name,
+                             std::string& te_endpoint) const;
 
    private:
+    void AttachMountedUsageTrackers();
+
+    std::shared_ptr<StorageUsageTracker> usage_tracker_ =
+        std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType
@@ -478,10 +472,6 @@ class SegmentManager {
         segment_id_by_name_;             // segment name -> segment_id
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
-    std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
-                       boost::hash<UUID>>
-        client_local_disk_segment_;  // client_id -> local_disk_segment
-
     friend class ScopedSegmentAccess;
     friend class SegmentTest;        // for unit tests
     friend class SegmentView;        // for fork serialize
@@ -526,6 +516,23 @@ class NoFSegmentManager {
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
 
+    /**
+     * @brief Return current NoF usage derived from mounted allocators.
+     */
+    [[nodiscard]] StorageUsageSnapshot GetUsageSnapshot() const;
+
+    /**
+     * @brief Return aggregate NoF usage in O(1) without segment_mutex_.
+     *
+     * Best-effort: used/capacity may tear briefly across mount/unmount,
+     * matching the previous metric-gauge watermark reads. An unmounted
+     * allocator may remain in the aggregate until in-flight allocate or
+     * deallocate calls drain and the last shared_ptr is dropped.
+     */
+    [[nodiscard]] StorageUsage GetUsage() const noexcept {
+        return usage_tracker_->GetUsage();
+    }
+
     tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> GetSegmentsByName(
         const std::string& segment_name) const {
         std::shared_lock<std::shared_mutex> lock(segment_mutex_);
@@ -542,6 +549,8 @@ class NoFSegmentManager {
     }
 
    private:
+    std::shared_ptr<StorageUsageTracker> usage_tracker_ =
+        std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType
