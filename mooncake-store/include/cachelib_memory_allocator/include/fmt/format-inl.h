@@ -2511,11 +2511,11 @@ template <> struct formatter<detail::bigint> {
     for (auto i = n.bigits_.size(); i > 0; --i) {
       auto value = n.bigits_[i - 1u];
       if (first) {
-        out = format_to(out, FMT_STRING("{:x}"), value);
+        out = fmt::format_to(out, "{:x}", value);
         first = false;
         continue;
       }
-      out = format_to(out, FMT_STRING("{:08x}"), value);
+      out = fmt::format_to(out, "{:08x}", value);
     }
     if (n.exp_ > 0)
       out = format_to(out, FMT_STRING("p{}"),
