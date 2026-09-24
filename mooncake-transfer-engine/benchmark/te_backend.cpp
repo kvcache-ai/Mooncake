@@ -31,14 +31,14 @@
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
-#elif defined(USE_SUNRISE)
+#elif defined(USE_SUNRISE) || defined(USE_SUPA)
 #include "cuda_alike.h"
 #endif
 
 namespace mooncake {
 namespace tent {
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_SUPA)
 static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     std::string sysfs_path = "/sys/bus/pci/devices/" + pci_bdf + "/numa_node";
     std::ifstream numa_file(sysfs_path);
@@ -98,7 +98,7 @@ void signalHandlerV0(int signum) {
 
 static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE) || defined(USE_SUPA)
     if (from_vram) {
         int gpu_id = buffer_id;
         void* d_buf;
@@ -237,7 +237,7 @@ static void freeMemoryPool(void* addr, size_t size) {
         return;
     }
 #endif
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE) || defined(USE_SUPA)
     cudaPointerAttributes attributes;
     cudaPointerGetAttributes(&attributes, addr);
 
@@ -307,7 +307,7 @@ int TEBenchRunner::allocateBuffers() {
                          "hugepages (hp="
                       << hugepageBytes() << ") for RDMA MR registration";
         }
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE) || defined(USE_SUPA)
     } else if (XferBenchConfig::seg_type == "VRAM") {
         int gpu_count = 0;
         cudaGetDeviceCount(&gpu_count);
@@ -496,8 +496,13 @@ void TEBenchRunner::pinThread(int thread_id) {
     if (result[0].location.starts_with("cpu")) {
         auto socket_id = parseIndex(result[0].location);
         bindToSocket(socket_id);
-#ifdef USE_CUDA
+#if defined(USE_CUDA)
     } else if (result[0].location.starts_with("cuda")) {
+        auto device_id = parseIndex(result[0].location);
+        auto socket_id = getCudaDeviceNumaID(device_id);
+        bindToSocket(socket_id);
+#elif defined(USE_SUPA)
+    } else if (result[0].location.starts_with("supa")) {
         auto device_id = parseIndex(result[0].location);
         auto socket_id = getCudaDeviceNumaID(device_id);
         bindToSocket(socket_id);

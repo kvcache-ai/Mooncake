@@ -80,12 +80,14 @@ const static std::string GPU_PREFIX = "supa:";
 #define cudaEventQuery suEventQuery
 #define cudaGetLastError suGetLastError
 #define cudaGetDeviceProperties suGetDeviceProperties
+#define cudaRuntimeGetVersion suRuntimeGetVersion
 #define cudaStreamPerThread suStreamDefault
 #define cudaEventSynchronize suEventSynchronize
 
 // ===================== Driver API types =====================
 #define CUresult suError_t
 #define CUDA_SUCCESS suSuccess
+#define CUDA_ERROR_NOT_INITIALIZED suErrorInitializationError
 #define CUDA_ERROR_NOT_PERMITTED suErrorNotPermitted
 #define CUDA_ERROR_NOT_SUPPORTED suErrorNotSupported
 #define CUdevice suDevice
@@ -131,6 +133,8 @@ const static std::string GPU_PREFIX = "supa:";
 #define cuMemGetAllocationGranularity sudrvMemGetAllocationGranularity
 #define cuDevicePrimaryCtxRetain sudrvPrimaryContextRetain
 #define cuDevicePrimaryCtxRelease sudrvPrimaryContextRelease
+#define cuDevicePrimaryCtxGetState sudrvPrimaryContextGetState
+#define cuCtxGetCurrent sudrvContextGetCurrent
 #define cuCtxSetCurrent sudrvContextSetCurrent
 #define CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL suPointerAttributeDeviceOrdinal
 

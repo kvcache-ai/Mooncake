@@ -57,6 +57,9 @@ endif()
 if(USE_SUNRISE)
   target_link_libraries(tebench PUBLIC tangrt_shared)
 endif()
+if(USE_SUPA)
+  target_link_libraries(tebench PUBLIC ${SUPA_LIBRARIES})
+endif()
 
 # Set RPATH for finding libasio.so at runtime
 if(USE_SUNRISE AND MC_TANGRT_ROOT)
