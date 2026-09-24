@@ -56,21 +56,34 @@ MasterStoreBackend::SnapshotWeightGroup(
     std::vector<WeightGroupMemberSnapshot> members;
     members.reserve(member_keys.size());
     for (const auto& key : member_keys) {
-        MasterService::MetadataAccessorRO accessor(
-            &master_, master_.MakeObjectIdentity(key, tenant_id));
-        if (!accessor.Exists()) {
+        // Each member is read through the tenant's route, so the snapshot is
+        // taken from the publication the route holds for that key.
+        std::optional<WeightGroupMemberSnapshot> snapshot;
+        const auto published = master_.WithObjectMetadataForRead(
+            tenant_id, key,
+            [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+                const ObjectMetadata& metadata,
+                const ObjectEntry::State&) -> bool {
+                if (metadata.group_id != payload_group_id) {
+                    return false;
+                }
+                snapshot = WeightGroupMemberSnapshot{
+                    .key = key,
+                    .size = metadata.size,
+                    .data_type = metadata.data_type,
+                    .readable = master_.HasReadableReplica(metadata),
+                };
+                return true;
+            });
+        if (!published.has_value()) {
             return tl::make_unexpected(WeightManagementError::NOT_FOUND);
         }
-        const auto& metadata = accessor.Get();
-        if (metadata.group_id != payload_group_id) {
+        if (!*published) {
+            // A member that no longer belongs to the group is a conflict, the
+            // same answer the shard model gave when the group had moved on.
             return tl::make_unexpected(WeightManagementError::CONFLICT);
         }
-        members.push_back(WeightGroupMemberSnapshot{
-            .key = key,
-            .size = metadata.size,
-            .data_type = metadata.data_type,
-            .readable = master_.HasReadableReplica(metadata),
-        });
+        members.push_back(std::move(*snapshot));
     }
     return members;
 }
