@@ -87,6 +87,13 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
+    - name: Run in-process master e2e tests (no mooncake_master)
+      run: |
+        source test_env/bin/activate
+        bash scripts/run_standalone_store_e2e.sh
+        deactivate
+      shell: bash
+
     - name: Run tensor snapshot regressions
       env:
         MASTER_SERVER: "127.0.0.1:50061"
@@ -685,11 +692,11 @@ jobs:
         cargo clean
       shell: bash
 
-    - name: Test Store completion with TENT
+    - name: Test Store completion and engine reuse with TENT
       if: matrix.name == 'cuda-off'
       run: |
         ctest --test-dir build-tent --output-on-failure --no-tests=error \
-          -R '^transfer_task_tent_completion_test$'
+          -R '^(transfer_task_tent_completion_test|standalone_client_tent_test)$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;

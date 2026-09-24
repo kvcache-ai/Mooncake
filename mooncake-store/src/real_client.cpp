@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "embedded_master.h"
 #include "common/client_buffer_allocation.h"
 #include "common/mmap_aligned.h"
 #include "registered_pinned_memory.h"
@@ -841,6 +842,31 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+tl::expected<std::string, ErrorCode> RealClient::StartEmbeddedMaster(
+    bool enable_ssd_offload) {
+    if (embedded_master_) {
+        return embedded_master_->master_address();
+    }
+
+    InProcMasterConfig config;
+    // In-process master uses P2PHANDSHAKE by default; skip the unused HTTP
+    // metadata listener unless an explicit port is requested by tests.
+    config.http_metadata_port = 0;
+    config.enable_offload = enable_ssd_offload;
+    // master_server_addr names an external service. In embedded mode each
+    // client needs its own kernel-assigned port, including callers that keep
+    // setup_real's legacy default external address.
+
+    auto master = std::make_unique<EmbeddedMaster>();
+    if (!master->Start(config)) {
+        LOG(ERROR) << "Failed to start in-process master";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    LOG(INFO) << "In-process master listening at " << master->master_address();
+    embedded_master_ = std::move(master);
+    return embedded_master_->master_address();
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -850,9 +876,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port) {
+    bool enable_client_http_server, int client_http_port,
+    bool enable_embedded_master) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
+    if (!enable_embedded_master &&
+        Environ::GetBool("MOONCAKE_ENABLE_EMBEDDED_MASTER", false)) {
+        LOG(INFO) << "enable_embedded_master inferred from "
+                     "MOONCAKE_ENABLE_EMBEDDED_MASTER";
+        enable_embedded_master = true;
+    }
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
         auto ascend_setup = setup_ascend_internal(local_buffer_size);
@@ -882,6 +915,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    std::string resolved_master_server_addr = master_server_addr;
+    std::string resolved_metadata_server = metadata_server;
+    if (enable_embedded_master) {
+        auto started = StartEmbeddedMaster(enable_ssd_offload);
+        if (!started) {
+            return tl::unexpected(started.error());
+        }
+        resolved_master_server_addr = started.value();
+        if (resolved_metadata_server.empty() && !transfer_engine) {
+            resolved_metadata_server = "P2PHANDSHAKE";
+        }
+    } else if (resolved_metadata_server.empty() && !transfer_engine) {
+        // An existing transfer engine already owns its metadata connection;
+        // Client::Create reuses it without initialization.
+        LOG(ERROR) << "metadata_server is empty";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Check if hostname already contains a port
     const std::string &hostname = local_hostname;
     bool user_specified_port = hasExplicitPort(hostname);
@@ -892,9 +943,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(hostname), local_rpc_port);
         auto client_opt = mooncake::Client::Create(
-            this->local_hostname, metadata_server, protocol, device_name,
-            master_server_addr, transfer_engine, {{"client_mode", "real"}},
-            tenant_id);
+            this->local_hostname, resolved_metadata_server, protocol,
+            device_name, resolved_master_server_addr, transfer_engine,
+            {{"client_mode", "real"}}, tenant_id);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -923,9 +974,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             this->local_rpc_addr =
                 buildHostNameWithPort(hostname, local_rpc_port);
             auto client_opt = mooncake::Client::Create(
-                this->local_hostname, metadata_server, protocol, device_name,
-                master_server_addr, transfer_engine, {{"client_mode", "real"}},
-                tenant_id);
+                this->local_hostname, resolved_metadata_server, protocol,
+                device_name, resolved_master_server_addr, transfer_engine,
+                {{"client_mode", "real"}}, tenant_id);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1341,6 +1392,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string local_hostname = get_config(config, CONFIG_KEY_LOCAL_HOSTNAME);
     std::string metadata_server =
         get_config(config, CONFIG_KEY_METADATA_SERVER);
+    bool enable_embedded_master =
+        get_config_bool(config, CONFIG_KEY_ENABLE_EMBEDDED_MASTER, false);
+    if (!enable_embedded_master) {
+        enable_embedded_master =
+            Environ::GetBool("MOONCAKE_ENABLE_EMBEDDED_MASTER", false);
+    }
 
     // Validate required parameters
     if (local_hostname.empty()) {
@@ -1348,8 +1405,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (metadata_server.empty()) {
-        LOG(ERROR) << "Missing required config: " << CONFIG_KEY_METADATA_SERVER;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        if (enable_embedded_master) {
+            metadata_server = "P2PHANDSHAKE";
+        } else {
+            LOG(ERROR) << "Missing required config: "
+                       << CONFIG_KEY_METADATA_SERVER;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     // Extract optional parameters with defaults
@@ -1369,7 +1431,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
     std::string master_server_addr = get_config(
-        config, CONFIG_KEY_MASTER_SERVER_ADDR, DEFAULT_MASTER_SERVER_ADDR);
+        config, CONFIG_KEY_MASTER_SERVER_ADDR,
+        enable_embedded_master ? std::string() : DEFAULT_MASTER_SERVER_ADDR);
     std::string ipc_socket_path =
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
@@ -1414,11 +1477,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    return setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, enable_embedded_master);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1453,25 +1516,25 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_dummy_client_monitor();
     stop_http_server();
 
-    if (!client_) {
-        // Not initialized or already cleaned; treat as success for idempotence
-        return {};
-    }
-    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
-        protocol != "cxl") {
-        auto unregister_result = client_->unregisterLocalMemory(
-            client_buffer_allocator_->getBase(), true);
-        if (!unregister_result) {
-            LOG(WARNING)
-                << "Failed to unregister client local buffer on tear down: "
-                << toString(unregister_result.error());
+    if (client_) {
+        if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
+            protocol != "cxl") {
+            auto unregister_result = client_->unregisterLocalMemory(
+                client_buffer_allocator_->getBase(), true);
+            if (!unregister_result) {
+                LOG(WARNING)
+                    << "Failed to unregister client local buffer on tear down: "
+                    << toString(unregister_result.error());
+            }
+            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            local_buffer_region_.reset();
         }
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        local_buffer_region_.reset();
+        client_.reset();
     }
-
-    // Reset all resources
-    client_.reset();
+    if (embedded_master_) {
+        embedded_master_->Stop();
+        embedded_master_.reset();
+    }
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();

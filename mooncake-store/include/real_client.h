@@ -629,7 +629,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool enable_embedded_master = false);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -1151,6 +1152,11 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
+        bool enable_ssd_offload);
+
+    std::unique_ptr<class EmbeddedMaster> embedded_master_;
+
     struct SessionRangeReadRequest {
         std::string object_key;
         size_t result_index;
