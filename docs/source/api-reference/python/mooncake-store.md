@@ -2956,18 +2956,22 @@ Typical flow:
 - Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
-Get sessions cache a filtered `QueryResult` (one complete MEMORY or DFS replica
-plus its lease). The MEMORY path remains zero-copy. DFS replicas are read into
-request-scoped host staging and then scattered to host or device destinations.
-If a key has no complete MEMORY or DFS replica, for example because it has only
-LOCAL_DISK, DISK, or NOF replicas, `batch_get_session_start` returns
-`INVALID_REPLICA` for that key and does not open a session.
-For device destinations, DFS staging first uses the fixed-capacity pinned restore
-arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`; if that arena is
-unavailable or exhausted, it falls back to the regular client buffer allocator.
-Host-only reads use the regular client buffer allocator. Range calls only check
-the cached lease locally (zero Master RPCs). Put sessions reserve object space
-via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+Get sessions cache a filtered `QueryResult` (one complete supported replica,
+plus lease). Range calls only check the cached lease locally (zero Master RPCs).
+The MEMORY path remains zero-copy via `BatchTransferReadRanges`. DFS replicas
+are read into request-scoped host staging and then scattered to host or device
+destinations; for device destinations, staging first uses the fixed-capacity
+pinned restore arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`
+and falls back to the regular client buffer allocator if it is unavailable or
+exhausted. LOCAL_DISK replicas are restored on the owner via the offload RPC
+and then scatter object-byte ranges into already `register_buffer`'d
+destinations (the reader does not need a setup local buffer). DISK replicas
+`BatchGet` into a temporary host buffer and scatter by `src_offset`. If a key
+has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
+it has only NOF replicas — `batch_get_session_start` returns
+`INVALID_REPLICA` for that key and does not open a session. Put sessions
+reserve object space via Master `BatchPutStart` and finalize with
+`BatchPutEnd`.
 
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
