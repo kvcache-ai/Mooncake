@@ -2199,7 +2199,8 @@ class MasterService {
     std::vector<std::string> http_metadata_cleanup_queue_;
 
     void HttpMetadataCleanupThreadFunc();
-    // DELETEs one key on the remote HTTP metadata server; true on success.
+    // Sends an HTTP DELETE for one key to the remote metadata server; true on
+    // success.
     bool removeRemoteHttpMetadataKey(const std::string& key) const;
 
     // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
