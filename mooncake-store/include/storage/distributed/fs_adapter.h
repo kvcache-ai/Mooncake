@@ -32,6 +32,17 @@ class FileSystemAdapter {
     virtual tl::expected<size_t, ErrorCode> WriteFile(
         const std::string& path, std::span<const char> data) = 0;
 
+    // Durably replace a small metadata file using write+fsync+rename and a
+    // parent-directory fsync. DFS adapters are mounted in the POSIX namespace,
+    // so the default implementation is shared by POSIX and HF3FS.
+    virtual tl::expected<void, ErrorCode> AtomicWriteFile(
+        const std::string& path, std::span<const char> data);
+
+    // Append one or more framed metadata records and make the append durable
+    // before returning. Callers must serialize appends to a given path.
+    virtual tl::expected<void, ErrorCode> AppendAndSyncFile(
+        const std::string& path, std::span<const char> data);
+
     // Read file into a pre-allocated buffer (zero-copy into Slice.ptr)
     virtual tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
                                                      void* buf, size_t len) = 0;

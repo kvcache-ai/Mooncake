@@ -481,9 +481,9 @@ flags and restrictions.
 ### Descriptor-based DFS replicas
 
 ```{warning}
-**Work in progress.** Descriptor-based DFS is not production-ready and is not
-covered by the general fault-tolerance, HA continuity, durability, or
-multi-tenant guarantees described elsewhere in this design document.
+**Work in progress.** Descriptor-based DFS remains experimental and does not
+yet provide HA continuity, multi-tenant support, or data-file `fsync`
+durability.
 ```
 
 The master owns DFS placement metadata and an allocator for the shared shard
@@ -499,8 +499,39 @@ new shard files and allocator state, then atomically publishes the complete
 ready set; existing shard paths and ranges remain unchanged. Allocation tries
 the hash-selected shard first and falls back to other ready shards, so added
 capacity can relieve full shards. Startup discovers the existing contiguous
-layout to retain the expanded capacity; it does not recover allocation or key
-metadata.
+layout to retain the expanded capacity; allocator ownership is recovered as
+described below.
+
+The `ShardAllocator` persists placement per shard in an atomic checkpoint and an
+append-only WAL. Every allocation has a persistent `allocation_id` in both the
+sidecar metadata and DFS descriptor, so reconciliation cannot confuse an old
+snapshot with a later allocation that reused the same extent. An `ALLOC` record
+is durable before its descriptor is exposed. The descriptor field uses
+`struct_pack::compatible`, allowing old peers to ignore it and new peers to
+decode descriptors from old peers; clients do not need to return it in RPC
+requests. A deferred extent is not made reusable until its `RELEASE` record is
+durable. `BatchPutStart` retains the existing per-key allocation path; grouping
+WAL records across keys is left for future work. Write-attempt identity is
+intentionally out of scope and the existing Put/Upsert RPC method signatures
+remain unchanged.
+
+After restart, the master restores the allocator first and keeps it sealed
+while snapshot metadata is reconciled. A standalone snapshot prunes stale DFS
+replicas (and objects left without a valid replica). Allocator-only active
+records are quarantined from barrier-open for the maximum of the deferred-free
+duration, read lease, and Put-start release timeout. Recovered pending frees
+receive a fresh deferred-free interval. Capacity pressure never shortens either
+safety window. HA, OpLog recovery, and standby promotion are intentionally out
+of scope and cannot be enabled with descriptor-based DFS.
+
+The separate immutable bucket allocator does not use these shard sidecars or
+snapshot reconciliation. Bucket mode continues to reject snapshot restore.
+
+Checkpoint and WAL corruption, missing sidecars, cluster-identity mismatches,
+or incompatible shard layouts fail closed. Directories created by versions
+that only contain `.data` files cannot be upgraded in place because those versions did
+not record the allocator's raw reservation boundaries; use an empty DFS root
+when enabling metadata recovery.
 
 The client owns the DFS data plane. `DistributedStorageBackend` validates the
 descriptor and delegates positional I/O to either `PosixFsAdapter` or
