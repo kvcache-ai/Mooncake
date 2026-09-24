@@ -6,10 +6,7 @@
 #include <chrono>
 #include <thread>
 
-#include "etcd_helper.h"
-#ifdef STORE_USE_ETCD
-#include "ha/kv/etcd_ha_kv_backend.h"
-#endif
+#include "ha/kv/ha_kv_backend_factory.h"
 #include "ha_metric_manager.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_batch_standby_reader.h"
@@ -118,21 +115,24 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         // Injected test backends exercise the production Start/replication
         // path without a live etcd cluster (and without STORE_USE_ETCD).
         if (!catch_up_batch_kv_backend_for_testing_) {
-#ifdef STORE_USE_ETCD
-            ErrorCode err =
-                EtcdHelper::ConnectToEtcdStoreClient(oplog_endpoints.c_str());
-            if (err != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to connect to etcd: " << oplog_endpoints;
+            ha::HABackendSpec spec;
+            spec.type = oplog_backend_type_;
+            spec.connstring = oplog_endpoints;
+            spec.cluster_namespace = cluster_id;
+            auto backend = CreateHaKvBackend(spec);
+            if (!backend) {
+                if (backend.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE) {
+                    state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                    LOG(ERROR) << "Batch-record OpLog backend is not compiled "
+                                  "in";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+                LOG(ERROR) << "Failed to open OpLog backend: "
+                           << toString(backend.error());
                 state_machine_.ProcessEvent(StandbyEvent::CONNECTION_FAILED);
-                return err;
+                return backend.error();
             }
-#else
-            // Without STORE_USE_ETCD, the following loop needs an injected
-            // test backend.
-            state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-            LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
-            return ErrorCode::INTERNAL_ERROR;
-#endif
+            batch_standby_kv_backend_ = std::move(backend.value());
         }
     }
 
@@ -315,14 +315,10 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
     (void)baseline_seq_id;
     if (catch_up_batch_kv_backend_for_testing_) {
         batch_standby_kv_backend_ = catch_up_batch_kv_backend_for_testing_;
-    } else {
-#ifdef STORE_USE_ETCD
-        batch_standby_kv_backend_ = std::make_shared<EtcdHaKvBackend>();
-#else
+    } else if (!batch_standby_kv_backend_) {
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-        LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
+        LOG(ERROR) << "Batch-record OpLog backend was not opened";
         return ErrorCode::INTERNAL_ERROR;
-#endif
     }
     batch_standby_reader_ = std::make_unique<OpLogBatchStandbyReader>(
         cluster_id_, *batch_standby_kv_backend_, *oplog_applier_);
@@ -381,6 +377,10 @@ void HotStandbyService::NotifySyncStatus() {
 void HotStandbyService::SetCatchUpBatchKvBackendForTesting(
     std::shared_ptr<HaKvBackend> backend) {
     catch_up_batch_kv_backend_for_testing_ = std::move(backend);
+}
+
+void HotStandbyService::SetOpLogBackendType(ha::HABackendType type) {
+    oplog_backend_type_ = type;
 }
 
 void HotStandbyService::StopReplicationLoop() {
@@ -542,14 +542,24 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
         return FinalCatchUpBatchRecordsLocked(
             *catch_up_batch_kv_backend_for_testing_, policy);
     }
+    if (batch_standby_kv_backend_) {
+        return FinalCatchUpBatchRecordsLocked(*batch_standby_kv_backend_,
+                                              policy);
+    }
 
-#ifdef STORE_USE_ETCD
-    EtcdHaKvBackend batch_backend;
-    return FinalCatchUpBatchRecordsLocked(batch_backend, policy);
-#else
-    LOG(ERROR) << "Final OpLog catch-up requires STORE_USE_ETCD";
-    return ErrorCode::INTERNAL_ERROR;
-#endif
+    ha::HABackendSpec spec;
+    spec.type = oplog_backend_type_;
+    spec.connstring = oplog_endpoints_;
+    spec.cluster_namespace = cluster_id_;
+    auto backend = CreateHaKvBackend(spec);
+    if (!backend) {
+        LOG(ERROR) << "Final OpLog catch-up failed to open backend: "
+                   << toString(backend.error());
+        return backend.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE
+                   ? ErrorCode::INTERNAL_ERROR
+                   : backend.error();
+    }
+    return FinalCatchUpBatchRecordsLocked(*backend.value(), policy);
 }
 
 ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(

@@ -39,10 +39,8 @@
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
-#ifdef STORE_USE_ETCD
-#include "etcd_helper.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
-#endif
+#include "ha/ha_types.h"
+#include "ha/kv/ha_kv_backend_factory.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
@@ -214,7 +212,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
       enable_oplog_(config.enable_ha && config.enable_oplog &&
-                    config.ha_backend_type == "etcd"),
+                    ha::HaBackendSupportsOpLog(config.ha_backend_type)),
       weight_management_mutations_enabled_(
           !enable_oplog_ ||
           config.weight_management_oplog_capability_confirmed),
@@ -462,24 +460,30 @@ MasterService::MasterService(const MasterServiceConfig& config)
     kv_track_tenant_epochs_ = KvEventsEnabled();
 
     if (enable_oplog_ && !cluster_id_.empty()) {
-#ifdef STORE_USE_ETCD
         if (config.ha_backend_connstring.empty()) {
             LOG(INFO) << "Skipping automatic batch-record OpLog writer "
                          "initialization; no HA backend connstring configured";
         } else {
-            ErrorCode connect_err = EtcdHelper::ConnectToEtcdStoreClient(
-                config.ha_backend_connstring.c_str());
-            if (connect_err != ErrorCode::OK) {
-                throw std::runtime_error(fmt::format(
-                    "failed to connect HA batch-record OpLog writer to etcd: "
-                    "{}",
-                    toString(connect_err)));
+            auto backend_type = ha::ParseHABackendType(config.ha_backend_type);
+            if (!backend_type.has_value()) {
+                throw std::runtime_error(
+                    "failed to create HA batch-record OpLog writer: invalid "
+                    "HA backend");
             }
-            auto backend = std::make_shared<EtcdHaKvBackend>();
+            auto backend = CreateHaKvBackend(ha::HABackendSpec{
+                .type = backend_type.value(),
+                .connstring = config.ha_backend_connstring,
+                .cluster_namespace = cluster_id_,
+            });
+            if (!backend) {
+                throw std::runtime_error(fmt::format(
+                    "failed to create HA batch-record OpLog writer: {}",
+                    toString(backend.error())));
+            }
             // Direct MasterService construction has no leadership session;
             // supervisor-created services carry a non-zero acquired view.
             ErrorCode err = InitializeBatchOpLogWriter(
-                std::move(backend),
+                std::move(backend.value()),
                 /*require_fenced_writer=*/view_version_ > 0);
             if (err != ErrorCode::OK) {
                 throw std::runtime_error(fmt::format(
@@ -487,16 +491,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
                     toString(err)));
             }
         }
-#else
-        if (config.ha_backend_connstring.empty()) {
-            LOG(INFO) << "Skipping automatic batch-record OpLog writer "
-                         "initialization; no HA backend connstring configured";
-        } else {
-            throw std::runtime_error(
-                "failed to create HA batch-record OpLog writer: ETCD support "
-                "not compiled in");
-        }
-#endif
     }
 
     // This worker is part of the Client lifecycle protocol. Start it before

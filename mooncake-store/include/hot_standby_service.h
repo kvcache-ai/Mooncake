@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "ha/ha_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
@@ -215,6 +216,10 @@ class HotStandbyService {
     void SetCatchUpBatchKvBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
 
+    // Selects the durable OpLog backend opened by Start(). Defaults to etcd so
+    // existing callers keep the previous connection path.
+    void SetOpLogBackendType(ha::HABackendType type);
+
     /**
      * @brief Get current state from state machine
      */
@@ -286,6 +291,7 @@ class HotStandbyService {
     // Configuration for OpLog sync
     std::string oplog_endpoints_;
     std::string cluster_id_;
+    ha::HABackendType oplog_backend_type_{ha::HABackendType::ETCD};
 
     // Replication state
     std::atomic<uint64_t> applied_seq_id_{0};
