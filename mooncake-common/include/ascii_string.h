@@ -22,24 +22,27 @@ inline std::string_view TrimAsciiWhitespace(std::string_view value) {
     return value;
 }
 
-// Split a comma-separated list, trimming whitespace around each entry and
-// dropping empty ones. Used to expand multi-disk configuration values such as
-// FileStorageConfig::storage_filepath.
+// Split a `delimiter`-separated list, trimming ASCII whitespace around each
+// entry. Empty entries are dropped unless `keep_empty` is set, which a
+// positionally aligned list needs so that a missing entry can be rejected
+// instead of shifting every later entry onto its neighbour.
 // The returned views alias `value`, so they outlive the call only as long as
 // the buffer behind `value` does: never pass a temporary std::string here.
-inline std::vector<std::string_view> SplitCommaList(std::string_view value) {
+inline std::vector<std::string_view> SplitAsciiList(std::string_view value,
+                                                    char delimiter,
+                                                    bool keep_empty = false) {
     std::vector<std::string_view> entries;
     while (true) {
-        const size_t comma = value.find(',');
+        const size_t pos = value.find(delimiter);
         const std::string_view token =
-            TrimAsciiWhitespace(value.substr(0, comma));
-        if (!token.empty()) {
+            TrimAsciiWhitespace(value.substr(0, pos));
+        if (keep_empty || !token.empty()) {
             entries.push_back(token);
         }
-        if (comma == std::string_view::npos) {
+        if (pos == std::string_view::npos) {
             break;
         }
-        value.remove_prefix(comma + 1);
+        value.remove_prefix(pos + 1);
     }
     return entries;
 }
