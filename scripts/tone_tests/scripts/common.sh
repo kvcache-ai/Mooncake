@@ -307,7 +307,7 @@ docker_launch(){
         # Reuse SGLang CI's single source of truth for the git-only evaluator
         # pin instead of duplicating the commit here.
         pip_cmd=$(append_str "${pip_cmd}" \
-            'source /sgl-workspace/sglang/scripts/ci/utils/sgl_eval_ref.sh && pip install "$SGL_EVAL_SPEC"')
+            'pip install sgl-eval==0.1.0')
     fi
 
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then

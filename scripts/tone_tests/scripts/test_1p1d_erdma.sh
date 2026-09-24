@@ -28,7 +28,7 @@ start_server()
         mode_name=decode
     fi
 
-    local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}"
+    local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-6} --mem-fraction-static 0.70"
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
         extra_args="${extra_args} --disaggregation-ib-device=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
     fi

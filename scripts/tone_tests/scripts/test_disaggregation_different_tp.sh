@@ -45,7 +45,15 @@ run_test()
         ${docker_exec} "\
             cd /sgl-workspace/sglang/test/registered/disaggregation && \
             sed -i '0,/^class /s|^class |DEFAULT_MODEL_NAME_FOR_TEST_MLA = \"deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct\"\nDEFAULT_MODEL_NAME_FOR_TEST = \"meta-llama/Llama-3.2-3B-Instruct\"\n&|' test_disaggregation_different_tp.py && \
-            echo 'Model override applied successfully' && \
+            sed -i '/def start_decode(cls):/,/cls\\.process_decode =/ {
+            /base-gpu-id/ {
+                n
+                a\\
+            \"--mem-fraction-static\",\\
+            \"0.70\",
+            }
+        }' test_disaggregation_different_tp.py && \
+	    echo 'Model and memory override applied successfully' && \
             ${offline_prefix}python3 -m pytest test_disaggregation_different_tp.py -v -s --tb=long"
     } 2>&1 | tee "$log_file"
 
