@@ -37,6 +37,11 @@ struct OpLogBatchRecord {
 bool ValidateOpLogBatchRecordShape(const OpLogBatchRecord& batch,
                                    std::string* reason = nullptr);
 
+// Canonical logical batch checksum. It is the checksum the JSON writer records
+// and that every reader verifies, so both physical encodings of the same
+// logical batch agree on this value.
+uint32_t ComputeOpLogBatchRecordChecksum(const OpLogBatchRecord& batch);
+
 bool ValidateOpLogBatchEntry(const OpLogEntry& entry,
                              std::string* reason = nullptr);
 

@@ -435,9 +435,29 @@ add_ha_test(hot_standby_snapshot_bootstrap_test
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
 add_ha_test(oplog_types_test ha/oplog/oplog_types_test.cpp)
 add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
+add_ha_test(oplog_batch_dual_codec_test
+            ha/oplog/oplog_batch_dual_codec_test.cpp)
 add_ha_test(oplog_batch_standby_reader_test
             ha/oplog/oplog_batch_standby_reader_test.cpp)
 add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
+
+# Measurement harness for the P02 reader. It is intentionally not registered
+# with CTest: it is a developer/measurement tool, not a pass/fail regression.
+add_executable(oplog_batch_reader_bench ha/oplog/oplog_batch_reader_bench.cpp)
+target_include_directories(oplog_batch_reader_bench
+                           PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
+target_link_libraries(
+  oplog_batch_reader_bench
+  PUBLIC mooncake_store
+         transfer_engine
+         cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB}
+         glog::glog
+         gflags::gflags
+         gtest
+         gtest_main
+         ibverbs
+         pthread)
 if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(ha_metric_manager_test
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
