@@ -932,24 +932,33 @@ Status RdmaTransport::submitTransferTask(
         }
 
         auto request_buffer_id = -1, request_device_id = -1;
+        // Default: one local HCA for the whole request (historical).
+        // Strict dest affinity: pick a local HCA per slice so a multi-slice
+        // transfer can stripe across rails, then pair the peer by name.
+        const bool pin_local_device =
+            !globalConfig().enable_strict_dest_device_affinity;
         const int local_hint_device_id =
-            last_local_device_buffer_id == last_local_buffer_id
+            pin_local_device &&
+                    last_local_device_buffer_id == last_local_buffer_id
                 ? last_local_device_id
                 : -1;
-        if (local_device_cache.select(
-                local_segment_desc, (uint64_t)request.source, request.length,
-                request_buffer_id, request_device_id, [&] {
-                    return selectDevice(
-                        local_segment_desc.get(), (uint64_t)request.source,
-                        request.length, request_buffer_id, request_device_id, 0,
-                        last_local_buffer_id, local_hint_device_id);
-                })) {
-            request_buffer_id = -1;
-            request_device_id = -1;
-        } else {
-            last_local_buffer_id = request_buffer_id;
-            last_local_device_id = request_device_id;
-            last_local_device_buffer_id = request_buffer_id;
+        if (pin_local_device) {
+            if (local_device_cache.select(
+                    local_segment_desc, (uint64_t)request.source,
+                    request.length, request_buffer_id, request_device_id, [&] {
+                        return selectDevice(
+                            local_segment_desc.get(), (uint64_t)request.source,
+                            request.length, request_buffer_id,
+                            request_device_id, 0, last_local_buffer_id,
+                            local_hint_device_id);
+                    })) {
+                request_buffer_id = -1;
+                request_device_id = -1;
+            } else {
+                last_local_buffer_id = request_buffer_id;
+                last_local_device_id = request_device_id;
+                last_local_device_buffer_id = request_buffer_id;
+            }
         }
 
         SliceLengthCalculator slice_calc{request,
@@ -984,7 +993,8 @@ Status RdmaTransport::submitTransferTask(
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
-            if (request_buffer_id >= 0 && request_device_id >= 0) {
+            if (pin_local_device && request_buffer_id >= 0 &&
+                request_device_id >= 0) {
                 auto &request_context = context_list_[request_device_id];
                 if (request_context && request_context->active()) {
                     found_device = true;
@@ -994,7 +1004,8 @@ Status RdmaTransport::submitTransferTask(
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 const int slice_hint_device_id =
-                    last_local_device_buffer_id == last_local_buffer_id
+                    pin_local_device &&
+                            last_local_device_buffer_id == last_local_buffer_id
                         ? last_local_device_id
                         : -1;
                 if (selectDevice(local_segment_desc.get(),
@@ -1338,8 +1349,11 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
         int selected = -1;
         // Consecutive hits in the same offset-independent MR (typical GPU
         // "cuda:N" buffers) keep the previous topology pick. retry_count > 0
-        // is a failover walk and must re-run selectDevice.
+        // is a failover walk and must re-run selectDevice. Strict rail
+        // affinity needs a fresh local HCA per slice so a request can use
+        // more than one rail.
         if (allow_device_reuse && retry_count == 0 && hint_device_id >= 0 &&
+            !globalConfig().enable_strict_dest_device_affinity &&
             buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0) {
             const size_t nkeys =
                 by_local_hca ? buffer.lkey.size() : buffer.rkey.size();

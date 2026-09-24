@@ -723,6 +723,13 @@ int Topology::selectDevice(const std::string storage_type,
         if (hca_idx != -1) {
             return hca_idx;
         }
+        // Soft DEST_DEVICE_AFFINITY prefers the same name then falls
+        // back. Strict mode is for rail-isolated fabrics where a
+        // mismatched pair is not reachable (IBV_WC_RETRY_EXC_ERR; see
+        // issues #35 and #1450).
+        if (globalConfig().enable_strict_dest_device_affinity) {
+            return ERR_DEVICE_NOT_FOUND;
+        }
     }
 
     return selectDevice(storage_type, retry_count);
@@ -774,6 +781,18 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
             tl_counter = (tl_counter + 1) % 10000;
         } else
             rand_value = SimpleRandom::Get().next();
+        if (globalConfig().enable_strict_dest_device_affinity) {
+            // When the caller asked for matched-pair striping, round-robin
+            // every HCA listed for this location, not only NUMA-preferred.
+            // retry_count==0 otherwise never leaves preferred_hca.
+            const size_t npref = entry.preferred_hca.size();
+            const size_t navail = entry.avail_hca.size();
+            const size_t nall = npref + navail;
+            if (nall == 0) return ERR_DEVICE_NOT_FOUND;
+            const size_t idx = static_cast<size_t>(rand_value) % nall;
+            if (idx < npref) return entry.preferred_hca[idx];
+            return entry.avail_hca[idx - npref];
+        }
         if (!entry.preferred_hca.empty())
             return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
         else
