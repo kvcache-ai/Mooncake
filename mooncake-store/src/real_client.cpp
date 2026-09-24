@@ -4645,7 +4645,7 @@ RealClient::get_into_ranges_internal(
 
     // Planning may consume most of a short lease; renew before submission.
     if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
-    auto operation = client_->SubmitScatter(memory_transfers);
+    auto operation = client_->SubmitScatterNative(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =
             Status::InvalidArgument("TransferSubmitter not initialized");
