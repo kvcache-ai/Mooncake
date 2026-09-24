@@ -1,34 +1,29 @@
 #pragma once
 
-// Tenant: one tenant's metadata state — the object route, the group table, the
-// in-flight replica-action leases, the promotion-candidate index and the bound
-// quota account.
+// Tenant: one tenant's object route and the lifecycle of its groups, plus the
+// quota account it was built with. Replica-action leases and promotion
+// candidates belong to their own subsystems, which validate what they hold
+// against the entry the route publishes before acting on it.
 //
 // Identity is the entry handle: an entry stands for exactly one publication, so
-// `EraseObjectIf` recognises an object by the handle a caller holds. Mutating a
-// published object goes through `WithPublishedObject`, which re-checks that
-// under the entry lock, and `RemoveObject` drops what a key carries — group
-// membership, replica-action leases, the promotion-candidate index entry.
+// `RemoveObject` recognises an object by the handle a caller holds and drops
+// its group membership with the slot. Mutating a published object goes through
+// `WithPublishedObject`, which re-checks that identity under the entry lock.
 //
 // Every method synchronizes internally. Lock order: entry lock, route lock,
-// then this tenant's indexes. Only `RemoveObject` holds the route lock across
-// those indexes, and nothing takes the route lock while holding one of them.
+// then the group table. Only `RemoveObject` holds the route lock across the
+// group table, and nothing takes the route lock while holding a group stripe.
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <memory>
-#include <mutex>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "dynamic_replication_lease_table.h"
 #include "group_index.h"
 #include "object_index.h"
 #include "tenant_quota.h"
@@ -38,6 +33,13 @@ namespace metadata {
 
 class Tenant {
    public:
+    // `quota_account` is the tenant's account in the quota table, or null when
+    // quotas are off. The registry's factory resolves it before building the
+    // tenant, and it never changes afterwards: the quota table keeps one stable
+    // account per tenant id and a policy recompute updates it in place.
+    explicit Tenant(TenantQuotaHandle quota_account = nullptr)
+        : quota_account_(quota_account) {}
+
     // Publishes `entry` on this tenant's route. The route slot and the group
     // lease are wired under the entry's own lock, so a reader that reaches the
     // entry through the route cannot observe a grouped object before its group
@@ -65,51 +67,25 @@ class Tenant {
         return object_index_.Get(key);
     }
 
-    // Erases the route slot only when it still resolves to `expected`, without
-    // touching the records that hang off the key. A publish that failed before
-    // registering anything rolls back with this; a teardown that already
-    // registered a membership uses `RemoveObject`, which drops those too.
-    [[nodiscard]] bool EraseObjectIf(
-        const std::shared_ptr<ObjectEntry>& expected) {
-        if (expected == nullptr) {
-            return false;
-        }
-        return object_index_.EraseIf(expected->key(), expected);
-    }
-
-    // Removes a torn-down object: its route slot and what the key carries
-    // (group membership, replica-action leases, the promotion-candidate index
-    // entry). Ownership and the drop happen under one hold of the route lock,
-    // so a publication that replaces this one cannot have its records dropped
-    // in between:
-    //
-    // - the slot holds `entry`: it owns the records, so they go with the slot;
-    // - the slot holds another entry: that publication owns them, so none is
-    //   touched;
-    // - the slot is empty: no publication owns them, so they go — this undoes
-    //   the records a publish registered before it failed.
-    //
-    // Returns whether the slot was erased, which a false answer does not tell
-    // apart from the case that keeps the records. Callers hold the entry's own
-    // lock, so a publication still wiring its state cannot be torn down
-    // half-registered.
+    // Removes a torn-down object: its route slot and its group membership,
+    // only while the slot still holds `entry`; false, touching nothing,
+    // otherwise. Both go under one hold of the route lock, because membership
+    // is keyed by the object key: once the slot is released, a newer
+    // publication of the same key can register the membership this teardown
+    // would drop. Callers hold the entry's own lock, so a publication still
+    // wiring its state cannot be torn down half-registered.
     [[nodiscard]] bool RemoveObject(const std::shared_ptr<ObjectEntry>& entry) {
         if (entry == nullptr) {
             return false;
         }
         return object_index_.WithExclusiveRoute([&](auto& route) {
             const auto it = route.find(entry->key());
-            if (it != route.end() && it->second != entry) {
+            if (it == route.end() || it->second != entry) {
                 return false;
             }
-            const bool erased = it != route.end();
-            if (erased) {
-                route.erase(it);
-            }
+            route.erase(it);
             UnregisterGroupMember(entry);
-            lease_table_.EraseForObject(entry->key());
-            UnindexPromotionCandidate(entry->key());
-            return erased;
+            return true;
         });
     }
 
@@ -155,16 +131,14 @@ class Tenant {
         return object_index_.SnapshotObjects();
     }
 
-    // True when the tenant holds no object, no group membership and no lease
-    // in flight.
+    // True when the tenant holds no object and no group membership.
     [[nodiscard]] bool Empty() const {
-        return object_index_.Empty() && group_index_.Empty() &&
-               lease_table_.Empty();
+        return object_index_.Empty() && group_index_.Empty();
     }
 
-    // Drops a grouped entry's membership, without touching the route slot or
-    // the leases; `RemoveObject` calls it as one step of a teardown, and
-    // rebuilding membership state calls it on its own. The group and the key
+    // Drops a grouped entry's membership, without touching the route slot;
+    // `RemoveObject` calls it as one step of a teardown, and rebuilding
+    // membership state calls it on its own. The group and the key
     // come from the entry. Callers must have established that this entry is the
     // one the route publishes, which is what keeps a teardown from dropping the
     // membership a newer publication of the same key registered.
@@ -232,85 +206,10 @@ class Tenant {
         }
     }
 
-    // --- In-flight replica-action leases ------------------------------------
-
-    // Clears the replica-action state of one object: the pending proposal, the
-    // cooldown, and the leases of its key. The caller passes the state it
-    // already holds under the entry's lock, so this joins a larger critical
-    // section rather than taking the entry lock again. `RemoveObject` is the
-    // teardown path; this is the reset path, which leaves the object routed.
-    void ResetDynamicReplicationState(
-        ObjectEntry::State& state, const std::shared_ptr<ObjectEntry>& entry) {
-        assert(entry != nullptr);
-        state.dynamic_replication_pending.reset();
-        state.dynamic_replication_cooldown = {};
-        lease_table_.EraseForObject(entry->key());
-    }
-
-    [[nodiscard]] std::optional<ReplicaActionLease> FindDynamicReplicationLease(
-        const UUID& proposal_id) const {
-        return lease_table_.Find(proposal_id);
-    }
-
-    // The entry names the object the proposal belongs to, so a proposal cannot
-    // be registered under a key that is not the entry's own.
-    void PutDynamicReplicationLease(const std::shared_ptr<ObjectEntry>& entry,
-                                    const UUID& proposal_id,
-                                    ReplicaActionLease lease) {
-        assert(entry != nullptr);
-        assert(lease.key == entry->key());
-        lease_table_.Put(proposal_id, std::move(lease));
-    }
-
-    [[nodiscard]] bool RemoveDynamicReplicationLease(const UUID& proposal_id) {
-        return lease_table_.Remove(proposal_id);
-    }
-
-    void EraseExpiredDynamicReplicationLeases(
-        std::chrono::system_clock::time_point now) {
-        lease_table_.EraseExpired(now);
-    }
-
-    // --- Promotion candidates -----------------------------------------------
-    // Sparse index of the keys whose entry carries a promotion candidate. The
-    // entry's own state stays the source of truth; this only lets the retry
-    // loop enumerate candidates without walking the whole route.
-
-    // `key` names the object whose candidate this is. A stale caller cannot
-    // unindex a newer publication's candidate: `RemoveObject` only reaches the
-    // index after it has established that the entry it is unwinding is the one
-    // the route publishes.
-    void IndexPromotionCandidate(const std::string& key) {
-        std::lock_guard<std::mutex> lock(promotion_candidate_keys_mutex_);
-        promotion_candidate_keys_.insert(key);
-    }
-
-    void UnindexPromotionCandidate(const std::string& key) {
-        std::lock_guard<std::mutex> lock(promotion_candidate_keys_mutex_);
-        promotion_candidate_keys_.erase(key);
-    }
-
-    [[nodiscard]] std::vector<std::string> PromotionCandidateKeys() const {
-        std::lock_guard<std::mutex> lock(promotion_candidate_keys_mutex_);
-        std::vector<std::string> keys;
-        keys.reserve(promotion_candidate_keys_.size());
-        for (const auto& candidate : promotion_candidate_keys_) {
-            keys.push_back(candidate);
-        }
-        return keys;
-    }
-
     // --- Quota account -------------------------------------------------------
-    // The bound account is read on every object operation and rebound when the
-    // quota policy is recomputed, so the handle is atomic: a recompute can run
-    // while other threads are charging against the bound account.
 
-    void BindQuotaAccount(TenantQuotaHandle handle) {
-        quota_account_.store(handle, std::memory_order_release);
-    }
-
-    [[nodiscard]] TenantQuotaHandle BoundQuotaAccount() const {
-        return quota_account_.load(std::memory_order_acquire);
+    [[nodiscard]] TenantQuotaHandle QuotaAccount() const {
+        return quota_account_;
     }
 
    private:
@@ -321,15 +220,8 @@ class Tenant {
     // Group membership and the one shared Lease per group.
     GroupIndex group_index_;
 
-    // The replica-action leases still in flight for this tenant.
-    DynamicReplicationLeaseTable lease_table_;
-
-    // The tenant's quota account, rebound when the quota policy is recomputed.
-    std::atomic<TenantQuotaHandle> quota_account_{nullptr};
-
-    mutable std::mutex promotion_candidate_keys_mutex_;
-    // The keys whose published object carries a promotion candidate.
-    std::unordered_set<std::string> promotion_candidate_keys_;
+    // The tenant's quota account, fixed at construction.
+    const TenantQuotaHandle quota_account_;
 };
 
 }  // namespace metadata

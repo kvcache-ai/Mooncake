@@ -1,6 +1,6 @@
 #pragma once
 
-// The in-flight replica-action leases for one tenant, keyed by proposal id.
+// The in-flight replica-action leases, keyed by proposal id.
 //
 // A proposal is not an object: the client asks for a replica to be added or
 // removed, the master answers with a lease that the client must act inside, and
@@ -12,9 +12,10 @@
 // id finds a lease, the object key finds the proposals in flight for it, and a
 // deadline heap orders the expiry sweep.
 //
-// Which publication a retracted proposal belonged to is settled by the caller
-// (see Tenant::RemoveObject) before it reaches this table, so the table keeps
-// no identity of its own.
+// Which publication a proposal belongs to is not recorded here: the replication
+// subsystem that owns the table checks a lease against the entry the tenant's
+// route publishes before acting on it, so the table keeps no identity of its
+// own.
 
 #include <cassert>
 #include <chrono>

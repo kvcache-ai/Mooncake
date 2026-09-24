@@ -2,7 +2,8 @@
 #include "object_test_helpers.h"
 
 #include <algorithm>
-#include <chrono>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
@@ -29,15 +30,22 @@ bool IsProcessing(const std::shared_ptr<ObjectEntry>& entry) {
         });
 }
 
-// A replica-action lease for the entry's key and the given proposal, so it can
-// be registered against the entry without tripping either check.
-ReplicaActionLease LeaseFor(const std::shared_ptr<ObjectEntry>& entry,
-                            const UUID& proposal_id) {
-    ReplicaActionLease lease;
-    lease.proposal_id = proposal_id;
-    lease.lease_id = proposal_id;
-    lease.key = entry->key();
-    return lease;
+enum class TearDownResult { kRemoved, kAlreadyClaimed, kLostSlot };
+
+// Tears `entry` down the way a caller must: claim it under its own lock, then
+// remove it while still holding that lock. A claimed entry is still routed, so
+// failing to remove it (`kLostSlot`) means the route lost track of it.
+TearDownResult TearDownObject(Tenant& tenant,
+                              const std::shared_ptr<ObjectEntry>& entry) {
+    return entry->WithExclusiveAccess(
+        [&](ObjectMetadata&, ObjectEntry::State& state) {
+            if (state.is_torn_down) {
+                return TearDownResult::kAlreadyClaimed;
+            }
+            state.is_torn_down = true;
+            return tenant.RemoveObject(entry) ? TearDownResult::kRemoved
+                                              : TearDownResult::kLostSlot;
+        });
 }
 
 TEST(TenantTest, InsertObjectWiresTheGroupLeaseAndJoinsTheGroup) {
@@ -89,42 +97,22 @@ TEST(TenantTest, InsertObjectRejectsAKeyThatIsAlreadyRouted) {
     EXPECT_TRUE(tenant.GroupMembers("g2").empty());
 }
 
-TEST(TenantTest, EraseObjectIfHonoursTheEntryIdentity) {
-    Tenant tenant;
-    auto entry = test::MakeObjectEntry("k1", "");
-    ASSERT_TRUE(tenant.InsertObject(entry));
-    EXPECT_EQ(tenant.Get("k1"), entry);
-
-    // A different handle for the same key does not erase the routed entry.
-    EXPECT_FALSE(tenant.EraseObjectIf(test::MakeObjectEntry("k1")));
-    EXPECT_TRUE(tenant.ContainsObject("k1"));
-
-    EXPECT_TRUE(tenant.EraseObjectIf(entry));
-    EXPECT_FALSE(tenant.ContainsObject("k1"));
-    EXPECT_EQ(tenant.Get("k1"), nullptr);
-    EXPECT_FALSE(tenant.EraseObjectIf(entry));
-}
-
-TEST(TenantTest, RemoveObjectDropsEveryRecordOfTheEntryTheSlotHolds) {
+TEST(TenantTest, RemoveObjectDropsTheSlotAndTheMembershipTogether) {
     Tenant tenant;
     auto entry = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(entry));
-    tenant.PutDynamicReplicationLease(entry, UUID{7, 8},
-                                      LeaseFor(entry, UUID{7, 8}));
-    tenant.IndexPromotionCandidate("k1");
     ASSERT_FALSE(tenant.Empty());
-    ASSERT_EQ(tenant.PromotionCandidateKeys().size(), 1u);
 
-    // The slot names this entry, so every record the key carries is its own and
-    // a teardown drops all of them in one call: the group membership, the
-    // leases still in flight, the candidate index entry and the slot itself.
+    // The slot names this entry, so the membership is its own and a teardown
+    // drops both in one call.
     EXPECT_TRUE(tenant.RemoveObject(entry));
 
     EXPECT_FALSE(tenant.ContainsObject("k1"));
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
-    EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
-    EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());
     EXPECT_TRUE(tenant.Empty());
+
+    // The slot is gone, so a repeated teardown has nothing left to take.
+    EXPECT_FALSE(tenant.RemoveObject(entry));
 }
 
 TEST(TenantTest, RemoveObjectRequiresTheEntryStillOnTheRoute) {
@@ -146,30 +134,22 @@ TEST(TenantTest, RemoveObjectRequiresTheEntryStillOnTheRoute) {
     EXPECT_FALSE(tenant.RemoveObject(std::shared_ptr<ObjectEntry>{}));
 }
 
-TEST(TenantTest, RemoveObjectLeavesAReplacementAndItsRecordsUntouched) {
+TEST(TenantTest, RemoveObjectLeavesAReplacementAndItsMembershipUntouched) {
     Tenant tenant;
     auto first = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(first));
-    tenant.PutDynamicReplicationLease(first, UUID{7, 8},
-                                      LeaseFor(first, UUID{7, 8}));
     ASSERT_TRUE(tenant.RemoveObject(first));
 
     auto second = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(second));
     const auto second_lease = LeaseOf(second);
     ASSERT_NE(second_lease, nullptr);
-    tenant.PutDynamicReplicationLease(second, UUID{9, 10},
-                                      LeaseFor(second, UUID{9, 10}));
-    tenant.IndexPromotionCandidate("k1");
 
     // The slot holds a newer publication of the same key, so the older handle
-    // owns none of the records under it: the membership, the lease and the
-    // candidate index entry the newer object registered all stay.
+    // owns nothing under it: the membership the newer object registered stays.
     EXPECT_FALSE(tenant.RemoveObject(first));
     EXPECT_EQ(tenant.Get("k1"), second);
     EXPECT_EQ(tenant.GroupMembers("g1").size(), 1u);
-    EXPECT_TRUE(tenant.FindDynamicReplicationLease(UUID{9, 10}).has_value());
-    EXPECT_EQ(tenant.PromotionCandidateKeys().size(), 1u);
     EXPECT_EQ(LeaseOf(second).get(), second_lease.get());
 }
 
@@ -278,83 +258,153 @@ TEST(TenantTest, AGroupKeepsOneLeaseAcrossReplacementOfItsKeys) {
     EXPECT_NE(LeaseOf(late).get(), group_lease.get());
 }
 
-TEST(TenantTest, RemoveObjectClearsRecordsUnderAKeyWhoseSlotIsGone) {
+TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
+    // Two keys of one group are published and torn down over and over, while
+    // other threads tear down whatever handle they resolve, mutate the
+    // published entry and watch both keys at once. Every teardown follows the
+    // caller protocol (`TearDownObject`), which is what the route relies on.
     Tenant tenant;
-    auto entry = test::MakeObjectEntry("k1", "g1");
-    ASSERT_TRUE(tenant.InsertObject(entry));
-    tenant.PutDynamicReplicationLease(entry, UUID{7, 8},
-                                      LeaseFor(entry, UUID{7, 8}));
-    tenant.IndexPromotionCandidate("k1");
-    ASSERT_FALSE(tenant.Empty());
+    const std::vector<std::string> keys = {"k1", "k2"};
+    constexpr int kWriters = 4;
+    constexpr int kWriterRounds = 20000;
 
-    // What a publish that failed after taking the slot leaves behind: the slot
-    // is rolled back, the membership, the lease and the candidate index entry
-    // it registered are not. Nothing is routed under the key, so no newer
-    // publication owns those records and the teardown still clears them.
-    ASSERT_TRUE(tenant.EraseObjectIf(entry));
-    EXPECT_FALSE(tenant.RemoveObject(entry));
-    EXPECT_FALSE(tenant.ContainsObject("k1"));
-    EXPECT_TRUE(tenant.GroupMembers("g1").empty());
-    EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
-    EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());
-    EXPECT_TRUE(tenant.Empty());
-}
+    std::atomic<bool> writers_done{false};
+    std::atomic<int> violations{0};
+    std::atomic<uint64_t> published{0};
+    std::atomic<uint64_t> torn_down_by_others{0};
+    std::atomic<uint64_t> mutations{0};
+    std::atomic<uint64_t> pairs_observed{0};
+    const auto violation = [&] {
+        violations.fetch_add(1, std::memory_order_relaxed);
+    };
+    const auto is_member = [&](const std::string& key) {
+        const auto members = tenant.GroupMembers("g1");
+        return std::find(members.begin(), members.end(), key) != members.end();
+    };
 
-TEST(TenantTest, AGroupSurvivesConcurrentReplacementOfItsKeys) {
-    Tenant tenant;
-    constexpr int kWriterRounds = 2000;
-
-    // Writers publish both keys of one group and tear their own publication
-    // down, so a teardown of one publication runs while another publication of
-    // the same group is registered.
-    //
-    // Nothing is asserted while they run: a reader cannot tell which group
-    // instance a listed member belongs to, because the listing and the handle
-    // it resolves can straddle a group being dropped and rebuilt, and the two
-    // members then legitimately carry the lease of different instances. What a
-    // broken race leaves behind is a resting state instead — a member record
-    // dropped for an object that is still routed, a group dropped with members,
-    // a lease lost — so it is checked once the writers are done and no one is
-    // publishing.
-    std::vector<std::thread> writers;
-    for (int i = 0; i < 4; ++i) {
-        writers.emplace_back([&] {
+    std::vector<std::thread> threads;
+    // Writers publish a fresh entry and tear their own down, unless another
+    // thread got to it first.
+    for (int w = 0; w < kWriters; ++w) {
+        threads.emplace_back([&, w] {
             for (int round = 0; round < kWriterRounds; ++round) {
-                const std::string key = (round % 2 == 0) ? "k1" : "k2";
-                auto entry = test::MakeObjectEntry(key, "g1");
-                if (tenant.InsertObject(entry)) {
-                    tenant.PutDynamicReplicationLease(
-                        entry, UUID{7, 8}, LeaseFor(entry, UUID{7, 8}));
+                auto entry = test::MakeObjectEntry(keys[(round + w) % 2], "g1");
+                if (!tenant.InsertObject(entry)) {
+                    continue;
                 }
-                (void)tenant.RemoveObject(entry);
+                published.fetch_add(1, std::memory_order_relaxed);
+                if (TearDownObject(tenant, entry) ==
+                    TearDownResult::kLostSlot) {
+                    violation();
+                }
             }
         });
     }
-    for (auto& writer : writers) {
-        writer.join();
+    // Stale removers tear down whatever the route hands them, which may be an
+    // entry a writer is still wiring or has just torn down itself.
+    for (int r = 0; r < 2; ++r) {
+        threads.emplace_back([&, r] {
+            for (uint64_t i = r; !writers_done.load(std::memory_order_relaxed);
+                 ++i) {
+                const auto entry = tenant.Get(keys[i % 2]);
+                if (entry == nullptr) {
+                    continue;
+                }
+                switch (TearDownObject(tenant, entry)) {
+                    case TearDownResult::kRemoved:
+                        torn_down_by_others.fetch_add(
+                            1, std::memory_order_relaxed);
+                        break;
+                    case TearDownResult::kLostSlot:
+                        violation();
+                        break;
+                    case TearDownResult::kAlreadyClaimed:
+                        break;
+                }
+            }
+        });
+    }
+    // Mutators only ever run on the published, live entry, and that entry is a
+    // member of its group for as long as they hold its lock.
+    for (int m = 0; m < 2; ++m) {
+        threads.emplace_back([&, m] {
+            for (uint64_t i = m; !writers_done.load(std::memory_order_relaxed);
+                 ++i) {
+                const std::string& key = keys[i % 2];
+                (void)tenant.WithPublishedObject(
+                    key, [&](ObjectMetadata&, ObjectEntry::State& state) {
+                        mutations.fetch_add(1, std::memory_order_relaxed);
+                        if (state.is_torn_down || !is_member(key)) {
+                            violation();
+                        }
+                        state.is_processing = !state.is_processing;
+                    });
+            }
+        });
+    }
+    // An observer holds both keys at once (always k1 before k2, and no other
+    // thread holds two entry locks). Two live members of one group joined the
+    // same group instance, so they carry one lease; a publication observed
+    // half-wired would carry the lease it was constructed with instead.
+    threads.emplace_back([&] {
+        while (!writers_done.load(std::memory_order_relaxed)) {
+            const auto first = tenant.Get("k1");
+            const auto second = tenant.Get("k2");
+            if (first == nullptr || second == nullptr) {
+                continue;
+            }
+            first->WithSharedAccess([&](const ObjectMetadata& first_metadata,
+                                        const ObjectEntry::State& first_state) {
+                second->WithSharedAccess(
+                    [&](const ObjectMetadata& second_metadata,
+                        const ObjectEntry::State& second_state) {
+                        if (first_state.is_torn_down ||
+                            second_state.is_torn_down) {
+                            return;
+                        }
+                        pairs_observed.fetch_add(1, std::memory_order_relaxed);
+                        if (first_metadata.lease_ != second_metadata.lease_ ||
+                            !is_member("k1") || !is_member("k2")) {
+                            violation();
+                        }
+                    });
+            });
+        }
+    });
+
+    for (int w = 0; w < kWriters; ++w) {
+        threads[w].join();
+    }
+    writers_done.store(true, std::memory_order_relaxed);
+    for (size_t t = kWriters; t < threads.size(); ++t) {
+        threads[t].join();
     }
 
-    // Whatever is routed now has to agree with the group table, and one group
-    // has to hold one lease.
-    std::shared_ptr<Lease> group_lease;
+    EXPECT_EQ(violations.load(), 0);
+    // Every racing path actually ran, so the run was not trivially quiet.
+    EXPECT_GT(published.load(), 0u);
+    EXPECT_GT(torn_down_by_others.load(), 0u);
+    EXPECT_GT(mutations.load(), 0u);
+    EXPECT_GT(pairs_observed.load(), 0u);
+
+    // At rest, the group lists exactly the keys that are routed: no member
+    // outlived its object, and no routed object lost its membership.
+    std::vector<std::string> routed;
     for (const auto& entry : tenant.SnapshotObjects()) {
-        const std::string& group_id = entry->group_id();
-        ASSERT_FALSE(group_id.empty());
-        const auto members = tenant.GroupMembers(group_id);
-        EXPECT_NE(std::find(members.begin(), members.end(), entry->key()),
-                  members.end());
-        auto lease = LeaseOf(entry);
-        ASSERT_NE(lease, nullptr);
-        if (group_lease == nullptr) {
-            group_lease = std::move(lease);
-        } else {
-            EXPECT_EQ(group_lease.get(), lease.get());
-        }
+        routed.push_back(entry->key());
+    }
+    auto members = tenant.GroupMembers("g1");
+    std::sort(routed.begin(), routed.end());
+    std::sort(members.begin(), members.end());
+    EXPECT_EQ(members, routed);
+
+    for (const auto& entry : tenant.SnapshotObjects()) {
+        EXPECT_EQ(TearDownObject(tenant, entry), TearDownResult::kRemoved);
     }
     EXPECT_TRUE(tenant.Empty());
 }
 
-TEST(TenantTest, EmptyTracksObjectsGroupsAndLeases) {
+TEST(TenantTest, EmptyTracksObjectsAndGroups) {
     Tenant tenant;
     EXPECT_TRUE(tenant.Empty());
 
@@ -362,20 +412,10 @@ TEST(TenantTest, EmptyTracksObjectsGroupsAndLeases) {
     ASSERT_TRUE(tenant.InsertObject(grouped));
     EXPECT_FALSE(tenant.Empty());
 
-    // Erasing the route slot leaves the membership behind, so the tenant is
-    // still non-empty until that is dropped too.
-    ASSERT_TRUE(tenant.EraseObjectIf(grouped));
-    EXPECT_FALSE(tenant.Empty());
-    tenant.UnregisterGroupMember(grouped);
+    // Removing the object drops its membership with the slot.
+    ASSERT_TRUE(tenant.RemoveObject(grouped));
     EXPECT_TRUE(tenant.Empty());
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
-
-    // A lease in flight is state of its own.
-    tenant.PutDynamicReplicationLease(grouped, UUID{7, 8},
-                                      LeaseFor(grouped, UUID{7, 8}));
-    EXPECT_FALSE(tenant.Empty());
-    EXPECT_TRUE(tenant.RemoveDynamicReplicationLease(UUID{7, 8}));
-    EXPECT_TRUE(tenant.Empty());
 }
 
 TEST(TenantTest, RebuildGroupStateRegroupsTheSameMembers) {
@@ -398,61 +438,6 @@ TEST(TenantTest, RebuildGroupStateRegroupsTheSameMembers) {
     auto rebuilt_second = LeaseOf(second);
     ASSERT_NE(rebuilt_first, nullptr);
     EXPECT_EQ(rebuilt_first.get(), rebuilt_second.get());
-}
-
-TEST(TenantTest, ResetDynamicReplicationStateClearsTheLeasesItHolds) {
-    Tenant tenant;
-    auto entry = test::MakeObjectEntry("k1", "g1");
-    ASSERT_TRUE(tenant.InsertObject(entry));
-
-    // What a replica-action proposal leaves behind: one lease in flight, a
-    // cooldown before the next action, and the proposal the entry waits on.
-    tenant.PutDynamicReplicationLease(entry, UUID{7, 8},
-                                      LeaseFor(entry, UUID{7, 8}));
-    entry->WithExclusiveAccess([](ObjectMetadata&, ObjectEntry::State& state) {
-        state.dynamic_replication_pending = DynamicReplicaPending{};
-        state.dynamic_replication_cooldown =
-            std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    });
-    ASSERT_FALSE(tenant.Empty());
-
-    entry->WithExclusiveAccess([&](ObjectMetadata&, ObjectEntry::State& state) {
-        tenant.ResetDynamicReplicationState(state, entry);
-    });
-
-    // The reset drops the lease and the cooldown and leaves the object routed,
-    // which is what separates this path from RemoveObject.
-    EXPECT_TRUE(tenant.ContainsObject("k1"));
-    EXPECT_FALSE(tenant.FindDynamicReplicationLease(UUID{7, 8}).has_value());
-    EXPECT_TRUE(entry->WithSharedAccess(
-        [](const ObjectMetadata&, const ObjectEntry::State& state) {
-            return !state.dynamic_replication_pending.has_value() &&
-                   state.dynamic_replication_cooldown ==
-                       std::chrono::steady_clock::time_point{};
-        }));
-    EXPECT_FALSE(tenant.Empty());
-}
-
-TEST(TenantTest, PromotionCandidateKeysTrackWhatWasIndexed) {
-    Tenant tenant;
-    auto entry = test::MakeObjectEntry("k1", "g1");
-    ASSERT_TRUE(tenant.InsertObject(entry));
-    EXPECT_TRUE(tenant.PromotionCandidateKeys().empty());
-
-    // The index holds keys, so indexing one twice leaves one entry.
-    tenant.IndexPromotionCandidate("k1");
-    tenant.IndexPromotionCandidate("k2");
-    tenant.IndexPromotionCandidate("k1");
-    EXPECT_EQ(tenant.PromotionCandidateKeys().size(), 2u);
-
-    // A key that was never indexed is not there to unindex, so nothing changes.
-    tenant.UnindexPromotionCandidate("k3");
-    EXPECT_EQ(tenant.PromotionCandidateKeys().size(), 2u);
-
-    tenant.UnindexPromotionCandidate("k1");
-    auto keys = tenant.PromotionCandidateKeys();
-    ASSERT_EQ(keys.size(), 1u);
-    EXPECT_EQ(keys[0], "k2");
 }
 
 }  // namespace

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
@@ -78,9 +79,11 @@ TEST(TenantRegistryTest, ConcurrentCreationPublishesOneWinningTenant) {
             << "racer " << i << " kept a losing handle";
     }
     EXPECT_EQ(registry.Lookup(tenant).get(), observed[0].get());
-    // The factory runs for the winner only, so a race leaves no orphan tenant
-    // behind.
-    EXPECT_EQ(builds.load(std::memory_order_relaxed), 1u);
+    // Racers that missed the lookup may each build, but only one build is
+    // published and every racer holds it.
+    EXPECT_GE(builds.load(std::memory_order_relaxed), 1u);
+    EXPECT_LE(builds.load(std::memory_order_relaxed),
+              static_cast<size_t>(kRacers));
 }
 
 TEST(TenantRegistryTest, RemoveDropsTheTenantButNotTheHandle) {
@@ -137,14 +140,14 @@ TEST(TenantRegistryTest, VisitReachesEveryTenantAndCarriesABroadcast) {
     }
 }
 
-TEST(TenantRegistryTest, VisitWalksTheFrameItLoaded) {
+TEST(TenantRegistryTest, VisitWalksTheTenantsPresentWhenItStarted) {
     TenantRegistry registry(MakeTenant);
     ASSERT_NE(registry.GetOrCreateTenant(TenantId("tenant-a")), nullptr);
     ASSERT_NE(registry.GetOrCreateTenant(TenantId("tenant-b")), nullptr);
 
-    // Publishing from inside the walk is allowed and must not change what that
-    // walk sees: it iterates the frame it loaded, not the registry's current
-    // one.
+    // Creating and removing tenants from inside the walk is allowed and must
+    // not change what that walk sees: it iterates the tenants present when it
+    // started, not the registry's current ones.
     std::vector<std::string> seen;
     bool published = false;
     registry.Visit(
@@ -164,7 +167,7 @@ TEST(TenantRegistryTest, VisitWalksTheFrameItLoaded) {
     EXPECT_NE(std::find(seen.begin(), seen.end(), "tenant-b"), seen.end());
     EXPECT_EQ(std::find(seen.begin(), seen.end(), "tenant-c"), seen.end());
 
-    // The published frame is what the next walk sees.
+    // The next walk sees the changes.
     std::vector<std::string> after;
     registry.Visit(
         [&](const TenantId& tenant_id, const std::shared_ptr<Tenant>&) {
@@ -175,10 +178,10 @@ TEST(TenantRegistryTest, VisitWalksTheFrameItLoaded) {
     EXPECT_NE(std::find(after.begin(), after.end(), "tenant-c"), after.end());
 }
 
-TEST(TenantRegistryTest, LookupsDuringWritesSeeOneWholePublish) {
+TEST(TenantRegistryTest, MixedLookupCreateRemoveAndVisitStayConsistent) {
     // Every tenant this registry builds arrives with one object already
-    // inserted, so a reader that finds a tenant without it saw a frame that was
-    // published before the tenant it names had finished being built.
+    // inserted, so a reader that finds a tenant without it saw the tenant
+    // published before it had finished being built.
     TenantRegistry registry([](const TenantId&) {
         auto tenant = std::make_shared<Tenant>();
         [[maybe_unused]] const bool inserted =
@@ -186,41 +189,89 @@ TEST(TenantRegistryTest, LookupsDuringWritesSeeOneWholePublish) {
         assert(inserted);
         return tenant;
     });
-    const TenantId tenant_id("tenant-a");
-    ASSERT_NE(registry.GetOrCreateTenant(tenant_id), nullptr);
+    const std::vector<TenantId> ids = {
+        TenantId("tenant-a"), TenantId("tenant-b"), TenantId("tenant-c"),
+        TenantId("tenant-d")};
+    constexpr int kRemoverRounds = 20000;
 
-    constexpr int kWriterIterations = 50'000;
-    std::atomic<bool> readers_stopped{false};
-    std::atomic<int> torn_reads{0};
-
-    const auto reader = [&]() {
-        while (!readers_stopped.load(std::memory_order_relaxed)) {
-            auto tenant = registry.Lookup(tenant_id);
-            if (tenant != nullptr && tenant->ObjectCount() != 1) {
-                torn_reads.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
+    std::atomic<bool> removers_done{false};
+    std::atomic<int> violations{0};
+    std::atomic<uint64_t> walks{0};
+    const auto violation = [&] {
+        violations.fetch_add(1, std::memory_order_relaxed);
+    };
+    const auto whole = [](const std::shared_ptr<Tenant>& tenant) {
+        return tenant != nullptr && tenant->ObjectCount() == 1;
     };
 
-    std::vector<std::thread> readers;
-    for (int i = 0; i < 8; ++i) {
-        readers.emplace_back(reader);
+    std::vector<std::thread> threads;
+    // Removers first, so the others can stop when they are done.
+    for (int r = 0; r < 2; ++r) {
+        threads.emplace_back([&, r] {
+            for (int round = 0; round < kRemoverRounds; ++round) {
+                registry.Remove(ids[(round + r) % ids.size()]);
+            }
+        });
+    }
+    for (int c = 0; c < 2; ++c) {
+        threads.emplace_back([&, c] {
+            for (uint64_t i = c; !removers_done.load(std::memory_order_relaxed);
+                 ++i) {
+                if (!whole(registry.GetOrCreateTenant(ids[i % ids.size()]))) {
+                    violation();
+                }
+            }
+        });
+    }
+    for (int l = 0; l < 4; ++l) {
+        threads.emplace_back([&, l] {
+            for (uint64_t i = l; !removers_done.load(std::memory_order_relaxed);
+                 ++i) {
+                const auto tenant = registry.Lookup(ids[i % ids.size()]);
+                if (tenant != nullptr && !whole(tenant)) {
+                    violation();
+                }
+            }
+        });
+    }
+    // A walker creates and removes tenants from inside its own callback, which
+    // must neither deadlock nor disturb the walk it is part of.
+    threads.emplace_back([&] {
+        uint64_t calls = 0;
+        while (!removers_done.load(std::memory_order_relaxed)) {
+            std::vector<std::string> seen;
+            registry.Visit([&](const TenantId& tenant_id,
+                               const std::shared_ptr<Tenant>& tenant) {
+                if (std::find(seen.begin(), seen.end(), tenant_id.value()) !=
+                        seen.end() ||
+                    !whole(tenant)) {
+                    violation();
+                }
+                seen.push_back(tenant_id.value());
+                const auto& other = ids[++calls % ids.size()];
+                if (calls % 2 == 0) {
+                    (void)registry.GetOrCreateTenant(other);
+                } else {
+                    registry.Remove(other);
+                }
+            });
+            walks.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    threads[0].join();
+    threads[1].join();
+    removers_done.store(true, std::memory_order_relaxed);
+    for (size_t t = 2; t < threads.size(); ++t) {
+        threads[t].join();
     }
 
-    for (int i = 0; i < kWriterIterations; ++i) {
-        registry.Remove(tenant_id);
-        ASSERT_NE(registry.GetOrCreateTenant(tenant_id), nullptr);
+    EXPECT_EQ(violations.load(), 0);
+    EXPECT_GT(walks.load(), 0u);
+    for (const auto& tenant_id : ids) {
+        const auto tenant = registry.Lookup(tenant_id);
+        EXPECT_TRUE(tenant == nullptr || whole(tenant)) << tenant_id.value();
     }
-
-    readers_stopped.store(true, std::memory_order_relaxed);
-    for (auto& thread : readers) {
-        thread.join();
-    }
-
-    EXPECT_EQ(torn_reads.load(std::memory_order_relaxed), 0);
-    auto final_tenant = registry.Lookup(tenant_id);
-    ASSERT_NE(final_tenant, nullptr);
-    EXPECT_EQ(final_tenant->ObjectCount(), 1u);
 }
 
 }  // namespace

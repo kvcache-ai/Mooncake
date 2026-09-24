@@ -1,6 +1,15 @@
 #include "group_index.h"
 
+#include <atomic>
+#include <cstddef>
+#include <map>
+#include <memory>
+#include <random>
+#include <set>
 #include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -105,6 +114,99 @@ TEST(GroupIndexTest, MembershipIsASetOfKeysUnderTheOneGroupLease) {
     ASSERT_NE(rebuilt, nullptr);
     EXPECT_NE(rebuilt.get(), lease.get());
     EXPECT_EQ(index.Members("g1").size(), 1u);
+}
+
+TEST(GroupIndexTest, ConcurrentMembershipAcrossStripesStaysConsistent) {
+    // Few stripes, so distinct groups share a stripe and collide. Each thread
+    // owns its member keys, so it knows exactly which memberships are its own
+    // and which lease each of them was handed.
+    StripedGroupIndex<4> index;
+    constexpr size_t kThreads = 8;
+    constexpr size_t kGroups = 8;
+    constexpr size_t kMembersPerThread = 4;
+    constexpr int kRounds = 20000;
+
+    using Membership =
+        std::map<std::pair<size_t, size_t>, std::shared_ptr<Lease>>;
+    std::vector<Membership> held(kThreads);
+    std::atomic<int> violations{0};
+    const auto group_name = [](size_t group) {
+        return "g" + std::to_string(group);
+    };
+    const auto member_name = [](size_t thread, size_t member) {
+        return "t" + std::to_string(thread) + "_m" + std::to_string(member);
+    };
+
+    std::vector<std::thread> threads;
+    for (size_t t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            std::mt19937 rng(static_cast<unsigned>(t));
+            Membership& mine = held[t];
+            for (int round = 0; round < kRounds; ++round) {
+                const size_t group = rng() % kGroups;
+                const size_t member = rng() % kMembersPerThread;
+                const auto it = mine.find({group, member});
+                if (it != mine.end()) {
+                    if (!index.RemoveMember(group_name(group),
+                                            member_name(t, member))) {
+                        violations.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    mine.erase(it);
+                    continue;
+                }
+                auto lease =
+                    index.AddMember(group_name(group), member_name(t, member));
+                // Another of this thread's members kept the group alive the
+                // whole time, so the new member joined that same instance.
+                for (const auto& [slot, other] : mine) {
+                    if (slot.first == group && other != lease) {
+                        violations.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (lease == nullptr) {
+                    violations.fetch_add(1, std::memory_order_relaxed);
+                }
+                mine.emplace(std::make_pair(group, member), std::move(lease));
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    EXPECT_EQ(violations.load(), 0);
+
+    // At rest, each group lists exactly the members the threads still hold,
+    // and every one of them still holds the group's current lease.
+    bool any_member = false;
+    for (size_t group = 0; group < kGroups; ++group) {
+        std::set<std::string> expected;
+        for (size_t t = 0; t < kThreads; ++t) {
+            for (const auto& [slot, lease] : held[t]) {
+                if (slot.first != group) {
+                    continue;
+                }
+                expected.insert(member_name(t, slot.second));
+                EXPECT_EQ(index.AddMember(group_name(group),
+                                          member_name(t, slot.second)),
+                          lease);
+            }
+        }
+        const auto members = index.Members(group_name(group));
+        EXPECT_EQ(std::set<std::string>(members.begin(), members.end()),
+                  expected)
+            << group_name(group);
+        any_member = any_member || !expected.empty();
+    }
+    EXPECT_EQ(index.Empty(), !any_member);
+
+    // Dropping every remaining member drops every group.
+    for (size_t t = 0; t < kThreads; ++t) {
+        for (const auto& [slot, lease] : held[t]) {
+            EXPECT_TRUE(index.RemoveMember(group_name(slot.first),
+                                           member_name(t, slot.second)));
+        }
+    }
+    EXPECT_TRUE(index.Empty());
 }
 
 }  // namespace
