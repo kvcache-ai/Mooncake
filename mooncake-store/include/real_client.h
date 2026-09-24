@@ -384,13 +384,14 @@ class RealClient : public PyClient {
     int probeKey(const std::string &key);
 
     /**
-     * @brief Point-in-time existence check for multiple objects, granting
-     * no read leases
+     * @brief Probe multiple objects, optionally leasing the last complete
+     * candidate.
      * @param keys Vector of keys to check
-     * @return Vector of existence results: 1 if exists, 0 if not exists, -1
-     * if error
+     * @return Per-key existence results (None) or a selected-only mask
+     * (LastHitOnly). Negative values indicate errors.
      */
-    std::vector<int> batchProbeKey(const std::vector<std::string> &keys);
+    std::vector<int> batchProbeKey(const std::vector<std::string> &keys,
+                                   const GrantLeasePolicy &policy = {});
 
     /**
      * @brief Get the size of an object
@@ -797,7 +798,7 @@ class RealClient : public PyClient {
     tl::expected<bool, ErrorCode> probeKey_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchProbeKey_internal(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys, const GrantLeasePolicy &policy);
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
 

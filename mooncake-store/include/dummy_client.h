@@ -185,7 +185,8 @@ class DummyClient : public PyClient {
 
     int probeKey(const std::string &key);
 
-    std::vector<int> batchProbeKey(const std::vector<std::string> &keys);
+    std::vector<int> batchProbeKey(const std::vector<std::string> &keys,
+                                   const GrantLeasePolicy &policy = {});
 
     int64_t getSize(const std::string &key);
 

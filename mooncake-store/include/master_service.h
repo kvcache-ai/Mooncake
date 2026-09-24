@@ -274,7 +274,8 @@ class MasterService {
         -> tl::expected<bool, ErrorCode>;
 
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& keys, const TenantId& tenant_id);
+        const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
+        const TenantId& tenant_id);
 
     /**
      * @brief Fetch all keys for a single tenant.

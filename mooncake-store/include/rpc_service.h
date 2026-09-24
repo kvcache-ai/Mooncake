@@ -54,7 +54,7 @@ class WrappedMasterService {
         const std::string& tenant_id = "default");
 
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& keys,
+        const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
     tl::expected<

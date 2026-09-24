@@ -2522,9 +2522,9 @@ int RealClient::probeKey(const std::string &key) {
     }
 }
 
-std::vector<int> RealClient::batchProbeKey(
-    const std::vector<std::string> &keys) {
-    auto internal_results = batchProbeKey_internal(keys);
+std::vector<int> RealClient::batchProbeKey(const std::vector<std::string> &keys,
+                                           const GrantLeasePolicy &policy) {
+    auto internal_results = batchProbeKey_internal(keys, policy);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -6204,7 +6204,7 @@ tl::expected<bool, ErrorCode> RealClient::probeKey_internal(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchProbeKey_internal(
-    const std::vector<std::string> &keys) {
+    const std::vector<std::string> &keys, const GrantLeasePolicy &policy) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<bool, ErrorCode>>(
@@ -6217,7 +6217,7 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchProbeKey_internal(
     }
 
     // Call client BatchProbeKey and return the vector<expected> directly
-    return client_->BatchProbeKey(keys);
+    return client_->BatchProbeKey(keys, policy);
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
