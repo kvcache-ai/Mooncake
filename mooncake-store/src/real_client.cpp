@@ -16,6 +16,7 @@
 #include <limits>
 #include <new>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "real_client.h"
@@ -32,6 +33,7 @@
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
 #include "config/cxl_segment_config.h"
+#include "config/egm_store_pool_config.h"
 #include "config/hugepage_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
@@ -47,6 +49,7 @@
 #include "shm_helper.h"
 #include "memory_location.h"
 #include "version.h"
+#include "transport/nvlink_transport/nvlink_host_numa_allocation.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -851,6 +854,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
+    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
+                          global_segment_size, local_buffer_size, protocol,
+                          rdma_devices, master_server_addr, transfer_engine,
+                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
+                          start_offload_rpc_server, ssd_offload_path, tenant_id,
+                          enable_client_http_server, client_http_port);
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
+    const std::string &metadata_server, size_t global_segment_size,
+    size_t local_buffer_size, const std::string &protocol,
+    const std::string &rdma_devices, const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
 #ifdef USE_ASCEND_DIRECT
@@ -950,6 +971,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    if (egm_config.enabled &&
+        (client_->transfer_engine_->isUsingTent() ||
+         client_->transfer_engine_->getTransport("nvlink") == nullptr)) {
+        LOG(ERROR) << "EGM Store requires the classic NVLink transport; "
+                      "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
@@ -1012,7 +1041,47 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t current_glbseg_size = 0;                  // For logging
 
         auto split_limit = GetTransportRegistrationLimit(protocol);
-        const size_t alignment = facebook::cachelib::Slab::kSize;
+        size_t alignment = facebook::cachelib::Slab::kSize;
+        std::vector<int> egm_numa_nodes;
+        std::vector<size_t> egm_node_sizes;
+        size_t egm_node_index = 0;
+        if (egm_config.enabled) {
+            if (egm_config.auto_numa_nodes) {
+                auto status = NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
+                    egm_numa_nodes);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM NUMA discovery failed: " << status;
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+            } else {
+                egm_numa_nodes = egm_config.numa_nodes;
+            }
+            std::vector<size_t> granularities;
+            for (int node : egm_numa_nodes) {
+                size_t granularity = 0;
+                auto status =
+                    NvlinkHostNumaAllocation::GetAllocationGranularity(
+                        node, granularity);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM granularity query failed for NUMA node "
+                               << node << ": " << status;
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                granularities.push_back(granularity);
+            }
+            auto capacity = CalculateEgmStorePoolCapacity(
+                global_segment_size, granularities, alignment,
+                static_cast<size_t>(globalConfig().max_mr_size));
+            if (!capacity) return tl::unexpected(capacity.error());
+            alignment = capacity->alignment;
+            split_limit = capacity->max_chunk_size;
+            egm_node_sizes = std::move(capacity->node_sizes);
+            global_segment_size = (global_segment_size / alignment) * alignment;
+            LOG(INFO) << "EGM Store capacity: requested=" << total_glbseg_size
+                      << " effective=" << global_segment_size
+                      << " alignment=" << alignment;
+            total_glbseg_size = global_segment_size;
+        }
 #ifdef USE_ASCEND_DIRECT
         if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
             const size_t cap = AgentModeStoreChunkCap(global_segment_size);
@@ -1050,8 +1119,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             protocol == "rdma" && use_hugepage_;
 
         while (global_segment_size > 0) {
-            size_t segment_size =
-                GetNextSegmentSize(global_segment_size, split_limit, alignment);
+            size_t segment_size = GetNextSegmentSize(
+                egm_config.enabled ? egm_node_sizes[egm_node_index]
+                                   : global_segment_size,
+                split_limit, alignment);
             if (segment_size == 0) {
                 LOG(ERROR) << "Registration limit is smaller than segment "
                               "alignment";
@@ -1063,7 +1134,30 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             void *ptr = nullptr;
             std::string seg_location = kWildcardLocation;
 
-            if (!seg_numa_nodes.empty()) {
+            if (egm_config.enabled) {
+                // Adopt even a partial Create result before handling failure.
+                egm_segment_ptrs_.emplace_back();
+                auto &owner = egm_segment_ptrs_.back();
+                auto status = NvlinkHostNumaAllocation::Create(
+                    egm_numa_nodes[egm_node_index], segment_size, alignment,
+                    owner);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM allocation failed: " << status;
+                    if (owner) {
+                        auto cleanup = owner->Release();
+                        if (!cleanup.ok()) {
+                            LOG(ERROR)
+                                << "EGM partial allocation cleanup failed: "
+                                << cleanup << "; retaining until process exit";
+                            (void)owner.release();
+                        }
+                    }
+                    egm_segment_ptrs_.pop_back();
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                ptr = owner->base();
+                mapped_size = owner->length();
+            } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
@@ -1095,42 +1189,46 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
             const size_t mount_size =
-                split_limit.has_value() ? segment_size : mapped_size;
+                egm_config.enabled || !split_limit.has_value() ? mapped_size
+                                                               : segment_size;
             current_glbseg_size += mount_size;
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
-                if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
+            if (!egm_config.enabled) {
+                if (this->protocol == "ascend" || this->protocol == "ubshmem") {
+                    if (use_hugepage_ &&
+                        !globalConfig().ascend_use_fabric_mem) {
+                        hugepage_segment_ptrs_.emplace_back(
+                            ptr, HugepageSegmentDeleter{mapped_size});
+                    } else {
+                        ascend_segment_ptrs_.emplace_back(
+                            ptr, AscendSegmentDeleter{this->protocol});
+                    }
+                } else if (this->protocol == "sunrise_link") {
+#if defined(USE_SUNRISE)
+                    sunrise_segment_ptrs_.emplace_back(ptr,
+                                                       SunriseSegmentDeleter{});
+#else
+                    LOG(ERROR)
+                        << "sunrise_link protocol requires USE_SUNRISE build";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+                } else if (this->protocol == "ub") {
+                    ub_segment_ptrs_.emplace_back(
+                        ptr, UbSegmentDeleter{mapped_size});
+                } else if (!seg_numa_nodes.empty() || use_hugepage_) {
+                    // NUMA-segmented or hugepage: track as mmap allocation for
+                    // munmap cleanup
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
                 } else {
-                    ascend_segment_ptrs_.emplace_back(
-                        ptr, AscendSegmentDeleter{this->protocol});
-                }
-            } else if (this->protocol == "sunrise_link") {
-#if defined(USE_SUNRISE)
-                sunrise_segment_ptrs_.emplace_back(ptr,
-                                                   SunriseSegmentDeleter{});
-#else
-                LOG(ERROR)
-                    << "sunrise_link protocol requires USE_SUNRISE build";
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
-#endif
-            } else if (this->protocol == "ub") {
-                ub_segment_ptrs_.emplace_back(ptr,
-                                              UbSegmentDeleter{mapped_size});
-            } else if (!seg_numa_nodes.empty() || use_hugepage_) {
-                // NUMA-segmented or hugepage: track as mmap allocation for
-                // munmap cleanup
-                hugepage_segment_ptrs_.emplace_back(
-                    ptr, HugepageSegmentDeleter{mapped_size});
-            } else {
 #ifdef USE_VRAM_SEGMENT
-                vram_segment_ptrs_.emplace_back(ptr);
+                    vram_segment_ptrs_.emplace_back(ptr);
 #else
-                segment_ptrs_.emplace_back(ptr);
+                    segment_ptrs_.emplace_back(ptr);
 #endif
+                }
             }
 
             // Populate HugeTLB pages in parallel immediately before transfer-
@@ -1161,6 +1259,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (pinned_region) {
                 setup_segment_pinned_regions_.push_back(
                     std::move(pinned_region));
+            }
+            if (egm_config.enabled) {
+                egm_node_sizes[egm_node_index] -= segment_size;
+                if (egm_node_sizes[egm_node_index] == 0) ++egm_node_index;
             }
         }
         if (total_glbseg_size == 0) {
@@ -1414,11 +1516,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    auto egm_config = ParseEgmStorePoolConfig(
+        config, protocol, global_segment_size, local_buffer_size);
+    if (!egm_config) return tl::unexpected(egm_config.error());
+    try {
+        auto result = setup_internal(
+            *egm_config, local_hostname, metadata_server, global_segment_size,
+            local_buffer_size, protocol, rdma_devices, master_server_addr,
+            nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
+            ssd_offload_path, tenant_id, enable_client_http_server,
+            client_http_port);
+        if (!result && egm_config->enabled) {
+            (void)tearDownAll_internal();
+        }
+        return result;
+    } catch (...) {
+        // The Python wrapper still owns this client when setup throws.
+        if (egm_config->enabled) (void)tearDownAll_internal();
+        throw;
+    }
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1457,6 +1573,32 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
+    ErrorCode cleanup_error = ErrorCode::OK;
+    if (!egm_segment_ptrs_.empty()) {
+        // Callers must quiesce in-flight requests before close. FileStorage
+        // owns a Client reference and background workers that access segments.
+        if (offload_rpc_server_) {
+            offload_rpc_server_->stop();
+            offload_rpc_server_.reset();
+        }
+        file_storage_.reset();
+        for (auto it = egm_segment_ptrs_.rbegin();
+             it != egm_segment_ptrs_.rend(); ++it) {
+            auto &owner = *it;
+            if (!owner) continue;
+            auto result =
+                client_->UnmountSegment(owner->base(), owner->length());
+            if (!result) {
+                // Failed mounts may have no Client record even if publication
+                // is uncertain. Retain memory unless unmount confirms cleanup.
+                LOG(ERROR) << "EGM unmount failed: " << toString(result.error())
+                           << "; retaining allocation until process exit";
+                if (cleanup_error == ErrorCode::OK)
+                    cleanup_error = result.error();
+                (void)owner.release();
+            }
+        }
+    }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
         auto unregister_result = client_->unregisterLocalMemory(
@@ -1472,6 +1614,20 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
     // Reset all resources
     client_.reset();
+    for (auto it = egm_segment_ptrs_.rbegin(); it != egm_segment_ptrs_.rend();
+         ++it) {
+        auto &owner = *it;
+        if (!owner) continue;
+        auto status = owner->Release();
+        if (!status.ok()) {
+            LOG(ERROR) << "EGM release failed: " << status
+                       << "; retaining allocation until process exit";
+            if (cleanup_error == ErrorCode::OK)
+                cleanup_error = ErrorCode::INTERNAL_ERROR;
+            (void)owner.release();
+        }
+    }
+    egm_segment_ptrs_.clear();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -1543,6 +1699,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     // which is safe: they are never munmapped, so SPDK's translations never
     // point at freed/reused virtual addresses.
     RetryQuarantinedShmsLocked();
+    if (cleanup_error != ErrorCode::OK) return tl::unexpected(cleanup_error);
     return {};
 }
 
