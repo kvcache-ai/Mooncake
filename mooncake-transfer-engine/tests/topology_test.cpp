@@ -195,8 +195,7 @@ TEST(ToplogyTest, HcaPeerAffinityAppliesToGpuPrefixEntries) {
 TEST(ToplogyTest, StrictDestDeviceAffinityHardFailsUnmatchedHint) {
     auto &cfg = mooncake::globalConfig();
     const bool old_strict = cfg.enable_strict_dest_device_affinity;
-    const std::string json_str =
-        "{\"cpu:0\" : [[\"mlx5_0\"],[\"mlx5_1\"]]}";
+    const std::string json_str = "{\"cpu:0\" : [[\"mlx5_0\"],[\"mlx5_1\"]]}";
 
     mooncake::Topology topology;
     ASSERT_EQ(topology.parse(json_str), 0);

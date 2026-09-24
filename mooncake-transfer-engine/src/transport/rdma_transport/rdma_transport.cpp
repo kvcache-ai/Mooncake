@@ -938,17 +938,19 @@ Status RdmaTransport::submitTransferTask(
         const bool pin_local_device =
             !globalConfig().enable_strict_dest_device_affinity;
         const int local_hint_device_id =
-            pin_local_device && last_local_device_buffer_id == last_local_buffer_id
+            pin_local_device &&
+                    last_local_device_buffer_id == last_local_buffer_id
                 ? last_local_device_id
                 : -1;
         if (pin_local_device) {
             if (local_device_cache.select(
-                    local_segment_desc, (uint64_t)request.source, request.length,
-                    request_buffer_id, request_device_id, [&] {
+                    local_segment_desc, (uint64_t)request.source,
+                    request.length, request_buffer_id, request_device_id, [&] {
                         return selectDevice(
                             local_segment_desc.get(), (uint64_t)request.source,
-                            request.length, request_buffer_id, request_device_id,
-                            0, last_local_buffer_id, local_hint_device_id);
+                            request.length, request_buffer_id,
+                            request_device_id, 0, last_local_buffer_id,
+                            local_hint_device_id);
                     })) {
                 request_buffer_id = -1;
                 request_device_id = -1;

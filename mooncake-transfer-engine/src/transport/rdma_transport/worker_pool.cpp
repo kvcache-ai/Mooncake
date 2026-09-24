@@ -1056,12 +1056,11 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                             peer_segment_desc->devices[device_id].name);
             if (!isRailAvailable(peer_nic_path)) {
                 if (globalConfig().enable_strict_dest_device_affinity) {
-                    LOG(ERROR)
-                        << "Worker: Cannot redispatch slice because the "
-                           "matched peer rail is paused for target "
-                        << slice->target_id
-                        << ", selected peer=" << peer_nic_path
-                        << ", retry_cnt=" << slice->rdma.retry_cnt;
+                    LOG(ERROR) << "Worker: Cannot redispatch slice because the "
+                                  "matched peer rail is paused for target "
+                               << slice->target_id
+                               << ", selected peer=" << peer_nic_path
+                               << ", retry_cnt=" << slice->rdma.retry_cnt;
                     slice->markFailed();
                     processed_slice_count_++;
                     continue;

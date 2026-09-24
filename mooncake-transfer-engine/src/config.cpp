@@ -542,8 +542,7 @@ void loadGlobalConfig(GlobalConfig& config) {
     parseNicPeerAffinity(std::getenv("MC_NIC_PEER_AFFINITY"),
                          config.nic_peer_affinity);
 
-    if (config.enable_hca_peer_affinity &&
-        destDeviceNameHintEnabled(config)) {
+    if (config.enable_hca_peer_affinity && destDeviceNameHintEnabled(config)) {
         LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY cannot be combined with "
                       "MC_ENABLE_DEST_DEVICE_AFFINITY or "
                       "MC_ENABLE_STRICT_DEST_DEVICE_AFFINITY; falling back "
