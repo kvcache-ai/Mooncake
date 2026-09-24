@@ -308,7 +308,7 @@ tl::expected<void, std::string> UdsAcceptor::start() {
     }
 
     running_ = true;
-    thread_ = std::jthread([this]() { acceptLoop(); });
+    thread_ = std::thread([this]() { acceptLoop(); });
     return {};
 }
 
