@@ -803,6 +803,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    friend class RealClient;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

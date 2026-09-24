@@ -889,8 +889,8 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend" || protocol == "ubshmem" ||
-                   protocol == "sunrise_link") {
+        } else if (protocol == "nvlink" || protocol == "ascend" ||
+                   protocol == "ubshmem" || protocol == "sunrise_link") {
             if (device_names.has_value()) {
                 LOG(WARNING) << protocol
                              << " protocol does not use device names, ignoring";
