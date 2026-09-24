@@ -564,6 +564,14 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.enable_dest_device_affinity = true;
     }
 
+    const char* enable_strict_dest_env =
+        std::getenv("MC_ENABLE_STRICT_DEST_DEVICE_AFFINITY");
+    if (enable_strict_dest_env) {
+        parseBoolConfigEnv(enable_strict_dest_env,
+                           "MC_ENABLE_STRICT_DEST_DEVICE_AFFINITY",
+                           config.enable_strict_dest_device_affinity);
+    }
+
     const char* enable_hca_peer_affinity_env =
         std::getenv("MC_ENABLE_HCA_PEER_AFFINITY");
     if (enable_hca_peer_affinity_env) {
@@ -575,13 +583,15 @@ void loadGlobalConfig(GlobalConfig& config) {
     parseNicPeerAffinity(std::getenv("MC_NIC_PEER_AFFINITY"),
                          config.nic_peer_affinity);
 
-    if (config.enable_hca_peer_affinity && config.enable_dest_device_affinity) {
-        LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY and "
-                      "MC_ENABLE_DEST_DEVICE_AFFINITY cannot be enabled at "
-                      "the same time; falling back to default peer device "
-                      "selection.";
+    if (config.enable_hca_peer_affinity &&
+        destDeviceNameHintEnabled(config)) {
+        LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY cannot be combined with "
+                      "MC_ENABLE_DEST_DEVICE_AFFINITY or "
+                      "MC_ENABLE_STRICT_DEST_DEVICE_AFFINITY; falling back "
+                      "to default peer device selection.";
         config.enable_hca_peer_affinity = false;
         config.enable_dest_device_affinity = false;
+        config.enable_strict_dest_device_affinity = false;
     }
 
     const char* log_rdma_slice_affinity_env =
@@ -887,6 +897,10 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
+    LOG(INFO) << "enable_dest_device_affinity = "
+              << (config.enable_dest_device_affinity ? "true" : "false");
+    LOG(INFO) << "enable_strict_dest_device_affinity = "
+              << (config.enable_strict_dest_device_affinity ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "

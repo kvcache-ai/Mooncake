@@ -51,6 +51,7 @@
     3. 如果显示 `Failed to create QP: Cannot allocate memory` 错误，通常是由于创建的 QP 数量过多，达到了驱动限制。可以使用 `rdma resource` 命令追踪已创建的 QP 数量。解决此问题的一种可能方法：
        - 将 Mooncake 更新到 v0.3.5 或更高版本
        - 在启动应用程序前设置环境变量 `MC_ENABLE_DEST_DEVICE_AFFINITY=1`
+       - 若跨轨出现 retry exceeded / `IBV_WC_RETRY_EXC_ERR`（本地网卡与不同名远端网卡配对），可设置 `MC_ENABLE_STRICT_DEST_DEVICE_AFFINITY=1`，强制同名配对且不回退
 
 ## RDMA 传输期间
 ### 建议排查方向

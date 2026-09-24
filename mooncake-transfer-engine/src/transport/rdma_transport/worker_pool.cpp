@@ -188,7 +188,10 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
             peer_segment_desc, offset, length, local_hca, buffer_id, device_id,
             retry_count, hint_buffer_id, hint_device_id);
     } else {
-        auto hint = config.enable_dest_device_affinity
+        // Soft dest affinity prefers the same name then may fall back.
+        // Strict dest affinity also passes the name hint; Topology then
+        // hard-fails instead of falling back to a mismatched peer HCA.
+        auto hint = destDeviceNameHintEnabled(config)
                         ? std::string_view(local_hca)
                         : std::string_view();
         ret = RdmaTransport::selectDevice(
@@ -391,8 +394,13 @@ int WorkerPool::submitPostSend(
             MakeNicPath(peer_segment_desc->nicPathServerName(),
                         peer_segment_desc->devices[device_id].name);
 
-        // If selected rail is paused, try alternative devices
+        // If selected rail is paused, try alternative devices. Strict
+        // same-name pairing must not hop onto a different peer HCA.
         if (!isRailAvailable(peer_nic_path)) {
+            if (globalConfig().enable_strict_dest_device_affinity) {
+                slice->markFailed();
+                continue;
+            }
             bool found = false;
             for (size_t alt_dev_id = 0;
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
@@ -1039,6 +1047,17 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 MakeNicPath(peer_segment_desc->nicPathServerName(),
                             peer_segment_desc->devices[device_id].name);
             if (!isRailAvailable(peer_nic_path)) {
+                if (globalConfig().enable_strict_dest_device_affinity) {
+                    LOG(ERROR)
+                        << "Worker: Cannot redispatch slice because the "
+                           "matched peer rail is paused for target "
+                        << slice->target_id
+                        << ", selected peer=" << peer_nic_path
+                        << ", retry_cnt=" << slice->rdma.retry_cnt;
+                    slice->markFailed();
+                    processed_slice_count_++;
+                    continue;
+                }
                 bool found = false;
                 for (size_t alt_dev_id = 0;
                      alt_dev_id < peer_segment_desc->devices.size();

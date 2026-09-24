@@ -8,6 +8,7 @@
 
 #include "config.h"
 #include "cuda_alike.h"
+#include "error.h"
 #include "transfer_metadata.h"
 #include "memory_location.h"
 
@@ -189,6 +190,62 @@ TEST(ToplogyTest, HcaPeerAffinityAppliesToGpuPrefixEntries) {
     ASSERT_EQ(hist.size(), static_cast<size_t>(1));
     EXPECT_EQ(hist[0], 64) << "peer affinity should pin " << gpu_loc
                            << " to P0 for local HCA L";
+}
+
+TEST(ToplogyTest, StrictDestDeviceAffinityHardFailsUnmatchedHint) {
+    auto &cfg = mooncake::globalConfig();
+    const bool old_strict = cfg.enable_strict_dest_device_affinity;
+    const std::string json_str =
+        "{\"cpu:0\" : [[\"mlx5_0\"],[\"mlx5_1\"]]}";
+
+    mooncake::Topology topology;
+    ASSERT_EQ(topology.parse(json_str), 0);
+
+    cfg.enable_strict_dest_device_affinity = false;
+    EXPECT_EQ(topology.selectDevice("cpu:0", "mlx5_0", 0), 0);
+    EXPECT_NE(topology.selectDevice("cpu:0", "mlx5_missing", 0),
+              ERR_DEVICE_NOT_FOUND);
+
+    cfg.enable_strict_dest_device_affinity = true;
+    EXPECT_EQ(topology.selectDevice("cpu:0", "mlx5_0", 0), 0);
+    EXPECT_EQ(topology.selectDevice("cpu:0", "mlx5_1", 0), 1);
+    EXPECT_EQ(topology.selectDevice("cpu:0", "mlx5_missing", 0),
+              ERR_DEVICE_NOT_FOUND);
+
+    cfg.enable_strict_dest_device_affinity = old_strict;
+}
+
+TEST(ToplogyTest, StrictDestDeviceAffinityStripesPreferredAndAvail) {
+    auto &cfg = mooncake::globalConfig();
+    const bool old_strict = cfg.enable_strict_dest_device_affinity;
+    const std::string json_str =
+        "{\"cpu:0\" : [[\"mlx5_0\",\"mlx5_1\"],[\"mlx5_2\",\"mlx5_3\"]]}";
+
+    mooncake::Topology topology;
+    ASSERT_EQ(topology.parse(json_str), 0);
+
+    cfg.enable_strict_dest_device_affinity = false;
+    std::unordered_map<int, int> default_hist;
+    for (int i = 0; i < 200; ++i) {
+        default_hist[topology.selectDevice("cpu:0", 0)]++;
+    }
+    EXPECT_EQ(default_hist.size(), static_cast<size_t>(2))
+        << "default retry_count==0 should stay in preferred_hca";
+    EXPECT_EQ(default_hist.count(0), 1u);
+    EXPECT_EQ(default_hist.count(1), 1u);
+
+    cfg.enable_strict_dest_device_affinity = true;
+    std::unordered_map<int, int> strict_hist;
+    for (int i = 0; i < 400; ++i) {
+        strict_hist[topology.selectDevice("cpu:0", 0)]++;
+    }
+    EXPECT_EQ(strict_hist.size(), static_cast<size_t>(4))
+        << "strict mode should stripe preferred_hca and avail_hca together";
+    for (int id = 0; id < 4; ++id) {
+        EXPECT_GT(strict_hist[id], 0) << "missing HCA index " << id;
+    }
+
+    cfg.enable_strict_dest_device_affinity = old_strict;
 }
 
 int main(int argc, char **argv) {
