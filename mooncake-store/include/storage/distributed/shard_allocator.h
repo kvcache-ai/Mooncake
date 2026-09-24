@@ -24,7 +24,7 @@ namespace mooncake {
 
 struct DistributedStorageConfig;
 
-class DfsGlobalAllocator final : public DfsAllocatorInterface {
+class ShardAllocator final : public DfsAllocatorInterface {
    public:
     struct EvictionCandidate {
         std::string key;
@@ -51,7 +51,7 @@ class DfsGlobalAllocator final : public DfsAllocatorInterface {
         }
 
        private:
-        friend class DfsGlobalAllocator;
+        friend class ShardAllocator;
 
         struct PreparedAllocation {
             EvictionCandidate candidate;
@@ -59,18 +59,18 @@ class DfsGlobalAllocator final : public DfsAllocatorInterface {
             uint64_t bytes = 0;
         };
 
-        explicit PendingEviction(DfsGlobalAllocator* owner) : owner_(owner) {}
+        explicit PendingEviction(ShardAllocator* owner) : owner_(owner) {}
 
-        DfsGlobalAllocator* owner_ = nullptr;
+        ShardAllocator* owner_ = nullptr;
         std::vector<EvictionCandidate> candidates_;
         std::vector<PreparedAllocation> prepared_;
     };
 
-    DfsGlobalAllocator() = default;
-    ~DfsGlobalAllocator() override;
+    ShardAllocator() = default;
+    ~ShardAllocator() override;
 
-    DfsGlobalAllocator(const DfsGlobalAllocator&) = delete;
-    DfsGlobalAllocator& operator=(const DfsGlobalAllocator&) = delete;
+    ShardAllocator(const ShardAllocator&) = delete;
+    ShardAllocator& operator=(const ShardAllocator&) = delete;
 
     DfsAllocatorType Type() const override { return DfsAllocatorType::SHARD; }
 

@@ -55,7 +55,7 @@
 #include "ha/snapshot/snapshot_logger.h"
 #include "common/zstd_util.h"
 #include "common/file_util.h"
-#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "random.h"
@@ -631,7 +631,7 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         bucket_allocator_ = allocator.get();
         dfs_allocator_ = std::move(allocator);
     } else {
-        auto allocator = std::make_unique<DfsGlobalAllocator>();
+        auto allocator = std::make_unique<ShardAllocator>();
         shard_allocator_ = allocator.get();
         dfs_allocator_ = std::move(allocator);
     }

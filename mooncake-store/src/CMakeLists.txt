@@ -51,7 +51,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     offset_allocator.cpp
     http_metadata_server.cpp
     serialize/serializer.cpp
-    storage/distributed/dfs_global_allocator.cpp
+    storage/distributed/shard_allocator.cpp
     storage/distributed/immutable_bucket_allocator.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
