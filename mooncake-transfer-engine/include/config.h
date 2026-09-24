@@ -57,6 +57,13 @@ struct GlobalConfig {
     // one it honors the operator's value, clamped to the hardware.  The RDMA
     // transport passes max_wr to ibv_create_qp() and is unaffected.
     bool max_wr_from_env = false;
+    // Outstanding RDMA READ/atomic depth. The IB default is 16, but some RNICs
+    // advertise fewer; updateGlobalConfig() clamps both to the device's
+    // ibv_device_attr so ibv_modify_qp() never rejects an unsupported value.
+    // initiator depth -> ibv_qp_attr.max_rd_atomic (IBV_QP_MAX_QP_RD_ATOMIC);
+    // responder depth -> ibv_qp_attr.max_dest_rd_atomic.
+    int max_qp_init_rd_atom = 16;
+    int max_qp_rd_atom = 16;
     size_t max_inline = 64;
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
