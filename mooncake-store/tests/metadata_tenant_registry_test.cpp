@@ -193,6 +193,11 @@ TEST(TenantRegistryTest, MixedLookupCreateRemoveAndVisitStayConsistent) {
         TenantId("tenant-a"), TenantId("tenant-b"), TenantId("tenant-c"),
         TenantId("tenant-d")};
     constexpr int kRemoverRounds = 20000;
+    // The other threads yield between rounds: std::shared_mutex prefers
+    // readers on glibc, and readers that never pause starve the removers on a
+    // machine with few cores. The caps only guard against a hang.
+    constexpr uint64_t kOtherRounds = 200000;
+    constexpr uint64_t kWalks = 20000;
 
     std::atomic<bool> removers_done{false};
     std::atomic<int> violations{0};
@@ -215,8 +220,10 @@ TEST(TenantRegistryTest, MixedLookupCreateRemoveAndVisitStayConsistent) {
     }
     for (int c = 0; c < 2; ++c) {
         threads.emplace_back([&, c] {
-            for (uint64_t i = c; !removers_done.load(std::memory_order_relaxed);
+            for (uint64_t i = c; i < kOtherRounds &&
+                                 !removers_done.load(std::memory_order_relaxed);
                  ++i) {
+                std::this_thread::yield();
                 if (!whole(registry.GetOrCreateTenant(ids[i % ids.size()]))) {
                     violation();
                 }
@@ -225,8 +232,10 @@ TEST(TenantRegistryTest, MixedLookupCreateRemoveAndVisitStayConsistent) {
     }
     for (int l = 0; l < 4; ++l) {
         threads.emplace_back([&, l] {
-            for (uint64_t i = l; !removers_done.load(std::memory_order_relaxed);
+            for (uint64_t i = l; i < kOtherRounds &&
+                                 !removers_done.load(std::memory_order_relaxed);
                  ++i) {
+                std::this_thread::yield();
                 const auto tenant = registry.Lookup(ids[i % ids.size()]);
                 if (tenant != nullptr && !whole(tenant)) {
                     violation();
@@ -238,7 +247,10 @@ TEST(TenantRegistryTest, MixedLookupCreateRemoveAndVisitStayConsistent) {
     // must neither deadlock nor disturb the walk it is part of.
     threads.emplace_back([&] {
         uint64_t calls = 0;
-        while (!removers_done.load(std::memory_order_relaxed)) {
+        for (uint64_t walk = 0;
+             walk < kWalks && !removers_done.load(std::memory_order_relaxed);
+             ++walk) {
+            std::this_thread::yield();
             std::vector<std::string> seen;
             registry.Visit([&](const TenantId& tenant_id,
                                const std::shared_ptr<Tenant>& tenant) {

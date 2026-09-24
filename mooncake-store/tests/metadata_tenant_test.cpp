@@ -267,6 +267,10 @@ TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
     const std::vector<std::string> keys = {"k1", "k2"};
     constexpr int kWriters = 4;
     constexpr int kWriterRounds = 20000;
+    // The other threads yield between rounds: std::shared_mutex prefers
+    // readers on glibc, and readers that never pause starve the writers on a
+    // machine with few cores. The cap only guards against a hang.
+    constexpr uint64_t kOtherRounds = 200000;
 
     std::atomic<bool> writers_done{false};
     std::atomic<int> violations{0};
@@ -293,6 +297,9 @@ TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
                     continue;
                 }
                 published.fetch_add(1, std::memory_order_relaxed);
+                // Leave the entry published for a moment, so the other
+                // threads meet it.
+                std::this_thread::yield();
                 if (TearDownObject(tenant, entry) ==
                     TearDownResult::kLostSlot) {
                     violation();
@@ -304,8 +311,10 @@ TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
     // entry a writer is still wiring or has just torn down itself.
     for (int r = 0; r < 2; ++r) {
         threads.emplace_back([&, r] {
-            for (uint64_t i = r; !writers_done.load(std::memory_order_relaxed);
+            for (uint64_t i = r; i < kOtherRounds &&
+                                 !writers_done.load(std::memory_order_relaxed);
                  ++i) {
+                std::this_thread::yield();
                 const auto entry = tenant.Get(keys[i % 2]);
                 if (entry == nullptr) {
                     continue;
@@ -328,8 +337,10 @@ TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
     // member of its group for as long as they hold its lock.
     for (int m = 0; m < 2; ++m) {
         threads.emplace_back([&, m] {
-            for (uint64_t i = m; !writers_done.load(std::memory_order_relaxed);
+            for (uint64_t i = m; i < kOtherRounds &&
+                                 !writers_done.load(std::memory_order_relaxed);
                  ++i) {
+                std::this_thread::yield();
                 const std::string& key = keys[i % 2];
                 (void)tenant.WithPublishedObject(
                     key, [&](ObjectMetadata&, ObjectEntry::State& state) {
@@ -347,7 +358,10 @@ TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
     // same group instance, so they carry one lease; a publication observed
     // half-wired would carry the lease it was constructed with instead.
     threads.emplace_back([&] {
-        while (!writers_done.load(std::memory_order_relaxed)) {
+        for (uint64_t i = 0;
+             i < kOtherRounds && !writers_done.load(std::memory_order_relaxed);
+             ++i) {
+            std::this_thread::yield();
             const auto first = tenant.Get("k1");
             const auto second = tenant.Get("k2");
             if (first == nullptr || second == nullptr) {
