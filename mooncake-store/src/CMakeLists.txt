@@ -24,6 +24,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/metrics_bootstrap_config_loader.cpp
     config/redis_connection_config.cpp
     config/s3_client_config.cpp
+    config/tenant_quota_bootstrap_config_loader.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
     master_service.cpp

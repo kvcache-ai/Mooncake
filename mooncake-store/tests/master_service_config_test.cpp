@@ -7,7 +7,7 @@
 #include <memory>
 #include <string>
 
-#include "../src/config/metrics_bootstrap_config_loader.h"
+#include "config/metrics_bootstrap_config_loader.h"
 #include "default_config.h"
 #include "ha/snapshot/batch_oplog/config.h"
 #include "master_config.h"
@@ -275,6 +275,44 @@ TEST(MasterServiceConfigTest,
     EXPECT_EQ(from_master.http_port, UINT16_MAX);
     EXPECT_FALSE(from_supervisor.enable_metric_reporting);
     EXPECT_EQ(from_supervisor.http_port, UINT16_MAX);
+}
+
+TEST(MasterServiceConfigTest, TenantQuotaConnectorReachesNonHaServingConfig) {
+    MasterConfig master_config{};
+    master_config.allocation_strategy = "random";
+    master_config.tenant_quota.enable_multi_tenants = true;
+    master_config.tenant_quota.tenant_quota_connector_type = "etcd";
+    master_config.tenant_quota.tenant_quota_connector_uri =
+        "tenant-policy-endpoint";
+
+    WrappedMasterServiceConfig wrapped_config(master_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
+
+    EXPECT_TRUE(service_config.enable_multi_tenants);
+    EXPECT_EQ(service_config.tenant_quota_connector_type, "etcd");
+    EXPECT_EQ(service_config.tenant_quota_connector_uri,
+              "tenant-policy-endpoint");
+}
+
+TEST(MasterServiceConfigTest, TenantQuotaConnectorReachesHaServingConfig) {
+    MasterConfig master_config{};
+    master_config.allocation_strategy = "random";
+    master_config.tenant_quota.enable_multi_tenants = true;
+    master_config.tenant_quota.tenant_quota_connector_type = "file";
+    master_config.tenant_quota.tenant_quota_connector_uri =
+        "tenant-policy.yaml";
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
+
+    EXPECT_TRUE(supervisor_config.enable_multi_tenants);
+    EXPECT_EQ(supervisor_config.tenant_quota_connector_type, "file");
+    EXPECT_EQ(supervisor_config.tenant_quota_connector_uri,
+              "tenant-policy.yaml");
+    EXPECT_TRUE(service_config.enable_multi_tenants);
+    EXPECT_EQ(service_config.tenant_quota_connector_type, "file");
+    EXPECT_EQ(service_config.tenant_quota_connector_uri, "tenant-policy.yaml");
 }
 
 }  // namespace mooncake::test
