@@ -913,7 +913,8 @@ int TransferEngine::sendNotifyByName(std::string remote_agent,
         auto status = impl_tent_->openSegment(handle, remote_agent);
         if (!status.ok()) return tentToClassicError(status.code());
         status = impl_tent_->sendNotification(handle, notifi);
-        impl_tent_->closeSegment(handle);
+        // openSegment may return a handle already held by a transfer caller.
+        // Keep the cached mapping until that caller closes it explicitly.
         return tentToClassicError(status.code());
     } else
         return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);

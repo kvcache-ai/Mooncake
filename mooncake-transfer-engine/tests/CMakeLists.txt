@@ -21,6 +21,12 @@ if(USE_TENT)
   # Match the compatibility shim public class definition and enable the
   # MC_USE_TENT regression cases in transport_uint_test.cpp.
   target_compile_definitions(transport_uint_test PRIVATE USE_TENT)
+  add_test(
+    NAME tent_compat_notify_test
+    COMMAND
+      transport_uint_test
+      --gtest_filter=TransferEngineTentCompatibilityTest.NotifyByNamePreservesOpenSegment
+  )
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 

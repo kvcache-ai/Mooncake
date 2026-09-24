@@ -289,6 +289,63 @@ TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {
     EXPECT_FALSE(engine.CheckSegmentStatus(1ull << 40).ok());
 }
 
+TEST(TransferEngineTentCompatibilityTest, NotifyByNamePreservesOpenSegment) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+    std::array<char, 4096> source{};
+    std::array<char, 4096> destination{};
+    source.fill('n');
+    TransferEngine target(true);
+    TransferEngine initiator(true);
+    ASSERT_EQ(target.init(P2PHANDSHAKE, "", "", 0, "tcp"), 0);
+    ASSERT_EQ(initiator.init(P2PHANDSHAKE, "", "", 0, "tcp"), 0);
+    ASSERT_EQ(
+        target.registerLocalMemory(destination.data(), destination.size()), 0);
+    ASSERT_EQ(initiator.registerLocalMemory(source.data(), source.size()), 0);
+    const std::string target_name =
+        "127.0.0.1:" + std::to_string(target.getRpcPort());
+    const auto peer = initiator.openSegment(target_name);
+    ASSERT_NE(peer, static_cast<Transport::SegmentHandle>(-1));
+
+    ASSERT_EQ(initiator.sendNotifyByName(target_name, {"test", "ready"}), 0);
+    std::vector<TransferMetadata::NotifyDesc> notifications;
+    ASSERT_EQ(target.getNotifies(notifications), 0);
+    ASSERT_EQ(notifications.size(), 1u);
+    EXPECT_EQ(notifications.front().notify_msg, "ready");
+    EXPECT_TRUE(initiator.CheckSegmentStatus(peer).ok());
+    EXPECT_EQ(initiator.openSegment(target_name), peer);
+
+    const auto batch = initiator.allocateBatchID(1);
+    TransferRequest request;
+    request.opcode = TransferRequest::WRITE;
+    request.source = source.data();
+    request.target_id = peer;
+    request.target_offset = reinterpret_cast<uint64_t>(destination.data());
+    request.length = source.size();
+    auto submitted = initiator.submitTransfer(batch, {request});
+    EXPECT_TRUE(submitted.ok()) << submitted.ToString();
+    if (submitted.ok()) {
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            ASSERT_TRUE(initiator.getTransferStatus(batch, 0, status).ok());
+            if (status.s != TransferStatusEnum::WAITING &&
+                status.s != TransferStatusEnum::PENDING)
+                break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(source, destination);
+    }
+    EXPECT_TRUE(initiator.freeBatchID(batch).ok());
+    EXPECT_EQ(initiator.closeSegment(peer), 0);
+    EXPECT_EQ(initiator.unregisterLocalMemory(source.data()), 0);
+    EXPECT_EQ(target.unregisterLocalMemory(destination.data()), 0);
+}
+
 TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");
     ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
