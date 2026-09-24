@@ -31,6 +31,14 @@ TEST(ObjectEntryTest, OwnsMetadataEnvelopeFromConstruction) {
         });
 }
 
+TEST(ObjectEntryTest, AConstructedEntryIsNotYetPublished) {
+    auto entry = test::MakeObjectEntry("k1");
+
+    // Publication is the route's claim on an entry, so an entry that was only
+    // constructed stands for no publication yet.
+    EXPECT_FALSE(entry->IsPublished());
+}
+
 TEST(ObjectEntryTest, AccessorsSeeTheStateWrittenUnderTheLock) {
     auto entry = test::MakeObjectEntry("k1");
     entry->WithExclusiveAccess([](ObjectMetadata&, ObjectEntry::State& state) {

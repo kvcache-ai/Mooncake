@@ -255,6 +255,70 @@ jobs:
         failed-tests-log: build/Testing/Temporary/LastTestsFailed.log
         last-test-log: build/Testing/Temporary/LastTest.log
 
+  tsan-tests:
+    name: TSAN metadata concurrency tests
+    needs: [check-paths]
+    if: *run-ci-for-source-changes
+    runs-on: ubuntu-22.04
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+      # The object model and tenancy suites, whose concurrency tests only
+      # prove anything when data races are detected, not just assertions.
+      TSAN_TESTS: >-
+        object_entry_test
+        object_index_test
+        group_index_test
+        metadata_tenant_test
+        metadata_tenant_registry_test
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Install build utilities and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build
+        sudo bash -x dependencies.sh -y
+      shell: bash
+
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
+
+    # The runner kernel randomizes mmap with more bits than the TSAN runtime
+    # of GCC 11 can map around, which aborts every instrumented binary at
+    # startup.
+    - name: Lower mmap randomization for TSAN
+      run: sudo sysctl -w vm.mmap_rnd_bits=28
+      shell: bash
+
+    - name: Configure project with TSAN
+      run: |
+        cmake -S . -B build-tsan -G Ninja \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DENABLE_TSAN=ON \
+          -DBUILD_UNIT_TESTS=ON \
+          -DBUILD_EXAMPLES=OFF \
+          -DWITH_STORE_RUST=OFF \
+          -DENABLE_SCCACHE=ON
+      shell: bash
+
+    - name: Build the TSAN test targets
+      run: cmake --build build-tsan --parallel --target ${TSAN_TESTS}
+      shell: bash
+
+    - name: Run the TSAN tests
+      env:
+        TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
+      run: |
+        ctest --test-dir build-tsan --output-on-failure \
+          -R "^($(echo ${TSAN_TESTS} | tr ' ' '|'))$"
+      shell: bash
+
   build-flags:
     needs: [check-paths]
     if: *run-ci-for-source-changes
@@ -754,6 +818,7 @@ jobs:
       - tone-script-tests
       - build-wheel
       - unit-tests
+      - tsan-tests
       - build-flags
       - test-wheel-ubuntu
       - build-wheel-cu13
@@ -785,6 +850,7 @@ jobs:
           RESULTS: >-
             ${{ needs.build-wheel.result }}
             ${{ needs.unit-tests.result }}
+            ${{ needs.tsan-tests.result }}
             ${{ needs.build-flags.result }}
             ${{ needs.test-wheel-ubuntu.result }}
             ${{ needs.build-wheel-cu13.result }}
