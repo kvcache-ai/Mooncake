@@ -432,6 +432,11 @@ class TentCompatibilityTransport final : public Transport {
             "TENT compatibility transport does not report transfer status");
     }
 
+    Status submitTransferTask(const std::vector<TransferTask*>&) override {
+        return Status::NotImplemented(
+            "TENT compatibility transport does not submit transfer tasks");
+    }
+
    private:
     int registerLocalMemory(void*, size_t, const std::string&, bool,
                             bool) override {
@@ -636,7 +641,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 
 int TransferEngine::freeEngine() {
     detachShutdownToken(shutdown_token_);
-    tent_compat_transport_.reset();
+    {
+        std::lock_guard<std::mutex> lock(tent_compat_transport_mutex_);
+        tent_compat_transport_.reset();
+    }
     if (!use_tent_ && impl_) {
         if (impl_.use_count() == 1) impl_->freeEngine();
         impl_.reset();
@@ -651,12 +659,13 @@ Transport* TransferEngine::installTransport(const std::string& proto,
     if (use_tent_) {
         (void)proto;
         (void)args;
-        static std::once_flag g_present;
-        std::call_once(g_present, [] {
+        std::call_once(tent_compat_log_once_, [] {
             LOG(INFO) << "installTransport is a compatibility no-op for TENT";
         });
+        std::lock_guard<std::mutex> lock(tent_compat_transport_mutex_);
         if (!tent_compat_transport_) {
-            tent_compat_transport_ = std::make_unique<TentCompatibilityTransport>();
+            tent_compat_transport_ =
+                std::make_unique<TentCompatibilityTransport>();
         }
         return tent_compat_transport_.get();
     } else {
@@ -996,10 +1005,12 @@ Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
 }
 
 Transport* TransferEngine::getTransport(const std::string& proto) {
-    if (use_tent_)
+    if (use_tent_) {
+        // TENT selects transports internally; installTransport() returns a
+        // compatibility handle only for classic null-checking callers.
         return nullptr;
-    else
-        return impl_->getTransport(proto);
+    }
+    return impl_->getTransport(proto);
 }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \

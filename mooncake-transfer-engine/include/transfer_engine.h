@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -35,7 +36,7 @@ class TransferEngineImpl;
 namespace tent {
 class Config;
 class TransferEngine;
-};
+};  // namespace tent
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 namespace device {
@@ -317,6 +318,8 @@ class TransferEngine {
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::unique_ptr<Transport> tent_compat_transport_;
+    std::mutex tent_compat_transport_mutex_;
+    std::once_flag tent_compat_log_once_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
     // Classic callers provide this through TransferEngine(auto_discover,
     // filter) before init() creates the native TENT engine.
