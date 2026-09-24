@@ -82,7 +82,7 @@ jobs:
           sleep $((attempt * 10))
         done
 
-    - name: Install toolchain and Python ${{ matrix.python-version }}
+    - name: Install toolchain
       shell: bash
       run: |
         set -eo pipefail
@@ -90,22 +90,23 @@ jobs:
         apt-get update -y
         apt-get install -y --no-install-recommends \
           curl build-essential sudo pkg-config \
-          ninja-build software-properties-common
-        PYV="${{ matrix.python-version }}"
-        if ! command -v "python${PYV}" >/dev/null 2>&1; then
-          add-apt-repository -y ppa:deadsnakes/ppa
-          apt-get update -y
-        fi
-        # Always install -dev + -venv: the image's system python3.10 exists but
-        # ships without the venv module / dev headers.
-        apt-get install -y --no-install-recommends \
-          "python${PYV}" "python${PYV}-dev" "python${PYV}-venv"
-        curl -sS https://bootstrap.pypa.io/get-pip.py | "python${PYV}"
-        PYTHON_BIN="$(command -v python${PYV})"
-        echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
-        # hipify-perl lives in /opt/rocm/bin; CMake's USE_HIP path requires it.
-        # Use GITHUB_PATH (setting PATH via GITHUB_ENV is not honored reliably).
+          ninja-build
+        # hipify-perl is required by the CMake USE_HIP path.
         echo "/opt/rocm/bin" >> "$GITHUB_PATH"
+
+    - name: Setup Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Set Python bin
+      shell: bash
+      run: |
+        set -euo pipefail
+        PYTHON_BIN="$(command -v python${{ matrix.python-version }})"
+        "$PYTHON_BIN" --version
+        "$PYTHON_BIN" -m pip --version
+        echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
 
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
