@@ -7,6 +7,7 @@
 #include <glog/logging.h>
 
 #include "config/metrics_bootstrap_config.h"
+#include "config/rpc_connection_bootstrap_config.h"
 #include "config_helper.h"
 #include "types.h"
 
@@ -98,8 +99,7 @@ struct MasterConfig {
     uint32_t rpc_thread_num;
     std::string rpc_address;
     std::string rpc_interface;
-    int32_t rpc_conn_timeout_seconds;
-    bool rpc_enable_tcp_no_delay;
+    RpcConnectionBootstrapConfig rpc_connection;
 
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
@@ -406,9 +406,8 @@ class MasterServiceSupervisorConfig {
 
         // Set optional parameters (these have default values)
         rpc_address = config.rpc_address;
-        rpc_conn_timeout =
-            std::chrono::seconds(config.rpc_conn_timeout_seconds);
-        rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
+        rpc_conn_timeout = config.rpc_connection.timeout;
+        rpc_enable_tcp_no_delay = config.rpc_connection.tcp_no_delay;
         ha_backend_type = config.ha_backend_type;
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
