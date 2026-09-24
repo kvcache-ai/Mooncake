@@ -347,6 +347,8 @@ class MasterMetricManager {
     // Tenant quota metrics
     void inc_tenant_quota_reject(const std::string& tenant_id,
                                  const std::string& reason, int64_t val = 1);
+    void inc_standby_restore_rejected_objects(const std::string& reason,
+                                              int64_t val = 1);
     void inc_tenant_evict_bytes(const std::string& tenant_id, int64_t bytes);
 
     // Promotion retry candidate metrics
@@ -765,6 +767,7 @@ class MasterMetricManager {
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
+    ylt::metric::dynamic_counter_1t standby_restore_rejected_objects_total_;
 
     // SSD Offload Task Metrics
     ylt::metric::dynamic_counter_1t offload_enqueued_total_;

@@ -451,6 +451,9 @@ MasterMetricManager::MasterMetricManager()
       tenant_evict_bytes_total_(
           "mooncake_tenant_evict_bytes_total",
           "Total bytes evicted by tenant-scoped quota eviction", {"tenant_id"}),
+      standby_restore_rejected_objects_total_(
+          "mooncake_ha_standby_restore_rejected_objects_total",
+          "Standby-restore objects skipped by validation reason", {"reason"}),
       offload_enqueued_total_(
           "master_offload_enqueued_total",
           "SSD offload tasks successfully enqueued (per store worker)",
@@ -1393,6 +1396,11 @@ void MasterMetricManager::inc_tenant_quota_reject(const std::string& tenant_id,
     tenant_quota_reject_total_.inc({tenant_id, reason}, val);
 }
 
+void MasterMetricManager::inc_standby_restore_rejected_objects(
+    const std::string& reason, int64_t val) {
+    standby_restore_rejected_objects_total_.inc({reason}, val);
+}
+
 void MasterMetricManager::inc_tenant_evict_bytes(const std::string& tenant_id,
                                                  int64_t bytes) {
     tenant_evict_bytes_total_.inc({tenant_id}, bytes);
@@ -2197,6 +2205,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_expired_unevaluated_);
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
+    serialize_metric(standby_restore_rejected_objects_total_);
     serialize_metric(tenant_evict_bytes_total_);
     serialize_metric(offload_enqueued_total_);
     serialize_metric(offload_completed_total_);
