@@ -158,7 +158,7 @@ std::string ReplyBytes(const redisReply* reply) {
 }
 
 RedisReplyPtr Exec(redisContext* context,
-                    const std::vector<std::string>& args) {
+                   const std::vector<std::string>& args) {
     std::vector<const char*> argv;
     std::vector<size_t> argvlen;
     argv.reserve(args.size());
@@ -253,10 +253,9 @@ ErrorCode RedisHaKvBackend::Put(std::string_view key, std::string_view value) {
         return connected;
     }
 #ifdef STORE_USE_REDIS
-    auto reply =
-        Exec(context_.get(),
-             {"EVAL", kPutScript, "2", mapped->index_key, mapped->redis_key,
-              std::string(value), std::string(key)});
+    auto reply = Exec(context_.get(), {"EVAL", kPutScript, "2",
+                                       mapped->index_key, mapped->redis_key,
+                                       std::string(value), std::string(key)});
     if (reply == nullptr) {
         LOG(WARNING) << "Redis PUT failed for OpLog key";
         context_.reset();
@@ -299,12 +298,12 @@ ErrorCode RedisHaKvBackend::Range(std::string_view begin_key,
         return connected;
     }
 #ifdef STORE_USE_REDIS
-    auto reply = Exec(
-        context_.get(),
-        {"EVAL", kRangeScript, "1", begin->index_key,
-         std::string("[") + std::string(begin_key),
-         std::string("(") + std::string(end_key), std::to_string(limit),
-         begin->logical_prefix, begin->redis_prefix});
+    auto reply =
+        Exec(context_.get(),
+             {"EVAL", kRangeScript, "1", begin->index_key,
+              std::string("[") + std::string(begin_key),
+              std::string("(") + std::string(end_key), std::to_string(limit),
+              begin->logical_prefix, begin->redis_prefix});
     if (reply == nullptr) {
         LOG(WARNING) << "Redis RANGE failed for OpLog keys";
         context_.reset();
@@ -361,11 +360,11 @@ ErrorCode RedisHaKvBackend::DeleteRange(std::string_view begin_key,
         return connected;
     }
 #ifdef STORE_USE_REDIS
-    auto reply = Exec(context_.get(),
-                      {"EVAL", kDeleteRangeScript, "1", begin->index_key,
-                       std::string("[") + std::string(begin_key),
-                       std::string("(") + std::string(end_key),
-                       begin->logical_prefix, begin->redis_prefix});
+    auto reply =
+        Exec(context_.get(), {"EVAL", kDeleteRangeScript, "1", begin->index_key,
+                              std::string("[") + std::string(begin_key),
+                              std::string("(") + std::string(end_key),
+                              begin->logical_prefix, begin->redis_prefix});
     if (reply == nullptr) {
         LOG(WARNING) << "Redis delete range failed for OpLog keys";
         context_.reset();
@@ -400,8 +399,8 @@ ErrorCode RedisHaKvBackend::Txn(const KvTxn& txn) {
     std::vector<std::string> args;
     std::string cluster_id;
     std::string index_key;
-    auto add_key = [&](std::string_view logical)
-        -> tl::expected<int, ErrorCode> {
+    auto add_key =
+        [&](std::string_view logical) -> tl::expected<int, ErrorCode> {
         auto mapped = MapOpLogKey(logical);
         if (!mapped) {
             return tl::make_unexpected(mapped.error());

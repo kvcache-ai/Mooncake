@@ -2592,8 +2592,7 @@ TEST_F(MasterServiceHATest, OplogRedisInvalidConnstringThrows) {
                       .set_cluster_id("oplog_redis_bad_connstring")
                       .build();
 
-    EXPECT_THROW(
-        { MasterService service(config); }, std::runtime_error);
+    EXPECT_THROW({ MasterService service(config); }, std::runtime_error);
 }
 
 TEST_F(MasterServiceHATest, BatchPrimaryDoesNotStartSnapshotWorker) {

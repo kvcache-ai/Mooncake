@@ -121,8 +121,7 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
             spec.cluster_namespace = cluster_id;
             auto backend = CreateHaKvBackend(spec);
             if (!backend) {
-                if (backend.error() ==
-                    ErrorCode::UNAVAILABLE_IN_CURRENT_MODE) {
+                if (backend.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE) {
                     state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
                     LOG(ERROR) << "Batch-record OpLog backend is not compiled "
                                   "in";

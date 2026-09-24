@@ -136,9 +136,8 @@ TEST_F(RedisOpLogBackendTest, CompareAndSwapAndBinaryValue) {
         "mooncake-store/{" + cluster_id_ + "}/oplog/durable_prefix";
     auto context = testing::ConnectRedisForTest(FLAGS_redis_endpoint);
     ASSERT_TRUE(context.has_value());
-    auto* raw = static_cast<redisReply*>(
-        redisCommand(context.value().get(), "GET %b", redis_key.data(),
-                     redis_key.size()));
+    auto* raw = static_cast<redisReply*>(redisCommand(
+        context.value().get(), "GET %b", redis_key.data(), redis_key.size()));
     testing::RedisReplyPtr reply(raw);
     ASSERT_NE(reply, nullptr);
     ASSERT_EQ(REDIS_REPLY_STRING, reply->type);
