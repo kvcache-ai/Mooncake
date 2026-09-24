@@ -75,6 +75,44 @@ Soft-pin state is not persisted in snapshots or the HA OpLog; after recovery or
 Standby promotion, restored objects are ordinary cache until a later write
 explicitly enables soft pinning again.
 
+### Managed Weight Revisions
+
+`MasterClient` and the Store client interface expose typed revision-management
+operations:
+
+```C++
+WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
+    const BeginWeightImportRequest& request);
+WeightRpcResult<WeightRevisionMetadata> CommitWeightImport(
+    const CommitWeightImportRequest& request);
+WeightRpcResult<WeightRevisionView> GetWeightRevision(
+    const GetWeightRevisionRequest& request);
+WeightRpcResult<ListWeightRevisionsResponse> ListWeightRevisions(
+    const ListWeightRevisionsRequest& request);
+WeightRpcResult<WeightRevisionLease> AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request);
+WeightRpcResult<WeightResidencyOperation> StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request);
+WeightRpcResult<WeightRevisionMetadata> ReconcileWeightRevision(
+    const ReconcileWeightRevisionRequest& request);
+WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request);
+```
+
+The same interface also provides abort, lease renew/release, and operation
+query calls. `WeightRpcResult<T>` preserves weight-management-domain errors
+separately from RPC transport errors. Commit, abort, lease acquisition,
+operation start, and deletion check the caller's expected metadata generation.
+Lease renewal and release use the lease identity; reconciliation uses the
+generation observed by the server. List requests use bounded deterministic
+pagination.
+
+The Weight metadata record contains one immutable manifest reference and aggregate
+lifecycle state. Tensor descriptors stay in `StoredWeightManifest`, while
+replica addresses stay in ordinary Store object metadata. See
+[Weight Management Architecture](../../design/mooncake-reshard/weight-management.md) for the
+complete ownership and recovery contract.
+
 ### Upsert
 
 ```C++

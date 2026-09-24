@@ -11,10 +11,12 @@ independent tensor-level management metadata.
 
 ## Delivery Status
 
-This stage integrates weight imports, publication, and revision leases with
-Master and HA replication and recovery. Managed payload-group reclamation,
-residency migration, and client RPCs are delivered as follow-up changes. The
-state machine remains independent of tensor geometry and physical placement.
+This stage provides Master RPC and C++ client access to revision management,
+managed-group removal protection, lease-fenced deletion, and basic residency
+operation reconciliation with HA recovery. Configurable residency policies,
+automatic migration, and the managed Python `WeightStore` facade remain
+follow-up work. The upload flow below describes the caller's responsibilities;
+the Python facade is not required to use the C++ interfaces.
 
 ## Authority Model
 
@@ -42,6 +44,12 @@ discoverable while the group is cold, degraded, deleting, or physically
 absent. The manifest and every payload object share one `payload_group_id`.
 Generic eviction and removal paths recognize that group as managed and cannot
 independently reclaim one member.
+
+`RemoveAll` removes eligible object metadata without issuing a whole-client
+SSD wipe: a disk client may also hold managed weights or objects imported
+concurrently. As with single-key removal, physical disk space is reclaimed by
+the existing disk eviction path when eligible; successful metadata removal
+does not promise immediate physical erasure.
 
 The group is a logical lifecycle boundary, not a distributed transaction.
 Physical work may be partial while an operation is running. The metadata store keeps
@@ -94,13 +102,19 @@ Availability, physical residency, and an in-progress operation are separate:
 | Residency | `UNKNOWN`, `HOT`, `COLD`, `MIXED`, `ABSENT` | observed placement across required group members |
 | Operation | `NONE`, `EVICTING`, `REHYDRATING`, `REPAIRING` | durable non-terminal group work |
 
+The current operation entry point starts `EVICTING` or `REHYDRATING`.
+`REPAIRING` is reserved for a follow-up recovery workflow.
+
 `READY` means the manifest and every required payload object have a readable
 replica. DRAM eviction changes residency but does not by itself make a revision
 unavailable. Missing required members produce `DEGRADED`; complete physical
 removal produces the retained `DELETED`/`ABSENT` tombstone.
 
-Every mutation is fenced by `expected_metadata_generation`. A stale writer
-fails with `STALE_GENERATION`. A retry of an uncertain import commit with the
+Commit, abort, lease acquisition, operation start, and deletion check the
+caller's `expected_metadata_generation`. Lease renewal and release use the
+lease identity; reconciliation prepares mutations against the generation it
+observes. A stale generation fails with `STALE_GENERATION`. A retry of an
+uncertain import commit with the
 same generation and immutable manifest reference is idempotent.
 
 ## Import and Publication
@@ -109,7 +123,7 @@ The managed upload sequence is:
 
 1. `BeginWeightImport` creates or returns the `IMPORTING` metadata record and
    Store-issued canonical payload group ID.
-2. `WeightStore` writes every payload object into that group.
+2. The caller writes every payload object into that group.
 3. The immutable `StoredWeightManifest` is committed last into the same group.
 4. `CommitWeightImport` validates exact group membership and the manifest
    reference, then durably publishes `READY`.
@@ -203,12 +217,6 @@ Disabling it does not remove existing weight state, including state loaded
 through snapshot restore or standby promotion. Such a cluster still requires
 readers that support its weight OpLog and snapshot formats.
 
-The metadata-only OpLog payload in this stage accepts revisions without an
-active residency operation (`operation=NONE`, `operation_id=0`). The applier
-rejects an active operation reference rather than accepting metadata whose
-operation record cannot be replicated. Residency operation publication and
-atomic replication of metadata with its operation record are follow-up work.
-
 ## Serving-System Boundary
 
 Store owns durable revision discovery, readable-residency state, leases, and
@@ -220,9 +228,11 @@ serving revision.
 
 ## Integration Boundary
 
-Follow-up changes expose the lifecycle primitives through the Master RPC and
-C++ client surfaces, then add a managed `WeightStore` Python facade for
-manifest upload and load. Framework adapters remain responsible for building
-and validating tensor manifests, holding runtime allocation guards, and
-activating revisions. Manifest-only objects without a Weight metadata record
-remain outside this lifecycle.
+This layer exposes the native lifecycle primitives through the Master RPC and
+C++ client surfaces. A follow-up change adds the managed `WeightStore` Python
+facade that composes these primitives with manifest upload and load. A
+framework adapter remains responsible for constructing and validating the
+immutable tensor manifest, holding runtime allocation guards, and activating a
+revision in the serving system. Manifest-only objects written without a Weight
+metadata record are outside this lifecycle and are not discovered
+automatically.

@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "master_service/dsl/scenario.h"
+#include "master_service_test_fixture.h"
 
 namespace mooncake::test {
 namespace {
@@ -180,6 +181,75 @@ TEST(MasterServiceDfsScenarioTest, EvictionReclaimsLastReplicas) {
     RunDfsEvictionCase("last_replica", {},
                        {std::nullopt, std::nullopt, size_t{1}, size_t{1}},
                        /*evict_memory_first=*/true);
+}
+
+class ManagedWeightDfsEvictionTest : public MasterServiceTest {};
+
+TEST_F(ManagedWeightDfsEvictionTest,
+       GenericDfsEvictionPreservesEveryManagedWeightMember) {
+    const ScopedDfsEnvironment dfs("managed_weight_dfs_eviction", "16384");
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    MasterService service(config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto importing = service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 4096,
+    });
+    ASSERT_TRUE(importing.has_value());
+
+    const std::string payload_key = "managed-weight-dfs-payload";
+    const std::string manifest_key =
+        "weights/production/llama-70b/step-100/7/manifest";
+    ReplicateConfig payload_config;
+    payload_config.replica_num = 1;
+    payload_config.dfs_replica_num = 1;
+    payload_config.data_type = ObjectDataType::WEIGHT;
+    payload_config.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    ASSERT_TRUE(service.PutStart(client_id, payload_key, TenantId::Default(),
+                                 4096, payload_config));
+    ASSERT_TRUE(service.PutEnd(client_id, payload_key, TenantId::Default(),
+                               ReplicaType::ALL));
+
+    auto manifest_config = payload_config;
+    manifest_config.data_type = ObjectDataType::METADATA;
+    ASSERT_TRUE(service.PutStart(client_id, manifest_key, TenantId::Default(),
+                                 4096, manifest_config));
+    ASSERT_TRUE(service.PutEnd(client_id, manifest_key, TenantId::Default(),
+                               ReplicaType::ALL));
+    ASSERT_TRUE(service.CommitWeightImport(CommitWeightImportRequest{
+        .identity = identity,
+        .expected_metadata_generation = importing->metadata_generation,
+        .manifest =
+            WeightManifestReference{
+                .manifest_key = manifest_key,
+                .manifest_sha256 = std::string(64, 'a'),
+                .payload_group_id = importing->manifest.payload_group_id,
+                .payload_keys_sha256 =
+                    ComputeWeightPayloadKeysSha256({payload_key}),
+                .payload_count = 1,
+                .logical_bytes = 4096,
+            },
+    }));
+
+    MasterServiceTestPeer(service).RunDfsEvictionForTesting();
+    auto payload = service.GetReplicaList(payload_key, TenantId::Default());
+    auto manifest = service.GetReplicaList(manifest_key, TenantId::Default());
+    ASSERT_TRUE(payload.has_value());
+    ASSERT_TRUE(manifest.has_value());
+    EXPECT_EQ(2u, payload->replicas.size());
+    EXPECT_EQ(2u, manifest->replicas.size());
 }
 
 }  // namespace mooncake::test

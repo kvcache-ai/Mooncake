@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 
@@ -33,6 +34,19 @@ class WeightStoreManager {
         return weight_metadata_.RestoreSnapshot(snapshot);
     }
     void Clear() { weight_metadata_.Clear(); }
+    size_t ReconcileWeightMetadataStoreOnce(uint64_t now_ms, size_t limit);
+    bool IsManagedGroup(const std::string& group) const {
+        return weight_metadata_.IsManagedGroup(group);
+    }
+    bool AllowsGroupMemberMutation(const std::string& group) const {
+        return weight_metadata_.AllowsGroupMemberMutation(group);
+    }
+    std::unique_lock<std::mutex> LockGroup(const TenantId& tenant,
+                                           const std::string& group) {
+        const auto key = tenant.MakeScopedKey(group);
+        return std::unique_lock(
+            group_locks_[std::hash<std::string>{}(key) % group_locks_.size()]);
+    }
 
     WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
         const AcquireWeightRevisionLeaseRequest& request);
@@ -40,6 +54,16 @@ class WeightStoreManager {
         const RenewWeightRevisionLeaseRequest& request);
     WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
         const ReleaseWeightRevisionLeaseRequest& request);
+
+    WeightMetadataStore::Result<WeightResidencyOperation>
+    StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request);
+    WeightMetadataStore::Result<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request) const;
+    WeightMetadataStore::Result<WeightRevisionMetadata> ReconcileWeightRevision(
+        const ReconcileWeightRevisionRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request);
 
     WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
@@ -53,6 +77,9 @@ class WeightStoreManager {
     ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
    private:
+    WeightMetadataStore::Result<WeightResidencyOperation>
+    PersistAndPublishWeightOperationMutation(
+        const WeightOperationMutation& mutation);
     WeightMetadataStore::Result<WeightRevisionLease>
     PersistAndPublishWeightLeaseMutation(const WeightLeaseMutation& mutation);
     WeightMetadataStore::Result<WeightRevisionMetadata>
@@ -66,6 +93,7 @@ class WeightStoreManager {
     WeightMetadataStore weight_metadata_;
     std::shared_mutex mutation_mutex_;
     std::array<std::mutex, 4096> group_locks_;
+    std::atomic<size_t> weight_reconciliation_offset_{0};
 };
 
 }  // namespace mooncake

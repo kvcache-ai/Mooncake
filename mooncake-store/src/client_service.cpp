@@ -2071,8 +2071,8 @@ bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
         !local_disk_probe_fn_) {
         return false;
     }
-    // RemoveAll wipes client SSD files while master keeps the metadata
-    // (issue #3709), leaving a completed entry whose backing file is gone.
+    // A physical SSD wipe can leave master metadata naming a completed entry
+    // whose backing file is gone (issue #3709).
     // Reporting success for a Put on top of it would store nothing. Ask the
     // installed probe (the offload file storage owned by RealClient) whether
     // the file is still there. Only a proven-gone answer evicts; present or
@@ -3665,11 +3665,8 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     }
 
     auto result = master_client_.RemoveAll(force);
-    if (result) {
-        if (storage_backend_) {
-            storage_backend_->RemoveAll();
-        }
-    }
+    // The master can retain protected objects. Local disk cleanup must use
+    // per-object eviction, not an unconditional wipe of this client's files.
     if (result && result.value() > 0 && hot_cache_) {
         hot_cache_->RemoveAllHotKeys();
     }
@@ -4051,6 +4048,66 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
     }
 
     return response;
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::BeginWeightImport(
+    const BeginWeightImportRequest& request) {
+    return master_client_.BeginWeightImport(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::CommitWeightImport(
+    const CommitWeightImportRequest& request) {
+    return master_client_.CommitWeightImport(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::AbortWeightImport(
+    const AbortWeightImportRequest& request) {
+    return master_client_.AbortWeightImport(request);
+}
+
+WeightRpcResult<WeightRevisionView> Client::GetWeightRevision(
+    const GetWeightRevisionRequest& request) {
+    return master_client_.GetWeightRevision(request);
+}
+
+WeightRpcResult<ListWeightRevisionsResponse> Client::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request) {
+    return master_client_.ListWeightRevisions(request);
+}
+
+WeightRpcResult<WeightRevisionLease> Client::AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request) {
+    return master_client_.AcquireWeightRevisionLease(request);
+}
+
+WeightRpcResult<WeightRevisionLease> Client::RenewWeightRevisionLease(
+    const RenewWeightRevisionLeaseRequest& request) {
+    return master_client_.RenewWeightRevisionLease(request);
+}
+
+WeightRpcResult<void> Client::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request) {
+    return master_client_.ReleaseWeightRevisionLease(request);
+}
+
+WeightRpcResult<WeightResidencyOperation> Client::StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request) {
+    return master_client_.StartWeightResidencyOperation(request);
+}
+
+WeightRpcResult<WeightResidencyOperation> Client::QueryWeightOperation(
+    const QueryWeightOperationRequest& request) {
+    return master_client_.QueryWeightOperation(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::ReconcileWeightRevision(
+    const ReconcileWeightRevisionRequest& request) {
+    return master_client_.ReconcileWeightRevision(request);
+}
+
+WeightRpcResult<WeightRevisionMetadata> Client::DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request) {
+    return master_client_.DeleteWeightRevision(request);
 }
 
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }

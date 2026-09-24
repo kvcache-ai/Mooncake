@@ -375,6 +375,31 @@ class RealClient : public PyClient {
      */
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
+    WeightRpcResult<WeightRevisionMetadata> begin_weight_import(
+        const BeginWeightImportRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> commit_weight_import(
+        const CommitWeightImportRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> abort_weight_import(
+        const AbortWeightImportRequest &request) override;
+    WeightRpcResult<WeightRevisionView> get_weight_revision(
+        const GetWeightRevisionRequest &request) override;
+    WeightRpcResult<ListWeightRevisionsResponse> list_weight_revisions(
+        const ListWeightRevisionsRequest &request) override;
+    WeightRpcResult<WeightRevisionLease> acquire_weight_revision_lease(
+        const AcquireWeightRevisionLeaseRequest &request) override;
+    WeightRpcResult<WeightRevisionLease> renew_weight_revision_lease(
+        const RenewWeightRevisionLeaseRequest &request) override;
+    WeightRpcResult<void> release_weight_revision_lease(
+        const ReleaseWeightRevisionLeaseRequest &request) override;
+    WeightRpcResult<WeightResidencyOperation> start_weight_residency_operation(
+        const StartWeightResidencyOperationRequest &request) override;
+    WeightRpcResult<WeightResidencyOperation> query_weight_operation(
+        const QueryWeightOperationRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> reconcile_weight_revision(
+        const ReconcileWeightRevisionRequest &request) override;
+    WeightRpcResult<WeightRevisionMetadata> delete_weight_revision(
+        const DeleteWeightRevisionRequest &request) override;
+
     /**
      * @brief Point-in-time existence check that grants no read lease
      * @param key Key to check

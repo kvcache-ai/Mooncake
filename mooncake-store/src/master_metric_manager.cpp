@@ -1,5 +1,7 @@
 #include "master_metric_manager.h"
 
+#include <algorithm>
+#include <array>
 #include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <limits>   // For std::numeric_limits
@@ -10,6 +12,7 @@
 #include "common/byte_size.h"
 #include "segment.h"
 #include "version.h"
+#include "weight_metadata_store.h"
 
 namespace mooncake {
 
@@ -539,6 +542,23 @@ MasterMetricManager::MasterMetricManager()
       mark_task_to_complete_failures_(
           "master_update_task_failures_total",
           "Total number of failed MarkTaskToComplete requests"),
+      weight_revisions_by_availability_(
+          "master_weight_revisions",
+          "Current managed weight revisions by availability", {"availability"}),
+      weight_revisions_by_residency_(
+          "master_weight_revision_residency",
+          "Current managed weight revisions by residency", {"residency"}),
+      weight_active_leases_("master_weight_active_leases",
+                            "Current unexpired managed weight revision leases"),
+      weight_pending_operations_(
+          "master_weight_pending_operations",
+          "Current unfinished managed weight residency operations"),
+      weight_oldest_operation_age_ms_(
+          "master_weight_oldest_operation_age_ms",
+          "Age in milliseconds of the oldest unfinished weight operation"),
+      weight_reconciliation_failures_(
+          "master_weight_reconciliation_failures_total",
+          "Total managed weight reconciliation failures"),
       build_info_("mooncake_build_info",
                   "Build version of the running master; the value is always 1 "
                   "and the version strings are carried by the labels",
@@ -570,6 +590,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
     promotion_in_flight_metric_.update(0);
+    weight_active_leases_.update(0);
+    weight_pending_operations_.update(0);
+    weight_oldest_operation_age_ms_.update(0);
+    weight_reconciliation_failures_.inc(0);
 
     // Update Counters (use inc(0) to mark as changed)
     promotion_admitted_.inc(0);
@@ -1992,6 +2016,95 @@ int64_t MasterMetricManager::get_update_task_failures() {
     return mark_task_to_complete_failures_.value();
 }
 
+void MasterMetricManager::project_weight_metadata(
+    const WeightMetadataSnapshot& snapshot, uint64_t now_ms) {
+    static constexpr std::array availability_labels{
+        std::pair{WeightAvailabilityState::IMPORTING, "importing"},
+        std::pair{WeightAvailabilityState::READY, "ready"},
+        std::pair{WeightAvailabilityState::DEGRADED, "degraded"},
+        std::pair{WeightAvailabilityState::DELETING, "deleting"},
+        std::pair{WeightAvailabilityState::DELETED, "deleted"},
+    };
+    static constexpr std::array residency_labels{
+        std::pair{WeightResidencyState::UNKNOWN, "unknown"},
+        std::pair{WeightResidencyState::HOT, "hot"},
+        std::pair{WeightResidencyState::COLD, "cold"},
+        std::pair{WeightResidencyState::MIXED, "mixed"},
+        std::pair{WeightResidencyState::ABSENT, "absent"},
+    };
+
+    for (const auto& [state, label] : availability_labels) {
+        const auto count =
+            std::count_if(snapshot.metadata.begin(), snapshot.metadata.end(),
+                          [state](const auto& metadata) {
+                              return metadata.availability == state;
+                          });
+        weight_revisions_by_availability_.update({label},
+                                                 static_cast<int64_t>(count));
+    }
+    for (const auto& [state, label] : residency_labels) {
+        const auto count =
+            std::count_if(snapshot.metadata.begin(), snapshot.metadata.end(),
+                          [state](const auto& metadata) {
+                              return metadata.residency == state;
+                          });
+        weight_revisions_by_residency_.update({label},
+                                              static_cast<int64_t>(count));
+    }
+
+    const auto active_leases = std::count_if(
+        snapshot.leases.begin(), snapshot.leases.end(),
+        [now_ms](const auto& lease) { return lease.expires_at_ms > now_ms; });
+    weight_active_leases_.update(static_cast<int64_t>(active_leases));
+
+    int64_t pending_operations = 0;
+    uint64_t oldest_age_ms = 0;
+    for (const auto& operation : snapshot.operations) {
+        if (operation.message == "completed") {
+            continue;
+        }
+        ++pending_operations;
+        if (now_ms >= operation.started_at_ms) {
+            oldest_age_ms =
+                std::max(oldest_age_ms, now_ms - operation.started_at_ms);
+        }
+    }
+    weight_pending_operations_.update(pending_operations);
+    weight_oldest_operation_age_ms_.update(static_cast<int64_t>(
+        std::min(oldest_age_ms,
+                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))));
+}
+
+void MasterMetricManager::inc_weight_reconciliation_failures(int64_t val) {
+    weight_reconciliation_failures_.inc(val);
+}
+
+int64_t MasterMetricManager::get_weight_revision_count(
+    const std::string& availability) {
+    return weight_revisions_by_availability_.value({availability});
+}
+
+int64_t MasterMetricManager::get_weight_residency_count(
+    const std::string& residency) {
+    return weight_revisions_by_residency_.value({residency});
+}
+
+int64_t MasterMetricManager::get_weight_active_leases() {
+    return weight_active_leases_.value();
+}
+
+int64_t MasterMetricManager::get_weight_pending_operations() {
+    return weight_pending_operations_.value();
+}
+
+int64_t MasterMetricManager::get_weight_oldest_operation_age_ms() {
+    return weight_oldest_operation_age_ms_.value();
+}
+
+int64_t MasterMetricManager::get_weight_reconciliation_failures() {
+    return weight_reconciliation_failures_.value();
+}
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -2203,6 +2316,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_failed_total_);
     serialize_metric(offload_cancelled_total_);
     serialize_metric(offload_enqueue_rejected_total_);
+    serialize_metric(weight_revisions_by_availability_);
+    serialize_metric(weight_revisions_by_residency_);
+    serialize_metric(weight_active_leases_);
+    serialize_metric(weight_pending_operations_);
+    serialize_metric(weight_oldest_operation_age_ms_);
+    serialize_metric(weight_reconciliation_failures_);
     serialize_metric(build_info_);
 
     // Serialize Snapshot Metrics
