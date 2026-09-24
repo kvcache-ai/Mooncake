@@ -286,8 +286,30 @@ if(USE_SUPA)
     endif()
   endif()
   message(STATUS "  BIREN_HOME: ${BIREN_HOME}")
-  include_directories(${BIREN_HOME}/supa/include)
+  # The SUPA SDK ships generic header names (e.g. version.h) that must not
+  # shadow Mooncake's own headers, so expose it as a system include directory.
+  include_directories(SYSTEM ${BIREN_HOME}/supa/include)
   link_directories(${BIREN_HOME}/supa/lib ${BIREN_HOME}/brumd/lib)
+  # Resolve the runtime library by name: older SUPA SDKs ship libsupa.so with a
+  # separate libsupart.so, while newer SDKs ship a single libsupa-runtime.so.
+  find_library(
+    SUPA_RUNTIME_LIBRARY
+    NAMES supa supa-runtime
+    PATHS ${BIREN_HOME}/supa/lib)
+  find_library(
+    SUPA_PART_LIBRARY
+    NAMES supart
+    PATHS ${BIREN_HOME}/supa/lib)
+  if(NOT SUPA_RUNTIME_LIBRARY)
+    message(
+      FATAL_ERROR
+        "SUPA runtime library not found under ${BIREN_HOME}/supa/lib (expected libsupa.so, libsupa-runtime.so, or libsupart.so)"
+    )
+  endif()
+  set(SUPA_LIBRARIES ${SUPA_RUNTIME_LIBRARY})
+  if(SUPA_PART_LIBRARY)
+    list(APPEND SUPA_LIBRARIES ${SUPA_PART_LIBRARY})
+  endif()
 endif()
 
 if(USE_TPU)

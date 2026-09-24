@@ -128,6 +128,7 @@ environment setup must be prepared separately.
 | Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Use `-DDTK_INCLUDE_DIR` and `-DDTK_LIB_DIR` for custom layouts. |
 | ScaleFabric SHCA | `-DUSE_SHCA=ON` | Install `shca-tools`. | Supports Transfer Engine/TENT RDMA paths only; Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
+| Biren GPU | `-DUSE_SUPA=ON` | Install Biren SUPA SDK. | Set `BIREN_HOME` to the SDK root containing `supa/include` and `supa/lib`, or pass `-DBIREN_HOME=/path/to/biren-sdk`. Uses a CUDA-compatible runtime. |
 
 ```{admonition} NCCL host RMA constraints
 :class: important
@@ -238,6 +239,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_HIP=ON/OFF` | `OFF` | Enable AMD GPU support via HIP/ROCm. |
 | `-DUSE_HYGON=ON/OFF` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
+| `-DUSE_SUPA=ON/OFF` | `OFF` | Enable Biren GPU support via the SUPA SDK. Uses a CUDA-compatible runtime. Set `BIREN_HOME` to the SDK root. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
 | `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
 | `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
@@ -262,6 +264,7 @@ The following options can be passed to `cmake ..`.
 | `-DCOREX_ROOT=/path/to/corex` | `-DUSE_COREX=ON` | Override the CoreX SDK root. `COREX_HOME` is also honored; default is `/usr/local/corex`. |
 | `-DCOREX_INCLUDE_DIR=/path/to/include` | `-DUSE_COREX=ON` | Override the CoreX include directory. |
 | `-DCOREX_LIB_DIR=/path/to/lib` | `-DUSE_COREX=ON` | Override the CoreX library directory. |
+| `-DBIREN_HOME=/path/to/biren-sdk` | `-DUSE_SUPA=ON` | Override the Biren SUPA SDK root. `BIREN_HOME` is also honored; default is `/usr/local/birensupa/all/latest`. The root must contain `supa/include` and `supa/lib`. |
 | `-DNEUWARE_ROOT=/path/to/neuware` | `-DUSE_MLU=ON` | Override the Neuware SDK root. `NEUWARE_HOME` is also honored; default is `/usr/local/neuware`. |
 | `-DMLU_INCLUDE_DIR=/path/to/include` | `-DUSE_MLU=ON` | Override the Neuware include directory. |
 | `-DMLU_LIB_DIR=/path/to/lib64` | `-DUSE_MLU=ON` | Override the Neuware library directory. |
