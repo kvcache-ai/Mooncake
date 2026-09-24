@@ -665,6 +665,15 @@ TEST(ShmTransportTest, RegisterRejectsSubRangeAndOverflow) {
                                                         page_size * 2 + 1),
               ERR_INVALID_ARGUMENT);
 
+    Transport::BufferEntry valid_entry{base, page_size};
+    Transport::BufferEntry invalid_entry{mid, page_size};
+    EXPECT_EQ(ShmTransportTestPeer::registerLocalMemoryBatch(
+                  transport, {valid_entry, invalid_entry}),
+              ERR_INVALID_ARGUMENT);
+    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(desc);
+    EXPECT_TRUE(desc->buffers.empty());
+
     std::vector<char> heap(page_size);
     EXPECT_EQ(ShmTransportTestPeer::registerLocalMemory(transport, heap.data(),
                                                         page_size),
@@ -673,7 +682,7 @@ TEST(ShmTransportTest, RegisterRejectsSubRangeAndOverflow) {
     ASSERT_EQ(
         ShmTransportTestPeer::registerLocalMemory(transport, base, page_size),
         0);
-    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
     ASSERT_TRUE(desc);
     ASSERT_EQ(desc->buffers.size(), 1u);
     EXPECT_EQ(desc->buffers[0].addr, reinterpret_cast<uint64_t>(base));

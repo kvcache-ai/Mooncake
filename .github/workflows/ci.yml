@@ -211,6 +211,7 @@ jobs:
           -DWITH_P2P_STORE=ON \
           -DWITH_CONDUCTOR=ON \
           -DSTORE_USE_ETCD=ON \
+          -DENABLE_MULTI_PROTOCOL=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=ON \
           -DENABLE_SCCACHE=ON

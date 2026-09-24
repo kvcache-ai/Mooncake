@@ -17,6 +17,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unistd.h>
 #include <vector>
 
@@ -156,6 +157,24 @@ const TransferMetadata::BufferDesc* FindPosixShmBuffer(
         if (isPosixShmName(buffer.shm_name)) return &buffer;
     }
     return nullptr;
+}
+
+const TransferMetadata::BufferDesc* FindPosixShmBufferAt(
+    const TransferMetadata::SegmentDesc& desc, const void* addr) {
+    const auto target = reinterpret_cast<uint64_t>(addr);
+    for (const auto& buffer : desc.buffers) {
+        if (buffer.addr == target && isPosixShmName(buffer.shm_name))
+            return &buffer;
+    }
+    return nullptr;
+}
+
+bool HasBufferAt(const TransferMetadata::SegmentDesc& desc, const void* addr) {
+    const auto target = reinterpret_cast<uint64_t>(addr);
+    for (const auto& buffer : desc.buffers) {
+        if (buffer.addr == target) return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -320,6 +339,76 @@ TEST(ShmTransportE2E, RegisterSubRangeFails) {
     ASSERT_NO_FATAL_FAILURE(ExpectShmWriteAndRead(*engine_a, *engine_b, remote,
                                                   remote_shm->addr, page_size));
     ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
+
+    void* batch_remote = engine_a->allocateSharedMemory(length);
+    ASSERT_NE(batch_remote, nullptr);
+    auto* batch_mid = static_cast<char*>(batch_remote) + page_size;
+    EXPECT_EQ(engine_a->registerLocalMemoryBatch(
+                  {{batch_remote, page_size}, {batch_mid, page_size}}, "cpu:0"),
+              ERR_INVALID_ARGUMENT);
+    auto local_desc =
+        engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(local_desc);
+    EXPECT_FALSE(HasBufferAt(*local_desc, batch_remote));
+    EXPECT_FALSE(HasBufferAt(*local_desc, batch_mid));
+    EXPECT_EQ(
+        engine_a->registerLocalMemoryBatch({{batch_remote, length}}, "cpu:0"),
+        0);
+    local_desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(local_desc);
+    auto* batch_shm = FindPosixShmBufferAt(*local_desc, batch_remote);
+    ASSERT_NE(batch_shm, nullptr);
+    EXPECT_EQ(batch_shm->length, length);
+#ifdef ENABLE_MULTI_PROTOCOL
+    EXPECT_EQ(batch_shm->protocol, "shm");
+#endif
+    ASSERT_EQ(engine_a->freeSharedMemory(batch_remote), 0);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    void* mp_remote = engine_a->allocateSharedMemory(length);
+    ASSERT_NE(mp_remote, nullptr);
+    auto* mp_mid = static_cast<char*>(mp_remote) + page_size;
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        invalid_map = {{"shm", {{mp_mid, page_size}}}};
+    EXPECT_EQ(engine_a->mp_registerLocalMemory(invalid_map),
+              ERR_INVALID_ARGUMENT);
+    local_desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(local_desc);
+    EXPECT_FALSE(HasBufferAt(*local_desc, mp_mid));
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        valid_map = {{"shm", {{mp_remote, length}}}};
+    EXPECT_EQ(engine_a->mp_registerLocalMemory(valid_map), 0);
+    local_desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(local_desc);
+    auto* mp_shm = FindPosixShmBufferAt(*local_desc, mp_remote);
+    ASSERT_NE(mp_shm, nullptr);
+    EXPECT_EQ(mp_shm->length, length);
+    EXPECT_EQ(mp_shm->protocol, "shm");
+    ASSERT_EQ(engine_a->freeSharedMemory(mp_remote), 0);
+
+    void* tcp_remote = engine_a->allocateSharedMemory(length);
+    ASSERT_NE(tcp_remote, nullptr);
+    auto* tcp_mid = static_cast<char*>(tcp_remote) + page_size;
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        invalid_tcp_map = {{"tcp", {{tcp_mid, page_size}}}};
+    EXPECT_EQ(engine_a->mp_registerLocalMemory(invalid_tcp_map),
+              ERR_INVALID_ARGUMENT);
+    local_desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(local_desc);
+    EXPECT_FALSE(HasBufferAt(*local_desc, tcp_mid));
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        valid_tcp_map = {{"tcp", {{tcp_remote, length}}}};
+    EXPECT_EQ(engine_a->mp_registerLocalMemory(valid_tcp_map), 0);
+    local_desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(local_desc);
+    EXPECT_TRUE(HasBufferAt(*local_desc, tcp_remote));
+    EXPECT_EQ(FindPosixShmBufferAt(*local_desc, tcp_remote), nullptr);
+    ASSERT_EQ(engine_a->freeSharedMemory(tcp_remote), 0);
+#endif
 }
 
 TEST(ShmTransportE2E, TransferFailsAfterFreeSharedMemory) {
