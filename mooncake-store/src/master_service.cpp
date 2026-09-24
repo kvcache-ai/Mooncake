@@ -173,6 +173,13 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
     return config.group_ids->at(key_index);
 }
 
+// A memory replica a standby remount can re-adopt.
+bool IsLiveMemoryReplica(const Replica& replica) {
+    return replica.is_memory_replica() &&
+           replica.status() != ReplicaStatus::REMOVED &&
+           replica.status() != ReplicaStatus::FAILED;
+}
+
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
@@ -752,10 +759,11 @@ MasterService::~MasterService() {
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }
-    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+    for (const auto& charge : orphaned_segments_.ReleaseAll()) {
         MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
-        MasterMetricManager::instance().remove_segment_metrics(segment);
+            charge.segment_name, static_cast<int64_t>(charge.bytes));
+        MasterMetricManager::instance().remove_segment_metrics(
+            charge.segment_name);
     }
 
     // Segments still mounted here never went through CommitUnmountSegment;
@@ -981,29 +989,21 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 #endif
 }
 
-ErrorCode MasterService::ValidateStandbyRemountSegment(
-    const Segment& segment) const {
-    const StandbySegmentInfo* match = nullptr;
-    for (const auto& standby : standby_memory_segments_) {
-        if (standby.transport_endpoint == segment.te_endpoint ||
-            standby.segment_name == segment.name) {
-            if (match != nullptr && match != &standby) {
-                return ErrorCode::INVALID_PARAMS;
-            }
-            match = &standby;
-        }
-    }
-    if (match != nullptr && segment.protocol == "cxl") {
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
-    }
-    if (match != nullptr && (match->segment_name != segment.name ||
-                             match->transport_endpoint != segment.te_endpoint ||
-                             match->capacity != segment.size)) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-    return ErrorCode::OK;
-}
-
+// Re-adopting a standby-restored segment happens in two stages.
+//
+// Finding the replicas that survived on the segment costs one pass over
+// every object in the store, and rebuilding the segment's allocator from
+// them costs one pass over those replicas. Neither mutates anything, so
+// both run under the shared snapshot lock, where they block only the
+// snapshot fork. The exclusive lock is taken for the second stage alone,
+// which publishes the segment and re-points the replicas the first stage
+// found: that stage looks up those keys directly instead of walking the
+// store, so its critical section is bounded by the number of replicas on
+// the segment rather than by the size of the store.
+//
+// The shared stage reads state that only an HA restore rewrites, so the
+// exclusive stage revalidates against the restore generation before acting
+// on anything the shared stage collected.
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
@@ -1030,286 +1030,28 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             MasterMetricManager::instance().on_client_liveness_record_removed(
                 ClientLivenessState::ACTIVE);
         };
-        std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
                 break;
             }
         }
-        {
-            auto segment_access = segment_manager_.getSegmentAccess();
-            for (const auto& segment : segments) {
-                auto standby_validation =
-                    ValidateStandbyRemountSegment(segment);
-                if (standby_validation != ErrorCode::OK) {
-                    discard_provisional_record();
-                    return tl::make_unexpected(standby_validation);
-                }
-                auto validation =
-                    segment_access.ValidateRemountSegment(segment, client_id);
-                if (validation != ErrorCode::OK) {
-                    discard_provisional_record();
-                    return tl::make_unexpected(validation);
-                }
-            }
+
+        auto plan = PrepareRemount(segments, client_id);
+        if (!plan) {
+            discard_provisional_record();
+            return tl::make_unexpected(plan.error());
         }
-        if (ok_client_.contains(client_id)) {
-            LOG(WARNING) << "client_id=" << client_id
-                         << ", warn=client_already_remounted";
-            // Return OK because this is an idempotent operation
+        if (plan->already_remounted) {
             return {};
         }
 
-        struct SegmentRestore {
-            Segment segment;
-            std::shared_ptr<BufferAllocatorBase> old_allocator;
-            std::shared_ptr<BufferAllocatorBase> restored_allocator;
-            std::vector<Replica*> replicas;
-            std::vector<AllocatedBuffer::Descriptor> descriptors;
-            std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
-            uint64_t imported_size{0};
-        };
-        std::vector<SegmentRestore> restores;
-        restores.reserve(segments.size());
-        std::vector<bool> segment_existed(segments.size());
-        auto rollback_new_segments = [&] {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            for (size_t i = 0; i < segments.size(); ++i) {
-                if (segment_existed[i] ||
-                    !segment_access.GetAllocator(segments[i].id)) {
-                    continue;
-                }
-                size_t capacity = 0;
-                if (segment_access.PrepareUnmountSegment(
-                        segments[i].id, capacity) != ErrorCode::OK) {
-                    LOG(ERROR) << "segment_name=" << segments[i].name
-                               << ", error=remount_rollback_prepare_failed";
-                    continue;
-                }
-                if (segment_access.CommitUnmountSegment(
-                        segments[i].id, client_id, capacity) != ErrorCode::OK) {
-                    LOG(ERROR) << "segment_name=" << segments[i].name
-                               << ", error=remount_rollback_commit_failed";
-                }
-            }
-        };
-        auto fail_remount =
-            [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
-            rollback_new_segments();
+        auto committed = CommitRemount(segments, client_id, record, *plan);
+        if (!committed) {
             discard_provisional_record();
-            return tl::make_unexpected(error);
-        };
-
-        ErrorCode remount_error = ErrorCode::OK;
-        {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            for (size_t i = 0; i < segments.size(); ++i) {
-                segment_existed[i] =
-                    segment_access.GetAllocator(segments[i].id) != nullptr;
-            }
-
-            remount_error =
-                segment_access.ReMountSegment(segments, client_id, record);
-            if (remount_error == ErrorCode::OK) {
-                segment_access.BindClientLiveness(client_id, record);
-                for (const auto& segment : segments) {
-                    auto allocator = segment_access.GetAllocator(segment.id);
-                    Segment authoritative;
-                    if (!allocator ||
-                        !segment_access.GetSegment(segment.id, authoritative)) {
-                        remount_error = ErrorCode::INTERNAL_ERROR;
-                        break;
-                    }
-                    restores.push_back({std::move(authoritative),
-                                        std::move(allocator),
-                                        nullptr,
-                                        {},
-                                        {},
-                                        {},
-                                        0});
-                }
-            }
+            return tl::make_unexpected(committed.error());
         }
-        if (remount_error != ErrorCode::OK) {
-            return fail_remount(remount_error);
-        }
-
-        bool ambiguous_endpoint = false;
-        bool unsupported_cxl = false;
-        std::unordered_set<ObjectMetadata*> affected_objects;
-        bool any_standby_kept_alive = std::any_of(
-            segments.begin(), segments.end(), [this](const Segment& segment) {
-                return standby_accounted_memory_bytes_.contains(segment.name);
-            });
-        for (size_t shard_index = 0;
-             any_standby_kept_alive && shard_index < kNumShards;
-             ++shard_index) {
-            MetadataShardAccessorRW shard(this, shard_index);
-            for (auto& [tenant_id, tenant] : shard->tenants) {
-                (void)tenant_id;
-                for (auto& [key, metadata] : tenant.metadata) {
-                    (void)key;
-                    metadata.VisitReplicas(
-                        [](const Replica& replica) {
-                            return replica.is_memory_replica() &&
-                                   replica.status() != ReplicaStatus::REMOVED &&
-                                   replica.status() != ReplicaStatus::FAILED;
-                        },
-                        [&](Replica& replica) {
-                            auto descriptor = replica.get_descriptor()
-                                                  .get_memory_descriptor()
-                                                  .buffer_descriptor;
-                            SegmentRestore* match = nullptr;
-                            for (auto& restore : restores) {
-                                if (descriptor.transport_endpoint_ ==
-                                        restore.segment.te_endpoint ||
-                                    descriptor.transport_endpoint_ ==
-                                        restore.segment.name) {
-                                    if (match != nullptr) {
-                                        ambiguous_endpoint = true;
-                                        return;
-                                    }
-                                    match = &restore;
-                                }
-                            }
-                            if (match != nullptr) {
-                                if (descriptor.protocol_ == "cxl") {
-                                    unsupported_cxl = true;
-                                    return;
-                                }
-                                descriptor.transport_endpoint_ =
-                                    match->segment.te_endpoint;
-                                match->replicas.push_back(&replica);
-                                match->descriptors.push_back(descriptor);
-                                affected_objects.insert(&metadata);
-                            }
-                        });
-                }
-            }
-        }
-        if (ambiguous_endpoint) {
-            return fail_remount(ErrorCode::INVALID_PARAMS);
-        }
-        if (unsupported_cxl) {
-            return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-        }
-
-        for (auto& restore : restores) {
-            if (restore.descriptors.empty()) {
-                continue;
-            }
-            const RegionResourceSpec spec{
-                restore.segment.id, restore.segment.name, restore.segment.base,
-                restore.segment.size, restore.segment.te_endpoint};
-            auto allocations =
-                BuildRegionLiveAllocations(spec, restore.descriptors);
-            if (!allocations) {
-                return fail_remount(allocations.error());
-            }
-            if (std::dynamic_pointer_cast<OffsetBufferAllocator>(
-                    restore.old_allocator)) {
-                auto imported = ImportOffsetBufferAllocator(
-                    restore.segment.name, restore.segment.base,
-                    restore.segment.size, restore.segment.te_endpoint,
-                    *allocations);
-                if (!imported) {
-                    return fail_remount(ErrorCode::INVALID_PARAMS);
-                }
-                restore.restored_allocator = std::move(imported->allocator);
-                restore.buffers = std::move(imported->buffers);
-            } else if (std::dynamic_pointer_cast<CachelibBufferAllocator>(
-                           restore.old_allocator)) {
-                auto imported = ImportCachelibBufferAllocator(
-                    restore.segment.name, restore.segment.base,
-                    restore.segment.size, restore.segment.te_endpoint,
-                    *allocations);
-                if (!imported) {
-                    return fail_remount(ErrorCode::INVALID_PARAMS);
-                }
-                restore.restored_allocator = std::move(imported->allocator);
-                restore.buffers = std::move(imported->buffers);
-            } else {
-                return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-            }
-        }
-
-        std::vector<ScopedSegmentAccess::AllocatorReplacement>
-            allocator_replacements;
-        for (auto& restore : restores) {
-            if (restore.restored_allocator) {
-                if (restore.buffers.size() != restore.replicas.size() ||
-                    std::any_of(restore.buffers.begin(), restore.buffers.end(),
-                                [](const auto& buffer) { return !buffer; })) {
-                    return fail_remount(ErrorCode::INTERNAL_ERROR);
-                }
-                restore.imported_size = std::accumulate(
-                    restore.descriptors.begin(), restore.descriptors.end(),
-                    uint64_t{0}, [](uint64_t sum, const auto& descriptor) {
-                        return sum + descriptor.size_;
-                    });
-                auto accounted =
-                    standby_accounted_memory_bytes_.find(restore.segment.name);
-                if (accounted == standby_accounted_memory_bytes_.end() ||
-                    accounted->second < restore.imported_size) {
-                    return fail_remount(ErrorCode::INTERNAL_ERROR);
-                }
-                allocator_replacements.push_back({restore.segment.id,
-                                                  restore.old_allocator,
-                                                  restore.restored_allocator});
-            }
-        }
-        bool allocators_replaced = false;
-        {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            allocators_replaced =
-                segment_access.ReplaceAllocators(allocator_replacements);
-        }
-        if (!allocators_replaced) {
-            return fail_remount(ErrorCode::INTERNAL_ERROR);
-        }
-        {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            for (auto& restore : restores) {
-                for (auto& buffer : restore.buffers) {
-                    segment_access.BindBufferToSegment(restore.segment.id,
-                                                       *buffer);
-                }
-            }
-        }
-        for (auto& restore : restores) {
-            if (restore.imported_size != 0) {
-                MasterMetricManager::instance().dec_allocated_mem_size(
-                    restore.segment.name,
-                    static_cast<int64_t>(restore.imported_size));
-                auto accounted =
-                    standby_accounted_memory_bytes_.find(restore.segment.name);
-                accounted->second -= restore.imported_size;
-                if (accounted->second == 0) {
-                    standby_accounted_memory_bytes_.erase(accounted);
-                }
-            }
-            for (size_t i = 0; i < restore.replicas.size(); ++i) {
-                (void)restore.replicas[i]->replace_memory_buffer(
-                    std::move(restore.buffers[i]));
-            }
-            invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
-            invalid_replica_endpoints_.erase(restore.segment.name);
-            standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
-            standby_allocator_keepalive_.erase(restore.segment.name);
-        }
-        for (const auto* metadata : affected_objects) {
-            metadata->GrantReadLease(
-                std::chrono::milliseconds(default_kv_lease_ttl_));
-        }
-
-        // Change the client status to OK
-        ok_client_.insert(client_id);
-        MasterMetricManager::instance().inc_active_clients();
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -1329,6 +1071,336 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     RecomputeTenantEffectiveQuotas();
 
     return {};
+}
+
+ErrorCode MasterService::ValidateRemountSegments(
+    const std::vector<Segment>& segments, const UUID& client_id) {
+    auto segment_access = segment_manager_.getSegmentAccess();
+    for (const auto& segment : segments) {
+        auto orphan = orphaned_segments_.Find(segment);
+        if (!orphan) {
+            return orphan.error();
+        }
+        auto validation =
+            segment_access.ValidateRemountSegment(segment, client_id);
+        if (validation != ErrorCode::OK) {
+            return validation;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+auto MasterService::PrepareRemount(const std::vector<Segment>& segments,
+                                   const UUID& client_id)
+    -> tl::expected<RemountPlan, ErrorCode> {
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    RemountPlan plan;
+    plan.restore_generation = orphaned_segments_.generation();
+
+    auto validation = ValidateRemountSegments(segments, client_id);
+    if (validation != ErrorCode::OK) {
+        return tl::make_unexpected(validation);
+    }
+
+    if (ok_client_.contains(client_id)) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", warn=client_already_remounted";
+        plan.already_remounted = true;
+        return plan;
+    }
+
+    // Only an orphan that had replicas restored onto it can carry surviving
+    // ones, so only those need the scan.
+    for (const auto& segment : segments) {
+        const auto* orphan = orphaned_segments_.Find(segment).value_or(nullptr);
+        if (orphan != nullptr && orphan->charged_bytes > 0) {
+            plan.restores.emplace_back().segment = &segment;
+        }
+    }
+    if (plan.restores.empty()) {
+        return plan;
+    }
+
+    auto scan_error = ScanSurvivingReplicas(plan.restores);
+    if (scan_error != ErrorCode::OK) {
+        return tl::make_unexpected(scan_error);
+    }
+    auto rebuild_error = RebuildRestoredAllocators(plan.restores);
+    if (rebuild_error != ErrorCode::OK) {
+        return tl::make_unexpected(rebuild_error);
+    }
+    return plan;
+}
+
+ErrorCode MasterService::ScanSurvivingReplicas(
+    std::vector<SegmentRestore>& restores) const {
+    bool ambiguous_endpoint = false;
+    bool unsupported_cxl = false;
+    for (size_t shard_index = 0; shard_index < kNumShards; ++shard_index) {
+        MetadataShardAccessorRO shard(this, shard_index);
+        for (const auto& [tenant_id, tenant] : shard->tenants) {
+            for (const auto& [key, metadata] : tenant.metadata) {
+                metadata.VisitReplicas(
+                    IsLiveMemoryReplica, [&](const Replica& replica) {
+                        // get_descriptor() returns by value; keep it alive for
+                        // the reference.
+                        const auto replica_descriptor =
+                            replica.get_descriptor();
+                        const auto& buffer =
+                            replica_descriptor.get_memory_descriptor()
+                                .buffer_descriptor;
+                        SegmentRestore* match = nullptr;
+                        for (auto& restore : restores) {
+                            if (buffer.transport_endpoint_ ==
+                                    restore.segment->te_endpoint ||
+                                buffer.transport_endpoint_ ==
+                                    restore.segment->name) {
+                                if (match != nullptr) {
+                                    ambiguous_endpoint = true;
+                                    return;
+                                }
+                                match = &restore;
+                            }
+                        }
+                        if (match == nullptr) {
+                            return;
+                        }
+                        if (buffer.protocol_ == "cxl") {
+                            unsupported_cxl = true;
+                            return;
+                        }
+                        match->replicas.push_back(
+                            {shard_index, tenant_id, key, nullptr});
+                        auto& descriptor =
+                            match->descriptors.emplace_back(buffer);
+                        descriptor.transport_endpoint_ =
+                            match->segment->te_endpoint;
+                    });
+            }
+        }
+    }
+    if (ambiguous_endpoint) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (unsupported_cxl) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::RebuildRestoredAllocators(
+    std::vector<SegmentRestore>& restores) {
+    for (auto& restore : restores) {
+        if (restore.descriptors.empty()) {
+            continue;
+        }
+        const RegionResourceSpec spec{
+            restore.segment->id, restore.segment->name, restore.segment->base,
+            restore.segment->size, restore.segment->te_endpoint};
+        auto allocations =
+            BuildRegionLiveAllocations(spec, restore.descriptors);
+        if (!allocations) {
+            return allocations.error();
+        }
+        std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers;
+        if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
+            auto imported = ImportOffsetBufferAllocator(
+                restore.segment->name, restore.segment->base,
+                restore.segment->size, restore.segment->te_endpoint,
+                *allocations);
+            if (!imported) {
+                return ErrorCode::INVALID_PARAMS;
+            }
+            restore.restored_allocator = std::move(imported->allocator);
+            imported_buffers = std::move(imported->buffers);
+        } else if (memory_allocator_type_ == BufferAllocatorType::CACHELIB) {
+            auto imported = ImportCachelibBufferAllocator(
+                restore.segment->name, restore.segment->base,
+                restore.segment->size, restore.segment->te_endpoint,
+                *allocations);
+            if (!imported) {
+                return ErrorCode::INVALID_PARAMS;
+            }
+            restore.restored_allocator = std::move(imported->allocator);
+            imported_buffers = std::move(imported->buffers);
+        } else {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+        }
+        if (imported_buffers.size() != restore.replicas.size() ||
+            std::any_of(imported_buffers.begin(), imported_buffers.end(),
+                        [](const auto& buffer) { return !buffer; })) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        for (size_t i = 0; i < imported_buffers.size(); ++i) {
+            restore.replicas[i].buffer = std::move(imported_buffers[i]);
+        }
+    }
+    return ErrorCode::OK;
+}
+
+auto MasterService::CommitRemount(
+    const std::vector<Segment>& segments, const UUID& client_id,
+    const std::shared_ptr<ClientLivenessRecord>& record, RemountPlan& plan)
+    -> tl::expected<void, ErrorCode> {
+    std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+
+    // A restore that landed while the lock was released rewrote the standby
+    // state the scan read, which invalidates everything collected above. The
+    // client retries the remount.
+    if (orphaned_segments_.generation() != plan.restore_generation) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", warn=remount_raced_standby_restore";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    auto validation = ValidateRemountSegments(segments, client_id);
+    if (validation != ErrorCode::OK) {
+        return tl::make_unexpected(validation);
+    }
+
+    std::vector<bool> segment_existed(segments.size());
+    auto fail_remount = [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (segment_existed[i] ||
+                !segment_access.GetAllocator(segments[i].id)) {
+                continue;
+            }
+            size_t capacity = 0;
+            if (segment_access.PrepareUnmountSegment(
+                    segments[i].id, capacity) != ErrorCode::OK) {
+                LOG(ERROR) << "segment_name=" << segments[i].name
+                           << ", error=remount_rollback_prepare_failed";
+                continue;
+            }
+            if (segment_access.CommitUnmountSegment(
+                    segments[i].id, client_id, capacity) != ErrorCode::OK) {
+                LOG(ERROR) << "segment_name=" << segments[i].name
+                           << ", error=remount_rollback_commit_failed";
+            }
+        }
+        return tl::make_unexpected(error);
+    };
+
+    ErrorCode mount_error = ErrorCode::OK;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (size_t i = 0; i < segments.size(); ++i) {
+            segment_existed[i] =
+                segment_access.GetAllocator(segments[i].id) != nullptr;
+        }
+        mount_error =
+            segment_access.ReMountSegment(segments, client_id, record);
+        if (mount_error == ErrorCode::OK) {
+            segment_access.BindClientLiveness(client_id, record);
+            mount_error =
+                AdoptRestoredAllocators(segment_access, plan.restores);
+        }
+    }
+    if (mount_error != ErrorCode::OK) {
+        return fail_remount(mount_error);
+    }
+
+    RepointRestoredReplicas(plan.restores);
+    // Only now do the segments' replicas become readable, so no reader observes
+    // a half-adopted segment.
+    for (const auto& segment : segments) {
+        if (auto charge = orphaned_segments_.Adopt(segment)) {
+            MasterMetricManager::instance().dec_allocated_mem_size(
+                charge->segment_name, static_cast<int64_t>(charge->bytes));
+        }
+    }
+
+    // Change the client status to OK
+    ok_client_.insert(client_id);
+    MasterMetricManager::instance().inc_active_clients();
+    return {};
+}
+
+// Swaps the allocator the mount has just created, which treats the whole
+// segment as free, for the one rebuilt from the surviving replicas. Nothing can
+// allocate from the segment in between: every allocation path holds the
+// snapshot lock in shared mode.
+ErrorCode MasterService::AdoptRestoredAllocators(
+    ScopedSegmentAccess& segment_access,
+    std::vector<SegmentRestore>& restores) {
+    std::vector<ScopedSegmentAccess::AllocatorReplacement> replacements;
+    replacements.reserve(restores.size());
+    for (auto& restore : restores) {
+        if (!restore.restored_allocator) {
+            continue;
+        }
+        auto allocator = segment_access.GetAllocator(restore.segment->id);
+        if (!allocator) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        replacements.push_back({restore.segment->id, std::move(allocator),
+                                restore.restored_allocator});
+    }
+    if (!segment_access.ReplaceAllocators(replacements)) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    for (auto& restore : restores) {
+        for (auto& restored : restore.replicas) {
+            segment_access.BindBufferToSegment(restore.segment->id,
+                                               *restored.buffer);
+        }
+    }
+    return ErrorCode::OK;
+}
+
+// The scan released each shard lock before taking the next one, so every key
+// is looked up and re-matched here. A replica that disappeared in between
+// leaves its imported buffer unclaimed; dropping that buffer returns the region
+// to the allocator that has just taken ownership of it.
+void MasterService::RepointRestoredReplicas(
+    std::vector<SegmentRestore>& restores) {
+    for (auto& restore : restores) {
+        std::optional<MetadataShardAccessorRW> shard;
+        size_t locked_shard = kNumShards;
+        for (auto& restored : restore.replicas) {
+            if (locked_shard != restored.shard_index) {
+                shard.emplace(this, restored.shard_index);
+                locked_shard = restored.shard_index;
+            }
+            auto tenant_it = (*shard)->tenants.find(restored.tenant_id);
+            if (tenant_it == (*shard)->tenants.end()) {
+                continue;
+            }
+            auto metadata_it = tenant_it->second.metadata.find(restored.key);
+            if (metadata_it == tenant_it->second.metadata.end()) {
+                continue;
+            }
+            auto& metadata = metadata_it->second;
+            const auto imported_address =
+                reinterpret_cast<uintptr_t>(restored.buffer->data());
+            const uint64_t imported_size = restored.buffer->size();
+            Replica* match =
+                metadata.GetFirstReplica([&](const Replica& replica) {
+                    if (!IsLiveMemoryReplica(replica)) {
+                        return false;
+                    }
+                    // get_descriptor() returns by value; keep it alive for
+                    // the reference.
+                    const auto replica_descriptor = replica.get_descriptor();
+                    const auto& buffer =
+                        replica_descriptor.get_memory_descriptor()
+                            .buffer_descriptor;
+                    return buffer.buffer_address_ == imported_address &&
+                           buffer.size_ == imported_size;
+                });
+            if (match != nullptr &&
+                match->replace_memory_buffer(std::move(restored.buffer))) {
+                metadata.GrantReadLease(
+                    std::chrono::milliseconds(default_kv_lease_ttl_));
+            }
+        }
+        // Drops the buffers nobody claimed while the exclusive lock still
+        // covers the allocator their regions go back to.
+        restore.replicas.clear();
+    }
 }
 
 auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
@@ -3543,12 +3615,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
     }
 
-    std::vector<StandbySegmentInfo> restored_memory_segments;
+    std::vector<OrphanedSegment> orphans;
     std::unordered_map<std::string, const StandbySegmentInfo*>
         memory_segments_by_alias;
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         restored_allocators;
-    std::unordered_set<std::string> restored_invalid_endpoints;
     for (const auto& seg : segments) {
         if (!seg.is_memory_segment) {
             continue;
@@ -3574,19 +3645,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        restored_memory_segments.push_back(seg);
         auto allocator = std::make_shared<DummyBufferAllocator>(
             seg.segment_name, seg.transport_endpoint);
         restored_allocators[seg.transport_endpoint] = allocator;
         if (seg.segment_name != seg.transport_endpoint) {
             restored_allocators[seg.segment_name] = allocator;
         }
-        if (!segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)) {
-            restored_invalid_endpoints.insert(seg.transport_endpoint);
-            if (seg.segment_name != seg.transport_endpoint) {
-                restored_invalid_endpoints.insert(seg.segment_name);
-            }
-        }
+        orphans.push_back(
+            {seg, std::move(allocator), 0,
+             segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)});
     }
 
     struct PreparedObject {
@@ -3858,19 +3925,32 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
     }
 
-    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+    // The memory segments' allocators now belong to their orphans; whatever is
+    // left in restored_allocators backs the restored NoF replicas.
+    for (auto& orphan : orphans) {
+        auto charged =
+            restored_accounted_memory_bytes.find(orphan.info.segment_name);
+        if (charged != restored_accounted_memory_bytes.end()) {
+            orphan.charged_bytes = charged->second;
+        }
+        restored_allocators.erase(orphan.info.transport_endpoint);
+        restored_allocators.erase(orphan.info.segment_name);
+    }
+    const auto unreadable_segments =
+        std::count_if(orphans.begin(), orphans.end(),
+                      [](const auto& orphan) { return !orphan.readable; });
+    for (const auto& charge : orphaned_segments_.Reset(std::move(orphans))) {
         MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
+            charge.segment_name, static_cast<int64_t>(charge.bytes));
     }
     for (const auto& [segment, bytes] : restored_accounted_memory_bytes) {
         MasterMetricManager::instance().inc_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
     }
-    standby_accounted_memory_bytes_ =
-        std::move(restored_accounted_memory_bytes);
-    standby_memory_segments_ = std::move(restored_memory_segments);
-    standby_allocator_keepalive_ = std::move(restored_allocators);
-    invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
+    restored_nof_allocators_.clear();
+    for (auto& [endpoint, allocator] : restored_allocators) {
+        restored_nof_allocators_.push_back(std::move(allocator));
+    }
     for (auto& [client_id, record] : new_known_owner_records) {
         client_liveness_records_.emplace(client_id, std::move(record));
         MasterMetricManager::instance().client_liveness_record_created();
@@ -3892,7 +3972,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     LOG(INFO) << "Restored from standby: " << restored_object_count
               << " objects, " << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
-              << ", invalid_endpoints=" << invalid_replica_endpoints_.size();
+              << ", unreadable_segments=" << unreadable_segments;
     return {};
 }
 
@@ -4200,7 +4280,7 @@ bool MasterService::TryGetReadableReplicaDescriptor(
     } else if (descriptor.is_local_disk_replica()) {
         endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
     }
-    if (endpoint && invalid_replica_endpoints_.contains(*endpoint)) {
+    if (endpoint && orphaned_segments_.IsUnreadable(*endpoint)) {
         return false;
     }
     return true;

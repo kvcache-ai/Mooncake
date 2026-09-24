@@ -1955,6 +1955,40 @@ TEST_F(MasterServiceHATest, InvalidHandleCleanupWaitsForSnapshotBarrier) {
     cleanup.get();
 }
 
+TEST_F(MasterServiceHATest, RemountReleasesTheChargeOfReplicasThatDiedOrphaned) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_died_orphaned_segment";
+    const std::string kept_key = "standby_died_orphaned_kept_key";
+    const std::string erased_key = "standby_died_orphaned_erased_key";
+    auto kept_object = MakeStandbyObject(kept_key, endpoint);
+    kept_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto erased_object = MakeStandbyObject(erased_key, endpoint);
+    erased_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({kept_object, erased_object}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    auto& metrics = MasterMetricManager::instance();
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(endpoint), 2048);
+
+    // Nothing un-charges a replica that dies while its segment is orphaned;
+    // the remount that ends the orphan has to.
+    EraseObjectForTesting(service, kDefaultTenant, erased_key);
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+
+    EXPECT_TRUE(service.GetReplicaList(kept_key, kDefaultTenant).has_value());
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 1024);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(endpoint), 1024);
+}
+
 TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());

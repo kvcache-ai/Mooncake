@@ -47,6 +47,7 @@
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
+#include "ha/orphaned_segments.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
 #include "task_manager.h"
@@ -2463,18 +2464,60 @@ class MasterService {
         const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
 
-    // Standby-restored memory endpoints remain unreadable until the owning
-    // Client has successfully remounted them.
-    std::unordered_set<std::string> invalid_replica_endpoints_;
+    // Guarded by snapshot_mutex_: a remount reads it under the shared lock and
+    // acts on it under the exclusive one.
+    OrphanedSegments orphaned_segments_;
+    // Keeps the allocators behind restored NoF replicas alive. No remount
+    // adopts them, so they last until the next restore.
+    std::vector<std::shared_ptr<BufferAllocatorBase>> restored_nof_allocators_;
 
-    // Keep DummyBufferAllocator alive after standby restore.
-    // Key: transport_endpoint, Value: allocator.
-    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
-        standby_allocator_keepalive_;
-    std::vector<StandbySegmentInfo> standby_memory_segments_;
-    std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+    // One replica a standby remount has to re-point, carried across the gap
+    // between the two stages with the buffer imported for it. The scan cannot
+    // keep a Replica* -- the shard locks are released in between -- so it keeps
+    // the key, and the commit stage looks it up again and re-matches the
+    // replica against the region that buffer covers.
+    struct RestoredReplica {
+        size_t shard_index{0};
+        TenantId tenant_id;
+        std::string key;
+        std::unique_ptr<AllocatedBuffer> buffer;
+    };
 
-    ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
+    struct SegmentRestore {
+        const Segment* segment{nullptr};
+        std::vector<RestoredReplica> replicas;
+        // Parallel to replicas while the scan stage runs: the importer returns
+        // its buffers in this order, which is how each one finds its replica.
+        std::vector<AllocatedBuffer::Descriptor> descriptors;
+        std::shared_ptr<BufferAllocatorBase> restored_allocator;
+    };
+
+    // A remount of a client that already holds its segments is idempotent, so
+    // preparing reports that instead of an error and there is nothing to
+    // commit.
+    struct RemountPlan {
+        bool already_remounted{false};
+        std::vector<SegmentRestore> restores;
+        uint64_t restore_generation{0};
+    };
+
+    ErrorCode ValidateRemountSegments(const std::vector<Segment>& segments,
+                                      const UUID& client_id);
+
+    // Stage 1 of ReMountSegment, under the shared snapshot lock.
+    tl::expected<RemountPlan, ErrorCode> PrepareRemount(
+        const std::vector<Segment>& segments, const UUID& client_id);
+    ErrorCode ScanSurvivingReplicas(
+        std::vector<SegmentRestore>& restores) const;
+    ErrorCode RebuildRestoredAllocators(std::vector<SegmentRestore>& restores);
+
+    // Stage 2 of ReMountSegment, under the exclusive snapshot lock.
+    tl::expected<void, ErrorCode> CommitRemount(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record, RemountPlan& plan);
+    ErrorCode AdoptRestoredAllocators(ScopedSegmentAccess& segment_access,
+                                      std::vector<SegmentRestore>& restores);
+    void RepointRestoredReplicas(std::vector<SegmentRestore>& restores);
 
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;
