@@ -417,6 +417,53 @@ int tentToClassicError(tent::Status::Code code) {
     }
 }
 
+class TentCompatibilityTransport final : public Transport {
+   public:
+    BatchID allocateBatchID(size_t) override { return INVALID_BATCH_ID; }
+
+    Status freeBatchID(BatchID) override {
+        return Status::NotImplemented(
+            "TENT compatibility transport does not free batches");
+    }
+
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::NotImplemented(
+            "TENT compatibility transport does not submit transfers");
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
+        return Status::NotImplemented(
+            "TENT compatibility transport does not report transfer status");
+    }
+
+    Status submitTransferTask(const std::vector<TransferTask*>&) override {
+        return Status::NotImplemented(
+            "TENT compatibility transport does not submit transfer tasks");
+    }
+
+   private:
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    int unregisterLocalMemory(void*, bool) override {
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    const char* getName() const override { return "tent_compat"; }
+};
+
 class TransferEngineShutdownToken : public ShutdownToken {
    public:
     explicit TransferEngineShutdownToken(TransferEngine* engine)
@@ -508,6 +555,7 @@ TransferEngine::TransferEngine(bool auto_discover,
 TransferEngine::TransferEngine(TransferEngine&& other) noexcept
     : impl_(std::move(other.impl_)),
       impl_tent_(std::move(other.impl_tent_)),
+      tent_compat_transport_(std::move(other.tent_compat_transport_)),
       shutdown_token_(nullptr),
       tent_device_filter_(std::move(other.tent_device_filter_)),
       use_tent_(other.use_tent_) {
@@ -524,6 +572,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     freeEngine();
     impl_ = std::move(other.impl_);
     impl_tent_ = std::move(other.impl_tent_);
+    tent_compat_transport_ = std::move(other.tent_compat_transport_);
     tent_device_filter_ = std::move(other.tent_device_filter_);
     use_tent_ = other.use_tent_;
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
@@ -624,6 +673,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 
 int TransferEngine::freeEngine() {
     detachShutdownToken(shutdown_token_);
+    {
+        std::lock_guard<std::mutex> lock(tent_compat_transport_mutex_);
+        tent_compat_transport_.reset();
+    }
     if (!use_tent_ && impl_) {
         if (impl_.use_count() == 1) impl_->freeEngine();
         impl_.reset();
@@ -636,12 +689,17 @@ int TransferEngine::freeEngine() {
 Transport* TransferEngine::installTransport(const std::string& proto,
                                             void** args) {
     if (use_tent_) {
-        static bool g_present = false;
-        if (!g_present) {
-            LOG(INFO) << "installTransport not used by TENT";
-            g_present = true;
+        (void)proto;
+        (void)args;
+        std::call_once(tent_compat_log_once_, [] {
+            LOG(INFO) << "installTransport is a compatibility no-op for TENT";
+        });
+        std::lock_guard<std::mutex> lock(tent_compat_transport_mutex_);
+        if (!tent_compat_transport_) {
+            tent_compat_transport_ =
+                std::make_unique<TentCompatibilityTransport>();
         }
-        return nullptr;
+        return tent_compat_transport_.get();
     } else {
         return impl_->installTransport(proto, args);
     }
@@ -979,10 +1037,12 @@ Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
 }
 
 Transport* TransferEngine::getTransport(const std::string& proto) {
-    if (use_tent_)
+    if (use_tent_) {
+        // TENT selects transports internally; installTransport() returns a
+        // compatibility handle only for classic null-checking callers.
         return nullptr;
-    else
-        return impl_->getTransport(proto);
+    }
+    return impl_->getTransport(proto);
 }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \

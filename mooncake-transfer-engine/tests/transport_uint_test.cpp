@@ -38,6 +38,7 @@
 
 #include "multi_transport.h"
 #include "transfer_engine.h"
+#include "transfer_engine_c.h"
 #include "transfer_engine_impl.h"
 #include "transport/transport.h"
 #ifdef USE_TENT
@@ -1759,6 +1760,90 @@ TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
 
     Transport::Slice::sealTaskSubmission(&task);
     EXPECT_EQ(batch.finished_task_count.load(), 1);
+}
+#endif
+
+#ifdef USE_TENT
+TEST(TransferEngineTentCompatibilityTest,
+     InstallTransportReturnsCompatibilityHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    TransferEngine engine;
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "tent-install-transport"), 0);
+
+    Transport* transport = nullptr;
+    for (const auto* protocol : {"tcp", "efa", "cxi", "ascend"}) {
+        auto* current = engine.installTransport(protocol, nullptr);
+        ASSERT_NE(current, nullptr) << protocol;
+        if (transport)
+            EXPECT_EQ(current, transport) << protocol;
+        else
+            transport = current;
+    }
+
+    EXPECT_EQ(transport->allocateBatchID(1), INVALID_BATCH_ID);
+    EXPECT_EQ(transport->freeBatchID(INVALID_BATCH_ID).code(),
+              Status::Code::kNotImplemented);
+    EXPECT_EQ(transport->submitTransfer(0, {}).code(),
+              Status::Code::kNotImplemented);
+    TransferStatus status{};
+    EXPECT_EQ(transport->getTransferStatus(0, 0, status).code(),
+              Status::Code::kNotImplemented);
+    EXPECT_EQ(engine.uninstallTransport("tcp"), 0);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     CApiInstallTransportReturnsCompatibilityHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    transfer_engine_t engine = createTransferEngine(
+        P2PHANDSHAKE, "tent-c-api-install-transport", "", 0, false);
+    ASSERT_NE(engine, nullptr);
+
+    transport_t transport = nullptr;
+    for (const auto* protocol : {"tcp", "efa", "cxi", "ascend"}) {
+        auto current = installTransport(engine, protocol, nullptr);
+        ASSERT_NE(current, nullptr) << protocol;
+        if (transport)
+            EXPECT_EQ(current, transport) << protocol;
+        else
+            transport = current;
+    }
+    EXPECT_EQ(uninstallTransport(engine, "tcp"), 0);
+    destroyTransferEngine(engine);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     ConcurrentInstallTransportReturnsOneCompatibilityHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    TransferEngine engine;
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "tent-concurrent-install"), 0);
+
+    constexpr size_t kThreadCount = 16;
+    std::array<Transport*, kThreadCount> transports{};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&engine, &transports, i] {
+            transports[i] = engine.installTransport("tcp", nullptr);
+        });
+    }
+    for (auto& thread : threads) thread.join();
+
+    ASSERT_NE(transports[0], nullptr);
+    for (const auto* transport : transports) {
+        ASSERT_NE(transport, nullptr);
+        EXPECT_EQ(transport, transports[0]);
+    }
 }
 #endif
 
