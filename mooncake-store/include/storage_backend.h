@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -51,6 +52,10 @@ struct BucketMetadata {
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
+    // Index into BucketStorageBackend::disks_ identifying which disk holds
+    // this bucket's files. Not serialized: Init() re-derives it from the disk
+    // the .meta file was found on.
+    int disk_index = 0;
 
     // Default constructor
     BucketMetadata() = default;
@@ -62,7 +67,8 @@ struct BucketMetadata {
           keys(other.keys),
           metadatas(other.metadatas),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          disk_index(other.disk_index) {}
 
     // Move constructor
     BucketMetadata(BucketMetadata&& other) noexcept
@@ -71,7 +77,8 @@ struct BucketMetadata {
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          disk_index(other.disk_index) {}
 
     // Copy assignment
     BucketMetadata& operator=(const BucketMetadata& other) {
@@ -80,6 +87,9 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = other.keys;
             metadatas = other.metadatas;
+            // disk_index routes file paths, so it is part of the bucket's
+            // identity rather than ephemeral runtime state: it must be copied.
+            disk_index = other.disk_index;
             // Don't copy runtime state
         }
         return *this;
@@ -92,6 +102,7 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = std::move(other.keys);
             metadatas = std::move(other.metadatas);
+            disk_index = other.disk_index;
             // Don't move runtime state
         }
         return *this;
@@ -769,6 +780,32 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     };
 };
 
+// Per-disk accounting for BucketStorageBackend's multi-disk support. All
+// fields are guarded by BucketStorageBackend::mutex_ via the disks_ container;
+// the disk paths live in the separate, lock-free disk_paths_ because the write
+// and delete paths need them without holding the lock.
+//
+// The quota bookkeeping is per-disk rather than global: a write reserved on
+// one disk must not count against another disk's quota, or that disk would
+// evict to make room for bytes it will never receive.
+struct DiskState {
+    int64_t max_total_size = 0;
+    int64_t total_size = 0;
+    int64_t pending_write_size = 0;
+    int64_t pending_eviction_size = 0;
+    // FIFO eviction index: bucket ids on this disk, ascending = oldest first.
+    // buckets_ alone is not enough once buckets live on several disks, since
+    // its begin() may point at a bucket on a different disk.
+    std::set<int64_t> fifo_index;
+    // LRU eviction index: {last_access_ns, bucket_id} for buckets on this
+    // disk. Maintained lazily; SelectEvictionCandidate() repairs stale entries.
+    std::set<std::pair<int64_t, int64_t>> lru_index;
+    // Cached result of ActualDiskBytesUsedLocked() for this disk and when it
+    // was taken. Per-disk because each root is scanned on its own.
+    int64_t cached_disk_bytes = -1;
+    std::chrono::steady_clock::time_point cached_disk_bytes_at;
+};
+
 class BucketStorageBackend : public StorageBackendInterface {
    public:
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
@@ -935,20 +972,23 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
-        std::vector<iovec>& iovs);
+        std::vector<iovec>& iovs, int disk_index);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
-        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
+        int disk_index);
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
-        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
+        int disk_index);
 
     tl::expected<int64_t, ErrorCode> CreateBucketId();
 
     tl::expected<std::string, ErrorCode> GetBucketMetadataPath(
-        int64_t bucket_id);
+        int64_t bucket_id, int disk_index) const;
 
-    tl::expected<std::string, ErrorCode> GetBucketDataPath(int64_t bucket_id);
+    tl::expected<std::string, ErrorCode> GetBucketDataPath(
+        int64_t bucket_id, int disk_index) const;
 
     tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
         const std::string& path, FileMode mode) const;
@@ -968,8 +1008,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @brief Remove any remaining data and metadata files for a bucket.
      * Used by write rollback and startup recovery of incomplete buckets.
      * @param bucket_id The bucket ID whose files should be deleted.
+     * @param disk_index The disk holding the bucket's files.
      */
-    void CleanupOrphanedBucket(int64_t bucket_id);
+    void CleanupOrphanedBucket(int64_t bucket_id, int disk_index);
 
     /**
      * @brief Rollback a committed bucket from the local index when
@@ -982,9 +1023,11 @@ class BucketStorageBackend : public StorageBackendInterface {
      *
      * @param bucket_id The bucket ID to roll back.
      * @param keys The keys that were committed.
+     * @param disk_index The disk the bucket was written to.
      */
     void RollbackCommittedBucket(int64_t bucket_id,
-                                 const std::vector<std::string>& keys);
+                                 const std::vector<std::string>& keys,
+                                 int disk_index);
 
     // Holds eviction state between PrepareEviction and FinalizeEviction.
     // PrepareEviction removes buckets from metadata maps and returns this.
@@ -1003,18 +1046,52 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::string> skipped_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
+        // Disk this reservation belongs to. PrepareEviction picks it before
+        // reserving anything, and every Restore/Commit/Release step credits
+        // that same disk's counters. -1 only ever survives on a default-
+        // constructed instance, which indexes no disk.
+        int disk_index = -1;
     };
 
     /**
      * @brief Phase 1 of eviction: under exclusive lock, select and remove
-     * oldest buckets (FIFO) until total_size_ + required_size <=
-     * max_total_size. The removed buckets are returned for later file deletion.
-     * Does nothing if eviction_policy == NONE or max_total_size == 0.
+     * oldest buckets (FIFO) on one disk until that disk's total_size +
+     * required_size <= its max_total_size. The removed buckets are returned
+     * for later file deletion. Does nothing if eviction_policy == NONE or the
+     * disk's max_total_size == 0.
+     *
+     * Disk selection happens here, inside the same exclusive critical section
+     * that reserves the write and evicts, so a concurrent writer cannot pick
+     * the same disk and observe stale free space. The chosen disk is reported
+     * back in PendingEviction::disk_index.
+     *
      * @param required_size Size of the incoming bucket to be written.
-     * @return PendingEviction with all keys and bucket metadata removed.
+     * @param write_keys Keys of the incoming bucket; empty for callers that
+     *        only drive eviction (they pass the drain amount as
+     *        @p required_size).
+     * @param disk_hint Restrict selection to this disk (>= 0). Used by
+     *        watermark eviction, which drives one disk at a time.
+     * @return PendingEviction with all keys and bucket metadata removed;
+     *         NO_AVAILABLE_DISK if no disk can hold the incoming bucket;
+     *         FILE_WRITE_FAIL if the quota is still exceeded afterwards.
      */
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
-        int64_t required_size, const std::vector<std::string>& write_keys = {});
+        int64_t required_size, const std::vector<std::string>& write_keys = {},
+        int disk_hint = -1);
+
+    /**
+     * @brief Pick the disk that should receive an incoming bucket.
+     * Must be called with mutex_ held (exclusive).
+     *
+     * Round-robin, deliberately not "most free space wins": once the disks
+     * fill up and eviction kicks in, the disk that was just evicted from
+     * regains headroom and would win every comparison, so the other disks
+     * would stay full and frozen forever.
+     *
+     * @param required_size Bytes the disk must be able to hold.
+     * @return disk index, or NO_AVAILABLE_DISK if no disk qualifies.
+     */
+    tl::expected<int, ErrorCode> SelectDiskForWrite(int64_t required_size);
 
     void RestorePreparedEviction(PendingEviction&& pending);
 
@@ -1027,31 +1104,33 @@ class BucketStorageBackend : public StorageBackendInterface {
     void ReleasePreparedWriteLocked(const PendingEviction& pending);
 
     /**
-     * @brief Select the next bucket to evict according to the configured
-     * eviction policy. Must be called with mutex_ held (exclusive).
+     * @brief Select the next bucket to evict on the given disk, according to
+     * the configured eviction policy. Must be called with mutex_ held
+     * (exclusive).
+     * @param disk_index Restricts candidates to buckets on this disk.
      * @return Iterator into buckets_ pointing at the candidate, or
-     *         buckets_.end() if no candidate is available.
+     *         buckets_.end() if that disk has no candidate.
      */
     std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
-    SelectEvictionCandidate();
+    SelectEvictionCandidate(int disk_index);
 
     /**
-     * @brief Actual on-disk bytes of the offload directory, measured by
-     *        summing real file allocation (stat st_blocks * 512) over every
-     *        file under storage_path_.
+     * @brief Actual on-disk bytes of one disk's offload directory, measured
+     *        by summing real file allocation (stat st_blocks * 512) over every
+     *        file under that disk's root.
      *
      * This is ground truth — the same block-based accounting kubelet uses for
      * emptyDir sizeLimit — so it captures bucket files that linger after their
-     * objects are logically evicted (which the in-memory total_size_ misses).
+     * objects are logically evicted (which the in-memory total_size misses).
+     * max_physical_bytes is a per-disk cap: each root sits on its own device
+     * (or its own emptyDir quota), so scanning and capping them together would
+     * make one busy disk reject writes on an idle one.
      * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
      * the scan cost regardless of offload rate. Caller must hold mutex_.
+     *
+     * @param disk_index The disk whose root is scanned.
      */
-    int64_t ActualDiskBytesUsedLocked() const;
-
-    // Cached result of ActualDiskBytesUsedLocked() and when it was taken.
-    mutable int64_t cached_disk_bytes_ GUARDED_BY(mutex_) = -1;
-    mutable std::chrono::steady_clock::time_point cached_disk_bytes_at_
-        GUARDED_BY(mutex_);
+    int64_t ActualDiskBytesUsedLocked(int disk_index) const;
 
     /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted
@@ -1074,10 +1153,27 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetFileInstance()
         const;
 
-    // Test-only: number of entries in the LRU eviction index.
+    // Test-only: number of entries in the LRU eviction index, summed over
+    // every disk.
     size_t GetLruIndexSizeForTest() const {
         SharedMutexLocker lock(&mutex_, shared_lock);
-        return lru_index_.size();
+        size_t size = 0;
+        for (const auto& disk : disks_) {
+            size += disk.lru_index.size();
+        }
+        return size;
+    }
+
+    // Test-only: effective per-disk quota after Init() has applied defaults.
+    // The quota is otherwise observable only by filling a device.
+    std::vector<int64_t> DiskQuotasForTest() const {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        std::vector<int64_t> quotas;
+        quotas.reserve(disks_.size());
+        for (const auto& disk : disks_) {
+            quotas.push_back(disk.max_total_size);
+        }
+        return quotas;
     }
 
     // Test-only: inject datasync failure in WriteBucket to verify orphan
@@ -1088,6 +1184,20 @@ class BucketStorageBackend : public StorageBackendInterface {
     }
 
    private:
+    /**
+     * @brief Take the exclusive owner lock on every disk root.
+     *
+     * A client that shares any one disk with another live client would
+     * collide with it on that disk's bucket files, so every root is locked.
+     * On failure, locks already taken are released.
+     *
+     * @return OK on success; FILE_OPEN_FAIL if a root cannot be created, its
+     *         lock file cannot be opened, or another live client holds it.
+     */
+    tl::expected<void, ErrorCode> AcquireDiskOwnerLocks();
+
+    void ReleaseDiskOwnerLocks();
+
     std::atomic<bool> test_datasync_failure_{false};
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
@@ -1102,8 +1212,9 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
-    // Held for process lifetime after Init(); enforces one client / path.
-    int owner_lock_fd_{-1};
+    // One flock per disk root, held for process lifetime after Init();
+    // enforces one live client per storage path (#3528).
+    std::vector<int> owner_lock_fds_;
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 
@@ -1119,24 +1230,28 @@ class BucketStorageBackend : public StorageBackendInterface {
      * metadata members:
      * - object_bucket_map_: maps object keys to bucket IDs
      * - buckets_: ordered map of bucket ID to bucket metadata
-     * - total_size_: cumulative data size of all stored objects
+     * - disks_: per-disk quota accounting and eviction indexes
      */
     mutable SharedMutex mutex_;
     mutable Mutex iterator_mutex_;
-    std::string storage_path_;
-    int64_t total_size_ GUARDED_BY(mutex_) = 0;
+    // Storage root of each disk. Populated by the constructor and normalised
+    // by Init() under mutex_; never mutated afterwards, so the write and
+    // delete paths can resolve file paths without holding the lock.
+    std::vector<std::string> disk_paths_;
+    // Per-disk quotas, accounting and eviction indexes, indexed in lockstep
+    // with disk_paths_. Never resized after construction.
+    mutable std::vector<DiskState> GUARDED_BY(mutex_) disks_;
+    // Round-robin cursor for SelectDiskForWrite: the disk to try first on the
+    // next write.
+    int rr_cursor_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
+    // Reserved key sets stay global: key uniqueness is a property of the whole
+    // backend, not of one disk.
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
-    int64_t pending_eviction_size_ GUARDED_BY(mutex_) = 0;
-    int64_t pending_write_size_ GUARDED_BY(mutex_) = 0;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
-    // LRU eviction index: ordered set of {last_access_ns_, bucket_id}.
-    // Maintained lazily — reads update last_access_ns_ atomically without
-    // touching this index; SelectEvictionCandidate() repairs stale entries.
-    std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 
