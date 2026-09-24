@@ -28,6 +28,7 @@
 
 #include "config.h"
 #include "memory_location.h"
+#include "transport/rdma_transport/rdma_batch_cache.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -336,6 +337,7 @@ int WorkerPool::submitPostSend(
     SliceList prepared_slice_list;
     uint64_t submitted_slice_count = 0;
     thread_local std::unordered_map<int, uint64_t> failed_target_ids;
+    BatchRdmaDeviceCache peer_device_cache;
     int last_buffer_id = -1;
     int last_device_id = -1;
     SegmentID last_target_id = static_cast<SegmentID>(-1);
@@ -356,9 +358,14 @@ int WorkerPool::submitPostSend(
             last_device_id = -1;
             last_target_id = slice->target_id;
         }
-        if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
-                             slice->length, context_.deviceName(), buffer_id,
-                             device_id, 0, last_buffer_id, last_device_id)) {
+        if (peer_device_cache.select(
+                peer_segment_desc, slice->rdma.dest_addr, slice->length,
+                buffer_id, device_id, [&] {
+                    return selectPeerDevice(
+                        peer_segment_desc.get(), slice->rdma.dest_addr,
+                        slice->length, context_.deviceName(), buffer_id,
+                        device_id, 0, last_buffer_id, last_device_id);
+                })) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -418,6 +425,7 @@ int WorkerPool::submitPostSend(
                     slice->rdma.dest_rkey =
                         peer_segment_desc->buffers[buffer_id].rkey[device_id];
                     peer_nic_path = alt_path;
+                    peer_device_cache.invalidate();
                     found = true;
                     break;
                 }

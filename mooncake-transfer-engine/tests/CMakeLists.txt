@@ -236,7 +236,30 @@ if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
-  add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
+  add_test(NAME nvlink_transport_test
+           COMMAND ${CMAKE_COMMAND} -E env GTEST_FILTER=NvlinkTransportTest.*
+                   $<TARGET_FILE:nvlink_transport_test>)
+  set_tests_properties(nvlink_transport_test PROPERTIES LABELS "nvlink_gpu")
+
+  if(USE_CUDA AND NOT USE_HIP)
+    add_test(
+      NAME nvlink_host_numa_registration_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env --unset=MC_USE_NVLINK_IPC
+        GTEST_FILTER=NvlinkHostNumaRegistrationTest.*
+        $<TARGET_FILE:nvlink_transport_test>)
+    set_tests_properties(nvlink_host_numa_registration_test
+                         PROPERTIES LABELS "nvlink_vmm_unit")
+
+    add_executable(nvlink_host_numa_allocation_test
+                   ${WORKSPACE}/nvlink_host_numa_allocation_test.cpp)
+    target_link_libraries(nvlink_host_numa_allocation_test
+                          PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME nvlink_host_numa_allocation_test
+             COMMAND nvlink_host_numa_allocation_test)
+    set_tests_properties(nvlink_host_numa_allocation_test
+                         PROPERTIES LABELS "nvlink_vmm_unit")
+  endif()
 endif()
 
 if(USE_HIP)
@@ -432,6 +455,17 @@ add_executable(rdma_buffer_range_index_test
 target_link_libraries(rdma_buffer_range_index_test PUBLIC transfer_engine gtest
                                                           gtest_main)
 add_test(NAME rdma_buffer_range_index_test COMMAND rdma_buffer_range_index_test)
+
+add_executable(rdma_batch_reuse_test ${WORKSPACE}/rdma_batch_reuse_test.cpp)
+target_link_libraries(rdma_batch_reuse_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+add_test(NAME rdma_batch_reuse_test COMMAND rdma_batch_reuse_test)
+
+add_executable(multi_transport_batch_test
+               ${WORKSPACE}/multi_transport_batch_test.cpp)
+target_link_libraries(multi_transport_batch_test PUBLIC transfer_engine gtest
+                                                        gtest_main)
+add_test(NAME multi_transport_batch_test COMMAND multi_transport_batch_test)
 
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)

@@ -648,12 +648,12 @@ int MasterServiceSupervisor::Start() {
         return -1;
     }
 
+    const auto metrics = config_.metrics.Get();
     mooncake::MasterAdminServer admin_server(
-        static_cast<uint16_t>(config_.metrics_port),
-        config_.enable_metric_reporting, config_.metrics_host);
+        static_cast<uint16_t>(metrics.port), metrics.enabled, metrics.host);
     if (!admin_server.Start()) {
         LOG(ERROR) << "Failed to start master admin server, metrics_port="
-                   << config_.metrics_port;
+                   << metrics.port;
         return -1;
     }
     return RunSupervisorLoop(*spec, config_, admin_server,

@@ -24,11 +24,13 @@ namespace mooncake {
 class TransferEngineImpl;
 class TransferEngineImplTestPeer;
 class MultiTransportTestPeer;
+class MultiTransportBatchTestPeer;
 
 class MultiTransport {
     friend class TransferEngineImpl;
     friend class TransferEngineImplTestPeer;
     friend class MultiTransportTestPeer;
+    friend class MultiTransportBatchTestPeer;
 
    public:
     using BatchID = Transport::BatchID;

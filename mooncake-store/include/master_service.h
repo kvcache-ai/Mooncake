@@ -69,7 +69,7 @@ struct MasterSnapshotPayloads;
 }  // namespace ha
 
 class EtcdOpLogStore;
-class DfsGlobalAllocator;
+class ShardAllocator;
 class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
 
@@ -2208,7 +2208,7 @@ class MasterService {
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
-    DfsGlobalAllocator* shard_allocator_{nullptr};
+    ShardAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};
     // Serializes allocation-failure recovery so concurrent writers can reuse
     // capacity made available by the first recovery instead of each evicting

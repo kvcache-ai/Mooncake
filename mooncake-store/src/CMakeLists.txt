@@ -21,6 +21,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     allocator.cpp
     config/ha_cluster_namespace_config.cpp
     config/local_file_snapshot_config.cpp
+    config/metrics_bootstrap_config_loader.cpp
     config/redis_connection_config.cpp
     config/s3_client_config.cpp
     segment_allocator_registration.cpp
@@ -50,7 +51,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     offset_allocator.cpp
     http_metadata_server.cpp
     serialize/serializer.cpp
-    storage/distributed/dfs_global_allocator.cpp
+    storage/distributed/shard_allocator.cpp
     storage/distributed/immutable_bucket_allocator.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp

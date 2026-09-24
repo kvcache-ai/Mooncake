@@ -64,7 +64,8 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
         const std::vector<std::string>& object_keys, const UUID& client_id,
-        const std::string& segment_name);
+        const std::string& segment_name,
+        const std::string& tenant_id = "default");
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
