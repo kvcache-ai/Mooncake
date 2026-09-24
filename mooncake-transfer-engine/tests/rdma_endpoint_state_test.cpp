@@ -126,6 +126,14 @@ class RdmaContextTestPeer {
         ASSERT_LT(static_cast<size_t>(cq_index), context.cq_list_.size());
         context.cq_list_[cq_index].native = nullptr;
     }
+
+    static void enableAutoGid(RdmaContext &context, const ibv_gid &gid,
+                              int gid_index, uint32_t rank) {
+        context.gid_ = gid;
+        context.gid_index_ = gid_index;
+        context.auto_gid_selection_rank_ = rank;
+        context.auto_gid_selection_enabled_ = true;
+    }
 };
 
 class WorkerPoolTestPeer {
@@ -211,6 +219,13 @@ class RdmaEndPointTestPeer {
     static int reconstruct(RdmaEndPoint &endpoint) {
         RWSpinlock::WriteGuard guard(endpoint.lock_);
         return endpoint.reconstruct();
+    }
+
+    static void rememberConnectedAutoGid(
+        RdmaEndPoint &endpoint, const GidSelectionSnapshot &local_selection,
+        const RdmaEndPoint::HandShakeDesc &peer_desc) {
+        RWSpinlock::WriteGuard guard(endpoint.lock_);
+        endpoint.rememberConnectedAutoGid(local_selection, peer_desc);
     }
 };
 
@@ -376,6 +391,31 @@ TEST_F(RdmaEndPointStateTest, ReadyAckTimeoutOnlyAppliesToWaitingState) {
 
     RdmaEndPointTestPeer::setStatus(*endpoint_, RdmaEndPoint::CONNECTED);
     EXPECT_FALSE(endpoint_->readyAckTimedOut());
+}
+
+TEST_F(RdmaEndPointStateTest, RecordsOnlyCoordinatedAutoGidConnections) {
+    ibv_gid local_gid = {};
+    local_gid.raw[15] = 7;
+    RdmaContextTestPeer::enableAutoGid(*context_, local_gid, /*gid_index=*/7,
+                                       /*rank=*/1);
+    GidSelectionSnapshot local_selection = context_->gidSelection();
+    RdmaEndPoint::HandShakeDesc peer_desc;
+    peer_desc.local_gid = "peer-gid-7";
+    peer_desc.auto_gid_rank_supported = true;
+    peer_desc.auto_gid_rank = 1;
+
+    RdmaEndPointTestPeer::rememberConnectedAutoGid(*endpoint_, local_selection,
+                                                   peer_desc);
+    auto connection = endpoint_->autoGidConnection();
+    ASSERT_TRUE(connection.has_value());
+    EXPECT_EQ(connection->local_gid, local_selection.gid);
+    EXPECT_EQ(connection->peer_gid, "peer-gid-7");
+    EXPECT_EQ(connection->selection_rank, 1U);
+
+    peer_desc.auto_gid_rank_supported = false;
+    RdmaEndPointTestPeer::rememberConnectedAutoGid(*endpoint_, local_selection,
+                                                   peer_desc);
+    EXPECT_FALSE(endpoint_->autoGidConnection().has_value());
 }
 
 TEST_F(RdmaEndPointStateTest, ReadyAckWithSamePeerQpMarksEndpointReady) {

@@ -954,6 +954,8 @@ void WorkerPool::processCompletions(int thread_id,
                                                     slice->peer_nic_path)) {
                     markRailFailed(slice->peer_nic_path, true);
                     redispatch_counter_++;
+                } else if (wc.status == IBV_WC_RETRY_EXC_ERR) {
+                    recordAutoGidDataPathFailure(slice);
                 }
                 if (slice->rdma.endpoint) {
                     context_.deleteEndpointByPtr(slice->rdma.endpoint);
@@ -965,6 +967,9 @@ void WorkerPool::processCompletions(int thread_id,
                 finalize_slice(slice, false);
             }
         } else {
+            if (auto_gid_failure_pending_.load(std::memory_order_relaxed)) {
+                recordAutoGidDataPathSuccess(slice);
+            }
             finalize_slice(slice, true);
         }
     }
@@ -982,6 +987,64 @@ void WorkerPool::processCompletions(int thread_id,
     }
     if (!failed_slice_list.empty()) {
         redispatch(failed_slice_list, thread_id, false, defer_local_redispatch);
+    }
+}
+
+void WorkerPool::recordAutoGidDataPathFailure(Transport::Slice *slice) {
+    if (!slice->rdma.endpoint || !context_.autoGidSelectionEnabled()) return;
+    auto connection = slice->rdma.endpoint->autoGidConnection();
+    if (!connection) return;
+
+    AutoGidDataPathAction action;
+    const std::string peer_path = normalizeNicPath(slice->peer_nic_path);
+    {
+        std::lock_guard<std::mutex> guard(auto_gid_failure_lock_);
+        action =
+            auto_gid_failure_trackers_[peer_path].recordFailure(*connection);
+        auto_gid_failure_pending_.store(true, std::memory_order_relaxed);
+    }
+    if (action != AutoGidDataPathAction::kAdvanceRank) return;
+
+    const uint32_t next_rank = connection->selection_rank + 1;
+    std::string previous_gid;
+    std::string next_gid;
+    auto result =
+        context_.ensureAutoGidRank(next_rank, &previous_gid, &next_gid);
+    if (result == GidRefreshResult::FAILED) {
+        LOG(WARNING) << "Auto GID data-path recovery exhausted at rank "
+                     << connection->selection_rank << " for local NIC "
+                     << context_.deviceName() << " and peer "
+                     << slice->peer_nic_path;
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(auto_gid_failure_lock_);
+        auto_gid_failure_trackers_.erase(peer_path);
+        auto_gid_failure_pending_.store(!auto_gid_failure_trackers_.empty(),
+                                        std::memory_order_relaxed);
+    }
+    LOG(WARNING) << "Auto GID data-path recovery advanced local NIC "
+                 << context_.deviceName() << " for peer "
+                 << slice->peer_nic_path << " from rank "
+                 << connection->selection_rank << " (" << previous_gid
+                 << ") to rank " << next_rank << " (" << next_gid << ")";
+}
+
+void WorkerPool::recordAutoGidDataPathSuccess(Transport::Slice *slice) {
+    if (!slice->rdma.endpoint) return;
+    auto connection = slice->rdma.endpoint->autoGidConnection();
+    if (!connection) return;
+
+    const std::string peer_path = normalizeNicPath(slice->peer_nic_path);
+    std::lock_guard<std::mutex> guard(auto_gid_failure_lock_);
+    auto iter = auto_gid_failure_trackers_.find(peer_path);
+    if (iter == auto_gid_failure_trackers_.end()) return;
+    iter->second.recordSuccess();
+    if (!iter->second.pending()) {
+        auto_gid_failure_trackers_.erase(iter);
+        auto_gid_failure_pending_.store(!auto_gid_failure_trackers_.empty(),
+                                        std::memory_order_relaxed);
     }
 }
 
