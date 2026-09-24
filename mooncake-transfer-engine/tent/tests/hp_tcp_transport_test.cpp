@@ -914,16 +914,10 @@ TEST_P(HighPerformanceTcpLaneDistributionTest,
         }
     }
     for (const auto& server : servers) {
-        const size_t sessions =
-            HighPerformanceTcpTransportTestPeer::activeSessions(*server);
-        // Sliced 4MiB reads on shared CI runners often finish without waking
-        // every configured lane (#4080). Require progress, not full fan-out.
-        if (sliced_read) {
-            EXPECT_GE(sessions, 1u);
-            EXPECT_LE(sessions, params.connections_per_peer);
-        } else {
-            EXPECT_EQ(sessions, params.connections_per_peer);
-        }
+        // Keep strict lane fan-out (#3987). #4080 flake is submit/RPC-pool,
+        // not lane utilization — see review on PR #4219.
+        EXPECT_EQ(HighPerformanceTcpTransportTestPeer::activeSessions(*server),
+                  params.connections_per_peer);
     }
     ASSERT_TRUE(client.quiesce().ok());
     ASSERT_TRUE(client.uninstall().ok());
