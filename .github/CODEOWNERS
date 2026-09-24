@@ -42,4 +42,6 @@
 /mooncake-transfer-engine/*/transport/efa_transport/ @alogfans @whn09
 /mooncake-wheel @ShangmingCai @stmatengss @zxpdemonio
 /scripts/tone_tests @luketong777
+/scripts/rocm_tests @andyluo7
+/scripts/e2e @luketong777 @andyluo7 @Aionw
 /scripts/ascend/ @ascend-direct-dev @VNightMare @MingYang119

@@ -25,7 +25,7 @@ run_test()
 
     ${docker_exec} "\
         export PYTHONPATH=/sgl-workspace/sglang:\$PYTHONPATH && \
-        cd /test_run/python && \
+        cd /test_run/e2e/python && \
         ${offline_prefix}python3 -m pytest test_moe_mooncake.py -v -s --tb=long" \
         2>&1 | tee "$log_file"
 
