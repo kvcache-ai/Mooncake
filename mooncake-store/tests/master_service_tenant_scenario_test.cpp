@@ -166,7 +166,7 @@ TEST(MasterServiceTenantScenarioTest, BatchGetReplicaListKeepsTenantIsolation) {
         .Given(Tenant("batch_get_tenant_b"))
         .When(PutStart(key, 1_KB)
                   .ForTenant("batch_get_tenant_a")
-                  .InGroup(GroupOnDifferentShard(key)))
+                  .InGroup(UnrelatedGroupId(key)))
         .When(PutEnd(key).ForTenant("batch_get_tenant_a"))
         .When(PutStart(key, 2_KB).ForTenant("batch_get_tenant_b"))
         .When(PutEnd(key).ForTenant("batch_get_tenant_b"))

@@ -270,15 +270,24 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             bytes);
     }
 
-    TenantQuotaHandle GetOrCreateTenantStateHandleForTest(
-        MasterService& service, size_t shard_idx, const TenantId& tenant_id) {
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
-        auto& tenant_state =
-            MasterServiceTestPeer(service).GetOrCreateTenantState(shard.get(),
-                                                                  tenant_id);
+    // The tenant for one tenant id, created through the registry's factory on
+    // first use, which binds its quota account.
+    std::shared_ptr<metadata::Tenant> GetOrCreateTenantHandleForTest(
+        MasterService& service, const TenantId& tenant_id) {
+        return MasterServiceTestPeer(service).GetOrCreateTenantHandle(
+            tenant_id);
+    }
+
+    // The one quota account bound to that tenant.
+    TenantQuotaHandle GetBoundTenantQuotaHandleForTest(
+        MasterService& service, const TenantId& tenant_id) {
+        auto tenant =
+            MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id);
+        if (tenant == nullptr) {
+            return nullptr;
+        }
         return MasterServiceTestPeer(service).GetBoundTenantQuotaHandle(
-            tenant_state);
+            *tenant);
     }
 
     tl::expected<void, ErrorCode> ChargeBoundTenantQuotaForTest(
@@ -292,44 +301,49 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         MasterServiceTestPeer(service).ReleaseTenantQuota(account, bytes);
     }
 
+    // Sweeps one tenant: its objects are its whole route, so no key is named.
     void DiscardExpiredProcessingForTest(MasterService& service,
-                                         const TenantId& tenant_id,
-                                         const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
+                                         const TenantId& tenant_id) {
+        auto tenant =
+            MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id);
+        ASSERT_NE(tenant, nullptr);
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            shard, std::chrono::system_clock::time_point::max());
+            *tenant, std::chrono::system_clock::time_point::max());
     }
 
     void FinalizeExpiredProcessingForTest(MasterService& service,
                                           const TenantId& tenant_id,
                                           const std::string& key) {
-        OpLogEntry entry;
-        entry.tenant_id = tenant_id.value();
-        entry.object_key = key;
+        auto object_entry = MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        ASSERT_NE(object_entry, nullptr);
+        OpLogEntry durable;
+        durable.tenant_id = tenant_id.value();
+        durable.object_key = key;
         MasterServiceTestPeer(service)
             .FinalizeExpiredProcessingReplicasAfterDurable(
-                entry, std::chrono::system_clock::now());
+                object_entry, durable, std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,
                                               const TenantId& tenant_id,
                                               const std::string& key) {
         std::vector<ReplicaID> removed_ids;
-        {
-            MasterServiceTestPeer::MetadataAccessorRW accessor(
-                &service,
-                MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-            ASSERT_TRUE(accessor.Exists());
-            accessor.Get().VisitReplicas(
-                &Replica::fn_is_memory_replica,
-                [&removed_ids](Replica& replica) {
-                    removed_ids.push_back(replica.id());
-                    replica.mark_removed();
+        const auto visited =
+            MasterServiceTestPeer(service).WithPublishedObjectForWrite(
+                tenant_id, key,
+                [&removed_ids](metadata::Tenant&,
+                               const std::shared_ptr<ObjectEntry>&,
+                               ObjectMetadata& metadata, ObjectEntry::State&) {
+                    metadata.VisitReplicas(
+                        &Replica::fn_is_memory_replica,
+                        [&removed_ids](Replica& replica) {
+                            removed_ids.push_back(replica.id());
+                            replica.mark_removed();
+                        });
+                    return true;
                 });
-        }
+        ASSERT_TRUE(visited.has_value());
         ASSERT_FALSE(removed_ids.empty());
 
         OpLogEntry entry;
@@ -474,17 +488,23 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       SameTenantStatesAcrossMetadataShardsShareBoundHandle) {
+       GetOrCreateTenantHandleIsIdempotentForOneTenantId) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     MountSegment(service);
 
-    auto* first_handle =
-        GetOrCreateTenantStateHandleForTest(service, 0, tenant_id);
-    auto* second_handle =
-        GetOrCreateTenantStateHandleForTest(service, 1, tenant_id);
+    auto first_tenant = GetOrCreateTenantHandleForTest(service, tenant_id);
+    auto second_tenant = GetOrCreateTenantHandleForTest(service, tenant_id);
+
+    ASSERT_NE(first_tenant, nullptr);
+    // One tenant id names one tenant, so a second lookup yields the same one.
+    EXPECT_EQ(first_tenant, second_tenant);
+
+    auto* first_handle = GetBoundTenantQuotaHandleForTest(service, tenant_id);
+    auto* second_handle = GetBoundTenantQuotaHandleForTest(service, tenant_id);
 
     ASSERT_NE(first_handle, nullptr);
+    // ...and that tenant owns exactly one bound account.
     EXPECT_EQ(first_handle, second_handle);
 
     auto charge = ChargeBoundTenantQuotaForTest(service, first_handle, 128);
@@ -820,7 +840,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     AddCompletedDiskReplica(service, client_id, "key", tenant_id, 100);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
 
-    DiscardExpiredProcessingForTest(service, tenant_id, "key");
+    DiscardExpiredProcessingForTest(service, tenant_id);
 
     ExpectDiskOnlyObjectAndChargedBytes(service, tenant_id, "key", 0);
 }
@@ -1175,7 +1195,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(delete_future.wait_for(std::chrono::milliseconds(200)),
               std::future_status::timeout)
         << "tenant deletion passed the metadata scan while zero-charge "
-           "PutStart still held the target metadata shard";
+           "PutStart was still in flight for that tenant";
 
     blocking_strategy_ptr->AllowAllocation();
     put_thread.join();

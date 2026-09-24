@@ -122,7 +122,7 @@ struct ReplicateConfig {
     // Optional per-key group IDs. Empty string keeps that key
     // ungrouped. Group IDs tie keys into a lifecycle group: the background
     // eviction treats the group as a unit (all-or-none). Object routing is
-    // always hash(tenant, key) and is decoupled from groups.
+    // always the key inside the owning tenant, and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
 
     ReplicateConfig ForSingleKey(size_t key_index) const {

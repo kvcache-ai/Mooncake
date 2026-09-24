@@ -47,9 +47,9 @@ void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {
     service_.kv_track_tenant_epochs_ = enabled;
 }
 
-void MasterServiceTestPeer::SetRemoveAllShardHookForTesting(
+void MasterServiceTestPeer::SetRemoveAllTenantHookForTesting(
     std::function<void(size_t)> hook) {
-    service_.kv_remove_all_shard_hook_ = std::move(hook);
+    service_.kv_remove_all_tenant_hook_ = std::move(hook);
 }
 
 uint64_t MasterServiceTestPeer::GetKvClearedPublishedForTesting() const {
@@ -110,35 +110,65 @@ MasterServiceTestPeer::GetNoFHeartbeatFailureCountForTesting(
 }
 
 size_t MasterServiceTestPeer::RunPromotionCandidateRetryForTesting() {
-    return service_.RunPromotionCandidateRetry(MasterService::kNumShards);
+    return service_.RunPromotionCandidateRetry();
+}
+
+void MasterServiceTestPeer::SeedPromotionTaskForTesting(
+    const TenantId& tenant_id, const std::string& key, const UUID& holder_id,
+    ReplicaID alloc_id, uint64_t object_size) {
+    auto tenant_handle = service_.GetOrCreateTenantHandle(tenant_id);
+    auto entry = tenant_handle->Get(key);
+    if (entry == nullptr) {
+        // The route is what keeps the entry reachable by the completion path,
+        // so an unpublished key is seeded through InsertObject.
+        entry = std::make_shared<ObjectEntry>(std::make_unique<ObjectMetadata>(
+            holder_id, std::chrono::system_clock::now(), object_size,
+            std::vector<Replica>{}, std::nullopt, false,
+            ObjectDataType::UNKNOWN, std::string{}, tenant_id, key));
+        // The insert is the seeding step itself, so it stays outside the
+        // assert, which a release build compiles out.
+        const bool inserted = tenant_handle->InsertObject(entry);
+        assert(inserted);
+        (void)inserted;
+    }
+    entry->WithExclusiveAccess([&](ObjectMetadata&, ObjectEntry::State& state) {
+        state.promotion_task =
+            PromotionTask{.source_id = 0,
+                          .alloc_id = alloc_id,
+                          .object_size = object_size,
+                          .start_time = std::chrono::system_clock::now(),
+                          .holder_id = holder_id};
+    });
 }
 
 size_t MasterServiceTestPeer::CountCandidatesForTesting(
     const TenantId& tenant_id) {
-    size_t count = 0;
     std::shared_lock<std::shared_mutex> lock(service_.snapshot_mutex_);
-    for (size_t i = 0; i < MasterService::kNumShards; i++) {
-        MetadataShardAccessorRO shard(&service_, i);
-        auto it = shard->tenants.find(tenant_id);
-        if (it != shard->tenants.end()) {
-            count += it->second.promotion_candidates.size();
-        }
-    }
-    return count;
+    // The count is the tenant's candidate index; the candidate state itself
+    // lives on each entry.
+    return service_.PromotionCandidateKeys(tenant_id).size();
 }
 
 void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
     const auto epoch = std::chrono::steady_clock::time_point{};
-    for (size_t i = 0; i < MasterService::kNumShards; i++) {
-        MetadataShardAccessorRW shard(&service_, i);
-        for (auto& [tenant_id, tenant_state] : shard->tenants) {
-            (void)tenant_id;
-            for (auto& [key, candidate] : tenant_state.promotion_candidates) {
-                (void)key;
-                candidate.retry_after = epoch;
+    // The index only names keys, so each key is resolved again under its own
+    // entry lock; a key whose entry was replaced in between is skipped.
+    service_.tenants_.Visit(
+        [&](const TenantId& tenant_id,
+            const std::shared_ptr<metadata::Tenant>& handle) {
+            for (const auto& key : service_.PromotionCandidateKeys(tenant_id)) {
+                auto entry = handle->Get(key);
+                if (entry == nullptr) {
+                    continue;
+                }
+                entry->WithExclusiveAccess(
+                    [&](ObjectMetadata&, ObjectEntry::State& state) {
+                        if (state.promotion_candidate.has_value()) {
+                            state.promotion_candidate->retry_after = epoch;
+                        }
+                    });
             }
-        }
-    }
+        });
 }
 
 size_t MasterServiceTestPeer::SoftPinHeapSize() const {

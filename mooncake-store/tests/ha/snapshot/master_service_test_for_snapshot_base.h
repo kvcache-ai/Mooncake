@@ -780,37 +780,37 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                     owner));
         }
 
-        for (const auto& shard :
-             MasterServiceTestPeer::MetadataShards(*service)) {
-            for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-                (void)tenant_id;
-                for (const auto& [key, metadata] : tenant_state.metadata) {
-                    (void)key;
-                    for (const auto& replica : metadata.GetAllReplicas()) {
-                        if (replica.is_memory_replica()) {
-                            const auto record = replica.getClientLiveness();
-                            ASSERT_TRUE(record);
-                            EXPECT_TRUE(known_records.contains(record.get()));
-                        } else if (replica.is_local_disk_replica()) {
-                            const auto owner =
-                                replica.get_local_disk_client_id();
-                            ASSERT_TRUE(owner.has_value());
-                            const auto record =
-                                MasterServiceTestPeer::ClientLivenessRecords(
-                                    *service)
-                                    .find(*owner);
-                            ASSERT_NE(
-                                record,
-                                MasterServiceTestPeer::ClientLivenessRecords(
-                                    *service)
-                                    .end());
-                            EXPECT_TRUE(
-                                replica.isAffiliatedWith(record->second));
+        MasterServiceTestPeer::Tenants(*service).Visit(
+            [&](const TenantId&,
+                const std::shared_ptr<metadata::Tenant>& handle) {
+                for (const auto& entry : handle->SnapshotObjects()) {
+                    entry->WithSharedAccess([&](const ObjectMetadata& metadata,
+                                                const ObjectEntry::State&) {
+                        for (const auto& replica : metadata.GetAllReplicas()) {
+                            if (replica.is_memory_replica()) {
+                                const auto record = replica.getClientLiveness();
+                                ASSERT_TRUE(record);
+                                EXPECT_TRUE(
+                                    known_records.contains(record.get()));
+                            } else if (replica.is_local_disk_replica()) {
+                                const auto owner =
+                                    replica.get_local_disk_client_id();
+                                ASSERT_TRUE(owner.has_value());
+                                const auto record =
+                                    MasterServiceTestPeer::
+                                        ClientLivenessRecords(*service)
+                                            .find(*owner);
+                                ASSERT_NE(record,
+                                          MasterServiceTestPeer::
+                                              ClientLivenessRecords(*service)
+                                                  .end());
+                                EXPECT_TRUE(
+                                    replica.isAffiliatedWith(record->second));
+                            }
                         }
-                    }
+                    });
                 }
-            }
-        }
+            });
     }
 
     // Test snapshot and restore functionality
