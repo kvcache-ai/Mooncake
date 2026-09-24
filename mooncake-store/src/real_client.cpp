@@ -3987,8 +3987,29 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto result = client_->RegisterLocalMemory(buffer, size, kWildcardLocation,
-                                               false, true);
+
+    // Only a HugeTLB segment's base address is widened to the physical
+    // segment. ShmHelper::allocate rounds the mapping up to hugepage
+    // granularity, so the MR bounds must coincide with the mapping bounds;
+    // otherwise madvise(MADV_DONTFORK) (active after ibv_fork_init) fails
+    // with EINVAL when the kernel has to split the hugetlb VMA. Sub-range
+    // registrations are not special-cased and behave exactly as before.
+    // A zero-length request is left untouched so it keeps hitting the
+    // existing length==0 rejection instead of being widened to the segment.
+    size_t registration_size = size;
+    auto *shm_helper = ShmHelper::getInstance();
+    if (shm_helper->is_hugepage()) {
+        auto shm = shm_helper->get_shm(buffer);
+        if (shm && buffer == shm->base_addr && size > 0 && size < shm->size) {
+            registration_size = shm->size;
+            LOG(INFO) << "Registering HugeTLB shared-memory segment: base="
+                      << buffer << ", segment_size=" << shm->size
+                      << ", logical_size=" << size;
+        }
+    }
+
+    auto result = client_->RegisterLocalMemory(buffer, registration_size,
+                                               kWildcardLocation, false, true);
     if (!result) {
         return result;
     }
