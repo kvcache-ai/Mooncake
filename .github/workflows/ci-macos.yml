@@ -36,7 +36,8 @@ jobs:
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
       BREW_PACKAGES: >-
-        ninja boost gflags glog jsoncpp yaml-cpp xxhash zstd openssl@3
+        ninja boost fmt gflags glog jsoncpp msgpack-cxx yaml-cpp xxhash zstd
+        openssl@3
 
     steps:
     # extern/pybind11 is required at configure time. Linux CI gets it from
