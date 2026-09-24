@@ -1617,18 +1617,6 @@ StoreScatterTransferOperation TransferSubmitter::submitNativeScatter(
             engine_.submitScatter(transfers)));
 }
 
-StoreScatterTransferOperation TransferSubmitter::submitNativeScatter(
-    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
-    int intent) {
-    auto parsed_intent = TransferIntentFromInt(intent);
-    if (!parsed_intent) {
-        return StoreScatterTransferOperation(
-            std::make_unique<StoreScatterTransferOperation::Impl>(
-                Status::InvalidArgument("invalid transfer intent")));
-    }
-    return submitNativeScatter(transfers, *parsed_intent);
-}
-
 std::optional<TransferFuture>
 TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,

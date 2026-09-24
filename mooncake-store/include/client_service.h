@@ -199,9 +199,6 @@ class Client {
     std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
-    std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
-        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
-        int intent);
 
     std::optional<StoreScatterTransferOperation> SubmitScatterNative(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
@@ -266,10 +263,6 @@ class Client {
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& src_offsets,
         TransferIntent intent = TransferIntent::kUnspecified);
-    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferReadRanges(
-        const std::vector<Replica::Descriptor>& replicas,
-        const std::vector<std::vector<Slice>>& slices,
-        const std::vector<std::vector<uint64_t>>& src_offsets, int intent);
 
     /**
      * @brief Batch ranged write into cached replicas (replication). Fragments
@@ -283,10 +276,6 @@ class Client {
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& dst_offsets,
         TransferIntent intent = TransferIntent::kUnspecified);
-    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferWriteRanges(
-        const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
-        const std::vector<std::vector<Slice>>& slices,
-        const std::vector<std::vector<uint64_t>>& dst_offsets, int intent);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -613,12 +602,6 @@ class Client {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
         OffloadBufferAccess buffer_access,
         TransferIntent intent = TransferIntent::kForegroundGet);
-    tl::expected<void, ErrorCode> BatchGetOffloadObject(
-        const std::string& transfer_engine_addr,
-        const std::vector<std::string>& keys,
-        const std::vector<uintptr_t>& pointers,
-        const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
-        OffloadBufferAccess buffer_access, int intent);
 
     /**
      * @brief Notifies the master that offloading of specified objects has

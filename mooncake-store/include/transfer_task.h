@@ -610,14 +610,6 @@ class TransferSubmitter {
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         TransferRequest::OpCode op_code, void* ptr = nullptr, size_t size = 0,
         TransferIntent intent = TransferIntent::kUnspecified);
-    std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
-                                         std::vector<Slice>& slices,
-                                         TransferRequest::OpCode op_code,
-                                         void* ptr, size_t size, int intent) {
-        auto parsed_intent = TransferIntentFromInt(intent);
-        if (!parsed_intent) return std::nullopt;
-        return submit(replica, slices, op_code, ptr, size, *parsed_intent);
-    }
 
     /**
      * @brief Submit a range read: read [src_offset, src_offset+size) from
@@ -627,48 +619,23 @@ class TransferSubmitter {
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         uint64_t src_offset,
         TransferIntent intent = TransferIntent::kUnspecified);
-    std::optional<TransferFuture> submitRangeRead(
-        const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        uint64_t src_offset, int intent) {
-        auto parsed_intent = TransferIntentFromInt(intent);
-        if (!parsed_intent) return std::nullopt;
-        return submitRangeRead(replica, slices, src_offset, *parsed_intent);
-    }
 
     std::optional<TransferFuture> submitRangeWrite(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         uint64_t dst_offset,
         TransferIntent intent = TransferIntent::kUnspecified);
-    std::optional<TransferFuture> submitRangeWrite(
-        const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        uint64_t dst_offset, int intent) {
-        auto parsed_intent = TransferIntentFromInt(intent);
-        if (!parsed_intent) return std::nullopt;
-        return submitRangeWrite(replica, slices, dst_offset, *parsed_intent);
-    }
 
     TransferEngine::ScatterTransferOperation submitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers);
     StoreScatterTransferOperation submitNativeScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
-    StoreScatterTransferOperation submitNativeScatter(
-        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
-        int intent);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
         TransferRequest::OpCode op_code,
         TransferIntent intent = TransferIntent::kUnspecified);
-    std::optional<TransferFuture> submit_batch(
-        const std::vector<Replica::Descriptor>& replicas,
-        std::vector<std::vector<Slice>>& all_slices,
-        TransferRequest::OpCode op_code, int intent) {
-        auto parsed_intent = TransferIntentFromInt(intent);
-        if (!parsed_intent) return std::nullopt;
-        return submit_batch(replicas, all_slices, op_code, *parsed_intent);
-    }
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
@@ -678,19 +645,6 @@ class TransferSubmitter {
             batched_slices,
         OffloadBufferAccess buffer_access,
         TransferIntent intent = TransferIntent::kUnspecified);
-    std::optional<TransferFuture> submit_batch_get_offload_object(
-        const std::string& transfer_engine_addr,
-        const std::vector<std::string>& keys,
-        const std::vector<uint64_t>& pointers,
-        const std::unordered_map<std::string, std::vector<Slice>>&
-            batched_slices,
-        OffloadBufferAccess buffer_access, int intent) {
-        auto parsed_intent = TransferIntentFromInt(intent);
-        if (!parsed_intent) return std::nullopt;
-        return submit_batch_get_offload_object(transfer_engine_addr, keys,
-                                               pointers, batched_slices,
-                                               buffer_access, *parsed_intent);
-    }
 
     [[nodiscard]] bool canUseLocalMemcpy(const std::string& endpoint) const;
 

@@ -1461,17 +1461,6 @@ std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
     return transfer_engine_->submitScatter(mutable_transfers);
 }
 
-std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
-    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
-    int intent) {
-    auto parsed_intent = TransferIntentFromInt(intent);
-    if (!parsed_intent) {
-        LOG(ERROR) << "Invalid transfer intent: " << intent;
-        return std::nullopt;
-    }
-    return SubmitScatter(transfers, *parsed_intent);
-}
-
 std::optional<StoreScatterTransferOperation> Client::SubmitScatterNative(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers,
     TransferIntent intent) {
@@ -4183,21 +4172,6 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     return {};
 }
 
-tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
-    const std::string& transfer_engine_addr,
-    const std::vector<std::string>& keys,
-    const std::vector<uintptr_t>& pointers,
-    const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
-    OffloadBufferAccess buffer_access, int intent) {
-    auto parsed_intent = TransferIntentFromInt(intent);
-    if (!parsed_intent) {
-        LOG(ERROR) << "Invalid transfer intent: " << intent;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    return BatchGetOffloadObject(transfer_engine_addr, keys, pointers,
-                                 batch_slices, buffer_access, *parsed_intent);
-}
-
 tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     const std::vector<std::string>& keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -4769,20 +4743,6 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
     return results;
 }
 
-std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
-    const std::vector<Replica::Descriptor>& replicas,
-    const std::vector<std::vector<Slice>>& slices,
-    const std::vector<std::vector<uint64_t>>& src_offsets, int intent) {
-    auto parsed_intent = TransferIntentFromInt(intent);
-    if (!parsed_intent) {
-        LOG(ERROR) << "Invalid transfer intent: " << intent;
-        return std::vector<tl::expected<int64_t, ErrorCode>>(
-            replicas.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    return BatchTransferReadRanges(replicas, slices, src_offsets,
-                                   *parsed_intent);
-}
-
 std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
     const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
     const std::vector<std::vector<Slice>>& slices,
@@ -4875,21 +4835,6 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
         results[i] = tl::unexpected(entry_errors[i].value());
     }
     return results;
-}
-
-std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
-    const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
-    const std::vector<std::vector<Slice>>& slices,
-    const std::vector<std::vector<uint64_t>>& dst_offsets, int intent) {
-    auto parsed_intent = TransferIntentFromInt(intent);
-    if (!parsed_intent) {
-        LOG(ERROR) << "Invalid transfer intent: " << intent;
-        return std::vector<tl::expected<int64_t, ErrorCode>>(
-            replicas_per_entry.size(),
-            tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    return BatchTransferWriteRanges(replicas_per_entry, slices, dst_offsets,
-                                    *parsed_intent);
 }
 
 ErrorCode Client::TransferReadInternal(
