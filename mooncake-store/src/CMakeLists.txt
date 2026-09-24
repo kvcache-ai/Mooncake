@@ -22,6 +22,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/ha_cluster_namespace_config.cpp
     config/local_file_snapshot_config.cpp
     config/metrics_bootstrap_config_loader.cpp
+    config/rpc_connection_bootstrap_config_loader.cpp
     config/redis_connection_config.cpp
     config/s3_client_config.cpp
     segment_allocator_registration.cpp

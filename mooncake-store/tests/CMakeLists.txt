@@ -127,6 +127,8 @@ target_link_libraries(master_service_concurrent_scenario_test
                       PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
+target_include_directories(master_service_config_test
+                           PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-store/src)
 add_store_test(master_service_processing_key_double_erase_test
                master_service_processing_key_double_erase_test.cpp)
 add_store_test(master_service_tenant_quota_test

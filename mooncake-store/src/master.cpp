@@ -16,6 +16,7 @@
 
 #include "allocator_status.h"
 #include "config/metrics_bootstrap_config_loader.h"
+#include "config/rpc_connection_bootstrap_config_loader.h"
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
@@ -484,6 +485,21 @@ GetMetricsBootstrapCommandLineOverrides() {
     return command_line;
 }
 
+mooncake::RpcConnectionCommandLineOverrides
+GetRpcConnectionCommandLineOverrides() {
+    mooncake::RpcConnectionCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("rpc_conn_timeout_seconds", &info) &&
+        !info.is_default) {
+        command_line.timeout_seconds = FLAGS_rpc_conn_timeout_seconds;
+    }
+    if (google::GetCommandLineFlagInfo("rpc_enable_tcp_no_delay", &info) &&
+        !info.is_default) {
+        command_line.tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
+    }
+    return command_line;
+}
+
 void ResolveRpcAddressFromInterfaceOrDie(
     mooncake::MasterConfig& master_config) {
     if (master_config.rpc_interface.empty()) {
@@ -530,12 +546,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_rpc_address);
     default_config.GetString("rpc_interface", &master_config.rpc_interface,
                              FLAGS_rpc_interface);
-    default_config.GetInt32("rpc_conn_timeout_seconds",
-                            &master_config.rpc_conn_timeout_seconds,
-                            FLAGS_rpc_conn_timeout_seconds);
-    default_config.GetBool("rpc_enable_tcp_no_delay",
-                           &master_config.rpc_enable_tcp_no_delay,
-                           FLAGS_rpc_enable_tcp_no_delay);
     default_config.GetDurationMs("default_kv_lease_ttl",
                                  &master_config.default_kv_lease_ttl,
                                  mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL);
@@ -875,16 +885,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_interface = FLAGS_rpc_interface;
-    }
-    if ((google::GetCommandLineFlagInfo("rpc_conn_timeout_seconds", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.rpc_conn_timeout_seconds = FLAGS_rpc_conn_timeout_seconds;
-    }
-    if ((google::GetCommandLineFlagInfo("rpc_enable_tcp_no_delay", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
     }
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
@@ -1566,6 +1566,15 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
     try {
+        master_config.rpc_connection =
+            mooncake::ResolveRpcConnectionBootstrapConfig(
+                loaded_default_config, GetRpcConnectionCommandLineOverrides());
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Invalid RPC connection bootstrap configuration: "
+                   << error.what();
+        return 1;
+    }
+    try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
     } catch (const std::exception& error) {
@@ -1722,8 +1731,9 @@ int main(int argc, char* argv[]) {
         << ", rpc_address=" << master_config.rpc_address
         << ", rpc_interface=" << master_config.rpc_interface
         << ", rpc_conn_timeout_seconds="
-        << master_config.rpc_conn_timeout_seconds
-        << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
+        << master_config.rpc_connection.timeout.count()
+        << ", rpc_enable_tcp_no_delay="
+        << master_config.rpc_connection.tcp_no_delay
         << ", rpc protocol=" << protocol
         << ", cluster_id=" << master_config.cluster_id
         << ", root_fs_dir=" << master_config.root_fs_dir
@@ -1803,9 +1813,8 @@ int main(int argc, char* argv[]) {
         mooncake::ViewVersionId version = 0;
         coro_rpc::coro_rpc_server server(
             master_config.rpc_thread_num, master_config.rpc_port,
-            master_config.rpc_address,
-            std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
-            master_config.rpc_enable_tcp_no_delay);
+            master_config.rpc_address, master_config.rpc_connection.timeout,
+            master_config.rpc_connection.tcp_no_delay);
         if (rpc_protocol_config.use_rdma) {
 #ifdef YLT_ENABLE_IBV
             server.init_ibv();
