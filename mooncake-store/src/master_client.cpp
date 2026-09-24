@@ -48,6 +48,16 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListForAdmin> {
+    static constexpr const char* value = "GetReplicaListForAdmin";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListForAdmin> {
+    static constexpr const char* value = "BatchGetReplicaListForAdmin";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
     static constexpr const char* value = "CalcCacheStats";
 };
@@ -255,6 +265,11 @@ struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
     static constexpr const char* value = "PromotionAllocStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterPrefetchTask> {
+    static constexpr const char* value = "RegisterPrefetchTask";
 };
 
 template <>
@@ -653,6 +668,44 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(
         object_keys.size(), object_keys, tenant_id);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListReadOnly(const std::string& object_key) {
+    return GetReplicaListReadOnly(object_key, tenant_id_.value());
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListReadOnly(const std::string& object_key,
+                                     const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaListReadOnly");
+    timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetReplicaListForAdmin,
+                             GetReplicaListResponse>(object_key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListReadOnly(
+    const std::vector<std::string>& object_keys) {
+    return BatchGetReplicaListReadOnly(object_keys, tenant_id_.value());
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListReadOnly(
+    const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaListReadOnly");
+    timer.LogRequest("keys_count=", object_keys.size(),
+                     ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListForAdmin,
+                         GetReplicaListResponse>(object_keys.size(),
+                                                 object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -1192,6 +1245,16 @@ MasterClient::PromotionAllocStart(
 tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
     const UUID& client_id, const std::string& key) {
     return NotifyPromotionSuccess(client_id, key, tenant_id_.value());
+}
+
+tl::expected<void, ErrorCode> MasterClient::RegisterPrefetchTask(
+    const UUID& client_id, const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::RegisterPrefetchTask");
+    timer.LogRequest("client_id=", client_id, ", key=", key);
+    auto result = invoke_rpc<&WrappedMasterService::RegisterPrefetchTask, void>(
+        client_id, key, tenant_id_.value());
+    timer.LogResponseExpected(result);
+    return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(

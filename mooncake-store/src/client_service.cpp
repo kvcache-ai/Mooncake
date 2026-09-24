@@ -1194,6 +1194,20 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
         result.value().object_checksum);
 }
 
+tl::expected<QueryResult, ErrorCode> Client::QueryReadOnly(
+    const std::string& object_key) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
+    auto result = master_client_.GetReplicaListReadOnly(object_key);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    // The admin read-only path grants no lease: pin the expiry to now so the
+    // caller cannot mistake this metadata for a lease-protected one.
+    return QueryResult(std::move(result.value().replicas), start_time,
+                       result.value().object_checksum);
+}
+
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys) {
     return BatchQuery(object_keys, master_client_.tenant_id());
@@ -1226,6 +1240,45 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
                 response[i].value().object_checksum);
+        } else {
+            results.emplace_back(tl::unexpected(response[i].error()));
+        }
+    }
+    return results;
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQueryReadOnly(
+    const std::vector<std::string>& object_keys) {
+    return BatchQueryReadOnly(object_keys, master_client_.tenant_id());
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQueryReadOnly(
+    const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
+    auto response =
+        master_client_.BatchGetReplicaListReadOnly(object_keys, tenant_id);
+
+    // Check if we got the expected number of responses
+    if (response.size() != object_keys.size()) {
+        LOG(ERROR) << "BatchQueryReadOnly response size mismatch. Expected: "
+                   << object_keys.size() << ", Got: " << response.size();
+        // Return vector of RPC_FAIL errors
+        std::vector<tl::expected<QueryResult, ErrorCode>> results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return results;
+    }
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(response.size());
+    for (size_t i = 0; i < response.size(); ++i) {
+        if (response[i]) {
+            // No lease granted on the read-only path: expiry pinned to now.
+            results.emplace_back(
+                QueryResult(std::move(response[i].value().replicas), start_time,
+                            response[i].value().object_checksum));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -4169,6 +4222,11 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::RegisterPrefetchTask(
+    const std::string& object_key) {
+    return master_client_.RegisterPrefetchTask(client_id_, object_key);
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 Client::PromotionAllocStart(
     const std::string& key, uint64_t size,
@@ -5442,10 +5500,26 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     }
     const auto replica_transfer_endpoint =
         replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    // Fast paths first: lock-free comparisons against this client's own
+    // endpoint/hostname.
     if (metadata_connstring_ == P2PHANDSHAKE) {
-        return replica_transfer_endpoint == GetTransportEndpoint();
+        if (replica_transfer_endpoint == GetTransportEndpoint()) {
+            return true;
+        }
+    } else if (local_hostname_ == replica_transfer_endpoint) {
+        return true;
     }
-    return local_hostname_ == replica_transfer_endpoint;
+    // Fallback: the replica's endpoint may address one of this client's
+    // mounted segments by segment name or TE endpoint (e.g. when the writer
+    // published the segment under a name different from local_hostname_).
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    for (const auto& [segment_id, segment] : mounted_segments_) {
+        if (replica_transfer_endpoint == segment.name ||
+            replica_transfer_endpoint == segment.te_endpoint) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace mooncake

@@ -141,6 +141,23 @@ class Client {
     tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
 
     /**
+     * @brief Read-only variant of Query(): fetches replica metadata without
+     * granting a lease, triggering promotion-on-hit, or counting valid_get
+     * metrics on the master.
+     *
+     * The returned QueryResult carries an already-expired lease
+     * (lease_ttl_ms is forced to 0): callers must not start data transfers
+     * based on it without a subsequent lease-granting Query().
+     *
+     * Intended for best-effort background paths (e.g. SSD prefetch metadata
+     * classification) that must not perturb hot-path state.
+     * @param object_key Key to query
+     * @return QueryResult containing replicas, or ErrorCode indicating failure
+     */
+    tl::expected<QueryResult, ErrorCode> QueryReadOnly(
+        const std::string& object_key);
+
+    /**
      * @brief Queries replica lists for object keys that match a regex pattern.
      * @param str The regular expression string to match against object keys.
      * @return An expected object containing a map from object keys to their
@@ -160,6 +177,16 @@ class Client {
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys,
+        const std::string& tenant_id);
+
+    /**
+     * @brief Read-only variant of BatchQuery(); see QueryReadOnly() for the
+     * lease/metrics semantics. Per-key results keep input order.
+     */
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryReadOnly(
+        const std::vector<std::string>& object_keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryReadOnly(
         const std::vector<std::string>& object_keys,
         const std::string& tenant_id);
 
@@ -535,6 +562,16 @@ class Client {
     // Virtual to enable subclassing in unit tests.
     virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
         std::vector<PromotionTaskItem>& promotion_objects);
+
+    /**
+     * @brief Register a master-side promotion task for SSD prefetch, without
+     * the promotion-on-hit admission gate or heartbeat mailbox. This client
+     * must hold the key's LOCAL_DISK replica. Best-effort:
+     * PROMOTION_ALREADY_EXISTS means skip quietly. The client's tenant
+     * applies.
+     */
+    virtual tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const std::string& object_key);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during

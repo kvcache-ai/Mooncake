@@ -188,6 +188,26 @@ enum class ReplicaWriteMode {
     RELIABLE_MULTI_REPLICA,
 };
 
+/**
+ * @brief Options for is_exist / batch_is_exist.
+ *
+ * Mirrors the ReplicateConfig pattern: a struct leaves room for future
+ * extensions without changing the function signature each time.
+ *
+ * prefetch_to_memory requires the client to be configured with
+ * enable_ssd_prefetch (and SSD offload for local promotion); otherwise it is
+ * silently ignored. See docs/source/design/ssd-prefetch.md.
+ */
+struct ExistOptions {
+    bool prefetch_to_memory = false;
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const ExistOptions& options) noexcept {
+        os << "ExistOptions: { prefetch_to_memory: "
+           << options.prefetch_to_memory << " }";
+        return os;
+    }
+};
+
 inline ReplicaWriteMode DetermineReplicaWriteMode(
     const ReplicateConfig& config) {
     if (config.dfs_replica_num == 0 && config.replica_num == 1 &&

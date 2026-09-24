@@ -169,6 +169,23 @@ class ClientRequester {
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
 
+    /**
+     * @brief Asks a remote holder node to prefetch (promote SSD->DRAM) the
+     * given keys. Used for cross-node SSD prefetch: the holder must register
+     * the promotion task itself (the master validates holder_id ==
+     * client_id), so the requester delegates via this RPC instead of calling
+     * RegisterPrefetchTask locally. Best-effort: errors are logged, not
+     * propagated, and never block the originating exist() call. Old peers
+     * reject the RPC and the keys simply stay SSD-only.
+     * @param client_addr Network address of the holder's offload RPC service.
+     * @param keys SSD-only keys held by the remote node.
+     * @param sizes Object sizes (bytes), index-aligned with keys. Hint only;
+     *        the holder re-reads sizes from its authoritative local metadata.
+     */
+    void prefetch_offload_object(const std::string &client_addr,
+                                 const std::vector<std::string> &keys,
+                                 const std::vector<int64_t> &sizes);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and
@@ -525,6 +542,20 @@ class PyClient {
 
     virtual std::vector<int> batchProbeKey(
         const std::vector<std::string> &keys) = 0;
+
+    // ExistOptions variants. The default implementation ignores the options
+    // (prefetch unsupported); RealClient overrides them when
+    // enable_ssd_prefetch is on. See docs/source/design/ssd-prefetch.md.
+    virtual int isExist(const std::string &key, const ExistOptions &options) {
+        (void)options;
+        return isExist(key);
+    }
+
+    virtual std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                          const ExistOptions &options) {
+        (void)options;
+        return batchIsExist(keys);
+    }
 
     virtual int64_t getSize(const std::string &key) = 0;
 

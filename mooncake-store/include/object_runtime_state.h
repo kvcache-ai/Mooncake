@@ -122,6 +122,9 @@ struct PromotionTask {
     // copies candidate -> task verbatim, failure re-record writes
     // task+1 -> candidate.
     uint32_t execution_failures{0};
+    // SSD prefetch admission. NotifyPromotionSuccess grants a read lease
+    // so the promoted replica survives until the follow-up get.
+    bool from_prefetch{false};
 };
 
 }  // namespace mooncake

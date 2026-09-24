@@ -23,6 +23,7 @@
 #include "common/network.h"
 #include "pyclient.h"
 #include "rpc_types.h"
+#include "ssd_prefetcher.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
 #endif
@@ -391,6 +392,17 @@ class RealClient : public PyClient {
      * if error
      */
     std::vector<int> batchProbeKey(const std::vector<std::string> &keys);
+
+    /**
+     * @brief isExist / batchIsExist with options. With
+     * ExistOptions.prefetch_to_memory and enable_ssd_prefetch configured,
+     * existing keys that turn out SSD-only get a best-effort asynchronous
+     * SSD->DRAM promotion so a later get() can hit DRAM. The synchronous
+     * path does no extra RPC (a throttle dedup plus a thread-pool enqueue).
+     */
+    int isExist(const std::string &key, const ExistOptions &options) override;
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                  const ExistOptions &options) override;
 
     /**
      * @brief Get the size of an object
@@ -837,6 +849,15 @@ class RealClient : public PyClient {
     bool release_offload_buffer(uint64_t batch_id);
 
     /**
+     * @brief RPC handler: a remote requester asks this node (the LOCAL_DISK
+     * holder) to prefetch-promote the given keys into DRAM. Best-effort and
+     * asynchronous; returns false when prefetch is disabled or SSD offload
+     * is not set up here.
+     */
+    bool prefetch_offload_object(const std::vector<std::string> &keys,
+                                 const std::vector<int64_t> &sizes);
+
+    /**
      * @brief Retrieves multiple stored objects from a remote service.
      * @param target_rpc_service_addr Address of the remote RPC service (e.g.,
      "ip:port").
@@ -1005,6 +1026,16 @@ class RealClient : public PyClient {
     std::string local_rpc_addr;
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     int offload_rpc_port_ = 0;
+
+    // SSD prefetch (best-effort SSD->DRAM promotion on exist probes). Off
+    // unless enable_ssd_prefetch is set in the config; knobs are read from
+    // the config dict in setup_internal. See
+    // docs/source/design/ssd-prefetch.md.
+    std::unique_ptr<SsdPrefetcher> prefetcher_;
+    bool enable_ssd_prefetch_ = false;
+    int64_t ssd_prefetch_cooldown_sec_ = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC;
+    int64_t ssd_prefetch_dedup_ttl_sec_ = DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC;
+    int64_t ssd_get_wait_ms_ = DEFAULT_SSD_GET_WAIT_MS;
     bool use_hugepage_ = false;
 
     struct MappedShm {

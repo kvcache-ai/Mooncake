@@ -2151,6 +2151,16 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     return object_bucket_map_.find(key) != object_bucket_map_.end();
 }
 
+std::optional<int64_t> BucketStorageBackend::GetObjectDataSize(
+    const std::string& key) const {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end() || it->second.data_size <= 0) {
+        return std::nullopt;
+    }
+    return it->second.data_size;
+}
+
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
     // When eviction is enabled, always allow offloading since PrepareEviction
     // will manage capacity by evicting old buckets as needed.

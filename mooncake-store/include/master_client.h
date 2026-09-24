@@ -231,6 +231,29 @@ class MasterClient {
                         const std::string& tenant_id);
 
     /**
+     * @brief Read-only variants of GetReplicaList / BatchGetReplicaList.
+     *
+     * Backed by the admin read-only RPCs: the master grants no lease, does
+     * not trigger promotion-on-hit, and does not update valid_get metrics.
+     * Note the response still carries the master's default lease_ttl_ms
+     * value; callers that need lease semantics must force it to 0 (see
+     * Client::QueryReadOnly).
+     *
+     * Intended for best-effort background paths (e.g. SSD prefetch metadata
+     * classification) that must not perturb hot-path state.
+     */
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListReadOnly(const std::string& object_key);
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListReadOnly(const std::string& object_key,
+                           const std::string& tenant_id);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys,
+                                const std::string& tenant_id);
+
+    /**
      * @brief Starts a put operation
      * @param key Object key
      * @param slice_lengths Vector of slice lengths
@@ -509,6 +532,21 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
+
+    /**
+     * @brief Registers a prefetch (SSD->DRAM promotion) task on the master.
+     *
+     * Creates a promotion_tasks entry consumed by PromotionAllocStart, but
+     * deliberately bypasses the promotion-on-hit admission gate and the
+     * holder's heartbeat mailbox, keeping the dedicated prefetch path
+     * separate from promotion-on-hit. The caller must be the holder of the
+     * key's LOCAL_DISK replica (the master checks holder_id == client_id).
+     * Best-effort: PROMOTION_ALREADY_EXISTS means a MEMORY replica or an
+     * in-flight promotion already exists and the caller should skip quietly.
+     * The client's own tenant is used.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const UUID& client_id, const std::string& key);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during

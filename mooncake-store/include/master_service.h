@@ -83,6 +83,33 @@ class OrderedOpLogWriter;
 struct MetadataStoragePlugin;
 
 namespace test {
+class MasterServiceTest;
+class MasterServiceSnapshotTestBase;
+class SnapshotChildProcessTest;
+// Friended so the promotion-on-hit tests can drive a serialize/reset/
+// deserialize cycle directly via the otherwise-private
+// MetadataSerializer, and inspect private clamp fields. This avoids
+// standing up a full snapshot catalog + child-process harness, and
+// exposing test-only accessors on MasterService itself.
+class PromotionOnHitTest;
+class DynamicReplicationTest;
+class MasterServiceTenantQuotaTest;
+class MasterScenario;
+class MasterServiceHATest;
+// Friended so the processing_keys double-erase reproduction test can
+// invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
+// ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
+class MasterServiceProcessingKeyDoubleEraseTest;
+// Friended so the LOCAL_DISK deregistration interleaving tests can run the
+// two halves of UnmountLocalDiskSegment (deregistration, replica sweep)
+// with a competing mount + register serialized between them, pinning the
+// interleaving instead of hoping a thread scheduler produces it.
+class LocalDiskUnmountInterleavingTest;
+// Friended so the #2997 regression test can call the private
+// PushOffloadingQueue directly with degenerate replica states that the
+// public PutStart/PutEnd path never produces.
+class MasterServiceSSDTest;
+class PrefetchTaskMasterTest;
 class MasterServiceTestPeer;
 }  // namespace test
 
@@ -125,10 +152,30 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  */
 
 class MasterService {
-    friend class test::MasterServiceTestPeer;
-    friend class MasterSnapshotManager;    // Allow access to internal state for
-                                           // snapshot
+    // Test friend class for snapshot/restore testing
+    friend class test::MasterServiceSnapshotTestBase;
+    friend class test::MasterServiceTest;
+    friend class test::SnapshotChildProcessTest;
+    friend class test::PromotionOnHitTest;
+    friend class test::PrefetchTaskMasterTest;
+    friend class test::DynamicReplicationTest;
+    friend class test::MasterServiceTenantQuotaTest;
+    // The scenario DSL controls lease timestamps so eviction tests do not
+    // depend on sleeps or the background eviction thread.
+    friend class test::MasterScenario;
+    // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
+    friend class test::MasterServiceProcessingKeyDoubleEraseTest;
+    friend class test::LocalDiskUnmountInterleavingTest;
+    // #2997 regression: exercises PushOffloadingQueue's no-op paths directly.
+    friend class test::MasterServiceSSDTest;
+    friend class MasterSnapshotManager;  // Allow access to internal state for
+                                         // snapshot
     friend class ClientOffboardingWorker;
+    friend class ha::MasterSnapshotCodec;      // Allow codec to access private
+                                               // members
+    friend class test::MasterServiceHATest;
+    friend class test::MasterServiceTestPeer;
+                                           // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
 
@@ -786,6 +833,30 @@ class MasterService {
                              const TenantId& tenant_id, uint64_t size,
                              const std::vector<std::string>& preferred_segments)
         -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
+
+    /**
+     * @brief Register an in-flight promotion task for SSD prefetch.
+     *
+     * Records a PromotionTask without going through the promotion-on-hit
+     * admission gates (frequency sketch, DRAM watermark) and without pushing
+     * onto the holder client's promotion heartbeat mailbox. The caller (the
+     * holder of the LOCAL_DISK replica) is expected to execute the transfer
+     * immediately via PromotionAllocStart + PromotionWrite +
+     * NotifyPromotionSuccess (e.g. FileStorage::PrefetchKeys).
+     *
+     * Shares the promotion_in_flight_ / promotion_queue_limit_ cap with
+     * promotion-on-hit: prefetch and on-hit promotion compete for the same
+     * DRAM resource, so they draw from the same budget.
+     *
+     * Returns PROMOTION_ALREADY_EXISTS when a MEMORY replica or an in-flight
+     * promotion task already exists for the key — a normal outcome for
+     * best-effort prefetch, not an error; callers should skip silently.
+     * Only the holder client may register (holder_id == client_id), others
+     * receive INVALID_PARAMS.
+     */
+    auto RegisterPrefetchTask(const UUID& client_id, const std::string& key,
+                              const TenantId& tenant_id)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; decrement source

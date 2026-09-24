@@ -1,5 +1,8 @@
 #pragma once
 
+#include <functional>
+#include <optional>
+
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
@@ -103,6 +106,41 @@ class FileStorage {
     FileStorageConfig config_;
 
     /**
+     * @brief Promote a set of keys from local SSD to DRAM (SSD prefetch).
+     *
+     * Each key must already have a promotion task registered on the master
+     * (Client::RegisterPrefetchTask) with this client as holder; this method
+     * runs the promotion execution chain (PromotionAllocStart -> staging
+     * AllocateBatch -> BatchLoad -> PromotionWrite -> NotifyPromotionSuccess).
+     * Failures are reported per-key via on_key_done and do not propagate;
+     * this is best-effort.
+     *
+     * @param keys  Keys to promote
+     * @param sizes Corresponding object sizes in bytes
+     * @param dram_pressure Optional out-flag, set to true if any key failed
+     *        because the master is out of DRAM (PromotionAllocStart returned
+     *        NO_AVAILABLE_HANDLE), so the caller can back off prefetch and let
+     *        eviction/offload reclaim memory. Never reset to false here;
+     *        the caller initializes it.
+     * @param on_key_done Optional per-key completion callback.
+     * @return void on success, ErrorCode on critical (pre-loop) failure
+     */
+    using PrefetchKeyCallback =
+        std::function<void(const std::string& key, bool success)>;
+
+    tl::expected<void, ErrorCode> PrefetchKeys(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool* dram_pressure = nullptr,
+        PrefetchKeyCallback on_key_done = nullptr);
+
+    /**
+     * @brief Local SSD object size from the storage backend's authoritative
+     * metadata (with tenant-scoped key fallback). Remote callers' size hints
+     * must not be trusted for allocation sizing.
+     */
+    std::optional<int64_t> LookupLocalObjectSize(const std::string& key) const;
+
+    /**
      * @brief Releases buffer associated with a specific batch_id.
      * Called by remote client after transfer completion.
      * @param batch_id The unique identifier of the batch to release
@@ -191,6 +229,21 @@ class FileStorage {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
+
+    /**
+     * @brief Execute the promotion chain for one key whose LOCAL_DISK replica
+     * lives on this node: PromotionAllocStart -> staging AllocateBatch ->
+     * BatchLoad -> PromotionWrite -> NotifyPromotionSuccess, with eager
+     * NotifyPromotionFailure on every failure path (RAII guard).
+     *
+     * Shared by the heartbeat-driven promotion-on-hit path
+     * (ProcessPromotionTasks) and the prefetch path (PrefetchKeys).
+     * @param dram_pressure Optional out-flag set when PromotionAllocStart
+     *        failed with NO_AVAILABLE_HANDLE (master out of DRAM).
+     */
+    tl::expected<void, ErrorCode> PromoteOneKeyFromLocalDisk(
+        const std::string& key, const std::string& tenant_id, int64_t size,
+        bool* dram_pressure);
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
