@@ -592,7 +592,7 @@ TEST(ZMQClient, SglangEnablesReplaySocket) {
     client.Stop();
 }
 
-TEST(ZMQClient, SglangRoutesNativeAndMooncakeFallbackEnvelopes) {
+TEST(ZMQClient, SglangRejectsMooncakeEnvelopeAndContinuesNativeStream) {
     MockPublisher publisher;
     auto handler = std::make_shared<MockEventHandler>();
     auto config = TestConfig(publisher);
@@ -611,15 +611,14 @@ TEST(ZMQClient, SglangRoutesNativeAndMooncakeFallbackEnvelopes) {
             native->batch));
     EXPECT_EQ(native->metadata.publisher_kind, PublisherKind::kSglang);
 
-    ASSERT_TRUE(PublishUntilHandled(*handler, 11, endpoint, [&] {
+    ASSERT_TRUE(PublishUntilHandled(*handler, 12, endpoint, [&] {
         publisher.Publish("", PackMooncakeStoredBatch(9001, 42), 11);
+        publisher.Publish("", PackSglangStoredBatch(-43), 12);
     }));
-    const auto fallback = handler->FindBatch(11, endpoint);
-    ASSERT_TRUE(fallback.has_value());
-    const auto* stored = GetMooncakeStored(*fallback);
-    ASSERT_NE(stored, nullptr);
-    EXPECT_EQ(stored->fields.event_id, 9001u);
-    EXPECT_EQ(fallback->metadata.publisher_kind, PublisherKind::kSglang);
+    EXPECT_FALSE(handler->FindBatch(11, endpoint).has_value());
+    EXPECT_TRUE(
+        std::holds_alternative<mooncake::conductor::zmq::SglangEventBatch>(
+            handler->FindBatch(12, endpoint)->batch));
     client.Stop();
 }
 

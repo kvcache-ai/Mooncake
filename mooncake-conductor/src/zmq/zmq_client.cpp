@@ -408,16 +408,7 @@ std::string ZMQClient::DispatchMessage(const std::string& topic,
         if (decoded.ok) {
             batch = std::move(decoded.batch);
         } else {
-            // A SGLang-backed Mooncake Store still uses the Mooncake map
-            // envelope.  Native SGLang is attempted first; fall back to the
-            // Mooncake decoder for that deployment mode.
-            auto mooncake = DecodeMooncakeEventBatch(payload, payload_size);
-            if (mooncake.ok) {
-                batch = std::move(mooncake.batch);
-            } else {
-                decode_error = "SGLang decode failed: " + decoded.error +
-                               "; Mooncake fallback failed: " + mooncake.error;
-            }
+            decode_error = std::move(decoded.error);
         }
     } else {
         auto decoded = DecodeVllmEventBatch(payload, payload_size);

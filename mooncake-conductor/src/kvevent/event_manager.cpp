@@ -668,7 +668,7 @@ bool ParseServiceConfigRequest(const msgpack::object_map& body,
 
 void PackCacheHitResult(MsgpackPacker& packer,
                         const prefixindex::CacheHitResult& result) {
-    packer.pack_map(6);
+    packer.pack_map(7);
     packer.pack("longest_matched");
     packer.pack(result.longest_match_tokens);
     packer.pack("dp");
@@ -683,18 +683,22 @@ void PackCacheHitResult(MsgpackPacker& packer,
     packer.pack_map(static_cast<uint32_t>(result.rank_matches.size()));
     for (const auto& [rank, match] : result.rank_matches) {
         packer.pack(std::to_string(rank));
-        packer.pack_map(3);
-        packer.pack("gpu");
-        packer.pack(match.gpu);
-        packer.pack("cpu");
-        packer.pack(match.cpu);
+        packer.pack_map(4);
+        packer.pack("npu");
+        packer.pack(match.npu);
+        packer.pack("cpu_local");
+        packer.pack(match.cpu_local);
+        packer.pack("cpu_share");
+        packer.pack(match.cpu_share);
         packer.pack("disk");
         packer.pack(match.disk);
     }
-    packer.pack("gpu");
-    packer.pack(result.gpu);
-    packer.pack("cpu");
-    packer.pack(result.cpu);
+    packer.pack("npu");
+    packer.pack(result.npu);
+    packer.pack("cpu_local");
+    packer.pack(result.cpu_local);
+    packer.pack("cpu_share");
+    packer.pack(result.cpu_share);
     packer.pack("disk");
     packer.pack(result.disk);
 }

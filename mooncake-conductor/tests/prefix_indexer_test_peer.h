@@ -15,9 +15,10 @@
 namespace mooncake::conductor::prefixindex {
 
 struct BlockPresenceSnapshot {
-    std::set<EngineOwner> gpu_owners;
-    std::set<SharedObjectOwner> cpu_owners;
-    std::set<SharedObjectOwner> disk_owners;
+    std::set<EngineOwner> npu_owners;
+    std::set<EngineOwner> cpu_local_owners;
+    std::set<SharedObjectOwner> cpu_share_owners;
+    std::set<TierOwner> disk_owners;
 
     bool operator==(const BlockPresenceSnapshot&) const = default;
 };
@@ -59,9 +60,9 @@ class PrefixCacheTableTestPeer {
         std::shared_lock state_lock(state->mutex);
         const auto block = state->blocks.find(prefix);
         if (block == state->blocks.end()) return std::nullopt;
-        return BlockPresenceSnapshot{block->second.gpu_owners,
-                                     block->second.cpu_owners,
-                                     block->second.disk_owners};
+        return BlockPresenceSnapshot{
+            block->second.npu_owners, block->second.cpu_local_owners,
+            block->second.cpu_share_owners, block->second.disk_owners};
     }
 
     // Snapshot sizes for validating order metadata invariants.
@@ -116,8 +117,9 @@ class PrefixCacheTableTestPeer {
             state_snapshot.instance_ranks = state->instance_ranks;
             for (const auto& [prefix, presence] : state->blocks) {
                 state_snapshot.blocks.emplace(
-                    prefix, BlockPresenceSnapshot{presence.gpu_owners,
-                                                  presence.cpu_owners,
+                    prefix, BlockPresenceSnapshot{presence.npu_owners,
+                                                  presence.cpu_local_owners,
+                                                  presence.cpu_share_owners,
                                                   presence.disk_owners});
             }
             snapshot.contexts.emplace(context, std::move(state_snapshot));

@@ -61,7 +61,7 @@ class KVEventHandler : public zmq::EventHandler {
         std::string backend_id;
         std::string tenant_id;
         std::string object_key;
-        prefixindex::StorageTier tier = prefixindex::StorageTier::kCpu;
+        prefixindex::StorageTier tier = prefixindex::StorageTier::kCpuShare;
 
         auto operator<=>(const PoolObjectKey&) const = default;
     };
