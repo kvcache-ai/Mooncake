@@ -76,7 +76,25 @@ jobs:
       uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
+      id: cuda_toolkit
+      continue-on-error: true
+      uses: Jimver/cuda-toolkit@v0.2.29
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+
+    - name: Clear CUDA apt sources after failed install
+      if: steps.cuda_toolkit.outcome == 'failure'
+      run: |
+        sudo rm -f /etc/apt/sources.list.d/*cuda* \
+                   /etc/apt/sources.list.d/archive_uri-*cuda* || true
+        sudo apt-get clean || true
+      shell: bash
+
+    - name: Install CUDA Toolkit (retry)
+      if: steps.cuda_toolkit.outcome == 'failure'
+      uses: Jimver/cuda-toolkit@v0.2.29
       with:
         cuda: '12.8.1'
         linux-local-args: '["--toolkit"]'
@@ -181,7 +199,7 @@ jobs:
       uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
+      uses: Jimver/cuda-toolkit@v0.2.29
       with:
         cuda: '12.8.1'
         linux-local-args: '["--toolkit"]'
@@ -279,7 +297,7 @@ jobs:
       uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
+      uses: Jimver/cuda-toolkit@v0.2.29
       with:
         cuda: '12.8.1'
         linux-local-args: '["--toolkit"]'
@@ -624,7 +642,7 @@ jobs:
 
     - name: Install CUDA Toolkit
       if: matrix.need_cuda
-      uses: Jimver/cuda-toolkit@v0.2.24
+      uses: Jimver/cuda-toolkit@v0.2.29
       with:
         cuda: '12.8.1'
         linux-local-args: '["--toolkit"]'
