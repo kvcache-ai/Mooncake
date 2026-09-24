@@ -322,4 +322,35 @@ struct BatchGetOffloadObjectResponse {
 YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
          transfer_engine_addr, gc_ttl_ms);
 
+// Verify request on the offload RPC server. Offload files are written under
+// the object's recorded tenant, which is not necessarily the owning client's
+// own tenant, so the reader ships its own tenant along: the master only ever
+// shows a reader replicas of its own tenant's objects, which makes the
+// reader's tenant the same scope the write path used.
+struct VerifyDiskReplicaRequest {
+    std::string tenant_id;
+    std::vector<std::string> keys;
+
+    VerifyDiskReplicaRequest() = default;
+    VerifyDiskReplicaRequest(std::string tenant_id_param,
+                             std::vector<std::string> keys_param)
+        : tenant_id(std::move(tenant_id_param)), keys(std::move(keys_param)) {}
+};
+YLT_REFL(VerifyDiskReplicaRequest, tenant_id, keys);
+
+// Answer to a replica verify on the offload RPC server: per-key what the
+// owner found and did. 1 = backing file present (reader retries the same
+// replica), 0 = file proven gone and the owner has evicted its own replica
+// (reader re-queries), 2 = the owner could not determine (storage layer
+// trouble or the eviction did not go through) — a reader must never treat an
+// undetermined answer as gone.
+struct VerifyDiskReplicaResponse {
+    std::vector<uint8_t> states;
+
+    VerifyDiskReplicaResponse() = default;
+    explicit VerifyDiskReplicaResponse(std::vector<uint8_t> states_param)
+        : states(std::move(states_param)) {}
+};
+YLT_REFL(VerifyDiskReplicaResponse, states);
+
 }  // namespace mooncake

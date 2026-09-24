@@ -1572,6 +1572,8 @@ struct InProcMasterConfig {
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
+    std::optional<bool> enable_multi_tenants;
+    std::optional<std::string> tenant_quota_connector_uri;
 };
 
 // Builder class for InProcMasterConfig
@@ -1589,6 +1591,8 @@ class InProcMasterConfigBuilder {
     std::optional<std::string> root_fs_dir_ = std::nullopt;
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
+    std::optional<bool> enable_multi_tenants_ = std::nullopt;
+    std::optional<std::string> tenant_quota_connector_uri_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -1657,6 +1661,17 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_enable_multi_tenants(bool enable) {
+        enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_tenant_quota_connector_uri(
+        const std::string& uri) {
+        tenant_quota_connector_uri_ = uri;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -1675,6 +1690,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_multi_tenants = enable_multi_tenants_;
+    config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     return config;
 }
 

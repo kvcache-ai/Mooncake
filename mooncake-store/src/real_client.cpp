@@ -1191,6 +1191,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
+        offload_rpc_server_->register_handler<&RealClient::verify_disk_replica>(
+            this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -1223,14 +1225,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // The dangling-replica heal in Client::Put needs an existence check
         // against this process's offload files, which only the FileStorage
         // owns. true: backing file is gone, false: present, nullopt: unknown.
+        // Offload storage keys are tenant-scoped (the default tenant
+        // included), so probe with the scoped key: a raw object key never
+        // hits the scoped index and would report every healthy file gone.
         std::weak_ptr<FileStorage> weak_storage = file_storage_;
         client_->SetLocalDiskProbe(
-            [weak_storage](const std::string &key) -> std::optional<bool> {
+            [weak_storage,
+             tenant_id](const std::string &key) -> std::optional<bool> {
                 auto storage = weak_storage.lock();
                 if (!storage) {
                     return std::nullopt;
                 }
-                auto exists = storage->Exists(key);
+                auto exists =
+                    storage->Exists(TenantId(tenant_id).MakeScopedKey(key));
                 if (!exists) {
                     return std::nullopt;
                 }
@@ -3320,10 +3327,45 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     return {};
 }
 
+RealClient::DiskReadHealResult RealClient::heal_disk_replica_for_read(
+    const std::string &key, const Replica::Descriptor &local_disk_replica) {
+    // The failed replica lives on a possibly remote owner: ask the owner over
+    // the offload RPC to verify the backing file and, when it is proven gone,
+    // evict its own replica (the master scopes LOCAL_DISK eviction to the
+    // owning client, so the reader cannot evict it directly). Unlike the
+    // Put-path guard, no "all replicas are this client's local disk"
+    // restriction: a remote reader heals the owner's dangling replica, and a
+    // key with a healthy DFS/DISK fallback still gets evicted so the fallback
+    // can serve.
+    if (!client_) {
+        return DiskReadHealResult::kUnknown;
+    }
+    const auto &endpoint =
+        local_disk_replica.get_local_disk_descriptor().transport_endpoint;
+    // Ship this reader's tenant: the owner probes and evicts under it, and it
+    // matches the tenant the write path scoped the file with.
+    auto verify = client_requester_->verify_disk_replica(
+        endpoint, {std::string(client_->tenant_id()), {key}});
+    if (!verify) {
+        return DiskReadHealResult::kUnknown;
+    }
+    // Tri-state per key: 1 = backing file present (transient failure, the
+    // caller retries the same replica), 0 = proven gone and evicted by the
+    // owner, anything else or a missing slot = the owner could not determine.
+    if (verify->states.empty() || verify->states[0] > 1) {
+        return DiskReadHealResult::kUnknown;
+    }
+    if (verify->states[0] == 1) {
+        return DiskReadHealResult::kPresent;
+    }
+    return DiskReadHealResult::kEvicted;
+}
+
 // Implementation of get_buffer_internal method
 std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string &key,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    bool heal_dangling_disk_replica) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return nullptr;
@@ -3392,6 +3434,18 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
+            // Same heal as the batch path: the owner proves the backing file
+            // gone (evict + re-query) or present (retry the same replica
+            // once). kUnknown surfaces the plain miss.
+            if (heal_dangling_disk_replica) {
+                const auto heal =
+                    heal_disk_replica_for_read(key, *best_replica);
+                if (heal != DiskReadHealResult::kUnknown) {
+                    return get_buffer_internal(key, client_buffer_allocator,
+                                               /*heal_dangling_disk_replica=*/
+                                               false);
+                }
+            }
             return nullptr;
         }
         auto checksum_result =
@@ -3672,7 +3726,8 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
 std::vector<std::shared_ptr<BufferHandle>>
 RealClient::batch_get_buffer_internal(
     const std::vector<std::string> &keys,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    bool heal_dangling_disk_replica) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -3930,6 +3985,63 @@ RealClient::batch_get_buffer_internal(
                                << "': " << toString(read_result.error());
                     op_status[idx_it->second] =
                         tl::make_unexpected(read_result.error());
+                    // A dead LOCAL_DISK replica must not stay failed forever:
+                    // the owner is asked over the offload RPC whether the
+                    // backing file is gone, a proven-gone answer evicts the
+                    // dangling replica, and the key is retried once so a
+                    // surviving replica can serve the read; when nothing
+                    // survives, the retry surfaces a real miss. The failed
+                    // replica is matched by the endpoint this batch read
+                    // from, so a sibling replica on another owner is never
+                    // blamed. A batch read also dies wholesale, so a key whose
+                    // file provably exists is retried as-is: its failure came
+                    // from a sibling's wiped bucket file, not from its own
+                    // data. The retry runs with healing off so a replica whose
+                    // file exists but keeps failing (e.g. a truncated bucket)
+                    // surfaces its error instead of recursing until the stack
+                    // or the allocator gives out. On success the bytes land in
+                    // this op's own buffer and op_status flips to success, so
+                    // the duplicate fan-out and handle assembly below treat
+                    // the healed key like any other successful read.
+                    if (client_ && heal_dangling_disk_replica) {
+                        const Replica::Descriptor *failed_replica = nullptr;
+                        for (const auto &r : op.query_result.replicas) {
+                            if (r.is_local_disk_replica() &&
+                                r.get_local_disk_descriptor()
+                                        .transport_endpoint == endpoint) {
+                                failed_replica = &r;
+                                break;
+                            }
+                        }
+                        if (failed_replica == nullptr) {
+                            for (const auto &r : op.query_result.replicas) {
+                                if (r.is_local_disk_replica()) {
+                                    failed_replica = &r;
+                                    break;
+                                }
+                            }
+                        }
+                        const auto heal = failed_replica
+                                              ? heal_disk_replica_for_read(
+                                                    key, *failed_replica)
+                                              : DiskReadHealResult::kUnknown;
+                        if (heal == DiskReadHealResult::kEvicted ||
+                            heal == DiskReadHealResult::kPresent) {
+                            auto healed = batch_get_buffer_internal(
+                                {key}, client_buffer_allocator,
+                                /*heal_dangling_disk_replica=*/false);
+                            if (!healed.empty() && healed[0] &&
+                                healed[0]->size() == op.total_size) {
+                                if (CopyMaybeDevice(
+                                        op.buffer_handle->ptr(),
+                                        healed[0]->ptr(), op.total_size,
+                                        "healed SSD read retry, key: " + key)) {
+                                    op_status[idx_it->second] =
+                                        static_cast<int64_t>(op.total_size);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -8027,6 +8139,103 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
     return file_storage_->ReleaseBuffer(batch_id);
 }
 
+async_simple::coro::Lazy<tl::expected<VerifyDiskReplicaResponse, ErrorCode>>
+RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
+    if (!file_storage_) {
+        LOG(ERROR) << "verify_disk_replica called but file_storage_ is null";
+        co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    // The write path scopes offload files by the object's recorded tenant,
+    // which is the tenant the master resolved for it. The reader reached this
+    // replica through its own tenant's master records, so the request tenant
+    // matches the write scope when tenant isolation is on. With isolation off
+    // the master resolves every request to "default", and the write scope is
+    // always "default" regardless of the reader's configured tenant: a scoped
+    // probe would report a healthy default-scoped file missing, and the
+    // master would then normalize the follow-up eviction to "default" and
+    // delete that healthy replica. So on a scoped miss we probe the default
+    // scope too and refuse to evict on the ambiguity.
+    struct CallState {
+        std::string tenant_id;
+        std::vector<std::string> raw_keys;
+        std::vector<std::string> scoped_keys;
+        std::vector<std::string> default_scoped_keys;
+        std::shared_ptr<FileStorage> file_storage;
+        std::shared_ptr<Client> client;
+    };
+    auto state = std::make_unique<CallState>();
+    state->tenant_id = request.tenant_id;
+    const TenantId scoped_tenant(request.tenant_id);
+    state->raw_keys = request.keys;
+    state->scoped_keys.reserve(request.keys.size());
+    state->default_scoped_keys.reserve(request.keys.size());
+    for (const auto &key : request.keys) {
+        state->scoped_keys.emplace_back(scoped_tenant.MakeScopedKey(key));
+        state->default_scoped_keys.emplace_back(
+            TenantId::Default().MakeScopedKey(key));
+    }
+    state->file_storage = file_storage_;
+    state->client = client_;
+    auto *s = state.get();
+    auto try_result = co_await coro_io::post([s]() {
+        // 1 = present, 0 = proven gone and this owner evicted its own
+        // replica, 2 = the storage layer could not answer or the eviction
+        // did not go through.
+        std::vector<uint8_t> states;
+        states.reserve(s->raw_keys.size());
+        for (size_t i = 0; i < s->raw_keys.size(); ++i) {
+            auto exists = s->file_storage->Exists(s->scoped_keys[i]);
+            if (!exists) {
+                states.push_back(2);
+                continue;
+            }
+            if (*exists) {
+                states.push_back(1);
+                continue;
+            }
+            // A scoped miss is not proof of absence. When the request tenant
+            // is not "default", the file may sit under the default scope
+            // instead: with tenant isolation off every write lands there no
+            // matter what tenant the reader configured, and under isolation a
+            // different tenant's object can share the raw key. Either way the
+            // object the reader meant is indistinguishable from the one we
+            // would find, so report undetermined rather than evict a possibly
+            // healthy replica.
+            if (s->tenant_id != TenantId::Default().value()) {
+                auto default_exists =
+                    s->file_storage->Exists(s->default_scoped_keys[i]);
+                if (!default_exists || *default_exists) {
+                    states.push_back(2);
+                    continue;
+                }
+            }
+            // The backing file is gone for good. The master scopes LOCAL_DISK
+            // eviction to the owning client, so the eviction has to happen on
+            // this side of the RPC, and it goes out under the request tenant
+            // to hit the same master record the reader saw. OBJECT_NOT_FOUND
+            // is the goal state too: the metadata is already gone.
+            auto evicted = s->client->EvictDiskReplica(
+                s->raw_keys[i], s->tenant_id, ReplicaType::LOCAL_DISK);
+            if (!evicted && evicted.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(WARNING)
+                    << "Owner-side eviction of dangling LOCAL_DISK "
+                       "replica failed for key="
+                    << s->raw_keys[i] << ": " << toString(evicted.error());
+                states.push_back(2);
+                continue;
+            }
+            LOG(WARNING) << "Owner evicted its dangling LOCAL_DISK replica "
+                            "for key="
+                         << s->raw_keys[i]
+                         << " after a reader's verify request found the "
+                            "backing file gone";
+            states.push_back(0);
+        }
+        return states;
+    });
+    co_return VerifyDiskReplicaResponse(std::move(try_result.value()));
+}
+
 bool RealClient::can_use_pinned_restore_arena(
     const std::string &target_rpc_service_addr,
     const std::unordered_map<std::string, std::vector<Slice>> &objects) const {
@@ -8214,6 +8423,19 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
         LOG(ERROR)
             << "Failed to invoke batch_get_offload_object, client_addr = "
             << client_addr << ", error is: " << result.error();
+    }
+    return result;
+}
+
+tl::expected<VerifyDiskReplicaResponse, ErrorCode>
+ClientRequester::verify_disk_replica(const std::string &client_addr,
+                                     const VerifyDiskReplicaRequest &request) {
+    auto result =
+        invoke_rpc<&RealClient::verify_disk_replica, VerifyDiskReplicaResponse>(
+            client_addr, request);
+    if (!result) {
+        LOG(ERROR) << "Failed to invoke verify_disk_replica, client_addr = "
+                   << client_addr << ", error is: " << result.error();
     }
     return result;
 }
