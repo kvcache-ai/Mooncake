@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "crates/mooncake-transport-sys",
+    "crates/mooncake-transport",
+    "crates/mooncake-store-core",
+    "crates/mooncake-store-route",
+    "crates/mooncake-store-transport-core",
+    "crates/mooncake-metadata",
+    "crates/mooncake-store-client",
+    "crates/mooncake-store-e2e",
+    "crates/mooncake-store-py",
+    "crates/mooncake-store-test-utils",
+    "crates/mooncake-tensor",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+ctrlc = { version = "3", features = ["termination"] }
+dashmap = "6"
+parking_lot = "0.12"
+pyo3 = { version = "0.24", features = ["extension-module", "multiple-pymethods"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace"] }
+shadow-rs = { version = "2", default-features = false, features = ["build"] }

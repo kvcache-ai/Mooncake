@@ -1,0 +1,1550 @@
+//! Cold Tier target ownership and owner-scoped health maintenance.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, OnceLock,
+};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use mooncake_store_core::{
+    ClientLease, ClientLifecycleState, ClientRuntimeId, ColdTierDeviceRecord, ColdTierDeviceState,
+    ColdTierDeviceUpdate, ColdTierPutDeviceResult, ColdTierTargetSpec, MetadataBackend,
+    ObjectRoute, Result, StoreError,
+};
+
+use crate::client::{
+    ColdTierDeviceManager, PersistentStorageBackend, PersistentStorageBackendHealth,
+    SharedLiveClientCache,
+};
+use crate::control_plane::ControlPlaneClient;
+use crate::placement::stable_rendezvous_score;
+
+const TARGET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+pub(super) const TARGET_HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
+pub(super) const TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD: u32 = 60;
+pub(in crate::client) const NOF_TARGET_SET_LABEL: &str = "nof.target-set";
+pub(in crate::client) const NOF_UNHEALTHY_TARGETS_LABEL: &str = "nof.unhealthy-targets";
+const NOF_MANAGED_LABELS: [&str; 2] = [NOF_TARGET_SET_LABEL, NOF_UNHEALTHY_TARGETS_LABEL];
+const NOF_DEVICE_KIND: &str = "nof";
+
+impl ColdTierDeviceManager {
+    /// Resolve the authority for a local persistent target.
+    ///
+    /// NoF ownership only distributes heartbeat work and never gates data I/O.
+    pub(in crate::client) fn current_target_owner(
+        &self,
+        target_id: &str,
+        recorded_owner: Option<&ClientRuntimeId>,
+    ) -> Result<ClientRuntimeId> {
+        if let Some(owner) = recorded_owner {
+            return Ok(owner.clone());
+        }
+        if self.has_local_backend(target_id) {
+            return Ok(self.runtime.clone());
+        }
+        Err(StoreError::NotFound(format!(
+            "persistent target {target_id} is not registered"
+        )))
+    }
+
+    pub(in crate::client) fn accept_nof_owner_snapshot(
+        &self,
+        target_id: String,
+        from: ClientRuntimeId,
+        to: ClientRuntimeId,
+        routes: Vec<ObjectRoute>,
+    ) -> Result<usize> {
+        self.nof_targets
+            .accept_nof_owner_snapshot(target_id, from, to, routes)
+    }
+
+    pub(in crate::client) fn release_nof_ownership_on_shutdown(
+        &self,
+        control_client: &ControlPlaneClient,
+    ) {
+        self.nof_targets
+            .release_ownership_on_shutdown(control_client);
+    }
+}
+
+pub(super) struct NofRuntimeTarget {
+    pub(super) backend: Arc<dyn PersistentStorageBackend>,
+    pub(super) accumulated_writes: AtomicU64,
+    recovery_required: AtomicBool,
+    health: parking_lot::RwLock<NofTargetHealthState>,
+}
+
+impl NofRuntimeTarget {
+    pub(super) fn new(backend: Arc<dyn PersistentStorageBackend>) -> Self {
+        Self {
+            backend,
+            accumulated_writes: AtomicU64::new(0),
+            recovery_required: AtomicBool::new(false),
+            health: parking_lot::RwLock::new(NofTargetHealthState::default()),
+        }
+    }
+
+    pub(super) fn health_snapshot(&self) -> Result<PersistentStorageBackendHealth> {
+        if self.recovery_required() {
+            return Err(StoreError::Backpressure(
+                "NoF target recovery is in progress".to_string(),
+            ));
+        }
+        self.health.read().snapshot()
+    }
+
+    pub(super) fn require_recovery(&self) {
+        self.recovery_required.store(true, Ordering::Release);
+    }
+
+    pub(super) fn finish_recovery(&self) {
+        self.recovery_required.store(false, Ordering::Release);
+    }
+
+    pub(super) fn recovery_required(&self) -> bool {
+        self.recovery_required.load(Ordering::Acquire)
+    }
+
+    pub(super) fn heartbeat(&self, target_id: &str) -> bool {
+        let result = self.backend.health();
+        let mut health = self.health.write();
+        let previous_failures = health.consecutive_failures;
+        health.record(result);
+        if previous_failures >= TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD
+            && health.consecutive_failures == 0
+        {
+            self.require_recovery();
+        }
+        match (previous_failures, health.consecutive_failures) {
+            (failures, 0) if failures > 0 => {
+                tracing::info!(
+                    target_id,
+                    previous_failures = failures,
+                    "NoF target heartbeat recovered"
+                );
+            }
+            (_, TARGET_HEARTBEAT_FAILURE_THRESHOLD) => {
+                tracing::warn!(
+                    target_id,
+                    failures = health.consecutive_failures,
+                    error = ?health.last_error,
+                    "NoF target excluded after consecutive heartbeat failures"
+                );
+            }
+            (_, TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD) => {
+                tracing::warn!(
+                    target_id,
+                    failures = health.consecutive_failures,
+                    "NoF target reached the long-failure downline threshold"
+                );
+            }
+            _ => {}
+        }
+        health.snapshot().is_ok() && !self.recovery_required()
+    }
+}
+
+#[derive(Default)]
+struct NofTargetHealthState {
+    last_success: Option<PersistentStorageBackendHealth>,
+    last_error: Option<StoreError>,
+    consecutive_failures: u32,
+}
+
+impl NofTargetHealthState {
+    fn record(&mut self, result: Result<PersistentStorageBackendHealth>) {
+        match result {
+            Ok(health) => {
+                self.last_success = Some(health);
+                self.last_error = None;
+                self.consecutive_failures = 0;
+            }
+            Err(error) => {
+                self.last_error = Some(error);
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Result<PersistentStorageBackendHealth> {
+        if self.consecutive_failures < TARGET_HEARTBEAT_FAILURE_THRESHOLD {
+            if let Some(health) = &self.last_success {
+                return Ok(health.clone());
+            }
+        }
+        Err(self.last_error.clone().unwrap_or_else(|| {
+            StoreError::Transport("NoF target has no successful heartbeat".to_string())
+        }))
+    }
+
+    fn downline_ready(&self) -> bool {
+        self.consecutive_failures >= TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD
+    }
+}
+
+pub(super) struct NofOwnerState {
+    pub(super) local_runtime: ClientRuntimeId,
+    metadata: Arc<dyn MetadataBackend>,
+    live_clients: SharedLiveClientCache,
+    target_set_fingerprint: String,
+    managed: bool,
+    pub(super) targets: BTreeMap<String, Arc<NofRuntimeTarget>>,
+    owners: parking_lot::RwLock<BTreeMap<String, ClientRuntimeId>>,
+    handoff_snapshots: parking_lot::Mutex<BTreeMap<String, NofHandoffSnapshot>>,
+    handoff_dirty_targets: parking_lot::Mutex<BTreeSet<String>>,
+    remote_unhealthy_targets: parking_lot::RwLock<BTreeSet<String>>,
+    published_unhealthy_targets: parking_lot::Mutex<Option<BTreeSet<String>>>,
+    pub(super) management_gate: parking_lot::RwLock<()>,
+    released: AtomicBool,
+}
+
+pub(super) struct NofHandoffSnapshot {
+    pub(super) from: ClientRuntimeId,
+    pub(super) routes: Vec<ObjectRoute>,
+}
+
+impl NofOwnerState {
+    pub(super) fn new(
+        local_runtime: ClientRuntimeId,
+        metadata: Arc<dyn MetadataBackend>,
+        live_clients: SharedLiveClientCache,
+        target_set_fingerprint: String,
+        managed: bool,
+        targets: BTreeMap<String, Arc<NofRuntimeTarget>>,
+    ) -> Self {
+        Self {
+            local_runtime,
+            metadata,
+            live_clients,
+            target_set_fingerprint,
+            managed,
+            targets,
+            owners: parking_lot::RwLock::new(BTreeMap::new()),
+            handoff_snapshots: parking_lot::Mutex::new(BTreeMap::new()),
+            handoff_dirty_targets: parking_lot::Mutex::new(BTreeSet::new()),
+            remote_unhealthy_targets: parking_lot::RwLock::new(BTreeSet::new()),
+            published_unhealthy_targets: parking_lot::Mutex::new(None),
+            management_gate: parking_lot::RwLock::new(()),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn refresh_ownership(&self) {
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
+        let leases = self.live_clients.lock().snapshot().unwrap_or_default();
+        let preferred = assign_target_owners(
+            self.targets.keys().map(String::as_str),
+            &leases,
+            &self.target_set_fingerprint,
+        );
+        let next = if self.managed {
+            self.rebalance_managed_ownership(&preferred);
+            self.refresh_managed_ownership(&preferred)
+        } else {
+            preferred
+        };
+        let mut owners = self.owners.write();
+        if *owners != next {
+            if self.managed {
+                let mut snapshots = self.handoff_snapshots.lock();
+                for (target_id, owner) in &next {
+                    if owner == &self.local_runtime && owners.get(target_id) != Some(owner) {
+                        let previous = owners.get(target_id);
+                        if snapshots
+                            .get(target_id)
+                            .is_some_and(|snapshot| Some(&snapshot.from) != previous)
+                        {
+                            snapshots.remove(target_id);
+                        }
+                        self.targets[target_id].require_recovery();
+                    } else if owner != &self.local_runtime
+                        && snapshots
+                            .get(target_id)
+                            .is_some_and(|snapshot| &snapshot.from != owner)
+                    {
+                        snapshots.remove(target_id);
+                    }
+                }
+                snapshots.retain(|target_id, _| next.contains_key(target_id));
+            }
+            let reassigned = next
+                .iter()
+                .filter(|(target_id, owner)| owners.get(*target_id) != Some(*owner))
+                .count()
+                + owners
+                    .keys()
+                    .filter(|target_id| !next.contains_key(*target_id))
+                    .count();
+            tracing::info!(
+                runtime = %self.local_runtime,
+                targets = next.len(),
+                reassigned,
+                "NoF target ownership updated"
+            );
+            *owners = next;
+        }
+        let remote_unhealthy = remote_unhealthy_targets(&owners, &leases, &self.local_runtime);
+        *self.remote_unhealthy_targets.write() = remote_unhealthy;
+    }
+
+    fn rebalance_managed_ownership(&self, preferred: &BTreeMap<String, ClientRuntimeId>) {
+        for (target_id, next_owner) in preferred {
+            if next_owner == &self.local_runtime
+                || self.handoff_dirty_targets.lock().contains(target_id)
+            {
+                continue;
+            }
+            let Some(_management) = self.management_gate.try_write() else {
+                continue;
+            };
+            let Ok(Some(current)) = self.metadata.get_cold_tier_device(target_id) else {
+                continue;
+            };
+            if nof_record_owner(&current).as_ref() != Some(&self.local_runtime) {
+                continue;
+            }
+            let Ok(routes) = self.list_managed_routes(target_id) else {
+                continue;
+            };
+            if routes.iter().any(|route| {
+                route.state != mooncake_store_core::RouteState::Active
+                    || route.nof_backing.as_ref().is_none_or(|backing| {
+                        backing.state != mooncake_store_core::ColdBackingState::Materialized
+                    })
+            }) {
+                continue;
+            }
+            let mut update = ColdTierDeviceUpdate::new(
+                crate::client::current_time_ms().max(current.updated_at_ms.saturating_add(1)),
+            );
+            update.expected_updated_at_ms = Some(current.updated_at_ms);
+            update.stable_id = Some(next_owner.stable_id.0.clone());
+            update.epoch = Some(Some(next_owner.epoch.0));
+            if self
+                .metadata
+                .update_cold_tier_device(target_id, update)
+                .is_ok()
+            {
+                tracing::info!(
+                    target_id,
+                    from = %self.local_runtime,
+                    to = %next_owner,
+                    "rebalanced managed NoF target owner"
+                );
+            }
+        }
+    }
+
+    fn refresh_managed_ownership(
+        &self,
+        preferred: &BTreeMap<String, ClientRuntimeId>,
+    ) -> BTreeMap<String, ClientRuntimeId> {
+        let mut owners = BTreeMap::new();
+        for target_id in self.targets.keys() {
+            let preferred_owner = preferred.get(target_id);
+            let result = self.resolve_managed_owner(target_id, preferred_owner);
+            match result {
+                Ok(Some(owner)) => {
+                    owners.insert(target_id.clone(), owner);
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    target_id,
+                    error = %error,
+                    "failed to refresh managed NoF target owner"
+                ),
+            }
+        }
+        owners
+    }
+
+    fn resolve_managed_owner(
+        &self,
+        target_id: &str,
+        preferred_owner: Option<&ClientRuntimeId>,
+    ) -> Result<Option<ClientRuntimeId>> {
+        let current = self.metadata.get_cold_tier_device(target_id)?;
+        if let Some(record) = current.as_ref() {
+            if record.kind != NOF_DEVICE_KIND || record.cold_tier_id != target_id {
+                return Err(StoreError::Conflict(format!(
+                    "persistent target ID {target_id} is already registered as {}",
+                    record.kind
+                )));
+            }
+            if record.state != ColdTierDeviceState::Unregistered {
+                if let Some(owner) = nof_record_owner(record) {
+                    if self.managed_owner_lease_is_active(&owner)? {
+                        return Ok(Some(owner));
+                    }
+                }
+            }
+        }
+        if preferred_owner != Some(&self.local_runtime) {
+            return Ok(None);
+        }
+        let record = match current {
+            Some(current) => {
+                let mut update = ColdTierDeviceUpdate::new(
+                    crate::client::current_time_ms().max(current.updated_at_ms.saturating_add(1)),
+                );
+                update.expected_updated_at_ms = Some(current.updated_at_ms);
+                update.stable_id = Some(self.local_runtime.stable_id.0.clone());
+                update.epoch = Some(Some(self.local_runtime.epoch.0));
+                update.state = Some(ColdTierDeviceState::Healthy);
+                update.target = Some(ColdTierTargetSpec::Uuid {
+                    uuid: self.target_set_fingerprint.clone(),
+                });
+                match self.metadata.update_cold_tier_device(target_id, update) {
+                    Ok(record) => record,
+                    Err(StoreError::Conflict(_)) => {
+                        return Ok(self
+                            .metadata
+                            .get_cold_tier_device(target_id)?
+                            .as_ref()
+                            .and_then(nof_record_owner));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            None => {
+                let candidate = ColdTierDeviceRecord {
+                    device_id: target_id.to_string(),
+                    stable_id: self.local_runtime.stable_id.0.clone(),
+                    epoch: Some(self.local_runtime.epoch.0),
+                    cold_tier_id: target_id.to_string(),
+                    kind: NOF_DEVICE_KIND.to_string(),
+                    target: ColdTierTargetSpec::Uuid {
+                        uuid: self.target_set_fingerprint.clone(),
+                    },
+                    root_dir: None,
+                    state: ColdTierDeviceState::Healthy,
+                    capacity_bytes: None,
+                    used_bytes: 0,
+                    reserved_bytes: 0,
+                    failure_count: 0,
+                    last_error: None,
+                    tags: Vec::new(),
+                    updated_at_ms: crate::client::current_time_ms(),
+                };
+                match self.metadata.put_cold_tier_device_if_absent(&candidate)? {
+                    ColdTierPutDeviceResult::Created(record)
+                    | ColdTierPutDeviceResult::Existing(record) => record,
+                }
+            }
+        };
+        if record.kind != NOF_DEVICE_KIND || record.cold_tier_id != target_id {
+            return Err(StoreError::Conflict(format!(
+                "persistent target ID {target_id} is already registered as {}",
+                record.kind
+            )));
+        }
+        Ok(nof_record_owner(&record))
+    }
+
+    fn managed_owner_lease_is_active(&self, owner: &ClientRuntimeId) -> Result<bool> {
+        Ok(self.metadata.get_client_lease(owner)?.is_some_and(|lease| {
+            lease_can_manage_target_set(
+                &lease,
+                &self.target_set_fingerprint,
+                crate::client::current_time_ms(),
+            )
+        }))
+    }
+
+    pub(super) fn ensure_local_managed_owner(&self, target_id: &str) -> Result<()> {
+        let record = self
+            .metadata
+            .get_cold_tier_device(target_id)?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("NoF target {target_id} is not registered"))
+            })?;
+        if nof_record_owner(&record).as_ref() == Some(&self.local_runtime)
+            && self.managed_owner_lease_is_active(&self.local_runtime)?
+        {
+            return Ok(());
+        }
+        Err(StoreError::Conflict(format!(
+            "managed NoF target {target_id} is not owned by {}",
+            self.local_runtime
+        )))
+    }
+
+    pub(super) fn heartbeat_owned_targets(&self) {
+        self.refresh_ownership();
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
+        let unhealthy = self
+            .locally_owned_target_ids()
+            .into_iter()
+            .filter(|target_id| {
+                let target = self
+                    .targets
+                    .get(target_id)
+                    .expect("ownership only contains registered NoF targets");
+                !target.heartbeat(target_id)
+            })
+            .collect();
+        self.publish_unhealthy_targets(unhealthy);
+    }
+
+    pub(super) fn owner_for(&self, target_id: &str) -> Option<ClientRuntimeId> {
+        self.owners.read().get(target_id).cloned()
+    }
+
+    pub(super) fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    pub(super) fn owner_lease(&self, target_id: &str) -> Option<ClientLease> {
+        let owner = self.owner_for(target_id)?;
+        self.live_clients
+            .lock()
+            .snapshot()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|lease| lease.runtime == owner)
+    }
+
+    pub(super) fn list_managed_routes(
+        &self,
+        target_id: &str,
+    ) -> Result<Vec<mooncake_store_core::ObjectRoute>> {
+        self.metadata.list_object_routes_by_nof_backing(
+            &mooncake_store_core::NofBackingRouteFilter {
+                target_id: Some(target_id.to_string()),
+                state: None,
+                limit: None,
+            },
+        )
+    }
+
+    pub(super) fn mirror_managed_route(
+        &self,
+        route: &ObjectRoute,
+        touched_target_id: &str,
+    ) -> Result<()> {
+        let result = super::nof::mirror_managed_route_index(self.metadata.as_ref(), route);
+        if result.is_err() {
+            self.handoff_dirty_targets
+                .lock()
+                .insert(touched_target_id.to_string());
+            if self.owner_for(touched_target_id).as_ref() == Some(&self.local_runtime) {
+                if let Some(target) = self.targets.get(touched_target_id) {
+                    target.require_recovery();
+                }
+            }
+        }
+        result
+    }
+
+    pub(super) fn accept_handoff(
+        &self,
+        target_id: String,
+        from: ClientRuntimeId,
+        to: ClientRuntimeId,
+        routes: Vec<ObjectRoute>,
+    ) -> Result<usize> {
+        if to != self.local_runtime {
+            return Err(StoreError::InvalidState(format!(
+                "NoF owner snapshot for {target_id} was sent to {}, local runtime is {}",
+                to, self.local_runtime
+            )));
+        }
+        if !self.targets.contains_key(&target_id) {
+            return Err(StoreError::NotFound(format!(
+                "NoF target {target_id} is not registered"
+            )));
+        }
+        self.refresh_ownership();
+        let current_owner = self.owner_for(&target_id).ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "NoF target {target_id} has no current owner for handoff from {from}"
+            ))
+        })?;
+        if current_owner != from {
+            return Err(StoreError::Conflict(format!(
+                "NoF target {target_id} is currently owned by {current_owner}, not {from}"
+            )));
+        }
+        let route_count = routes.len();
+        self.handoff_snapshots
+            .lock()
+            .insert(target_id, NofHandoffSnapshot { from, routes });
+        Ok(route_count)
+    }
+
+    pub(super) fn take_handoff(&self, target_id: &str) -> Option<NofHandoffSnapshot> {
+        self.handoff_snapshots.lock().remove(target_id)
+    }
+
+    pub(super) fn restore_handoff(&self, target_id: String, snapshot: NofHandoffSnapshot) {
+        self.handoff_snapshots.lock().insert(target_id, snapshot);
+    }
+
+    pub(super) fn clear_handoff_dirty(&self, target_id: &str) {
+        self.handoff_dirty_targets.lock().remove(target_id);
+    }
+
+    pub(super) fn handoff_owned_targets(&self, control_client: &ControlPlaneClient) {
+        self.refresh_ownership();
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
+        let leases = self.live_clients.lock().snapshot().unwrap_or_default();
+        for target_id in self.locally_owned_target_ids() {
+            let Some(successor) = select_target_owner(
+                &target_id,
+                &leases,
+                &self.target_set_fingerprint,
+                Some(&self.local_runtime),
+                crate::client::current_time_ms(),
+            ) else {
+                continue;
+            };
+            if self.handoff_dirty_targets.lock().contains(&target_id) {
+                tracing::warn!(
+                    target_id,
+                    "NoF owner snapshot skipped because its metadata index is incomplete"
+                );
+                continue;
+            }
+            let routes = match self.list_managed_routes(&target_id) {
+                Ok(routes) => routes,
+                Err(error) => {
+                    tracing::warn!(
+                        target_id,
+                        error = %error,
+                        "failed to build NoF owner handoff snapshot"
+                    );
+                    continue;
+                }
+            };
+            if routes
+                .iter()
+                .any(|route| route.state != mooncake_store_core::RouteState::Active)
+            {
+                tracing::warn!(
+                    target_id,
+                    "NoF owner snapshot skipped because the target has incomplete route work"
+                );
+                continue;
+            }
+            if let Err(error) = control_client.transfer_nof_owner_snapshot(
+                successor,
+                &target_id,
+                &self.local_runtime,
+                &successor.runtime,
+                routes,
+            ) {
+                tracing::warn!(
+                    target_id,
+                    successor = %successor.runtime,
+                    error = %error,
+                    "failed to transfer NoF owner handoff snapshot"
+                );
+            }
+        }
+    }
+
+    pub(super) fn locally_owned_target_ids(&self) -> Vec<String> {
+        self.owners
+            .read()
+            .iter()
+            .filter(|(_, owner)| owner == &&self.local_runtime)
+            .map(|(target_id, _)| target_id.clone())
+            .collect()
+    }
+
+    pub(super) fn locally_owned_recovery_target_ids(&self) -> Vec<String> {
+        self.locally_owned_target_ids()
+            .into_iter()
+            .filter(|target_id| self.targets[target_id].recovery_required())
+            .collect()
+    }
+
+    pub(super) fn require_recovery_for_locally_owned(&self) {
+        for target_id in self.locally_owned_target_ids() {
+            self.targets[&target_id].require_recovery();
+        }
+    }
+
+    pub(super) fn locally_owned_downline_ready_target_ids(&self) -> Vec<String> {
+        self.locally_owned_target_ids()
+            .into_iter()
+            .filter(|target_id| {
+                self.targets
+                    .get(target_id)
+                    .map(|target| target.health.read().downline_ready())
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    pub(super) fn health_snapshot(
+        &self,
+        target_id: &str,
+    ) -> Result<PersistentStorageBackendHealth> {
+        let owner = self.owner_for(target_id).ok_or_else(|| {
+            StoreError::Transport(format!("NoF target {target_id} has no live owner"))
+        })?;
+        if owner != self.local_runtime {
+            if self.remote_unhealthy_targets.read().contains(target_id) {
+                return Err(StoreError::Transport(format!(
+                    "NoF target {target_id} is unhealthy according to owner {owner}"
+                )));
+            }
+            return Ok(PersistentStorageBackendHealth {
+                capacity_bytes: None,
+                available_bytes: None,
+            });
+        }
+        self.targets
+            .get(target_id)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "NoF target backend {target_id} is not registered"
+                ))
+            })?
+            .health_snapshot()
+    }
+
+    fn publish_unhealthy_targets(&self, unhealthy: BTreeSet<String>) {
+        if self.published_unhealthy_targets.lock().as_ref() == Some(&unhealthy) {
+            return;
+        }
+        let result = {
+            let _guard = nof_managed_label_lock().lock();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            let Some(mut lease) = self
+                .metadata
+                .get_client_lease(&self.local_runtime)
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            set_unhealthy_target_label(&mut lease, &unhealthy);
+            self.metadata.upsert_client_lease(&lease).map(|()| lease)
+        };
+        match result {
+            Ok(lease) => {
+                replace_cached_lease(&self.live_clients, &lease);
+                *self.published_unhealthy_targets.lock() = Some(unhealthy);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    runtime = %self.local_runtime,
+                    error = %error,
+                    "failed to publish NoF target health snapshot"
+                );
+            }
+        }
+    }
+
+    pub(super) fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        // Withdraw only the NoF-manager capability. The Client remains live
+        // long enough to finish the rest of its normal shutdown cleanup.
+        let released_lease = {
+            let _guard = nof_managed_label_lock().lock();
+            self.metadata
+                .get_client_lease(&self.local_runtime)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    self.live_clients
+                        .lock()
+                        .snapshot()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|lease| lease.runtime == self.local_runtime)
+                })
+                .map(|mut lease| {
+                    for label in NOF_MANAGED_LABELS {
+                        lease.endpoints.labels.remove(label);
+                    }
+                    let error = self.metadata.upsert_client_lease(&lease).err();
+                    (lease, error)
+                })
+        };
+        if let Some((lease, error)) = released_lease {
+            replace_cached_lease(&self.live_clients, &lease);
+            if let Some(error) = error {
+                tracing::warn!(
+                    runtime = %self.local_runtime,
+                    error = %error,
+                    "failed to withdraw NoF target ownership during shutdown"
+                );
+            }
+        }
+        self.owners.write().clear();
+        self.remote_unhealthy_targets.write().clear();
+    }
+}
+
+fn nof_record_owner(record: &ColdTierDeviceRecord) -> Option<ClientRuntimeId> {
+    if record.state == ColdTierDeviceState::Unregistered {
+        return None;
+    }
+    Some(ClientRuntimeId {
+        stable_id: mooncake_store_core::ClientStableId(record.stable_id.clone()),
+        epoch: mooncake_store_core::ClientEpoch(record.epoch?),
+    })
+}
+
+fn nof_managed_label_lock() -> &'static parking_lot::Mutex<()> {
+    static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+}
+
+pub(in crate::client) fn upsert_client_lease_preserving_nof_labels(
+    metadata: &dyn MetadataBackend,
+    lease: &mut ClientLease,
+) -> Result<()> {
+    if NOF_MANAGED_LABELS
+        .iter()
+        .all(|label| !lease.endpoints.labels.contains_key(*label))
+    {
+        return metadata.upsert_client_lease(lease);
+    }
+    let _guard = nof_managed_label_lock().lock();
+    preserve_nof_managed_labels(metadata, lease);
+    metadata.upsert_client_lease(lease)
+}
+
+fn set_unhealthy_target_label(lease: &mut ClientLease, unhealthy: &BTreeSet<String>) {
+    let encoded =
+        serde_json::to_string(unhealthy).expect("serializing a set of NoF target IDs cannot fail");
+    lease
+        .endpoints
+        .labels
+        .insert(NOF_UNHEALTHY_TARGETS_LABEL.to_string(), encoded);
+}
+
+fn remote_unhealthy_targets(
+    owners: &BTreeMap<String, ClientRuntimeId>,
+    leases: &[ClientLease],
+    local_runtime: &ClientRuntimeId,
+) -> BTreeSet<String> {
+    let unhealthy_by_owner = leases
+        .iter()
+        .map(|lease| {
+            let unhealthy = lease
+                .endpoints
+                .labels
+                .get(NOF_UNHEALTHY_TARGETS_LABEL)
+                .and_then(|encoded| serde_json::from_str::<BTreeSet<String>>(encoded).ok());
+            (&lease.runtime, unhealthy)
+        })
+        .collect::<BTreeMap<_, _>>();
+    owners
+        .iter()
+        .filter_map(|(target_id, owner)| {
+            if owner == local_runtime {
+                return None;
+            }
+            match unhealthy_by_owner.get(owner) {
+                Some(Some(unhealthy)) if unhealthy.contains(target_id) => Some(target_id.clone()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn replace_cached_lease(live_clients: &SharedLiveClientCache, updated: &ClientLease) {
+    let mut cache = live_clients.lock();
+    if let Some(mut leases) = cache.snapshot() {
+        if let Some(lease) = leases
+            .iter_mut()
+            .find(|lease| lease.runtime == updated.runtime)
+        {
+            *lease = updated.clone();
+        }
+        cache.store(leases);
+    }
+}
+
+fn preserve_nof_managed_labels(metadata: &dyn MetadataBackend, lease: &mut ClientLease) {
+    let Ok(Some(current)) = metadata.get_client_lease(&lease.runtime) else {
+        return;
+    };
+    for key in NOF_MANAGED_LABELS {
+        match current.endpoints.labels.get(key) {
+            Some(value) => {
+                lease
+                    .endpoints
+                    .labels
+                    .insert(key.to_string(), value.clone());
+            }
+            None => {
+                lease.endpoints.labels.remove(key);
+            }
+        }
+    }
+}
+
+fn assign_target_owners<'a>(
+    target_ids: impl Iterator<Item = &'a str>,
+    leases: &[ClientLease],
+    target_set_fingerprint: &str,
+) -> BTreeMap<String, ClientRuntimeId> {
+    // LiveClientCache already removes expired leases and older active epochs.
+    let now_ms = crate::client::current_time_ms();
+    target_ids
+        .filter_map(|target_id| {
+            select_target_owner(target_id, leases, target_set_fingerprint, None, now_ms)
+                .map(|owner| (target_id.to_string(), owner.runtime.clone()))
+        })
+        .collect()
+}
+
+fn lease_can_manage_target_set(
+    lease: &ClientLease,
+    target_set_fingerprint: &str,
+    now_ms: u64,
+) -> bool {
+    lease.state == ClientLifecycleState::Active
+        && lease.expires_at_ms > now_ms
+        && lease
+            .endpoints
+            .labels
+            .get(NOF_TARGET_SET_LABEL)
+            .is_some_and(|value| value == target_set_fingerprint)
+}
+
+fn select_target_owner<'a>(
+    target_id: &str,
+    leases: &'a [ClientLease],
+    target_set_fingerprint: &str,
+    exclude: Option<&ClientRuntimeId>,
+    now_ms: u64,
+) -> Option<&'a ClientLease> {
+    leases
+        .iter()
+        .filter(|lease| {
+            exclude != Some(&lease.runtime)
+                && lease_can_manage_target_set(lease, target_set_fingerprint, now_ms)
+        })
+        .map(|lease| {
+            (
+                stable_rendezvous_score(
+                    &["nof-target-owner", target_set_fingerprint, target_id],
+                    &lease.runtime.stable_id,
+                ),
+                lease,
+            )
+        })
+        .max_by(|(left_score, left), (right_score, right)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| right.runtime.cmp(&left.runtime))
+        })
+        .map(|(_, lease)| lease)
+}
+
+#[derive(Default)]
+pub(super) struct NofHeartbeatMonitor {
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl NofHeartbeatMonitor {
+    pub(super) fn disabled() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn start(state: Arc<NofOwnerState>) -> Result<Self> {
+        let (shutdown, shutdown_rx) = std::sync::mpsc::channel();
+        let stable_id = state.local_runtime.stable_id.0.clone();
+        let initial_delay = Duration::from_millis(crate::client::stable_phase_spread_ms(
+            &stable_id,
+            TARGET_HEARTBEAT_INTERVAL.as_millis() as u64,
+            "nof-owner-heartbeat",
+        ));
+        let thread = thread::Builder::new()
+            .name(format!("nof-owner-{stable_id}"))
+            .spawn(move || {
+                if !matches!(
+                    shutdown_rx.recv_timeout(initial_delay),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+                loop {
+                    state.heartbeat_owned_targets();
+                    match shutdown_rx.recv_timeout(TARGET_HEARTBEAT_INTERVAL) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .map_err(|error| {
+                StoreError::Transport(format!("failed to start NoF owner worker: {error}"))
+            })?;
+        Ok(Self {
+            shutdown: Some(shutdown),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for NofHeartbeatMonitor {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicUsize;
+
+    use mooncake_metadata::InMemoryMetadataBackend;
+    use mooncake_store_core::{
+        ClientEndpointSet, ClientEpoch, ClientStableId, ColdBackingRoute, CompatibilityDescriptor,
+        ObjectKey, ObjectRoute, RouteState, RouteVersion,
+    };
+
+    use super::*;
+    use crate::client::LiveClientCache;
+
+    struct CountingHealthBackend {
+        calls: AtomicUsize,
+        fail: AtomicBool,
+    }
+
+    impl CountingHealthBackend {
+        fn new(fail: bool) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail: AtomicBool::new(fail),
+            }
+        }
+    }
+
+    impl PersistentStorageBackend for CountingHealthBackend {
+        fn health(&self) -> Result<PersistentStorageBackendHealth> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(StoreError::Transport("target offline".to_string()));
+            }
+            Ok(PersistentStorageBackendHealth {
+                capacity_bytes: Some(100),
+                available_bytes: Some(75),
+            })
+        }
+
+        fn put_object(
+            &self,
+            _backing: &ColdBackingRoute,
+            _payload: &[u8],
+        ) -> Result<ColdBackingRoute> {
+            unreachable!("owner test does not write objects")
+        }
+
+        fn get_object(&self, _backing: &ColdBackingRoute) -> Result<Option<Vec<u8>>> {
+            unreachable!("owner test does not read objects")
+        }
+
+        fn delete_object(&self, _backing: &ColdBackingRoute) -> Result<bool> {
+            unreachable!("owner test does not delete objects")
+        }
+
+        fn put_pending_source(&self, _backing: &ColdBackingRoute, _payload: &[u8]) -> Result<()> {
+            unreachable!("owner test does not stage objects")
+        }
+
+        fn get_pending_source(&self, _backing: &ColdBackingRoute) -> Result<Option<Vec<u8>>> {
+            unreachable!("owner test does not read staged objects")
+        }
+
+        fn delete_pending_source(&self, _backing: &ColdBackingRoute) -> Result<bool> {
+            unreachable!("owner test does not delete staged objects")
+        }
+    }
+
+    fn runtime_target(backend: Arc<CountingHealthBackend>) -> NofRuntimeTarget {
+        NofRuntimeTarget::new(backend)
+    }
+
+    fn owner_lease(stable_id: &str, epoch: u64, fingerprint: &str) -> ClientLease {
+        let mut endpoints = ClientEndpointSet::default();
+        endpoints
+            .labels
+            .insert(NOF_TARGET_SET_LABEL.to_string(), fingerprint.to_string());
+        ClientLease {
+            runtime: ClientRuntimeId {
+                stable_id: ClientStableId::new(stable_id),
+                epoch: ClientEpoch(epoch),
+            },
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints,
+            expires_at_ms: u64::MAX,
+        }
+    }
+
+    fn assigned(
+        target_ids: &[String],
+        leases: &[ClientLease],
+    ) -> BTreeMap<String, ClientRuntimeId> {
+        assign_target_owners(
+            target_ids.iter().map(String::as_str),
+            leases,
+            "same-target-set",
+        )
+    }
+
+    #[test]
+    fn request_health_snapshot_never_probes_backend_and_starts_unknown() {
+        let backend = Arc::new(CountingHealthBackend::new(false));
+        let target = runtime_target(backend.clone());
+        for _ in 0..100 {
+            assert!(target.health_snapshot().is_err());
+        }
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+        target.heartbeat("nof-a");
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(target.health_snapshot().unwrap().available_bytes, Some(75));
+    }
+
+    #[test]
+    fn heartbeat_fences_after_threshold_and_recovers_on_success() {
+        let backend = Arc::new(CountingHealthBackend::new(false));
+        let target = runtime_target(backend.clone());
+        target.heartbeat("nof-a");
+        backend.fail.store(true, Ordering::Relaxed);
+        for _ in 1..TARGET_HEARTBEAT_FAILURE_THRESHOLD {
+            target.heartbeat("nof-a");
+            assert!(target.health_snapshot().is_ok());
+        }
+        target.heartbeat("nof-a");
+        assert!(target.health_snapshot().is_err());
+        backend.fail.store(false, Ordering::Relaxed);
+        target.heartbeat("nof-a");
+        assert!(target.health_snapshot().is_ok());
+    }
+
+    #[test]
+    fn heartbeat_downline_waits_for_the_long_failure_window() {
+        let backend = Arc::new(CountingHealthBackend::new(true));
+        let target = runtime_target(backend);
+        for _ in 0..TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD - 1 {
+            target.heartbeat("nof-a");
+        }
+        assert!(!target.health.read().downline_ready());
+        target.heartbeat("nof-a");
+        assert!(target.health.read().downline_ready());
+    }
+
+    #[test]
+    fn owner_assignment_is_stable_and_only_uses_matching_active_clients() {
+        let target_ids = (0..256)
+            .map(|index| format!("nof-{index:04}"))
+            .collect::<Vec<_>>();
+        let a = owner_lease("client-a", 1, "same-target-set");
+        let b = owner_lease("client-b", 1, "same-target-set");
+        let c = owner_lease("client-c", 1, "same-target-set");
+        let wrong_set = owner_lease("client-wrong", 1, "different-target-set");
+        let mut standby = owner_lease("client-standby", 1, "same-target-set");
+        standby.state = ClientLifecycleState::Standby;
+        let forward = assigned(
+            &target_ids,
+            &[a.clone(), b.clone(), c.clone(), wrong_set, standby],
+        );
+        let reverse = assigned(&target_ids, &[c.clone(), b.clone(), a.clone()]);
+        assert_eq!(forward, reverse);
+        assert!(forward.values().all(|owner| {
+            ["client-a", "client-b", "client-c"].contains(&owner.stable_id.0.as_str())
+        }));
+        let before = assigned(&target_ids, &[a.clone(), b.clone(), c.clone()]);
+        let after = assigned(&target_ids, &[a, c]);
+        for target_id in &target_ids {
+            let previous = &before[target_id];
+            if previous.stable_id.0 != "client-b" {
+                assert_eq!(after[target_id], *previous);
+            }
+        }
+    }
+
+    #[test]
+    fn rendezvous_owner_load_is_even_over_many_targets() {
+        let target_ids = (0..4096)
+            .map(|index| format!("nof-{index:04}"))
+            .collect::<Vec<_>>();
+        let leases = [
+            owner_lease("client-a", 1, "same-target-set"),
+            owner_lease("client-b", 1, "same-target-set"),
+            owner_lease("client-c", 1, "same-target-set"),
+            owner_lease("client-d", 1, "same-target-set"),
+        ];
+        let owners = assigned(&target_ids, &leases);
+        let mut counts = BTreeMap::<String, usize>::new();
+        for owner in owners.values() {
+            *counts.entry(owner.stable_id.0.clone()).or_default() += 1;
+        }
+        assert_eq!(counts.len(), leases.len());
+        assert!(counts.values().all(|count| (800..=1250).contains(count)));
+    }
+
+    #[test]
+    fn managed_owner_rebalance_is_fenced_by_shared_device_record() {
+        let a = owner_lease("client-a", 1, "same-target-set");
+        let b = owner_lease("client-b", 1, "same-target-set");
+        let target_id = (0..1024)
+            .map(|index| format!("nof-fenced-{index}"))
+            .find(|target| {
+                assigned(std::slice::from_ref(target), &[a.clone(), b.clone()])[target] == b.runtime
+            })
+            .expect("rendezvous should assign a target to client-b");
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        metadata.upsert_client_lease(&a).unwrap();
+        let live_clients = Arc::new(parking_lot::Mutex::new(LiveClientCache::default()));
+        live_clients.lock().store(vec![a.clone()]);
+        let target = || {
+            BTreeMap::from([(
+                target_id.clone(),
+                Arc::new(runtime_target(Arc::new(CountingHealthBackend::new(false)))),
+            )])
+        };
+        let state_a = NofOwnerState::new(
+            a.runtime.clone(),
+            metadata.clone(),
+            live_clients.clone(),
+            "same-target-set".to_string(),
+            true,
+            target(),
+        );
+        state_a.refresh_ownership();
+        assert!(state_a.ensure_local_managed_owner(&target_id).is_ok());
+
+        metadata.upsert_client_lease(&b).unwrap();
+        live_clients.lock().store(vec![a.clone(), b.clone()]);
+        state_a.refresh_ownership();
+        let state_b = NofOwnerState::new(
+            b.runtime.clone(),
+            metadata,
+            live_clients,
+            "same-target-set".to_string(),
+            true,
+            target(),
+        );
+        state_b.refresh_ownership();
+        assert!(state_a.ensure_local_managed_owner(&target_id).is_err());
+        assert!(state_b.ensure_local_managed_owner(&target_id).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_probes_only_targets_owned_by_the_local_client() {
+        let local = owner_lease("client-a", 1, "same-target-set");
+        let remote = owner_lease("client-b", 1, "same-target-set");
+        let live_clients = Arc::new(parking_lot::Mutex::new(LiveClientCache::default()));
+        live_clients
+            .lock()
+            .store(vec![local.clone(), remote.clone()]);
+        let mut targets = BTreeMap::new();
+        let mut backends = BTreeMap::new();
+        for index in 0..64 {
+            let target_id = format!("nof-{index:04}");
+            let backend = Arc::new(CountingHealthBackend::new(false));
+            targets.insert(target_id.clone(), Arc::new(runtime_target(backend.clone())));
+            backends.insert(target_id, backend);
+        }
+        let state = NofOwnerState::new(
+            local.runtime.clone(),
+            Arc::new(InMemoryMetadataBackend::new()),
+            live_clients,
+            "same-target-set".to_string(),
+            false,
+            targets,
+        );
+        state.heartbeat_owned_targets();
+        let local_targets = state
+            .locally_owned_target_ids()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert!(!local_targets.is_empty());
+        assert!(local_targets.len() < backends.len());
+        for (target_id, backend) in backends {
+            assert_eq!(
+                backend.calls.load(Ordering::Relaxed),
+                usize::from(local_targets.contains(&target_id))
+            );
+        }
+    }
+
+    #[test]
+    fn owner_snapshot_is_consumed_once_by_successor() {
+        let local = owner_lease("client-b", 1, "same-target-set");
+        let from_lease = owner_lease("client-a", 1, "same-target-set");
+        let live_clients = Arc::new(parking_lot::Mutex::new(LiveClientCache::default()));
+        live_clients
+            .lock()
+            .store(vec![local.clone(), from_lease.clone()]);
+        let target_id = "nof-handoff".to_string();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        metadata
+            .upsert_client_lease(&from_lease)
+            .expect("old owner lease should be registered");
+        metadata
+            .put_cold_tier_device_if_absent(&ColdTierDeviceRecord {
+                device_id: target_id.clone(),
+                stable_id: from_lease.runtime.stable_id.0.clone(),
+                epoch: Some(from_lease.runtime.epoch.0),
+                cold_tier_id: target_id.clone(),
+                kind: NOF_DEVICE_KIND.to_string(),
+                target: ColdTierTargetSpec::Uuid {
+                    uuid: "same-target-set".to_string(),
+                },
+                root_dir: None,
+                state: ColdTierDeviceState::Healthy,
+                capacity_bytes: None,
+                used_bytes: 0,
+                reserved_bytes: 0,
+                failure_count: 0,
+                last_error: None,
+                tags: Vec::new(),
+                updated_at_ms: crate::client::current_time_ms(),
+            })
+            .expect("old owner fence should be registered");
+        let state = NofOwnerState::new(
+            local.runtime.clone(),
+            metadata.clone(),
+            live_clients.clone(),
+            "same-target-set".to_string(),
+            true,
+            BTreeMap::from([(
+                target_id.clone(),
+                Arc::new(runtime_target(Arc::new(CountingHealthBackend::new(false)))),
+            )]),
+        );
+        let route = ObjectRoute {
+            key: ObjectKey::new("handoff-route"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::new(),
+            cold_backing: None,
+            nof_backing: None,
+        };
+        let from = from_lease.runtime;
+        assert_eq!(
+            state
+                .accept_handoff(
+                    target_id.clone(),
+                    from.clone(),
+                    local.runtime.clone(),
+                    vec![route.clone()],
+                )
+                .expect("successor should accept a snapshot"),
+            1
+        );
+        let snapshot = state
+            .take_handoff(&target_id)
+            .expect("accepted snapshot should be retained");
+        assert_eq!(snapshot.from, from);
+        assert_eq!(snapshot.routes, vec![route]);
+        assert!(state.take_handoff(&target_id).is_none());
+
+        metadata
+            .upsert_client_lease(&local)
+            .expect("successor lease should be registered");
+        let current = metadata.get_cold_tier_device(&target_id).unwrap().unwrap();
+        let mut update = ColdTierDeviceUpdate::new(current.updated_at_ms + 1);
+        update.expected_updated_at_ms = Some(current.updated_at_ms);
+        update.stable_id = Some(local.runtime.stable_id.0.clone());
+        update.epoch = Some(Some(local.runtime.epoch.0));
+        metadata
+            .update_cold_tier_device(&target_id, update)
+            .unwrap();
+        live_clients.lock().store(vec![local.clone()]);
+        state.refresh_ownership();
+        assert!(state
+            .accept_handoff(target_id, from, local.runtime.clone(), Vec::new(),)
+            .is_err());
+    }
+
+    #[test]
+    fn graceful_release_withdraws_nof_manager_label() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let template = owner_lease("client-a", 0, "same-target-set");
+        let runtime = metadata
+            .allocate_client_lease(&template)
+            .expect("lease allocation should succeed");
+        let lease = metadata
+            .get_client_lease(&runtime)
+            .expect("lease lookup should succeed")
+            .expect("allocated lease should exist");
+        let mut stale_heartbeat = lease.clone();
+        let live_clients = Arc::new(parking_lot::Mutex::new(LiveClientCache::default()));
+        live_clients.lock().store(vec![lease]);
+        let target_id = "nof-released".to_string();
+        let backend = Arc::new(CountingHealthBackend::new(true));
+        let state = NofOwnerState::new(
+            runtime.clone(),
+            metadata.clone(),
+            live_clients,
+            "same-target-set".to_string(),
+            false,
+            BTreeMap::from([(target_id, Arc::new(NofRuntimeTarget::new(backend)))]),
+        );
+        for _ in 0..TARGET_HEARTBEAT_FAILURE_THRESHOLD {
+            state.heartbeat_owned_targets();
+        }
+        state.release();
+        *state.published_unhealthy_targets.lock() = None;
+        state.publish_unhealthy_targets(BTreeSet::new());
+        let released = metadata
+            .get_client_lease(&runtime)
+            .expect("released lease lookup should succeed")
+            .expect("released client remains live for normal cleanup");
+        assert!(!released.endpoints.labels.contains_key(NOF_TARGET_SET_LABEL));
+        assert!(!released
+            .endpoints
+            .labels
+            .contains_key(NOF_UNHEALTHY_TARGETS_LABEL));
+        assert_eq!(released.state, ClientLifecycleState::Active);
+
+        upsert_client_lease_preserving_nof_labels(metadata.as_ref(), &mut stale_heartbeat)
+            .expect("stale heartbeat should preserve the ownership withdrawal");
+        assert!(!stale_heartbeat
+            .endpoints
+            .labels
+            .contains_key(NOF_TARGET_SET_LABEL));
+        let persisted = metadata.get_client_lease(&runtime).unwrap().unwrap();
+        assert!(!persisted
+            .endpoints
+            .labels
+            .contains_key(NOF_UNHEALTHY_TARGETS_LABEL));
+        assert!(!persisted
+            .endpoints
+            .labels
+            .contains_key(NOF_TARGET_SET_LABEL));
+    }
+
+    #[test]
+    fn owner_publishes_failed_target_for_remote_request_filtering() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let template = owner_lease("client-a", 0, "same-target-set");
+        let runtime = metadata
+            .allocate_client_lease(&template)
+            .expect("lease allocation should succeed");
+        let lease = metadata
+            .get_client_lease(&runtime)
+            .expect("lease lookup should succeed")
+            .expect("allocated lease should exist");
+        let live_clients = Arc::new(parking_lot::Mutex::new(LiveClientCache::default()));
+        live_clients.lock().store(vec![lease]);
+        let target_id = "nof-failed".to_string();
+        let backend = Arc::new(CountingHealthBackend::new(true));
+        let state = NofOwnerState::new(
+            runtime.clone(),
+            metadata.clone(),
+            live_clients,
+            "same-target-set".to_string(),
+            false,
+            BTreeMap::from([(target_id.clone(), Arc::new(NofRuntimeTarget::new(backend)))]),
+        );
+
+        for _ in 0..TARGET_HEARTBEAT_FAILURE_THRESHOLD {
+            state.heartbeat_owned_targets();
+        }
+
+        let published = metadata
+            .get_client_lease(&runtime)
+            .expect("published lease lookup should succeed")
+            .expect("published lease should exist");
+        let encoded = published
+            .endpoints
+            .labels
+            .get(NOF_UNHEALTHY_TARGETS_LABEL)
+            .expect("failed target should be published");
+        let unhealthy = serde_json::from_str::<BTreeSet<String>>(encoded)
+            .expect("health label should be valid JSON");
+        assert_eq!(unhealthy, BTreeSet::from([target_id.clone()]));
+
+        let owners = BTreeMap::from([(target_id.clone(), runtime)]);
+        let remote_runtime = owner_lease("client-b", 1, "same-target-set").runtime;
+        assert!(remote_unhealthy_targets(
+            &owners,
+            std::slice::from_ref(&published),
+            &remote_runtime
+        )
+        .contains(&target_id));
+    }
+
+    #[test]
+    fn managed_target_is_unavailable_until_owner_recovery_finishes() {
+        let local = owner_lease("client-a", 1, "same-target-set");
+        let live_clients = Arc::new(parking_lot::Mutex::new(LiveClientCache::default()));
+        live_clients.lock().store(vec![local.clone()]);
+        let target_id = "nof-recovering".to_string();
+        let state = NofOwnerState::new(
+            local.runtime,
+            Arc::new(InMemoryMetadataBackend::new()),
+            live_clients,
+            "same-target-set".to_string(),
+            true,
+            BTreeMap::from([(
+                target_id.clone(),
+                Arc::new(runtime_target(Arc::new(CountingHealthBackend::new(false)))),
+            )]),
+        );
+
+        state.heartbeat_owned_targets();
+        assert_eq!(
+            state.locally_owned_recovery_target_ids(),
+            vec![target_id.clone()]
+        );
+        assert!(state.health_snapshot(&target_id).is_err());
+
+        state.targets[&target_id].finish_recovery();
+        assert!(state.health_snapshot(&target_id).is_ok());
+    }
+
+    #[test]
+    fn recovered_downlined_target_requires_recovery() {
+        let local = owner_lease("client-a", 1, "same-target-set");
+        let live_clients = Arc::new(parking_lot::Mutex::new(LiveClientCache::default()));
+        live_clients.lock().store(vec![local.clone()]);
+        let target_id = "nof-reonline".to_string();
+        let backend = Arc::new(CountingHealthBackend::new(true));
+        let state = NofOwnerState::new(
+            local.runtime,
+            Arc::new(InMemoryMetadataBackend::new()),
+            live_clients,
+            "same-target-set".to_string(),
+            true,
+            BTreeMap::from([(target_id.clone(), Arc::new(runtime_target(backend.clone())))]),
+        );
+        state.refresh_ownership();
+        state.targets[&target_id].finish_recovery();
+        for _ in 0..TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD {
+            state.heartbeat_owned_targets();
+        }
+
+        backend.fail.store(false, Ordering::Relaxed);
+        state.heartbeat_owned_targets();
+        assert!(state.health_snapshot(&target_id).is_err());
+    }
+}

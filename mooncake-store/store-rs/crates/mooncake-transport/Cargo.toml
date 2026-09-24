@@ -1,0 +1,15 @@
+[package]
+name = "mooncake-transport"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mooncake-store-core = { path = "../mooncake-store-core" }
+mooncake-transport-sys = { path = "../mooncake-transport-sys" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

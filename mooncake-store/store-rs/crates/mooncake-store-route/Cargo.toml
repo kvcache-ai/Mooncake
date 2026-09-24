@@ -1,0 +1,13 @@
+[package]
+name = "mooncake-store-route"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dashmap.workspace = true
+mooncake-store-core = { path = "../mooncake-store-core" }
+parking_lot.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

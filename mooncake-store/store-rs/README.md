@@ -1,0 +1,1047 @@
+# mooncake-store-rs
+
+A Rust-native Mooncake Store implementation that keeps the Mooncake store programming model, reuses Mooncake TE/TENT for data transfer, and defaults to masterless route control.
+
+## What This Project Is
+
+`mooncake-store-rs` is a complete store implementation built in Rust.
+
+It keeps the familiar Mooncake-style store API, but organizes the system around client-owned routing and peer-to-peer control-plane communication. Object data is transferred through Mooncake TE/TENT, while leases, segment state, route policy, handoff plans, and other durable coordination state stay in Redis or etcd.
+
+The result is a store that is easier to embed into Rust systems, easier to test locally, and easier to expose to Python without adding another store implementation.
+
+## Documentation
+
+Use the document that matches what you are doing.
+
+| If You Want To | Read |
+|----------------|------|
+| run the project locally | `README.md`, `docs/deployment.md` |
+| run `mooncake-store-bench` for verify / benchmark / soak | `README.md`, `docs/bench.md`, `docs/deployment.md` |
+| run the multi-client stress benchmark | `README.md`, `docs/deployment.md` |
+| integrate the client into a Rust service | `docs/rust.md` |
+| configure routing, memory, placement, or observability | `docs/configuration.md` |
+| use the Python compatibility layer | `docs/python.md` |
+| understand repository structure | `docs/components.md` |
+| understand implemented capabilities | `docs/features.md` |
+| understand runtime flow and control plane behavior | `docs/architecture.md` |
+| add or review tests, run the suite, understand the fault-injection model | `docs/testing.md` |
+
+## Project Map
+
+The repository is organized by clear runtime responsibilities.
+
+| Module | Role | Why It Exists |
+|--------|------|---------------|
+| `mooncake-store-core` | Shared store model | Defines identities, leases, routes, segments, lifecycle, and traits |
+| `mooncake-metadata` | Metadata backends | Stores leases, segments, and route state in Redis, etcd, or memory |
+| `mooncake-store-client` | Main runtime | Implements store APIs, routing, allocation, reclaim, control-plane RPC, and observability |
+| `mooncake-transport-sys` | Native FFI | Links Rust to upstream Mooncake native libraries |
+| `mooncake-transport` | Safe transport wrapper | Exposes TE/TENT as Rust-friendly transport abstractions |
+| `mooncake-store-py` | Python bindings | Exposes the Rust client as a native Python module |
+| `mooncake-store-e2e` | Validation binary | Runs end-to-end checks and benchmark loops |
+
+If you want a deeper module-by-module explanation, read `docs/components.md`.
+
+## Feature Map
+
+The implementation is easier to understand when grouped by capability instead of by crate.
+
+### Data I/O
+
+- single `put` / `get`
+- `batch_put` / `batch_get`
+- buffer-based and registered-buffer I/O
+- multi-buffer put and get for fragmented payloads
+- local copy and remote transfer paths through TE/TENT
+
+### Routing
+
+- default client-side route ownership with embedded weighted rendezvous hashing
+- configurable WRH authority fanout through `route_topk` with primary-plus-mirrors selection
+- optional `MetadataOnly` route mode
+- route read, replace, and compare-and-swap through the control plane
+- authority reads with mirrored top-k repair inside the route-authority set
+- prewarmed membership snapshots with background lease refresh instead of request-path membership refresh
+- read fail-fast on suspect or offline owners while keeping draining owners readable during handoff
+- suspect owners stay quarantined until a fresh lease heartbeat or control-plane endpoint change proves recovery
+- cluster route policy bootstrap in metadata: the first client in a metadata keyspace publishes `route_control + route_topk` as the cluster policy, later clients must match or fail startup
+
+### Placement and Replication
+
+- local-only writes
+- routed writes to remote storage nodes
+- local-first placement with remote spillover
+- request-level replication policy
+- preferred segment hints
+- preferred storage owner hints
+- multi-replica publication
+
+### Memory and Reclaim
+
+- local segment registration
+- native local-memory hugepage allocation
+- Python shm allocator hugepage allocation
+- local and remote allocation paths
+- background async eviction with configurable watermarks
+- storage-owner CLOCK eviction with route-owner CAS
+- best-effort read-hit reporting to storage owners
+- best-effort remote replica route tracking after publish
+- overwrite reclaim
+- delete reclaim
+- configurable reclaim grace window
+- elastic segment expansion and retirement
+- remote allocator reserve/release through peer control-plane RPC; capacity errors stay owner-local, while transport/protocol failures quarantine the owner and let placement move on
+
+### Lifecycle and Membership
+
+- standby, activate, and draining states
+- handoff planning for upgrades
+- build-time membership snapshot prewarm and background live-client sync
+- default compatibility lease TTL of `30_000ms`
+- storage-role validation during startup
+- segment-level drain / retire flows
+- true client shrink through replica evacuation
+- hot-upgrade handoff with payload preservation validated by dedicated CLI and Python regression tests
+
+### Observability
+
+- tracing through `tracing` / `tracing-subscriber`
+- in-process Prometheus-style metrics
+- optional metrics HTTP server
+- request, lease, capacity, route-CAS, lifecycle, eviction, and process metrics
+
+The `/metrics` surface is now split by metric family instead of one flat operation map:
+
+- `mooncake_store_request_*`: request totals, inflight, bytes, and latency histograms
+- `mooncake_store_segment_*`: per-segment used/capacity gauges
+- `mooncake_store_runtime_*`: runtime state and lease-expiry gauges
+- `mooncake_store_route_cas_total`: first-class CAS conflict accounting
+- `mooncake_store_segment_lifecycle_total` / `mooncake_store_eviction_*`: rebalance and allocator maintenance progress
+- `process_*`: in-process CPU, RSS, and open-fd facts
+
+### Python Compatibility
+
+- Mooncake-style `MooncakeDistributedStore`
+- `MooncakeHostMemAllocator` for registered buffer ownership
+- dummy and real HiCache-compatible execution paths
+- daemon-local hot read cache for the Python compatibility runtime, with optional shm-backed payload sharing for dummy clients attached to the same standalone daemon
+- wheel packaging with bundled native runtime libraries
+- wheel-installed `mooncake-store-client` console command
+- wheel-installed `mooncake-store-admin` maintenance command
+- wheel-installed `mooncake-store-bench` benchmark / verify / soak command
+- standalone `mooncake-store-client` binary artifact in `dist/bin/`
+- standalone `mooncake-store-admin` binary artifact in `dist/bin/`
+- standalone `mooncake-store-bench` binary artifact in `dist/bin/`
+- hugepage-aware allocator options
+- `ReplicateConfig` request policy mapping
+- batch APIs, route query, metrics helpers, lifecycle helpers
+- soft-miss batch compatibility for `batch_get_into`, `batch_get_into_multi_buffers`, and `batch_is_exist`
+- native module backed by the Rust implementation
+
+### Multi-Tenant Isolation
+
+Store-RS now treats tenant isolation as a control-plane feature authored in metadata and enforced inside the runtime.
+
+The intended operator flow is:
+
+1. write tenant policy through `mooncake-store-admin policy ...`
+2. launch runtimes with a tenant identity plus transport and memory configuration
+3. let Store-RS resolve and enforce effective tenant policy from metadata during bootstrap and on write paths
+
+What tenant policy covers:
+
+- routing defaults such as `route_topk`
+- quota limits such as `max_bytes` and `max_objects`
+- placement defaults such as replica count and preferred storage owners
+- QoS-related defaults such as fairness and shaping knobs
+- scope selection at tenant, tenant+domain, or tenant+domain+object-set granularity
+
+Important boundary:
+
+- `mooncake-store-admin` is the preferred management surface for tenant policy and explicit repair
+- request-path enforcement stays inside Store-RS clients and control-plane services
+- runtime-local builder / Python / CLI knobs remain compatibility fallbacks, not the preferred authoring path
+
+Current strict-isolation path:
+
+- strict tenant quota is metadata-authoritative rather than best-effort runtime-local preflight
+- concurrent writes reserve and finalize quota through metadata state instead of relying on stale snapshots
+- delete refunds quota at authoritative delete time, so released capacity is reusable immediately
+- admin inspection and repair surfaces expose `quota state`, `quota object`, `quota reservations`, `quota abort`, and `quota reconcile`
+
+Validation coverage already includes:
+
+- multi-tenant behavior in the main Rust e2e harness
+- strict tenant quota admission, rejection, refund, and reuse checks in `scripts/e2e/run-local-e2e.sh`
+- operator-facing quota inspection and reconcile workflows documented in `docs/deployment.md`
+
+Basic usage:
+
+1. write policy for one tenant:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  policy set \
+  --tenant tenant-a \
+  --route-topk 3 \
+  --route-control embedded-wrh \
+  --max-bytes 1048576 \
+  --max-objects 10
+```
+
+2. start a runtime for that tenant:
+
+```bash
+mooncake-store-client \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  --stable-id tenant-a-store-1 \
+  --tenant tenant-a \
+  --state active \
+  --storage-bytes 268435456 \
+  --scratch-bytes 16777216
+```
+
+For Rust clients, the equivalent scope selection is `.tenant("tenant-a")` on `StoreClientBuilder`.
+
+3. inspect quota state and pending reservations:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota state \
+  --tenant tenant-a
+
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reservations \
+  --tenant tenant-a \
+  --state pending
+```
+
+4. run explicit repair when needed:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  quota reconcile \
+  --tenant tenant-a \
+  --dry-run
+```
+
+Completed tenant-quota reservations no longer accumulate forever in Redis: `Finalized` and `Aborted` records are retained for `24h` by default, while `Pending` reservations remain reconcile-driven.
+
+Start here when working on this area:
+
+- `docs/deployment.md` for the recommended admin-first workflow
+- `docs/configuration.md` for tenant-policy precedence and fallback behavior
+- `docs/multi-tenant-admin-control-plane-design.md` for the management-plane model
+- `docs/tenant-quota-consistency-design.md` for strict quota semantics
+
+If you want a feature-by-feature view, read `docs/features.md`.
+
+## Architecture at a Glance
+
+```mermaid
+graph TB
+    App["Application"] --> Client["StoreClient"]
+    Client --> Route["Route Directory\nEmbedded WRH or MetadataOnly"]
+    Client --> Alloc["Allocator\nLocal or Remote"]
+    Client --> Evict["Storage Owner CLOCK\nReplica Tracking + Reclaim"]
+    Client --> CP["Control Plane RPC\nroute + allocator + eviction"]
+    Client --> TE["Mooncake TE / TENT"]
+    Route --> Meta["Metadata Backend\nRedis / etcd / in-memory"]
+    Alloc --> Meta
+    Evict --> Route
+    Evict --> Alloc
+    CP --> Evict
+    CP --> Peer["Peer Client"]
+    TE --> Peer
+
+    style Client fill:#e3f2fd
+    style Route fill:#e8f5e9
+    style Alloc fill:#fff3e0
+    style Evict fill:#fce4ec
+    style Meta fill:#f3e5f5
+    style TE fill:#ede7f6
+```
+
+The runtime separates two owner roles:
+
+- route owner decides object-route versions and CAS
+- storage owner tracks locally stored replicas and runs eviction under capacity pressure
+- `route_topk` controls how many route authorities are mirrored per key; it is distinct from write-side `replica_count`
+- storage owners reclaim in the background above the high watermark and stop at the low watermark
+- readers report replica hits to storage owners in batch
+- writers push published remote routes to storage owners in batch
+- metadata carries durable coordination state such as leases, segment state, route policy, handoff plans, and `MetadataOnly` routes
+
+For the runtime view, read `docs/architecture.md`.
+
+## Quick Start
+
+### Prerequisites
+
+- Rust toolchain
+- `cmake` and a C++ toolchain
+- `redis-server` and `redis-cli`
+- Git submodule support
+- Python 3, if you want the Python layer
+
+### Fetch the upstream Mooncake submodule
+
+```bash
+git submodule update --init --recursive
+```
+
+### Run the local Rust e2e and benchmark
+
+```bash
+./scripts/e2e/run-local-e2e.sh
+```
+
+This script will:
+
+- auto-start a local Redis instance on port `6380` when needed
+- build Mooncake TE/TENT from `third_party/Mooncake` when native artifacts are missing
+- run the Rust end-to-end suite
+- print batch put/get benchmark results
+
+For deployment details and script knobs, read `docs/deployment.md`.
+
+### Run the hot-upgrade validation
+
+Native CLI hot-upgrade validation:
+
+```bash
+./scripts/tests/client/test-client-hot-upgrade-cli.sh
+```
+
+This script:
+
+- builds the standalone `mooncake-store-client` binary
+- starts an active predecessor and a standby successor with the same `stable_id`
+- writes a real payload through an external routed client
+- sends `SIGTERM` to trigger graceful handoff
+- verifies that the successor promotes itself and can still read the original payload
+
+Python hot-upgrade argument and wrapper compatibility validation:
+
+```bash
+./scripts/tests/client/test-python-client-hot-upgrade-args.sh
+```
+
+This script verifies both layers:
+
+- PyO3 native `setup(..., stable_id, initial_state)` argument parsing; the metadata backend assigns the epoch
+- Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
+
+### Run the local hot-cache validation
+
+```bash
+./scripts/e2e/run-local-hot-cache-e2e.sh
+```
+
+This script verifies:
+
+- a real-mode reader reuses daemon-local cached bytes after the origin key is removed remotely
+- two dummy clients attached to one standalone daemon reuse a shm-backed hot-cache hit
+- local Redis, wheel runtime, and standalone daemon startup are wired automatically for the check
+
+For script knobs and cache tuning, read `docs/deployment.md` and `docs/configuration.md`.
+
+### Clean stale Redis segment metadata
+
+Client leases in Redis expire automatically, but segment registration keys do not.
+If a storage client is hard-killed, Redis can keep stale `segments/...` entries for
+that dead owner until an operator sweeps them.
+
+Use the explicit admin command when you want to remove segment metadata that belongs
+to owners with no live lease:
+
+```bash
+mooncake-store-admin \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  cleanup-stale-segments
+```
+
+Optional inputs:
+
+- `--keyspace <prefix>` to target a non-default metadata keyspace
+- `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` for Redis ACL authentication
+
+The sweep is intentionally explicit. It removes only dead-owner segment metadata and
+its index entries; it does not touch live owners.
+
+### Run the eviction validation
+
+Native CLI eviction validation:
+
+```bash
+./scripts/tests/client/test-client-eviction-cli.sh
+```
+
+This script:
+
+- builds the standalone `mooncake-store-client` binary
+- starts a real storage client with `/metrics` enabled
+- drives `put`, `get`, and `batch_get` through an external routed Python client
+- waits for background storage-owner eviction to reclaim the cold replica
+- verifies eviction through `/metrics` and tracing logs
+
+### Run the multi-client stress benchmark
+
+```bash
+./scripts/e2e/run-multi-client-stress.sh
+```
+
+This script runs the Python compatibility layer in a process-per-client layout:
+
+- storage instances run as dedicated processes with local storage memory
+- rw instances run as separate processes with `rw_storage_bytes=0` by default
+- routed traffic uses the same Rust store runtime and the same embedded WRH route mode
+
+At the end of the run, the script prints a concise steady-state bandwidth summary:
+
+```text
+steady-state bandwidth:
+- put: 24.82 MiB/s
+- get: 27.22 MiB/s
+- batch-put: 45.31 MiB/s
+- batch-get: 109.52 MiB/s
+```
+
+Treat this summary as the primary throughput signal. The per-phase `stress phase=...` lines remain in the log for latency breakdowns and setup debugging.
+
+### Run `mooncake-store-bench`
+
+Use the shipped benchmark binary when you want a first-party verify / benchmark /
+soak surface against the same runtime that the wheel packages.
+
+Correctness smoke check:
+
+```bash
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  verify \
+  --write-interface batch-put-from \
+  --read-interface batch-get-into
+```
+
+Scratch-only remote-store benchmark:
+
+```bash
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  bench \
+  --mode mixed \
+  --concurrency 8 \
+  --duration 30
+```
+
+The default measured interfaces are `batch_put_from` and `batch_get_into`. Override them
+from the CLI or env when needed:
+
+```bash
+MC_BENCH_WRITE_INTERFACE=put \
+MC_BENCH_READ_INTERFACE=get \
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  bench \
+  --mode mixed \
+  --write-interface put \
+  --read-interface get
+```
+
+Or use one combined env:
+
+```bash
+MC_BENCH_INTERFACES=put,get \
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  bench \
+  --mode mixed
+```
+
+Longer soak run:
+
+```bash
+mooncake-store-bench \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  soak \
+  --duration 3600 \
+  --write-interface batch-put-from \
+  --read-interface batch-get-into \
+  --fault redis-jitter:5:50 \
+  --verify-reads
+```
+
+Important runtime behavior:
+
+- `MC_BENCH_STORAGE_BYTES=0` by default, so the bench expects separate active `storage=true` daemons in the same metadata keyspace
+- `MC_BENCH_INTERFACES=<write>,<read>` can set both interface env defaults together
+- `MC_BENCH_WRITE_INTERFACE=batch-put-from` and `MC_BENCH_READ_INTERFACE=batch-get-into` by default
+- when `--keyspace` is omitted in scratch-only mode, bench joins `mc/store-rs/v2`
+- when `--storage-bytes > 0` and `--keyspace` is omitted, bench generates an isolated `mc/store-rs/bench/<unique>` keyspace
+- bench tracing goes to `stderr` by default, honors `--trace-filter` / `MC_STORE_RS_TRACE_FILTER` / `RUST_LOG`, and falls back to `info`
+- use `MC_BENCH_TRACE_FILE=/path/to/bench.log` for a dedicated bench log file; `MC_STORE_RS_TRACE_FILE` does not redirect bench output
+- for `classic_te` over RDMA, set `MC_STORE_RS_GID_INDEX=<n>` when the host requires a non-default RoCE GID index
+
+See `docs/bench.md` for the full CLI reference.
+
+### Run the Python compatibility e2e
+
+```bash
+./scripts/e2e/run-python-compat-e2e.sh
+```
+
+### Run the client read/write validation
+
+```bash
+./scripts/tests/client/test-client-rw-cli.sh
+```
+
+This standard entry point builds the standalone `mooncake-store-client` binary,
+starts storage daemons against a temporary Redis metadata backend, and verifies:
+
+- dummy single-item read/write
+- dummy shared-memory batch read/write
+- dummy multi-buffer shared-memory read/write
+- real routed write on one client and read on another client
+- both single-item and batched real-mode paths
+
+For direct operator-driven validation, the paired helper scripts remain
+available:
+
+```bash
+python3 ./scripts/clients/real_client_rw.py --help
+python3 ./scripts/clients/dummy_client_rw.py --help
+```
+
+Run the real-mode black-box read/write validator:
+
+```bash
+python3 ./scripts/clients/real_client_rw.py \
+  --local_host 127.0.0.1:17111 \
+  --metadata_url redis://127.0.0.1:6380/0 \
+  --storage-bytes $((128 * 1024 * 1024)) \
+  --mode idle \
+  --hold-seconds 600
+```
+
+Use the same script to validate routed rw-only clients:
+
+```bash
+python3 ./scripts/clients/real_client_rw.py \
+  --local_host 127.0.0.1:17121 \
+  --metadata_url redis://127.0.0.1:6380/0 \
+  --storage-bytes 0 \
+  --routed-writes \
+  --mode write \
+  --key_prefix smoke
+```
+
+Run the dummy-mode black-box read/write validator against a standalone daemon:
+
+```bash
+python3 ./scripts/clients/dummy_client_rw.py \
+  --daemon_addr 127.0.0.1:16590 \
+  --key_prefix smoke \
+  --batch_size 4
+```
+
+To package the Python module and the standalone client command together:
+
+```bash
+./scripts/build/build-wheel.sh
+python3 -m venv .venv-wheel-test
+. .venv-wheel-test/bin/activate
+pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
+mooncake-store-client --help
+mooncake-store-client -v
+python -c "import mooncake_store_rs as m; print(m.__version__, m.__edition__)"
+python -c "import mooncake_store_rs as m; print(m.__build_info__)"
+```
+
+If the host OS is missing build dependencies, use the Ubuntu Docker wrapper:
+
+```bash
+PYTHON=python3.11 ./scripts/build/build-wheel.sh
+```
+
+The Docker wrapper produces the same `dist/wheels/` and `dist/bin/` outputs and
+defaults to CN mirrors for rustup, cargo, and pip. Set `CN_MIRROR=0` to force
+the upstream endpoints.
+
+This packaging flow produces a single wheel, `mooncake_store_rs-*.whl`, imported
+as `mooncake_store_rs`.
+
+It owns its own top-level name, so it installs alongside the upstream
+`mooncake-transfer-engine` wheel without either overwriting the other's files.
+Code that expects the upstream import path keeps working by opting in:
+
+```bash
+export MOONCAKE_STORE_BACKEND=rs   # `from mooncake.store import ...` now resolves here
+python -m mooncake_store_rs.doctor # report which backend is active
+```
+
+See `docs/python.md` for how the redirect works and why the variable has to be
+exported before the interpreter starts.
+
+### SGLang HiCache integration
+
+Example launch patterns:
+
+- real-mode SGLang with an in-process rw-only client (`global_segment_size=0`)
+
+```bash
+MC_STORE_RS_TRANSPORT_BACKEND=classic_te \
+SGLANG_HICACHE_MOONCAKE_REUSE_TE=0 \
+python -m sglang.launch_server \
+  --model-path /models/Qwen3-0.6B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --enable-hierarchical-cache \
+  --hicache-size 4 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --hicache-storage-backend mooncake \
+  --hicache-storage-prefetch-policy wait_complete \
+  --hicache-storage-backend-extra-config '{
+    "local_hostname": "10.0.0.21:17121",
+    "metadata_server": "P2PHANDSHAKE",
+    "master_server_address": "redis://10.0.0.10:6379/0",
+    "global_segment_size": 0,
+    "protocol": "tcp",
+    "device_name": "",
+    "check_server": false
+  }'
+```
+
+  The upstream sglang JSON keys `metadata_server` and `master_server_address` are accepted as aliases that map to `transport_metadata_url` and `metadata_url` respectively. `metadata_server` is forwarded to the Transfer Engine only (`redis://...` or `P2PHANDSHAKE`; defaults to `P2PHANDSHAKE` everywhere that supports defaults — Python dict-form, standalone CLI, bench. The Python positional `setup(...)` requires it explicitly because it precedes other required args). `master_server_address` carries the Store-RS metadata URL (`redis://...` or `etcd://...`, required); `master_server` and `master_server_addr` are equivalent aliases. The Python wrapper rejects setup if no metadata URL is supplied.
+
+  Current upstream SGLang only forwards the legacy Mooncake fields from `--hicache-storage-backend-extra-config`: `local_hostname`, `metadata_server`, `global_segment_size`, `protocol`, `device_name`, `master_server_address`, `check_server`, `standalone_storage`, and `client_server_address`.
+
+  Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. The Python compatibility layer therefore treats environment variables as setup fallbacks when SGLang does not pass the new fields. Explicit Python `setup(...)` arguments still win over environment values.
+
+Use these environment variables for SGLang real mode:
+
+- `MC_STORE_RS_METADATA_URL` (dict-form `metadata_url` fallback) and `MC_STORE_RS_TRANSPORT_METADATA_URL` (dict-form `transport_metadata_url` fallback; defaults to `P2PHANDSHAKE`)
+- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`; default `classic_te`
+- `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
+- `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
+- `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
+- `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
+- `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
+- `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
+- `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC client capacity; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS=<n>` to tune embedded control-plane gRPC server capacity; default `4`
+
+`MC_STORE_RS_LABELS` accepts either a JSON object or comma-separated `key=value` pairs, for example `MC_STORE_RS_LABELS='storage=false,pool=rw'`.
+
+- dummy-mode SGLang through a standalone routed gateway
+
+```bash
+mooncake-store-client \
+  --local-hostname 10.0.0.21 \
+  --metadata-url redis://10.0.0.10:6379/0 \
+  --storage-bytes 0 \
+  --scratch-bytes 16777216 \
+  --protocol tcp \
+  --transport-rpc-port 17121 \
+  --stable-id sglang-gateway \
+  --tenant default \
+  --label pool=pool-a \
+  --label storage=false \
+  --routed-writes \
+  --replica-count 2 \
+  --route-topk 2 \
+  --client-server-address 0.0.0.0:16590 \
+  --metrics-addr 0.0.0.0:19101
+
+SGLANG_HICACHE_MOONCAKE_REUSE_TE=0 \
+python -m sglang.launch_server \
+  --model-path /models/Qwen3-0.6B \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --enable-hierarchical-cache \
+  --hicache-size 4 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --hicache-storage-backend mooncake \
+  --hicache-storage-prefetch-policy wait_complete \
+  --hicache-storage-backend-extra-config '{
+    "standalone_storage": true,
+    "client_server_address": "10.0.0.21:16590",
+    "check_server": false,
+    "prefetch_threshold": 32
+  }'
+```
+
+- real mode uses `setup(...)` and requires a reachable `local_hostname[:transport_rpc_port]`
+- dummy mode uses `setup_dummy(...)` through `client_server_address`
+
+For Python build and API details, read `docs/python.md`.
+
+## Rust Usage
+
+### Minimal local store
+
+```rust
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+use mooncake_store_client::{LocalMemoryConfig, MooncakeCompatibilityFacade, StoreClientBuilder};
+use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
+use mooncake_transport::{TentEngine, TentEngineConfig, TentTransportFactory};
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_millis() as u64
+}
+
+fn main() -> Result<()> {
+    let metadata = Arc::new(RedisMetadataBackend::new(
+        RedisMetadataConfig::new("redis://127.0.0.1:6380/0")
+            .keyspace(MetadataKeyspace::new("mc/store-rs/demo")),
+    )?);
+
+    let tent_config = TentEngineConfig::new()
+        .set("metadata_type", "redis")
+        .set("metadata_servers", "127.0.0.1:6380")
+        .set("redis_db_index", "0")
+        .set("rpc_server_hostname", "127.0.0.1")
+        .set("rpc_server_port", "0")
+        .set("log_level", "warning")
+        .set("transports/tcp/enable", "true")
+        .set("transports/shm/enable", "false")
+        .set("transports/rdma/enable", "false")
+        .set("transports/io_uring/enable", "false");
+
+    let engine = Arc::new(TentEngine::new(
+        &tent_config.clone().set("local_segment_name", "demo-segment"),
+    )?);
+    let factory = Arc::new(TentTransportFactory::new(tent_config));
+
+    let client = StoreClientBuilder::new(metadata, "demo-store")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .tenant("default")
+        .compatibility(CompatibilityDescriptor::default())
+        .local_memory(
+            LocalMemoryConfig::new()
+                .storage_bytes(128 * 1024 * 1024)
+                .scratch_bytes(16 * 1024 * 1024)
+                .location("cpu:0"),
+        )
+        .with_tent(engine)
+        .transport_factory(factory)
+        .build(now_ms() + 600_000)?;
+
+    client.register_local_memory()?;
+    client.put("hello", b"world")?;
+    assert_eq!(client.get("hello")?, b"world");
+    Ok(())
+}
+```
+
+In Rust, TENT `rpc_server_port` is the real data-plane TCP port. Leaving it at `0` is fine for local demos; for cross-host or cross-container deployments, set a fixed port and make sure peers can reach `rpc_server_hostname:rpc_server_port`.
+
+### Transport backend selection
+
+There are two transport backends in the current tree:
+
+- `TentEngine` + `TentEngineConfig`
+- `ClassicTransferEngine` + `ClassicEngineConfig`
+
+The low-level Rust API keeps transport selection explicit: applications construct the engine they want and wire it into `StoreClientBuilder` themselves.
+
+The runtime transport switch belongs to the compatibility layer:
+
+- `mooncake-store-client --transport-backend tent|classic-te`
+- `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
+- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
+
+### Metadata restart and reconnect behavior
+
+Both real transport backends self-heal after Redis metadata connectivity returns:
+
+- transient Redis outages keep the process alive; heartbeat recovery republishes store metadata and Redis-backed transport metadata after Redis is reachable again
+- fresh Redis restarts are supported as long as the storage clients survive long enough to renew their lease and repair local metadata
+- `classic-te` rebuilds the transport engine and republishes its local buffers
+- `tent` rebuilds the transport engine and re-registers its local buffers back into transport metadata
+
+During the outage window, new routed writes or remote reads can fail because leases or segment metadata are unavailable. After Redis recovers and the local heartbeat repair runs, existing storage clients become writable and readable again without manual cleanup.
+
+### Routed writes
+
+```rust
+use mooncake_store_client::PlacementPlanner;
+
+let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+let routed = StoreClientBuilder::new(metadata, "router-a")
+    .state(ClientLifecycleState::Active)
+    .label("storage", "false")
+    .with_tent(engine)
+    .transport_factory(factory)
+    .local_memory(local_memory)
+    .routed_writes(planner, 2)
+    .build(now_ms() + 600_000)?;
+```
+
+For a fuller Rust guide, including lifecycle and buffer-oriented APIs, read `docs/rust.md`.
+
+## Python Usage
+
+Build the native module and expose the Python package from the repository checkout:
+
+```bash
+cargo build -p mooncake-store-py
+export PYTHONPATH="$PWD/python"
+```
+
+Build a distributable wheel and package the standalone client binary:
+
+```bash
+./scripts/build/build-wheel.sh
+```
+
+Or build in Ubuntu Docker with an explicit Python runtime:
+
+```bash
+PYTHON_VERSION=3.12 ./scripts/build/build-wheel-ubuntu-docker.sh
+```
+
+The default output layout is:
+
+- `dist/wheels/mooncake_store_rs-*.whl` for the runtime package
+- `dist/bin/mooncake-store-client` for the standalone client runtime
+- `dist/bin/mooncake-store-bench` for the standalone benchmark / verify / soak runtime
+
+Recommended installation flow:
+
+```bash
+python3 -m venv .venv-wheel-test
+. .venv-wheel-test/bin/activate
+pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
+python -c "import mooncake_store_rs as m; print(m.__version__, m.__edition__)"
+python -c "import mooncake_store_rs as m; print(m.__build_info__)"
+mooncake-store-client --version
+mooncake-store-client -v
+mooncake-store-bench --help
+```
+
+For local wheelhouse installs, `scripts/build/install-wheel.sh` wraps the same flow.
+
+Packaging model:
+
+- users install `mooncake-store-rs`, which imports as `mooncake_store_rs`
+- the upstream `mooncake-transfer-engine` wheel can be installed at the same
+  time; the two share no files, so neither needs uninstalling first
+- integrations written against `from mooncake.store import ...` work unchanged
+  once `MOONCAKE_STORE_BACKEND=rs` is exported, which redirects that import here
+- without that variable the upstream implementation stays in charge, so
+  installing this wheel does not change existing behaviour
+
+```python
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+
+store = MooncakeDistributedStore()
+store.setup(
+    "127.0.0.1",
+    "P2PHANDSHAKE",                      # arg2: transport_metadata_url -> Transfer Engine (default for classic_te)
+    128 * 1024 * 1024,
+    16 * 1024 * 1024,
+    "tcp",
+    "",
+    "redis://127.0.0.1:6380/0",          # arg7: metadata_url -> Store-RS metadata (required)
+    stable_id="py-store-a",
+    labels={"pool": "pool-a", "storage": "true"},
+    transport_backend="classic_te",
+)
+
+store.put("hello", b"world")
+assert store.get("hello") == b"world"
+
+config = ReplicateConfig(replica_num=2, prefer_local=True)
+store.put("replicated", b"payload", config=config)
+```
+
+Use the host allocator when the application wants stable registered buffers:
+
+```python
+from mooncake.store import MooncakeHostMemAllocator
+
+allocator = MooncakeHostMemAllocator(use_hugepage=True, hugepage_size="2MB")
+ptr = allocator.alloc(2 * 1024 * 1024)
+allocator.free(ptr)
+```
+
+If hugepage mode is requested, the kernel must already have compatible hugepages reserved.
+
+For Python APIs and configuration details, read `docs/python.md`.
+
+## Configuration Notes
+
+For the complete configuration reference, read `docs/configuration.md`.
+
+### Metadata backends
+
+| Backend | Purpose | Status |
+|--------|---------|--------|
+| `RedisMetadataBackend` | Leases, segments, route persistence, e2e defaults | Recommended for local runs |
+| `EtcdMetadataBackend` | Store metadata on etcd | Supported |
+| `InMemoryMetadataBackend` | Unit tests and local-only testing | Test-only |
+
+If `metadata_url` (arg7) is an etcd URL, the Transfer Engine still needs its own metadata at arg2: pass `P2PHANDSHAKE` (the default; only `classic_te` accepts it) or a `redis://...` URL. The `tent` backend always requires `redis://...`.
+
+For Redis authentication, use URL-embedded credentials or set `MC_REDIS_PASSWORD`; set `MC_REDIS_USERNAME` as well when Redis ACLs require a named user. Environment variables are preferred for passwords that contain URL-reserved characters such as `@`.
+
+### Port roles
+
+| Knob | Used by | Meaning |
+|------|---------|---------|
+| `transport_rpc_port` / backend `rpc_server_port` | real mode | selected backend TCP data-plane listen port; peer real clients use it for cross-host reads and writes |
+| `client_server_address` | dummy mode | standalone compatibility gRPC endpoint used by `setup_dummy(...)` |
+| `metrics_addr` | all modes | HTTP `/metrics` endpoint |
+
+`client_server_address` is not part of the real data path. Real clients create their own transport runtime inside the calling process and publish `local_hostname + transport_rpc_port` to peers.
+
+For single-host demos, leaving `transport_rpc_port` unset keeps the old random-port behavior. For cross-host or cross-container deployments, set a fixed `transport_rpc_port` and make sure that port is reachable from peer nodes.
+
+The Python compatibility layer also accepts `local_hostname` in `host:port` form. When a port is embedded there, the wrapper normalizes it into `transport_rpc_port` automatically. If both are supplied and disagree, setup fails fast instead of silently publishing a broken real-mode endpoint.
+
+### Route control modes
+
+| Mode | Description | Default |
+|------|-------------|---------|
+| `EmbeddedWrh` | Client-side weighted rendezvous chooses route owners and keeps route lookups off the metadata hot path | Yes |
+| `MetadataOnly` | Object routes are read and written directly from the metadata backend | No |
+
+In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `build(...)` and refreshes it in the background. Normal request paths reuse that shared snapshot instead of performing on-demand metadata refreshes. Read paths keep `Draining` owners readable for handoff, fail fast on suspect or offline owners after remote failures, and best-effort prune unreadable replicas from stale routes when fallback succeeds. Suspect owners are not trusted again just because a local timer expires; they recover only after the membership snapshot observes a fresh lease heartbeat or a new control-plane endpoint.
+
+## Observability
+
+### Tracing
+
+- `MC_STORE_RS_TRACE=1`
+- `MC_STORE_RS_TRACE_FILTER=info` or any `tracing_subscriber` filter string; `mooncake-store-client --trace-filter ...` overrides the environment value
+- span close lines such as `close time.busy=...` are suppressed by default; set `MC_STORE_RS_TRACE_SPAN_EVENTS=close` only when you need synthetic span-close timing
+- Python real clients auto-initialize Rust tracing before `setup(...)` when `MC_STORE_RS_TRACE=1`
+- `mooncake-store-bench` uses its own tracing init, writes to `stderr` by default, and falls back to `info` when neither `--trace-filter`, `MC_STORE_RS_TRACE_FILTER`, nor `RUST_LOG` is set
+- use `MC_BENCH_TRACE_FILE=/path/to/bench.log` for bench logs; keep `MC_STORE_RS_TRACE_FILE` for standalone-client and Python real-client logging
+- bench disables tracing span-close events so hot-path `close time.busy=...` noise does not flood benchmark output
+- Jaeger profiling uses OTLP HTTP: set `MC_STORE_RS_OTLP_ENDPOINT=http://jaeger.observability.svc.cluster.local:4318`; keep `MC_STORE_RS_OTLP_TRACE` unset or `0` for a disabled startup
+- local profiling can write JSONL spans with `MC_STORE_RS_TRACE_JSONL_FILE=/tmp/store-rs.trace.jsonl` or `/tracing?file=...`
+- set `MC_STORE_RS_OTLP_SAMPLE_RATIO=0.05`, or pass `sample_ratio=0.05` before enabling, when profiling high-throughput bench traffic through memory-backed Jaeger
+- when `/metrics` is enabled, use `/tracing`, `/tracing/on`, `/tracing/off`, and `/tracing/flush` on that same HTTP server to inspect and dynamically switch OTLP profiling
+
+### Metrics
+
+- `MC_STORE_RS_METRICS_ADDR=127.0.0.1:9090`
+- Python real clients auto-start the in-process `/metrics` endpoint after `setup(...)` when `MC_STORE_RS_METRICS_ADDR` is set
+- `render_prometheus_metrics()` returns a text snapshot
+- `start_metrics_http_server()` exposes `/metrics`, `/stats`, `/healthz`, and `/tracing`
+- host-level CPU, disk, and network remain the responsibility of `node_exporter` / `cAdvisor`
+
+## Documentation Index
+
+- `README.md` — project entry and first run
+- `docs/deployment.md` — environment setup, local scripts, and deployment roles
+- `docs/bench.md` — standalone benchmark / verify / soak tool
+- `docs/rust.md` — Rust integration and API usage
+- `docs/configuration.md` — builder defaults, request policies, labels, and environment variables
+- `docs/components.md` — component guide
+- `docs/features.md` — feature-by-feature capability guide
+- `docs/architecture.md` — runtime architecture and request paths
+- `docs/python.md` — Python usage and compatibility notes
+
+## Workspace Layout
+
+```text
+crates/
+  mooncake-store-core/      Shared types, identities, routes, lifecycle, traits
+  mooncake-metadata/        Redis, etcd, and in-memory metadata backends
+  mooncake-store-client/    Client API, routing, allocation, control plane, transport glue
+  mooncake-store-py/        Python compatibility bindings
+  mooncake-store-e2e/       End-to-end validation and benchmarks
+  mooncake-transport/       Safe Rust wrapper around Mooncake TE/TENT
+  mooncake-transport-sys/   Native FFI and upstream Mooncake build integration
+python/
+  mooncake/                 Python convenience package
+scripts/
+  format.sh                 Unified Rust/Python formatter plus Rust clippy gate
+  run-all-tests.sh            Unified scripts regression runner for CI and local use
+  build/                    Wheel, coverage, and packaging helpers
+  clients/                  Real-mode and dummy-mode black-box validators
+  e2e/                      Generic local compatibility and stress runners
+  lib/                      Shared shell bootstrap helpers for script entrypoints
+  tests/client/             Standalone client CLI regressions
+  tests/rolling/            Rolling-upgrade and rollback regressions
+third_party/
+  Mooncake/                 Upstream Mooncake submodule
+```
+
+## Unified Script Runner
+
+Use the unified shell-based regression runner to execute every discovered test
+entrypoint under `scripts/` in one pass:
+
+```bash
+./scripts/run-all-tests.sh
+```
+
+Useful variants:
+
+```bash
+./scripts/run-all-tests.sh --list
+./scripts/run-all-tests.sh --include rolling
+```
+
+## Formatting
+
+Format and lint the repository before every commit:
+
+```bash
+./scripts/format.sh
+```
+
+Check formatting without modifying files:
+
+```bash
+./scripts/format.sh --check
+```
+
+Enable the repository pre-commit hook in your local clone:
+
+```bash
+git config core.hooksPath scripts/lib/git-hooks
+chmod +x scripts/format.sh scripts/lib/git-hooks/pre-commit
+```
+
+Python formatting uses `ruff` when available and falls back to `black`.
+Rust checks run `cargo fmt --all` followed by `cargo clippy --workspace --lib --bins -- -D warnings`.
+Install the recommended formatter tooling with:
+
+```bash
+python3 -m pip install -e '.[dev]'
+```
+
+## Status
+
+The repository includes automated coverage for:
+
+- single put/get
+- batch put/get
+- registered-buffer and multi-buffer I/O
+- request-level replication policy
+- overwrite reclaim and delete reclaim
+- routed remote writes
+- multi-tenant operation
+- dynamic membership, elastic segment changes, and hot-upgrade handoff with payload preservation

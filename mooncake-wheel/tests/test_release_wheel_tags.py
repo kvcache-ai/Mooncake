@@ -16,6 +16,7 @@ detected glibc a constant of the image instead of a property of the runner. See
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -36,10 +37,6 @@ ARCH_CONTAINER = {
     "aarch64": re.compile(r"^pytorch/manylinuxaarch64-builder:cuda\d+\.\d+$"),
     "x86_64": re.compile(r"^pytorch/manylinux2_28-builder:cuda\d+\.\d+$"),
 }
-
-
-def _runner_arch(runner: str) -> str:
-    return "aarch64" if runner.endswith("-arm") else "x86_64"
 
 
 def _find_workflows_dir() -> Path | None:
@@ -76,6 +73,29 @@ def _collect_build_jobs() -> list:
 
 
 BUILD_JOBS = _collect_build_jobs()
+SHARED_WORKFLOW = yaml.load(
+    (WORKFLOWS_DIR / SHARED_BUILD_WORKFLOW).read_text(), Loader=yaml.BaseLoader
+)
+
+
+def _profile_value(expression: str, architecture: str, variant: str) -> str:
+    """Evaluate the shared workflow's string/boolean profile expressions."""
+    source = expression.strip().removeprefix("${{").removesuffix("}}")
+    source = source.replace("inputs.architecture", repr(architecture))
+    source = source.replace("inputs.variant", repr(variant))
+    source = source.replace("&&", " and ").replace("||", " or ").strip()
+    tree = ast.parse(f"({source})", mode="eval")
+    allowed = (
+        ast.Expression,
+        ast.BoolOp,
+        ast.And,
+        ast.Or,
+        ast.Compare,
+        ast.Eq,
+        ast.Constant,
+    )
+    assert all(isinstance(node, allowed) for node in ast.walk(tree)), expression
+    return eval(compile(tree, "<wheel-profile>", "eval"), {"__builtins__": {}})
 
 
 def test_shared_build_workflow_still_has_callers() -> None:
@@ -91,12 +111,23 @@ def test_shared_build_workflow_still_has_callers() -> None:
 
 
 @pytest.mark.parametrize("with_block", BUILD_JOBS)
-def test_wheel_build_pins_glibc_floor_to_a_container(with_block: dict) -> None:
-    runner = str(with_block.get("runner", ""))
-    container = with_block.get("container", "")
-    arch = _runner_arch(runner)
+def test_callers_use_shared_build_inputs(with_block: dict) -> None:
+    declared_inputs = SHARED_WORKFLOW["on"]["workflow_call"]["inputs"]
+    assert set(with_block) <= set(declared_inputs)
+
+
+@pytest.mark.parametrize("architecture", ["x86_64", "arm64"])
+@pytest.mark.parametrize("variant", ["cuda", "cuda13", "non-cuda"])
+def test_wheel_build_pins_glibc_floor_to_a_container(
+    architecture: str, variant: str
+) -> None:
+    job = SHARED_WORKFLOW["jobs"]["build"]
+    runner = _profile_value(job["runs-on"], architecture, variant)
+    container = _profile_value(job["container"], architecture, variant)
+    arch = "aarch64" if architecture == "arm64" else architecture
     expected = ARCH_CONTAINER[arch]
 
+    assert runner.endswith("-arm") == (arch == "aarch64"), runner
     assert container, (
         "job builds wheels on a bare runner, so its manylinux tag "
         "follows the runner's glibc and drifts when GitHub bumps the image; "
@@ -107,11 +138,6 @@ def test_wheel_build_pins_glibc_floor_to_a_container(with_block: dict) -> None:
         f"for {arch} (runner {runner!r}); expected one matching "
         f"{expected.pattern}"
     )
-    # sbsa-* makes _build-wheel.yaml install the CUDA toolkit with apt, which
-    # the AlmaLinux-based manylinux image does not have. Any other value
-    # ('container', 'none') keeps the build inside the image.
-    cuda = str(with_block.get("cuda", ""))
-    assert not cuda.startswith("sbsa-"), (
-        f"cuda is {cuda!r}; a job pinned to a manylinux container cannot "
-        "install CUDA via the host package manager"
-    )
+    # Toolchains belong to the selected image; host-side sbsa installers would
+    # require the Debian package manager inside an AlmaLinux manylinux image.
+    assert "sbsa-" not in str(job["steps"])

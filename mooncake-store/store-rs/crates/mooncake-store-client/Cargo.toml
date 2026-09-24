@@ -1,0 +1,56 @@
+[package]
+name = "mooncake-store-client"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+gds = []
+# Opt-in dynamic link to the KVCS public C ABI. The vendor SDK stays outside Cargo's dependency
+# graph and is validated by build.rs only when this feature is enabled.
+kvcs-capi = []
+nof-spdk = []
+
+[dependencies]
+libc = "0.2"
+io-uring = "0.7"
+mooncake-store-core           = { path = "../mooncake-store-core" }
+mooncake-store-route          = { path = "../mooncake-store-route" }
+mooncake-store-transport-core = { path = "../mooncake-store-transport-core" }
+mooncake-transport            = { path = "../mooncake-transport" }
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+tonic = { version = "0.12", features = ["transport"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+is-terminal = "0.4.17"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
+
+[dev-dependencies]
+mooncake-metadata         = { path = "../mooncake-metadata" }
+mooncake-store-test-utils = { path = "../mooncake-store-test-utils" }
+proptest                  = "1"
+criterion                 = { version = "0.5", features = ["html_reports"] }
+
+# Multi-tenant isolation perf benches: compare client behaviour with the
+# multi-tenant feature stack disabled (single tenant, default scope, no admin
+# tenant policy installed) vs enabled (multiple tenants, non-default scope,
+# admin-installed quota policy).  Used as a regression gate.
+[[bench]]
+name = "multi_tenant_perf"
+harness = false
+
+[lints]
+workspace = true

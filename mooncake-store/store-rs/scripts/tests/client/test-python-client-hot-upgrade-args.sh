@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
+# where the git toplevel is the enclosing repository rather than this tree.
+[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store/store-rs"
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/scripts/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/tests/client/test-python-client-hot-upgrade-args.sh
+
+Verify Python hot-upgrade startup argument handling for both the native PyO3
+binding and the pure-Python wrapper compatibility path.
+
+Environment:
+  MOONCAKE_UPSTREAM_DIR       Mooncake upstream submodule path
+  MOONCAKE_UPSTREAM_BUILD_DIR Explicit upstream build directory override
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+mc_scripts_require_command cargo
+mc_scripts_require_command python3
+UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
+mc_scripts_setup_upstream_runtime_env "${REPO_ROOT}" none "${UPSTREAM_BUILD_DIR}"
+
+cd "${REPO_ROOT}"
+
+echo "==> testing Python native setup hot-upgrade parsers"
+cargo test -p mooncake-store-py python_setup_parsers
+
+echo "==> testing Python wrapper forwarding compatibility"
+REPO_ROOT="${REPO_ROOT}" python3 - <<'PY'
+import importlib.util
+import os
+import pathlib
+import sys
+import threading
+import types
+
+repo_root = pathlib.Path(os.environ["REPO_ROOT"])
+package_dir = repo_root / "python" / "mooncake_store_rs"
+
+pkg = types.ModuleType("mooncake_store_rs")
+pkg.__path__ = [str(package_dir)]
+sys.modules["mooncake_store_rs"] = pkg
+
+runtime = types.ModuleType("mooncake_store_rs._runtime")
+runtime.package_dir = lambda: package_dir
+runtime.preload_native_libraries = lambda root: None
+sys.modules["mooncake_store_rs._runtime"] = runtime
+
+native = types.ModuleType("mooncake_store_rs._store_rs")
+native.MooncakeDistributedStore = lambda: object()
+native.MooncakeHostMemAllocator = lambda *args, **kwargs: None
+trace_state = {"filters": []}
+def init_tracing(trace_filter=None):
+    trace_state["filters"].append(trace_filter)
+    return 0
+native.init_tracing = init_tracing
+native.metrics_text = lambda: ""
+metrics_state = {"address": None, "starts": []}
+def start_metrics_server(bind_addr="127.0.0.1:0"):
+    metrics_state["starts"].append(bind_addr)
+    metrics_state["address"] = bind_addr
+    return bind_addr
+native.start_metrics_server = start_metrics_server
+native.stop_metrics_server = lambda: None
+native.metrics_server_address = lambda: metrics_state["address"]
+sys.modules["mooncake_store_rs._store_rs"] = native
+
+spec = importlib.util.spec_from_file_location("mooncake_store_rs.store", package_dir / "store.py")
+module = importlib.util.module_from_spec(spec)
+sys.modules["mooncake_store_rs.store"] = module
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+class FakeWorker:
+    def __init__(self):
+        self.calls = []
+
+    def call(self, name, *args, **kwargs):
+        self.calls.append((name, args, kwargs))
+        return 0
+
+store = module.MooncakeDistributedStore.__new__(module.MooncakeDistributedStore)
+store._worker = FakeWorker()
+store._lock = threading.RLock()
+store._registered_buffers = {}
+store._tracked_keys = set()
+
+store.setup(
+    "127.0.0.1",
+    "P2PHANDSHAKE",
+    1024,
+    512,
+    stable_id="py-store-a",
+    initial_state="standby",
+)
+name, args, kwargs = store._worker.calls.pop()
+assert name == "setup"
+assert kwargs["stable_id"] == "py-store-a"
+assert "epoch" not in kwargs
+assert kwargs["initial_state"] == "standby"
+
+store.setup(
+    "127.0.0.1",
+    "P2PHANDSHAKE",
+    1024,
+    512,
+    stable_id="py-store-b",
+    state="draining",
+)
+name, args, kwargs = store._worker.calls.pop()
+assert kwargs["stable_id"] == "py-store-b"
+assert kwargs["initial_state"] == "draining"
+assert "state" not in kwargs
+
+store.setup(
+    "127.0.0.1:17111",
+    "P2PHANDSHAKE",
+    1024,
+    512,
+    stable_id="py-store-port-a",
+)
+name, args, kwargs = store._worker.calls.pop()
+assert args[0] == "127.0.0.1"
+assert kwargs["transport_rpc_port"] == 17111
+
+store.setup(
+    {
+        "local_hostname": "127.0.0.1",
+        "transport_metadata_url": "P2PHANDSHAKE",
+        "metadata_url": "redis://127.0.0.1:6379/0",
+        "stable_id": "py-store-c",
+        "initial_state": "standby",
+        "global_segment_size": 2048,
+        "local_buffer_size": 1024,
+    }
+)
+name, args, kwargs = store._worker.calls.pop()
+assert name == "setup"
+assert kwargs["stable_id"] == "py-store-c"
+assert "epoch" not in kwargs
+assert kwargs["initial_state"] == "standby"
+
+store.setup(
+    {
+        "local_hostname": "127.0.0.1",
+        "metadata_server": "P2PHANDSHAKE",
+        "master_server": "redis://127.0.0.1:6379/0",
+        "stable_id": "py-store-d",
+        "state": "offline",
+    }
+)
+name, args, kwargs = store._worker.calls.pop()
+assert kwargs["stable_id"] == "py-store-d"
+assert "epoch" not in kwargs
+assert kwargs["initial_state"] == "offline"
+
+store.setup(
+    {
+        "local_hostname": "node-a:17112",
+        "metadata_server": "P2PHANDSHAKE",
+        "master_server": "redis://127.0.0.1:6379/0",
+        "stable_id": "py-store-e",
+    }
+)
+name, args, kwargs = store._worker.calls.pop()
+assert args[0] == "node-a"
+assert kwargs["transport_rpc_port"] == 17112
+
+setup_env_vars = [
+    "MC_STORE_RS_STABLE_ID",
+    "MC_STORE_RS_INITIAL_STATE",
+    "MC_STORE_RS_TENANT",
+    "MC_STORE_RS_ROUTED_WRITES",
+    "MC_STORE_RS_REPLICA_COUNT",
+    "MC_STORE_RS_ROUTE_TOPK",
+    "MC_STORE_RS_KEYSPACE",
+    "MC_STORE_RS_TRANSPORT_RPC_PORT",
+    "MC_STORE_RS_TRANSPORT_BACKEND",
+    "MC_STORE_RS_LOCAL_SEGMENT_NAME",
+    "MC_STORE_RS_EXPIRES_AT_MS",
+    "MC_STORE_RS_ROUTE_CONTROL",
+    "MC_STORE_RS_LABELS",
+]
+
+def clear_setup_env():
+    for env_name in setup_env_vars:
+        os.environ.pop(env_name, None)
+
+try:
+    clear_setup_env()
+    os.environ.update(
+        {
+            "MC_STORE_RS_STABLE_ID": "env-store",
+            "MC_STORE_RS_INITIAL_STATE": "standby",
+            "MC_STORE_RS_TENANT": "tenant-env",
+            "MC_STORE_RS_ROUTED_WRITES": "1",
+            "MC_STORE_RS_REPLICA_COUNT": "3",
+            "MC_STORE_RS_ROUTE_TOPK": "5",
+            "MC_STORE_RS_KEYSPACE": "env/keyspace",
+            "MC_STORE_RS_TRANSPORT_RPC_PORT": "17113",
+            "MC_STORE_RS_TRANSPORT_BACKEND": "classic_te",
+            "MC_STORE_RS_LOCAL_SEGMENT_NAME": "env-segment",
+            "MC_STORE_RS_EXPIRES_AT_MS": "12345",
+            "MC_STORE_RS_ROUTE_CONTROL": "embedded_wrh",
+            "MC_STORE_RS_LABELS": "pool=env,storage=false",
+        }
+    )
+    store.setup(
+        "127.0.0.1",
+        "P2PHANDSHAKE",
+        0,
+        512,
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert kwargs["stable_id"] == "env-store"
+    assert "epoch" not in kwargs
+    assert kwargs["initial_state"] == "standby"
+    assert kwargs["tenant"] == "tenant-env"
+    assert kwargs["routed_writes"] is True
+    assert kwargs["replica_count"] == 3
+    assert kwargs["route_topk"] == 5
+    assert kwargs["keyspace"] == "env/keyspace"
+    assert kwargs["transport_rpc_port"] == 17113
+    assert kwargs["transport_backend"] == "classic_te"
+    assert kwargs["local_segment_name"] == "env-segment"
+    assert kwargs["expires_at_ms"] == 12345
+    assert kwargs["route_control"] == "embedded_wrh"
+    assert kwargs["labels"] == {"pool": "env", "storage": "false"}
+
+    os.environ["MC_STORE_RS_LABELS"] = '{"pool": "json", "storage": "true"}'
+    store.setup(
+        {
+            "local_hostname": "127.0.0.1",
+            "metadata_server": "P2PHANDSHAKE",
+            "master_server": "redis://127.0.0.1:6379/0",
+            "state": "offline",
+            "rpc_server_port": 17114,
+            "labels": {"pool": "explicit"},
+        }
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert kwargs["initial_state"] == "offline"
+    assert kwargs["transport_rpc_port"] == 17114
+    assert kwargs["labels"] == {"pool": "explicit"}
+    assert kwargs["route_topk"] == 5
+finally:
+    clear_setup_env()
+
+try:
+    clear_setup_env()
+    os.environ["MC_STORE_RS_KEYSPACE"] = "dummy/env-keyspace"
+    store.setup_dummy(64 * 1024 * 1024, 16 * 1024 * 1024, "127.0.0.1:16590")
+    name, args, kwargs = store._worker.calls.pop()
+    assert name == "setup_dummy"
+    assert kwargs["keyspace"] == "dummy/env-keyspace"
+    assert kwargs["worker_scope"] is None
+
+    store.setup_dummy(
+        64 * 1024 * 1024,
+        16 * 1024 * 1024,
+        "127.0.0.1:16590",
+        keyspace="dummy/explicit",
+        worker_scope="dummy-scope",
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert kwargs["keyspace"] == "dummy/explicit"
+    assert kwargs["worker_scope"] == "dummy-scope"
+finally:
+    clear_setup_env()
+
+os.environ["MC_STORE_RS_METRICS_ADDR"] = "127.0.0.1:19090"
+try:
+    store.setup(
+        "127.0.0.1",
+        "P2PHANDSHAKE",
+        1024,
+        512,
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert metrics_state["starts"] == ["127.0.0.1:19090"]
+
+    store.setup(
+        {
+            "local_hostname": "127.0.0.1",
+            "metadata_server": "P2PHANDSHAKE",
+            "master_server": "redis://127.0.0.1:6379/0",
+        }
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert metrics_state["starts"] == ["127.0.0.1:19090"]
+finally:
+    os.environ.pop("MC_STORE_RS_METRICS_ADDR", None)
+    metrics_state["address"] = None
+    metrics_state["starts"].clear()
+
+os.environ["MC_STORE_RS_TRACE"] = "1"
+os.environ["MC_STORE_RS_TRACE_FILTER"] = "info,mooncake_store_client::client=debug"
+try:
+    store.setup(
+        "127.0.0.1",
+        "P2PHANDSHAKE",
+        1024,
+        512,
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert trace_state["filters"] == ["info,mooncake_store_client::client=debug"]
+finally:
+    os.environ.pop("MC_STORE_RS_TRACE", None)
+    os.environ.pop("MC_STORE_RS_TRACE_FILTER", None)
+    trace_state["filters"].clear()
+
+os.environ["MC_STORE_RS_TRACE_FILE"] = "/tmp/mooncake-real-client.log"
+try:
+    store.setup(
+        "127.0.0.1",
+        "P2PHANDSHAKE",
+        1024,
+        512,
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert trace_state["filters"] == [None]
+finally:
+    os.environ.pop("MC_STORE_RS_TRACE_FILE", None)
+    trace_state["filters"].clear()
+
+try:
+    store.setup(
+        "127.0.0.1:17111",
+        "P2PHANDSHAKE",
+        1024,
+        512,
+        transport_rpc_port=17112,
+    )
+except ValueError:
+    pass
+else:
+    raise AssertionError("conflicting transport ports should be rejected")
+PY

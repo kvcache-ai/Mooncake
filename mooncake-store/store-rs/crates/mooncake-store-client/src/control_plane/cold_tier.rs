@@ -1,0 +1,560 @@
+use super::codec::{
+    decode_error, ensure_batch_len, pb_object_route, pb_runtime_id, try_object_route,
+};
+use super::cold_tier_codec::pb_cold_backing_route;
+use super::*;
+use crate::observability::OperationTracker;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ColdTierFreeResult {
+    pub attempted_victims: usize,
+    pub freed_backings: usize,
+    pub collected_backings: usize,
+    pub skipped_backings: usize,
+    pub reached_low_watermark: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ColdTierProbeResult {
+    pub device_id: String,
+    pub capacity_bytes: Option<u64>,
+    pub used_bytes: u64,
+    pub reserved_bytes: u64,
+    pub schedulable: bool,
+    pub state: String,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ColdReadResult {
+    pub segment_name: String,
+    pub segment_offset: u64,
+    pub length: u64,
+    pub checksum: Option<u64>,
+    pub target_chunks: Vec<SegmentTargetChunk>,
+    pub transport_endpoint: Option<String>,
+    pub transport_segment_descriptor: Option<String>,
+    pub admission_wait_us: u64,
+    pub ssd_read_us: u64,
+    pub memcpy_us: u64,
+    pub route_update_us: u64,
+    pub total_promote_us: u64,
+}
+
+pub(crate) struct ColdReadResponse {
+    pub result: Result<ColdReadResult>,
+    pub deferred_promote: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ColdReclaimResult {
+    pub removed_cold_payload: bool,
+    pub removed_pending_source: bool,
+    pub skipped_still_referenced: bool,
+}
+
+pub(crate) struct ColdReadTarget {
+    pub tenant: String,
+    pub key: String,
+    pub domain: String,
+    pub object_set: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedNofRouteAction {
+    Prepare,
+    Publish,
+    Release,
+}
+
+pub(crate) trait ColdTierControlService: Send + Sync {
+    fn trigger_offload(&self, max_tasks: usize) -> Result<usize>;
+
+    fn manual_gc(&self, device_id: &str, max_backings: usize) -> Result<usize>;
+
+    fn manual_free(&self, device_id: &str, max_victims: usize) -> Result<ColdTierFreeResult>;
+
+    fn probe_device(&self, device_id: &str) -> Result<ColdTierProbeResult>;
+
+    fn read_from_cold(
+        &self,
+        namespace: &str,
+        authority: &str,
+        tenant: &str,
+        key: &str,
+        domain: &str,
+        object_set: &str,
+    ) -> ColdReadResponse;
+
+    fn batch_read_from_cold(
+        &self,
+        namespace: &str,
+        authority: &str,
+        targets: Vec<ColdReadTarget>,
+    ) -> Vec<ColdReadResponse> {
+        targets
+            .into_iter()
+            .map(|target| {
+                self.read_from_cold(
+                    namespace,
+                    authority,
+                    &target.tenant,
+                    &target.key,
+                    &target.domain,
+                    &target.object_set,
+                )
+            })
+            .collect()
+    }
+
+    fn ack_cold_read_complete(&self, slots: &[(SegmentName, u64)]);
+
+    fn batch_reclaim_cold_backings(
+        &self,
+        namespace: &str,
+        authority: &str,
+        route_key: ObjectKey,
+        cold_backings: Vec<mooncake_store_core::ColdBackingRoute>,
+    ) -> Vec<Result<ColdReclaimResult>>;
+
+    fn accept_nof_owner_snapshot(
+        &self,
+        target_id: String,
+        from: ClientRuntimeId,
+        to: ClientRuntimeId,
+        routes: Vec<ObjectRoute>,
+    ) -> Result<usize>;
+
+    fn manage_nof_backing(
+        &self,
+        target_id: String,
+        action: ManagedNofRouteAction,
+        route: ObjectRoute,
+        length: u64,
+        checksum: Option<u64>,
+    ) -> Result<ObjectRoute>;
+
+    fn pin_for_read(&self, _slots: &[(SegmentName, u64)]) -> u64 {
+        0
+    }
+}
+
+pub(crate) struct UnsupportedColdTierControlService;
+
+impl ColdTierControlService for UnsupportedColdTierControlService {
+    fn trigger_offload(&self, _max_tasks: usize) -> Result<usize> {
+        Err(StoreError::Unsupported(
+            "cold tier offload trigger is not wired yet".to_string(),
+        ))
+    }
+
+    fn manual_gc(&self, _device_id: &str, _max_backings: usize) -> Result<usize> {
+        Err(StoreError::Unsupported(
+            "cold tier manual GC is not wired yet".to_string(),
+        ))
+    }
+
+    fn manual_free(&self, _device_id: &str, _max_victims: usize) -> Result<ColdTierFreeResult> {
+        Err(StoreError::Unsupported(
+            "cold tier manual free is not wired yet".to_string(),
+        ))
+    }
+
+    fn probe_device(&self, _device_id: &str) -> Result<ColdTierProbeResult> {
+        Err(StoreError::Unsupported(
+            "cold tier device probe is not wired yet".to_string(),
+        ))
+    }
+
+    fn read_from_cold(
+        &self,
+        _namespace: &str,
+        _authority: &str,
+        _tenant: &str,
+        _key: &str,
+        _domain: &str,
+        _object_set: &str,
+    ) -> ColdReadResponse {
+        ColdReadResponse {
+            result: Err(StoreError::Unsupported(
+                "cold tier read control is not wired yet".to_string(),
+            )),
+            deferred_promote: None,
+        }
+    }
+
+    fn ack_cold_read_complete(&self, _slots: &[(SegmentName, u64)]) {}
+
+    fn batch_reclaim_cold_backings(
+        &self,
+        _namespace: &str,
+        _authority: &str,
+        _route_key: ObjectKey,
+        cold_backings: Vec<mooncake_store_core::ColdBackingRoute>,
+    ) -> Vec<Result<ColdReclaimResult>> {
+        cold_backings
+            .into_iter()
+            .map(|_| {
+                Err(StoreError::Unsupported(
+                    "cold tier reclaim control is not wired yet".to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    fn accept_nof_owner_snapshot(
+        &self,
+        _target_id: String,
+        _from: ClientRuntimeId,
+        _to: ClientRuntimeId,
+        _routes: Vec<ObjectRoute>,
+    ) -> Result<usize> {
+        Err(StoreError::Unsupported(
+            "NoF owner snapshot transfer is not wired yet".to_string(),
+        ))
+    }
+
+    fn manage_nof_backing(
+        &self,
+        _target_id: String,
+        _action: ManagedNofRouteAction,
+        _route: ObjectRoute,
+        _length: u64,
+        _checksum: Option<u64>,
+    ) -> Result<ObjectRoute> {
+        Err(StoreError::Unsupported(
+            "managed NoF route control is not wired yet".to_string(),
+        ))
+    }
+}
+
+impl ControlPlaneClient {
+    #[allow(dead_code)]
+    pub(crate) fn trigger_cold_tier_offload(
+        &self,
+        lease: &ClientLease,
+        max_tasks: u64,
+    ) -> Result<u64> {
+        let tracker = OperationTracker::new("control_cold_tier_offload_trigger");
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let request = pb::TriggerColdTierOffloadRequest { max_tasks };
+            let reply = self.rpc(
+                move |mut client| async move {
+                    client
+                        .trigger_cold_tier_offload(Request::new(request))
+                        .await
+                },
+                channel,
+            )?;
+            decode_error(reply.error)?;
+            Ok(reply.materialized)
+        })();
+        tracker.finish(&result, result.as_ref().copied().unwrap_or_default());
+        result
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn manual_cold_tier_gc(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+        max_backings: u64,
+    ) -> Result<u64> {
+        let tracker = OperationTracker::new("control_cold_tier_manual_gc");
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let request = pb::ManualColdTierGcRequest {
+                device_id: device_id.to_string(),
+                max_backings,
+            };
+            let reply =
+                self.rpc(
+                    move |mut client| async move {
+                        client.manual_cold_tier_gc(Request::new(request)).await
+                    },
+                    channel,
+                )?;
+            decode_error(reply.error)?;
+            Ok(reply.collected)
+        })();
+        tracker.finish(&result, result.as_ref().copied().unwrap_or_default());
+        result
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn manual_cold_tier_free(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+        max_victims: u64,
+    ) -> Result<pb::ManualColdTierFreeReply> {
+        let tracker = OperationTracker::new("control_cold_tier_manual_free");
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let request = pb::ManualColdTierFreeRequest {
+                device_id: device_id.to_string(),
+                max_victims,
+            };
+            let reply = self.rpc(
+                move |mut client| async move {
+                    client.manual_cold_tier_free(Request::new(request)).await
+                },
+                channel,
+            )?;
+            decode_error(reply.error.clone())?;
+            Ok(reply)
+        })();
+        tracker.finish(
+            &result,
+            result
+                .as_ref()
+                .map(|reply| reply.freed_backings)
+                .unwrap_or_default(),
+        );
+        result
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn probe_cold_tier_device(
+        &self,
+        lease: &ClientLease,
+        device_id: &str,
+    ) -> Result<pb::ProbeColdTierDeviceReply> {
+        let tracker = OperationTracker::new("control_cold_tier_probe_device");
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let request = pb::ProbeColdTierDeviceRequest {
+                device_id: device_id.to_string(),
+            };
+            let reply = self.rpc(
+                move |mut client| async move {
+                    client.probe_cold_tier_device(Request::new(request)).await
+                },
+                channel,
+            )?;
+            decode_error(reply.error.clone())?;
+            Ok(reply)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_from_cold(
+        &self,
+        lease: &ClientLease,
+        request: pb::ReadFromColdRequest,
+    ) -> Result<pb::ReadFromColdReply> {
+        let tracker = OperationTracker::new("control_read_from_cold");
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let reply = self.rpc(
+                move |mut client| async move { client.read_from_cold(Request::new(request)).await },
+                channel,
+            )?;
+            if reply.backpressure {
+                return Err(StoreError::Backpressure(
+                    "cold tier owner reported restore backpressure".to_string(),
+                ));
+            }
+            decode_error(reply.error.clone())?;
+            Ok(reply)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn batch_read_from_cold(
+        &self,
+        lease: &ClientLease,
+        request: pb::BatchReadFromColdRequest,
+    ) -> Result<pb::BatchReadFromColdReply> {
+        let tracker = OperationTracker::new("control_batch_read_from_cold");
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            self.rpc(
+                move |mut client| async move {
+                    client.batch_read_from_cold(Request::new(request)).await
+                },
+                channel,
+            )
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn batch_reclaim_cold_backings(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &str,
+        route_key: &ObjectKey,
+        cold_backings: &[mooncake_store_core::ColdBackingRoute],
+    ) -> Result<Vec<Result<ColdReclaimResult>>> {
+        let tracker = OperationTracker::new("control_batch_reclaim_cold_backings");
+        let expected = cold_backings.len();
+        let request = pb::BatchReclaimColdBackingsRequest {
+            namespace: namespace.to_string(),
+            authority: authority.to_string(),
+            cold_backings: cold_backings.iter().map(pb_cold_backing_route).collect(),
+            route_key: route_key.0.clone(),
+        };
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let reply = self.rpc(
+                move |mut client| async move {
+                    client
+                        .batch_reclaim_cold_backings(Request::new(request))
+                        .await
+                },
+                channel,
+            )?;
+            ensure_batch_len("batch_reclaim_cold_backings", expected, reply.results.len())?;
+            Ok(reply
+                .results
+                .into_iter()
+                .map(|reply| {
+                    decode_error(reply.error)?;
+                    Ok(ColdReclaimResult {
+                        removed_cold_payload: reply.removed_cold_payload,
+                        removed_pending_source: reply.removed_pending_source,
+                        skipped_still_referenced: reply.skipped_still_referenced,
+                    })
+                })
+                .collect())
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn transfer_nof_owner_snapshot(
+        &self,
+        lease: &ClientLease,
+        target_id: &str,
+        from: &ClientRuntimeId,
+        to: &ClientRuntimeId,
+        routes: Vec<ObjectRoute>,
+    ) -> Result<usize> {
+        let tracker = OperationTracker::new("control_transfer_nof_owner_snapshot");
+        let request = pb::TransferNofOwnerSnapshotRequest {
+            target_id: target_id.to_string(),
+            from: Some(pb_runtime_id(from)),
+            to: Some(pb_runtime_id(to)),
+            routes: routes.iter().map(pb_object_route).collect(),
+        };
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let reply = self.rpc(
+                move |mut client| async move {
+                    client
+                        .transfer_nof_owner_snapshot(Request::new(request))
+                        .await
+                },
+                channel,
+            )?;
+            decode_error(reply.error)?;
+            Ok(reply.route_count as usize)
+        })();
+        tracker.finish(
+            &result,
+            result
+                .as_ref()
+                .copied()
+                .unwrap_or_default()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
+        result
+    }
+
+    pub(crate) fn manage_nof_backing(
+        &self,
+        lease: &ClientLease,
+        target_id: &str,
+        action: ManagedNofRouteAction,
+        route: &ObjectRoute,
+        length: u64,
+        checksum: Option<u64>,
+    ) -> Result<ObjectRoute> {
+        let tracker = OperationTracker::new("control_manage_nof_backing");
+        let request = pb::ManageNofBackingRequest {
+            target_id: target_id.to_string(),
+            route: Some(pb_object_route(route)),
+            action: match action {
+                ManagedNofRouteAction::Prepare => pb::ManagedNofRouteAction::Prepare,
+                ManagedNofRouteAction::Publish => pb::ManagedNofRouteAction::Publish,
+                ManagedNofRouteAction::Release => pb::ManagedNofRouteAction::Release,
+            } as i32,
+            length,
+            checksum,
+        };
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let reply =
+                self.rpc(
+                    move |mut client| async move {
+                        client.manage_nof_backing(Request::new(request)).await
+                    },
+                    channel,
+                )?;
+            decode_error(reply.error)?;
+            reply
+                .route
+                .map(try_object_route)
+                .transpose()?
+                .ok_or_else(|| {
+                    StoreError::Transport("manage_nof_backing reply is missing route".to_string())
+                })
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn ack_cold_read_complete(
+        &self,
+        lease: &ClientLease,
+        segment_names: Vec<String>,
+        segment_offsets: Vec<u64>,
+    ) {
+        let Ok(channel) = self.channel_for(lease) else {
+            return;
+        };
+        let request = pb::AckColdReadCompleteRequest {
+            segment_names,
+            segment_offsets,
+        };
+        let request_timeout = self.request_timeout;
+        self.with_runtime(|runtime| {
+            runtime.spawn(async move {
+                let mut client =
+                    pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
+                let _ = tokio::time::timeout(
+                    request_timeout,
+                    client.ack_cold_read_complete(Request::new(request)),
+                )
+                .await;
+            });
+        });
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn pin_for_read(
+        &self,
+        lease: &ClientLease,
+        segment_names: Vec<String>,
+        segment_offsets: Vec<u64>,
+    ) -> Result<u64> {
+        let channel = self.channel_for(lease)?;
+        let request = pb::PinForReadRequest {
+            segment_names,
+            segment_offsets,
+        };
+        let reply = self.rpc(
+            move |mut client| async move { client.pin_for_read(Request::new(request)).await },
+            channel,
+        )?;
+        Ok(reply.pinned)
+    }
+}

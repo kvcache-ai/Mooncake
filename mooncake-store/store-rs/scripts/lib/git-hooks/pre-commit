@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# scripts/lib/git-hooks/pre-commit
+#
+# Repository pre-commit hook. It formats tracked Rust and Python sources before
+# commit and aborts if that formatting changed the working tree.
+# ---------------------------------------------------------------------------
+
+HOOK_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(git -C "${HOOK_DIR}" rev-parse --show-toplevel)
+# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
+# where the git toplevel is the enclosing repository rather than this tree.
+[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store/store-rs"
+FORMATTER="${REPO_ROOT}/scripts/format.sh"
+
+if [[ ! -x "${FORMATTER}" ]]; then
+  echo "missing executable formatter: ${FORMATTER}" >&2
+  exit 1
+fi
+
+"${FORMATTER}"
+
+mapfile -t tracked_sources < <(git -C "${REPO_ROOT}" ls-files '*.rs' '*.py')
+
+if ((${#tracked_sources[@]} > 0)) && ! git -C "${REPO_ROOT}" diff --quiet -- "${tracked_sources[@]}"; then
+  cat >&2 <<'EOF'
+pre-commit formatter updated source files
+review and stage the formatting changes, then run git commit again
+EOF
+  exit 1
+fi

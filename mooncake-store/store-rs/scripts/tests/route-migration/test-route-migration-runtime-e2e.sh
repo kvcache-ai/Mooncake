@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
+# where the git toplevel is the enclosing repository rather than this tree.
+[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store/store-rs"
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/scripts/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/tests/route-migration/test-route-migration-runtime-e2e.sh
+
+Run the route-migration runtime/control-plane in-process E2E checks that belong
+to the runtime PR layer.
+
+This script intentionally stays below the admin/operator surface. It validates:
+
+- control-plane submit -> executor worker -> route publish
+- executor panic recovery for a subsequent task
+
+The host environment is expected to satisfy the repository-standard Rust build
+requirements.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+mc_scripts_require_command cargo
+mc_scripts_require_command python3
+
+UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
+mc_scripts_setup_upstream_runtime_env "${REPO_ROOT}" python "${UPSTREAM_BUILD_DIR}"
+export PYTHONDONTWRITEBYTECODE=1
+
+cd "${REPO_ROOT}"
+
+echo "==> route migration runtime e2e: explicit move through control plane"
+cargo test -p mooncake-store-client \
+  control_plane_submit_migration_task_executes_explicit_move \
+  -- --nocapture
+
+echo "==> route migration runtime e2e: worker survives panic and keeps serving"
+cargo test -p mooncake-store-client \
+  control_plane_submit_migration_task_recovers_after_executor_panic \
+  -- --nocapture
+
+echo "route migration runtime e2e ok"
