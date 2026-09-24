@@ -139,6 +139,12 @@ def test_ep_modules_have_one_authoritative_source() -> None:
         assert not legacy_test.exists()
 
 
+def test_pg_loader_has_one_authoritative_source() -> None:
+    assert (REPOSITORY_ROOT / "python" / "mooncake" / "pg.py").is_file()
+    assert (REPOSITORY_ROOT / "python" / "tests" / "pg" / "test_loader.py").is_file()
+    assert not (REPOSITORY_ROOT / "mooncake-wheel" / "mooncake" / "pg.py").exists()
+
+
 def test_cli_has_one_authoritative_source_and_test_location() -> None:
     package_root = REPOSITORY_ROOT / "python" / "mooncake"
     legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
@@ -183,7 +189,6 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
         "mooncake_store_service.py",
         "mooncake_connector_v1.py",
         "vllm_v1_proxy_server.py",
-        "pg.py",
         "structured_object_store.py",
         "dataproto_catalog.py",
     ):

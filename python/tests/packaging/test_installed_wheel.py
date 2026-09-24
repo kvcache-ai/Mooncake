@@ -5,6 +5,7 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
@@ -39,6 +40,8 @@ def test_wheel_imports_outside_the_repository(
 
     wheel = Path(wheel_value).resolve()
     assert wheel.is_file(), f"wheel does not exist: {wheel}"
+    with zipfile.ZipFile(wheel) as archive:
+        assert archive.namelist().count("mooncake/pg.py") == 1
 
     environment = tmp_path / "environment"
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
@@ -55,6 +58,7 @@ def test_wheel_imports_outside_the_repository(
 from importlib import import_module, metadata, util
 from pathlib import Path
 import sys
+from types import ModuleType
 import mooncake
 
 cli_modules = (
@@ -125,6 +129,20 @@ assert {{
     "mooncake/mooncake_ssd_unregister.py",
     "mooncake/spdk_tgt_create.py",
 }} <= installed_files
+
+assert "mooncake.pg" not in sys.modules
+assert "torch" not in sys.modules
+
+torch = ModuleType("torch")
+torch.__version__ = "2.7.1+cu128"
+sys.modules["torch"] = torch
+backend = ModuleType("mooncake.pg_2_7_1")
+backend.installed_wheel_marker = object()
+sys.modules[backend.__name__] = backend
+
+pg = import_module("mooncake.pg")
+assert Path(pg.__file__).resolve().parent == package_path.parent
+assert pg.installed_wheel_marker is backend.installed_wheel_marker
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],

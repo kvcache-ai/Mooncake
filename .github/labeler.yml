@@ -31,7 +31,10 @@ Transfer Engine:
 
 PyTorch Backend:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-pg/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-pg/**/*'
+      - 'python/mooncake/pg.py'
+      - 'python/tests/pg/**/*'
 
 Mooncake EP:
   - changed-files:

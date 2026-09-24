@@ -195,6 +195,7 @@ MIGRATED_PYTHON_MODULES=(
     ep.py
     mooncake_ep_buffer.py
     mooncake_elastic_buffer.py
+    pg.py
     _administration.py
     mooncake_ssd_register.py
     mooncake_ssd_unregister.py
