@@ -8,6 +8,8 @@ store:
     - any-glob-to-any-file:
       - 'mooncake-store/**/*'
       - 'python/mooncake/mooncake_store_service.py'
+      - 'python/mooncake/http_metadata_server.py'
+      - 'python/tests/services/test_http_metadata_server.py'
       - 'python/mooncake/async_store.py'
       - 'python/mooncake/cli.py'
       - 'python/mooncake/cli_client.py'
@@ -47,6 +49,7 @@ Installation:
   - changed-files:
     - any-glob-to-any-file:
       - 'mooncake-wheel/**/*'
+      - 'python/mooncake/http_metadata_server.py'
       - 'python/mooncake/cli.py'
       - 'python/mooncake/cli_client.py'
       - 'python/mooncake/cli_bench.py'

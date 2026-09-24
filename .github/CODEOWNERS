@@ -17,6 +17,7 @@
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
 /python/mooncake/mooncake_store_service.py @ykwd @stmatengss
 /python/tests/store/test_mooncake_store_service_api.py @ykwd @stmatengss
+/python/mooncake/http_metadata_server.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/async_store.py @ykwd @stmatengss @zxpdemonio
 /python/tests/store/async_store_integration.py @ykwd @stmatengss @zxpdemonio
 /python/tests/store/test_async_store.py @ykwd @stmatengss @zxpdemonio
@@ -26,6 +27,7 @@
 /python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
+/python/tests/services/test_http_metadata_server.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/cli.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/cli_client.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/cli_bench.py @ShangmingCai @alogfans @stmatengss

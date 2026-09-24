@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -72,7 +73,8 @@ struct LogicalTransferRuntimePolicy {
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
-    bool derived{false};                  // merged by other tasks
+    bool derived{false};  // merged by other tasks
+    size_t physical_owner_task_id{std::numeric_limits<size_t>::max()};
     int xport_priority{0};                // transport priority (for fallback)
     int failover_count{0};                // number of failover attempts
     int metadata_refresh_retry_count{0};  // same-transport stale-cache retries
@@ -112,6 +114,7 @@ struct TaskInfo {
         : type(other.type),
           sub_task_id(other.sub_task_id),
           derived(other.derived),
+          physical_owner_task_id(other.physical_owner_task_id),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
           metadata_refresh_retry_count(other.metadata_refresh_retry_count),
@@ -137,6 +140,7 @@ struct TaskInfo {
         : type(other.type),
           sub_task_id(other.sub_task_id),
           derived(other.derived),
+          physical_owner_task_id(other.physical_owner_task_id),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
           metadata_refresh_retry_count(other.metadata_refresh_retry_count),
@@ -163,6 +167,7 @@ struct TaskInfo {
             type = other.type;
             sub_task_id = other.sub_task_id;
             derived = other.derived;
+            physical_owner_task_id = other.physical_owner_task_id;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
             metadata_refresh_retry_count = other.metadata_refresh_retry_count;
@@ -194,6 +199,7 @@ struct TaskInfo {
             type = other.type;
             sub_task_id = other.sub_task_id;
             derived = other.derived;
+            physical_owner_task_id = other.physical_owner_task_id;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
             metadata_refresh_retry_count = other.metadata_refresh_retry_count;
@@ -223,6 +229,7 @@ struct TaskInfo {
 
 class TransferEngineImpl {
     friend class ProxyManager;
+    friend class TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 
    public:
@@ -304,8 +311,18 @@ class TransferEngineImpl {
 
     Status cancelTransfer(BatchID batch_id, size_t task_id);
 
+    // Tries every loaded notification transport in slot order. A transport
+    // whose channel is unavailable (endpoint down, no notify QP) is skipped
+    // for the next one, and when all are, the notification goes over the
+    // control-plane RPC the peer answers bootstrap on. Any other error is
+    // returned as is. notification/rpc_fallback=false restores the
+    // first-transport-only behavior.
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 
+    // Drains every loaded notification transport plus the in-process queue,
+    // so a notification lands with the caller no matter which path carried
+    // it. Order is kept within one path only: in a poll, notifications that
+    // took the RPC fallback come after the ones the notify QP carried.
     Status receiveNotification(std::vector<Notification>& notifi_list);
 
     Status probePeerAliveByID(SegmentID target_id);
@@ -427,10 +444,13 @@ class TransferEngineImpl {
 
     struct PreparedSubmit;
 
+    Status submitTransferRequiringPostSubmitCancellation(
+        BatchID batch_id, const std::vector<Request>& request_list);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
-                          const Notification* notifi,
-                          QueueOwnerKind owner_kind);
+                          const Notification* notifi, QueueOwnerKind owner_kind,
+                          bool require_post_submit_cancellation = false);
 
     Status submitStagingTransfer(BatchID batch_id,
                                  const std::vector<Request>& request_list);
@@ -442,7 +462,8 @@ class TransferEngineImpl {
                            QueueOwnerKind owner_kind) const;
 
     Status prepareSubmit(Batch* batch, const std::vector<Request>& request_list,
-                         PreparedSubmit& prepared);
+                         PreparedSubmit& prepared,
+                         bool require_post_submit_cancellation = false);
 
     Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
 
@@ -486,6 +507,12 @@ class TransferEngineImpl {
     Status validateTransportHint(const Request& req, size_t request_index);
 
     Status loadTransports();
+
+    // Control-plane delivery used by sendNotification() once every loaded
+    // notification transport has reported its channel unavailable. Same
+    // wire path as TcpTransport::sendNotification().
+    Status sendNotificationViaRpc(SegmentID target_id,
+                                  const Notification& notifi);
 
     void findStagingPolicy(const Request& req,
                            std::vector<std::string>& policy);
@@ -573,6 +600,7 @@ class TransferEngineImpl {
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
     std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
+    bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;

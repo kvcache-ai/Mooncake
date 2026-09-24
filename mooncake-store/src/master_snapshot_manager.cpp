@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <thread>
 
@@ -128,20 +129,9 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
         const std::string path_prefix = snapshot_root + snapshot_id + "/";
         const std::string manifest_path =
             path_prefix + ha::kSnapshotManifestFile;
-        auto descriptor =
-            BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
-        if (!descriptor) {
-            LOG(ERROR) << "[Snapshot] Failed to build descriptor before fork, "
-                          "snapshot_id="
-                       << snapshot_id
-                       << ", code=" << toString(descriptor.error().code)
-                       << ", msg=" << descriptor.error().message;
-            close(log_pipe[0]);
-            close(log_pipe[1]);
-            continue;
-        }
-
+        std::optional<ha::SnapshotDescriptor> descriptor;
         pid_t pid;
+        WeightMetadataSnapshot frozen_weight_metadata;
         {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
@@ -160,6 +150,49 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
                 close(log_pipe[1]);
                 continue;
             }
+            // Never wait for publication while holding snapshot_mutex_: an
+            // earlier OpLog callback may need that mutex before it can finish.
+            auto weight_lock =
+                master_service_->weight_manager_.TryLockSnapshot();
+            if (!weight_lock.owns_lock()) {
+                LOG(INFO) << "[Snapshot] Skipping snapshot while weight "
+                             "publication is pending, snapshot_id="
+                          << snapshot_id;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
+            // A terminal writer can release failed callers before an uncertain
+            // durable write has finished. Keep its log available for recovery.
+            if (master_service_->enable_oplog_ &&
+                (!master_service_->ordered_oplog_writer_ ||
+                 !master_service_->ordered_oplog_writer_->IsAccepting())) {
+                LOG(INFO) << "[Snapshot] Skipping snapshot while OpLog writer "
+                             "is not accepting, snapshot_id="
+                          << snapshot_id;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
+            auto captured_descriptor = BuildSnapshotDescriptor(
+                snapshot_id, manifest_path, path_prefix);
+            if (!captured_descriptor) {
+                LOG(ERROR)
+                    << "[Snapshot] Failed to build descriptor before fork, "
+                       "snapshot_id="
+                    << snapshot_id
+                    << ", code=" << toString(captured_descriptor.error().code)
+                    << ", msg=" << captured_descriptor.error().message;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
+            descriptor = std::move(captured_descriptor.value());
+            // Weight readers do not take snapshot_mutex_. Freeze their state
+            // in the parent so the child never locks the inherited weight
+            // mutex.
+            frozen_weight_metadata =
+                master_service_->weight_manager_.ExportSnapshot();
             pid = fork();
         }
         if (pid == -1) {
@@ -178,7 +211,8 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             // Save current state using the configured persistence mechanism
             SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
                           snapshot_id);
-            auto result = PersistState(descriptor.value());
+            auto result =
+                PersistState(descriptor.value(), &frozen_weight_metadata);
             if (!result) {
                 SNAP_LOG_ERROR(
                     "[Snapshot] Child process failed to persist state, "
@@ -436,7 +470,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
 }
 
 tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
-    const ha::SnapshotDescriptor& descriptor) {
+    const ha::SnapshotDescriptor& descriptor,
+    const WeightMetadataSnapshot* frozen_weight_metadata) {
     const std::string& snapshot_id = descriptor.snapshot_id;
     const std::string& path_prefix = descriptor.object_prefix;
     const std::string& manifest_path = descriptor.manifest_key;
@@ -462,7 +497,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             master_service_->nof_segment_manager_,
             master_service_->task_manager_);
 
-        auto encode_result = codec.Encode(state_view);
+        auto encode_result = codec.Encode(state_view, frozen_weight_metadata);
         if (!encode_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] state encoding failed, snapshot_id={}, "

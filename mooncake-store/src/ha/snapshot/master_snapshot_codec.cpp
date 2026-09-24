@@ -20,11 +20,14 @@ std::vector<uint8_t> MasterSnapshotCodec::EncodeManifest(
 }
 
 tl::expected<MasterSnapshotPayloads, SerializationError>
-MasterSnapshotCodec::Encode(MasterSnapshotStateView& state_view) const {
+MasterSnapshotCodec::Encode(
+    MasterSnapshotStateView& state_view,
+    const WeightMetadataSnapshot* frozen_weight_metadata) const {
     MasterSnapshotPayloads payloads;
 
     // 1. Encode metadata (shards, discarded replicas, replica_next_id)
-    auto metadata_result = EncodeMetadata(state_view.master_service);
+    auto metadata_result =
+        EncodeMetadata(state_view.master_service, frozen_weight_metadata);
     if (!metadata_result) {
         return tl::make_unexpected(metadata_result.error());
     }
@@ -104,11 +107,13 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::Decode(
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>
-MasterSnapshotCodec::EncodeMetadata(MasterService& master_service) const {
+MasterSnapshotCodec::EncodeMetadata(
+    MasterService& master_service,
+    const WeightMetadataSnapshot* frozen_weight_metadata) const {
     // Delegate to the existing MetadataSerializer for now.
     // This maintains the exact same format as before.
     MasterService::MetadataSerializer serializer(&master_service);
-    return serializer.Serialize();
+    return serializer.Serialize(frozen_weight_metadata);
 }
 
 tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeMetadata(

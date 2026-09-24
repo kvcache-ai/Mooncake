@@ -137,7 +137,7 @@ struct GlobalConfig {
     // Install RdmaTwoSidedTransport (CtrlChannel notify) instead of classic
     // one-sided RdmaTransport. MC_USE_RDMA_TWOSIDED.
     bool use_rdma_twosided = false;
-    // RDMA CtrlChannel notify path. MC_RDMA_NOTIFY_ENABLED.
+    // RDMA notifications for rdma and rdma_twosided. MC_RDMA_NOTIFY_ENABLED.
     bool rdma_notify_enabled = true;
     // Ctrl recv/send slot count and slot size. MC_RDMA_NOTIFY_RECV_COUNT /
     // MC_RDMA_NOTIFY_BUFFER_SIZE.
@@ -146,7 +146,7 @@ struct GlobalConfig {
     // Local pending SEND cap; actual cap is min(this, peer notify_rq_depth).
     // MC_RDMA_NOTIFY_MAX_PENDING_SENDS.
     size_t rdma_notify_max_pending_sends = 64;
-    // Fall back to OOB RPC notify when CtrlChannel is unavailable.
+    // Allow OOB RPC fallback when the RDMA notification path is unavailable.
     // MC_RDMA_NOTIFY_OOB_FALLBACK.
     bool rdma_notify_oob_fallback = true;
     // Upper bound for waiting on an in-flight CtrlChannel connect to the same

@@ -28,6 +28,11 @@ void ascend_free_memory(const std::string& protocol, void* ptr);
 // Check if [addr, addr+length) overlaps with any store memory range.
 bool ascend_is_store_memory(void* addr, size_t length);
 
+// Check whether addr starts inside a direct ACL VMM allocation (allocated via
+// ascend_allocate_vmm_memory_direct). Returns false for adxl::MallocMem
+// allocations and non-VMM host buffers.
+bool ascend_is_direct_vmm_memory(void* addr, size_t length);
+
 // Direct ACL VMM allocation, always bypasses adxl MallocMem.
 // For use by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.
 // Requires size to be a multiple of 1GB. Returns nullptr on failure.

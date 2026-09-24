@@ -44,6 +44,10 @@ def test_wheel_imports_outside_the_repository(
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
     python = environment / "bin" / "python"
     subprocess.run(
+        [str(python), "-m", "pip", "install", "aiohttp"],
+        check=True,
+    )
+    subprocess.run(
         [str(python), "-m", "pip", "install", "--no-deps", str(wheel)],
         check=True,
     )
@@ -55,11 +59,6 @@ def test_wheel_imports_outside_the_repository(
 from importlib import import_module, metadata, util
 from pathlib import Path
 import sys
-import types
-
-aiohttp = types.ModuleType("aiohttp")
-aiohttp.web = types.SimpleNamespace()
-sys.modules["aiohttp"] = aiohttp
 
 import mooncake
 
@@ -81,6 +80,7 @@ assert "mooncake.engine" not in sys.modules
 import mooncake.async_store
 import mooncake.engine
 import mooncake.mooncake_store_service
+import mooncake.http_metadata_server
 import mooncake.mooncake_config
 import mooncake.reshard
 import mooncake.store
@@ -105,6 +105,7 @@ assert len(store_entry_points) == 1
 store_entry_point = store_entry_points[0]
 assert store_entry_point.value == "mooncake.mooncake_store_service:sync_main"
 assert store_entry_point.load() is mooncake.mooncake_store_service.sync_main
+assert mooncake.http_metadata_server.KVBootstrapServer is not None
 assert mooncake.mooncake_config.MooncakeConfig is not None
 for ep_module in (
     "ep.py",
@@ -143,6 +144,12 @@ assert {{
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],
+        cwd=tmp_path,
+        env=clean_environment,
+        check=True,
+    )
+    subprocess.run(
+        [str(environment / "bin" / "mooncake_http_metadata_server"), "--help"],
         cwd=tmp_path,
         env=clean_environment,
         check=True,
