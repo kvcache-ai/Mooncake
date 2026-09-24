@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -76,10 +77,21 @@ DEFINE_double(dsa_evict_ratio, 0.05,
               "the steady-state cluster fill closer to the fragmentation "
               "ceiling but trigger evictions more frequently.");
 DEFINE_string(size_class_pattern, "kv_mixed",
-              "Size-class churn pattern: kv_mixed, dsa_pair, or all");
+              "Size-class churn pattern: kv_mixed, dsa_pair, variable, trace, "
+              "or all");
 DEFINE_double(size_class_evict_ratio, 0.02,
               "Fraction of live objects to evict on each Allocate failure "
               "in size_class_churn mode.");
+DEFINE_int64(variable_min_kib, 64,
+             "Smallest object size, in KiB, for the 'variable' size-class "
+             "pattern");
+DEFINE_int64(variable_max_mib, 512,
+             "Largest object size, in MiB, for the 'variable' size-class "
+             "pattern");
+DEFINE_string(size_class_trace_file, "",
+              "Trace file for the 'trace' size-class pattern. Accepts either "
+              "one requested byte count per line, or '<kind> <key> <bytes>' "
+              "event lines, of which only 'put' lines are counted.");
 
 using namespace mooncake;
 
@@ -283,6 +295,25 @@ struct SizeClassChurnResult : BenchResultBase {
     DistributionStats largest_free_mb_stats;
     FragmentationSnapshot final_fragmentation;
     std::vector<SizeClassStat> size_class_stats;
+
+    // Requested bytes still live, over cluster capacity, at the end of the
+    // run: the share of the pool doing useful work.
+    double useful_util = 0.0;
+    // Bytes the allocator has handed out, over cluster capacity. The gap to
+    // useful_util is internal fragmentation - the size-class round-up, which
+    // is what MANTISSA_BITS controls.
+    double charged_util = 0.0;
+    // useful_util at the moment of the first failed allocation. The incident
+    // this workload models is a failure well below 100%, so this is the
+    // headline number: how much of the pool the workload got to use before
+    // the allocator stopped being able to place a large object.
+    double useful_util_at_first_failure = 0.0;
+    bool saw_failure = false;
+    // Share of objects that survived to their own removal instead of being
+    // evicted to make room for someone else. An object evicted early is a
+    // cache entry that cannot be reused, so this is the reuse ceiling the
+    // allocator imposes on any workload layered on top.
+    double survival_pct = 100.0;
 };
 
 static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
@@ -560,6 +591,87 @@ static std::vector<SizeClassSpec> getSizeClassSpecs(
             {"kv", kDsaKvSize, 50},
             {"indexer", kDsaIndexerSize, 50},
         };
+    }
+
+    // Equally weighted classes spread log-uniformly over [min, max], four per
+    // octave. KV cache traffic is near-fixed-size, so a segment only ever has
+    // to have *enough* bytes free; RL data-plane offload hands the allocator
+    // data-dependent sizes spanning several octaves, and then a segment also
+    // has to have them *contiguous*. Spreading the weight evenly keeps a
+    // steady supply of large requests competing with small ones for the same
+    // segments, which is the mix that starves large allocations first.
+    //
+    // The quarter-octave steps matter for the internal-fragmentation column.
+    // Powers of two land exactly on a size-class boundary for any
+    // MANTISSA_BITS, so an octave-spaced ladder would report zero round-up no
+    // matter what the mantissa is. Quarter octaves are the plain "sample the
+    // range evenly in log space" choice rather than one picked against a
+    // particular mantissa's bin edges.
+    if (pattern_name == "variable") {
+        // 2^(k/4) in 1/1000ths, for k = 0..3.
+        static constexpr size_t kQuarterOctave[] = {1000, 1189, 1414, 1682};
+        std::vector<SizeClassSpec> specs;
+        const size_t min_size =
+            static_cast<size_t>(FLAGS_variable_min_kib) * KiB;
+        const size_t max_size =
+            static_cast<size_t>(FLAGS_variable_max_mib) * MiB;
+        for (size_t base = min_size; base <= max_size; base *= 2) {
+            for (size_t mult : kQuarterOctave) {
+                const size_t size = base / 1000 * mult;
+                if (size > max_size) break;
+                std::ostringstream name;
+                if (size < MiB) {
+                    name << (size / KiB) << "KiB";
+                } else {
+                    name << (size / MiB) << "MiB";
+                }
+                specs.push_back({name.str(), size, 1});
+            }
+        }
+        return specs;
+    }
+
+    // Size distribution read straight from a captured trace: one class per
+    // distinct requested size, weighted by how often the trace asked for it.
+    // Byte counts are used as recorded. To make a small trace exercise a full
+    // pool, shrink the cluster with --segment_capacity rather than scaling the
+    // sizes up, so the sizes under test stay the ones the workload really
+    // asked for.
+    if (pattern_name == "trace") {
+        std::ifstream trace(FLAGS_size_class_trace_file);
+        if (!trace) {
+            std::cout << "Cannot open --size_class_trace_file="
+                      << FLAGS_size_class_trace_file << std::endl;
+            return {};
+        }
+
+        std::map<size_t, int> histogram;
+        std::string line;
+        while (std::getline(trace, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream fields(line);
+            std::string first, second, third;
+            fields >> first >> second >> third;
+            // Event lines are "<kind> <key> <bytes>"; a bare line is a size.
+            if (!third.empty() && first != "put") continue;
+            const std::string& size_token = third.empty() ? first : third;
+            size_t bytes = 0;
+            try {
+                bytes = std::stoull(size_token);
+            } catch (const std::exception&) {
+                continue;
+            }
+            if (bytes > 0) ++histogram[bytes];
+        }
+
+        std::vector<SizeClassSpec> specs;
+        specs.reserve(histogram.size());
+        for (const auto& entry : histogram) {
+            std::ostringstream name;
+            name << entry.first << "B";
+            specs.push_back({name.str(), entry.first, entry.second});
+        }
+        return specs;
     }
 
     return {};
@@ -1006,6 +1118,45 @@ static void evictRandomFraction(std::vector<std::vector<Replica>>& live,
     }
 }
 
+// Live set for the size-class workload. Holds the replicas, whose destructor
+// returns memory to the allocator, alongside the byte count the workload
+// actually asked for. Keeping both lets the benchmark separate the bytes a
+// caller requested from the bytes the allocator charged for them, which is the
+// difference that size-class granularity controls.
+struct SizeClassLiveSet {
+    std::vector<std::vector<Replica>> replicas;
+    std::vector<size_t> requested_bytes;  // parallel to replicas
+    size_t total_requested = 0;
+    size_t evicted_objects = 0;
+
+    bool empty() const { return replicas.empty(); }
+
+    void Add(std::vector<Replica> entry, size_t bytes) {
+        replicas.push_back(std::move(entry));
+        requested_bytes.push_back(bytes);
+        total_requested += bytes;
+    }
+
+    void EvictRandomFraction(double ratio, std::mt19937& rng) {
+        if (replicas.empty()) return;
+
+        size_t to_drop =
+            std::max<size_t>(1, static_cast<size_t>(replicas.size() * ratio));
+        if (to_drop > replicas.size()) to_drop = replicas.size();
+
+        for (size_t i = 0; i < to_drop; ++i) {
+            std::uniform_int_distribution<size_t> dist(0, replicas.size() - 1);
+            size_t idx = dist(rng);
+            std::swap(replicas[idx], replicas.back());
+            std::swap(requested_bytes[idx], requested_bytes.back());
+            total_requested -= requested_bytes.back();
+            replicas.pop_back();
+            requested_bytes.pop_back();
+            ++evicted_objects;
+        }
+    }
+};
+
 // Try to allocate once; on failure, sample utilization before eviction.
 static bool dsaAllocateWithEvict(
     const std::shared_ptr<AllocationStrategy>& strategy,
@@ -1037,8 +1188,8 @@ static bool dsaAllocateWithEvict(
 static SizeClassAllocationResult sizeClassAllocateWithEvict(
     const std::shared_ptr<AllocationStrategy>& strategy,
     AllocatorManager& manager, size_t size, int replica_num,
-    std::vector<std::vector<Replica>>& live, std::mt19937& rng,
-    int& evict_count, double evict_ratio) {
+    SizeClassLiveSet& live, std::mt19937& rng, int& evict_count,
+    double evict_ratio) {
     for (int attempt = 0; attempt <= kSizeClassMaxRetries; ++attempt) {
         auto result = strategy->Allocate(manager, size, replica_num);
         if (result.has_value()) {
@@ -1046,7 +1197,7 @@ static SizeClassAllocationResult sizeClassAllocateWithEvict(
             if (replica_count == 0) {
                 return {};
             }
-            live.push_back(std::move(result.value()));
+            live.Add(std::move(result.value()), size * replica_count);
             return {
                 replica_count == static_cast<size_t>(replica_num)
                     ? SizeClassAllocationStatus::FULL
@@ -1058,7 +1209,7 @@ static SizeClassAllocationResult sizeClassAllocateWithEvict(
         if (live.empty()) return {};
         if (attempt == kSizeClassMaxRetries) return {};
 
-        evictRandomFraction(live, evict_ratio, rng);
+        live.EvictRandomFraction(evict_ratio, rng);
         ++evict_count;
     }
 
@@ -1068,8 +1219,8 @@ static SizeClassAllocationResult sizeClassAllocateWithEvict(
 static SizeClassPrefillStats prefillSizeClassChurn(
     const std::shared_ptr<AllocationStrategy>& strategy,
     AllocatorManager& manager, const BenchConfig& cfg,
-    const std::vector<SizeClassSpec>& specs,
-    std::vector<std::vector<Replica>>& live_allocations, std::mt19937& rng) {
+    const std::vector<SizeClassSpec>& specs, SizeClassLiveSet& live_allocations,
+    std::mt19937& rng) {
     SizeClassPrefillStats stats;
     if (cfg.prefill_pct <= 0 || specs.empty()) return stats;
     stats.requested_pct = cfg.prefill_pct;
@@ -1266,8 +1417,8 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     std::vector<double> largest_free_mb_samples;
     largest_free_mb_samples.reserve(fragmentation_samples.capacity());
 
-    std::vector<std::vector<Replica>> live_allocations;
-    live_allocations.reserve(std::min(cfg.num_allocations, 1 << 20));
+    SizeClassLiveSet live_allocations;
+    live_allocations.replicas.reserve(std::min(cfg.num_allocations, 1 << 20));
 
     std::mt19937 rng(42);
     SizeClassPrefillStats prefill_stats = prefillSizeClassChurn(
@@ -1278,6 +1429,8 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     int failed_count = 0;
     int total_count = 0;
     int evict_count = 0;
+    bool saw_failure = false;
+    double useful_util_at_first_failure = 0.0;
     double instrumentation_time_us = 0.0;
 
     auto total_start = std::chrono::high_resolution_clock::now();
@@ -1308,6 +1461,19 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
         } else {
             ++failed_count;
             ++per_class_stats[class_idx].failed_count;
+            if (!saw_failure) {
+                saw_failure = true;
+                auto s0 = std::chrono::high_resolution_clock::now();
+                const size_t capacity = computeTotalCapacity(manager);
+                useful_util_at_first_failure =
+                    capacity > 0 ? static_cast<double>(
+                                       live_allocations.total_requested) /
+                                       static_cast<double>(capacity)
+                                 : 0.0;
+                auto s1 = std::chrono::high_resolution_clock::now();
+                instrumentation_time_us +=
+                    std::chrono::duration<double, std::micro>(s1 - s0).count();
+            }
         }
 
         if ((i + 1) % sample_interval == 0 || i == cfg.num_allocations - 1) {
@@ -1358,6 +1524,32 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
         computeDistributionStats(largest_free_mb_samples);
     res.final_fragmentation = computeFragmentationSnapshot(manager);
     res.size_class_stats = std::move(per_class_stats);
+
+    const size_t capacity = computeTotalCapacity(manager);
+    if (capacity > 0) {
+        res.useful_util =
+            static_cast<double>(live_allocations.total_requested) /
+            static_cast<double>(capacity);
+        if (res.final_fragmentation.valid) {
+            res.charged_util =
+                static_cast<double>(res.final_fragmentation.capacity -
+                                    res.final_fragmentation.total_free_space) /
+                static_cast<double>(res.final_fragmentation.capacity);
+        }
+    }
+    res.saw_failure = saw_failure;
+    res.useful_util_at_first_failure =
+        saw_failure ? useful_util_at_first_failure : res.useful_util;
+    const size_t puts = success_count + partial_count +
+                        prefill_stats.full_count + prefill_stats.partial_count;
+    if (puts > 0) {
+        res.survival_pct =
+            100.0 *
+            (1.0 - static_cast<double>(live_allocations.evicted_objects) /
+                       static_cast<double>(puts));
+        res.survival_pct = std::clamp(res.survival_pct, 0.0, 100.0);
+    }
+
     computeLatencyStats(latencies, total_us, total_count, res);
     return res;
 }
@@ -1491,7 +1683,7 @@ static void printScaleOutResult(const ScaleOutResult& r) {
 }
 
 static void printSizeClassChurnHeader() {
-    std::cout << std::string(260, '-') << std::endl;
+    std::cout << std::string(312, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
               << "Replica" << std::setw(10) << "Segments" << std::setw(14)
               << "Pattern" << std::setw(12) << "Cluster(GB)" << std::setw(8)
@@ -1501,9 +1693,11 @@ static void printSizeClassChurnHeader() {
               << std::setw(12) << "Frag_avg" << std::setw(12) << "Frag_p50"
               << std::setw(12) << "Frag_p90" << std::setw(12) << "Frag_p99"
               << std::setw(15) << "LargestFreeMB" << std::setw(10) << "AvgUtil%"
+              << std::setw(10) << "Useful%" << std::setw(10) << "IntFrag%"
+              << std::setw(12) << "Fail@Util%" << std::setw(10) << "Survive%"
               << std::setw(24) << "Full/Partial/Fail/Total" << std::setw(14)
               << "Evictions" << std::endl;
-    std::cout << std::string(260, '-') << std::endl;
+    std::cout << std::string(312, '-') << std::endl;
 }
 
 static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
@@ -1531,8 +1725,12 @@ static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
               << r.fragmentation_stats.p99 << std::setprecision(1)
               << std::setw(15) << final_largest_free_mb << std::setprecision(2)
               << std::setw(9) << (r.final_avg_util * 100.0) << "%"
-              << std::setw(24) << alloc_ratio << std::setw(14) << r.evict_count
-              << std::endl;
+              << std::setw(9) << (r.useful_util * 100.0) << "%" << std::setw(9)
+              << ((r.charged_util - r.useful_util) * 100.0) << "%"
+              << std::setw(11) << (r.useful_util_at_first_failure * 100.0)
+              << (r.saw_failure ? "%" : "-") << std::setw(9) << r.survival_pct
+              << "%" << std::setw(24) << alloc_ratio << std::setw(14)
+              << r.evict_count << std::endl;
 
     std::cout << "Prefill summary [" << r.strategy_name
               << ", pattern=" << r.pattern_name
@@ -1816,7 +2014,7 @@ static void runSizeClassChurnMatrix() {
 
     std::vector<std::string> patterns;
     if (FLAGS_size_class_pattern == "all") {
-        patterns = {"kv_mixed", "dsa_pair"};
+        patterns = {"kv_mixed", "dsa_pair", "variable"};
     } else {
         patterns = {FLAGS_size_class_pattern};
     }
@@ -1832,7 +2030,8 @@ static void runSizeClassChurnMatrix() {
     for (const auto& pattern : patterns) {
         if (getSizeClassSpecs(pattern).empty()) {
             std::cout << "Invalid size_class_pattern: " << pattern
-                      << ". Use --size_class_pattern=kv_mixed, dsa_pair, or "
+                      << ". Use --size_class_pattern=kv_mixed, dsa_pair, "
+                         "variable, trace (with --size_class_trace_file), or "
                          "all."
                       << std::endl;
             return;
@@ -1851,7 +2050,15 @@ static void runSizeClassChurnMatrix() {
               << ", evict_ratio=" << FLAGS_size_class_evict_ratio
               << ", size_class_pattern=" << FLAGS_size_class_pattern << "\n"
               << "Patterns: kv_mixed = 4KB:70%, 256KB:20%, 3198KB:10%; "
-                 "dsa_pair = 3198KB:50%, 643KB:50%.\n"
+                 "dsa_pair = 3198KB:50%, 643KB:50%; variable = equally "
+                 "weighted classes, four per octave, over ["
+              << FLAGS_variable_min_kib << "KiB, " << FLAGS_variable_max_mib
+              << "MiB].\n"
+              << "Useful% = live requested bytes / capacity. IntFrag% = the "
+                 "size-class round-up on top of that (what MANTISSA_BITS "
+                 "controls). Fail@Util% = Useful% when the first allocation "
+                 "failed. Survive% = objects that were not evicted to make "
+                 "room for another object.\n"
               << "Skewed setup: half nodes are (base + 50%) capacity, half are "
                  "(base - 50%)\n"
               << std::endl;
