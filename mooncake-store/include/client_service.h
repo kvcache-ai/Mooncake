@@ -673,6 +673,10 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    [[nodiscard]] std::shared_ptr<TransferEngine> getTransferEngine() const {
+        return transfer_engine_;
+    }
+
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
@@ -831,6 +835,7 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
+    ErrorCode MaybeInstallStoreShmTransport();
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,

@@ -1391,7 +1391,7 @@ Do not run binaries from before and after checksum support was introduced in the
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MC_STORE_USE_HUGEPAGE` | unset | Set `1` to request HugeTLB-backed `mmap()` |
+| `MC_STORE_USE_HUGEPAGE` | unset | Set `1` to request HugeTLB-backed `mmap()` (also used for Store SHM segments when same-host SHM is enabled; see below) |
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `512MB`, `1GB` |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
@@ -1430,6 +1430,57 @@ hugepages (set `MC_STORE_USE_HUGEPAGE=1` and `MC_STORE_HUGEPAGE_SIZE=1GB` for
 pool plus any hugepage-backed segments; when the pool is exhausted the first
 allocation aborts with a clear error naming the hugepage size and count needed
 rather than silently degrading.
+
+(same-host-store-shm-segment)=
+#### Same-host Store SHM Segment (`ShmTransport`)
+
+By default, same-host Put/Get between Store clients still uses the segment
+protocol (for example intra-node RDMA). Opt in to allocate the **host DRAM
+global segment** as a Transfer Engine shared-memory object so peers on the
+same machine copy via classic `ShmTransport` (POSIX shm or hugetlbfs) instead.
+
+This path is **classic Transfer Engine only**. Setting
+`MC_STORE_USE_SHM_SEGMENT` under TENT fails client init
+(`allocateSharedMemory` is unavailable). Build with
+`-DENABLE_MULTI_PROTOCOL=ON` so RDMA/TCP remain available for cross-host
+traffic alongside SHM; without that flag, installing SHM may become shm-only
+and log a warning.
+
+Applies only to **host-DRAM** protocols (`rdma`, `tcp`, `efa`, …). Device /
+CXL / NVLink-style protocols (`ascend`, `ub`, `ubshmem`, `sunrise_link`,
+`cxl`, `nvlink_intra`) keep their existing segment allocators.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MC_STORE_USE_SHM_SEGMENT` | unset | Opt in to Store SHM global segments. Accepts `1`/`true`/`yes`/`on` (or any non-empty value other than `0`/`false`/`no`/`off`). When enabled, Store installs `ShmTransport` and allocates the host segment via `TransferEngine::allocateSharedMemory` |
+| `MC_FORCE_SHM` | unset | TE-level SHM opt-in. Also enables the Store SHM segment path (`store_use_shm_segment()` is true if this **or** `MC_STORE_USE_SHM_SEGMENT` is on). Prefer the Store-specific flag when only Store segments should use SHM |
+| `MC_STORE_USE_HUGEPAGE` / `MC_STORE_HUGEPAGE_SIZE` | unset / `2MB` | When SHM is enabled, hugepage settings are forwarded into `SharedMemoryOptions` (hugetlbfs-backed SHM). Populate is deferred so Store can `mbind` then touch pages itself |
+| `MC_HUGETLBFS_PATH` | unset | Optional custom hugetlbfs mount for SHM hugepage files. Used only when hugepage is enabled; otherwise TE defaults to `/dev/hugepages`, `/dev/hugepages-512M`, or `/dev/hugepages-1G` by page size |
+| `MC_STORE_SHM_ALLOW_TMPFS` | unset | When set (same truthy rules as `MC_STORE_USE_SHM_SEGMENT`), if hugetlbfs SHM allocation fails Store retries with POSIX shm (`/dev/shm`). **Unset/off by default** — hugepage exhaustion fails allocation instead of silently falling back |
+
+**POSIX SHM (tmpfs) segment:**
+
+```bash
+export MC_STORE_USE_SHM_SEGMENT=1
+# leave MC_STORE_USE_HUGEPAGE unset
+```
+
+**Hugetlbfs SHM segment (recommended for large segments):**
+
+```bash
+export MC_STORE_USE_SHM_SEGMENT=1
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+# optional: export MC_HUGETLBFS_PATH=/dev/hugepages
+# leave MC_STORE_SHM_ALLOW_TMPFS unset unless you intentionally want POSIX fallback
+```
+
+Set the same SHM/hugepage env on every same-host Store client that should
+participate (segment contributor and readers/writers). Peer processes must
+share a UID (`0600` objects) and a visible `/dev/shm` or hugetlbfs mount.
+After a crash, leftover hugetlbfs files continue to reserve hugepages until
+unlinked — remove only `mooncake_<dead-pid>_*` on the mount (see
+{ref}`SHM Transport <shm-transport>`).
 
 #### yalantinglibs Log Level
 
