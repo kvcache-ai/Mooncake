@@ -159,8 +159,13 @@ metadata-service process is launched. The existing client hosting options remain
 unchanged, and this is not a documented user deployment mode.
 
 The CTest targets `embedded_master_test` and `standalone_client_test` also cover
-loopback-only RPC/admin listeners and reusing an initialized TransferEngine
-without repeating its metadata connection string.
+loopback-only listeners, kernel-assigned ports during concurrent startup, and
+same-port restart after stopping a master. TransferEngine reuse is checked with
+both HTTP metadata and `P2PHANDSHAKE`; the latter deliberately uses different
+Store and engine names and checks the published replica endpoint. The TENT
+`cuda-off` CI job runs the same metadata-reuse cases with `MC_USE_TENT=1`.
+In embedded mode, the legacy external `master_server_addr` argument is ignored
+so multiple clients can keep its default without competing for port 50051.
 
 ```bash
 bash scripts/run_standalone_store_e2e.sh

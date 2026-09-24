@@ -998,8 +998,14 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
+    // must publish the engine's actual endpoint rather than the Store hostname.
+    const auto& resolved_metadata =
+        transfer_engine && metadata_connstring.empty()
+            ? transfer_engine->getMetadataConnectionString()
+            : metadata_connstring;
     auto client = std::shared_ptr<Client>(new Client(
-        local_hostname, metadata_connstring, protocol, labels, tenant_id));
+        local_hostname, resolved_metadata, protocol, labels, tenant_id));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {

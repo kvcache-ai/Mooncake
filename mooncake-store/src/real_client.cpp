@@ -843,7 +843,7 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
 }
 
 tl::expected<std::string, ErrorCode> RealClient::StartEmbeddedMaster(
-    const std::string &master_server_addr, bool enable_ssd_offload) {
+    bool enable_ssd_offload) {
     if (embedded_master_) {
         return embedded_master_->master_address();
     }
@@ -853,11 +853,9 @@ tl::expected<std::string, ErrorCode> RealClient::StartEmbeddedMaster(
     // metadata listener unless an explicit port is requested by tests.
     config.http_metadata_port = 0;
     config.enable_offload = enable_ssd_offload;
-    if (!master_server_addr.empty() && hasExplicitPort(master_server_addr)) {
-        auto [host, port] = parseHostNameWithPort(master_server_addr);
-        config.rpc_port = static_cast<int>(port);
-        (void)host;
-    }
+    // master_server_addr names an external service. In embedded mode each
+    // client needs its own kernel-assigned port, including callers that keep
+    // setup_real's legacy default external address.
 
     auto master = std::make_unique<EmbeddedMaster>();
     if (!master->Start(config)) {
@@ -920,13 +918,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string resolved_master_server_addr = master_server_addr;
     std::string resolved_metadata_server = metadata_server;
     if (enable_embedded_master) {
-        auto started =
-            StartEmbeddedMaster(master_server_addr, enable_ssd_offload);
+        auto started = StartEmbeddedMaster(enable_ssd_offload);
         if (!started) {
             return tl::unexpected(started.error());
         }
         resolved_master_server_addr = started.value();
-        if (resolved_metadata_server.empty()) {
+        if (resolved_metadata_server.empty() && !transfer_engine) {
             resolved_metadata_server = "P2PHANDSHAKE";
         }
     } else if (resolved_metadata_server.empty() && !transfer_engine) {

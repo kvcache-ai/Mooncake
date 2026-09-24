@@ -5,6 +5,8 @@
 
 #include <array>
 #include <cstdlib>
+#include <future>
+#include <set>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,7 +34,8 @@ std::optional<asio::ip::address_v4> NonLoopbackAddress() {
                                                            freeifaddrs);
     for (auto* entry = interfaces; entry; entry = entry->ifa_next) {
         if (!entry->ifa_addr || entry->ifa_addr->sa_family != AF_INET ||
-            (entry->ifa_flags & IFF_LOOPBACK) != 0) {
+            (entry->ifa_flags & IFF_LOOPBACK) != 0 ||
+            (entry->ifa_flags & IFF_UP) == 0) {
             continue;
         }
         const auto* address =
@@ -109,6 +112,71 @@ TEST_F(EmbeddedMasterTest, AllListenersBindOnlyToLoopback) {
     }
 }
 
+TEST_F(EmbeddedMasterTest, StopPreservesAddressesForRestart) {
+    EmbeddedMaster master;
+    ASSERT_TRUE(master.Start({}));
+    const auto address = master.master_address();
+    const auto metrics = master.http_metrics_base();
+    const auto metadata = master.metadata_url();
+    master.Stop();
+    EXPECT_EQ(master.master_address(), address);
+    EXPECT_EQ(master.http_metrics_base(), metrics);
+    EXPECT_EQ(master.metadata_url(), metadata);
+
+    InProcMasterConfig config;
+    config.rpc_port = master.rpc_port();
+    config.http_metrics_port = master.http_metrics_port();
+    config.http_metadata_port = master.http_metadata_port();
+    ASSERT_TRUE(master.Start(config));
+    EXPECT_EQ(master.master_address(), address);
+    EXPECT_EQ(master.http_metrics_base(), metrics);
+    EXPECT_EQ(master.metadata_url(), metadata);
+    EXPECT_TRUE(httpGet(metrics + "/health").has_value());
+}
+
+TEST_F(EmbeddedMasterTest, ExplicitZeroPortsReportActualListeners) {
+    InProcMasterConfig config;
+    config.rpc_port = 0;
+    config.http_metrics_port = 0;
+    config.http_metadata_port = 0;
+    EmbeddedMaster master;
+    ASSERT_TRUE(master.Start(config));
+    EXPECT_GT(master.rpc_port(), 0);
+    EXPECT_GT(master.http_metrics_port(), 0);
+    EXPECT_EQ(master.http_metadata_port(), 0);
+    EXPECT_TRUE(master.metadata_url().empty());
+    EXPECT_TRUE(httpGet(master.http_metrics_base() + "/health").has_value());
+}
+
+TEST_F(EmbeddedMasterTest, ConcurrentMastersKeepDistinctBoundPorts) {
+    std::array<EmbeddedMaster, 4> masters;
+    std::array<std::future<bool>, 4> starts;
+    std::promise<void> ready;
+    const auto start = ready.get_future().share();
+    for (size_t i = 0; i < masters.size(); ++i) {
+        starts[i] = std::async(std::launch::async, [&, i, start] {
+            start.wait();
+            return masters[i].Start({});
+        });
+    }
+    ready.set_value();
+    std::set<int> ports;
+    for (size_t i = 0; i < masters.size(); ++i) {
+        ASSERT_TRUE(starts[i].get());
+        for (int port : {masters[i].rpc_port(), masters[i].http_metrics_port(),
+                         masters[i].http_metadata_port()}) {
+            EXPECT_GT(port, 0);
+            EXPECT_TRUE(ports.insert(port).second);
+            asio::io_context context;
+            tcp::socket socket(context);
+            std::error_code ec;
+            socket.connect(
+                tcp::endpoint(asio::ip::address_v4::loopback(), port), ec);
+            EXPECT_FALSE(ec) << ec.message();
+        }
+    }
+}
+
 class EmbeddedMasterStartFailureTest
     : public EmbeddedMasterTest,
       public ::testing::WithParamInterface<size_t> {};
@@ -127,9 +195,6 @@ TEST_P(EmbeddedMasterStartFailureTest, ReleasesListenersAndCanRestart) {
 
     EmbeddedMaster master;
     EXPECT_FALSE(master.Start(config));
-    EXPECT_EQ(master.rpc_port(), 0);
-    EXPECT_EQ(master.http_metrics_port(), 0);
-    EXPECT_EQ(master.http_metadata_port(), 0);
     EXPECT_EQ(master.service(), nullptr);
     for (size_t i = 0; i < ports.size(); ++i) {
         if (i == GetParam()) continue;

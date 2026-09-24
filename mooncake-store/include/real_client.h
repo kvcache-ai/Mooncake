@@ -1153,7 +1153,7 @@ class RealClient : public PyClient {
 
    private:
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
-        const std::string &master_server_addr, bool enable_ssd_offload);
+        bool enable_ssd_offload);
 
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 

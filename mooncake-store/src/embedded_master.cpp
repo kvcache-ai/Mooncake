@@ -1,17 +1,14 @@
 #include "embedded_master.h"
 
-#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <string_view>
 #include <thread>
-#include <vector>
 
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "common/network.h"
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
 #include "types.h"
@@ -25,52 +22,15 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
         return false;
     }
     try {
-        // Allocate all needed ports atomically to avoid collisions from
-        // rapid sequential getFreeTcpPort() calls (TOCTOU).
-        int needed = (!config.rpc_port.has_value()) +
-                     (!config.http_metrics_port.has_value()) +
-                     (!config.http_metadata_port.has_value());
-        std::vector<int> available_ports;
-        if (needed > 0) {
-            std::vector<int> reserved_ports;
-            if (config.rpc_port.has_value()) {
-                reserved_ports.push_back(config.rpc_port.value());
-            }
-            if (config.http_metrics_port.has_value()) {
-                reserved_ports.push_back(config.http_metrics_port.value());
-            }
-            if (config.http_metadata_port.has_value()) {
-                reserved_ports.push_back(config.http_metadata_port.value());
-            }
-            auto free_ports = getFreeTcpPorts(
-                needed + static_cast<int>(reserved_ports.size()));
-            available_ports.reserve(needed);
-            for (int port : free_ports) {
-                if (std::find(reserved_ports.begin(), reserved_ports.end(),
-                              port) == reserved_ports.end()) {
-                    available_ports.push_back(port);
-                    if (static_cast<int>(available_ports.size()) == needed) {
-                        break;
-                    }
-                }
-            }
-            if (static_cast<int>(available_ports.size()) < needed) {
-                LOG(ERROR) << "Failed to reserve " << needed
-                           << " free TCP ports for embedded master";
-                return false;
-            }
-        }
-        int idx = 0;
-        rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value()
-                                                : available_ports[idx++];
-        http_metrics_port_ = config.http_metrics_port.has_value()
-                                 ? config.http_metrics_port.value()
-                                 : available_ports[idx++];
-        http_metadata_port_ = config.http_metadata_port.has_value()
-                                  ? config.http_metadata_port.value()
-                                  : available_ports[idx++];
+        // Let each listener bind port zero so the kernel allocates and holds
+        // its port atomically. Probing free ports before binding races with
+        // other clients and processes.
+        rpc_port_ = config.rpc_port.value_or(0);
+        http_metrics_port_ = config.http_metrics_port.value_or(0);
+        http_metadata_port_ = config.http_metadata_port.value_or(0);
 
-        if (http_metadata_port_ > 0) {
+        // An explicit metadata port of zero disables this optional listener.
+        if (!config.http_metadata_port || http_metadata_port_ > 0) {
             meta_server_ = std::make_unique<HttpMetadataServer>(
                 static_cast<uint16_t>(http_metadata_port_), "127.0.0.1");
             if (!meta_server_->start()) {
@@ -80,6 +40,7 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
                 Stop();
                 return false;
             }
+            http_metadata_port_ = meta_server_->port();
         }
 
         server_ = std::make_unique<coro_rpc::coro_rpc_server>(
@@ -105,6 +66,18 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
                 default_kv_lease_ttl = static_cast<uint64_t>(parsed);
             }
         }
+
+        admin_server_ = std::make_unique<MasterAdminServer>(
+            static_cast<uint16_t>(http_metrics_port_),
+            /*enable_metric_reporting=*/false, /*http_host=*/"127.0.0.1");
+        if (!admin_server_->Start()) {
+            LOG(ERROR) << "Failed to start embedded master admin server on "
+                          "port "
+                       << http_metrics_port_;
+            Stop();
+            return false;
+        }
+        http_metrics_port_ = admin_server_->port();
 
         WrappedMasterServiceConfig wms_cfg;
         wms_cfg.default_kv_lease_ttl = default_kv_lease_ttl;
@@ -153,16 +126,6 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
         }
 
         wrapped_ = std::make_shared<WrappedMasterService>(wms_cfg);
-        admin_server_ = std::make_unique<MasterAdminServer>(
-            static_cast<uint16_t>(http_metrics_port_),
-            /*enable_metric_reporting=*/false, /*http_host=*/"127.0.0.1");
-        if (!admin_server_->Start()) {
-            LOG(ERROR) << "Failed to start embedded master admin server on "
-                          "port "
-                       << http_metrics_port_;
-            Stop();
-            return false;
-        }
         admin_server_->SetRuntimeState(ha::MasterRuntimeState::kServing);
         admin_server_->SetServiceDelegate(wrapped_);
         admin_server_->SetServiceAvailable(true);
@@ -175,6 +138,7 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
             Stop();
             return false;
         }
+        rpc_port_ = server_->port();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         LOG(INFO) << "Embedded master started on " << master_address()
                   << ", metrics_port=" << http_metrics_port_
@@ -205,9 +169,8 @@ void EmbeddedMaster::Stop() {
         meta_server_->stop();
         meta_server_.reset();
     }
-    rpc_port_ = 0;
-    http_metrics_port_ = 0;
-    http_metadata_port_ = 0;
+    // Preserve the last bound addresses: InProcMaster callers use these
+    // accessors after Stop() to restart on the same ports for reconnection.
 }
 
 }  // namespace mooncake

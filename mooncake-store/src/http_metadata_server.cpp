@@ -122,6 +122,7 @@ bool HttpMetadataServer::start() {
                    << port_;
         return false;
     }
+    port_ = server_->port();
     running_ = true;
     LOG(INFO) << "HTTP metadata server started on " << host_ << ":" << port_;
     return true;
