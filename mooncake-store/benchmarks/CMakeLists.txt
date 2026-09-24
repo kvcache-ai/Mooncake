@@ -19,6 +19,21 @@ add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
 target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
                                                        mooncake_store)
 
+# Offline, dependency-aware replay of master RPC operation traces.
+add_library(master_rpc_trace STATIC master_rpc_trace/trace.cpp)
+target_link_libraries(master_rpc_trace PUBLIC JsonCpp::JsonCpp pthread)
+target_include_directories(master_rpc_trace PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(master_rpc_trace_bench master_rpc_trace_bench.cpp)
+target_link_libraries(master_rpc_trace_bench
+                      PRIVATE master_rpc_trace mooncake_store gflags::gflags)
+if(BUILD_UNIT_TESTS)
+  add_executable(master_rpc_trace_test master_rpc_trace/tests/trace_test.cpp)
+  target_include_directories(master_rpc_trace_test PRIVATE master_rpc_trace)
+  target_link_libraries(master_rpc_trace_test PRIVATE master_rpc_trace
+                                                      gtest_main)
+  add_test(NAME master_rpc_trace_test COMMAND master_rpc_trace_test)
+endif()
+
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)

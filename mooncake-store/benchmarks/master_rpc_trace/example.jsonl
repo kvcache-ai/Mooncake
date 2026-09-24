@@ -1,0 +1,5 @@
+{"type":"master_rpc_trace","version":1,"time_unit":"us","metadata":{"source":"handwritten-smoke-test","initial_state":"empty"}}
+{"id":"write-0","timestamp_us":0,"client_id":"instance-0","op":"BatchPutStart","keys":["trace-demo/page-0","trace-demo/page-1"],"value_sizes":[4096,4096]}
+{"id":"commit-0","timestamp_us":1000,"client_id":"instance-0","op":"BatchPutEnd","keys":["trace-demo/page-0","trace-demo/page-1"],"put_start":"write-0"}
+{"id":"exists-1","timestamp_us":2000,"client_id":"instance-1","op":"BatchExistKey","keys":["trace-demo/page-0","trace-demo/missing"],"depends_on":["commit-0"]}
+{"id":"read-1","timestamp_us":2000,"client_id":"instance-1","op":"BatchGetReplicaList","keys":["trace-demo/page-0","trace-demo/page-1"],"depends_on":["commit-0"]}
