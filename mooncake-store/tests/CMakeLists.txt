@@ -51,6 +51,8 @@ add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
 add_store_test(master_config_test master_config_test.cpp)
+target_include_directories(master_config_test
+                           PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-store/src)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_store_test(replica_selection_config_test replica_selection_config_test.cpp)
 set_tests_properties(replica_selection_test
@@ -127,6 +129,8 @@ target_link_libraries(master_service_concurrent_scenario_test
                       PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
+target_include_directories(master_service_config_test
+                           PRIVATE ${CMAKE_SOURCE_DIR}/mooncake-store/src)
 add_store_test(master_service_processing_key_double_erase_test
                master_service_processing_key_double_erase_test.cpp)
 add_store_test(master_service_tenant_quota_test

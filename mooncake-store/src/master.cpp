@@ -17,6 +17,7 @@
 #include "allocator_status.h"
 #include "config/metrics_bootstrap_config_loader.h"
 #include "config/rpc_protocol_config.h"
+#include "config/tenant_quota_bootstrap_config_loader.h"
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
@@ -484,6 +485,26 @@ GetMetricsBootstrapCommandLineOverrides() {
     return command_line;
 }
 
+mooncake::TenantQuotaCommandLineOverrides GetTenantQuotaCommandLineOverrides() {
+    mooncake::TenantQuotaCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("enable_multi_tenants", &info) &&
+        !info.is_default) {
+        command_line.enable_multi_tenants = FLAGS_enable_multi_tenants;
+    }
+    if (google::GetCommandLineFlagInfo("tenant_quota_connector_type", &info) &&
+        !info.is_default) {
+        command_line.tenant_quota_connector_type =
+            FLAGS_tenant_quota_connector_type;
+    }
+    if (google::GetCommandLineFlagInfo("tenant_quota_connector_uri", &info) &&
+        !info.is_default) {
+        command_line.tenant_quota_connector_uri =
+            FLAGS_tenant_quota_connector_uri;
+    }
+    return command_line;
+}
+
 void ResolveRpcAddressFromInterfaceOrDie(
     mooncake::MasterConfig& master_config) {
     if (master_config.rpc_interface.empty()) {
@@ -727,16 +748,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
-    default_config.GetBool("enable_multi_tenants",
-                           &master_config.enable_multi_tenants,
-                           FLAGS_enable_multi_tenants);
-    default_config.GetString("tenant_quota_connector_type",
-                             &master_config.tenant_quota_connector_type,
-                             FLAGS_tenant_quota_connector_type);
-    default_config.GetString("tenant_quota_connector_uri",
-                             &master_config.tenant_quota_connector_uri,
-                             FLAGS_tenant_quota_connector_uri);
-
     default_config.GetString("snapshot_backup_dir",
                              &master_config.snapshot_backup_dir,
                              FLAGS_snapshot_backup_dir);
@@ -1277,23 +1288,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.quota_bytes = FLAGS_quota_bytes;
     }
-    if ((google::GetCommandLineFlagInfo("enable_multi_tenants", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_multi_tenants = FLAGS_enable_multi_tenants;
-    }
-    if ((google::GetCommandLineFlagInfo("tenant_quota_connector_type", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.tenant_quota_connector_type =
-            FLAGS_tenant_quota_connector_type;
-    }
-    if ((google::GetCommandLineFlagInfo("tenant_quota_connector_uri", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.tenant_quota_connector_uri =
-            FLAGS_tenant_quota_connector_uri;
-    }
     if ((google::GetCommandLineFlagInfo("max_total_finished_tasks", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1565,6 +1559,8 @@ int main(int argc, char* argv[]) {
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    master_config.tenant_quota = mooncake::ResolveTenantQuotaBootstrapConfig(
+        loaded_default_config, GetTenantQuotaCommandLineOverrides());
     try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
