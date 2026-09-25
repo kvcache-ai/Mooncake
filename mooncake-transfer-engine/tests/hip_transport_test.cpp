@@ -96,7 +96,8 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
                   dst, kLen, GPU_PREFIX + std::to_string(kSourceDevice)),
               0);
 
-    auto segment_id = engine->openSegment(server_name);
+    // P2P handshake binds a free port, so open the address it actually uses.
+    auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
     ASSERT_GE(segment_id, 0);
 
     ASSERT_EQ(cudaSetDevice(kSourceDevice), cudaSuccess);
