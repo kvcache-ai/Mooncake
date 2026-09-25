@@ -747,12 +747,15 @@ void TcpTransport::runGroupPump(
             // is_open() only describes the local descriptor. A peer may have
             // closed an otherwise idle pooled connection since its last ACK.
             char pending_byte;
-            const auto received =
-                lane->socket && lane->socket->is_open()
-                    ? recv(lane->socket->native_handle(), &pending_byte, 1,
-                           MSG_PEEK | MSG_DONTWAIT)
-                    : 0;
-            if (received >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+            asio::error_code peek_ec = asio::error::not_connected;
+            size_t received = 0;
+            if (lane->socket && lane->socket->is_open()) {
+                received = lane->socket->receive(
+                    asio::buffer(&pending_byte, 1),
+                    asio::socket_base::message_peek, peek_ec);
+            }
+            if (received != 0 || (peek_ec != asio::error::would_block &&
+                                  peek_ec != asio::error::try_again)) {
                 lane->socket.reset();
                 lane->state = LaneState::DISCONNECTED;
                 lane->last_connect_round = 0;
@@ -1032,6 +1035,7 @@ void TcpTransport::handleLaneConnected(
         } else {
             asio::error_code option_ec;
             lane->socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
+            if (!option_ec) lane->socket->non_blocking(true, option_ec);
             if (option_ec) {
                 option_error = option_ec.message();
             } else {

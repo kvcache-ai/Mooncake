@@ -19,13 +19,10 @@
 #include <asio/ip/v6_only.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
-#include <sys/socket.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
-#include <cerrno>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
