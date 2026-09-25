@@ -81,7 +81,10 @@ class TcpStagingBuffer {
     std::vector<char> buffer_;
 };
 
-#ifdef USE_MACA
+// cudaMemcpy on the legacy default stream waits behind every kernel the
+// process already queued, and the calling thread sits in it for the whole
+// wait. A private non-blocking stream keeps the copy off that lane; the sync
+// at the end preserves the copy's completion contract for the caller.
 static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
     cudaStream_t stream;
     cudaError_t status =
@@ -96,7 +99,6 @@ static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
     cudaError_t destroy_status = cudaStreamDestroy(stream);
     return status == cudaSuccess ? destroy_status : status;
 }
-#endif
 #endif
 
 // Forward declaration
@@ -253,14 +255,8 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
-#else
-            cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
-#endif
             if (cuda_status != cudaSuccess) {
                 LOG(ERROR) << "ServerSession::writeBody failed to copy from "
                               "CUDA memory. "
@@ -342,15 +338,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_COREX)
                 if (cuda_device_ >= 0) {
                     cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
                     cudaError_t cuda_status =
                         copyTcpCudaMemory(addr + total_transferred_bytes_,
                                           dram_buffer, transferred_bytes);
-#else
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
-#endif
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
                             << "ServerSession::readBody failed to copy to CUDA "
@@ -803,15 +793,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_COREX)
                 if (cuda_device_ >= 0) {
                     cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
                     cudaError_t cuda_status =
                         copyTcpCudaMemory(addr + total_transferred_bytes_,
                                           dram_buffer, transferred_bytes);
-#else
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
-#endif
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
                             << "ClientSession::readBody failed to copy to CUDA "
@@ -868,14 +852,8 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
-#ifdef USE_MACA
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
-#else
-            cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
-#endif
             if (cuda_status != cudaSuccess) {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
                               "CUDA memory. "
