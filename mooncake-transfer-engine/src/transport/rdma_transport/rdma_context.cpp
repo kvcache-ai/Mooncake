@@ -101,7 +101,7 @@ static Mlx5RegDmabufMr dataDirectRegMr() {
 
 bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_start = reinterpret_cast<uintptr_t>(region.addr);
-    const auto region_length = static_cast<uintptr_t>(region.mr->length);
+    const auto region_length = static_cast<uintptr_t>(region.length);
     return region_start <= addr && addr - region_start < region_length;
 }
 
@@ -754,6 +754,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
     mrMeta.addr = addr;
+    mrMeta.length = length;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
@@ -765,8 +766,17 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         if (Environ::Get().GetRdmaDataDirect()) {
             auto reg_mr = dataDirectRegMr();
             if (!reg_mr) return ERR_CONTEXT;
-            mrMeta.mr = reg_mr(pd_, exp.offset, length, (uintptr_t)addr, exp.fd,
-                               access, MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+            const size_t prefix = (uintptr_t)addr % getpagesize();
+            if (exp.offset < prefix ||
+                prefix > (size_t)globalConfig().max_mr_size - length) {
+                LOG(ERROR) << "Cannot align Data Direct memory region at "
+                           << addr << " length " << length << " dmabuf_offset "
+                           << exp.offset;
+                return ERR_INVALID_ARGUMENT;
+            }
+            mrMeta.mr = reg_mr(pd_, exp.offset - prefix, length + prefix,
+                               (uintptr_t)addr - prefix, exp.fd, access,
+                               MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
         } else
 #endif
         {
@@ -829,8 +839,9 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     // reading mr->length (or the cached region length) afterwards is a use-
     // after-free. We restore fork state on the same range to undo the
     // MADV_DONTFORK applied at register time (see issue #3639).
-    void *region_addr = iter->second.addr;
     size_t region_length = iter->second.mr->length;
+    void *region_addr = static_cast<char *>(iter->second.addr) -
+                        (region_length - iter->second.length);
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;

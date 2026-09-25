@@ -85,6 +85,7 @@ struct MemoryRegionMeta {
     // mr->addr is not set to starting address for iova based mr. Therefore we
     // track it ourselves.
     void *addr;
+    size_t length;
     struct ibv_mr *mr;
 };
 
