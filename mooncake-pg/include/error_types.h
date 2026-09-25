@@ -5,6 +5,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include <ylt/util/expected.hpp>
@@ -15,17 +17,6 @@ class PGAssertionException : public std::runtime_error {
    public:
     using std::runtime_error::runtime_error;
 };
-
-namespace detail {
-
-template <typename... Args>
-[[noreturn]] inline void throwPGAssertFailure(Args&&... args) {
-    std::ostringstream message;
-    (message << ... << std::forward<Args>(args));
-    throw PGAssertionException(message.str());
-}
-
-}  // namespace detail
 
 // Keep the order and values synchronized with mooncakePgResult_t.
 enum class PGErrorCode : uint8_t {
@@ -48,6 +39,55 @@ struct PGError {
 template <typename T>
 using PGResult = ylt::expected<T, PGError>;
 
+namespace detail {
+
+template <typename... Args>
+[[noreturn]] inline void throwPGAssertFailure(Args&&... args) {
+    std::ostringstream message;
+    (message << ... << std::forward<Args>(args));
+    throw PGAssertionException(message.str());
+}
+
+template <typename T>
+struct IsPGResult : std::false_type {};
+
+template <typename T>
+struct IsPGResult<ylt::expected<T, PGError>> : std::true_type {};
+
+template <typename T>
+using RemoveCVRef =
+    typename std::remove_cv<typename std::remove_reference<T>::type>::type;
+
+template <typename T>
+inline constexpr bool is_pg_result_v = IsPGResult<RemoveCVRef<T>>::value;
+
+inline PGError addPGErrorContext(PGError error, std::string_view expression,
+                                 std::string_view function,
+                                 std::string_view file, int line) {
+    const auto separator = file.find_last_of("/\\");
+    if (separator != std::string_view::npos) {
+        file.remove_prefix(separator + 1);
+    }
+
+    try {
+        std::string context("\n  while ");
+        context.append(expression);
+        context.append(" [");
+        context.append(function);
+        context.append(" @ ");
+        context.append(file);
+        context.push_back(':');
+        context.append(std::to_string(line));
+        context.push_back(']');
+        error.message.append(context);
+    } catch (...) {
+        // Preserve the original error when diagnostic enrichment fails.
+    }
+    return error;
+}
+
+}  // namespace detail
+
 inline auto makePGError(PGError error) {
     return ylt::unexpected<PGError>{std::move(error)};
 }
@@ -58,11 +98,28 @@ inline auto makePGError(PGErrorCode code, std::string message) {
 
 }  // namespace mooncake
 
-#define PG_ASSERT(condition, ...)                                  \
-    do {                                                           \
-        if (!(condition)) {                                        \
-            ::mooncake::detail::throwPGAssertFailure(__VA_ARGS__); \
-        }                                                          \
+#define PG_ASSERT(condition, ...)                                       \
+    do {                                                                \
+        static_assert(                                                  \
+            !::mooncake::detail::is_pg_result_v<decltype((condition))>, \
+            "PG_ASSERT does not accept PGResult");                      \
+        if (!(condition)) {                                             \
+            ::mooncake::detail::throwPGAssertFailure(__VA_ARGS__);      \
+        }                                                               \
+    } while (false)
+
+#define PG_ASSERT_OK(expression)                                               \
+    do {                                                                       \
+        auto&& pg_result_internal = (expression);                              \
+        static_assert(                                                         \
+            std::is_same_v<                                                    \
+                ::mooncake::detail::RemoveCVRef<decltype(pg_result_internal)>, \
+                ::mooncake::PGResult<void>>,                                   \
+            "PG_ASSERT_OK requires PGResult<void>");                           \
+        if (!pg_result_internal.has_value()) {                                 \
+            ::mooncake::detail::throwPGAssertFailure(                          \
+                #expression, " failed: ", pg_result_internal.error().message); \
+        }                                                                      \
     } while (false)
 
 #define PG_ASSERT_CUDA(expression)                                          \
@@ -72,28 +129,33 @@ inline auto makePGError(PGErrorCode code, std::string message) {
                   " failed: ", cudaGetErrorString(pg_cuda_error_internal)); \
     } while (false)
 
-#define PG_DETAIL_TRY(expression)                       \
-    do {                                                \
-        auto&& pg_result_internal = (expression);       \
-        if (!pg_result_internal.has_value()) {          \
-            return ::mooncake::makePGError(             \
-                std::move(pg_result_internal).error()); \
-        }                                               \
+#define PG_DETAIL_TRY(expression)                                       \
+    do {                                                                \
+        auto&& pg_result_internal = (expression);                       \
+        if (!pg_result_internal.has_value()) {                          \
+            return ::mooncake::makePGError(                             \
+                ::mooncake::detail::addPGErrorContext(                  \
+                    std::move(pg_result_internal).error(), #expression, \
+                    __func__, __FILE__, __LINE__));                     \
+        }                                                               \
     } while (false)
 
 #define PG_DETAIL_CONCAT_IMPL(left, right) left##right
 #define PG_DETAIL_CONCAT(left, right) PG_DETAIL_CONCAT_IMPL(left, right)
 
-#define PG_DETAIL_TRY_ASSIGN_IMPL(result_name, lhs, expression)         \
-    auto&& result_name = (expression);                                  \
-    if (!result_name.has_value()) {                                     \
-        return ::mooncake::makePGError(std::move(result_name).error()); \
-    }                                                                   \
+#define PG_DETAIL_TRY_ASSIGN_IMPL(result_name, lhs, expression,               \
+                                  expression_text)                            \
+    auto&& result_name = (expression);                                        \
+    if (!result_name.has_value()) {                                           \
+        return ::mooncake::makePGError(::mooncake::detail::addPGErrorContext( \
+            std::move(result_name).error(), expression_text, __func__,        \
+            __FILE__, __LINE__));                                             \
+    }                                                                         \
     lhs = std::move(result_name).value()
 
 #define PG_DETAIL_TRY_ASSIGN(lhs, ...)                                         \
     PG_DETAIL_TRY_ASSIGN_IMPL(PG_DETAIL_CONCAT(pg_result_internal_, __LINE__), \
-                              lhs, (__VA_ARGS__))
+                              lhs, (__VA_ARGS__), #__VA_ARGS__)
 
 #define PG_DETAIL_FIRST(first, ...) first
 
