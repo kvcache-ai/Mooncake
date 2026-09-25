@@ -704,6 +704,54 @@ Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
         return impl_->CheckSegmentStatus(sid);
 }
 
+namespace {
+// Translate a TENT Status into the classic negative ERR_* code that pre-TENT
+// callers of the int-returning TransferEngine API expect.
+//
+// TENT's Status::Code enum is dense and non-negative and does NOT share
+// numbering with the classic codes -- e.g. TENT kDeviceNotFound == 4 while
+// ERR_DEVICE_NOT_FOUND == -6, and TENT kNotImplemented == 200 collides with the
+// classic kMetadata magnitude. Returning (int)status.code() therefore both
+// flipped the sign (callers test `ret < 0`, so a positive code looked like
+// success) and reported the wrong error -- the Store client, for instance,
+// specifically tolerates ERR_ADDRESS_NOT_REGISTERED. Map each TENT code to its
+// classic equivalent; success stays 0. Unmapped/internal failures fall back to
+// ERR_CONTEXT, mirroring how the Status-returning shim methods already collapse
+// unknown TENT failures to Status::Context. Refs #3995 (P1-error-codes).
+int tentStatusToErrCode(const mooncake::tent::Status& status) {
+    if (status.ok()) return 0;
+    using Code = mooncake::tent::Status::Code;
+    switch (status.code()) {
+        case Code::kInvalidArgument:
+            return ERR_INVALID_ARGUMENT;
+        case Code::kTooManyRequests:
+            return ERR_TOO_MANY_REQUESTS;
+        case Code::kAddressNotRegistered:
+            return ERR_ADDRESS_NOT_REGISTERED;
+        case Code::kDeviceNotFound:
+            return ERR_DEVICE_NOT_FOUND;
+        case Code::kMalformedJson:
+            return ERR_MALFORMED_JSON;
+        case Code::kInvalidMetadataType:
+        case Code::kMetadataError:
+        case Code::kNeedsRefreshCache:
+            return ERR_METADATA;
+        case Code::kRdmaError:
+        case Code::kRpcServiceError:
+        case Code::kRpcConnectionError:
+            return ERR_ENDPOINT;
+        case Code::kCudaError:
+            return ERR_MEMORY;
+        case Code::kNotImplemented:
+            return ERR_NOT_IMPLEMENTED;
+        case Code::kInvalidEntry:
+        case Code::kInternalError:
+        default:
+            return ERR_CONTEXT;
+    }
+}
+}  // namespace
+
 int TransferEngine::closeSegment(SegmentHandle handle) {
     if (use_tent_) {
         auto status = impl_tent_->closeSegment(handle);
