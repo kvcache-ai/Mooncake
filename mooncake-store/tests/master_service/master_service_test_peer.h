@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <utility>
 
 #include "master_service.h"
@@ -49,6 +50,19 @@ class MasterServiceTestPeer {
 
     void SetBatchOpLogWriterFactoryForTesting(
         MasterService::BatchOpLogWriterFactory factory);
+
+    // Installs an OpLog writer without the etcd handshake: the batches such a
+    // writer accepts are made durable by its own `write_batch`. Everything
+    // above it -- slot reservation, entry construction and the commit that
+    // registers the durable finalizer -- is the production path.
+    static void InstallOpLogWriterForTesting(
+        MasterService& service, std::unique_ptr<OrderedOpLogWriter> writer) {
+        assert(!service.ordered_oplog_writer_);
+        assert(writer != nullptr);
+        service.ordered_oplog_writer_ = std::move(writer);
+        service.ordered_oplog_writer_->Start();
+        service.ordered_oplog_writer_->ActivateRuntimeMetrics();
+    }
 
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
@@ -250,6 +264,13 @@ class MasterServiceTestPeer {
         return service.promotion_in_flight_;
     }
 
+    static auto& PromotionRetryCursor(MasterService& service) {
+        return service.promotion_retry_cursor_;
+    }
+    static const auto& PromotionRetryCursor(const MasterService& service) {
+        return service.promotion_retry_cursor_;
+    }
+
     static auto& ReplicaCleanupWorker(MasterService& service) {
         return service.replica_cleanup_worker_;
     }
@@ -382,7 +403,9 @@ class MasterServiceTestPeer {
         service_.CleanupExpiredSoftPins(now);
     }
 
-    void ClearCandidatesForReload() { service_.ClearCandidatesForReload(); }
+    void ReconcilePromotionBookkeeping() {
+        service_.ReconcilePromotionBookkeeping();
+    }
 
     // Drops `key`'s pending dynamic-replication task state under the entry's
     // own lock, the way the sweep paths do.
@@ -448,22 +471,53 @@ class MasterServiceTestPeer {
 
     void FinalizeExpiredProcessingReplicasAfterDurable(
         std::shared_ptr<ObjectEntry> entry, const OpLogEntry& durable_entry,
+        const std::vector<ReplicaID>& processing_replica_ids,
         const std::chrono::system_clock::time_point& ttl) {
         service_.FinalizeExpiredProcessingReplicasAfterDurable(
-            std::move(entry), durable_entry, ttl);
+            std::move(entry), durable_entry, processing_replica_ids, ttl);
+    }
+
+    void FinalizeExpiredReplicationTaskAfterDurable(
+        std::shared_ptr<ObjectEntry> entry, const OpLogEntry& durable_entry,
+        ReplicaID source_id, const std::vector<ReplicaID>& target_ids,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch,
+        const std::chrono::system_clock::time_point& ttl) {
+        service_.FinalizeExpiredReplicationTaskAfterDurable(
+            std::move(entry), durable_entry, source_id, target_ids,
+            dynamic_replication_lease_id, dynamic_replication_version_epoch,
+            ttl);
+    }
+
+    void FinalizeMetadataEraseAfterDurable(std::shared_ptr<ObjectEntry> entry,
+                                           const TenantId& tenant_id,
+                                           QuotaEraseMode quota_mode) {
+        service_.FinalizeMetadataEraseAfterDurable(std::move(entry), tenant_id,
+                                                   quota_mode);
     }
 
     void FinalizeRemovedReplicasAfterDurable(
+        const std::shared_ptr<ObjectEntry>& entry,
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
         const std::vector<std::string>& previous_media_hint = {}) {
         service_.FinalizeRemovedReplicasAfterDurable(
-            durable_entry, replica_ids, quota_mode, previous_media_hint);
+            entry, durable_entry, replica_ids, quota_mode, previous_media_hint);
     }
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
         return service_.FindClientRecord(client_id);
+    }
+
+    // Test access to the service-owned lease table: the dynamic-replication
+    // proposal path files a lease under the publication that owns the
+    // proposal, and a test stages that record directly.
+    void PutDynamicReplicationLeaseForTesting(
+        const TenantId& tenant_id, const std::shared_ptr<ObjectEntry>& entry,
+        const UUID& proposal_id, ReplicaActionLease lease) {
+        service_.PutDynamicReplicationLease(tenant_id, entry, proposal_id,
+                                            std::move(lease));
     }
 
     TenantQuotaHandle GetBoundTenantQuotaHandle(

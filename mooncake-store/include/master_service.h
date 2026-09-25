@@ -1097,8 +1097,16 @@ class MasterService {
         std::unordered_set<std::string> promotion_candidate_keys;
     };
 
-    // One lock over the whole table: it is touched on the proposal paths and on
-    // a teardown, never on a read of the object route.
+    // One control-plane lock over the whole table, and a known boundary of the
+    // tenant-first migration: the records are keyed by tenant, but a lease
+    // proposal, a candidate index change and a teardown all take this same
+    // lock, so tenants serialize against each other here. The object route, the
+    // group table and the quota account are per-tenant and do not. Moving these
+    // records into per-tenant runtime with their own lock is follow-up work,
+    // not a correctness gap: the table is touched on the action paths below,
+    // never on a read of the object route. `DynamicReplicationLeaseTable` keeps
+    // its own internal lock, so a future per-tenant split does not need to
+    // widen this one.
     mutable std::mutex replica_action_mutex_;
     std::unordered_map<TenantId, TenantReplicaActionState, TenantIdHash>
         replica_action_state_ GUARDED_BY(replica_action_mutex_);
@@ -1112,6 +1120,13 @@ class MasterService {
     // leave a client acting on a key that is gone.
     void EraseReplicaActionLeasesForObject(const TenantId& tenant_id,
                                            std::string_view key);
+    // Drops every tenant's records for a reload that replaces all state: the
+    // leases and the candidate index are keyed by keys whose entries are gone,
+    // so keeping them would leave clients acting on objects that no longer
+    // exist and a candidate index that no publication owns. The promotion
+    // bookkeeping that shadows the table is part of the same step, so a reset
+    // path cannot retire one without the other.
+    void ResetReplicaActionStateForReload();
     [[nodiscard]] std::optional<ReplicaActionLease> FindDynamicReplicationLease(
         const TenantId& tenant_id, const UUID& proposal_id);
     // `entry` names the object the proposal belongs to, so a proposal cannot be
@@ -1217,12 +1232,18 @@ class MasterService {
     // publishes this entry and that it is not torn down. Nothing when `fn` did
     // not run.
     //
-    // The object's invalid memory replicas are dropped under the same lock
-    // first, which may tear the object down. The entry lock is not recursive:
-    // `fn` must not resolve the same key through this accessor again nor
-    // through `Tenant::WithPublishedObject`.
+    // This is the only accessor with a side effect: it drops the object's
+    // invalid memory replicas first, which may tear the object down. Three
+    // kinds of caller must not run that cleanup, and each has its own handle
+    // instead: a reader uses the read form below, a sweep that classifies the
+    // replicas it removes uses `Tenant::WithPublishedObject`, and a durable
+    // finalizer that acts on the publication it was armed for uses the captured
+    // entry's `WithExclusiveAccess`/`WithSharedAccess`.
+    //
+    // The entry lock is not recursive: `fn` must not resolve the same key
+    // through these accessors again.
     template <typename Fn>
-    [[nodiscard]] auto WithObjectMetadataForWrite(
+    [[nodiscard]] auto WithObjectMetadataForWriteAndCleanup(
         const ObjectIdentity& object_id, Fn&& fn) {
         using Result =
             std::invoke_result_t<Fn, metadata::Tenant&,
@@ -1255,9 +1276,10 @@ class MasterService {
             });
     }
 
-    // The reader's form: `fn` sees all four as const, and concurrent readers of
-    // one object do not exclude each other. The invalid-replica cleanup above
-    // is skipped, because a reader must not mutate what it reads.
+    // The read form: `fn` sees all four as const, and concurrent readers of one
+    // object do not exclude each other. The invalid-replica cleanup of the
+    // write form above is skipped, because a reader must not mutate what it
+    // reads.
     template <typename Fn>
     [[nodiscard]] auto WithObjectMetadataForRead(
         const ObjectIdentity& object_id, Fn&& fn) const {
@@ -1392,19 +1414,26 @@ class MasterService {
     void LoadTenantQuotaPoliciesFromStoreOrThrow();
     void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
     TenantQuotaPolicySnapshot BuildTenantQuotaPolicySnapshot() const;
+    // Every durable finalizer names the publication it was armed for and
+    // returns without a side effect once the route publishes another entry.
     void FinalizeRemovedReplicasAfterDurable(
+        const std::shared_ptr<ObjectEntry>& entry,
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
         const std::vector<std::string>& previous_media_hint = {});
     void FinalizeMetadataEraseAfterDurable(std::shared_ptr<ObjectEntry> entry,
                                            const TenantId& tenant_id,
                                            QuotaEraseMode quota_mode);
+    // The expired-processing cleanup names the write round it was armed for as
+    // well: UpsertStart preempts that round on the same entry and starts the
+    // next one, whose replicas carry other ids.
     void FinalizeExpiredProcessingReplicasAfterDurable(
         std::shared_ptr<ObjectEntry> entry, const OpLogEntry& durable_entry,
+        const std::vector<ReplicaID>& processing_replica_ids,
         const std::chrono::system_clock::time_point& ttl);
     void FinalizeExpiredReplicationTaskAfterDurable(
-        const OpLogEntry& durable_entry, ReplicaID source_id,
-        const std::vector<ReplicaID>& target_ids,
+        std::shared_ptr<ObjectEntry> entry, const OpLogEntry& durable_entry,
+        ReplicaID source_id, const std::vector<ReplicaID>& target_ids,
         const UUID& dynamic_replication_lease_id,
         uint64_t dynamic_replication_version_epoch,
         const std::chrono::system_clock::time_point& ttl);
@@ -1422,8 +1451,8 @@ class MasterService {
         const std::function<bool(const Replica&)>& is_stale) const;
     tl::expected<void, ErrorCode> PersistStaleHandleCleanupForHA(
         const std::string& why, const TenantId& tenant_id,
-        const std::string& key, ObjectMetadata& metadata,
-        const StaleHandleCleanupPlan& plan);
+        const std::shared_ptr<ObjectEntry>& entry, const std::string& key,
+        ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan);
     void RebuildGroupState();
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(
@@ -1589,7 +1618,12 @@ class MasterService {
     void DecrementCandidateCount();
     void BackoffCandidate(const ObjectIdentity& object_id,
                           PromotionQueueResult result);
-    void ClearCandidatesForReload();
+    // Reconciles the promotion bookkeeping with the routes the service
+    // publishes now: it unindexes every entry's candidate and zeroes the
+    // candidate count, the retry cursor and the in-flight counter that shadow
+    // it. This is a step of the reload reset above and of the snapshot restore,
+    // never a reset of its own.
+    void ReconcilePromotionBookkeeping();
     std::chrono::milliseconds CandidateBackoff(uint32_t retry_count) const;
     bool IsTransientResult(PromotionQueueResult result) const;
     size_t RunPromotionCandidateRetry();

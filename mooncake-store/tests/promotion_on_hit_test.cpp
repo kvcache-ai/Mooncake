@@ -77,8 +77,9 @@ class PromotionOnHitTest : public ::testing::Test {
             .RunPromotionCandidateRetryForTesting();
     }
 
-    static void ClearCandidatesForReloadForTesting(MasterService* service) {
-        MasterServiceTestPeer(*service).ClearCandidatesForReload();
+    static void ReconcilePromotionBookkeepingForTesting(
+        MasterService* service) {
+        MasterServiceTestPeer(*service).ReconcilePromotionBookkeeping();
     }
 
     static uint64_t GetPromotionCandidateCountForTesting(
@@ -3172,7 +3173,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_MultipleKeysTracked) {
     service->RemoveAll();
 }
 
-// ClearCandidatesForReload resets all candidate state and the global count.
+// ReconcilePromotionBookkeeping resets all candidate state and the global
+// count.
 TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -3198,7 +3200,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
         1u);
 
     // Simulate metadata reload.
-    ClearCandidatesForReloadForTesting(service.get());
+    ReconcilePromotionBookkeepingForTesting(service.get());
 
     EXPECT_EQ(
         CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),

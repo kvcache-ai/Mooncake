@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <future>
 #include <fstream>
@@ -53,6 +54,93 @@ class BlockingTenantQuotaPolicyStore final : public TenantQuotaPolicyStore {
     std::promise<void> save_started_promise_;
     std::promise<void> allow_save_promise_;
     std::future<void> allow_save_;
+};
+
+// An OpLog writer whose batches are durable on `write_batch`, used to drive the
+// sweeps that register a durable finalizer. While it is holding, the finalizer
+// the service committed is kept for the test to run when it chooses; the
+// reservation, entry construction and commit above the writer are the
+// production path.
+class HoldingOpLogWriter final : public OrderedOpLogWriter {
+   public:
+    HoldingOpLogWriter()
+        : OrderedOpLogWriter(OrderedOpLogWriterConfig{},
+                             [](const OpLogBatchRecord&, const DurablePrefix&) {
+                                 return ErrorCode::OK;
+                             }) {}
+
+    ~HoldingOpLogWriter() override { Stop(); }
+
+    void HoldFinalizers() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        holding_ = true;
+    }
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        const std::string key = entry.object_key;
+        bool hold = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            hold = holding_;
+        }
+        if (!hold) {
+            return OrderedOpLogWriter::Commit(
+                std::move(reservation), std::move(entry), std::move(callback));
+        }
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry),
+            [this, key,
+             callback = std::move(callback)](const OpLogEntry& durable) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                held_[key] = Held{durable, callback};
+                cv_.notify_all();
+            });
+    }
+
+    // The OpLog entry the finalizer committed for `key` was armed with. The
+    // callback runs on the writer's own thread, so this waits for it.
+    OpLogEntry WaitForHeldEntry(const std::string& key) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        EXPECT_TRUE(cv_.wait_for(lock, std::chrono::seconds(5),
+                                 [&] { return held_.count(key) != 0; }))
+            << "no durable finalizer was committed for " << key;
+        const auto it = held_.find(key);
+        return it == held_.end() ? OpLogEntry{} : it->second.entry;
+    }
+
+    // Runs the finalizer the service committed for `key`, on the calling
+    // thread.
+    void RunHeldFinalizerFor(const std::string& key) {
+        DurableCallback finalizer;
+        OpLogEntry durable;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            EXPECT_TRUE(cv_.wait_for(lock, std::chrono::seconds(5),
+                                     [&] { return held_.count(key) != 0; }))
+                << "no durable finalizer was committed for " << key;
+            auto it = held_.find(key);
+            if (it == held_.end()) {
+                return;
+            }
+            durable = it->second.entry;
+            finalizer = it->second.finalizer;
+            held_.erase(it);
+        }
+        finalizer(durable);
+    }
+
+   private:
+    struct Held {
+        OpLogEntry entry;
+        DurableCallback finalizer;
+    };
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool holding_{false};
+    std::map<std::string, Held> held_;
 };
 
 #ifdef USE_NOF
@@ -311,6 +399,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             *tenant, std::chrono::system_clock::time_point::max());
     }
 
+    // Runs the durable processing cleanup the sweep arms for this publication's
+    // current write round, with the replica ids that sweep records.
     void FinalizeExpiredProcessingForTest(MasterService& service,
                                           const TenantId& tenant_id,
                                           const std::string& key) {
@@ -322,7 +412,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         durable.object_key = key;
         MasterServiceTestPeer(service)
             .FinalizeExpiredProcessingReplicasAfterDurable(
-                object_entry, durable, std::chrono::system_clock::now());
+                object_entry, durable, ProcessingReplicaIdsOf(object_entry),
+                std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,
@@ -346,11 +437,17 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         ASSERT_TRUE(visited.has_value());
         ASSERT_FALSE(removed_ids.empty());
 
-        OpLogEntry entry;
-        entry.tenant_id = tenant_id.value();
-        entry.object_key = key;
+        OpLogEntry durable_entry;
+        durable_entry.tenant_id = tenant_id.value();
+        durable_entry.object_key = key;
+        // The durable cleanup names the publication it was armed for, so the
+        // test hands over the one the route publishes now.
+        auto object_entry = MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        ASSERT_NE(object_entry, nullptr);
         MasterServiceTestPeer(service).FinalizeRemovedReplicasAfterDurable(
-            entry, removed_ids, MasterServiceTestPeer::QuotaEraseMode::kFull);
+            object_entry, durable_entry, removed_ids,
+            MasterServiceTestPeer::QuotaEraseMode::kFull);
     }
 
     void AddCompletedDiskReplica(MasterService& service, const UUID& client_id,
@@ -361,6 +458,515 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         auto result =
             service.AddReplica(client_id, key, tenant_id, disk_replica);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
+    }
+
+    // --- The publication a durable cleanup was armed for ---------------------
+    //
+    // A durable finalizer is armed for one publication and runs later, on the
+    // OpLog writer's thread, after the key may have been removed and published
+    // again. Each test in this section stages two publications of one key, one
+    // on a segment each: `superseded_`, which the cleanup was armed for and
+    // which has already left the route, and `replacement_`, which the route
+    // publishes now. Each owns a soft pin, a promotion candidate, a
+    // dynamic-replication lease and a replication task of its own, so a stale
+    // cleanup that acts by key instead of by publication shows up in all of
+    // them.
+
+    struct StagedPublication {
+        UUID client;
+        std::string segment;
+        UUID proposal;
+        std::chrono::system_clock::time_point soft_pin_deadline;
+        ReplicationTask task;
+        std::shared_ptr<ObjectEntry> entry;
+    };
+
+    StagedPublication superseded_;
+    StagedPublication replacement_;
+    OpLogEntry durable_entry_;
+
+    // The promotion machinery the staging needs: promotion_on_hit binds only
+    // with offload enabled, and a zero pool watermark sends every admission
+    // down the watermark-rejection branch that records the retry candidate.
+    MasterServiceConfig MakeRecreateConfig(const TenantId& tenant,
+                                           bool enable_oplog = false) {
+        MasterServiceConfig config = MakeConfig({{tenant, 4096}});
+        config.enable_offload = true;
+        config.promotion_on_hit = true;
+        config.promotion_admission_threshold = 1;
+        config.eviction_high_watermark_ratio = 0.0;
+        // The processing sweep commits a durable cleanup only with the OpLog
+        // writer on, which the service enables for HA plus oplog.
+        config.enable_ha = enable_oplog;
+        config.enable_oplog = enable_oplog;
+        return config;
+    }
+
+    // An expired write round on `key`: a PROCESSING memory target plus a
+    // completed disk replica, which is what makes the processing sweep find
+    // work to do and commit a durable cleanup for it.
+    std::shared_ptr<ObjectEntry> StageExpiredProcessingRound(
+        MasterService& service, const UUID& client, const TenantId& tenant,
+        const std::string& key, uint64_t object_size) {
+        auto start =
+            service.PutStart(client, key, tenant, object_size, MemoryConfig());
+        EXPECT_TRUE(start.has_value()) << toString(start.error());
+        AddCompletedDiskReplica(service, client, key, tenant, object_size);
+        return MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+    }
+
+    // Leaves nothing running that would move the state under test: the
+    // eviction pass retries promotion candidates and its retry loop unindexes a
+    // candidate whose object still carries a memory replica, and the
+    // invalid-handle sweep erases an object whose last replica has a dead
+    // handle.
+    void QuiesceRecreateBackgroundWorkers(MasterService& service) {
+        MasterServiceTestPeer::EvictionRunning(service) = false;
+        if (MasterServiceTestPeer::EvictionThread(service).joinable()) {
+            MasterServiceTestPeer::EvictionThread(service).join();
+        }
+        MasterServiceTestPeer::ReplicaCleanupWorker(service).Stop();
+    }
+
+    // Publishes one complete MEMORY replica of `key` on `segment`, which is the
+    // only segment its replicas can land on.
+    void PublishOnSegment(MasterService& service, const UUID& client,
+                          const std::string& segment, const TenantId& tenant,
+                          const std::string& key, uint64_t size) {
+        ReplicateConfig config = MemoryConfig();
+        config.preferred_segment = segment;
+        auto start = service.PutStart(client, key, tenant, size, config);
+        ASSERT_TRUE(start.has_value()) << toString(start.error());
+        auto end = service.PutEnd(client, key, tenant, ReplicaType::MEMORY);
+        ASSERT_TRUE(end.has_value()) << toString(end.error());
+    }
+
+    // The soft pin a soft-pinning write leaves: committed on the publication
+    // and registered in the deadline index together.
+    void CommitSoftPin(MasterService& service, const TenantId& tenant,
+                       const std::string& key,
+                       const std::shared_ptr<ObjectEntry>& entry,
+                       const std::chrono::system_clock::time_point& deadline) {
+        entry->WithExclusiveAccess(
+            [&](ObjectMetadata& metadata, ObjectEntry::State&) {
+                SpinLocker locker(&metadata.lock);
+                metadata.soft_pin_timeout = deadline;
+            });
+        MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
+            tenant.MakeScopedKey(key), deadline);
+    }
+
+    // The dynamic-replication lease one publication owns, keyed by its own
+    // proposal id. An hour out: no sweep can retract it during the test.
+    ReplicaActionLease MakeReplicaActionLease(const TenantId& tenant,
+                                              const std::string& key,
+                                              const UUID& proposal_id) {
+        ReplicaActionLease lease;
+        lease.proposal_id = proposal_id;
+        lease.lease_id = proposal_id;
+        lease.tenant_id = tenant.value();
+        lease.key = key;
+        lease.expire_at_ms_epoch =
+            MasterServiceTestPeer::DynamicReplicationNowMs() + 3600000;
+        return lease;
+    }
+
+    // Publishes one publication of `key` on its own segment and stages the
+    // state it owns, so only the publication whose segment goes away is
+    // invalidated. `cleanup_pending` and `version_epoch` are the replication
+    // task records a durable cleanup of that publication is armed with, so the
+    // two publications must differ in them.
+    void StagePublication(MasterService& service, const TenantId& tenant,
+                          const std::string& key, uint64_t size,
+                          const std::string& segment, bool cleanup_pending,
+                          uint64_t version_epoch, StagedPublication& staged) {
+        MasterServiceTestPeer peer(service);
+        staged.segment = segment;
+        staged.client = MountSegment(service, /*size=*/4096, segment);
+        PublishOnSegment(service, staged.client, segment, tenant, key, size);
+        staged.entry = MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        ASSERT_NE(staged.entry, nullptr);
+        staged.proposal = generate_uuid();
+        staged.soft_pin_deadline =
+            std::chrono::system_clock::now() + std::chrono::seconds(600);
+
+        // The records a replication in flight leaves behind: this publication's
+        // own replica as the source, and the target id its task had just
+        // allocated.
+        const auto replica_ids = MemoryReplicaIdsOf(staged.entry);
+        ASSERT_EQ(replica_ids.size(), 1u);
+        staged.task =
+            ReplicationTask{.client_id = staged.client,
+                            .start_time = std::chrono::system_clock::now(),
+                            .type = ReplicationTask::Type::COPY,
+                            .source_id = replica_ids.front(),
+                            .replica_ids = {replica_ids.front() + 1},
+                            .pending_quota_charge_bytes = 0,
+                            .dynamic_replication_lease_id = staged.proposal,
+                            .dynamic_replication_version_epoch = version_epoch,
+                            .durable_cleanup_pending = cleanup_pending};
+
+        CommitSoftPin(service, tenant, key, staged.entry,
+                      staged.soft_pin_deadline);
+        using Result = MasterServiceTestPeer::PromotionQueueResult;
+        const MasterServiceTestPeer::ObjectIdentity identity{tenant, key};
+        const auto queued =
+            peer.TryPushPromotionQueue(identity, /*record_candidate=*/true);
+        ASSERT_EQ(queued, Result::kWatermarkRejected);
+        peer.PutDynamicReplicationLeaseForTesting(
+            tenant, staged.entry, staged.proposal,
+            MakeReplicaActionLease(tenant, key, staged.proposal));
+        SetReplicationTaskForTest(service, tenant, key, staged.task);
+
+        durable_entry_.tenant_id = tenant.value();
+        durable_entry_.object_key = key;
+    }
+
+    void StageSupersededPublication(MasterService& service,
+                                    const TenantId& tenant,
+                                    const std::string& key, uint64_t size) {
+        StagePublication(service, tenant, key, size, "superseded_segment",
+                         /*cleanup_pending=*/true, /*version_epoch=*/1,
+                         superseded_);
+    }
+
+    void StageReplacementPublication(MasterService& service,
+                                     const TenantId& tenant,
+                                     const std::string& key, uint64_t size) {
+        StagePublication(service, tenant, key, size, "replacement_segment",
+                         /*cleanup_pending=*/false, /*version_epoch=*/2,
+                         replacement_);
+    }
+
+    // The one mounted segment named `name`, or an empty UUID.
+    UUID SegmentIdByName(MasterService& service, const std::string& name) {
+        auto segment_access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        std::vector<std::pair<Segment, UUID>> mounted_segments;
+        EXPECT_EQ(segment_access.GetAllSegments(mounted_segments),
+                  ErrorCode::OK);
+        for (const auto& mounted : mounted_segments) {
+            if (mounted.first.name == name) {
+                return mounted.first.id;
+            }
+        }
+        return UUID{};
+    }
+
+    // Invalidates the memory handles of `segment_name`'s replicas the way a
+    // segment going away does. The public unmount path would sweep the objects
+    // instead.
+    void PrepareSegmentUnmount(MasterService& service,
+                               const std::string& segment_name) {
+        const UUID segment_id = SegmentIdByName(service, segment_name);
+        ASSERT_NE(segment_id, UUID{});
+        auto segment_access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
+                                     segment_id, metrics_dec_capacity));
+    }
+
+    // Stages the replication task the publication now routed for `key` owns.
+    void SetReplicationTaskForTest(MasterService& service,
+                                   const TenantId& tenant,
+                                   const std::string& key,
+                                   const ReplicationTask& task) {
+        MasterServiceTestPeer peer(service);
+        const auto staged = peer.WithPublishedObjectForWrite(
+            tenant, key,
+            [&task](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+                    ObjectMetadata&, ObjectEntry::State& state) {
+                state.replication_task = task;
+                return true;
+            });
+        ASSERT_TRUE(staged.has_value());
+    }
+
+    // What one publication owns, as a stale cleanup must leave it: the state on
+    // its own entry, the service records keyed by its key (the candidate index
+    // and its count, the dynamic-replication lease) and the tenant charge.
+    struct PublicationState {
+        std::vector<ReplicaID> replica_ids;
+        std::vector<std::string> kv_media;
+        std::optional<std::chrono::system_clock::time_point> soft_pin;
+        bool is_processing{false};
+        uint64_t committed_quota{0};
+        std::vector<uint64_t> candidate_fields;
+        std::vector<uint64_t> task_fields;
+        std::vector<std::string> candidate_keys;
+        size_t candidate_count{0};
+        uint64_t charged_bytes{0};
+        UUID lease_proposal;
+    };
+
+    // The soft-pin deadline the index still holds for `key`, read through the
+    // index's only reader: PopExpired consumes what it reports, so a test reads
+    // this last. `due` is the deadline the registration is expected to hold.
+    std::optional<std::chrono::system_clock::time_point>
+    RegisteredSoftPinDeadline(
+        MasterService& service, const TenantId& tenant, const std::string& key,
+        const std::chrono::system_clock::time_point& due) {
+        auto& index = MasterServiceTestPeer::SoftPinDeadlineIndex(service);
+        const std::string scoped_key = tenant.MakeScopedKey(key);
+        for (const auto& registration : index.PopExpired(due)) {
+            if (registration.scoped_key == scoped_key) {
+                return registration.deadline;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // The replica ids of one publication's memory replicas, read through its
+    // own handle: a replica whose memory handle is dead is exactly the state
+    // these tests stage, and a readability predicate would hide it.
+    std::vector<ReplicaID> MemoryReplicaIdsOf(
+        const std::shared_ptr<ObjectEntry>& entry) {
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                std::vector<ReplicaID> ids;
+                metadata.VisitReplicas(&Replica::fn_is_memory_replica,
+                                       [&ids](const Replica& replica) {
+                                           ids.push_back(replica.id());
+                                       });
+                std::sort(ids.begin(), ids.end());
+                return ids;
+            });
+    }
+
+    // The replica ids of one publication's processing replicas, in id order:
+    // the write round in flight on that publication.
+    std::vector<ReplicaID> ProcessingReplicaIdsOf(
+        const std::shared_ptr<ObjectEntry>& entry) {
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                std::vector<ReplicaID> ids;
+                metadata.VisitReplicas(&Replica::fn_is_processing,
+                                       [&ids](const Replica& replica) {
+                                           ids.push_back(replica.id());
+                                       });
+                std::sort(ids.begin(), ids.end());
+                return ids;
+            });
+    }
+
+    bool IsProcessingOf(const std::shared_ptr<ObjectEntry>& entry) {
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata&, const ObjectEntry::State& state) {
+                return state.is_processing;
+            });
+    }
+
+    // The media one publication announces, the bytes its quota ledger holds,
+    // the soft-pin deadline committed on it, and how many of its replicas carry
+    // a dead memory handle.
+    std::vector<std::string> KvMediaOf(
+        const std::shared_ptr<ObjectEntry>& entry) {
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                return MasterServiceTestPeer::KvMediaForMetadata(metadata);
+            });
+    }
+
+    std::optional<std::chrono::system_clock::time_point> CommittedSoftPinOf(
+        const std::shared_ptr<ObjectEntry>& entry) {
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                return metadata.GetCommittedSoftPinTimeout();
+            });
+    }
+
+    uint64_t CommittedQuotaOf(const std::shared_ptr<ObjectEntry>& entry) {
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                return metadata.quota_ledger.CommittedBytes();
+            });
+    }
+
+    size_t InvalidHandleCountOf(const std::shared_ptr<ObjectEntry>& entry) {
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                return metadata.CountReplicas([](const Replica& replica) {
+                    return replica.has_invalid_mem_handle();
+                });
+            });
+    }
+
+    // The scalar contents of one publication's promotion candidate, in field
+    // order. The candidate record has no equality and its timestamps move, so a
+    // test compares this projection instead.
+    std::vector<uint64_t> PromotionCandidateFieldsOf(
+        const std::shared_ptr<ObjectEntry>& entry) {
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata&,
+               const ObjectEntry::State& state) -> std::vector<uint64_t> {
+                if (!state.promotion_candidate.has_value()) {
+                    return {};
+                }
+                const auto& candidate = *state.promotion_candidate;
+                return {candidate.sketch_score,
+                        static_cast<uint64_t>(candidate.last_reason),
+                        static_cast<uint64_t>(candidate.last_error),
+                        candidate.retry_count, candidate.execution_failures};
+            });
+    }
+
+    // The contents of one replication task, in field order, with its target
+    // replica ids last. The task record has no equality either.
+    static std::vector<uint64_t> ReplicationTaskFields(
+        const ReplicationTask& task) {
+        std::vector<uint64_t> fields{
+            static_cast<uint64_t>(task.type),
+            task.source_id,
+            task.pending_quota_charge_bytes,
+            task.dynamic_replication_lease_id.first,
+            task.dynamic_replication_lease_id.second,
+            task.dynamic_replication_version_epoch,
+            task.durable_cleanup_pending ? 1u : 0u,
+            task.client_id.first,
+            task.client_id.second,
+            static_cast<uint64_t>(task.start_time.time_since_epoch().count())};
+        fields.insert(fields.end(), task.replica_ids.begin(),
+                      task.replica_ids.end());
+        return fields;
+    }
+
+    std::vector<uint64_t> ReplicationTaskFieldsOf(
+        const std::shared_ptr<ObjectEntry>& entry) {
+        return entry->WithSharedAccess(
+            [](const ObjectMetadata&, const ObjectEntry::State& state) {
+                return state.replication_task.has_value()
+                           ? ReplicationTaskFields(*state.replication_task)
+                           : std::vector<uint64_t>{};
+            });
+    }
+
+    // Reads everything a stale cleanup must leave alone. `staged_task` is the
+    // task the staging recorded and the lease is the one it filed, both checked
+    // here, so no test asserts against a state its own staging never reached.
+    PublicationState CapturePublicationState(
+        MasterService& service, MasterServiceTestPeer& peer,
+        const TenantId& tenant, const std::shared_ptr<ObjectEntry>& entry,
+        const ReplicationTask& staged_task, const UUID& lease_proposal) {
+        PublicationState state;
+        state.replica_ids = MemoryReplicaIdsOf(entry);
+        state.kv_media = KvMediaOf(entry);
+        state.soft_pin = CommittedSoftPinOf(entry);
+        state.is_processing = IsProcessingOf(entry);
+        state.committed_quota = CommittedQuotaOf(entry);
+        state.candidate_fields = PromotionCandidateFieldsOf(entry);
+        state.task_fields = ReplicationTaskFieldsOf(entry);
+        state.candidate_keys =
+            MasterServiceTestPeer::PromotionCandidateKeys(service, tenant);
+        state.candidate_count = peer.CountCandidatesForTesting(tenant);
+        state.charged_bytes = Snapshot(service, tenant).charged_bytes;
+        state.lease_proposal = lease_proposal;
+        EXPECT_EQ(state.task_fields, ReplicationTaskFields(staged_task));
+        EXPECT_TRUE(state.soft_pin.has_value());
+        EXPECT_FALSE(state.candidate_fields.empty());
+        EXPECT_EQ(state.candidate_keys,
+                  (std::vector<std::string>{entry->key()}));
+        EXPECT_EQ(state.candidate_count, 1u);
+        EXPECT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                        service, tenant, lease_proposal)
+                        .has_value());
+        return state;
+    }
+
+    // The publication the cleanup did not own keeps every record it holds.
+    void ExpectPublicationUnchanged(MasterService& service,
+                                    MasterServiceTestPeer& peer,
+                                    const TenantId& tenant,
+                                    const std::shared_ptr<ObjectEntry>& entry,
+                                    const PublicationState& before) {
+        EXPECT_EQ(
+            MasterServiceTestPeer::FindObject(
+                service,
+                MasterServiceTestPeer::ObjectIdentity{tenant, entry->key()}),
+            entry);
+        EXPECT_EQ(MemoryReplicaIdsOf(entry), before.replica_ids);
+        EXPECT_EQ(KvMediaOf(entry), before.kv_media);
+        EXPECT_EQ(CommittedSoftPinOf(entry), before.soft_pin);
+        EXPECT_EQ(IsProcessingOf(entry), before.is_processing);
+        EXPECT_EQ(CommittedQuotaOf(entry), before.committed_quota);
+        EXPECT_EQ(PromotionCandidateFieldsOf(entry), before.candidate_fields);
+        EXPECT_EQ(ReplicationTaskFieldsOf(entry), before.task_fields);
+        EXPECT_EQ(
+            MasterServiceTestPeer::PromotionCandidateKeys(service, tenant),
+            before.candidate_keys);
+        EXPECT_EQ(peer.CountCandidatesForTesting(tenant),
+                  before.candidate_count);
+        EXPECT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                        service, tenant, before.lease_proposal)
+                        .has_value());
+        EXPECT_EQ(Snapshot(service, tenant).charged_bytes,
+                  before.charged_bytes);
+    }
+
+    // How the superseded publication leaves the route before the replacement is
+    // published. `kEraseRemoved` marks its replicas REMOVED first, the state
+    // FinalizeRemovedReplicasAfterDurable acts on.
+    enum class SupersededExit { kErase, kEraseRemoved, kReleaseRouteSlot };
+
+    // Publishes one key twice, one segment per publication: `superseded_`
+    // leaves the route through `exit`, and the replacement is published on its
+    // own segment with `invalidate_replacement_handle` deciding whether its
+    // memory handle is dead. `removed_ids` receives the ids kEraseRemoved
+    // marked. The state the replacement owns is checked here; a test that reads
+    // it again captures what it needs.
+    void StageRecreate(MasterService& service, MasterServiceTestPeer& peer,
+                       const TenantId& tenant, const std::string& key,
+                       uint64_t object_size, SupersededExit exit,
+                       bool invalidate_replacement_handle,
+                       std::vector<ReplicaID>* removed_ids = nullptr) {
+        QuiesceRecreateBackgroundWorkers(service);
+        StageSupersededPublication(service, tenant, key, object_size);
+
+        if (exit == SupersededExit::kEraseRemoved) {
+            ASSERT_NE(removed_ids, nullptr);
+            // The replicas the superseded publication's own cleanup pops.
+            const auto marked = peer.WithPublishedObjectForWrite(
+                tenant, key,
+                [removed_ids](metadata::Tenant&,
+                              const std::shared_ptr<ObjectEntry>&,
+                              ObjectMetadata& metadata, ObjectEntry::State&) {
+                    metadata.VisitReplicas(
+                        &Replica::fn_is_memory_replica,
+                        [removed_ids](Replica& replica) {
+                            removed_ids->push_back(replica.id());
+                            replica.mark_removed();
+                        });
+                    return true;
+                });
+            ASSERT_TRUE(marked.has_value());
+            ASSERT_EQ(removed_ids->size(), 1u);
+        }
+        if (exit == SupersededExit::kReleaseRouteSlot) {
+            // The erase cleanup's own gate is the route identity and its
+            // teardown claim would make a stale call a no-op, so the superseded
+            // publication leaves the route without one: the state a reload
+            // rebuilding the tenant's route leaves behind.
+            ASSERT_TRUE(GetOrCreateTenantHandleForTest(service, tenant)
+                            ->RemoveObject(superseded_.entry));
+        } else {
+            ASSERT_TRUE(peer.EraseObjectForTesting(tenant, key));
+        }
+
+        StageReplacementPublication(service, tenant, key, object_size);
+        ASSERT_NE(replacement_.entry, superseded_.entry);
+        if (invalidate_replacement_handle) {
+            // The replacement's handle is dead, the state the read-write
+            // accessor the older cleanups resolved through drops before its
+            // callback.
+            PrepareSegmentUnmount(service, replacement_.segment);
+            ASSERT_EQ(InvalidHandleCountOf(replacement_.entry), 1u);
+        }
+        // Checks that the replacement really owns the soft pin, the promotion
+        // candidate, the candidate index and its lease.
+        (void)CapturePublicationState(service, peer, tenant, replacement_.entry,
+                                      replacement_.task, replacement_.proposal);
     }
 
     void ExpectDiskOnlyObjectAndChargedBytes(MasterService& service,
@@ -850,6 +1456,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     UUID client_id = MountSegment(service);
+    const MasterServiceTestPeer::ObjectIdentity identity{tenant_id, "key"};
 
     auto start =
         service.PutStart(client_id, "key", tenant_id, 100, MemoryConfig());
@@ -857,9 +1464,18 @@ TEST_F(MasterServiceTenantQuotaTest,
     AddCompletedDiskReplica(service, client_id, "key", tenant_id, 100);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
 
+    // No next round intervenes, so the ids the cleanup was armed for are the
+    // ones it removes.
+    const auto entry = MasterServiceTestPeer::FindObject(service, identity);
+    ASSERT_NE(entry, nullptr);
+    const std::vector<ReplicaID> armed_ids = ProcessingReplicaIdsOf(entry);
+    ASSERT_EQ(armed_ids.size(), 1u);
+
     FinalizeExpiredProcessingForTest(service, tenant_id, "key");
 
     ExpectDiskOnlyObjectAndChargedBytes(service, tenant_id, "key", 0);
+    EXPECT_TRUE(ProcessingReplicaIdsOf(entry).empty());
+    EXPECT_FALSE(IsProcessingOf(entry));
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -898,6 +1514,251 @@ TEST_F(MasterServiceTenantQuotaTest,
     FinalizeRemovedMemoryReplicasForTest(service, tenant_id, "key");
 
     ExpectDiskOnlyObjectAndChargedBytes(service, tenant_id, "key", 0);
+}
+
+// A durable cleanup is armed for one publication, so a same-key recreate that
+// lands while it is still in flight keeps the state it owns. The replacement is
+// staged with a dead memory handle, the state the read-write accessor the
+// cleanup resolves through drops before its callback.
+TEST_F(MasterServiceTenantQuotaTest,
+       DurableRemovalOfSupersededPublicationSparesTheRecreate) {
+    const TenantId tenant("tenant-a");
+    const std::string key = "recreated-key";
+    const uint64_t object_size = 128;
+
+    MasterService service(MakeRecreateConfig(tenant));
+    MasterServiceTestPeer peer(service);
+    std::vector<ReplicaID> removed_ids;
+    StageRecreate(service, peer, tenant, key, object_size,
+                  SupersededExit::kEraseRemoved,
+                  /*invalidate_replacement_handle=*/true, &removed_ids);
+    const auto before_replicas = MemoryReplicaIdsOf(replacement_.entry);
+    const uint64_t before_charged = Snapshot(service, tenant).charged_bytes;
+
+    peer.FinalizeRemovedReplicasAfterDurable(
+        superseded_.entry, durable_entry_, removed_ids,
+        MasterServiceTestPeer::QuotaEraseMode::kFull);
+
+    // Its own discriminator: the route still publishes the replacement, with
+    // the dead-handle replica the accessor this cleanup resolved through would
+    // have dropped, and the charge it carries is untouched.
+    EXPECT_EQ(MasterServiceTestPeer::FindObject(
+                  service, MasterServiceTestPeer::ObjectIdentity{tenant, key}),
+              replacement_.entry);
+    EXPECT_EQ(MemoryReplicaIdsOf(replacement_.entry), before_replicas);
+    EXPECT_EQ(InvalidHandleCountOf(replacement_.entry), 1u);
+    EXPECT_EQ(Snapshot(service, tenant).charged_bytes, before_charged);
+}
+
+// The comprehensive superseded-publication test: the metadata erase did its
+// damage under the object key rather than under the publication, so it
+// published a KV removal for the key, retracted every dynamic-replication lease
+// of that key, dropped the key's soft-pin deadline registration, unindexed its
+// promotion candidate and released the superseded publication's charge. Every
+// record the replacement owns is read again after it.
+TEST_F(MasterServiceTenantQuotaTest, DurableMetadataEraseSparesTheRecreate) {
+    const TenantId tenant("tenant-a");
+    const std::string key = "recreated-key";
+    const uint64_t object_size = 128;
+
+    MasterService service(MakeRecreateConfig(tenant));
+    MasterServiceTestPeer peer(service);
+    StageRecreate(service, peer, tenant, key, object_size,
+                  SupersededExit::kReleaseRouteSlot,
+                  /*invalidate_replacement_handle=*/false);
+    const auto before =
+        CapturePublicationState(service, peer, tenant, replacement_.entry,
+                                replacement_.task, replacement_.proposal);
+    // The replacement owns the soft-pin registration this erase used to take by
+    // key, and the superseded publication's charge is still on the tenant:
+    // dropping its route slot released nothing.
+    ASSERT_EQ(peer.SoftPinRegistrationCount(), 1u);
+    ASSERT_EQ(before.charged_bytes, 2 * object_size);
+
+    peer.FinalizeMetadataEraseAfterDurable(
+        superseded_.entry, tenant,
+        MasterServiceTestPeer::QuotaEraseMode::kFull);
+
+    ExpectPublicationUnchanged(service, peer, tenant, replacement_.entry,
+                               before);
+    // The index's only reader consumes what it reports, so the registration is
+    // read last: it still holds the deadline the replacement registered.
+    EXPECT_EQ(RegisteredSoftPinDeadline(service, tenant, key,
+                                        replacement_.soft_pin_deadline),
+              replacement_.soft_pin_deadline);
+}
+
+// The expired-processing cleanup resolves through the tenant's plain published
+// object. It used to resolve through the read-write accessor, whose
+// invalid-replica cleanup ran on whatever the route published, so a same-key
+// recreate whose own replica has a dead handle was dropped and torn down before
+// the cleanup compared the publication it was armed for.
+TEST_F(MasterServiceTenantQuotaTest,
+       DurableExpiredProcessingCleanupSparesTheRecreate) {
+    const TenantId tenant("tenant-a");
+    const std::string key = "recreated-key";
+    const uint64_t object_size = 128;
+
+    MasterService service(MakeRecreateConfig(tenant));
+    MasterServiceTestPeer peer(service);
+    StageRecreate(service, peer, tenant, key, object_size,
+                  SupersededExit::kErase,
+                  /*invalidate_replacement_handle=*/true);
+    const auto before_replicas = MemoryReplicaIdsOf(replacement_.entry);
+
+    peer.FinalizeExpiredProcessingReplicasAfterDurable(
+        superseded_.entry, durable_entry_,
+        MemoryReplicaIdsOf(superseded_.entry),
+        std::chrono::system_clock::now());
+
+    // Its own discriminator: the accessor would have dropped the replacement's
+    // dead-handle replica, and the route would have published nothing.
+    EXPECT_EQ(MasterServiceTestPeer::FindObject(
+                  service, MasterServiceTestPeer::ObjectIdentity{tenant, key}),
+              replacement_.entry);
+    EXPECT_EQ(InvalidHandleCountOf(replacement_.entry), 1u);
+    EXPECT_EQ(MemoryReplicaIdsOf(replacement_.entry), before_replicas);
+}
+
+// The expired-replication cleanup carried the same accessor damage as the
+// processing one, and it adds its own task-token check: the task records the
+// ids and the lease it was created with, so the cleanup of one publication must
+// not consume the task another one owns.
+TEST_F(MasterServiceTenantQuotaTest,
+       DurableExpiredReplicationCleanupSparesTheRecreate) {
+    const TenantId tenant("tenant-a");
+    const std::string key = "recreated-key";
+    const uint64_t object_size = 128;
+
+    MasterService service(MakeRecreateConfig(tenant));
+    MasterServiceTestPeer peer(service);
+    StageRecreate(service, peer, tenant, key, object_size,
+                  SupersededExit::kErase,
+                  /*invalidate_replacement_handle=*/true);
+    // The records of the task the superseded publication armed this cleanup
+    // for: the callback is handed them verbatim.
+    const ReplicationTask superseded_task = superseded_.task;
+    // The replacement owns a different task in every field the callback
+    // compares.
+    ASSERT_TRUE(superseded_task.durable_cleanup_pending);
+    ASSERT_FALSE(replacement_.task.durable_cleanup_pending);
+    ASSERT_NE(replacement_.task.source_id, superseded_task.source_id);
+    ASSERT_NE(replacement_.task.replica_ids, superseded_task.replica_ids);
+    ASSERT_NE(replacement_.task.dynamic_replication_lease_id,
+              superseded_task.dynamic_replication_lease_id);
+
+    peer.FinalizeExpiredReplicationTaskAfterDurable(
+        superseded_.entry, durable_entry_, superseded_task.source_id,
+        superseded_task.replica_ids,
+        superseded_task.dynamic_replication_lease_id,
+        superseded_task.dynamic_replication_version_epoch,
+        std::chrono::system_clock::now());
+
+    // Its own discriminator: the task-token check matched the superseded
+    // publication's own records, so the replacement keeps the task it was
+    // staged with and the route it was published on.
+    EXPECT_EQ(MasterServiceTestPeer::FindObject(
+                  service, MasterServiceTestPeer::ObjectIdentity{tenant, key}),
+              replacement_.entry);
+    EXPECT_EQ(ReplicationTaskFieldsOf(replacement_.entry),
+              ReplicationTaskFields(replacement_.task));
+}
+
+// The comprehensive stale-cleanup test, driven through the real scheduling
+// path: DiscardExpiredProcessingReplicas finds each expired write round,
+// records its replica ids and commits them into a durable finalizer, and the
+// writer this test installs holds those finalizers until the test runs them.
+TEST_F(MasterServiceTenantQuotaTest,
+       DurableProcessingCleanupSparesTheNextRound) {
+    const TenantId tenant("tenant-a");
+    const std::string key = "processing-round-key";
+    const std::string untouched_key = "processing-round-key-without-successor";
+    const uint64_t object_size = 128;
+    const MasterServiceTestPeer::ObjectIdentity identity{tenant, key};
+
+    MasterService service(MakeRecreateConfig(tenant, /*enable_oplog=*/true));
+    MasterServiceTestPeer peer(service);
+    QuiesceRecreateBackgroundWorkers(service);
+    const UUID client = MountSegment(service, /*size=*/4096, "round-segment");
+    // A completed disk replica may only be registered for a client whose local
+    // disk segment is mounted.
+    ASSERT_TRUE(
+        service.MountLocalDiskSegment(client, /*enable_offloading=*/true)
+            .has_value());
+
+    const auto entry =
+        StageExpiredProcessingRound(service, client, tenant, key, object_size);
+    ASSERT_NE(entry, nullptr);
+    const std::vector<ReplicaID> armed_ids = ProcessingReplicaIdsOf(entry);
+    ASSERT_EQ(armed_ids.size(), 1u);
+    const auto untouched_entry = StageExpiredProcessingRound(
+        service, client, tenant, untouched_key, object_size);
+    ASSERT_NE(untouched_entry, nullptr);
+    const std::vector<ReplicaID> untouched_armed_ids =
+        ProcessingReplicaIdsOf(untouched_entry);
+    ASSERT_EQ(untouched_armed_ids.size(), 1u);
+
+    auto writer = std::make_unique<HoldingOpLogWriter>();
+    auto* holding_writer = writer.get();
+    MasterServiceTestPeer::InstallOpLogWriterForTesting(service,
+                                                        std::move(writer));
+    holding_writer->HoldFinalizers();
+    DiscardExpiredProcessingForTest(service, tenant);
+    // The sweep committed a durable entry per key instead of discarding inline:
+    // with the OpLog on, the replicas go only when that finalizer runs.
+    const OpLogEntry armed_entry = holding_writer->WaitForHeldEntry(key);
+    ASSERT_EQ(armed_entry.object_key, key);
+    ASSERT_EQ(armed_entry.op_type, OpType::PUT_END);
+    ASSERT_EQ(ProcessingReplicaIdsOf(entry), armed_ids);
+
+    // The next round on the same entry: UpsertStart preempts `armed_ids` and
+    // moves the complete replica into PROCESSING.
+    auto upsert =
+        service.UpsertStart(client, key, tenant, object_size, MemoryConfig());
+    ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
+    ASSERT_EQ(MasterServiceTestPeer::FindObject(service, identity), entry);
+    const std::vector<ReplicaID> next_round_ids = ProcessingReplicaIdsOf(entry);
+    ASSERT_EQ(next_round_ids.size(), 1u);
+    ASSERT_NE(next_round_ids, armed_ids);
+
+    // The next round owns its own soft pin, promotion candidate, lease and
+    // task.
+    const UUID proposal = generate_uuid();
+    CommitSoftPin(service, tenant, key, entry,
+                  std::chrono::system_clock::now() + std::chrono::seconds(600));
+    ASSERT_EQ(peer.TryPushPromotionQueue(identity, /*record_candidate=*/true),
+              MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected);
+    peer.PutDynamicReplicationLeaseForTesting(
+        tenant, entry, proposal, MakeReplicaActionLease(tenant, key, proposal));
+    const ReplicationTask next_round_task{
+        .client_id = client,
+        .start_time = std::chrono::system_clock::now(),
+        .type = ReplicationTask::Type::COPY,
+        .source_id = next_round_ids.front(),
+        .replica_ids = {next_round_ids.front() + 1},
+        .pending_quota_charge_bytes = 0,
+        .dynamic_replication_lease_id = proposal,
+        .dynamic_replication_version_epoch = 3,
+        .durable_cleanup_pending = false};
+    SetReplicationTaskForTest(service, tenant, key, next_round_task);
+
+    const auto before = CapturePublicationState(service, peer, tenant, entry,
+                                                next_round_task, proposal);
+    ASSERT_TRUE(before.is_processing);
+
+    // The finalizer the sweep committed for `key`, running against the next
+    // round: the preempted ids stay gone, the next round's replica stays, and
+    // every record the stale callback could have taken by key is still there.
+    holding_writer->RunHeldFinalizerFor(key);
+    EXPECT_EQ(ProcessingReplicaIdsOf(entry), next_round_ids);
+    ExpectPublicationUnchanged(service, peer, tenant, entry, before);
+
+    // The finalizer the sweep committed for the key nothing took over: it
+    // removes the ids it recorded and ends that round.
+    holding_writer->RunHeldFinalizerFor(untouched_key);
+    EXPECT_TRUE(ProcessingReplicaIdsOf(untouched_entry).empty());
+    EXPECT_FALSE(IsProcessingOf(untouched_entry));
+    ExpectDiskOnlyObjectAndChargedBytes(service, tenant, untouched_key, 0);
 }
 
 TEST_F(MasterServiceTenantQuotaTest, CopyStartRequiresQuotaForNewReplica) {

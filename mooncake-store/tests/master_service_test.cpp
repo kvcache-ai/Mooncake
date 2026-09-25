@@ -1194,6 +1194,115 @@ TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     EXPECT_FALSE(service.ExistKey(key, TenantId::Default()).value_or(true));
 }
 
+// A snapshot reload replaces every publication, so the replica-action records
+// the service keeps beside them, the promotion-candidate index and the
+// dynamic-replication leases, have to go with them: a key published again
+// after the reload must inherit none of them.
+TEST_F(MasterServiceTest, SnapshotReloadDropsReplicaActionState) {
+    const TenantId tenant("tenant_reload");
+    const std::string key = "reloaded_key";
+    const uint64_t slice_length = 1024;
+    const MasterServiceTestPeer::ObjectIdentity identity{tenant, key};
+
+    // promotion_on_hit binds only with the offload machinery on, and a zero
+    // pool watermark sends every admission down the watermark-rejection
+    // branch that records the retry candidate.
+    MasterServiceConfig config = MakeStrictTenantConfig({tenant.value()});
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.eviction_high_watermark_ratio = 0.0;
+    MasterService service(config);
+    const auto segment = PrepareSimpleSegment(service);
+    MasterServiceTestPeer peer(service);
+    // The eviction pass retries promotion candidates, and its retry loop
+    // unindexes a candidate whose object still carries a memory replica.
+    MasterServiceTestPeer::EvictionRunning(service) = false;
+    if (MasterServiceTestPeer::EvictionThread(service).joinable()) {
+        MasterServiceTestPeer::EvictionThread(service).join();
+    }
+
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    PutCompletedObject(service, segment.client_id, key, tenant, put_config,
+                       slice_length);
+
+    auto publication = MasterServiceTestPeer::FindObject(service, identity);
+    ASSERT_NE(publication, nullptr);
+    ASSERT_EQ(peer.TryPushPromotionQueue(identity, /*record_candidate=*/true),
+              MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected);
+
+    const UUID proposal_id = generate_uuid();
+    ReplicaActionLease lease;
+    lease.proposal_id = proposal_id;
+    lease.lease_id = proposal_id;
+    lease.tenant_id = tenant.value();
+    lease.key = key;
+    // An hour out: no sweep can retract it during the test.
+    lease.expire_at_ms_epoch =
+        MasterServiceTestPeer::DynamicReplicationNowMs() + 3600000;
+    peer.PutDynamicReplicationLeaseForTesting(tenant, publication, proposal_id,
+                                              lease);
+
+    // Both records name the key rather than the publication, so they are the
+    // service's own state and not the entry's.
+    const auto candidates =
+        MasterServiceTestPeer::PromotionCandidateKeys(service, tenant);
+    ASSERT_FALSE(candidates.empty());
+    EXPECT_EQ(peer.CountCandidatesForTesting(tenant), candidates.size());
+    ASSERT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                    service, tenant, proposal_id)
+                    .has_value());
+    EXPECT_NE(MasterServiceTestPeer::PromotionCandidateCount(service).load(
+                  std::memory_order_relaxed),
+              0u);
+    // The retry cursor and the in-flight counter move during a sweep, so a
+    // reset that dropped only the candidate index would leave them behind.
+    MasterServiceTestPeer::PromotionRetryCursor(service).store(7);
+    MasterServiceTestPeer::PromotionInFlight(service).store(3);
+
+    MasterServiceTestPeer::MetadataSerializer serializer(&service);
+    serializer.Reset();
+
+    EXPECT_EQ(MasterServiceTestPeer::Tenants(service).Lookup(tenant), nullptr);
+    EXPECT_EQ(MasterServiceTestPeer::FindObject(service, identity), nullptr);
+    EXPECT_TRUE(
+        MasterServiceTestPeer::PromotionCandidateKeys(service, tenant).empty());
+    EXPECT_EQ(peer.CountCandidatesForTesting(tenant), 0u);
+    EXPECT_EQ(MasterServiceTestPeer::PromotionCandidateCount(service).load(
+                  std::memory_order_relaxed),
+              0u);
+    EXPECT_EQ(MasterServiceTestPeer::PromotionRetryCursor(service).load(
+                  std::memory_order_relaxed),
+              0u);
+    EXPECT_EQ(MasterServiceTestPeer::PromotionInFlight(service).load(
+                  std::memory_order_relaxed),
+              0u);
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant, proposal_id)
+                     .has_value());
+
+    // The same tenant and key published again inherit nothing.
+    PutCompletedObject(service, segment.client_id, key, tenant, put_config,
+                       slice_length);
+    auto republished = MasterServiceTestPeer::FindObject(service, identity);
+    ASSERT_NE(republished, nullptr);
+    EXPECT_NE(republished, publication);
+    EXPECT_TRUE(
+        MasterServiceTestPeer::PromotionCandidateKeys(service, tenant).empty());
+    EXPECT_EQ(peer.CountCandidatesForTesting(tenant), 0u);
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant, proposal_id)
+                     .has_value());
+    // The new publication carries no ledger state of its own beyond the
+    // object just put.
+    const auto committed_quota = republished->WithSharedAccess(
+        [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+            return metadata.quota_ledger.CommittedBytes();
+        });
+    EXPECT_EQ(committed_quota, slice_length);
+}
+
 TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
     const TenantId tenant_a("tenant_get_all_keys_a");
     auto service_ = std::make_unique<MasterService>(MakeStrictTenantConfig(
