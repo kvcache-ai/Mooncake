@@ -74,6 +74,12 @@ struct GlobalConfig {
     // Cooldown before retrying a failed RDMA peer rail. Override via
     // MC_RDMA_RAIL_PAUSE_SECONDS.
     uint64_t rdma_rail_pause_seconds = 30;
+    // How long an RDMA transfer worker keeps busy-polling after its device
+    // instance becomes idle before it parks, in microseconds. A polling worker
+    // occupies a whole CPU core; a parked one pays a thread wake-up when the
+    // next transfer arrives. 0 parks as soon as the instance is idle. Override
+    // via MC_RDMA_WORKER_IDLE_SPIN_US.
+    uint64_t rdma_worker_idle_spin_us = 100000;
     bool metacache = true;
     // Periodically refresh Transfer Engine metadata-derived local caches. 0
     // disables the background poller and preserves the manual

@@ -392,6 +392,26 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* rdma_worker_idle_spin_us =
+        std::getenv("MC_RDMA_WORKER_IDLE_SPIN_US");
+    if (rdma_worker_idle_spin_us) {
+        // Strict parse (not atoi): a typo keeps the default instead of
+        // silently parking or spinning every worker. 0 is a valid value.
+        uint64_t val = 0;
+        const char* end =
+            rdma_worker_idle_spin_us + strlen(rdma_worker_idle_spin_us);
+        auto [ptr, ec] = std::from_chars(rdma_worker_idle_spin_us, end, val);
+        if (ec == std::errc() && ptr == end && val <= 10000000) {
+            config.rdma_worker_idle_spin_us = val;
+            LOG(INFO) << "Set MC_RDMA_WORKER_IDLE_SPIN_US=" << val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_WORKER_IDLE_SPIN_US: "
+                         << rdma_worker_idle_spin_us
+                         << ". Expected an integer in range 0-10000000";
+        }
+    }
+
     const char* log_level = std::getenv("MC_LOG_LEVEL");
     config.trace = false;
     if (log_level) {
@@ -834,6 +854,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
+    LOG(INFO) << "rdma_worker_idle_spin_us = "
+              << config.rdma_worker_idle_spin_us;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
