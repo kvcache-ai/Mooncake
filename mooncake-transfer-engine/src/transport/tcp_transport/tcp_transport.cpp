@@ -71,13 +71,38 @@ LaneFailureReasonHook lane_failure_reason_hook = nullptr;
 SessionProgressHook session_progress_hook = nullptr;
 StartTransferMetadataHook start_transfer_metadata_hook = nullptr;
 std::atomic<size_t> staging_buffer_allocation_count{0};
+std::atomic<size_t> staging_buffer_pinned_count{0};
 std::atomic<size_t> staging_device_query_count{0};
+
+#ifdef USE_CUDA
+using CudaPrefetchHook = void (*)(cudaStream_t) noexcept;
+CudaPrefetchHook cuda_prefetch_hook = nullptr;
+
+void invokeCudaPrefetchHook(cudaStream_t stream) noexcept {
+    CudaPrefetchHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = cuda_prefetch_hook;
+    }
+    if (hook) hook(stream);
+}
+#endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
 void recordStagingBufferAllocationForTest() noexcept {
     staging_buffer_allocation_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void recordStagingBufferPointerForTest(void* ptr) noexcept {
+#ifdef USE_CUDA
+    unsigned int flags = 0;
+    if (cudaHostGetFlags(&flags, ptr) == cudaSuccess)
+        staging_buffer_pinned_count.fetch_add(1, std::memory_order_relaxed);
+#else
+    (void)ptr;
+#endif
 }
 
 void recordStagingDeviceQueryForTest() noexcept {
@@ -111,6 +136,7 @@ enum SessionProgressTestEvent {
     kSessionTimeoutCommitted = 3,
     kSessionTimeoutStale = 4,
     kSessionTerminal = 5,
+    kSessionWriteBodySuccess = 6,
 };
 
 enum SessionProgressTestAction {
@@ -237,6 +263,13 @@ void tcpTransportSetSessionProgressHookForTest(
     session_progress_hook = hook;
 }
 
+#ifdef USE_CUDA
+void tcpTransportSetCudaPrefetchHookForTest(CudaPrefetchHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    cuda_prefetch_hook = hook;
+}
+#endif
+
 void tcpTransportSetStartTransferMetadataHookForTest(
     StartTransferMetadataHook hook) noexcept {
     std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
@@ -254,11 +287,16 @@ bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {
 
 void tcpTransportResetStagingStatsForTest() noexcept {
     staging_buffer_allocation_count.store(0, std::memory_order_relaxed);
+    staging_buffer_pinned_count.store(0, std::memory_order_relaxed);
     staging_device_query_count.store(0, std::memory_order_relaxed);
 }
 
 size_t tcpTransportStagingBufferAllocationCountForTest() noexcept {
     return staging_buffer_allocation_count.load(std::memory_order_relaxed);
+}
+
+size_t tcpTransportStagingPinnedAllocationCountForTest() noexcept {
+    return staging_buffer_pinned_count.load(std::memory_order_relaxed);
 }
 
 size_t tcpTransportStagingDeviceQueryCountForTest() noexcept {
