@@ -806,10 +806,6 @@ void updateGlobalConfig(ibv_device_attr& device_attr) {
         config.max_cqe = device_attr.max_cqe;
     if (config.max_mr_size > device_attr.max_mr_size)
         config.max_mr_size = device_attr.max_mr_size;
-    if (config.max_qp_init_rd_atom > device_attr.max_qp_init_rd_atom)
-        config.max_qp_init_rd_atom = device_attr.max_qp_init_rd_atom;
-    if (config.max_qp_rd_atom > device_attr.max_qp_rd_atom)
-        config.max_qp_rd_atom = device_attr.max_qp_rd_atom;
 }
 
 void dumpGlobalConfig() {

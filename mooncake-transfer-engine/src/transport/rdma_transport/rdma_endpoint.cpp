@@ -1553,8 +1553,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     attr.ah_attr.port_num = context_.portNum();
     attr.dest_qp_num = peer_qp_num;
     attr.rq_psn = 0;
-    attr.max_dest_rd_atomic =
-        static_cast<uint8_t>(globalConfig().max_qp_rd_atom);
+    attr.max_dest_rd_atomic = static_cast<uint8_t>(context_.maxQpRdAtom());
     attr.min_rnr_timer = 12;  // 12 in previous implementation
     ret = ibv_modify_qp(qp, &attr,
                         IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER |
@@ -1589,8 +1588,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     attr.retry_cnt = kRetryCount;
     attr.rnr_retry = 7;  // or 7,RNR error
     attr.sq_psn = 0;
-    attr.max_rd_atomic =
-        static_cast<uint8_t>(globalConfig().max_qp_init_rd_atom);
+    attr.max_rd_atomic = static_cast<uint8_t>(context_.maxQpInitRdAtom());
     ret = ibv_modify_qp(qp, &attr,
                         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
