@@ -123,6 +123,56 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
+// With two segments on one host (segA1, segA2) and one on another (segB1), a
+// 2-replica allocation must land on two different hosts, so losing a single
+// host cannot take down both copies. Before host-aware placement the two
+// replicas could both land on the first host's two segments, because placement
+// only guaranteed distinct segments -- not distinct hosts.
+TEST_F(AllocationStrategyTest, SpreadsReplicasAcrossHosts) {
+    constexpr size_t kSize = 64 * MiB;
+    auto seg_a1 = CreateBufferAllocator(BufferAllocatorType::CACHELIB, "segA1",
+                                        0x100000000ULL, kSize, "segA1");
+    auto seg_a2 = CreateBufferAllocator(BufferAllocatorType::CACHELIB, "segA2",
+                                        0x200000000ULL, kSize, "segA2");
+    auto seg_b1 = CreateBufferAllocator(BufferAllocatorType::CACHELIB, "segB1",
+                                        0x300000000ULL, kSize, "segB1");
+    ASSERT_TRUE(seg_a1.has_value());
+    ASSERT_TRUE(seg_a2.has_value());
+    ASSERT_TRUE(seg_b1.has_value());
+
+    AllocatorManager mgr;
+    mgr.addAllocator("segA1", *seg_a1);
+    mgr.addAllocator("segA2", *seg_a2);
+    mgr.addAllocator("segB1", *seg_b1);
+
+    // Two segments live on hostA, one on hostB.
+    const std::unordered_map<std::string, std::string> host_of = {
+        {"segA1", "hostA"}, {"segA2", "hostA"}, {"segB1", "hostB"}};
+    const AllocatorManager snapshot =
+        mgr.Snapshot(/*owners=*/nullptr, &host_of);
+
+    // Repeat so the random start point cannot accidentally pass: the two
+    // replicas must always span both hosts, never both land on hostA.
+    for (int iter = 0; iter < 50; ++iter) {
+        auto result = strategy_->Allocate(snapshot, /*slice_length=*/1024,
+                                          /*replica_num=*/2, {}, {});
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result.value().size(), 2u);
+
+        std::set<std::string> hosts;
+        for (const auto& replica : result.value()) {
+            for (const auto& name_ptr : replica.get_segment_names()) {
+                if (!name_ptr) continue;
+                auto it = host_of.find(*name_ptr);
+                ASSERT_NE(it, host_of.end());
+                hosts.insert(it->second);
+            }
+        }
+        EXPECT_EQ(hosts.size(), 2u)
+            << "replicas must span two distinct hosts (iter " << iter << ")";
+    }
+}
+
 TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     const auto initial = ClientLivenessRecord::TimePoint{};
     auto suspected = std::make_shared<ClientLivenessRecord>(initial);

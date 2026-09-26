@@ -321,7 +321,22 @@ class ScopedAllocatorAccess {
     }
 
     AllocatorManager SnapshotAllocatorManager() const {
-        return allocator_manager_.Snapshot(client_by_name_);
+        // Invert the host -> segments index into a segment -> host map so the
+        // snapshot can answer GetHost(), letting allocation keep an object's
+        // replicas on different hosts. Left empty when no host index is
+        // available (this access was constructed without one), which skips that
+        // check (GetHost returns "").
+        std::unordered_map<std::string, std::string> host_by_name;
+        if (segments_by_host_) {
+            for (const auto& [host, segments] : *segments_by_host_) {
+                for (const auto& [segment_name, segment_ids] : segments) {
+                    if (!segment_ids.empty()) {
+                        host_by_name.emplace(segment_name, host);
+                    }
+                }
+            }
+        }
+        return allocator_manager_.Snapshot(client_by_name_, &host_by_name);
     }
 
     std::vector<std::string> GetHostOrderedSegments(
