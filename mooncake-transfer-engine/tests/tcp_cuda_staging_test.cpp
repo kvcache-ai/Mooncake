@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -69,6 +70,34 @@ class DeviceBuffer {
 
    private:
     void* data_ = nullptr;
+};
+
+// a host function blocked until release(), not a long kernel: this file builds
+// without nvcc, and the legacy stream stays busy however long the copy takes
+class LegacyStreamGate {
+   public:
+    ~LegacyStreamGate() {
+        release();
+        cudaStreamSynchronize(cudaStreamLegacy);
+    }
+
+    cudaError_t close() {
+        return cudaLaunchHostFunc(cudaStreamLegacy, &wait, this);
+    }
+
+    void release() {
+        if (!released_) open_.set_value();
+        released_ = true;
+    }
+
+   private:
+    static void wait(void* gate) {
+        static_cast<LegacyStreamGate*>(gate)->opened_.wait();
+    }
+
+    std::promise<void> open_;
+    std::future<void> opened_ = open_.get_future();
+    bool released_ = false;
 };
 
 TransferStatusEnum runOne(TransferEngine* engine,
@@ -179,6 +208,60 @@ TEST(TcpCudaStagingTest, ReusesStagingAcrossChunksAndRequests) {
               cudaSuccess);
     EXPECT_EQ(actual, pattern);
 
+    EXPECT_EQ(engine->unregisterLocalMemory(device_buffer.get()), 0);
+    engine.reset();
+}
+
+TEST(TcpCudaStagingTest, StagingDoesNotWaitForTheLegacyStream) {
+    int device_count = 0;
+    cudaError_t cuda_status = cudaGetDeviceCount(&device_count);
+    if (cuda_status != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr size_t kTransferSize = 64 * 1024;
+    constexpr size_t kBufferSize = 2 * kTransferSize;
+
+    DeviceBuffer device_buffer;
+    ASSERT_EQ(cudaMalloc(device_buffer.out(), kBufferSize), cudaSuccess);
+
+    auto engine = std::make_unique<TransferEngine>(false);
+    const std::string server_name = "127.0.0.2:17932";
+    const auto hostname_port = parseHostNameWithPort(server_name);
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, server_name,
+                           hostname_port.first.c_str(), hostname_port.second),
+              0);
+    ASSERT_NE(engine->installTransport("tcp", nullptr), nullptr);
+    ASSERT_EQ(
+        engine->registerLocalMemory(device_buffer.get(), kBufferSize, "cuda:0"),
+        0);
+
+    const auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
+    const auto segment_desc =
+        engine->getMetadata()->getSegmentDescByID(segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_FALSE(segment_desc->buffers.empty());
+    const uint64_t remote_base = segment_desc->buffers[0].addr;
+
+    LegacyStreamGate gate;
+    ASSERT_EQ(gate.close(), cudaSuccess);
+
+    TransferRequest write;
+    write.opcode = TransferRequest::WRITE;
+    write.length = kTransferSize;
+    write.source = device_buffer.get();
+    write.target_id = segment_id;
+    write.target_offset = remote_base + kTransferSize;
+    EXPECT_EQ(runOne(engine.get(), write), TransferStatusEnum::COMPLETED)
+        << "a WRITE of device memory waited for the legacy default stream";
+
+    TransferRequest read = write;
+    read.opcode = TransferRequest::READ;
+    EXPECT_EQ(runOne(engine.get(), read), TransferStatusEnum::COMPLETED)
+        << "a READ of device memory waited for the legacy default stream";
+
+    gate.release();
     EXPECT_EQ(engine->unregisterLocalMemory(device_buffer.get()), 0);
     engine.reset();
 }
