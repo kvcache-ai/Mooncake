@@ -358,17 +358,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         chunks.emplace_back(addr, length);
     }
 
-    // Resolve the location name once, from the original buffer.
-    std::string resolved_name;
-    if (name == kWildcardLocation) {
-        bool only_first_page = true;
-        const std::vector<MemoryLocationEntry> entries =
-            getMemoryLocation(addr, length, only_first_page);
-        if (entries.empty()) return -1;
-        resolved_name = entries[0].location;
-    } else {
-        resolved_name = name;
-    }
+    std::string resolved_name = name;
 
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
@@ -526,6 +516,18 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                       << ", contexts=" << context_list_.size()
                       << ", parallel=" << (use_parallel_reg ? "true" : "false")
                       << ", duration=" << reg_duration_ms << "ms";
+        }
+
+        // Registration faults in untouched host pages. Resolve the original
+        // buffer's first page only after it has been pinned, or NUMA discovery
+        // can retain "*" and select NICs on unrelated NUMA nodes.
+        if (ci == 0 && name == kWildcardLocation) {
+            const auto entries = getMemoryLocation(addr, length, true);
+            if (entries.empty()) {
+                unregisterChunkMRs(chunk_addr);
+                return -1;
+            }
+            resolved_name = entries[0].location;
         }
 
         // Collect per-context keys for THIS chunk (address-range lookup).

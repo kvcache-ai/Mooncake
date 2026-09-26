@@ -58,6 +58,10 @@ class RdmaTransportTestPeer {
 
 class RdmaContextTestPeer {
    public:
+    static void bindProtectionDomain(RdmaContext &context, ibv_pd *pd) {
+        context.pd_ = pd;
+    }
+
     static bool hasEndpointStore(const RdmaContext &context) {
         return context.endpoint_store_ != nullptr;
     }
