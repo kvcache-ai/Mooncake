@@ -1410,7 +1410,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
         // Resolve every callback before releasing that batch.
         failPending(status);
         auto free_status = freeBatch(batch_id_);
-        if (!free_status.ok()) {
+        if (!free_status.ok() && !free_status.IsBatchCleanupDeferred()) {
             remember(free_status);
             return false;
         }

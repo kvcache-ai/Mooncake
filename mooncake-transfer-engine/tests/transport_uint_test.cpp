@@ -605,19 +605,25 @@ class TerminalFailureTransport : public BatchResultTransport {
         const std::vector<TransferTask*>& tasks) override {
         tasks_ = tasks;
         for (auto* task : tasks_) {
-            task->is_finished = initially_finished_;
+            __atomic_store_n(&task->is_finished, initially_finished_,
+                             __ATOMIC_RELEASE);
         }
         return Status::OK();
     }
 
     Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
-        status.s = TransferStatusEnum::FAILED;
+        const bool all_finished = std::all_of(
+            tasks_.begin(), tasks_.end(), [](const auto* task) {
+                return __atomic_load_n(&task->is_finished, __ATOMIC_ACQUIRE);
+            });
+        status.s = all_finished ? TransferStatusEnum::FAILED
+                                : TransferStatusEnum::TIMEOUT;
         return Status::OK();
     }
 
     void finishTasks() {
         for (auto* task : tasks_) {
-            task->is_finished = true;
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
         }
     }
 
@@ -1451,11 +1457,16 @@ TEST_F(TransportTest, BusyBatchKeepsPendingNotify) {
             .submitTransferWithNotify(batch_id, {request}, {"name", "payload"})
             .ok());
 
-    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchBusy());
+    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchCleanupDeferred());
     EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
 
     transport->finishTasks();
-    ASSERT_TRUE(engine.freeBatchID(batch_id).ok());
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::pendingNotifyCount(engine) != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
 }
 
