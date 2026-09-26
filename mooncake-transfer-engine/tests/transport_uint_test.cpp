@@ -612,8 +612,8 @@ class TerminalFailureTransport : public BatchResultTransport {
     }
 
     Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
-        const bool all_finished = std::all_of(
-            tasks_.begin(), tasks_.end(), [](const auto* task) {
+        const bool all_finished =
+            std::all_of(tasks_.begin(), tasks_.end(), [](const auto* task) {
                 return __atomic_load_n(&task->is_finished, __ATOMIC_ACQUIRE);
             });
         status.s = all_finished ? TransferStatusEnum::FAILED
