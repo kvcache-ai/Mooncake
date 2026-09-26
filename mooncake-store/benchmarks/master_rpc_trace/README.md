@@ -137,8 +137,11 @@ counts and are not successful-hit counts.
 
 Heartbeat calls are separate maintenance traffic. Each client is pinged after
 registration; a failed heartbeat invalidates the run instead of silently
-remounting. `--heartbeat_interval_ms` (default 1000) is the pause between sequential
-sweeps, so slow sweeps lengthen the effective client heartbeat period.
+remounting. `--heartbeat_workers` (default 16) partitions clients across a bounded
+set of workers independently of workload calls. `--heartbeat_interval_ms`
+(default 1000) is the pause between sweeps within each partition. Slow sweeps
+still lengthen the effective client heartbeat period; inspect heartbeats and
+master liveness metrics when increasing client count or pressure.
 
 High replay lag with low master utilization indicates a load-generator limit.
 Sweep workers or arrival compression and check offered versus achieved rates

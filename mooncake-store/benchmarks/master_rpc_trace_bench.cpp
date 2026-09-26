@@ -28,7 +28,9 @@ DEFINE_string(tenant, "default", "Tenant used for all trace clients");
 DEFINE_uint32(workers, 8,
               "Maximum concurrent trace calls (not simulated clients)");
 DEFINE_uint32(heartbeat_interval_ms, 1000,
-              "Pause between sequential sweeps of client heartbeats");
+              "Pause between heartbeat sweeps in each worker partition");
+DEFINE_uint32(heartbeat_workers, 16,
+              "Concurrent heartbeat workers, separate from replay workers");
 DEFINE_double(speed, 1.0,
               "Arrival-time speedup; 1 preserves logical intervals");
 DEFINE_uint64(segment_size, 64ULL * 1024 * 1024,
@@ -112,12 +114,22 @@ struct PreparedCall {
 
 class MasterReplay {
    public:
-    MasterReplay() : heartbeat_([this] { Heartbeats(); }) {}
+    MasterReplay() {
+        try {
+            for (size_t i = 0; i < FLAGS_heartbeat_workers; ++i)
+                heartbeats_.emplace_back([this, i] { Heartbeats(i); });
+        } catch (...) {
+            stopping_.store(true);
+            wake_.notify_all();
+            for (auto& thread : heartbeats_) thread.join();
+            throw;
+        }
+    }
 
     ~MasterReplay() {
         stopping_.store(true);
         wake_.notify_all();
-        heartbeat_.join();
+        for (auto& thread : heartbeats_) thread.join();
         // Sessions are destroyed only after all heartbeat calls have stopped.
     }
 
@@ -264,11 +276,21 @@ class MasterReplay {
         return result;
     }
 
-    void Heartbeats() {
+    void Heartbeats(size_t partition) {
         std::unique_lock lock(mutex_);
         while (!stopping_.load()) {
+            std::vector<std::pair<std::string, Session*>> clients;
+            size_t index = 0;
             for (const auto& [id, session] : sessions_) {
-                if (!session->registered.load()) continue;
+                if (index++ % FLAGS_heartbeat_workers == partition &&
+                    session->registered.load())
+                    clients.emplace_back(id, session.get());
+            }
+            // Sessions remain alive until all heartbeat workers have joined.
+            // Do not hold the session-map lock while waiting for network I/O.
+            lock.unlock();
+            for (const auto& [id, session] : clients) {
+                if (stopping_.load()) break;
                 ++heartbeat_calls_;
                 try {
                     const auto result = session->client.Ping();
@@ -288,6 +310,7 @@ class MasterReplay {
                                << ": " << error.what();
                 }
             }
+            lock.lock();
             wake_.wait_for(
                 lock, std::chrono::milliseconds(FLAGS_heartbeat_interval_ms),
                 [&] { return stopping_.load(); });
@@ -299,7 +322,7 @@ class MasterReplay {
     std::atomic<uint64_t> heartbeat_calls_{0};
     std::mutex mutex_;
     std::condition_variable wake_;
-    std::thread heartbeat_;
+    std::vector<std::thread> heartbeats_;
 };
 
 bool HasErrors(const std::vector<TraceSample>& samples) {
@@ -319,11 +342,13 @@ int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     try {
         if (FLAGS_trace.empty() || FLAGS_workers == 0 ||
-            FLAGS_heartbeat_interval_ms == 0 || FLAGS_segment_size == 0 ||
-            !std::isfinite(FLAGS_speed) || FLAGS_speed <= 0) {
+            FLAGS_heartbeat_interval_ms == 0 || FLAGS_heartbeat_workers == 0 ||
+            FLAGS_segment_size == 0 || !std::isfinite(FLAGS_speed) ||
+            FLAGS_speed <= 0) {
             throw std::invalid_argument(
                 "trace, positive "
-                "workers/heartbeat_interval_ms/segment_size/speed are "
+                "workers/heartbeat_interval_ms/heartbeat_workers/segment_size/"
+                "speed are "
                 "required");
         }
         const auto trace = mooncake::bench::LoadTrace(FLAGS_trace);
@@ -361,6 +386,7 @@ int main(int argc, char** argv) {
         result["tenant"] = FLAGS_tenant;
         result["workers"] = FLAGS_workers;
         result["heartbeat_interval_ms"] = FLAGS_heartbeat_interval_ms;
+        result["heartbeat_workers"] = FLAGS_heartbeat_workers;
         result["logical_clients"] = Json::UInt64(runner.client_count());
         if (trace.version == 1)
             result["segment_size_bytes"] = Json::UInt64(FLAGS_segment_size);
