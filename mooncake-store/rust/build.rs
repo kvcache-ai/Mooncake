@@ -208,10 +208,15 @@ fn main() {
 
     // mooncake_store depends on libasio.so (shared) built in mooncake-common.
     let lib_path = PathBuf::from(&lib_dir);
-    let build_dir = lib_path.ancestors().nth(2).map(PathBuf::from).unwrap_or_else(|| {
-        println!("cargo:warning=MOONCAKE_STORE_LIB_DIR='{lib_dir}' does not have enough parent directories; using current directory");
-        PathBuf::from(".")
-    });
+    // Prefer the supplied build root for sibling native libraries. Keep the
+    // conventional layout inference for standalone callers without it.
+    let build_dir = env::var_os("MOONCAKE_BUILD_DIR")
+        .map(PathBuf::from)
+        .or_else(|| lib_path.ancestors().nth(2).map(PathBuf::from))
+        .unwrap_or_else(|| {
+            println!("cargo:warning=MOONCAKE_STORE_LIB_DIR='{lib_dir}' does not have enough parent directories; using current directory");
+            PathBuf::from(".")
+        });
     println!(
         "cargo:rustc-link-search=native={}",
         build_dir.join("mooncake-common").display()
