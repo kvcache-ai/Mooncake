@@ -2,7 +2,6 @@ import unittest
 import os
 import time
 import threading
-import random
 from mooncake.store import MooncakeDistributedStore, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
@@ -177,6 +176,36 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         # Remove the key
         time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.remove(key), 0)
+
+    def test_typed_buffer_roundtrip(self):
+        """Non-byte buffers must store size * itemsize bytes, not just size."""
+        import array
+
+        key = "test_typed_buffer_key"
+        value = array.array("f", [float(i) for i in range(1024)])
+        expected = value.tobytes()
+
+        self.assertEqual(self.store.put(key, value), 0)
+        self.assertEqual(self.store.get_size(key), len(expected))
+        self.assertEqual(self.store.get(key), expected)
+
+        batch_keys = ["test_typed_batch_0", "test_typed_batch_1"]
+        batch_values = [
+            array.array("d", [1.5, 2.5, 3.5]),
+            array.array("i", [7, 8, 9, 10]),
+        ]
+        self.assertEqual(self.store.put_batch(batch_keys, batch_values), 0)
+        for batch_key, batch_value in zip(batch_keys, batch_values):
+            self.assertEqual(self.store.get_size(batch_key), len(batch_value.tobytes()))
+            self.assertEqual(self.store.get(batch_key), batch_value.tobytes())
+
+    def test_non_contiguous_buffer_rejected(self):
+        """Strided views must fail loudly instead of storing wrong bytes."""
+        view = memoryview(b"abcdefgh")[::2]
+        with self.assertRaises(RuntimeError):
+            self.store.put("test_non_contiguous_key", view)
+        with self.assertRaises(RuntimeError):
+            self.store.put_batch(["test_non_contiguous_batch"], [view])
 
     def test_soft_pin_config_forwarding(self):
         """Test soft-pin action and TTL forwarding through Store operations."""
@@ -626,8 +655,8 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         put_duration = system_stats['put_end'] - system_stats['put_start']
         get_duration = system_stats['get_end'] - system_stats['get_start']
         total_data_size_gb = (VALUE_SIZE * total_operations) / (1024**3)
-        
-        print(f"\nConcurrent Stress Test Results:")
+
+        print("\nConcurrent Stress Test Results:")
         print(f"Total threads: {NUM_THREADS}")
         print(f"Operations per thread: {OPERATIONS_PER_THREAD}")
         print(f"Total operations: {total_operations}")
