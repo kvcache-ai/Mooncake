@@ -763,6 +763,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         }
 
         bool completed = false;
+        bool release_scheduled = false;
         TransferStatus status;
         while (!completed) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
@@ -772,10 +773,12 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
+                release_scheduled = true;
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
                 engine_->freeBatchID(batch_id);
+                release_scheduled = true;
                 completed = true;
             }
             if (completed) break;
@@ -787,7 +790,9 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                           << current_ts - start_ts << "ns, local buffer "
                           << (void*)buffer << " remote buffer "
                           << (void*)peer_buffer_address << " length " << length;
-                engine_->freeBatchID(batch_id);
+                if (!release_scheduled) {
+                    engine_->freeBatchID(batch_id);
+                }
                 return -1;
             }
         }
@@ -879,6 +884,7 @@ int TransferEnginePy::batchTransferSync(
         }
 
         bool completed = false;
+        bool release_scheduled = false;
         TransferStatus status;
         while (!completed) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
@@ -896,6 +902,7 @@ int TransferEnginePy::batchTransferSync(
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
                 engine_->freeBatchID(batch_id);
+                release_scheduled = true;
                 completed = true;
             }
             if (completed) break;
@@ -905,10 +912,9 @@ int TransferEnginePy::batchTransferSync(
             if (current_ts - start_ts > timeout) {
                 LOG(INFO) << "Sync batch data transfer timeout after "
                           << current_ts - start_ts << "ns";
-                // TODO: as @doujiang24 mentioned, early free(while there are
-                // still waiting tasks) the batch_id may fail and cause memory
-                // leak(a known issue).
-                engine_->freeBatchID(batch_id);
+                if (!release_scheduled) {
+                    engine_->freeBatchID(batch_id);
+                }
                 return -1;
             }
         }
@@ -1095,6 +1101,7 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
         engine_->freeBatchID(batch_id);
         return -1;
     } else if (status.s == TransferStatusEnum::TIMEOUT) {
+        engine_->freeBatchID(batch_id);
         return -2;
     } else {
         return 0;
