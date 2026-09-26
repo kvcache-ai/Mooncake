@@ -1,0 +1,485 @@
+{
+  "description": "Golden vectors for the supported vLLM v1 sha256 (CPython Pickle protocol 5) seed-derived root and block-hash profile.  pickle_hex records the exact serialized bytes hashed for small values; large frame-boundary values record pickle_len and are certified by their digest.",
+  "generator": "vLLM v0.22.1rc0-459-g462ef83d5 hash_block_tokens value shapes with utils/hashing.py sha256 = SHA256(pickle.dumps(value, protocol=5))",
+  "generator_metadata": {
+    "python_version": "3.12.13",
+    "pickle_protocol": 5,
+    "pickle_highest_protocol": 5
+  },
+  "profile": {
+    "strategy": "vllm_v1",
+    "algorithm": "sha256",
+    "python_hash_seed": "0",
+    "root_digest": "1973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c",
+    "index_projection": "low64_be"
+  },
+  "seed_root_vectors": [
+    {
+      "python_hash_seed": "0",
+      "pickle_hex": "80059505000000000000008c0130942e",
+      "root_digest": "1973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c"
+    },
+    {
+      "python_hash_seed": "00",
+      "pickle_hex": "80059506000000000000008c023030942e",
+      "root_digest": "67c61e0f70ad5d3fc0eacb59744008ac6f2a8bd2edad43540a743eaf0fb4993c"
+    },
+    {
+      "python_hash_seed": "random",
+      "pickle_hex": "8005950a000000000000008c0672616e646f6d942e",
+      "root_digest": "fa1326fc0ad784c54e10f808051a77f999f7b675b12fba49cbef92b3e1a09cb7"
+    },
+    {
+      "python_hash_seed": "4294967295",
+      "pickle_hex": "8005950e000000000000008c0a34323934393637323935942e",
+      "root_digest": "670c2eca46f5f7e11b9dce5c3bd2ff0e9e19567fd45b50c2db5cc0c9aae470d9"
+    }
+  ],
+  "cases": [
+    {
+      "name": "spec_unsalted",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "762b2e7e1520febd3a0aedb7358e8602facf3924440e18538fce057e23bae91d",
+          "projected_hex": "8fce057e23bae91d",
+          "projected_decimal": "10362225831949560093",
+          "pickle_hex": "800595320000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b0474944e87942e"
+        },
+        {
+          "digest": "9e62b5a7ec298f33cb4c7d9e00b659874bb2432d23ad6879ad1746592a2b036b",
+          "projected_hex": "ad1746592a2b036b",
+          "projected_decimal": "12472515041799373675",
+          "pickle_hex": "80059532000000000000004320762b2e7e1520febd3a0aedb7358e8602facf3924440e18538fce057e23bae91d94284b054b064b074b0874944e87942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "incorrect_low64_parent_digest": "22f70d17411c10aa544ecdac1d2df0fc1d7c7ac2d21efe1aebe32028620638c6"
+    },
+    {
+      "name": "single_token_tuple",
+      "block_size": 1,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "4e7493abc7315520e17ce180ee400439b7dc83e7406fb239462766705eb058c8",
+          "projected_hex": "462766705eb058c8",
+          "projected_decimal": "5055121739557656776",
+          "pickle_hex": "8005952b0000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c944b0785944e87942e"
+        }
+      ],
+      "token_ids": [
+        7
+      ]
+    },
+    {
+      "name": "two_token_tuple",
+      "block_size": 2,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "aa9e79304bb6921235ea2e187b25f9bb43d9044ec232e3d1c07d7e21e51e64ee",
+          "projected_hex": "c07d7e21e51e64ee",
+          "projected_decimal": "13870381111413990638",
+          "pickle_hex": "8005952d0000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c944b074b0886944e87942e"
+        }
+      ],
+      "token_ids": [
+        7,
+        8
+      ]
+    },
+    {
+      "name": "three_token_tuple",
+      "block_size": 3,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "6368e68a46c970c8ec2ebab3eb9d2fe7ddc2730165bb64d698aaed2907396794",
+          "projected_hex": "98aaed2907396794",
+          "projected_decimal": "11000865800276502420",
+          "pickle_hex": "8005952f0000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c944b074b084b0987944e87942e"
+        }
+      ],
+      "token_ids": [
+        7,
+        8,
+        9
+      ]
+    },
+    {
+      "name": "empty_extras_encode_as_none",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "569de0636f6064532b63312eab095a4577e72dc55286dbfb43821ec866309e47",
+          "projected_hex": "43821ec866309e47",
+          "projected_decimal": "4864484393570311751",
+          "pickle_hex": "800595320000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b0a4b144b1e4b2874944e87942e"
+        }
+      ],
+      "token_ids": [
+        10,
+        20,
+        30,
+        40
+      ]
+    },
+    {
+      "name": "signed_integer_boundaries",
+      "block_size": 8,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "6c9e5f944f0a93319b3ba9478115a9447de2f6d4ef1cd1c0b19a7ebd607353e8",
+          "projected_hex": "b19a7ebd607353e8",
+          "projected_decimal": "12797680642958775272",
+          "pickle_hex": "800595480000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284a000000804affffffff4b004bff4d00014dffff4a000001004affffff7f74944e87942e"
+        }
+      ],
+      "token_ids": [
+        -2147483648,
+        -1,
+        0,
+        255,
+        256,
+        65535,
+        65536,
+        2147483647
+      ]
+    },
+    {
+      "name": "utf8_multibyte",
+      "block_size": 4,
+      "lora_name": "模型-适配器",
+      "cache_salt": "盐值-🚀",
+      "expected": [
+        {
+          "digest": "cc1a2ab147f91a34070bb430e35dbc6ca6261a93b490a2307d0b4b31696a247a",
+          "projected_hex": "7d0b4b31696a247a",
+          "projected_decimal": "9010378155078853754",
+          "pickle_hex": "800595540000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b0474948c10e6a8a1e59e8b2de98082e9858de599a8948c0be79b90e580bc2df09f9a8094869487942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "name": "lora_length_255",
+      "block_size": 4,
+      "lora_name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "866b277c9d76457e35bd6a5dd3ec0d5b598faa9e36d108608f6e925149b1524b",
+          "projected_hex": "8f6e925149b1524b",
+          "projected_decimal": "10335359072688230987",
+          "pickle_hex": "800595350100000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b0474948cff61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616194859487942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "name": "lora_length_256",
+      "block_size": 4,
+      "lora_name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "0c934ab8aa543128da871a91a46387ed907ed3ca8b39e5c137da510f80a106df",
+          "projected_hex": "37da510f80a106df",
+          "projected_decimal": "4024618344033355487",
+          "pickle_hex": "800595390100000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b04749458000100006161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616194859487942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "name": "salt_length_255",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": "sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+      "expected": [
+        {
+          "digest": "167d69abb219f81883e1fc5e554564bab043051f849914feb058487c8bffc398",
+          "projected_hex": "b058487c8bffc398",
+          "projected_decimal": "12706986048387793816",
+          "pickle_hex": "800595350100000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b0474948cff73737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737394859487942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "name": "salt_length_256",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+      "expected": [
+        {
+          "digest": "0875d6e8c04ec7bb02928dc8f4b9e336aecb8adfae9078a9b6b54fe557b6857d",
+          "projected_hex": "b6b54fe557b6857d",
+          "projected_decimal": "13165516932125197693",
+          "pickle_hex": "800595390100000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b04749458000100007373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737394859487942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "name": "lora_every_block",
+      "block_size": 4,
+      "lora_name": "adapter-A",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "5c5d9e04e03de9f2f4a9f38766c4d0fb0e207ccf5d2fb3b272c50117f336ae0c",
+          "projected_hex": "72c50117f336ae0c",
+          "projected_decimal": "8270017493112106508",
+          "pickle_hex": "8005953f0000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b0474948c09616461707465722d4194859487942e"
+        },
+        {
+          "digest": "bde66cc24757972cc88e0fe62079d85934868c2733874ffa1c54ff679604f61a",
+          "projected_hex": "1c54ff679604f61a",
+          "projected_decimal": "2041537351469299226",
+          "pickle_hex": "8005953f0000000000000043205c5d9e04e03de9f2f4a9f38766c4d0fb0e207ccf5d2fb3b272c50117f336ae0c94284b054b064b074b0874948c09616461707465722d4194859487942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    },
+    {
+      "name": "salt_first_block_only",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": "tenant-salt",
+      "expected": [
+        {
+          "digest": "373c09c29ab08b91b13bf1a67e0a461990572d476016c064b6ba6b75c163ceb1",
+          "projected_hex": "b6ba6b75c163ceb1",
+          "projected_decimal": "13166954614070955697",
+          "pickle_hex": "800595410000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b0474948c0b74656e616e742d73616c7494859487942e"
+        },
+        {
+          "digest": "141900dd6fe59d22764357a125ecf4d670923bb12ad705a520de0e98c7338d5d",
+          "projected_hex": "20de0e98c7338d5d",
+          "projected_decimal": "2368346503383321949",
+          "pickle_hex": "80059532000000000000004320373c09c29ab08b91b13bf1a67e0a461990572d476016c064b6ba6b75c163ceb194284b054b064b074b0874944e87942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    },
+    {
+      "name": "lora_then_salt",
+      "block_size": 4,
+      "lora_name": "adapter-A",
+      "cache_salt": "tenant-salt",
+      "expected": [
+        {
+          "digest": "dacd8a5addba8cf4b89589bedab04999b3676299a455ba3e085cc7777be6b328",
+          "projected_hex": "085cc7777be6b328",
+          "projected_decimal": "602575766154556200",
+          "pickle_hex": "8005954d0000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b0474948c09616461707465722d41948c0b74656e616e742d73616c7494869487942e"
+        },
+        {
+          "digest": "55575bd9b63ced6a3dc36c355afbb5f551599533795c26d27d8b5fc836681618",
+          "projected_hex": "7d8b5fc836681618",
+          "projected_decimal": "9046429590014662168",
+          "pickle_hex": "8005953f000000000000004320dacd8a5addba8cf4b89589bedab04999b3676299a455ba3e085cc7777be6b32894284b054b064b074b0874948c09616461707465722d4194859487942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    },
+    {
+      "name": "multi_block_chain",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "762b2e7e1520febd3a0aedb7358e8602facf3924440e18538fce057e23bae91d",
+          "projected_hex": "8fce057e23bae91d",
+          "projected_decimal": "10362225831949560093",
+          "pickle_hex": "800595320000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b0474944e87942e"
+        },
+        {
+          "digest": "9e62b5a7ec298f33cb4c7d9e00b659874bb2432d23ad6879ad1746592a2b036b",
+          "projected_hex": "ad1746592a2b036b",
+          "projected_decimal": "12472515041799373675",
+          "pickle_hex": "80059532000000000000004320762b2e7e1520febd3a0aedb7358e8602facf3924440e18538fce057e23bae91d94284b054b064b074b0874944e87942e"
+        },
+        {
+          "digest": "fd503875de30430b3c7e35f7ecca2fe995f2d55487bfef31707e09b175f917a0",
+          "projected_hex": "707e09b175f917a0",
+          "projected_decimal": "8105927037106591648",
+          "pickle_hex": "800595320000000000000043209e62b5a7ec298f33cb4c7d9e00b659874bb2432d23ad6879ad1746592a2b036b94284b094b0a4b0b4b0c74944e87942e"
+        },
+        {
+          "digest": "ac30858a66380467632841b758acc6cbe95ff9cfd7b9d226aa33de029248adff",
+          "projected_hex": "aa33de029248adff",
+          "projected_decimal": "12264390312885530111",
+          "pickle_hex": "80059532000000000000004320fd503875de30430b3c7e35f7ecca2fe995f2d55487bfef31707e09b175f917a094284b0d4b0e4b0f4b1074944e87942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16
+      ]
+    },
+    {
+      "name": "incomplete_tail",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "762b2e7e1520febd3a0aedb7358e8602facf3924440e18538fce057e23bae91d",
+          "projected_hex": "8fce057e23bae91d",
+          "projected_decimal": "10362225831949560093",
+          "pickle_hex": "800595320000000000000043201973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c94284b014b024b034b0474944e87942e"
+        }
+      ],
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "name": "no_complete_block",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [],
+      "token_ids": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "name": "frame_boundary_token_stream",
+      "block_size": 22000,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "7f245129165bb9ba11747856a9a908740bf7b29c0033da4958281d87b252f469",
+          "projected_hex": "58281d87b252f469",
+          "projected_decimal": "6352359743055656041",
+          "pickle_len": 66062
+        }
+      ],
+      "token_ids_repeat": {
+        "value": 256,
+        "count": 22000
+      }
+    },
+    {
+      "name": "large_lora_large_payload",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "expected": [
+        {
+          "digest": "f30f906062e861807059e2099b689baf2c9484128a0c2fd40a5fdd1e1032f47f",
+          "projected_hex": "0a5fdd1e1032f47f",
+          "projected_decimal": "747559184357323903",
+          "pickle_len": 70077
+        }
+      ],
+      "lora_name_repeat": {
+        "value": "a",
+        "count": 70000
+      },
+      "token_ids": [
+        1,
+        2,
+        3,
+        4
+      ]
+    }
+  ]
+}

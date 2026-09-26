@@ -41,6 +41,22 @@ use crate::ffi_dlopen as ffi;
 // ReplicateConfig
 // ---------------------------------------------------------------------------
 
+/// Soft-pin intent of a put operation.
+///
+/// A soft pin guards an object from eviction until a deadline fixed at write
+/// time; reads never extend it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SoftPinAction {
+    /// Keep an existing unexpired soft-pin deadline. The default, so plain
+    /// puts commit ordinary cache.
+    #[default]
+    Preserve = 0,
+    /// Commit a new soft-pin lifetime when the write becomes readable.
+    Enable = 1,
+    /// Remove an existing soft pin when the write becomes readable.
+    Disable = 2,
+}
+
 /// Replication settings for a put operation.
 ///
 /// This is the Rust counterpart of `mooncake_replicate_config_t` from
@@ -49,8 +65,11 @@ use crate::ffi_dlopen as ffi;
 pub struct ReplicateConfig {
     /// Number of replicas to create (0 means use the server default).
     pub replica_num: usize,
-    /// Prefer a replica on the same NUMA node / host ("soft pin").
-    pub with_soft_pin: bool,
+    /// Soft-pin intent for this write.
+    pub soft_pin_action: SoftPinAction,
+    /// Soft-pin TTL override in milliseconds. Only valid with
+    /// [`SoftPinAction::Enable`]; `None` uses the master's default TTL.
+    pub soft_pin_ttl_ms: Option<u64>,
     /// Declare whether the object will never be evicted.
     pub with_hard_pin: bool,
     /// Whitelist of segment names that should host a replica.
@@ -73,6 +92,12 @@ impl ReplicateConfig {
         ),
         StoreError,
     > {
+        if self.soft_pin_ttl_ms.is_some() && self.soft_pin_action != SoftPinAction::Enable {
+            return Err(StoreError::InvalidArgument(
+                "soft_pin_ttl_ms is only valid with SoftPinAction::Enable".to_string(),
+            ));
+        }
+
         let strings: Vec<CString> = self
             .preferred_segments
             .iter()
@@ -83,7 +108,9 @@ impl ReplicateConfig {
 
         let c_config = ffi::mooncake_replicate_config_t {
             replica_num: self.replica_num,
-            with_soft_pin: i32::from(self.with_soft_pin),
+            soft_pin_action: self.soft_pin_action as i32,
+            has_soft_pin_ttl: i32::from(self.soft_pin_ttl_ms.is_some()),
+            soft_pin_ttl_ms: self.soft_pin_ttl_ms.unwrap_or(0),
             with_hard_pin: i32::from(self.with_hard_pin),
             preferred_segments: if ptrs.is_empty() {
                 std::ptr::null_mut()
@@ -626,14 +653,17 @@ mod tests {
     fn replicate_config_to_ffi_empty_segments() {
         let config = ReplicateConfig {
             replica_num: 2,
-            with_soft_pin: true,
+            soft_pin_action: SoftPinAction::Enable,
+            soft_pin_ttl_ms: Some(30000),
             with_hard_pin: false,
             preferred_segments: Vec::new(),
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
         assert_eq!(ffi_cfg.replica_num, 2);
-        assert_eq!(ffi_cfg.with_soft_pin, 1);
+        assert_eq!(ffi_cfg.soft_pin_action, SoftPinAction::Enable as i32);
+        assert_eq!(ffi_cfg.has_soft_pin_ttl, 1);
+        assert_eq!(ffi_cfg.soft_pin_ttl_ms, 30000);
         assert_eq!(ffi_cfg.with_hard_pin, 0);
         assert!(ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 0);
@@ -645,14 +675,17 @@ mod tests {
     fn replicate_config_to_ffi_with_segments() {
         let config = ReplicateConfig {
             replica_num: 3,
-            with_soft_pin: false,
+            soft_pin_action: SoftPinAction::Preserve,
+            soft_pin_ttl_ms: None,
             with_hard_pin: false,
             preferred_segments: vec!["seg-a".to_string(), "seg-b".to_string()],
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
         assert_eq!(ffi_cfg.replica_num, 3);
-        assert_eq!(ffi_cfg.with_soft_pin, 0);
+        assert_eq!(ffi_cfg.soft_pin_action, SoftPinAction::Preserve as i32);
+        assert_eq!(ffi_cfg.has_soft_pin_ttl, 0);
+        assert_eq!(ffi_cfg.soft_pin_ttl_ms, 0);
         assert_eq!(ffi_cfg.with_hard_pin, 0);
         assert!(!ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 2);
@@ -666,10 +699,27 @@ mod tests {
     }
 
     #[test]
+    fn replicate_config_to_ffi_rejects_ttl_without_enable() {
+        let config = ReplicateConfig {
+            replica_num: 1,
+            soft_pin_action: SoftPinAction::Disable,
+            soft_pin_ttl_ms: Some(1000),
+            with_hard_pin: false,
+            preferred_segments: Vec::new(),
+        };
+
+        assert!(matches!(
+            config.to_ffi(),
+            Err(StoreError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
     fn replicate_config_to_ffi_rejects_interior_nul() {
         let config = ReplicateConfig {
             replica_num: 1,
-            with_soft_pin: false,
+            soft_pin_action: SoftPinAction::Preserve,
+            soft_pin_ttl_ms: None,
             with_hard_pin: false,
             preferred_segments: vec!["bad\0segment".to_string()],
         };
@@ -690,7 +740,8 @@ mod tests {
     fn prepare_config_some_preserves_storage_and_values() {
         let config = ReplicateConfig {
             replica_num: 4,
-            with_soft_pin: true,
+            soft_pin_action: SoftPinAction::Enable,
+            soft_pin_ttl_ms: None,
             with_hard_pin: false,
             preferred_segments: vec!["x".to_string(), "y".to_string()],
         };
@@ -699,7 +750,9 @@ mod tests {
             MooncakeStore::prepare_config(Some(&config)).expect("prepare should succeed");
         let cfg_ref = c_cfg.as_ref().expect("expected Some config");
         assert_eq!(cfg_ref.replica_num, 4);
-        assert_eq!(cfg_ref.with_soft_pin, 1);
+        assert_eq!(cfg_ref.soft_pin_action, SoftPinAction::Enable as i32);
+        assert_eq!(cfg_ref.has_soft_pin_ttl, 0);
+        assert_eq!(cfg_ref.soft_pin_ttl_ms, 0);
         assert_eq!(cfg_ref.with_hard_pin, 0);
         assert_eq!(cfg_ref.preferred_segments_count, 2);
         assert_eq!(strings.len(), 2);

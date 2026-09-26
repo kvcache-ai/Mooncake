@@ -360,6 +360,13 @@ TcpTransport::TcpTransport()
         "MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
         getenv("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER"),
         kDefaultPendingAdmissionsPerPeer, 1, kMaxPendingAdmissionsPerPeer);
+    if (const char* queued_bytes_env =
+            getenv("MC_TCP_MAX_QUEUED_BYTES_PER_PEER")) {
+        lane_state_->max_queued_bytes_per_peer = parseBoundedTcpSetting(
+            "MC_TCP_MAX_QUEUED_BYTES_PER_PEER", queued_bytes_env,
+            /*default_value=*/0, /*minimum=*/0,
+            std::numeric_limits<size_t>::max());
+    }
     lane_state_->admission_timeout =
         std::chrono::milliseconds(parseBoundedTcpSetting(
             "MC_TCP_ADMISSION_TIMEOUT_MS",
@@ -515,16 +522,13 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
-    // These counters are updated with __atomic_fetch_add from the I/O
-    // thread(s) in Slice::markSuccess/markFailed; read them atomically here to
-    // match MultiTransport::getTransferStatus and avoid a data race with the
-    // completion path (the read runs on the polling submission thread).
-    status.transferred_bytes =
-        __atomic_load_n(&task.transferred_bytes, __ATOMIC_ACQUIRE);
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
         __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Acquire completion counters before reading the bytes they publish.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
@@ -577,7 +581,8 @@ Status TcpTransport::submitTransferTask(
         do {
             task = task_list[i];
             assert(task && task->request);
-            slices.push_back(prepareTransfer(task, *task->request));
+            for (size_t j = 0; j < task->request_count; ++j)
+                slices.push_back(prepareTransfer(task, task->request[j]));
             ++i;
         } while (i < task_list.size() && task_list[i]->request &&
                  task_list[i]->request->task_group_id == group_id &&
@@ -594,7 +599,8 @@ Status TcpTransport::submitTransferTaskGroup(
     slices.reserve(task_list.size());
     for (auto* task : task_list) {
         assert(task && task->request);
-        slices.push_back(prepareTransfer(task, *task->request));
+        for (size_t j = 0; j < task->request_count; ++j)
+            slices.push_back(prepareTransfer(task, task->request[j]));
     }
     startTransferSequence(std::move(slices));
     return Status::OK();
@@ -602,7 +608,7 @@ Status TcpTransport::submitTransferTaskGroup(
 
 Transport::Slice* TcpTransport::prepareTransfer(
     TransferTask* task, const TransferRequest& request) {
-    task->total_bytes = request.length;
+    task->total_bytes += request.length;
     Slice* slice = getSliceCache().allocate();
     slice->source_addr = static_cast<char*>(request.source);
     slice->length = request.length;

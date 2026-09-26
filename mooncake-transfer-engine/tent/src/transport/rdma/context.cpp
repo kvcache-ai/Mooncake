@@ -21,6 +21,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <atomic>
 #include <cassert>
@@ -195,6 +198,7 @@ static inline std::string gidBytesToString(const uint8_t* raw) {
 // 3) RoCEv2/IB + no network device
 // 4) first non-zero GID (any type)
 static inline GidNetworkState getBestGidIndex(const std::string& device_name,
+                                              const IbvSymbols& verbs,
                                               struct ibv_context* context,
                                               ibv_port_attr& port_attr,
                                               uint8_t port, int& gid_index) {
@@ -210,7 +214,7 @@ static inline GidNetworkState getBestGidIndex(const std::string& device_name,
             << device_name << " port " << (int)port;
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
-        if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
+        if (QueryGidEx(verbs, context, port, i, &gid_entry)) {
             continue;  // Skip invalid GID entries
         }
 
@@ -503,8 +507,14 @@ void RdmaContext::cleanupResources() {
 
 int RdmaContext::pause() {
     DeviceStatus expected = DEVICE_ENABLED;
-    status_.compare_exchange_strong(expected, DEVICE_PAUSED);
-    return (expected == DEVICE_PAUSED) ? 0 : -1;
+    if (status_.compare_exchange_strong(expected, DEVICE_PAUSED,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        return 0;
+    }
+    // Pausing is idempotent. Other states (UNINIT/DISABLED) must not proceed
+    // into hardware reprobe or metadata publication.
+    return expected == DEVICE_PAUSED ? 0 : -1;
 }
 
 void RdmaContext::evictEndpoints() {
@@ -512,14 +522,17 @@ void RdmaContext::evictEndpoints() {
 }
 
 int RdmaContext::resume() {
-    DeviceStatus expected = DEVICE_PAUSED;
-    status_.compare_exchange_strong(expected, DEVICE_ENABLED);
-    if (expected != DEVICE_PAUSED) return -1;
-    // Port recovered: evict all cached endpoints so stale QPs (which may
-    // have entered IBV_QPS_ERR while the link was down) are torn down and
-    // rebuilt on the next getOrInsert() call.
+    if (status_.load(std::memory_order_acquire) != DEVICE_PAUSED) return -1;
+    // Keep the context paused while old QPs are retired. Publishing ENABLED
+    // first lets a concurrent bootstrap reuse an EP_READY endpoint from the
+    // previous address generation.
     evictEndpoints();
-    return 0;
+    DeviceStatus expected = DEVICE_PAUSED;
+    return status_.compare_exchange_strong(expected, DEVICE_ENABLED,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed)
+               ? 0
+               : -1;
 }
 
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
@@ -659,15 +672,95 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     return 0;
 }
 
-std::string RdmaContext::gid() const {
-    std::string gid_str;
-    char buf[16] = {0};
-    const static size_t kGidLength = 16;
-    for (size_t i = 0; i < kGidLength; ++i) {
-        sprintf(buf, "%02x", gid_.raw[i]);
-        gid_str += i == 0 ? buf : std::string(":") + buf;
+RdmaAddressSnapshot RdmaContext::address() const {
+    std::lock_guard<std::mutex> guard(address_mutex_);
+    return {lid_, gidBytesToString(gid_.raw), gid_index_};
+}
+
+RdmaAddressRefreshResult RdmaContext::refreshAddress(
+    RdmaAddressSnapshot* previous, RdmaAddressSnapshot* current) {
+    std::lock_guard<std::mutex> refresh_guard(address_refresh_mutex_);
+    const auto old_address = address();
+    if (previous) *previous = old_address;
+    if (!native_context_ || !params_) return RdmaAddressRefreshResult::FAILED;
+
+    ibv_port_attr port_attr{};
+    const uint8_t port = params_->device.port;
+    if (verbs_.ibv_query_port_default(native_context_, port, &port_attr)) {
+        PLOG(WARNING) << "Failed to refresh RDMA address on " << device_name_
+                      << "/" << static_cast<int>(port);
+        return RdmaAddressRefreshResult::FAILED;
     }
-    return gid_str;
+    if (port_attr.state != IBV_PORT_ACTIVE) {
+        LOG(WARNING) << "Cannot refresh RDMA address on " << device_name_ << "/"
+                     << static_cast<int>(port) << " while port state is "
+                     << port_attr.state;
+        return RdmaAddressRefreshResult::FAILED;
+    }
+
+    int next_gid_index = params_->device.gid_index;
+    if (next_gid_index < 0) {
+        if (getBestGidIndex(device_name_, verbs_, native_context_, port_attr,
+                            port,
+                            next_gid_index) == GidNetworkState::GID_NOT_FOUND) {
+            LOG(WARNING) << "No suitable GID found while refreshing "
+                         << device_name_ << "/" << static_cast<int>(port);
+            return RdmaAddressRefreshResult::FAILED;
+        }
+    }
+    if (next_gid_index < 0 || next_gid_index >= port_attr.gid_tbl_len) {
+        LOG(WARNING) << "Refreshed GID index " << next_gid_index
+                     << " is out of range [0, " << port_attr.gid_tbl_len
+                     << ") for " << device_name_;
+        return RdmaAddressRefreshResult::FAILED;
+    }
+
+    ibv_gid next_gid{};
+    if (verbs_.ibv_query_gid(native_context_, port, next_gid_index,
+                             &next_gid)) {
+        PLOG(WARNING) << "Failed to refresh GID " << next_gid_index << " on "
+                      << device_name_ << "/" << static_cast<int>(port);
+        return RdmaAddressRefreshResult::FAILED;
+    }
+    if (isNullGid(&next_gid)) {
+        LOG(WARNING) << "Refreshed GID " << next_gid_index << " on "
+                     << device_name_ << "/" << static_cast<int>(port)
+                     << " is empty";
+        return RdmaAddressRefreshResult::FAILED;
+    }
+
+#ifdef USE_SHCA
+    const uint32_t next_lid = u17_to_32(port_attr.lid);
+#else
+    const uint32_t next_lid = port_attr.lid;
+#endif
+    RdmaAddressSnapshot next_address{next_lid, gidBytesToString(next_gid.raw),
+                                     next_gid_index};
+    if (current) *current = next_address;
+    const bool changed = next_address.lid != old_address.lid ||
+                         next_address.gid != old_address.gid ||
+                         next_address.gid_index != old_address.gid_index;
+
+    // Publish even when the address is unchanged: a context whose port was
+    // down during setupLocalSegment() was omitted and must be inserted when
+    // it recovers.
+    auto status = transport_.refreshLocalDeviceDesc(
+        device_name_, next_address.lid, next_address.gid);
+    if (!status.ok()) {
+        LOG(ERROR) << "Failed to publish refreshed RDMA address for "
+                   << device_name_ << ": " << status.ToString();
+        return RdmaAddressRefreshResult::FAILED;
+    }
+
+    if (!changed) return RdmaAddressRefreshResult::UNCHANGED;
+
+    {
+        std::lock_guard<std::mutex> guard(address_mutex_);
+        lid_ = next_address.lid;
+        gid_ = next_gid;
+        gid_index_ = next_address.gid_index;
+    }
+    return RdmaAddressRefreshResult::CHANGED;
 }
 
 RdmaCQ* RdmaContext::cq(int index) {
@@ -748,7 +841,7 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     if (params_->verbose) {
         for (int i = 0; i < port_attr.gid_tbl_len; i++) {
             struct ibv_gid_entry entry;
-            if (ibv_query_gid_ex(context.get(), port, i, &entry, 0)) {
+            if (QueryGidEx(verbs_, context.get(), port, i, &entry)) {
                 PLOG(WARNING)
                     << "Scan: Unable to query GID " << i << " on device "
                     << device_name << " port " << port;
@@ -767,8 +860,9 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     if (gid_index_ < 0) {
         // Auto-select GID
         int found_gid_index = -1;
-        GidNetworkState gid_state = getBestGidIndex(
-            device_name, context.get(), port_attr, port, found_gid_index);
+        GidNetworkState gid_state =
+            getBestGidIndex(device_name, verbs_, context.get(), port_attr, port,
+                            found_gid_index);
         if (gid_state == GidNetworkState::GID_NOT_FOUND) {
             LOG(ERROR) << "No valid GID found for device " << device_name
                        << " port " << static_cast<int>(port);
@@ -803,8 +897,8 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
             has_issues = true;
         }
 
-        if (ibv_query_gid_ex(context.get(), port, gid_index_, &user_gid_entry,
-                             0) == 0) {
+        if (QueryGidEx(verbs_, context.get(), port, gid_index_,
+                       &user_gid_entry) == 0) {
             bool is_ipv4 =
                 ipv6_addr_v4mapped((struct in6_addr*)user_gid_entry.gid.raw);
             bool is_roce_v2 = user_gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2;
@@ -849,7 +943,11 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     }
 
     native_context_ = context.release();
+#ifdef USE_SHCA
+    lid_ = u17_to_32(port_attr.lid);
+#else
     lid_ = port_attr.lid;
+#endif
     recordPortSpeed(port_attr);
     queryEffectiveSpeed();
     return 0;

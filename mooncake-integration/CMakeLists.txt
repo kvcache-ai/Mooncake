@@ -84,6 +84,28 @@ if(WITH_TE)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(engine PRIVATE CUDA::cudart)
   endif()
+
+  if(BUILD_UNIT_TESTS AND USE_TENT)
+    add_test(
+      NAME tent_python_send_probe_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+        "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
+        PYTHONPATH=$<TARGET_FILE_DIR:engine>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_send_probe.py)
+    add_test(
+      NAME tent_python_first_buffer_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+        "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
+        PYTHONPATH=$<TARGET_FILE_DIR:engine>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
+    set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
+  endif()
 endif()
 
 set(ALLOCATOR_SO_PATH
@@ -181,7 +203,7 @@ if(USE_INTRA_NVLINK)
 endif()
 
 install(
-  FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py"
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/async_store.py"
   DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
   COMPONENT python)
 
@@ -197,9 +219,10 @@ endif()
 if(NOT SKBUILD)
   install(
     FILES
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/transfer_engine_topology_dump.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/http_metadata_server.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_launcher.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli_bench.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/transfer_engine_topology_dump.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_connector_v1.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/vllm_v1_proxy_server.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
@@ -208,16 +231,18 @@ if(NOT SKBUILD)
     install(
       FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_config.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli_client.py"
       DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
 
     if(USE_NOF)
       install(
         FILES
-          "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ssd_register.py"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ssd_unregister.py"
-          "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/spdk_tgt_create.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_administration.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_ssd_register.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_ssd_unregister.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/spdk_tgt_create.py"
         DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
     endif()
   endif()

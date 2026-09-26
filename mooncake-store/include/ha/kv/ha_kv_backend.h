@@ -41,6 +41,11 @@ class HaKvBackend {
     virtual ErrorCode Range(std::string_view begin_key,
                             std::string_view end_key, size_t limit,
                             std::vector<KvPair>& kvs) = 0;
+    // Delete [begin_key, end_key). Both bounds must be nonempty and finite.
+    // Equal bounds are a no-op for backends supporting deletion.
+    // Unsupported backends must return INVALID_PARAMS.
+    virtual ErrorCode DeleteRange(std::string_view begin_key,
+                                  std::string_view end_key) = 0;
     virtual bool SupportsTxn() const = 0;
     virtual ErrorCode Txn(const KvTxn& txn) = 0;
 };

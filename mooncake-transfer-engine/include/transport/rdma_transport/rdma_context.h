@@ -107,6 +107,8 @@ class RdmaContext {
    public:
     friend class RdmaContextTestPeer;
     friend class WorkerPool;
+    friend class RdmaEndPoint;
+    friend class RdmaTransport;
 
     RdmaContext(RdmaTransport &engine, const std::string &device_name);
 
@@ -131,14 +133,18 @@ class RdmaContext {
     int registerMemoryRegion(void *addr, size_t length, int access,
                              const DmabufExport &exp);
 
-    // Exports a single dma_buf fd for the allocation backing addr. GPU device
+    // Exports a single dma_buf fd covering [addr, addr + length). GPU device
     // memory yields kDmabufReg with a live fd; host memory and the
     // nvidia-peermem path yield kHostReg with no fd. Any fd placed in out.fd
     // MUST be closed by the caller (via closeDmabufExport) AFTER every
     // registerMemoryRegion() call consuming it has returned — each successful
     // registration takes its own reference, so closing earlier would invalidate
     // the fd for the remaining NICs.
-    static int exportDmabuf(void *addr, DmabufExport &out);
+    // `length` is the length of the whole buffer the caller is going to
+    // register (chunked registrations derive their own offset from out.offset),
+    // and is used to guarantee the exported dma_buf really covers that range —
+    // see the VMM note in exportDmabuf().
+    static int exportDmabuf(void *addr, size_t length, DmabufExport &out);
 
     // Closes the fd held by a DmabufExport, if any. Idempotent.
     static void closeDmabufExport(DmabufExport &exp);
@@ -171,6 +177,8 @@ class RdmaContext {
     }
 
    public:
+    bool nativeNotifyEnabled() const { return native_notify_enabled_; }
+
     // EndPoint Management
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path,
@@ -222,7 +230,7 @@ class RdmaContext {
     std::string nicPath() const;
 
    public:
-    uint16_t lid() const { return lid_; }
+    uint32_t lid() const { return lid_; }
 
     std::string gid() const;
 
@@ -315,7 +323,7 @@ class RdmaContext {
     ibv_comp_channel **comp_channel_ = nullptr;
 
     uint8_t port_ = 0;
-    uint16_t lid_ = 0;
+    uint32_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;
     int active_width_ = 1;
@@ -331,6 +339,17 @@ class RdmaContext {
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
+    bool native_notify_enabled_ = false;
+    std::mutex notify_mutex_;
+    // One fixed-size notification CQ per device, separate from the data CQs.
+    ibv_cq *notify_cq_ = nullptr;
+    std::unordered_map<uint32_t, std::weak_ptr<RdmaEndPoint>> notify_endpoints_;
+    void registerNotifyQp(uint32_t qp_num,
+                          const std::weak_ptr<RdmaEndPoint> &endpoint);
+    void unregisterNotifyQp(uint32_t qp_num);
+    int pollNotificationCq();
+    void dispatchNotificationCompletion(
+        const ibv_wc &wc, std::vector<TransferMetadata::NotifyDesc> &received);
 
     // Active-connect circuit-breaker (keyed by peer server name).
     ConnectPauseTracker connect_pause_;

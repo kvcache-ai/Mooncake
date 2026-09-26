@@ -914,5 +914,84 @@ TEST_F(MtuEnvTest, InvalidIsIgnored) {
     EXPECT_EQ(config.mtu_length, IBV_MTU_4096);
 }
 
+// MC_CONTEXT_PAUSE_TTL_MS bounds how long the context-level circuit breaker
+// holds a tripped local RNIC context inactive before half-open reactivation.
+// The valid range is 1-600000ms. Zero, garbage, negative and out-of-range
+// values must preserve the configured value because zero would re-introduce
+// the permanent-latch behavior this knob exists to fix.
+class ContextPauseTtlEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_CONTEXT_PAUSE_TTL_MS"); }
+};
+
+TEST_F(ContextPauseTtlEnvTest, DefaultIsFiveThousandWhenUnset) {
+    ::unsetenv("MC_CONTEXT_PAUSE_TTL_MS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 5000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "10000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 10000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, ZeroIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "0", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 99;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 99);
+}
+
+TEST_F(ContextPauseTtlEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "600000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 600000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "600001", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 7);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "-1", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 11);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "abc", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 13;  // a typo must NOT re-enable the latch
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 13);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "5000s", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 15);
+}
+
+TEST_F(ContextPauseTtlEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 17);
+}
+
 }  // namespace
 }  // namespace mooncake

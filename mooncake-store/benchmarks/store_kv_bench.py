@@ -467,7 +467,7 @@ class StoreSession:
             lengths = self._get_lengths_zcopy(keys, len(object_ids))
             for slot, (object_id, length) in enumerate(zip(object_ids, lengths)):
                 if length < 0:
-                    if self.store.isExist(keys[slot]) == 0:
+                    if self.store.is_exist(keys[slot]) == 0:
                         misses += 1
                         errors["MISS"] += 1
                     else:
@@ -509,7 +509,7 @@ class StoreSession:
         if operation == "put":
             payload = self.payload_factory.build(object_id)
             result_code = self.store.put(key, payload, self.config)
-            actual_present = result_code == 0 or self.store.isExist(key) == 1
+            actual_present = result_code == 0 or self.store.is_exist(key) == 1
             success = result_code == 0 or (expected_present and actual_present)
             bytes_processed = len(payload) if success else 0
         elif operation == "get":
@@ -526,13 +526,18 @@ class StoreSession:
                 result_code = "PRESENCE_MISMATCH"
             bytes_processed = len(payload) if actual_present else 0
         elif operation == "exist":
-            result_code = self.store.isExist(key)
+            result_code = self.store.is_exist(key)
             actual_present = result_code == 1
             success = result_code >= 0 and actual_present == expected_present
         elif operation == "remove":
             result_code = self.store.remove(key)
-            actual_present = self.store.isExist(key) == 1
-            success = not actual_present and (result_code == 0 or not expected_present)
+            existence_result = self.store.is_exist(key)
+            actual_present = existence_result == 1
+            success = existence_result == 0 and (
+                result_code == 0 or not expected_present
+            )
+            if existence_result < 0:
+                result_code = existence_result
         else:
             raise ValueError(f"unsupported metadata operation: {operation}")
 
@@ -965,11 +970,16 @@ class BenchmarkRunner:
         sessions = self._make_sessions()
         per_lane_stats: List[Optional[PhaseStats]] = [None] * self.lane_count
         threads: List[threading.Thread] = []
+        errors: List[Optional[BaseException]] = [None] * self.lane_count
 
         def runner(index: int, session: StoreSession) -> None:
             stats = PhaseStats(name=f"{phase_name}/lane{index}")
             stats.start_time = time.perf_counter()
-            worker_builder(session, index)(stats)
+            try:
+                worker_builder(session, index)(stats)
+            except BaseException as exc:
+                errors[index] = exc
+                return
             stats.end_time = time.perf_counter()
             per_lane_stats[index] = stats
 
@@ -984,6 +994,11 @@ class BenchmarkRunner:
 
         for thread in threads:
             thread.join()
+
+        # Join every lane before allowing the caller to release shared buffers.
+        for lane_id, error in enumerate(errors):
+            if error is not None:
+                raise RuntimeError(f"{phase_name} lane {lane_id} failed") from error
 
         merged = merge_stats(phase_name, [s for s in per_lane_stats if s is not None])
         log_phase_stats(merged)

@@ -22,6 +22,30 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+void collectConfigPaths(const json& node, const std::string& prefix,
+                        std::vector<std::string>& paths) {
+    // A default-constructed Config has a null root and represents an empty
+    // configuration whose callers rely entirely on defaults.
+    if (prefix.empty() && node.is_null()) return;
+    if (!node.is_object()) {
+        paths.push_back(prefix);
+        return;
+    }
+    if (node.empty()) {
+        if (!prefix.empty()) paths.push_back(prefix);
+        return;
+    }
+
+    for (auto it = node.begin(); it != node.end(); ++it) {
+        std::string path = prefix.empty() ? it.key() : prefix + "/" + it.key();
+        collectConfigPaths(it.value(), path, paths);
+    }
+}
+
+}  // namespace
+
 Status Config::load(const std::string& content) {
     std::lock_guard<std::mutex> lock(mutex_);
     try {
@@ -79,6 +103,24 @@ bool Config::dumpSubtree(const std::string& key_path, std::string* out) const {
     return false;
 }
 
+std::shared_ptr<const Config> Config::freeze() const {
+    auto frozen = std::make_shared<Config>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    frozen->config_data_ = config_data_;
+    return frozen;
+}
+
+std::vector<std::string> Config::paths() const {
+    std::vector<std::string> paths;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        collectConfigPaths(config_data_, "", paths);
+    }
+    std::sort(paths.begin(), paths.end());
+    paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+    return paths;
+}
+
 static inline void setConfig(Config& config, const std::string& env_key,
                              const std::string& config_key) {
     const char* val = std::getenv(env_key.c_str());
@@ -111,6 +153,13 @@ static inline void setArrayConfig(Config& config, const std::string& env_key,
         if (!item.empty()) items.push_back(item);
     }
     if (!items.empty()) config.set(config_key, items);
+}
+
+void ConfigHelper::forceTcp(Config& config) {
+    config.set("transports/force_tcp", true);
+    config.set("transports/tcp/enable", true);
+    config.set("transports/rdma/enable", false);
+    config.set("transports/hp_tcp/enable", false);
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {
@@ -146,6 +195,12 @@ Status ConfigHelper::loadFromEnv(Config& config) {
 
     // Legacy keys for backward compatibility (MC_* env vars)
     setConfig(config, "MOONCAKE_LOCAL_HOSTNAME", "rpc_server_hostname");
+    if (std::getenv("MC_FORCE_TCP")) {
+        forceTcp(config);
+        LOG(INFO)
+            << "MC_FORCE_TCP is set, forcing TENT memory transfers to use TCP";
+    }
+    setBoolConfig(config, "MC_MNNVL_EGM", "transports/mnnvl/egm");
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",
               "transports/rdma/device/num_cq_list");

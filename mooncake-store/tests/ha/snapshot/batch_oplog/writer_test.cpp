@@ -1,3 +1,4 @@
+#include "ha_metric_manager.h"
 #include "ha/snapshot/batch_oplog/writer.h"
 
 #include <glog/logging.h>
@@ -18,6 +19,7 @@
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/snapshot/batch_oplog/codec.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
@@ -28,6 +30,10 @@ namespace {
 
 class FakeHaKvBackend final : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = values_.find(std::string(key));
@@ -217,19 +223,56 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 
-    std::optional<BatchOpLogSnapshotCapture> StartCapture(size_t object_count) {
+    std::optional<BatchOpLogSnapshotCapture> StartCapture(
+        size_t object_count,
+        const WeightMetadataSnapshot* weight_metadata = nullptr) {
         backend_ = std::make_shared<FakeHaKvBackend>();
-        if (object_count != 0) {
+        auto batch = MakeObjectBatch(object_count);
+        const auto append = [&](OpType type, const std::string& key,
+                                const auto& value) {
+            const auto encoded = struct_pack::serialize(value);
+            OpLogEntry entry;
+            entry.sequence_id = ++batch.last_seq;
+            entry.op_type = type;
+            entry.tenant_id = "default";
+            entry.object_key = key;
+            entry.payload.assign(encoded.begin(), encoded.end());
+            entry.checksum = ComputeOpLogChecksum(entry.payload);
+            batch.entries.push_back(std::move(entry));
+        };
+        if (weight_metadata != nullptr) {
+            for (const auto& metadata : weight_metadata->metadata) {
+                auto importing = metadata;
+                importing.metadata_generation = 1;
+                importing.availability = WeightAvailabilityState::IMPORTING;
+                importing.residency = WeightResidencyState::UNKNOWN;
+                importing.manifest.manifest_key.clear();
+                importing.manifest.manifest_sha256.clear();
+                importing.manifest.payload_keys_sha256.clear();
+                importing.updated_at_ms = importing.created_at_ms;
+                append(OpType::WEIGHT_METADATA_UPSERT,
+                       MakeWeightRevisionMetadataKey(importing.identity),
+                       importing);
+                append(OpType::WEIGHT_METADATA_UPSERT,
+                       MakeWeightRevisionMetadataKey(metadata.identity),
+                       metadata);
+            }
+            for (const auto& lease : weight_metadata->leases) {
+                append(OpType::WEIGHT_LEASE_UPSERT,
+                       "weight-lease:" + std::to_string(lease.lease_id), lease);
+            }
+        }
+        if (!batch.entries.empty()) {
             EXPECT_EQ(ErrorCode::OK,
                       backend_->Put(BuildBatchRecordKey(kClusterId, 1),
-                                    EncodeOpLogBatchRecord(
-                                        MakeObjectBatch(object_count))));
+                                    EncodeOpLogBatchRecord(batch)));
         }
-        EXPECT_EQ(ErrorCode::OK,
-                  backend_->Put(BuildDurablePrefixKey(kClusterId),
-                                EncodeDurablePrefix(
-                                    {.batch_id = object_count == 0 ? 0u : 1u,
-                                     .last_seq = object_count})));
+        EXPECT_EQ(
+            ErrorCode::OK,
+            backend_->Put(BuildDurablePrefixKey(kClusterId),
+                          EncodeDurablePrefix(
+                              {.batch_id = batch.entries.empty() ? 0u : 1u,
+                               .last_seq = batch.last_seq})));
         EXPECT_EQ(ErrorCode::OK,
                   backend_->Put(BuildProducerViewKey(kClusterId), "7"));
 
@@ -240,6 +283,7 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
         standby_ = std::make_unique<HotStandbyService>(config);
         standby_->SetCatchUpBatchKvBackendForTesting(backend_);
         EXPECT_EQ(ErrorCode::OK, standby_->Start("", "", kClusterId));
+        HAMetricManager::instance().reset_snapshot_runtime(true);
         return standby_->BeginBatchOpLogSnapshotCapture();
     }
 
@@ -285,9 +329,24 @@ TEST_F(BatchOpLogSnapshotWriterTest, WritesAndVerifiesMultipleChunks) {
                       object.metadata.hard_pinned.value_or(false));
         }
     }
+    const auto metrics = HAMetricManager::instance().get_snapshot_runtime();
+    EXPECT_EQ(2u, metrics.chunk_count);
+    EXPECT_EQ(manifest->object_chunks[0].stored_size +
+                  manifest->object_chunks[1].stored_size,
+              metrics.chunk_bytes);
+    EXPECT_EQ(metrics.chunk_bytes + manifest->segments.stored_size +
+                  manifest_json.size() + descriptor_json->size(),
+              metrics.snapshot_bytes);
     EXPECT_EQ(5u, object_store.size());
+    EXPECT_EQ(ha::kBatchOpLogSnapshotSchemaVersion, descriptor->schema_version);
+    EXPECT_FALSE(manifest->weight_metadata);
     EXPECT_EQ(2u, object_store.string_upload_attempts);
     EXPECT_GT(object_store.download_attempts, 0u);
+    standby_
+        ->Stop();  // Join the apply loop before inspecting its pause sample.
+    EXPECT_GT(
+        HAMetricManager::instance().get_snapshot_runtime().capture_pause_us,
+        0u);
 }
 
 TEST_F(BatchOpLogSnapshotWriterTest, WritesEmptyClusterWithoutObjectChunks) {
@@ -303,12 +362,129 @@ TEST_F(BatchOpLogSnapshotWriterTest, WritesEmptyClusterWithoutObjectChunks) {
     ASSERT_TRUE(descriptor_json) << descriptor_json.error();
     auto descriptor = ha::DecodeBatchOpLogSnapshotDescriptor(*descriptor_json);
     ASSERT_TRUE(descriptor);
+    EXPECT_EQ(ha::kBatchOpLogSnapshotSchemaVersion, descriptor->schema_version);
     std::string manifest_json;
     ASSERT_TRUE(
         object_store.DownloadString(descriptor->manifest_key, manifest_json));
     auto manifest = ha::DecodeBatchOpLogSnapshotManifest(manifest_json);
     ASSERT_TRUE(manifest);
     EXPECT_TRUE(manifest->object_chunks.empty());
+}
+
+TEST_F(BatchOpLogSnapshotWriterTest,
+       RestoresWeightMetadataAndLeasesAfterCompactedBaseline) {
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    const WeightRevisionMetadata metadata{
+        .identity = identity,
+        .manifest =
+            WeightManifestReference{
+                .manifest_key =
+                    "weights/production/llama-70b/step-100/7/manifest",
+                .manifest_sha256 = std::string(64, 'a'),
+                .payload_group_id = MakeWeightPayloadGroupId(identity),
+                .payload_keys_sha256 = std::string(64, 'b'),
+                .payload_count = 2,
+                .logical_bytes = 2048,
+            },
+        .availability = WeightAvailabilityState::READY,
+        .residency = WeightResidencyState::HOT,
+        .operation = WeightOperationState::NONE,
+        .metadata_generation = 2,
+        .created_at_ms = 100,
+        .updated_at_ms = 102,
+    };
+    const WeightRevisionLease lease{
+        .lease_id = 42,
+        .identity = identity,
+        .holder = "worker-0",
+        .expires_at_ms = 1000,
+        .fenced_metadata_generation = 2,
+    };
+    const WeightMetadataSnapshot expected{
+        .metadata = {metadata},
+        .leases = {lease},
+        .next_lease_id = 43,
+    };
+    auto capture = StartCapture(1, &expected);
+    ASSERT_TRUE(capture);
+    ASSERT_EQ(4u, capture->last_included_seq);
+    FakeObjectStore object_store;
+    BatchOpLogSnapshotWriter writer(object_store);
+    auto descriptor =
+        writer.Write(*standby_, *capture, "snapshots", "1-42", 2, 1234);
+    ASSERT_TRUE(descriptor) << descriptor.error();
+    const auto decoded_descriptor =
+        ha::DecodeBatchOpLogSnapshotDescriptor(*descriptor);
+    ASSERT_TRUE(decoded_descriptor);
+    EXPECT_EQ(ha::kBatchOpLogWeightSnapshotSchemaVersion,
+              decoded_descriptor->schema_version);
+    standby_->Stop();
+
+    // Only the materialized baseline remains; replay cannot recover omitted
+    // weight records from the original batch.
+    FakeHaKvBackend compacted_backend;
+    ASSERT_EQ(
+        ErrorCode::OK,
+        compacted_backend.Put(ha::BuildBatchOpLogSnapshotLatestKey(kClusterId),
+                              *descriptor));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        compacted_backend.Put(
+            ha::BuildBatchOpLogSnapshotCompactionFloorKey(kClusterId), "1"));
+    ASSERT_EQ(ErrorCode::OK,
+              compacted_backend.Put(
+                  BuildDurablePrefixKey(kClusterId),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 4})));
+    BatchOpLogSnapshotProvider provider(kClusterId, compacted_backend,
+                                        object_store, "snapshots");
+    StandbyMetadataStore restored;
+    StandbySegmentRegistry registry;
+    auto result = provider.RestoreBaseline(restored, registry);
+    ASSERT_TRUE(result) << toString(result.error());
+    EXPECT_EQ(expected, restored.SnapshotWeightMetadata());
+
+    auto renewed = lease;
+    renewed.expires_at_ms = 2000;
+    const auto encoded_lease = struct_pack::serialize(renewed);
+    OpLogEntry renewal;
+    renewal.sequence_id = 5;
+    renewal.op_type = OpType::WEIGHT_LEASE_UPSERT;
+    renewal.tenant_id = "default";
+    renewal.object_key = "weight-lease:42";
+    renewal.payload.assign(encoded_lease.begin(), encoded_lease.end());
+    renewal.checksum = ComputeOpLogChecksum(renewal.payload);
+    OpLogBatchRecord suffix;
+    suffix.batch_id = 2;
+    suffix.first_seq = 5;
+    suffix.last_seq = 5;
+    suffix.entries.push_back(renewal);
+    ASSERT_EQ(ErrorCode::OK,
+              compacted_backend.Put(BuildBatchRecordKey(kClusterId, 2),
+                                    EncodeOpLogBatchRecord(suffix)));
+    ASSERT_EQ(ErrorCode::OK,
+              compacted_backend.Put(
+                  BuildDurablePrefixKey(kClusterId),
+                  EncodeDurablePrefix({.batch_id = 2, .last_seq = 5})));
+    ASSERT_TRUE(provider.RestoreBaseline(restored, registry));
+    auto after_suffix = expected;
+    after_suffix.leases.front() = renewed;
+    EXPECT_EQ(after_suffix, restored.SnapshotWeightMetadata());
+
+    const auto weight_key =
+        ha::BuildBatchOpLogSnapshotWeightMetadataKey("snapshots", "1-42");
+    std::vector<uint8_t> weight_bytes;
+    ASSERT_TRUE(object_store.DownloadBuffer(weight_key, weight_bytes));
+    ASSERT_FALSE(weight_bytes.empty());
+    weight_bytes.back() ^= 1;
+    ASSERT_TRUE(object_store.UploadBuffer(weight_key, weight_bytes));
+    EXPECT_FALSE(provider.RestoreBaseline(restored, registry));
+    EXPECT_TRUE(restored.SnapshotWeightMetadata().metadata.empty());
 }
 
 TEST_F(BatchOpLogSnapshotWriterTest,

@@ -7,21 +7,27 @@
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
+#include <optional>
 #include <string>
 #include <thread>  // For std::thread
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
+#include "allocator_status.h"
+#include "config/metrics_bootstrap_config_loader.h"
+#include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
+#include "ha/snapshot/batch_oplog/config.h"
 
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "utils.h"
+#include "common/network.h"
+#include "glog_compat.h"
 
 #include "master_config.h"
 #include "version.h"
@@ -120,9 +126,13 @@ DEFINE_int32(port, 50051,
 DEFINE_int32(
     max_threads, 16,
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
-DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
-DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
-DEFINE_string(metrics_host, "0.0.0.0",
+DEFINE_bool(enable_metric_reporting,
+            mooncake::MetricsBootstrapConfig::kDefaultEnabled,
+            "Enable periodic metric reporting");
+DEFINE_int32(metrics_port, mooncake::MetricsBootstrapConfig::kDefaultPort,
+             "Port for HTTP metrics server to listen on");
+DEFINE_string(metrics_host,
+              std::string(mooncake::MetricsBootstrapConfig::kDefaultHost),
               "Address for the HTTP metrics/admin server to listen on. "
               "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
@@ -146,6 +156,18 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in Memory");
+DEFINE_double(tenant_eviction_high_watermark_ratio,
+              mooncake::DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO,
+              "Per-tenant high watermark, as a fraction of that tenant's own "
+              "effective quota, at which background eviction starts for it. "
+              "Defaults to the same value as -eviction_high_watermark_ratio; "
+              "0 disables it. Only meaningful with -enable_multi_tenants. "
+              "This is the only mechanism that frees space for a tenant: "
+              "admission itself never evicts, it rejects with "
+              "TENANT_QUOTA_EXCEEDED. Without it, a tenant whose effective "
+              "quota sits at or below eviction_high_watermark_ratio reaches "
+              "its own ceiling before the pool crosses the pool-wide "
+              "watermark, so nothing ever reclaims on its behalf");
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -175,6 +197,15 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
+DEFINE_validator(tenant_eviction_high_watermark_ratio,
+                 [](const char* flagname, double value) {
+                     if (value < 0.0 || value > 1.0) {
+                         LOG(FATAL) << "Tenant eviction high watermark ratio "
+                                       "must be between 0.0 and 1.0";
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "NoF eviction ratio must be between 0.0 and 1.0";
@@ -281,11 +312,16 @@ DEFINE_string(ha_backend_connstring, "",
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
-DEFINE_int64(
-    client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-    "Seconds a client stays considered alive after the last heartbeat. "
-    "If this TTL elapses without a refresh, the master treats the "
-    "client as disconnected and may unmount its segments");
+DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+             "Deprecated alias for --client_active_ttl_sec");
+DEFINE_int64(client_active_ttl_sec, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+             "Seconds a client remains active after its last liveness "
+             "observation");
+DEFINE_int64(client_suspicion_ttl_sec,
+             mooncake::DEFAULT_CLIENT_SUSPICION_TTL_SEC,
+             "Seconds a suspected client may recover before going offline; "
+             "defaults to 20 seconds, or to an explicitly configured active "
+             "TTL when omitted");
 DEFINE_int64(nof_heartbeat_interval_sec,
              mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
              "How often master probes each mounted NoF segment");
@@ -310,6 +346,13 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
             "Enable HA metadata replication through batch-record OpLog");
+DEFINE_bool(weight_management_oplog_capability_confirmed, false,
+            "Confirm every configured OpLog standby supports weight metadata "
+            "and lease entry types before enabling weight mutations");
+DEFINE_bool(enable_oplog_snapshot, false,
+            "Enable standby batch OpLog snapshot production");
+DEFINE_uint64(snapshot_chunk_object_count, 1000000,
+              "Maximum objects per standby batch OpLog snapshot chunk");
 DEFINE_int32(oplog_poll_interval_ms, 1000,
              "Batch-record standby poll interval.");
 DEFINE_uint32(oplog_batch_max_entries, 1024,
@@ -422,6 +465,25 @@ std::string ResolveHABackendConnstring(
         master_config.etcd_endpoints);
 }
 
+mooncake::MetricsBootstrapCommandLineOverrides
+GetMetricsBootstrapCommandLineOverrides() {
+    mooncake::MetricsBootstrapCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
+        !info.is_default) {
+        command_line.enabled = FLAGS_enable_metric_reporting;
+    }
+    if (google::GetCommandLineFlagInfo("metrics_port", &info) &&
+        !info.is_default) {
+        command_line.port = static_cast<uint32_t>(FLAGS_metrics_port);
+    }
+    if (google::GetCommandLineFlagInfo("metrics_host", &info) &&
+        !info.is_default) {
+        command_line.host = FLAGS_metrics_host;
+    }
+    return command_line;
+}
+
 void ResolveRpcAddressFromInterfaceOrDie(
     mooncake::MasterConfig& master_config) {
     if (master_config.rpc_interface.empty()) {
@@ -456,15 +518,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_cxl);
     default_config.GetString("cxl_path", &master_config.cxl_path,
                              FLAGS_cxl_path);
-    default_config.GetUInt64("cxl_size", &master_config.cxl_size,
-                             FLAGS_cxl_size);
-    default_config.GetBool("enable_metric_reporting",
-                           &master_config.enable_metric_reporting,
-                           FLAGS_enable_metric_reporting);
-    default_config.GetUInt32("metrics_port", &master_config.metrics_port,
-                             FLAGS_metrics_port);
-    default_config.GetString("metrics_host", &master_config.metrics_host,
-                             FLAGS_metrics_host);
+    // cxl_size is size_t, which is not uint64_t on every platform (macOS).
+    uint64_t cxl_size = master_config.cxl_size;
+    default_config.GetUInt64("cxl_size", &cxl_size, FLAGS_cxl_size);
+    master_config.cxl_size = cxl_size;
     default_config.GetUInt32("rpc_port", &master_config.rpc_port,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
@@ -496,15 +553,16 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble(
+        "tenant_eviction_high_watermark_ratio",
+        &master_config.tenant_eviction_high_watermark_ratio,
+        FLAGS_tenant_eviction_high_watermark_ratio);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
     default_config.GetDouble("nof_eviction_high_watermark_ratio",
                              &master_config.nof_eviction_high_watermark_ratio,
                              FLAGS_nof_eviction_high_watermark_ratio);
-    default_config.GetInt64("client_live_ttl_sec",
-                            &master_config.client_live_ttl_sec,
-                            FLAGS_client_ttl);
     default_config.GetInt64("nof_heartbeat_interval_sec",
                             &master_config.nof_heartbeat_interval_sec,
                             FLAGS_nof_heartbeat_interval_sec);
@@ -612,6 +670,16 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cluster_id);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
                            FLAGS_enable_oplog);
+    default_config.GetBool(
+        "weight_management_oplog_capability_confirmed",
+        &master_config.weight_management_oplog_capability_confirmed,
+        FLAGS_weight_management_oplog_capability_confirmed);
+    default_config.GetBool("enable_oplog_snapshot",
+                           &master_config.enable_oplog_snapshot,
+                           FLAGS_enable_oplog_snapshot);
+    default_config.GetUInt64("snapshot_chunk_object_count",
+                             &master_config.snapshot_chunk_object_count,
+                             FLAGS_snapshot_chunk_object_count);
     default_config.GetInt32("oplog_poll_interval_ms",
                             &master_config.oplog_poll_interval_ms,
                             FLAGS_oplog_poll_interval_ms);
@@ -818,21 +886,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
     }
-    if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_metric_reporting = FLAGS_enable_metric_reporting;
-    }
-    if ((google::GetCommandLineFlagInfo("metrics_port", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.metrics_port = FLAGS_metrics_port;
-    }
-    if ((google::GetCommandLineFlagInfo("metrics_host", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.metrics_host = FLAGS_metrics_host;
-    }
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -869,6 +922,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.eviction_high_watermark_ratio =
             FLAGS_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("tenant_eviction_high_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.tenant_eviction_high_watermark_ratio =
+            FLAGS_tenant_eviction_high_watermark_ratio;
     }
     if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
          !info.is_default) ||
@@ -1073,11 +1133,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
     }
-    if ((google::GetCommandLineFlagInfo("client_ttl", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.client_live_ttl_sec = FLAGS_client_ttl;
-    }
     if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1107,6 +1162,24 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_oplog = FLAGS_enable_oplog;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "weight_management_oplog_capability_confirmed", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.weight_management_oplog_capability_confirmed =
+            FLAGS_weight_management_oplog_capability_confirmed;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_oplog_snapshot", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_oplog_snapshot = FLAGS_enable_oplog_snapshot;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_chunk_object_count", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_chunk_object_count =
+            FLAGS_snapshot_chunk_object_count;
     }
     if ((google::GetCommandLineFlagInfo("oplog_poll_interval_ms", &info) &&
          !info.is_default) ||
@@ -1369,6 +1442,61 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     }
 }
 
+std::optional<int64_t> GetConfiguredInt64(
+    const mooncake::DefaultConfig* default_config, const std::string& key) {
+    if (default_config == nullptr || !default_config->Contains(key)) {
+        return std::nullopt;
+    }
+    int64_t value = 0;
+    default_config->GetInt64(key, &value);
+    return value;
+}
+
+std::optional<int64_t> GetExplicitInt64Flag(const char* name, int64_t value) {
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo(name, &info) && !info.is_default) {
+        return value;
+    }
+    return std::nullopt;
+}
+
+void InitClientLivenessConf(const mooncake::DefaultConfig* default_config,
+                            mooncake::MasterConfig& master_config) {
+    const mooncake::ClientLivenessConfigSource config_file{
+        .active_ttl_sec =
+            GetConfiguredInt64(default_config, "client_active_ttl_sec"),
+        .legacy_ttl_sec =
+            GetConfiguredInt64(default_config, "client_live_ttl_sec"),
+        .suspicion_ttl_sec =
+            GetConfiguredInt64(default_config, "client_suspicion_ttl_sec"),
+    };
+    const mooncake::ClientLivenessConfigSource command_line{
+        .active_ttl_sec = GetExplicitInt64Flag("client_active_ttl_sec",
+                                               FLAGS_client_active_ttl_sec),
+        .legacy_ttl_sec = GetExplicitInt64Flag("client_ttl", FLAGS_client_ttl),
+        .suspicion_ttl_sec = GetExplicitInt64Flag(
+            "client_suspicion_ttl_sec", FLAGS_client_suspicion_ttl_sec),
+    };
+
+    const auto resolved = mooncake::ResolveClientLivenessConfig(
+        config_file, command_line, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+        mooncake::DEFAULT_CLIENT_SUSPICION_TTL_SEC);
+    if (resolved.config_active_conflict) {
+        LOG(WARNING) << "Both client_active_ttl_sec and deprecated "
+                        "client_live_ttl_sec are configured with different "
+                        "values; using client_active_ttl_sec="
+                     << *config_file.active_ttl_sec;
+    }
+    if (resolved.command_line_active_conflict) {
+        LOG(WARNING) << "Both --client_active_ttl_sec and deprecated "
+                        "--client_ttl are set with different values; using "
+                        "--client_active_ttl_sec="
+                     << *command_line.active_ttl_sec;
+    }
+    master_config.client_active_ttl_sec = resolved.active_ttl_sec;
+    master_config.client_suspicion_ttl_sec = resolved.suspicion_ttl_sec;
+}
+
 // Function to start HTTP metadata server
 std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
     int port, const std::string& host) {
@@ -1400,7 +1528,9 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     if (!FLAGS_log_dir.empty()) {
-        google::InitGoogleLogging(argv[0]);
+        // MC_LOG_DIR may have initialized glog (and set FLAGS_log_dir) from
+        // a static initializer before main — see glog_compat.h.
+        mooncake::InitGoogleLoggingOnce(argv[0]);
         // Merge all master logs into a single journal file in --log_dir,
         // reusing glog: every record is already written to its own severity
         // file and all lower ones, so the INFO sink is a complete journal.
@@ -1412,6 +1542,8 @@ int main(int argc, char* argv[]) {
         google::SetLogDestination(google::GLOG_FATAL, "");
         google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
+    mooncake::LogAllocatorStatus();
+    mooncake::InstallAllocatorStatsCollector();
 
     LOG(INFO) << "Mooncake master version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
@@ -1419,8 +1551,9 @@ int main(int argc, char* argv[]) {
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
     std::string conf_path = FLAGS_config_path;
+    mooncake::DefaultConfig default_config;
+    const mooncake::DefaultConfig* loaded_default_config = nullptr;
     if (!conf_path.empty()) {
-        mooncake::DefaultConfig default_config;
         default_config.SetPath(conf_path);
         try {
             default_config.Load();
@@ -1429,8 +1562,23 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         InitMasterConf(default_config, master_config);
+        loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    try {
+        master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
+            loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Invalid metrics bootstrap configuration: "
+                   << error.what();
+        return 1;
+    }
+    try {
+        InitClientLivenessConf(loaded_default_config, master_config);
+    } catch (const std::invalid_argument& error) {
+        LOG(ERROR) << "Invalid Client liveness configuration: " << error.what();
+        return 1;
+    }
     ResolveRpcAddressFromInterfaceOrDie(master_config);
 
     // Fall back to environment variables for pod identity (K8s Downward API)
@@ -1461,6 +1609,10 @@ int main(int argc, char* argv[]) {
         LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd";
         return 1;
     }
+    if (auto error = ValidateBatchOpLogSnapshotConfig(master_config)) {
+        LOG(FATAL) << *error;
+        return 1;
+    }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
                                      !master_config.etcd_endpoints.empty())) {
         LOG(WARNING)
@@ -1483,11 +1635,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    std::string protocol = "tcp";
-    if (value && std::string_view(value) == "rdma") {
-        protocol = "rdma";
+    const auto rpc_protocol_config =
+        mooncake::RpcProtocolConfig::FromEnvironment();
+#ifdef YLT_ENABLE_IBV
+    const std::string protocol = rpc_protocol_config.use_rdma ? "rdma" : "tcp";
+#else
+    const std::string protocol = "tcp";
+    if (rpc_protocol_config.use_rdma) {
+        LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP RPC";
     }
+#endif
 
     // enable_metadata_cleanup_on_timeout requires a reachable HTTP metadata
     // server. Two topologies are supported:
@@ -1526,9 +1683,9 @@ int main(int argc, char* argv[]) {
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
-        << ", enable_metric_reporting=" << master_config.enable_metric_reporting
-        << ", metrics_port=" << master_config.metrics_port
-        << ", metrics_host=" << master_config.metrics_host
+        << ", enable_metric_reporting=" << master_config.metrics.enabled
+        << ", metrics_port=" << master_config.metrics.port
+        << ", metrics_host=" << master_config.metrics.host
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
         << ", max_kv_soft_pin_ttl=" << master_config.max_kv_soft_pin_ttl
@@ -1537,8 +1694,15 @@ int main(int argc, char* argv[]) {
         << ", eviction_ratio=" << master_config.eviction_ratio
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
+        << ", tenant_eviction_high_watermark_ratio="
+        << master_config.tenant_eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_oplog=" << master_config.enable_oplog
+        << ", weight_management_oplog_capability_confirmed="
+        << master_config.weight_management_oplog_capability_confirmed
+        << ", enable_oplog_snapshot=" << master_config.enable_oplog_snapshot
+        << ", snapshot_chunk_object_count="
+        << master_config.snapshot_chunk_object_count
         << ", enable_offload=" << master_config.enable_offload
         << ", enable_kv_events=" << master_config.enable_kv_events
         << ", kv_events_bind_endpoint=" << master_config.kv_events_bind_endpoint
@@ -1550,7 +1714,9 @@ int main(int argc, char* argv[]) {
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
-        << ", client_ttl=" << master_config.client_live_ttl_sec
+        << ", client_active_ttl_sec=" << master_config.client_active_ttl_sec
+        << ", client_suspicion_ttl_sec="
+        << master_config.client_suspicion_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
         << ", rpc_port=" << master_config.rpc_port
         << ", rpc_address=" << master_config.rpc_address
@@ -1640,17 +1806,21 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        if (rpc_protocol_config.use_rdma) {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#else
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
         }
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(
                 mooncake::WrappedMasterServiceConfig(master_config, version),
                 metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
-            static_cast<uint16_t>(master_config.metrics_port),
-            master_config.enable_metric_reporting, master_config.metrics_host);
+            static_cast<uint16_t>(master_config.metrics.port),
+            master_config.metrics.enabled, master_config.metrics.host);
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;

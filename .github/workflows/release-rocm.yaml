@@ -56,6 +56,18 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      # workflow_dispatch may build a tag older than the verification helper.
+      # Keep release policy tied to the trusted workflow revision instead of
+      # relying on files from the historical source tree.
+      - name: Check out release verification helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-ci
+          persist-credentials: false
+          sparse-checkout: scripts/tone_tests/python/verify_rocm_wheel.py
+          sparse-checkout-cone-mode: false
+
       - name: Mark repository as safe
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
@@ -93,7 +105,7 @@ jobs:
             exit 1
           fi
 
-      - name: Install toolchain and Python ${{ matrix.python-version }}
+      - name: Install toolchain
         shell: bash
         run: |
           set -eo pipefail
@@ -101,20 +113,23 @@ jobs:
           apt-get update -y
           apt-get install -y --no-install-recommends \
             git curl ca-certificates build-essential sudo pkg-config \
-            ninja-build software-properties-common
-          PYV="${{ matrix.python-version }}"
-          if ! command -v "python${PYV}" >/dev/null 2>&1; then
-            add-apt-repository -y ppa:deadsnakes/ppa
-            apt-get update -y
-          fi
-          # Always install -dev + -venv: the image's system python3.10 exists but
-          # ships without the venv module / dev headers.
-          apt-get install -y --no-install-recommends \
-            "python${PYV}" "python${PYV}-dev" "python${PYV}-venv"
-          curl -sS https://bootstrap.pypa.io/get-pip.py | "python${PYV}"
-          PYTHON_BIN="$(command -v python${PYV})"
-          echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+            ninja-build
+          # hipify-perl is required by the CMake USE_HIP path.
           echo "/opt/rocm/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set Python bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHON_BIN="$(command -v python${{ matrix.python-version }})"
+          "$PYTHON_BIN" --version
+          "$PYTHON_BIN" -m pip --version
+          echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         shell: bash
@@ -131,12 +146,15 @@ jobs:
           rm -rf build && mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+            -DENABLE_MULTI_PROTOCOL=ON \
             -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
             -DBUILD_UNIT_TESTS=OFF -DENABLE_DEBUG_SYMBOLS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             -DPython3_EXECUTABLE="${PYTHON_BIN}"
 
       - name: Build project
+        env:
+          MAX_JOBS: "2"
         shell: bash
         run: |
           set -eo pipefail
@@ -145,7 +163,7 @@ jobs:
           # Retry to ride out transient Go module (proxy.golang.org) fetch errors
           # during the etcd-wrapper build; Go caches modules, so retries resume.
           n=0
-          until cmake --build . -j"$(nproc)"; do
+          until cmake --build . -j"${MAX_JOBS}"; do
             n=$((n+1))
             if [ "$n" -ge 3 ]; then echo "Build failed after $n attempts"; exit 1; fi
             echo "Build attempt $n failed; retrying in 15s..."; sleep 15
@@ -187,13 +205,16 @@ jobs:
           # Install the actual per-matrix release artifact (cp310-cp313) into a
           # fresh venv and exercise the packaged binary, so packaging/ELF-layout
           # failures in any version are caught before this wheel reaches PyPI.
-          # No GPU is needed for `mooncake_master --version`.
+          # Import both native bindings as well as exercising the packaged
+          # binary. No GPU is needed for these load-time checks.
           smoke_venv=$(mktemp -d)
           "${PYTHON_BIN}" -m venv "$smoke_venv"
           "$smoke_venv/bin/python" -m pip install --no-deps \
             mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
           export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
-          site="$("$smoke_venv/bin/python" -c 'import mooncake,os;print(os.path.dirname(mooncake.__file__))')"
+          "$smoke_venv/bin/python" \
+            .release-ci/scripts/tone_tests/python/verify_rocm_wheel.py
+          site="$("$smoke_venv/bin/python" -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')"
           "$site/mooncake_master" --version
 
       - name: Upload Python wheel artifact
