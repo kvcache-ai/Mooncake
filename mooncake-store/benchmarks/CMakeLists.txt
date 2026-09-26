@@ -17,23 +17,38 @@ target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
 # Add BatchGetReplicaList latency benchmark executable
 add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
 target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
-                                                       mooncake_store)
+                                                      mooncake_store)
+
+# Offline, dependency-aware replay of master RPC operation traces.
+add_library(master_rpc_trace STATIC master_rpc_trace/trace.cpp)
+target_link_libraries(master_rpc_trace PUBLIC JsonCpp::JsonCpp pthread)
+target_include_directories(master_rpc_trace PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(master_rpc_trace_bench master_rpc_trace_bench.cpp)
+target_link_libraries(master_rpc_trace_bench
+                      PRIVATE master_rpc_trace mooncake_store gflags::gflags)
+if(BUILD_UNIT_TESTS)
+  add_executable(master_rpc_trace_test master_rpc_trace/tests/trace_test.cpp)
+  target_include_directories(master_rpc_trace_test PRIVATE master_rpc_trace)
+  target_link_libraries(master_rpc_trace_test PRIVATE master_rpc_trace
+                                                      gtest_main)
+  add_test(NAME master_rpc_trace_test COMMAND master_rpc_trace_test)
+endif()
 
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)
 
-# Add storage backend benchmark executable
-# This benchmark tests all storage backends (OffsetAllocator, Bucket, FilePerKey)
-# with realistic KV cache workloads for LLM inference scenarios
+# Add storage backend benchmark executable This benchmark tests all storage
+# backends (OffsetAllocator, Bucket, FilePerKey) with realistic KV cache
+# workloads for LLM inference scenarios
 add_executable(storage_backend_bench storage_backend_bench.cpp)
 target_link_libraries(
   storage_backend_bench PRIVATE mooncake_store cachelib_memory_allocator
                                 gflags::gflags glog::glog pthread)
 
-# Add allocation strategy benchmark executable
-# This benchmark tests AllocationStrategy performance with configurable
-# segment counts, allocation sizes, replica counts, and workload patterns
+# Add allocation strategy benchmark executable This benchmark tests
+# AllocationStrategy performance with configurable segment counts, allocation
+# sizes, replica counts, and workload patterns
 add_executable(allocation_strategy_bench allocation_strategy_bench.cpp)
 target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
@@ -43,7 +58,7 @@ target_link_libraries(
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
-                                                       gflags::gflags)
+                                                      gflags::gflags)
 endif()
 
 # Add BatchEvict benchmark executable
