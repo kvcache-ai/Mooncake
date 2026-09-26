@@ -13,8 +13,27 @@ import tempfile
 import time
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from recorder import RpcTraceWriter  # noqa: E402
+
+class FixtureWriter:
+    """Tiny test-fixture helper; trace producers are external to Mooncake."""
+
+    def __init__(self, path):
+        self.path = path
+        self.events = []
+
+    def __enter__(self):
+        return self
+
+    def record(self, **fields):
+        event_id = str(len(self.events))
+        self.events.append({"id": event_id, **fields})
+        return event_id
+
+    def __exit__(self, *exception):
+        header = {"type": "master_rpc_trace", "version": 1, "time_unit": "us"}
+        self.path.write_text(
+            "\n".join(json.dumps(row) for row in [header, *self.events]) + "\n"
+        )
 
 
 def unused_port():
@@ -126,7 +145,7 @@ class RpcSmokeTest(unittest.TestCase):
 
     def test_partial_put_after_prefill(self):
         prefill = self.directory / "prefill.jsonl"
-        with RpcTraceWriter(prefill) as writer:
+        with FixtureWriter(prefill) as writer:
             start = writer.record(
                 timestamp_us=0,
                 client_id="a",
@@ -142,7 +161,7 @@ class RpcSmokeTest(unittest.TestCase):
                 put_start=start,
             )
         trace = self.directory / "partial.jsonl"
-        with RpcTraceWriter(trace) as writer:
+        with FixtureWriter(trace) as writer:
             start = writer.record(
                 timestamp_us=0,
                 client_id="a",
@@ -173,7 +192,7 @@ class RpcSmokeTest(unittest.TestCase):
 
     def test_revoke_and_remove(self):
         trace = self.directory / "remove.jsonl"
-        with RpcTraceWriter(trace) as writer:
+        with FixtureWriter(trace) as writer:
             start = writer.record(
                 timestamp_us=0,
                 client_id="a",
@@ -219,6 +238,90 @@ class RpcSmokeTest(unittest.TestCase):
         result, rows = self.replay(trace)
         self.assertFalse(result["has_errors"])
         self.assertEqual(rows[-1]["key_status"]["miss"], 2)
+
+    def test_explicit_storage_lifecycle(self):
+        trace = self.directory / "lifecycle.jsonl"
+        events = [
+            {"type": "master_rpc_trace", "version": 2, "time_unit": "us"},
+            {
+                "id": "ra",
+                "phase": "setup",
+                "timestamp_us": 0,
+                "client_id": "a",
+                "op": "ReMountSegment",
+                "segments": [],
+            },
+            {
+                "id": "rb",
+                "phase": "setup",
+                "timestamp_us": 0,
+                "client_id": "b",
+                "op": "ReMountSegment",
+                "segments": [],
+            },
+            {
+                "id": "rs",
+                "phase": "setup",
+                "timestamp_us": 0,
+                "client_id": "storage",
+                "op": "ReMountSegment",
+                "segments": [],
+            },
+            {
+                "id": "m",
+                "phase": "setup",
+                "timestamp_us": 0,
+                "client_id": "storage",
+                "op": "MountSegment",
+                "segment_id": "segment",
+                "size_bytes": 64 * 1024 * 1024,
+            },
+            {
+                "id": "s",
+                "phase": "workload",
+                "timestamp_us": 0,
+                "client_id": "a",
+                "op": "BatchPutStart",
+                "keys": ["x"],
+                "value_sizes": [4096],
+            },
+            {
+                "id": "e",
+                "phase": "workload",
+                "timestamp_us": 100,
+                "client_id": "a",
+                "op": "BatchPutEnd",
+                "keys": ["x"],
+                "put_start": "s",
+            },
+            {
+                "id": "q",
+                "phase": "workload",
+                "timestamp_us": 1_100_000,
+                "client_id": "b",
+                "op": "BatchGetReplicaList",
+                "keys": ["x"],
+                "depends_on": ["e"],
+            },
+            {
+                "id": "u",
+                "phase": "teardown",
+                "timestamp_us": 0,
+                "client_id": "storage",
+                "op": "UnmountSegment",
+                "segment_id": "segment",
+            },
+        ]
+        trace.write_text("\n".join(json.dumps(row) for row in events) + "\n")
+        result, rows = self.replay(trace)
+        self.assertFalse(result["has_errors"])
+        self.assertEqual(result["logical_clients"], 3)
+        self.assertEqual(rows[6]["key_status"]["ok"], 1)
+        self.assertEqual(result["phases"]["workload"]["events"], 3)
+        for op in ("MountSegment", "UnmountSegment"):
+            self.assertEqual(result["operations"][op]["rpc_calls"], 1)
+            self.assertEqual(result["operations"][op]["failed_calls"], 0)
+        self.assertGreaterEqual(rows[-1]["start_us"], rows[-2]["finish_us"])
 
 
 if __name__ == "__main__":

@@ -18,6 +18,9 @@ struct TraceEvent {
     std::string id;
     std::string client_id;
     std::string op;
+    std::string phase = "workload";
+    std::string segment_id;
+    uint64_t size_bytes = 0;
     uint64_t timestamp_us = 0;
     std::vector<std::string> keys;
     std::vector<uint64_t> value_sizes;
@@ -27,6 +30,7 @@ struct TraceEvent {
 };
 
 struct RpcTrace {
+    unsigned version = 1;
     Json::Value metadata;
     std::vector<TraceEvent> events;
 };
@@ -46,6 +50,8 @@ struct RpcOutcome {
 };
 
 struct TraceSample {
+    int64_t replay_origin_monotonic_us = 0;
+    int64_t phase_origin_us = 0;
     int64_t scheduled_us = 0;
     int64_t start_us = 0;
     int64_t finish_us = 0;

@@ -17,7 +17,7 @@ add_test(NAME master_rpc_trace_test COMMAND master_rpc_trace_test)
 set_tests_properties(master_rpc_trace_test PROPERTIES TIMEOUT 20)
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
-  add_test(NAME master_rpc_trace_recorder_test
+  add_test(NAME master_rpc_trace_monitor_test
            COMMAND ${Python3_EXECUTABLE} -m unittest discover -s
-                   ${CMAKE_CURRENT_SOURCE_DIR} -p test_recorder.py -v)
+                   ${CMAKE_CURRENT_SOURCE_DIR} -p test_monitor.py -v)
 endif()

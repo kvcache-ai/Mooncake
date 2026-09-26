@@ -1,217 +1,154 @@
-# Offline master RPC trace benchmark
+# Offline master RPC trace replay
 
-This benchmark separates **offline workload generation** from **real master
-measurement**. Stop the simulator before replay: the measurement process only
-loads a saved trace and calls `MasterClient` against a real Mooncake master.
-It does not run a model or transfer KV payloads.
+This tool loads a timestamped RPC-intent trace, calls a dedicated real Mooncake
+master, and records latency, throughput and resource usage. Trace generation is
+external: neither a serving framework nor generated workload traces are needed
+in this repository. Stop the producer before running a measurement.
 
-The initial implementation provides:
-
-- A versioned JSONL RPC-intent format and a Python writer for producer adapters.
-- Validation before connecting to a master, plus optional initialization traces.
-- Timestamp-driven concurrent replay with explicit operation dependencies.
-- Real batch existence, replica lookup, put-start, put-end, revoke and remove calls.
-- Per-operation latency/throughput summaries and per-event timing records.
-
-**Integration boundary:** `recorder.py` is an export interface, not an installed
-SGLang simulator hook. The SGLang-side adapter still needs to translate HiCache
-events into physical Mooncake keys, object sizes and actual client API calls.
-Do not treat AutoBench prompts, logical pages, or the included handwritten
-smoke trace as production master traffic. One KV page is not necessarily one
-Mooncake object. Simulator logical time, not its execution wall time, must be
-supplied to the writer.
-
-## Build and test
-
-Build the real RPC executable with the normal Mooncake dependencies:
+## Build and verify
 
 ```bash
-cmake -S . -B build -DBUILD_BENCHMARK=ON -DUSE_CUDA=OFF \
-  -DWITH_STORE_RUST=OFF
-cmake --build build --target master_rpc_trace_bench mooncake_master -j 4
-```
-
-The scheduler/parser tests can also run without the Store, transfer engine,
-SGLang or GPU dependencies. They only need a C++20 compiler, CMake, JsonCpp,
-GoogleTest and Python 3:
-
-```bash
-cmake -S mooncake-store/benchmarks/master_rpc_trace/tests \
-  -B build-trace-tests
-cmake --build build-trace-tests -j 4
+cmake -S . -B build -DBUILD_BENCHMARK=ON -DUSE_CUDA=OFF -DWITH_STORE_RUST=OFF
+cmake --build build --target master_rpc_trace_bench mooncake_master -j "$(nproc)"
+cmake -S mooncake-store/benchmarks/master_rpc_trace/tests -B build-trace-tests
+cmake --build build-trace-tests -j "$(nproc)"
 ctest --test-dir build-trace-tests --output-on-failure
-```
-
-After building the real executables, run the optional RPC integration checks:
-
-```bash
 python3 mooncake-store/benchmarks/master_rpc_trace/tests/test_rpc_smoke.py \
-  --master=build/mooncake-store/src/mooncake_master \
-  --replayer=build/mooncake-store/benchmarks/master_rpc_trace_bench
+  --master build/mooncake-store/src/mooncake_master \
+  --replayer build/mooncake-store/benchmarks/master_rpc_trace_bench
 ```
 
-These checks start their own loopback-only masters and exercise cross-client
-reuse, partial write failure, initialization, revoke and removal. They verify
-correctness, not performance.
+The standalone parser/scheduler tests require C++20, JsonCpp and GoogleTest.
+The Python monitor uses only the standard library; it requires Linux and
+`taskset`. Lower build parallelism if compiler memory exceeds available RAM.
 
-## Smoke replay
+## Run and monitor
 
-Use a **dedicated, empty benchmark master**. Registered segments have fake
-addresses and cannot serve payload reads to real serving clients. Stop this
-master after the experiment. The replayer never removes arbitrary pre-existing
-objects to reset a run.
-
-Start the master in a separate terminal:
+Use a fresh, dedicated master: segments have fake addresses, and no KV payload
+is allocated or transferred. They cannot serve requests from real applications.
+The launcher starts a loopback-only master, waits for readiness, runs the
+replayer, and stops both child processes on completion or error:
 
 ```bash
-build/mooncake-store/src/mooncake_master
+python3 mooncake-store/benchmarks/master_rpc_trace/run_benchmark.py \
+  --trace /outside/repo/master-rpc.jsonl \
+  --master build/mooncake-store/src/mooncake_master \
+  --replayer build/mooncake-store/benchmarks/master_rpc_trace_bench \
+  --output-dir /outside/repo/results/run-001 \
+  --master-cpus 0-3 --replay-cpus 4-7 \
+  --rpc-threads 4 --workers 16 --speed 1
 ```
 
-Then validate and replay the example:
+Choose CPU sets using `lscpu -e=CPU,CORE,SOCKET,NODE`; keep physical cores and
+SMT siblings together. The launcher rejects overlapping logical CPU sets but
+cannot eliminate shared memory, NUMA or host contention. Output directories
+must be new. The launcher clears `MOONCAKE_CONFIG_PATH`, sets client I/O threads
+to 2, enables master metrics and uses zero default KV lease TTL for controlled
+remove tests. These choices are recorded in the manifest.
 
-```bash
-build/mooncake-store/benchmarks/master_rpc_trace_bench \
-  --trace=mooncake-store/benchmarks/master_rpc_trace/example.jsonl \
-  --validate_only
+For manual master management, invoke the C++ binary with `--trace`,
+`--master_server`, `--workers`, `--speed`, `--output` and `--samples`.
+`--validate_only` validates the entire file without contacting the master.
 
-build/mooncake-store/benchmarks/master_rpc_trace_bench \
-  --trace=mooncake-store/benchmarks/master_rpc_trace/example.jsonl \
-  --master_server=127.0.0.1:50051 --workers=4 --speed=1 \
-  --output=result.json --samples=samples.jsonl
-```
+## Trace contract: version 2
 
-The example writes two objects, commits them, and reuses them from another
-logical client. Its existence query also contains one intentionally missing
-key. A miss is counted separately from a transport or server error.
-
-Each logical client receives a fresh UUID and a fake segment, with capacity
-controlled by `--segment_size` (default 64 MiB per client). The capacity must
-match the intended modeled storage; it is not the actual payload RAM usage.
-BatchPutStart object sizes affect the master's real allocation and metadata.
-End/Revoke use the same owning client as Start. Failed Start keys are skipped
-at End/Revoke rather than incorrectly marked complete. Segment registration,
-connection setup, trace parsing and worker startup occur outside measurement.
-Initial registration uses `ReMountSegment` to complete the master's first-client
-handshake before measurement. Later requests to remount invalidate the run.
-Segments are unmounted on exit; do not assume this restores every master state
-immediately. Use a fresh master for repeated comparisons.
-
-`--prefill_trace=initial.jsonl` replays a separate trace before measurement,
-using the same clients and segments. All prefill key outcomes must succeed.
-The measured trace must then describe accesses against that initialized state.
-Dependencies cannot cross file boundaries; completion of prefill is the barrier.
-
-## JSONL format, version 1
-
-The first nonblank row is a header. Event times are nonnegative integer
-**microseconds relative to the replay origin**; this differs from AutoBench's
-millisecond request timestamps.
+The first nonblank JSONL row is a header:
 
 ```json
-{"type":"master_rpc_trace","version":1,"time_unit":"us","metadata":{"source":"simulator-adapter","initial_state":"empty","seed":42}}
-{"id":"s0","timestamp_us":0,"client_id":"instance-0","op":"BatchPutStart","keys":["prefix/page-0"],"value_sizes":[4096],"replica_num":1}
-{"id":"e0","timestamp_us":1000,"client_id":"instance-0","op":"BatchPutEnd","keys":["prefix/page-0"],"put_start":"s0"}
-{"id":"r1","timestamp_us":2000,"client_id":"instance-1","op":"BatchGetReplicaList","keys":["prefix/page-0"],"depends_on":["e0"]}
+{"type":"master_rpc_trace","version":2,"time_unit":"us","metadata":{"initial_state":"empty","seed":42}}
 ```
 
-| Field | Contract |
+Every event has `id`, `client_id`, `op`, `phase` and `timestamp_us`. Phases are
+ordered `setup`, `workload`, `teardown`, with a completion barrier between them.
+Timestamps are nonnegative integer microseconds relative to **that phase's**
+origin, sorted within each phase. These differ from AutoBench request times in
+milliseconds. Parsing and connection setup precede replay; mount time has its
+own measured phase and does not consume the workload's arrival-time budget.
+
+| Operation | Additional fields |
 | --- | --- |
-| `id` | Unique event ID. |
-| `timestamp_us` | Planned invocation time on the simulator's logical timeline. Rows must be nondecreasing. |
-| `client_id` | Logical client identity; multiple events from one client may overlap. |
-| `op` | One of the six supported `Batch*` operations listed above. |
-| `keys` | Ordered, nonempty list of physical object keys; batch boundaries are preserved. |
-| `value_sizes` | Required for Start: one positive byte count per key. Each is passed as one slice. |
-| `replica_num` | Optional positive memory replica count for Start; default 1. |
-| `depends_on` | Optional earlier event IDs. Completion dependencies do not imply success. |
-| `put_start` | Required for End/Revoke; implies a completion dependency on Start and selective handling of its successful keys. |
+| `ReMountSegment` | `segments: []`; one initial handshake per client in setup. |
+| `MountSegment` | `segment_id`, positive `size_bytes`; setup only. |
+| `UnmountSegment` | `segment_id`; teardown only, same owner as mount. |
+| `BatchExistKey`, `BatchGetReplicaList`, `BatchRemove` | Nonempty ordered `keys`. |
+| `BatchPutStart` | `keys`, matching positive `value_sizes`, optional `replica_num` (default 1). |
+| `BatchPutEnd`, `BatchPutRevoke` | Same client and ordered keys as Start, plus `put_start` referencing its ID. |
 
-Each Start must have exactly one End or Revoke with the same client and ordered
-keys. General dependencies can refer only to earlier rows, so cycles cannot be
-introduced. Unknown fields and operations fail validation instead of being
-silently ignored. All events and parameters are retained in memory during a run;
-size the replay host for the trace as well as the master metadata.
+Register request-only clients without mounting memory. Mount capacity belongs
+to independently configured storage clients: adding serving clients must not
+silently enlarge storage. A segment ID is trace-local; the replayer maps it to a
+fresh real UUID. Every mounted segment requires exactly one explicit unmount.
+The teardown barrier drains all workload calls before storage is removed.
+Mid-workload topology changes and nonempty remount recovery are unsupported.
 
-The v1 adapter models MEMORY replicas and default `ReplicateConfig` options
-(except `replica_num`). Remove respects leases (`force=false`). Pinning, group
-IDs, per-request placement overrides, disk replicas, dynamic topology and HA
-failover are not modeled. A producer must not silently discard those semantics
-when exporting a workload that relies on them.
+All key operations belong to workload. Each Start requires exactly one End or
+Revoke. `put_start` implies a completion dependency; unsuccessful Start keys are
+skipped at End/Revoke. If all keys are skipped, no finalization RPC is issued.
+Each value is one memory slice. Remove respects leases (`force=false`).
 
-Use metadata to record the SGLang/Mooncake commits, model/layout, page size,
-topology, cache capacities, routing, random seeds and initial object state.
-Object sizes and client counts are explicit assumptions, not a calibrated
-conversion from a GPU count.
+`depends_on` lists earlier event IDs. Dependencies wait for completion; they do
+not imply success. Producers must preserve write/read/remove ordering for shared
+keys, including reads that must precede a later mutation. Unrelated ready calls
+remain concurrent. Unknown fields, invalid lifecycles and forward references
+fail validation before any connection is opened.
 
-## Recording from an adapter
+Record producer revision, model, physical key layout, batch sizes, object sizes,
+cache capacities, routing, topology, random seed, initial state and timing model
+in `metadata`. A logical GPU count is not a calibration of real serving load.
+The replayer does not infer requests, prefix relationships or cache policy.
+Pinning, group IDs, placement overrides, disk replicas, transfers and HA are not
+modeled. Do not silently discard these semantics in a producer.
 
-The producer resolves physical keys and supplies a logical clock explicitly:
+## Arrival control and results
 
-```python
-from recorder import RpcTraceWriter
+`--speed=1` preserves intervals; larger values compress them and must be reported
+as stress-test transformations. `--workers` caps concurrent API calls, independent
+of logical client count. Overdue events stay queued; planned arrival times do
+not move to conceal overload. Dispatch lag includes worker and dependency waits.
+A fixed trace does not model serving feedback caused by a slow or failed master.
 
-with RpcTraceWriter("rpc.jsonl", metadata={"clock": "logical"}) as trace:
-    start = trace.record(
-        timestamp_us=0, client_id="instance-0", op="BatchPutStart",
-        keys=["physical-key-0"], value_sizes=[4096],
-    )
-    trace.record(
-        timestamp_us=1000, client_id="instance-0", op="BatchPutEnd",
-        keys=["physical-key-0"], put_start=start,
-    )
-```
+The launcher saves:
 
-Add this directory to the producer's Python import path. The writer creates a
-new file and refuses to overwrite an existing trace. Merge multiple simulator
-streams on their shared logical timeline before writing; the writer does not
-invent routing, keys, timestamps, arrival distributions or dependency edges.
+- `manifest.json`: commands, parameters, environment and input/binary SHA-256.
+- `replay.json`: per-operation and per-phase summaries, key outcomes, heartbeat
+  counts, P50/P95/P99/max call latency and dispatch lag.
+- `samples.jsonl`: planned/start/finish times, phase origins, issued calls,
+  original key counts, outcomes and errors. Written after timed replay.
+- `process.jsonl`: monotonic time, CPU seconds, RSS and thread counts for both
+  processes; `metrics.jsonl` and before/after `.prom` snapshots contain master
+  Prometheus metrics. Sampling continues during setup and teardown.
+- `result.json`: workload-only CPU/RSS and traffic summaries, one-second offered,
+  sent and completed call counts, issued keys and peak calls in flight.
+- Child process logs.
 
-## Arrival control and CPU isolation
+CPU utilization is expressed in cores (1 means one fully occupied core), derived
+from Linux process CPU time. Very short phases can have too few samples to estimate
+CPU use. Sampled RSS is a sampled peak, not an exact high-water mark. Metrics
+scraping adds overhead; hold its interval fixed between comparisons.
 
-`--speed=1` preserves trace intervals. Higher values compress them; explicitly
-report this as a stress-test transformation. Changing time scale also changes
-its relationship to real master lease/TTL timers. `--workers` caps in-flight
-calls and is independent of the number of logical clients.
+`master_total_capacity_bytes` and `master_allocated_bytes` describe logical Store
+capacity and allocation, which differ from the master's actual process RSS.
+Use the metrics to check capacity during workload and cleanup afterward.
+Throughput includes phase-leading idle time and final drain. Client-call latency
+includes API/RPC work; it is not server-only processing time. Calls count
+MasterClient API invocations; retries can create extra wire traffic. Compare
+server metrics as well. Miss, not-ready and already-exists outcomes have separate
+counts and are not successful-hit counts.
 
-Due calls are dispatched without waiting for unrelated requests to complete.
-When all workers are busy, overdue calls remain queued and the lag is recorded;
-their planned timestamps are never moved forward to conceal overload.
-Dependency waits are also included in dispatch lag. A frozen trace does not
-model the serving feedback caused by a slower master.
+Heartbeat calls are separate maintenance traffic. Each client is pinged after
+registration; a failed heartbeat invalidates the run instead of silently
+remounting. `--heartbeat_interval_ms` (default 1000) is the pause between sequential
+sweeps, so slow sweeps lengthen the effective client heartbeat period.
 
-On a single host, use `lscpu -e=CPU,CORE,SOCKET,NODE` to choose separate physical
-cores for master and replayer; avoid assigning SMT siblings across them. Start
-each with `taskset -c <chosen-cpus> ...`. The benchmark does not clear inherited
-CPU affinity. Keep master core count fixed between runs, and report residual
-shared memory/NUMA contention. Set `MC_STORE_RPC_CLIENT_IO_THREADS` explicitly
-to keep the replay client's I/O pool bounded. Observe master CPU/RSS separately
-(for example with `pidstat`); the replayer's own process usage is not master usage.
+High replay lag with low master utilization indicates a load-generator limit.
+Sweep workers or arrival compression and check offered versus achieved rates
+before attributing a throughput ceiling to master locks. This benchmark reports
+whole-master load; lock attribution additionally requires profiling.
 
-## Result interpretation
+## Legacy version 1
 
-Outputs are written **after** replay, not from the hot path:
-
-- `samples.jsonl`: event/client/op, scheduled/start/finish times, whether an API
-  call was issued, original key count, key outcomes and error details.
-- `result.json`: per-operation attempted call/key throughput, key status counts,
-  P50/P95/P99/max dispatch lag, client-call latency, and scheduled-to-completion
-  latency; plus replay configuration and producer metadata.
-
-Client-call latency includes the client API and its RPC work; it is not a
-server-only service-time measurement. `rpc_calls` counts issued MasterClient
-API invocations. Retries may cause additional wire requests; use server metrics
-to validate actual arrivals. Heartbeats are separate maintenance traffic and
-are counted separately. A failed heartbeat invalidates the run; the benchmark
-does not silently remount and continue with a changed cache state.
-`--heartbeat_interval_ms` controls the pause between sequential client sweeps
-(default 1000 ms); slow sweeps lengthen each client's actual heartbeat period.
-
-Throughput uses the full measured elapsed time, including leading idle time and
-draining the final calls. Miss, not-ready and already-exists outcomes have their
-own counters; they are not silently counted as successful hits or new writes.
-Already-existing keys are skipped by End/Revoke, as for other non-OK Start keys.
-Unexpected RPC/executor errors
-produce a nonzero exit code. An entirely skipped End/Revoke is not counted as an
-issued RPC. Increasing worker count should reduce replay lag before master
-saturation; a large lag at low master utilization indicates insufficient replay
-capacity, not a measured master limit.
+The handwritten `example.jsonl` and v1 contract remain accepted. V1 has a single
+workload phase and implicitly registers one fake segment per client before timing
+(default 64 MiB, `--segment_size`). Cleanup occurs after timing. Use v2 for explicit
+and independently sized storage lifecycle. V1's optional `--prefill_trace` runs
+before workload and requires all keys to succeed; it cannot be combined with v2.

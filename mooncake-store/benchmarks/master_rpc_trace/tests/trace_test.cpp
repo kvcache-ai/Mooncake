@@ -162,5 +162,56 @@ TEST(TraceReplay, InvalidSpeedOrWorkerCountDoesNotExecute) {
         std::invalid_argument);
 }
 
+TEST(TraceReplay, LifecyclePhasesDrainAndUseIndependentOrigins) {
+    const auto text =
+        R"({"type":"master_rpc_trace","version":2,"time_unit":"us"}
+{"id":"r","phase":"setup","timestamp_us":0,"client_id":"c","op":"ReMountSegment","segments":[]}
+{"id":"m","phase":"setup","timestamp_us":0,"client_id":"c","op":"MountSegment","segment_id":"s","size_bytes":67108864}
+{"id":"q","phase":"workload","timestamp_us":1000,"client_id":"c","op":"BatchExistKey","keys":["k"]}
+{"id":"u","phase":"teardown","timestamp_us":0,"client_id":"c","op":"UnmountSegment","segment_id":"s"})";
+    std::istringstream input(text);
+    const auto trace = ReadTrace(input);
+    std::atomic<bool> mounted{false}, queried{false};
+    const auto samples =
+        ReplayTrace(trace, 4, 1, [&](const auto& event, const auto*) {
+            if (event.op == "MountSegment") {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                mounted = true;
+            }
+            if (event.op == "BatchExistKey") {
+                EXPECT_TRUE(mounted);
+                queried = true;
+                return RpcOutcome{{KeyStatus::MISS}, true, {}};
+            }
+            if (event.op == "UnmountSegment") EXPECT_TRUE(queried);
+            return RpcOutcome{{}, true, {}};
+        });
+    EXPECT_GE(samples[2].phase_origin_us, samples[1].finish_us);
+    EXPECT_EQ(samples[2].scheduled_us - samples[2].phase_origin_us, 1000);
+    EXPECT_GE(samples[3].start_us, samples[2].finish_us);
+    const auto summary = SummarizeTrace(trace, samples);
+    EXPECT_EQ(
+        summary["phases"]["setup"]["operations"]["MountSegment"]["rpc_calls"]
+            .asUInt64(),
+        1);
+    EXPECT_EQ(summary["phases"]["workload"]["events"].asUInt64(), 1);
+}
+
+TEST(TraceValidation, LifecycleRequiresMatchingOwnerAndCleanup) {
+    const std::string setup =
+        R"({"type":"master_rpc_trace","version":2,"time_unit":"us"}
+{"id":"r","phase":"setup","timestamp_us":0,"client_id":"c","op":"ReMountSegment","segments":[]}
+{"id":"m","phase":"setup","timestamp_us":0,"client_id":"c","op":"MountSegment","segment_id":"s","size_bytes":67108864}
+)";
+    for (
+        const auto& ending :
+        {std::string{},
+         std::string{
+             R"({"id":"u","phase":"teardown","timestamp_us":0,"client_id":"other","op":"UnmountSegment","segment_id":"s"})"}}) {
+        std::istringstream input(setup + ending);
+        EXPECT_THROW(ReadTrace(input), std::invalid_argument);
+    }
+}
+
 }  // namespace
 }  // namespace mooncake::bench

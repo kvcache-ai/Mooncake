@@ -60,11 +60,13 @@ KeyStatus Classify(mooncake::ErrorCode error) {
 // This executable must only be used against a dedicated benchmark master.
 class Session {
    public:
-    Session() : client(mooncake::generate_uuid(), nullptr, FLAGS_tenant) {
+    explicit Session(bool legacy)
+        : client(mooncake::generate_uuid(), nullptr, FLAGS_tenant) {
         const auto error = client.Connect(FLAGS_master_server);
         if (error != mooncake::ErrorCode::OK) {
             throw std::runtime_error("connect failed: " + toString(error));
         }
+        if (!legacy) return;
         segment.id = mooncake::generate_uuid();
         segment.name = "trace_" + mooncake::UuidToString(segment.id);
         segment.base = 0x100000000ULL;
@@ -78,21 +80,31 @@ class Session {
         if (!mounted)
             throw std::runtime_error("mount failed: " +
                                      toString(mounted.error()));
+        registered.store(true);
+        segments.emplace("legacy", segment);
     }
 
     ~Session() {
-        const auto result = client.UnmountSegment(segment.id);
-        if (!result)
-            LOG(ERROR) << "Trace segment cleanup failed: "
-                       << toString(result.error());
+        for (const auto& [id, value] : segments) {
+            const auto result = client.UnmountSegment(value.id);
+            if (!result)
+                LOG(ERROR) << "Trace segment cleanup failed: "
+                           << toString(result.error());
+        }
     }
 
     mooncake::MasterClient client;
     mooncake::Segment segment;
+    std::map<std::string, mooncake::Segment> segments;
+    std::mutex lifecycle_mutex;
+    std::atomic<bool> registered{false};
+    const std::string host_id =
+        "trace_" + mooncake::UuidToString(mooncake::generate_uuid());
 };
 
 struct PreparedCall {
     mooncake::MasterClient* client;
+    Session* session;
     std::vector<std::vector<uint64_t>> lengths;
     std::vector<mooncake::ObjectMeta> object_metas;
     mooncake::ReplicateConfig config;
@@ -112,7 +124,7 @@ class MasterReplay {
     void Prepare(const RpcTrace& trace) {
         for (const auto& event : trace.events) {
             if (!sessions_.count(event.client_id)) {
-                auto session = std::make_unique<Session>();
+                auto session = std::make_unique<Session>(trace.version == 1);
                 std::lock_guard lock(mutex_);
                 sessions_.emplace(event.client_id, std::move(session));
             }
@@ -125,6 +137,7 @@ class MasterReplay {
         for (const auto& event : trace.events) {
             PreparedCall call;
             call.client = &sessions_.at(event.client_id)->client;
+            call.session = sessions_.at(event.client_id).get();
             call.config.replica_num = event.replica_num;
             for (auto size : event.value_sizes) call.lengths.push_back({size});
             for (const auto& key : event.keys)
@@ -174,13 +187,50 @@ class MasterReplay {
                               const RpcOutcome* start) {
         RpcOutcome result;
         result.keys.assign(event.keys.size(), KeyStatus::SKIPPED);
+        auto& session = *call.session;
+        auto& client = *call.client;
+        if (event.op == "ReMountSegment" || event.op == "MountSegment" ||
+            event.op == "UnmountSegment") {
+            std::lock_guard lock(session.lifecycle_mutex);
+            tl::expected<void, mooncake::ErrorCode> response;
+            if (event.op == "ReMountSegment") {
+                response = client.ReMountSegment({});
+                if (response) session.registered.store(true);
+            } else if (!session.registered.load()) {
+                throw std::runtime_error("client registration failed");
+            } else if (event.op == "MountSegment") {
+                mooncake::Segment segment;
+                segment.id = mooncake::generate_uuid();
+                segment.name = "trace_" + mooncake::UuidToString(segment.id);
+                segment.base = 0x100000000ULL;
+                segment.size = event.size_bytes;
+                segment.host_id = session.host_id;
+                segment.te_endpoint = segment.host_id + ":12345";
+                segment.protocol = "tcp";
+                response = client.MountSegment(segment);
+                if (response)
+                    session.segments.emplace(event.segment_id,
+                                             std::move(segment));
+            } else {
+                const auto found = session.segments.find(event.segment_id);
+                if (found == session.segments.end())
+                    throw std::runtime_error(
+                        "segment was not successfully mounted");
+                response = client.UnmountSegment(found->second.id);
+                if (response) session.segments.erase(found);
+            }
+            result.rpc_sent = true;
+            if (!response) result.error = toString(response.error());
+            return result;
+        }
+        if (!session.registered.load())
+            throw std::runtime_error("client registration failed");
         std::vector<size_t> positions;
         for (size_t i = 0; i < event.keys.size(); ++i) {
             if (!start || start->keys[i] == KeyStatus::OK)
                 positions.push_back(i);
         }
         if (positions.empty()) return result;
-        auto& client = *call.client;
         if (event.op == "BatchExistKey") {
             const auto response = client.BatchExistKey(event.keys);
             Collect(result, response, positions);
@@ -218,6 +268,7 @@ class MasterReplay {
         std::unique_lock lock(mutex_);
         while (!stopping_.load()) {
             for (const auto& [id, session] : sessions_) {
+                if (!session->registered.load()) continue;
                 ++heartbeat_calls_;
                 try {
                     const auto result = session->client.Ping();
@@ -279,6 +330,10 @@ int main(int argc, char** argv) {
         std::optional<RpcTrace> prefill;
         if (!FLAGS_prefill_trace.empty())
             prefill = mooncake::bench::LoadTrace(FLAGS_prefill_trace);
+        if (prefill && (trace.version != 1 || prefill->version != 1))
+            throw std::invalid_argument(
+                "prefill_trace is for v1 only; include initialization in v2 "
+                "workload");
         if (FLAGS_validate_only) {
             std::cout << "Validated " << trace.events.size()
                       << " measured events\n";
@@ -307,7 +362,8 @@ int main(int argc, char** argv) {
         result["workers"] = FLAGS_workers;
         result["heartbeat_interval_ms"] = FLAGS_heartbeat_interval_ms;
         result["logical_clients"] = Json::UInt64(runner.client_count());
-        result["segment_size_bytes"] = Json::UInt64(FLAGS_segment_size);
+        if (trace.version == 1)
+            result["segment_size_bytes"] = Json::UInt64(FLAGS_segment_size);
         result["speed"] = FLAGS_speed;
         result["prefill_trace"] = FLAGS_prefill_trace;
         result["heartbeat_calls_during_replay"] =

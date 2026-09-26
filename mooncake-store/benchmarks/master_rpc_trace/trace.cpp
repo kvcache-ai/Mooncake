@@ -6,9 +6,11 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <exception>
 #include <fstream>
 #include <latch>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -113,6 +115,11 @@ RpcTrace ReadTrace(std::istream& input) {
     RpcTrace trace;
     std::unordered_map<std::string, size_t> ids;
     std::set<size_t> finalized;
+    std::unordered_map<std::string, size_t> registered;
+    std::unordered_map<std::string, size_t> mounted;
+    std::set<std::string> unmounted;
+    const std::map<std::string, int> phases = {
+        {"setup", 0}, {"workload", 1}, {"teardown", 2}};
     std::string line;
     size_t line_number = 0;
     bool header_seen = false;
@@ -126,34 +133,55 @@ RpcTrace ReadTrace(std::istream& input) {
                 Require(
                     row["type"] == "master_rpc_trace" &&
                         IsUInt64(row["version"]) &&
-                        row["version"].asUInt64() == 1 &&
+                        (row["version"].asUInt64() == 1 ||
+                         row["version"].asUInt64() == 2) &&
                         row["time_unit"] == "us",
-                    "expected master_rpc_trace v1 header with time_unit=us");
+                    "expected master_rpc_trace v1/v2 header with time_unit=us");
                 Require(!row.isMember("metadata") || row["metadata"].isObject(),
                         "metadata must be an object");
                 trace.metadata = row["metadata"];
+                trace.version = row["version"].asUInt();
                 header_seen = true;
                 continue;
             }
             CheckFields(
                 row, {"id", "timestamp_us", "client_id", "op", "keys",
-                      "value_sizes", "replica_num", "depends_on", "put_start"});
+                      "value_sizes", "replica_num", "depends_on", "put_start",
+                      "phase", "segment_id", "size_bytes", "segments"});
             TraceEvent event;
             event.id = StringField(row, "id");
             Require(!ids.count(event.id), "duplicate event id: " + event.id);
             event.client_id = StringField(row, "client_id");
             event.op = StringField(row, "op");
+            if (trace.version == 2) {
+                event.phase = StringField(row, "phase");
+                Require(phases.count(event.phase), "invalid phase");
+                Require(trace.events.empty() ||
+                            phases.at(event.phase) >=
+                                phases.at(trace.events.back().phase),
+                        "phases must be setup, workload, teardown in order");
+            } else {
+                Require(!row.isMember("phase"), "phase requires v2");
+            }
             const std::set<std::string> operations = {
-                "BatchExistKey", "BatchGetReplicaList", "BatchPutStart",
-                "BatchPutEnd",   "BatchPutRevoke",      "BatchRemove"};
+                "BatchExistKey",  "BatchGetReplicaList", "BatchPutStart",
+                "BatchPutEnd",    "BatchPutRevoke",      "BatchRemove",
+                "ReMountSegment", "MountSegment",        "UnmountSegment"};
             Require(operations.count(event.op), "unsupported op: " + event.op);
+            const bool lifecycle = event.op == "ReMountSegment" ||
+                                   event.op == "MountSegment" ||
+                                   event.op == "UnmountSegment";
+            Require(!lifecycle || trace.version == 2,
+                    "lifecycle operations require v2");
             Require(IsUInt64(row["timestamp_us"]),
                     "timestamp_us must be a nonnegative integer");
             event.timestamp_us = row["timestamp_us"].asUInt64();
             Require(trace.events.empty() ||
+                        event.phase != trace.events.back().phase ||
                         event.timestamp_us >= trace.events.back().timestamp_us,
-                    "timestamps must be nondecreasing");
-            Require(row["keys"].isArray() && !row["keys"].empty(),
+                    "timestamps must be nondecreasing within a phase");
+            Require(lifecycle ? !row.isMember("keys")
+                              : (row["keys"].isArray() && !row["keys"].empty()),
                     "keys must be a nonempty array");
             for (const auto& key : row["keys"]) {
                 Require(key.isString() && !key.asString().empty(),
@@ -170,6 +198,51 @@ RpcTrace ReadTrace(std::istream& input) {
                     event.dependencies.push_back(ids.at(dependency.asString()));
                 }
             }
+            if (event.op == "ReMountSegment") {
+                Require(event.phase == "setup" &&
+                            !registered.count(event.client_id),
+                        "each client must register once during setup");
+                Require(
+                    row["segments"].isArray() && row["segments"].empty(),
+                    "ReMountSegment requires segments=[] (initial handshake)");
+                registered[event.client_id] = trace.events.size();
+            } else if (trace.version == 2) {
+                Require(registered.count(event.client_id),
+                        "client must register before use");
+                event.dependencies.push_back(registered.at(event.client_id));
+            }
+            if (event.op == "MountSegment") {
+                Require(event.phase == "setup",
+                        "MountSegment is supported in setup only");
+                event.segment_id = StringField(row, "segment_id");
+                Require(!mounted.count(event.segment_id),
+                        "duplicate segment id");
+                Require(IsUInt64(row["size_bytes"]) &&
+                            row["size_bytes"].asUInt64() > 0,
+                        "size_bytes must be positive");
+                event.size_bytes = row["size_bytes"].asUInt64();
+                mounted[event.segment_id] = trace.events.size();
+            } else if (event.op == "UnmountSegment") {
+                Require(event.phase == "teardown",
+                        "UnmountSegment is supported in teardown only");
+                event.segment_id = StringField(row, "segment_id");
+                Require(mounted.count(event.segment_id) &&
+                            unmounted.insert(event.segment_id).second,
+                        "segment must be mounted and unmounted exactly once");
+                const auto mount = mounted.at(event.segment_id);
+                Require(trace.events[mount].client_id == event.client_id,
+                        "unmount must use segment owner");
+                event.dependencies.push_back(mount);
+            } else {
+                Require(!row.isMember("segment_id"),
+                        "segment_id is only valid for mount/unmount");
+            }
+            Require(event.op == "MountSegment" || !row.isMember("size_bytes"),
+                    "size_bytes is only valid for mount");
+            Require(event.op == "ReMountSegment" || !row.isMember("segments"),
+                    "segments is only valid for remount");
+            Require(lifecycle || event.phase == "workload",
+                    "key operations must be in workload");
             if (event.op == "BatchPutStart") {
                 Require(row["value_sizes"].isArray() &&
                             row["value_sizes"].size() == event.keys.size(),
@@ -228,6 +301,9 @@ RpcTrace ReadTrace(std::istream& input) {
     }
     Require(!input.bad(), "failed to read trace");
     Require(header_seen && !trace.events.empty(), "trace must contain events");
+    Require(trace.version == 1 ||
+                (!mounted.empty() && mounted.size() == unmounted.size()),
+            "v2 must mount storage and unmount every segment");
     for (size_t i = 0; i < trace.events.size(); ++i) {
         Require(trace.events[i].op != "BatchPutStart" || finalized.count(i),
                 "BatchPutStart has no End/Revoke: " + trace.events[i].id);
@@ -258,6 +334,8 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
     std::mutex mutex;
     std::condition_variable cv;
     size_t remaining = trace.events.size();
+    std::exception_ptr scheduling_error;
+    size_t phase_begin = 0, phase_end = 0, phase_remaining = 0;
     auto origin = Clock::now();
     const auto max_delay =
         std::chrono::duration_cast<Micros>(Clock::time_point::max() - origin)
@@ -273,12 +351,28 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
             Require(dependency < i, "invalid dependency index");
             children[dependency].push_back(i);
         }
-        if (pending[i] == 0) ready.push(i);
     }
     const auto elapsed = [&] {
         return std::chrono::duration_cast<Micros>(Clock::now() - origin)
             .count();
     };
+    const auto activate_phase = [&](int64_t phase_origin) {
+        phase_end = phase_begin;
+        while (phase_end < trace.events.size() &&
+               trace.events[phase_end].phase ==
+                   trace.events[phase_begin].phase) {
+            auto& sample = samples[phase_end];
+            Require(sample.scheduled_us <=
+                        std::numeric_limits<int64_t>::max() - phase_origin,
+                    "phase timestamp overflow");
+            sample.scheduled_us += phase_origin;
+            sample.phase_origin_us = phase_origin;
+            if (pending[phase_end] == 0) ready.push(phase_end);
+            ++phase_end;
+        }
+        phase_remaining = phase_end - phase_begin;
+    };
+    activate_phase(0);
     const auto worker_count = std::min(workers, trace.events.size());
     std::latch initialized(worker_count), start(1);
     bool startup_cancelled = false;
@@ -328,9 +422,19 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
             {
                 std::lock_guard lock(mutex);
                 for (auto child : children[index]) {
-                    if (--pending[child] == 0) ready.push(child);
+                    if (--pending[child] == 0 && child < phase_end)
+                        ready.push(child);
                 }
                 --remaining;
+                if (--phase_remaining == 0 && remaining) {
+                    phase_begin = phase_end;
+                    try {
+                        activate_phase(elapsed());
+                    } catch (...) {
+                        scheduling_error = std::current_exception();
+                        remaining = 0;
+                    }
+                }
             }
             cv.notify_all();
         }
@@ -345,18 +449,26 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
     }
     initialized.wait();
     origin = Clock::now();
+    for (auto& sample : samples)
+        sample.replay_origin_monotonic_us =
+            std::chrono::duration_cast<Micros>(origin.time_since_epoch())
+                .count();
     start.count_down();
     for (auto& thread : threads) thread.join();
+    if (scheduling_error) std::rethrow_exception(scheduling_error);
     return samples;
 }
 
-Json::Value SummarizeTrace(const RpcTrace& trace,
-                           const std::vector<TraceSample>& samples) {
+static Json::Value SummarizeEvents(const RpcTrace& trace,
+                                   const std::vector<TraceSample>& samples) {
     Require(samples.size() == trace.events.size(), "sample count mismatch");
     Json::Value result(Json::objectValue);
     result["schema_version"] = 1;
     result["trace_metadata"] = trace.metadata;
     result["events"] = Json::UInt64(samples.size());
+    if (!samples.empty())
+        result["replay_origin_monotonic_us"] =
+            Json::Int64(samples.front().replay_origin_monotonic_us);
     int64_t elapsed_us = 0;
     std::set<std::string> operations;
     for (size_t i = 0; i < samples.size(); ++i) {
@@ -367,12 +479,14 @@ Json::Value SummarizeTrace(const RpcTrace& trace,
     for (const auto& op : operations) {
         auto& stats = result["operations"][op];
         uint64_t calls = 0, keys = 0, planned = 0;
+        uint64_t failed_calls = 0;
         RpcOutcome outcomes;
         std::vector<int64_t> lag, latency, end_to_end;
         for (size_t i = 0; i < samples.size(); ++i) {
             if (trace.events[i].op != op) continue;
             const auto& sample = samples[i];
             ++planned;
+            failed_calls += !sample.outcome.error.empty();
             outcomes.keys.insert(outcomes.keys.end(),
                                  sample.outcome.keys.begin(),
                                  sample.outcome.keys.end());
@@ -387,6 +501,7 @@ Json::Value SummarizeTrace(const RpcTrace& trace,
             }
         }
         stats["planned_calls"] = Json::UInt64(planned);
+        stats["failed_calls"] = Json::UInt64(failed_calls);
         stats["rpc_calls"] = Json::UInt64(calls);
         stats["issued_keys"] = Json::UInt64(keys);
         stats["key_status"] = StatusCounts(outcomes);
@@ -398,6 +513,27 @@ Json::Value SummarizeTrace(const RpcTrace& trace,
             stats["rpc_per_second"] = calls * 1e6 / elapsed_us;
             stats["keys_per_second"] = keys * 1e6 / elapsed_us;
         }
+    }
+    return result;
+}
+
+Json::Value SummarizeTrace(const RpcTrace& trace,
+                           const std::vector<TraceSample>& samples) {
+    auto result = SummarizeEvents(trace, samples);
+    result["schema_version"] = 2;
+    for (const auto* phase : {"setup", "workload", "teardown"}) {
+        RpcTrace subset;
+        std::vector<TraceSample> selected;
+        for (size_t i = 0; i < samples.size(); ++i) {
+            if (trace.events[i].phase != phase) continue;
+            subset.events.push_back(trace.events[i]);
+            auto sample = samples[i];
+            sample.scheduled_us -= sample.phase_origin_us;
+            sample.start_us -= sample.phase_origin_us;
+            sample.finish_us -= sample.phase_origin_us;
+            selected.push_back(std::move(sample));
+        }
+        result["phases"][phase] = SummarizeEvents(subset, selected);
     }
     return result;
 }
@@ -414,6 +550,8 @@ void WriteSamples(const std::string& path, const RpcTrace& trace,
         row["id"] = trace.events[i].id;
         row["client_id"] = trace.events[i].client_id;
         row["op"] = trace.events[i].op;
+        row["phase"] = trace.events[i].phase;
+        row["phase_origin_us"] = Json::Int64(samples[i].phase_origin_us);
         row["scheduled_us"] = Json::Int64(samples[i].scheduled_us);
         row["start_us"] = Json::Int64(samples[i].start_us);
         row["finish_us"] = Json::Int64(samples[i].finish_us);
