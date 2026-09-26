@@ -267,6 +267,7 @@ if(USE_HIP)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME hip_transport_test COMMAND hip_transport_test)
+  set_tests_properties(hip_transport_test PROPERTIES TIMEOUT 300)
 endif()
 
 if(USE_UBSHMEM)
