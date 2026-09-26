@@ -240,6 +240,14 @@ if(USE_MNNVL)
            COMMAND ${CMAKE_COMMAND} -E env GTEST_FILTER=NvlinkTransportTest.*
                    $<TARGET_FILE:nvlink_transport_test>)
   set_tests_properties(nvlink_transport_test PROPERTIES LABELS "nvlink_gpu")
+  if(USE_CUDA)
+    # Two-process cudaIpc test; needs a GPU but no metadata server.
+    add_test(NAME nvlink_ipc_test
+             COMMAND ${CMAKE_COMMAND} -E env GTEST_FILTER=NvlinkIpcTest.*
+                     $<TARGET_FILE:nvlink_transport_test>)
+    set_tests_properties(nvlink_ipc_test PROPERTIES LABELS "nvlink_gpu" TIMEOUT
+                                                    300)
+  endif()
 
   if(USE_CUDA AND NOT USE_HIP)
     add_test(
