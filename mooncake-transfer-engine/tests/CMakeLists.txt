@@ -443,6 +443,12 @@ target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
 
+add_executable(rdma_memory_location_test
+               ${WORKSPACE}/rdma_memory_location_test.cpp)
+target_link_libraries(rdma_memory_location_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+add_test(NAME rdma_memory_location_test COMMAND rdma_memory_location_test)
+
 add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
 target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
