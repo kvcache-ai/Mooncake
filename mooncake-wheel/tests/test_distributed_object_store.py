@@ -655,7 +655,7 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         put_duration = system_stats['put_end'] - system_stats['put_start']
         get_duration = system_stats['get_end'] - system_stats['get_start']
         total_data_size_gb = (VALUE_SIZE * total_operations) / (1024**3)
-        
+
         print("\nConcurrent Stress Test Results:")
         print(f"Total threads: {NUM_THREADS}")
         print(f"Operations per thread: {OPERATIONS_PER_THREAD}")
