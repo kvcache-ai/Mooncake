@@ -1305,16 +1305,25 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
     }
 
     // Treat the same transport endpoint as the same remote SSD namespace even
-    // if a retry arrives with a different generated UUID.
+    // if a retry arrives with a different generated UUID. Also block reuse
+    // while an existing entry is still UNMOUNTING so CloseNofSegment cannot
+    // free probe/qpair resources belonging to a remount that raced in.
     for (const auto& [existing_id, existing_segment] :
          nof_segment_manager_->mounted_segments_) {
-        if (existing_segment.status == SegmentStatus::OK &&
-            existing_segment.segment.te_endpoint == segment.te_endpoint) {
+        if (existing_segment.segment.te_endpoint != segment.te_endpoint) {
+            continue;
+        }
+        if (existing_segment.status == SegmentStatus::OK) {
             LOG(WARNING) << "NoF segment mount: segment_name=" << segment.name
                          << ", endpoint=" << segment.te_endpoint
                          << ", warn=segment_already_exists_with_different_id";
             return ErrorCode::SEGMENT_ALREADY_EXISTS;
         }
+        LOG(WARNING) << "NoF segment mount: segment_name=" << segment.name
+                     << ", endpoint=" << segment.te_endpoint
+                     << ", status=" << existing_segment.status
+                     << ", warn=endpoint_busy_during_unmount";
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
     auto created = CreateBufferAllocator(
@@ -1364,7 +1373,8 @@ ErrorCode ScopedNoFSegmentAccess::ReMountSegment(
 }
 
 ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
-    const UUID& segment_id, size_t& metrics_dec_capacity) {
+    const UUID& segment_id, size_t& metrics_dec_capacity,
+    std::string* te_endpoint) {
     auto it = nof_segment_manager_->mounted_segments_.find(segment_id);
     if (it == nof_segment_manager_->mounted_segments_.end()) {
         LOG(WARNING) << "NoF segment unmount: segment_id=" << segment_id
@@ -1380,6 +1390,9 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
     auto& mounted_segment = it->second;
     auto& segment = mounted_segment.segment;
     metrics_dec_capacity = segment.size;
+    if (te_endpoint != nullptr) {
+        *te_endpoint = segment.te_endpoint;
+    }
 
     auto registration = mounted_segment.allocator_registration;
     if (HasAllocatorRegistration(nof_segment_manager_->allocator_manager_,
@@ -1498,6 +1511,17 @@ ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& segment,
     used = total_used;
     capacity = total_capacity;
     return ErrorCode::OK;
+}
+
+bool NoFSegmentManager::HasEndpoint(const std::string& endpoint) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        if (mounted_segment.segment.te_endpoint == endpoint) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void NoFSegmentManager::GetMountedSegmentsSnapshot(
