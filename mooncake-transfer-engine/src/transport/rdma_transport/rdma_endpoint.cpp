@@ -435,6 +435,54 @@ int RdmaEndPoint::postNotificationReceive(size_t slot) {
     wr.num_sge = 1;
     return ibv_post_recv(s.qp, &wr, &bad) ? ERR_ENDPOINT : 0;
 }
+
+void RdmaEndPoint::rollbackNotificationConstruction() {
+    rollbackNotificationConstruction(
+        NotificationCleanupOps{ibv_destroy_qp, ibv_dereg_mr});
+}
+
+void RdmaEndPoint::rollbackNotificationConstruction(
+    const NotificationCleanupOps &ops) {
+    // constructNotification() holds notify_.mutex and has not registered the
+    // QP with the context yet. Best-effort cleanup keeps a failed optional
+    // channel from retaining verbs resources until endpoint destruction.
+    auto &s = notify_;
+    if (s.qp) {
+        const int ret = ops.destroy_qp(s.qp);
+        if (ret == 0) {
+            s.qp = nullptr;
+        } else {
+            LOG(ERROR) << "Failed to destroy notification QP during rollback: "
+                       << strerror(ret);
+        }
+    }
+    if (s.send_mr) {
+        const int ret = ops.dereg_mr(s.send_mr);
+        if (ret == 0) {
+            s.send_mr = nullptr;
+        } else {
+            LOG(ERROR) << "Failed to deregister notification send MR during "
+                          "rollback: "
+                       << strerror(ret);
+        }
+    }
+    if (s.recv_mr) {
+        const int ret = ops.dereg_mr(s.recv_mr);
+        if (ret == 0) {
+            s.recv_mr = nullptr;
+        } else {
+            LOG(ERROR) << "Failed to deregister notification receive MR during "
+                          "rollback: "
+                       << strerror(ret);
+        }
+    }
+    if (!s.qp && !s.send_mr && !s.recv_mr) {
+        s.send_buffer.reset();
+        s.recv_buffer.reset();
+        s.enabled = false;
+    }
+}
+
 int RdmaEndPoint::constructNotification() {
     auto &s = notify_;
     std::lock_guard<std::mutex> guard(s.mutex);
@@ -442,7 +490,11 @@ int RdmaEndPoint::constructNotification() {
     s.error = 0;
     s.connected = s.reconnect_needed = false;
     s.pending = s.next_send = s.peer_qp = 0;
-    if (!context_.notify_cq_) return s.fail(ERR_CONTEXT);
+    if (!context_.notify_cq_) {
+        const int ret = s.fail(ERR_CONTEXT);
+        rollbackNotificationConstruction();
+        return ret;
+    }
     ibv_qp_init_attr init{};
     init.send_cq = init.recv_cq = context_.notify_cq_;
     init.qp_type = IBV_QPT_RC;
@@ -450,7 +502,11 @@ int RdmaEndPoint::constructNotification() {
     init.cap.max_send_sge = init.cap.max_recv_sge = 1;
     init.cap.max_inline_data = globalConfig().max_inline;
     s.qp = ibv_create_qp(context_.pd(), &init);
-    if (!s.qp) return s.fail(ERR_ENDPOINT);
+    if (!s.qp) {
+        const int ret = s.fail(ERR_ENDPOINT);
+        rollbackNotificationConstruction();
+        return ret;
+    }
     s.inline_bytes = init.cap.max_inline_data;
     ibv_qp_attr attr{};
     attr.qp_state = IBV_QPS_INIT;
@@ -459,8 +515,11 @@ int RdmaEndPoint::constructNotification() {
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE;
     if (ibv_modify_qp(s.qp, &attr,
                       IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX |
-                          IBV_QP_ACCESS_FLAGS))
-        return s.fail(ERR_ENDPOINT);
+                          IBV_QP_ACCESS_FLAGS)) {
+        const int ret = s.fail(ERR_ENDPOINT);
+        rollbackNotificationConstruction();
+        return ret;
+    }
     s.send_buffer = std::make_unique<char[]>(kNotifySlots * kNotifySlotBytes);
     s.recv_buffer = std::make_unique<char[]>(kNotifySlots * kNotifySlotBytes);
     s.send_mr =
@@ -469,9 +528,18 @@ int RdmaEndPoint::constructNotification() {
     s.recv_mr =
         ibv_reg_mr(context_.pd(), s.recv_buffer.get(),
                    kNotifySlots * kNotifySlotBytes, IBV_ACCESS_LOCAL_WRITE);
-    if (!s.send_mr || !s.recv_mr) return s.fail(ERR_MEMORY);
-    for (size_t slot = 0; slot < kNotifySlots; ++slot)
-        if (postNotificationReceive(slot)) return s.fail(ERR_ENDPOINT);
+    if (!s.send_mr || !s.recv_mr) {
+        const int ret = s.fail(ERR_MEMORY);
+        rollbackNotificationConstruction();
+        return ret;
+    }
+    for (size_t slot = 0; slot < kNotifySlots; ++slot) {
+        if (postNotificationReceive(slot)) {
+            const int ret = s.fail(ERR_ENDPOINT);
+            rollbackNotificationConstruction();
+            return ret;
+        }
+    }
     context_.registerNotifyQp(s.qp->qp_num, weak_from_this());
     return 0;
 }
