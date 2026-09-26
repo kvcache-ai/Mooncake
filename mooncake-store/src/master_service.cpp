@@ -12416,6 +12416,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     const MountedNoFSegmentSnapshot& snapshot,
     const std::string& error_reason) {
     size_t metrics_dec_capacity = 0;
+    std::string te_endpoint;
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
@@ -12423,7 +12424,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
         ErrorCode err = nof_segment_access.PrepareUnmountSegment(
-            snapshot.segment_id, metrics_dec_capacity);
+            snapshot.segment_id, metrics_dec_capacity, &te_endpoint);
         if (err == ErrorCode::SEGMENT_NOT_FOUND ||
             err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
             std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
@@ -12463,7 +12464,6 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(snapshot.segment_id);
     }
-    const std::string& te_endpoint = snapshot.segment.te_endpoint;
     if (!te_endpoint.empty() &&
         !nof_segment_manager_.HasEndpoint(te_endpoint)) {
         ReleaseNoFProbeResources(te_endpoint);
@@ -12558,6 +12558,31 @@ void MasterService::NofHeartbeatThreadFunc() {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(kNoFHeartbeatThreadSleepMs));
             continue;
+        }
+
+        // Explicit unmount can race after we drop locks: skip probing so we
+        // do not reopen SpdkWrapper qpair/probe buffers for a gone segment.
+        {
+            std::vector<MountedNoFSegmentSnapshot> live_segments;
+            nof_segment_manager_.GetMountedSegmentsSnapshot(live_segments);
+            bool still_mounted = false;
+            for (const auto& live : live_segments) {
+                if (live.segment_id == probe_target->segment_id &&
+                    live.status == SegmentStatus::OK &&
+                    live.segment.te_endpoint ==
+                        probe_target->segment.te_endpoint) {
+                    still_mounted = true;
+                    break;
+                }
+            }
+            if (!still_mounted) {
+                std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+                nof_heartbeat_states_.erase(probe_target->segment_id);
+                VLOG(1) << "segment_id=" << probe_target->segment_id
+                        << ", action=skip_nof_heartbeat_probe"
+                        << ", reason=segment_no_longer_mounted";
+                continue;
+            }
         }
 
         auto probe_start = std::chrono::steady_clock::now();
