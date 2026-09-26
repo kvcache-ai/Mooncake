@@ -71,7 +71,7 @@ own measured phase and does not consume the workload's arrival-time budget.
 | `MountSegment` | `segment_id`, positive `size_bytes`; setup only. |
 | `UnmountSegment` | `segment_id`; teardown only, same owner as mount. |
 | `BatchExistKey`, `BatchGetReplicaList`, `BatchRemove` | Nonempty ordered `keys`. |
-| `BatchPutStart` | `keys`, matching positive `value_sizes`, optional `replica_num` (default 1). |
+| `BatchPutStart` | `keys`, either `value_sizes` or `value_slices`, optional `replica_num` (default 1). |
 | `BatchPutEnd`, `BatchPutRevoke` | Same client and ordered keys as Start, plus `put_start` referencing its ID. |
 
 Register request-only clients without mounting memory. Mount capacity belongs
@@ -84,7 +84,12 @@ Mid-workload topology changes and nonempty remount recovery are unsupported.
 All key operations belong to workload. Each Start requires exactly one End or
 Revoke. `put_start` implies a completion dependency; unsuccessful Start keys are
 skipped at End/Revoke. If all keys are skipped, no finalization RPC is issued.
-Each value is one memory slice. Remove respects leases (`force=false`).
+`value_sizes` gives one positive byte length per key, with one slice per value.
+For multi-slice objects, `value_slices` instead gives one nonempty array of
+positive slice lengths per key: `[[4194288, 4194288, 32], [8192]]` describes two
+objects, with three slices and one slice respectively. The replayer preserves
+these boundaries; the producer must follow its Mooncake client's slice limits.
+The two fields are mutually exclusive. Remove respects leases (`force=false`).
 
 `depends_on` lists earlier event IDs. Dependencies wait for completion; they do
 not imply success. Producers must preserve write/read/remove ordering for shared
@@ -123,6 +128,23 @@ The launcher saves:
   throughput includes draining the backlog. For an all-at-once trace, the
   offered average is null; per-second buckets still show the burst.
 - Child process logs.
+
+For capacity-pressure experiments, grow the recorded KV working set beyond the
+trace's fixed mounted capacity and let the real master select eviction victims.
+`--eviction-high-watermark-ratio` and `--eviction-ratio` override the master's
+corresponding settings; omitted values retain master defaults. Add
+`--require-eviction` to fail a run unless successful eviction and freed bytes
+are observed during workload. `result.json` includes `workload_evictions` with
+sampled counter deltas and the intervals in which eviction occurred, including
+allocation failures. `pids.json` exposes the owned processes for an external
+profiler; use a separate profiling run when measuring profiler overhead matters.
+
+Changing capacity while keeping a trace's requests fixed measures master
+behavior under those offered intents. Eviction can make recorded reads miss,
+so their hit counts need not reproduce the generating simulator's state.
+Report misses, not-ready results and allocation errors explicitly. This is not
+a closed-loop serving simulation, and injecting client `BatchRemove` calls is
+not a substitute for exercising the master's background eviction path.
 
 CPU utilization is expressed in cores (1 means one fully occupied core), derived
 from Linux process CPU time. Very short phases can have too few samples to estimate

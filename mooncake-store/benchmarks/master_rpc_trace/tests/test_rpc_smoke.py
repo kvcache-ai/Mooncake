@@ -190,6 +190,35 @@ class RpcSmokeTest(unittest.TestCase):
         self.assertEqual(rows[1]["key_status"]["ok"], 1)
         self.assertEqual(rows[2]["key_status"]["ok"], 2)
 
+    def test_multiple_slices_preserve_single_object(self):
+        trace = self.directory / "slices.jsonl"
+        with FixtureWriter(trace) as writer:
+            start = writer.record(
+                timestamp_us=0,
+                client_id="a",
+                op="BatchPutStart",
+                keys=["large-state", "small-state"],
+                value_slices=[[4194288] * 4 + [2097216], [368640]],
+            )
+            end = writer.record(
+                timestamp_us=0,
+                client_id="a",
+                op="BatchPutEnd",
+                keys=["large-state", "small-state"],
+                put_start=start,
+            )
+            writer.record(
+                timestamp_us=0,
+                client_id="b",
+                op="BatchGetReplicaList",
+                keys=["large-state", "small-state"],
+                depends_on=[end],
+            )
+        result, rows = self.replay(trace)
+        self.assertFalse(result["has_errors"])
+        for row in rows:
+            self.assertEqual(row["key_status"]["ok"], 2)
+
     def test_revoke_and_remove(self):
         trace = self.directory / "remove.jsonl"
         with FixtureWriter(trace) as writer:

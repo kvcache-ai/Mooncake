@@ -144,10 +144,10 @@ RpcTrace ReadTrace(std::istream& input) {
                 header_seen = true;
                 continue;
             }
-            CheckFields(
-                row, {"id", "timestamp_us", "client_id", "op", "keys",
-                      "value_sizes", "replica_num", "depends_on", "put_start",
-                      "phase", "segment_id", "size_bytes", "segments"});
+            CheckFields(row, {"id", "timestamp_us", "client_id", "op", "keys",
+                              "value_sizes", "value_slices", "replica_num",
+                              "depends_on", "put_start", "phase", "segment_id",
+                              "size_bytes", "segments"});
             TraceEvent event;
             event.id = StringField(row, "id");
             Require(!ids.count(event.id), "duplicate event id: " + event.id);
@@ -244,13 +244,39 @@ RpcTrace ReadTrace(std::istream& input) {
             Require(lifecycle || event.phase == "workload",
                     "key operations must be in workload");
             if (event.op == "BatchPutStart") {
-                Require(row["value_sizes"].isArray() &&
-                            row["value_sizes"].size() == event.keys.size(),
-                        "value_sizes must match keys for BatchPutStart");
-                for (const auto& size : row["value_sizes"]) {
-                    Require(IsUInt64(size) && size.asUInt64() > 0,
-                            "value sizes must be positive integers");
-                    event.value_sizes.push_back(size.asUInt64());
+                Require(
+                    row.isMember("value_sizes") != row.isMember("value_slices"),
+                    "provide exactly one of value_sizes or value_slices");
+                if (row.isMember("value_slices")) {
+                    Require(row["value_slices"].isArray() &&
+                                row["value_slices"].size() == event.keys.size(),
+                            "value_slices must match keys for BatchPutStart");
+                    for (const auto& value : row["value_slices"]) {
+                        Require(value.isArray() && !value.empty(),
+                                "each value must have at least one slice");
+                        std::vector<uint64_t> slices;
+                        uint64_t total = 0;
+                        for (const auto& size : value) {
+                            Require(IsUInt64(size) && size.asUInt64() > 0,
+                                    "slice lengths must be positive integers");
+                            Require(size.asUInt64() <=
+                                        std::numeric_limits<uint64_t>::max() -
+                                            total,
+                                    "value slice total overflows uint64");
+                            total += size.asUInt64();
+                            slices.push_back(size.asUInt64());
+                        }
+                        event.value_slices.push_back(std::move(slices));
+                    }
+                } else {
+                    Require(row["value_sizes"].isArray() &&
+                                row["value_sizes"].size() == event.keys.size(),
+                            "value_sizes must match keys for BatchPutStart");
+                    for (const auto& size : row["value_sizes"]) {
+                        Require(IsUInt64(size) && size.asUInt64() > 0,
+                                "value sizes must be positive integers");
+                        event.value_sizes.push_back(size.asUInt64());
+                    }
                 }
                 Require(
                     std::set<std::string>(event.keys.begin(), event.keys.end())
@@ -263,10 +289,11 @@ RpcTrace ReadTrace(std::istream& input) {
                     event.replica_num = row["replica_num"].asUInt64();
                 }
             } else {
-                Require(
-                    !row.isMember("value_sizes") &&
-                        !row.isMember("replica_num"),
-                    "value_sizes/replica_num are only valid for BatchPutStart");
+                Require(!row.isMember("value_sizes") &&
+                            !row.isMember("value_slices") &&
+                            !row.isMember("replica_num"),
+                        "value_sizes/value_slices/replica_num are only valid "
+                        "for BatchPutStart");
             }
             if (event.op == "BatchPutEnd" || event.op == "BatchPutRevoke") {
                 const auto start_id = StringField(row, "put_start");

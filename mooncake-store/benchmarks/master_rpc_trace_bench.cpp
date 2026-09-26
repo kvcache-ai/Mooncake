@@ -152,6 +152,7 @@ class MasterReplay {
             call.session = sessions_.at(event.client_id).get();
             call.config.replica_num = event.replica_num;
             for (auto size : event.value_sizes) call.lengths.push_back({size});
+            if (!event.value_slices.empty()) call.lengths = event.value_slices;
             for (const auto& key : event.keys)
                 call.object_metas.push_back({key, std::nullopt});
             prepared.push_back(std::move(call));

@@ -24,6 +24,7 @@ struct TraceEvent {
     uint64_t timestamp_us = 0;
     std::vector<std::string> keys;
     std::vector<uint64_t> value_sizes;
+    std::vector<std::vector<uint64_t>> value_slices;
     uint64_t replica_num = 1;
     std::vector<size_t> dependencies;
     std::optional<size_t> put_start;

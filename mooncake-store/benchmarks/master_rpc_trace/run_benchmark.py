@@ -20,6 +20,15 @@ import time
 import urllib.error
 import urllib.request
 
+STORE_COUNTERS = {
+    "master_successful_evictions_total",
+    "master_attempted_evictions_total",
+    "master_evicted_key_count",
+    "master_evicted_size_bytes",
+    "master_put_start_alloc_failures_total",
+    "master_put_start_partial_allocations_total",
+}
+
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
@@ -93,7 +102,7 @@ def store_metrics(text):
         "master_allocated_bytes",
         "master_key_count",
         "master_active_clients",
-    }
+    } | STORE_COUNTERS
     values = {}
     for line in text.splitlines():
         fields = line.split()
@@ -102,6 +111,41 @@ def store_metrics(text):
             if math.isfinite(value):
                 values[fields[0]] = value
     return values
+
+
+def eviction_summary(rows, start, finish):
+    """Count sampled eviction activity during workload, excluding teardown."""
+    before = [row for row in rows if row["monotonic_s"] <= start]
+    during = [row for row in rows if start < row["monotonic_s"] <= finish]
+    if not during:
+        return {"observed": False, "counter_deltas": {}, "intervals": []}
+    baseline = before[-1] if before else during[0]
+    previous = baseline
+    intervals = []
+    for row in during:
+        changes = {
+            name: row[name] - previous[name]
+            for name in STORE_COUNTERS
+            if name in row and name in previous
+        }
+        if changes.get("master_attempted_evictions_total", 0) > 0:
+            intervals.append(
+                {"end_s": row["monotonic_s"] - start, "counter_deltas": changes}
+            )
+        previous = row
+    deltas = {
+        name: during[-1][name] - baseline[name]
+        for name in STORE_COUNTERS
+        if name in during[-1] and name in baseline
+    }
+    return {
+        "observed": deltas.get("master_successful_evictions_total", 0) > 0
+        and deltas.get("master_evicted_size_bytes", 0) > 0,
+        "sample_start_s": baseline["monotonic_s"] - start,
+        "sample_end_s": during[-1]["monotonic_s"] - start,
+        "counter_deltas": deltas,
+        "intervals": intervals,
+    }
 
 
 def traffic_summary(samples):
@@ -175,6 +219,13 @@ def main():
     parser.add_argument("--speed", type=float, default=1)
     parser.add_argument("--sample-interval", type=float, default=0.2)
     parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--eviction-high-watermark-ratio", type=float)
+    parser.add_argument("--eviction-ratio", type=float)
+    parser.add_argument(
+        "--require-eviction",
+        action="store_true",
+        help="Fail the run unless successful eviction is sampled during workload",
+    )
     args = parser.parse_args()
     if platform.system() != "Linux":
         parser.error("process sampling and CPU affinity require Linux")
@@ -189,6 +240,9 @@ def main():
         )
     ):
         parser.error("counts, speed, intervals and timeout must be positive")
+    for value in (args.eviction_high_watermark_ratio, args.eviction_ratio):
+        if value is not None and (not math.isfinite(value) or not 0 <= value <= 1):
+            parser.error("eviction ratios must be between zero and one")
     trace, master_bin, replay_bin = (
         path.resolve(strict=True) for path in (args.trace, args.master, args.replayer)
     )
@@ -219,6 +273,10 @@ def main():
         "--default_kv_lease_ttl=0ms",
         "--logtostderr=1",
     ]
+    for flag in ("eviction_high_watermark_ratio", "eviction_ratio"):
+        value = getattr(args, flag)
+        if value is not None:
+            master_command.append(f"--{flag}={value}")
     replay_command = [
         "taskset",
         "-c",
@@ -292,6 +350,10 @@ def main():
                 env=env,
             )
             processes.append(replayer)
+            write_json(
+                directory / "pids.json",
+                {"master": master.pid, "replayer": replayer.pid},
+            )
             deadline = time.monotonic() + args.timeout
             while replayer.poll() is None:
                 tick = time.monotonic()
@@ -352,11 +414,16 @@ def main():
                 )
                 if any(name in row for row in selected_metrics)
             }
+            evictions = eviction_summary(metric_rows, start, finish)
             result.update(
                 {
                     "success": replayer.returncode == 0
                     and replay["healthy_heartbeats"]
-                    and not replay["has_errors"],
+                    and not replay["has_errors"]
+                    and (not args.require_eviction or evictions["observed"]),
+                    "workload_evictions": evictions,
+                    "eviction_requirement_met": not args.require_eviction
+                    or evictions["observed"],
                     "workload_process": process_summary(rows, start, finish),
                     "workload_monotonic_window_s": [start, finish],
                     "traffic": traffic_summary(samples),
@@ -370,16 +437,16 @@ def main():
         for process in reversed(processes):
             stop(process)
         write_json(directory / "result.json", result)
-    print(
-        json.dumps(
-            {
-                key: value
-                for key, value in result.items()
-                if key not in ("phases", "traffic")
-            },
-            indent=2,
-        )
-    )
+    summary = {
+        key: value for key, value in result.items() if key not in ("phases", "traffic")
+    }
+    if "workload_evictions" in summary:
+        summary["workload_evictions"] = {
+            key: value
+            for key, value in summary["workload_evictions"].items()
+            if key != "intervals"
+        }
+    print(json.dumps(summary, indent=2))
     return 0 if result["success"] else 1
 
 

@@ -5,7 +5,12 @@ from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from run_benchmark import process_summary, traffic_summary  # noqa: E402
+from run_benchmark import (
+    eviction_summary,
+    process_summary,
+    store_metrics,
+    traffic_summary,
+)  # noqa: E402
 
 
 class MonitorTest(unittest.TestCase):
@@ -53,6 +58,37 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(result["master"]["mean_cpu_cores"], 2)
         self.assertEqual(result["master"]["peak_rss_bytes"], 200)
         self.assertEqual(result["replayer"]["samples"], 0)
+
+    def test_eviction_counters_exclude_setup_and_teardown(self):
+        names = (
+            "master_attempted_evictions_total",
+            "master_successful_evictions_total",
+            "master_evicted_size_bytes",
+        )
+        rows = [
+            {"monotonic_s": t, **dict(zip(names, values))}
+            for t, values in (
+                (0, (5, 5, 100)),
+                (1, (5, 5, 100)),
+                (2, (8, 7, 250)),
+                (3, (50, 50, 1000)),
+            )
+        ]
+        result = eviction_summary(rows, 1, 2)
+        self.assertTrue(result["observed"])
+        self.assertEqual(result["counter_deltas"][names[0]], 3)
+        self.assertEqual(result["counter_deltas"][names[1]], 2)
+        self.assertEqual(result["counter_deltas"][names[2]], 150)
+        self.assertEqual(len(result["intervals"]), 1)
+        self.assertFalse(eviction_summary(rows, 0, 1)["observed"])
+        self.assertFalse(eviction_summary([], 0, 1)["observed"])
+
+    def test_metrics_parser_keeps_eviction_counters(self):
+        text = "# TYPE master_evicted_size_bytes counter\nmaster_evicted_size_bytes 4096\nmaster_key_count 7\nunrelated 1\n"
+        self.assertEqual(
+            store_metrics(text),
+            {"master_evicted_size_bytes": 4096, "master_key_count": 7},
+        )
 
 
 if __name__ == "__main__":

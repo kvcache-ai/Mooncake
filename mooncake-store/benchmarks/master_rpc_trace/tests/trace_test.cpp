@@ -35,6 +35,41 @@ TEST(TraceValidation, PreservesBatchAndInfersPutDependency) {
     EXPECT_EQ(trace.events[1].timestamp_us, 1000);
 }
 
+TEST(TraceValidation, PreservesMultipleSlicesPerValue) {
+    const auto trace = Parse(
+        R"({"id":"s","timestamp_us":0,"client_id":"c","op":"BatchPutStart","keys":["x","y"],"value_slices":[[4194288,4194288,32],[8192]]})"
+        "\n" +
+        kEnd);
+    EXPECT_TRUE(trace.events[0].value_sizes.empty());
+    EXPECT_EQ(
+        trace.events[0].value_slices,
+        (std::vector<std::vector<uint64_t>>{{4194288, 4194288, 32}, {8192}}));
+}
+
+TEST(TraceValidation, RejectsInvalidSliceLayouts) {
+    for (const auto& fields : {
+             R"("value_sizes":[1,1],"value_slices":[[1],[1]])",
+             R"("value_slices":[[1]])",
+             R"("value_slices":[[],[1]])",
+             R"("value_slices":[[0],[1]])",
+             R"("value_slices":[[-1],[1]])",
+             R"("value_slices":[[1.5],[1]])",
+             R"("value_slices":[1,[1]])",
+             R"("value_slices":[[18446744073709551615,1],[1]])",
+         }) {
+        SCOPED_TRACE(fields);
+        const auto start =
+            std::string{
+                R"({"id":"s","timestamp_us":0,"client_id":"c","op":"BatchPutStart","keys":["x","y"],)"} +
+            fields + "}";
+        EXPECT_THROW(Parse(start + '\n' + kEnd), std::invalid_argument);
+    }
+    EXPECT_THROW(
+        Parse(
+            R"({"id":"r","timestamp_us":0,"client_id":"c","op":"BatchExistKey","keys":["x"],"value_slices":[[1]]})"),
+        std::invalid_argument);
+}
+
 TEST(TraceValidation, RejectsInvalidTracesBeforeReplay) {
     const std::vector<std::string> invalid = {
         kStart,  // Unfinished write.
