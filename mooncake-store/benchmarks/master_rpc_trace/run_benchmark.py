@@ -115,6 +115,7 @@ def traffic_summary(samples):
     )
     edges = []
     end_us = 0
+    arrival_end_us = 0
     for row in samples:
         if row["phase"] != "workload":
             continue
@@ -123,6 +124,7 @@ def traffic_summary(samples):
             row[key] - origin for key in ("scheduled_us", "start_us", "finish_us")
         )
         end_us = max(end_us, finish)
+        arrival_end_us = max(arrival_end_us, due)
         buckets[due // 1_000_000]["offered_calls"] += 1
         if row["rpc_sent"]:
             buckets[start // 1_000_000]["sent_calls"] += 1
@@ -145,6 +147,10 @@ def traffic_summary(samples):
     }
     return {
         "duration_s": seconds,
+        "arrival_span_s": arrival_end_us / 1_000_000,
+        "offered_calls_per_second": totals["offered_calls"] * 1_000_000 / arrival_end_us
+        if arrival_end_us
+        else None,
         "peak_client_calls_inflight": peak,
         "totals": totals,
         "mean_per_second": {

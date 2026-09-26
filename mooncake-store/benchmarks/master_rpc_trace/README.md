@@ -119,6 +119,9 @@ The launcher saves:
   Prometheus metrics. Sampling continues during setup and teardown.
 - `result.json`: workload-only CPU/RSS and traffic summaries, one-second offered,
   sent and completed call counts, issued keys and peak calls in flight.
+  `offered_calls_per_second` uses the planned arrival span, while completed
+  throughput includes draining the backlog. For an all-at-once trace, the
+  offered average is null; per-second buckets still show the burst.
 - Child process logs.
 
 CPU utilization is expressed in cores (1 means one fully occupied core), derived

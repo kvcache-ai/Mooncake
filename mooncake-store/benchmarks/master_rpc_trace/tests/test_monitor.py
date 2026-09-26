@@ -40,6 +40,8 @@ class MonitorTest(unittest.TestCase):
             },
         )
         self.assertEqual(result["mean_per_second"]["completed_calls"], 0.5)
+        self.assertEqual(result["arrival_span_s"], 0.000001)
+        self.assertEqual(result["offered_calls_per_second"], 2_000_000)
         self.assertEqual(result["peak_client_calls_inflight"], 1)
 
     def test_process_stats_use_workload_window(self):
