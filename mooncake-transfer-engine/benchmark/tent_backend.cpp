@@ -23,7 +23,7 @@
 #include "tent/runtime/topology.h"
 #include "tent/runtime/transport_selector.h"
 
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE) || defined(USE_SUPA)
 #include "cuda_alike.h"
 #endif
 
@@ -131,7 +131,7 @@ static int resolveSegTypeParams(const std::string& seg_type,
     if (seg_type == "DRAM" || seg_type == "dram") {
         device_prefix = "cpu";
         num_buffers = numa_num_configured_nodes();
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE) || defined(USE_SUPA)
     } else if (seg_type == "VRAM" || seg_type == "vram") {
         device_prefix = "cuda";
         int gpu_count = 0;
@@ -386,7 +386,7 @@ static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     return numa_node;
 }
 
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE) || defined(USE_SUPA)
 static inline int getGpuDeviceNumaID(int gpu_id) {
     char pci_bus_id[20];
     auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);

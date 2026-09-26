@@ -15,7 +15,7 @@
 #ifndef TENT_PLATFORM_CUDA_UTILS_H
 #define TENT_PLATFORM_CUDA_UTILS_H
 
-#include <cuda.h>
+#include "cuda_alike.h"
 
 #include <mutex>
 

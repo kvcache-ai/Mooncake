@@ -70,6 +70,7 @@ export MOONCAKE_PROTOCOL="tcp"
 - NVIDIA GPUDirect RDMA
 - Non-NVIDAI GPUDirect RDMA (e.g., Intel E810 RDMA NIC)
 - Cambricon MLU memory via Neuware (`-DUSE_MLU=ON`)
+- Biren GPU memory via SUPA (`-DUSE_SUPA=ON`)
 
 **Use When:**
 - High-performance networking is required

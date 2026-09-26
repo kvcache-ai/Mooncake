@@ -27,7 +27,7 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <cuda_runtime.h>
+#include "cuda_alike.h"
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -280,6 +280,7 @@ bool cudaDevicePresent() {
 
 bool cudaAbiMatches() {
     static const bool matches = [] {
+#ifdef USE_CUDA
         int runtime_version = 0;
         // Major version only: struct layout changes across CUDA majors.
         if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess &&
@@ -291,6 +292,7 @@ bool cudaAbiMatches() {
                           "matching CUDA toolkit.";
             return false;
         }
+#endif
         return true;
     }();
     return matches;

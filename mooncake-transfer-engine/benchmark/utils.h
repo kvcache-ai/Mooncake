@@ -34,7 +34,7 @@
 
 #if defined(USE_CUDA)
 #include <cuda_runtime.h>
-#elif defined(USE_SUNRISE)
+#elif defined(USE_SUNRISE) || defined(USE_SUPA)
 #include "cuda_alike.h"
 #endif
 
@@ -217,7 +217,7 @@ static inline bool rangeContains(uint64_t offset, uint64_t bytes,
     return offset <= limit && bytes <= limit - offset;
 }
 
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE) || defined(USE_SUPA)
 static inline bool isCudaMemory(void* ptr) {
     cudaPointerAttributes attr;
     auto ret = cudaPointerGetAttributes(&attr, ptr);
@@ -234,7 +234,7 @@ static inline bool isHipMemory(void* ptr) {
 #endif
 
 static inline bool isGpuMemory(void* ptr) {
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_SUNRISE) || defined(USE_SUPA)
     if (isCudaMemory(ptr)) return true;
 #endif
 #ifdef USE_HIP
@@ -244,7 +244,7 @@ static inline bool isGpuMemory(void* ptr) {
 }
 
 static inline void fillData(void* addr, size_t length, uint8_t seed) {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     if (isCudaMemory(addr)) {
         auto err = cudaMemset(addr, seed, length);
         LOG_ASSERT(err == cudaSuccess)
@@ -288,7 +288,7 @@ static inline uint8_t fillData(void* addr, size_t length) {
 
 static inline void verifyData(void* addr, size_t length, uint8_t seed) {
     std::vector<uint8_t> ref_data(length, seed);
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> act_data(length);
         cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
