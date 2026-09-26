@@ -118,7 +118,7 @@ class MultiTransport {
                            bool *allows_reuse = nullptr);
 
     Status tryFreeBatchID(BatchID batch_id,
-                          const std::function<void()>& before_delete);
+                          const std::function<void()> &before_delete);
 
     void deferredCleanupLoop();
 
