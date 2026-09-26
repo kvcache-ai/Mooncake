@@ -139,6 +139,15 @@ sampled counter deltas and the intervals in which eviction occurred, including
 allocation failures. `pids.json` exposes the owned processes for an external
 profiler; use a separate profiling run when measuring profiler overhead matters.
 
+Queueing can stretch the actual interval between PutStart and PutEnd beyond the
+master's incomplete-write timeouts. Keep the default settings for an overload
+test that includes these failures. To isolate capacity eviction from incomplete
+write cleanup, explicitly set `--put-start-discard-timeout-sec` and
+`--put-start-release-timeout-sec` above the expected replay write intervals
+(release must exceed discard). These optional overrides are recorded in the
+manifest. Report discard/release counters and PutEnd errors separately from
+capacity eviction, and identify timeout overrides in comparisons.
+
 Changing capacity while keeping a trace's requests fixed measures master
 behavior under those offered intents. Eviction can make recorded reads miss,
 so their hit counts need not reproduce the generating simulator's state.

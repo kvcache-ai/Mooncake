@@ -487,21 +487,25 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
 }
 
 static Json::Value SummarizeEvents(const RpcTrace& trace,
-                                   const std::vector<TraceSample>& samples) {
+                                   const std::vector<TraceSample>& samples,
+                                   const char* phase = nullptr) {
     Require(samples.size() == trace.events.size(), "sample count mismatch");
     Json::Value result(Json::objectValue);
     result["schema_version"] = 1;
-    result["trace_metadata"] = trace.metadata;
-    result["events"] = Json::UInt64(samples.size());
-    if (!samples.empty())
-        result["replay_origin_monotonic_us"] =
-            Json::Int64(samples.front().replay_origin_monotonic_us);
+    result["trace_metadata"] = phase ? Json::Value{} : trace.metadata;
     int64_t elapsed_us = 0;
+    size_t event_count = 0;
     std::set<std::string> operations;
     for (size_t i = 0; i < samples.size(); ++i) {
+        if (phase && trace.events[i].phase != phase) continue;
+        if (event_count++ == 0)
+            result["replay_origin_monotonic_us"] =
+                Json::Int64(samples[i].replay_origin_monotonic_us);
         operations.insert(trace.events[i].op);
-        elapsed_us = std::max(elapsed_us, samples[i].finish_us);
+        const auto origin = phase ? samples[i].phase_origin_us : 0;
+        elapsed_us = std::max(elapsed_us, samples[i].finish_us - origin);
     }
+    result["events"] = Json::UInt64(event_count);
     result["elapsed_us"] = Json::Int64(elapsed_us);
     for (const auto& op : operations) {
         auto& stats = result["operations"][op];
@@ -510,6 +514,7 @@ static Json::Value SummarizeEvents(const RpcTrace& trace,
         RpcOutcome outcomes;
         std::vector<int64_t> lag, latency, end_to_end;
         for (size_t i = 0; i < samples.size(); ++i) {
+            if (phase && trace.events[i].phase != phase) continue;
             if (trace.events[i].op != op) continue;
             const auto& sample = samples[i];
             ++planned;
@@ -549,18 +554,7 @@ Json::Value SummarizeTrace(const RpcTrace& trace,
     auto result = SummarizeEvents(trace, samples);
     result["schema_version"] = 2;
     for (const auto* phase : {"setup", "workload", "teardown"}) {
-        RpcTrace subset;
-        std::vector<TraceSample> selected;
-        for (size_t i = 0; i < samples.size(); ++i) {
-            if (trace.events[i].phase != phase) continue;
-            subset.events.push_back(trace.events[i]);
-            auto sample = samples[i];
-            sample.scheduled_us -= sample.phase_origin_us;
-            sample.start_us -= sample.phase_origin_us;
-            sample.finish_us -= sample.phase_origin_us;
-            selected.push_back(std::move(sample));
-        }
-        result["phases"][phase] = SummarizeEvents(subset, selected);
+        result["phases"][phase] = SummarizeEvents(trace, samples, phase);
     }
     return result;
 }

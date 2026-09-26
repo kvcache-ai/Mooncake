@@ -27,6 +27,9 @@ STORE_COUNTERS = {
     "master_evicted_size_bytes",
     "master_put_start_alloc_failures_total",
     "master_put_start_partial_allocations_total",
+    "master_put_start_discard_cnt",
+    "master_put_start_release_cnt",
+    "master_put_end_failures_total",
 }
 
 
@@ -221,6 +224,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--eviction-high-watermark-ratio", type=float)
     parser.add_argument("--eviction-ratio", type=float)
+    parser.add_argument("--put-start-discard-timeout-sec", type=int)
+    parser.add_argument("--put-start-release-timeout-sec", type=int)
     parser.add_argument(
         "--require-eviction",
         action="store_true",
@@ -243,6 +248,18 @@ def main():
     for value in (args.eviction_high_watermark_ratio, args.eviction_ratio):
         if value is not None and (not math.isfinite(value) or not 0 <= value <= 1):
             parser.error("eviction ratios must be between zero and one")
+    for value in (
+        args.put_start_discard_timeout_sec,
+        args.put_start_release_timeout_sec,
+    ):
+        if value is not None and value <= 0:
+            parser.error("put timeouts must be positive")
+    if (
+        args.put_start_discard_timeout_sec is not None
+        and args.put_start_release_timeout_sec is not None
+        and args.put_start_release_timeout_sec <= args.put_start_discard_timeout_sec
+    ):
+        parser.error("put release timeout must exceed discard timeout")
     trace, master_bin, replay_bin = (
         path.resolve(strict=True) for path in (args.trace, args.master, args.replayer)
     )
@@ -273,7 +290,12 @@ def main():
         "--default_kv_lease_ttl=0ms",
         "--logtostderr=1",
     ]
-    for flag in ("eviction_high_watermark_ratio", "eviction_ratio"):
+    for flag in (
+        "eviction_high_watermark_ratio",
+        "eviction_ratio",
+        "put_start_discard_timeout_sec",
+        "put_start_release_timeout_sec",
+    ):
         value = getattr(args, flag)
         if value is not None:
             master_command.append(f"--{flag}={value}")
