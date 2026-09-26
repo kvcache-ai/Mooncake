@@ -391,10 +391,8 @@ def main():
             if not (directory / "replay.json").exists():
                 raise RuntimeError("replayer produced no summary; see replayer.log")
             replay = json.loads((directory / "replay.json").read_text())
-            samples = [
-                json.loads(line)
-                for line in (directory / "samples.jsonl").read_text().splitlines()
-            ]
+            with (directory / "samples.jsonl").open() as stream:
+                samples = [json.loads(line) for line in stream]
             workload = [row for row in samples if row["phase"] == "workload"]
             if not workload:
                 raise RuntimeError("trace contains no workload events")
