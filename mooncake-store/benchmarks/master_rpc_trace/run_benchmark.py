@@ -254,7 +254,7 @@ def main():
         [str(replay_bin), f"--trace={trace}", "--validate_only"],
         check=True,
         env=env,
-        timeout=60,
+        timeout=args.timeout,
     )
     rpc_port, metrics_port = port(), port()
     while metrics_port == rpc_port:
