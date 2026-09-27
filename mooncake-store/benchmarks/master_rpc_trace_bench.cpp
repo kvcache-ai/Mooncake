@@ -38,8 +38,6 @@ DEFINE_string(master_server, "127.0.0.1:50051",
 DEFINE_string(tenant, "default", "Tenant used for all trace clients");
 DEFINE_uint32(workers, 8,
               "Maximum concurrent trace calls (not simulated clients)");
-DEFINE_uint64(segment_size, 64ULL * 1024 * 1024,
-              "Fake segment capacity per logical client, in bytes");
 DEFINE_string(output, "master_trace_result.json",
               "Summary output, written after replay");
 DEFINE_string(samples, "master_trace_samples.jsonl",
@@ -52,7 +50,7 @@ struct TraceEvent {
     std::string id;
     std::string client_id;
     std::string op;
-    std::string phase = "workload";
+    std::string phase;
     std::string segment_id;
     uint64_t size_bytes = 0;
     uint64_t timestamp_us = 0;
@@ -65,7 +63,6 @@ struct TraceEvent {
 };
 
 struct RpcTrace {
-    unsigned version = 1;
     Json::Value metadata;
     std::vector<TraceEvent> events;
 };
@@ -176,12 +173,10 @@ RpcTrace ReadTrace(std::istream& input) {
                 Require(
                     row["type"] == "master_rpc_trace" &&
                         row["version"].isUInt64() &&
-                        (row["version"].asUInt64() == 1 ||
-                         row["version"].asUInt64() == 2) &&
+                        row["version"].asUInt64() == 2 &&
                         row["time_unit"] == "us",
-                    "expected master_rpc_trace v1/v2 header with time_unit=us");
+                    "expected master_rpc_trace v2 header with time_unit=us");
                 trace.metadata = row["metadata"];
-                trace.version = row["version"].asUInt();
                 header_seen = true;
                 continue;
             }
@@ -189,9 +184,7 @@ RpcTrace ReadTrace(std::istream& input) {
             event.id = row["id"].asString();
             event.client_id = row["client_id"].asString();
             event.op = row["op"].asString();
-            if (trace.version == 2) {
-                event.phase = row["phase"].asString();
-            }
+            event.phase = row["phase"].asString();
             event.timestamp_us = row["timestamp_us"].asUInt64();
             for (const auto& key : row["keys"]) {
                 event.keys.push_back(key.asString());
@@ -201,7 +194,7 @@ RpcTrace ReadTrace(std::istream& input) {
             }
             if (event.op == "ReMountSegment") {
                 registered[event.client_id] = trace.events.size();
-            } else if (trace.version == 2) {
+            } else {
                 event.dependencies.push_back(registered.at(event.client_id));
             }
             if (event.op == "MountSegment") {
@@ -248,7 +241,7 @@ RpcTrace ReadTrace(std::istream& input) {
         }
     }
     Require(header_seen,
-            "expected master_rpc_trace v1/v2 header with time_unit=us");
+            "expected master_rpc_trace v2 header with time_unit=us");
     return trace;
 }
 
@@ -513,28 +506,11 @@ KeyStatus Classify(mooncake::ErrorCode error) {
 // This executable must only be used against a dedicated benchmark master.
 class Session {
    public:
-    explicit Session(bool legacy)
-        : client(mooncake::generate_uuid(), nullptr, FLAGS_tenant) {
+    Session() : client(mooncake::generate_uuid(), nullptr, FLAGS_tenant) {
         const auto error = client.Connect(FLAGS_master_server);
         if (error != mooncake::ErrorCode::OK) {
             throw std::runtime_error("connect failed: " + toString(error));
         }
-        if (!legacy) return;
-        segment.id = mooncake::generate_uuid();
-        segment.name = "trace_" + mooncake::UuidToString(segment.id);
-        segment.base = 0x100000000ULL;
-        segment.size = FLAGS_segment_size;
-        segment.host_id = segment.name;
-        segment.te_endpoint = segment.name + ":12345";
-        segment.protocol = "tcp";
-        // First registration must finish the remount handshake to mark the
-        // client OK for Ping. All of this happens before replay measurement.
-        const auto mounted = client.ReMountSegment({segment});
-        if (!mounted)
-            throw std::runtime_error("mount failed: " +
-                                     toString(mounted.error()));
-        registered.store(true);
-        segments.emplace("legacy", segment);
     }
 
     ~Session() {
@@ -547,7 +523,6 @@ class Session {
     }
 
     mooncake::MasterClient client;
-    mooncake::Segment segment;
     std::map<std::string, mooncake::Segment> segments;
     std::mutex lifecycle_mutex;
     std::atomic<bool> registered{false};
@@ -568,7 +543,7 @@ class MasterReplay {
     void Prepare(const RpcTrace& trace) {
         for (const auto& event : trace.events) {
             if (!sessions_.count(event.client_id)) {
-                auto session = std::make_unique<Session>(trace.version == 1);
+                auto session = std::make_unique<Session>();
                 sessions_.emplace(event.client_id, std::move(session));
             }
         }
@@ -733,10 +708,9 @@ int main(int argc, char** argv) {
     google::InitGoogleLogging(argv[0]);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     try {
-        if (FLAGS_trace.empty() || FLAGS_workers == 0 ||
-            FLAGS_segment_size == 0) {
+        if (FLAGS_trace.empty() || FLAGS_workers == 0) {
             throw std::invalid_argument(
-                "trace and positive workers/segment_size are required");
+                "trace and positive workers are required");
         }
         const auto trace = LoadTrace(FLAGS_trace);
         MasterReplay runner;
@@ -747,8 +721,6 @@ int main(int argc, char** argv) {
         result["tenant"] = FLAGS_tenant;
         result["workers"] = FLAGS_workers;
         result["logical_clients"] = Json::UInt64(runner.client_count());
-        if (trace.version == 1)
-            result["segment_size_bytes"] = Json::UInt64(FLAGS_segment_size);
         result["has_errors"] = HasErrors(samples);
         WriteSamples(FLAGS_samples, trace, samples);
         std::ofstream output(FLAGS_output);

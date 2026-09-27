@@ -108,9 +108,11 @@ The Python monitor uses only the standard library; it requires Linux and
 To check the RPC path manually, run the launcher below with
 `--trace mooncake-store/benchmarks/master_rpc_trace_example.jsonl`. After cleanup,
 `result.json` should report `success: true`.
-`replay.json` should show one Exist miss and two successful
-Get keys, plus two successful Ping calls. This small example does not validate
-eviction.
+The example registers two request clients and one storage client, explicitly
+mounts a 64 MiB segment on the storage client, and unmounts it during teardown.
+`replay.json` should show 12 calls across all phases, including one Exist miss,
+two successful Get keys and three successful Ping calls. This small example
+does not validate eviction.
 
 ### Run and monitor
 
@@ -144,7 +146,7 @@ responsible for satisfying the trace contract below.
 
 ### Trace contract: version 2
 
-The first nonblank JSONL row is a header:
+Only version 2 is supported. The first nonblank JSONL row is a header:
 
 ```json
 {"type":"master_rpc_trace","version":2,"time_unit":"us","metadata":{"initial_state":"empty","seed":42}}
@@ -285,11 +287,3 @@ High replay lag with low master utilization indicates a load-generator limit.
 Vary workers or the input workload and check offered versus achieved rates
 before attributing a throughput ceiling to master locks. This benchmark reports
 whole-master load; lock attribution additionally requires profiling.
-
-### Legacy version 1
-
-The handwritten `master_rpc_trace_example.jsonl` and v1 contract remain accepted.
-V1 has a single workload phase and implicitly registers one fake segment per
-client before timing
-(default 64 MiB, `--segment_size`). Cleanup occurs after timing. Use v2 for explicit
-and independently sized storage lifecycle.
