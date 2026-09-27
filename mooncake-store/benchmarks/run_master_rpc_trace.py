@@ -8,7 +8,6 @@ This launcher owns both child processes and stores all output in a fresh folder.
 
 import argparse
 from collections import defaultdict
-import hashlib
 import json
 import math
 import os
@@ -81,22 +80,19 @@ def proc_sample(pid):
 
 
 def process_summary(rows, start, finish):
-    output = {}
-    for name in ("master", "replayer"):
-        values = [
-            (row["monotonic_s"], row[name])
-            for row in rows
-            if start <= row["monotonic_s"] <= finish and name in row
-        ]
-        result = {"samples": len(values)}
-        if values:
-            result["peak_rss_bytes"] = max(value["rss_bytes"] for _, value in values)
-            if len(values) >= 2 and values[-1][0] > values[0][0]:
-                result["mean_cpu_cores"] = (
-                    values[-1][1]["cpu_seconds"] - values[0][1]["cpu_seconds"]
-                ) / (values[-1][0] - values[0][0])
-        output[name] = result
-    return output
+    values = [
+        (row["monotonic_s"], row["master"])
+        for row in rows
+        if start <= row["monotonic_s"] <= finish
+    ]
+    result = {"samples": len(values)}
+    if values:
+        result["peak_rss_bytes"] = max(value["rss_bytes"] for _, value in values)
+        if len(values) >= 2 and values[-1][0] > values[0][0]:
+            result["mean_cpu_cores"] = (
+                values[-1][1]["cpu_seconds"] - values[0][1]["cpu_seconds"]
+            ) / (values[-1][0] - values[0][0])
+    return result
 
 
 def store_metrics(text):
@@ -117,7 +113,7 @@ def store_metrics(text):
 
 
 def eviction_summary(rows, start, finish):
-    """Count sampled eviction activity during workload, excluding teardown."""
+    """Count sampled eviction activity across all replay phases."""
     before = [row for row in rows if row["monotonic_s"] <= start]
     during = [row for row in rows if start < row["monotonic_s"] <= finish]
     if not during:
@@ -164,11 +160,8 @@ def traffic_summary(samples):
     end_us = 0
     arrival_end_us = 0
     for row in samples:
-        if row["phase"] != "workload":
-            continue
-        origin = row["phase_origin_us"]
         due, start, finish = (
-            row[key] - origin for key in ("scheduled_us", "start_us", "finish_us")
+            row[key] for key in ("scheduled_us", "start_us", "finish_us")
         )
         end_us = max(end_us, finish)
         arrival_end_us = max(arrival_end_us, due)
@@ -221,15 +214,6 @@ def main():
     parser.add_argument("--rpc-threads", type=int, default=4)
     parser.add_argument("--sample-interval", type=float, default=0.2)
     parser.add_argument("--timeout", type=float, default=600)
-    parser.add_argument("--eviction-high-watermark-ratio", type=float)
-    parser.add_argument("--eviction-ratio", type=float)
-    parser.add_argument("--put-start-discard-timeout-sec", type=int)
-    parser.add_argument("--put-start-release-timeout-sec", type=int)
-    parser.add_argument(
-        "--require-eviction",
-        action="store_true",
-        help="Fail the run unless successful eviction is sampled during workload",
-    )
     args = parser.parse_args()
     if platform.system() != "Linux":
         parser.error("process sampling and CPU affinity require Linux")
@@ -244,21 +228,6 @@ def main():
         )
     ):
         parser.error("counts, intervals and timeout must be positive")
-    for value in (args.eviction_high_watermark_ratio, args.eviction_ratio):
-        if value is not None and (not math.isfinite(value) or not 0 <= value <= 1):
-            parser.error("eviction ratios must be between zero and one")
-    for value in (
-        args.put_start_discard_timeout_sec,
-        args.put_start_release_timeout_sec,
-    ):
-        if value is not None and value <= 0:
-            parser.error("put timeouts must be positive")
-    if (
-        args.put_start_discard_timeout_sec is not None
-        and args.put_start_release_timeout_sec is not None
-        and args.put_start_release_timeout_sec <= args.put_start_discard_timeout_sec
-    ):
-        parser.error("put release timeout must exceed discard timeout")
     trace, master_bin, replay_bin = (
         path.resolve(strict=True) for path in (args.trace, args.master, args.replayer)
     )
@@ -266,12 +235,6 @@ def main():
     directory.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, MC_STORE_RPC_CLIENT_IO_THREADS="2")
     env.pop("MOONCAKE_CONFIG_PATH", None)
-    subprocess.run(
-        [str(replay_bin), f"--trace={trace}", "--validate_only"],
-        check=True,
-        env=env,
-        timeout=args.timeout,
-    )
     rpc_port, metrics_port = port(), port()
     while metrics_port == rpc_port:
         metrics_port = port()
@@ -286,18 +249,8 @@ def main():
         f"--metrics_port={metrics_port}",
         "--metrics_host=127.0.0.1",
         "--enable_metric_reporting=true",
-        "--default_kv_lease_ttl=0ms",
         "--logtostderr=1",
     ]
-    for flag in (
-        "eviction_high_watermark_ratio",
-        "eviction_ratio",
-        "put_start_discard_timeout_sec",
-        "put_start_release_timeout_sec",
-    ):
-        value = getattr(args, flag)
-        if value is not None:
-            master_command.append(f"--{flag}={value}")
     replay_command = [
         "taskset",
         "-c",
@@ -310,25 +263,6 @@ def main():
         f"--samples={directory / 'samples.jsonl'}",
         "--logtostderr=1",
     ]
-    manifest = {
-        "trace": str(trace),
-        "trace_sha256": hashlib.sha256(trace.read_bytes()).hexdigest(),
-        "master_command": master_command,
-        "replay_command": replay_command,
-        "platform": platform.platform(),
-        "cpu_count": os.cpu_count(),
-        "parameters": {
-            key: str(value) if isinstance(value, Path) else value
-            for key, value in vars(args).items()
-        },
-        "started_unix_s": time.time(),
-        "payload": "metadata_only",
-        "binary_sha256": {
-            name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for name, path in (("master", master_bin), ("replayer", replay_bin))
-        },
-    }
-    write_json(directory / "manifest.json", manifest)
     processes = []
     rows = []
     metric_rows = []
@@ -370,10 +304,6 @@ def main():
                 env=env,
             )
             processes.append(replayer)
-            write_json(
-                directory / "pids.json",
-                {"master": master.pid, "replayer": replayer.pid},
-            )
             deadline = time.monotonic() + args.timeout
             while replayer.poll() is None:
                 tick = time.monotonic()
@@ -381,12 +311,7 @@ def main():
                     raise RuntimeError("master exited during replay")
                 if tick > deadline:
                     raise TimeoutError("replay timeout")
-                row = {"monotonic_s": tick}
-                for name, process in (("master", master), ("replayer", replayer)):
-                    try:
-                        row[name] = proc_sample(process.pid)
-                    except (FileNotFoundError, ProcessLookupError):
-                        pass
+                row = {"monotonic_s": tick, "master": proc_sample(master.pid)}
                 rows.append(row)
                 proc_file.write(json.dumps(row) + "\n")
                 metric = {"monotonic_s": time.monotonic()}
@@ -403,26 +328,15 @@ def main():
                     metric["error"] = str(error)
                 metrics_file.write(json.dumps(metric) + "\n")
                 time.sleep(max(0, args.sample_interval - (time.monotonic() - tick)))
-            with opener.open(url, timeout=3) as response:
-                after = response.read().decode()
-                (directory / "metrics-after.prom").write_text(after)
-                result["store_after_replay"] = store_metrics(after)
-            result["replayer_exit_code"] = replayer.returncode
-            if not (directory / "replay.json").exists():
-                raise RuntimeError("replayer produced no summary; see replayer.log")
             replay = json.loads((directory / "replay.json").read_text())
             with (directory / "samples.jsonl").open() as stream:
                 samples = [json.loads(line) for line in stream]
-            workload = [row for row in samples if row["phase"] == "workload"]
-            if not workload:
-                raise RuntimeError("trace contains no workload events")
-            origin = replay["replay_origin_monotonic_us"] / 1_000_000
-            start = origin + workload[0]["phase_origin_us"] / 1_000_000
-            finish = origin + max(row["finish_us"] for row in workload) / 1_000_000
+            start = replay["replay_origin_monotonic_us"] / 1_000_000
+            finish = start + replay["elapsed_us"] / 1_000_000
             selected_metrics = [
                 row for row in metric_rows if start <= row["monotonic_s"] <= finish
             ]
-            result["store_workload_sampled_peak"] = {
+            result["store_sampled_peak"] = {
                 name: max(row[name] for row in selected_metrics if name in row)
                 for name in (
                     "master_total_capacity_bytes",
@@ -435,14 +349,10 @@ def main():
             evictions = eviction_summary(metric_rows, start, finish)
             result.update(
                 {
-                    "success": replayer.returncode == 0
-                    and not replay["has_errors"]
-                    and (not args.require_eviction or evictions["observed"]),
-                    "workload_evictions": evictions,
-                    "eviction_requirement_met": not args.require_eviction
-                    or evictions["observed"],
-                    "workload_process": process_summary(rows, start, finish),
-                    "workload_monotonic_window_s": [start, finish],
+                    "success": replayer.returncode == 0 and not replay["has_errors"],
+                    "evictions": evictions,
+                    "master_process": process_summary(rows, start, finish),
+                    "replay_monotonic_window_s": [start, finish],
                     "traffic": traffic_summary(samples),
                     "phases": replay["phases"],
                 }
@@ -457,10 +367,10 @@ def main():
     summary = {
         key: value for key, value in result.items() if key not in ("phases", "traffic")
     }
-    if "workload_evictions" in summary:
-        summary["workload_evictions"] = {
+    if "evictions" in summary:
+        summary["evictions"] = {
             key: value
-            for key, value in summary["workload_evictions"].items()
+            for key, value in summary["evictions"].items()
             if key != "intervals"
         }
     print(json.dumps(summary, indent=2))

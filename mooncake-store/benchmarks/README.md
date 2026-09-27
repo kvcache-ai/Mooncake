@@ -107,8 +107,8 @@ The Python monitor uses only the standard library; it requires Linux and
 
 To check the RPC path manually, run the launcher below with
 `--trace mooncake-store/benchmarks/master_rpc_trace_example.jsonl`. After cleanup,
-`result.json` should report `success: true` and zero remaining allocated bytes,
-capacity and keys. `replay.json` should show one Exist miss and two successful
+`result.json` should report `success: true`.
+`replay.json` should show one Exist miss and two successful
 Get keys, plus two successful Ping calls. This small example does not validate
 eviction.
 
@@ -133,12 +133,14 @@ Choose CPU sets using `lscpu -e=CPU,CORE,SOCKET,NODE`; keep physical cores and
 SMT siblings together. The launcher rejects overlapping logical CPU sets but
 cannot eliminate shared memory, NUMA or host contention. Output directories
 must be new. The launcher clears `MOONCAKE_CONFIG_PATH`, sets client I/O threads
-to 2, enables master metrics and uses zero default KV lease TTL for controlled
-remove tests. These choices are recorded in the manifest.
+to 2 and enables master metrics. The master retains its default KV read lease
+TTL.
 
 For manual master management, invoke the C++ binary with `--trace`,
 `--master_server`, `--workers`, `--output` and `--samples`.
-`--validate_only` validates the entire file without contacting the master.
+The replayer loads the trace once before issuing RPCs and checks that its header
+uses a supported format. There is no separate validation pass; the producer is
+responsible for satisfying the trace contract below.
 
 ### Trace contract: version 2
 
@@ -193,8 +195,9 @@ The two fields are mutually exclusive. Remove respects leases (`force=false`).
 `depends_on` lists earlier event IDs. Dependencies wait for completion; they do
 not imply success. Producers must preserve write/read/remove ordering for shared
 keys, including reads that must precede a later mutation. Unrelated ready calls
-remain concurrent. Unknown fields, invalid lifecycles and forward references
-fail validation before any connection is opened.
+remain concurrent. Unknown fields are ignored. Event fields and lifecycle
+consistency are not prevalidated; JSON decoding or dependency lookup can still
+fail while loading a malformed trace.
 
 Record producer revision, model, physical key layout, batch sizes, object sizes,
 cache capacities, routing, topology, random seed, initial state and timing model
@@ -213,40 +216,37 @@ A fixed trace does not model serving feedback caused by a slow or failed master.
 
 The launcher saves:
 
-- `manifest.json`: commands, parameters, environment and input/binary SHA-256.
 - `replay.json`: per-operation and per-phase summaries, key outcomes,
   P50/P95/P99/max call latency and dispatch lag. Explicit Ping calls have their
   own operation entry, with zero keys.
 - `samples.jsonl`: planned/start/finish times, phase origins, issued calls,
   original key counts, outcomes and errors. Written after timed replay.
-- `process.jsonl`: monotonic time, CPU seconds, RSS and thread counts for both
-  processes; `metrics.jsonl` and before/after `.prom` snapshots contain master
-  Prometheus metrics. Sampling continues during setup and teardown.
-- `result.json`: workload-only CPU/RSS and traffic summaries, one-second offered,
-  sent and completed call counts, issued keys and peak calls in flight.
-  `offered_calls_per_second` uses the planned arrival span, while completed
-  throughput includes draining the backlog. For an all-at-once trace, the
-  offered average is null; per-second buckets still show the burst.
+- `process.jsonl`: monotonic time, CPU seconds, RSS and thread counts for the
+  master; `metrics.jsonl` and `metrics-before.prom` contain master Prometheus
+  metrics. Sampling continues during setup and teardown.
+- `result.json`: `master_process`, `store_sampled_peak`, `evictions` and `traffic`
+  summarize the full replay, including v2 setup, workload and teardown.
+  Traffic includes one-second offered, sent and completed call counts, issued
+  keys and peak calls in flight. All buckets use the replay's common time origin,
+  including phase-barrier waits. `offered_calls_per_second` uses the scheduled
+  arrival span, while completed throughput includes draining the backlog.
+  For an all-at-once trace, the offered average is null; per-second buckets still
+  show the burst. `phases` retains separate operation and latency summaries for
+  setup, workload and teardown, including MountSegment and UnmountSegment.
 - Child process logs.
 
 For capacity-pressure experiments, grow the recorded KV working set beyond the
 trace's fixed mounted capacity and let the real master select eviction victims.
-`--eviction-high-watermark-ratio` and `--eviction-ratio` override the master's
-corresponding settings; omitted values retain master defaults. Add
-`--require-eviction` to fail a run unless successful eviction and freed bytes
-are observed during workload. `result.json` includes `workload_evictions` with
-sampled counter deltas and the intervals in which eviction occurred, including
-allocation failures. `pids.json` exposes the owned processes for an external
-profiler; use a separate profiling run when measuring profiler overhead matters.
+The launcher uses the master's default eviction and incomplete-write timeout
+settings. `result.json` includes `evictions` with sampled counter deltas
+and the intervals in which eviction occurred, including allocation failures.
+Eviction observations are reported separately from replay success; use them to
+evaluate the experiment's capacity-pressure requirements.
+Use a separate profiling run when measuring profiler overhead matters.
 
 Queueing can stretch the actual interval between PutStart and PutEnd beyond the
-master's incomplete-write timeouts. Keep the default settings for an overload
-test that includes these failures. To isolate capacity eviction from incomplete
-write cleanup, explicitly set `--put-start-discard-timeout-sec` and
-`--put-start-release-timeout-sec` above the expected replay write intervals
-(release must exceed discard). These optional overrides are recorded in the
-manifest. Report discard/release counters and PutEnd errors separately from
-capacity eviction, and identify timeout overrides in comparisons.
+master's incomplete-write timeouts. Report discard/release counters and PutEnd
+errors separately from capacity eviction.
 
 Changing capacity while keeping a trace's requests fixed measures master
 behavior under those offered intents. Eviction can make recorded reads miss,
@@ -262,7 +262,7 @@ scraping adds overhead; hold its interval fixed between comparisons.
 
 `master_total_capacity_bytes` and `master_allocated_bytes` describe logical Store
 capacity and allocation, which differ from the master's actual process RSS.
-Use the metrics to check capacity during workload and cleanup afterward.
+Use the metrics to check capacity throughout the replay.
 Throughput includes phase-leading idle time and final drain. Client-call latency
 includes API/RPC work; it is not server-only processing time. Calls count
 MasterClient API invocations; retries can create extra wire traffic. Compare
@@ -277,7 +277,7 @@ remain valid inputs and send no Ping calls. Under overload, delayed or exhausted
 heartbeats can let clients expire; the replay preserves that behavior instead
 of repairing it. A failed Ping RPC or a non-OK client status is a failed event
 and makes the run unsuccessful. Ping latency, lag and failures are reported like
-other operations, and workload traffic totals include these calls. Use
+other operations, and traffic totals include these calls. Use
 per-operation results when comparing business RPC throughput with older runs
 that generated heartbeats outside the trace.
 
@@ -292,5 +292,4 @@ The handwritten `master_rpc_trace_example.jsonl` and v1 contract remain accepted
 V1 has a single workload phase and implicitly registers one fake segment per
 client before timing
 (default 64 MiB, `--segment_size`). Cleanup occurs after timing. Use v2 for explicit
-and independently sized storage lifecycle. V1's optional `--prefill_trace` runs
-before workload and requires all keys to succeed; it cannot be combined with v2.
+and independently sized storage lifecycle.

@@ -33,8 +33,6 @@
 #include "master_client.h"
 
 DEFINE_string(trace, "", "Master RPC JSONL trace to replay");
-DEFINE_string(prefill_trace, "",
-              "Optional initialization trace, outside measurement");
 DEFINE_string(master_server, "127.0.0.1:50051",
               "Dedicated benchmark master address");
 DEFINE_string(tenant, "default", "Tenant used for all trace clients");
@@ -46,8 +44,6 @@ DEFINE_string(output, "master_trace_result.json",
               "Summary output, written after replay");
 DEFINE_string(samples, "master_trace_samples.jsonl",
               "Per-event timings, written after replay");
-DEFINE_bool(validate_only, false,
-            "Validate traces and exit without contacting master");
 
 namespace {
 
@@ -101,32 +97,9 @@ void Require(bool condition, const std::string& message) {
     if (!condition) throw std::invalid_argument(message);
 }
 
-bool IsUInt64(const Json::Value& value) {
-    return (value.type() == Json::intValue ||
-            value.type() == Json::uintValue) &&
-           value.isUInt64();
-}
-
-std::string StringField(const Json::Value& value, const char* field) {
-    Require(value[field].isString() && !value[field].asString().empty(),
-            std::string(field) + " must be a nonempty string");
-    return value[field].asString();
-}
-
-void CheckFields(const Json::Value& value,
-                 const std::set<std::string>& allowed) {
-    Require(value.isObject(), "each row must be a JSON object");
-    for (const auto& name : value.getMemberNames()) {
-        Require(allowed.count(name), "unknown field: " + name);
-    }
-}
-
 Json::Value ParseLine(const std::string& line) {
     Json::CharReaderBuilder builder;
     builder["collectComments"] = false;
-    builder["allowComments"] = false;
-    builder["failIfExtra"] = true;
-    builder["rejectDupKeys"] = true;
     Json::Value value;
     std::string error;
     const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
@@ -184,17 +157,13 @@ Json::Value StatusCounts(const RpcOutcome& outcome) {
     return counts;
 }
 
-// Validation happens before connecting to a master or starting measurement.
-// Dependencies must reference earlier rows. Timestamps must be nondecreasing.
+// Decode the producer's trace and resolve event IDs before connecting.
+// The producer is responsible for satisfying the documented trace contract.
 RpcTrace ReadTrace(std::istream& input) {
     RpcTrace trace;
     std::unordered_map<std::string, size_t> ids;
-    std::set<size_t> finalized;
     std::unordered_map<std::string, size_t> registered;
     std::unordered_map<std::string, size_t> mounted;
-    std::set<std::string> unmounted;
-    const std::map<std::string, int> phases = {
-        {"setup", 0}, {"workload", 1}, {"teardown", 2}};
     std::string line;
     size_t line_number = 0;
     bool header_seen = false;
@@ -204,194 +173,67 @@ RpcTrace ReadTrace(std::istream& input) {
         try {
             const auto row = ParseLine(line);
             if (!header_seen) {
-                CheckFields(row, {"type", "version", "time_unit", "metadata"});
                 Require(
                     row["type"] == "master_rpc_trace" &&
-                        IsUInt64(row["version"]) &&
+                        row["version"].isUInt64() &&
                         (row["version"].asUInt64() == 1 ||
                          row["version"].asUInt64() == 2) &&
                         row["time_unit"] == "us",
                     "expected master_rpc_trace v1/v2 header with time_unit=us");
-                Require(!row.isMember("metadata") || row["metadata"].isObject(),
-                        "metadata must be an object");
                 trace.metadata = row["metadata"];
                 trace.version = row["version"].asUInt();
                 header_seen = true;
                 continue;
             }
-            CheckFields(row, {"id", "timestamp_us", "client_id", "op", "keys",
-                              "value_sizes", "value_slices", "replica_num",
-                              "depends_on", "put_start", "phase", "segment_id",
-                              "size_bytes", "segments"});
             TraceEvent event;
-            event.id = StringField(row, "id");
-            Require(!ids.count(event.id), "duplicate event id: " + event.id);
-            event.client_id = StringField(row, "client_id");
-            event.op = StringField(row, "op");
+            event.id = row["id"].asString();
+            event.client_id = row["client_id"].asString();
+            event.op = row["op"].asString();
             if (trace.version == 2) {
-                event.phase = StringField(row, "phase");
-                Require(phases.count(event.phase), "invalid phase");
-                Require(trace.events.empty() ||
-                            phases.at(event.phase) >=
-                                phases.at(trace.events.back().phase),
-                        "phases must be setup, workload, teardown in order");
-            } else {
-                Require(!row.isMember("phase"), "phase requires v2");
+                event.phase = row["phase"].asString();
             }
-            const std::set<std::string> operations = {
-                "BatchExistKey",  "BatchGetReplicaList",
-                "BatchPutStart",  "BatchPutEnd",
-                "BatchPutRevoke", "BatchRemove",
-                "ReMountSegment", "MountSegment",
-                "UnmountSegment", "Ping"};
-            Require(operations.count(event.op), "unsupported op: " + event.op);
-            const bool lifecycle = event.op == "ReMountSegment" ||
-                                   event.op == "MountSegment" ||
-                                   event.op == "UnmountSegment";
-            const bool keyless = lifecycle || event.op == "Ping";
-            Require(!lifecycle || trace.version == 2,
-                    "lifecycle operations require v2");
-            Require(IsUInt64(row["timestamp_us"]),
-                    "timestamp_us must be a nonnegative integer");
             event.timestamp_us = row["timestamp_us"].asUInt64();
-            Require(trace.events.empty() ||
-                        event.phase != trace.events.back().phase ||
-                        event.timestamp_us >= trace.events.back().timestamp_us,
-                    "timestamps must be nondecreasing within a phase");
-            Require(keyless ? !row.isMember("keys")
-                            : (row["keys"].isArray() && !row["keys"].empty()),
-                    "key operations require nonempty keys; lifecycle/Ping "
-                    "must omit keys");
             for (const auto& key : row["keys"]) {
-                Require(key.isString() && !key.asString().empty(),
-                        "keys must contain nonempty strings");
                 event.keys.push_back(key.asString());
             }
-            if (row.isMember("depends_on")) {
-                Require(row["depends_on"].isArray(),
-                        "depends_on must be an array");
-                for (const auto& dependency : row["depends_on"]) {
-                    Require(dependency.isString() &&
-                                ids.count(dependency.asString()),
-                            "dependencies must reference earlier event ids");
-                    event.dependencies.push_back(ids.at(dependency.asString()));
-                }
+            for (const auto& dependency : row["depends_on"]) {
+                event.dependencies.push_back(ids.at(dependency.asString()));
             }
             if (event.op == "ReMountSegment") {
-                Require(event.phase == "setup" &&
-                            !registered.count(event.client_id),
-                        "each client must register once during setup");
-                Require(
-                    row["segments"].isArray() && row["segments"].empty(),
-                    "ReMountSegment requires segments=[] (initial handshake)");
                 registered[event.client_id] = trace.events.size();
             } else if (trace.version == 2) {
-                Require(registered.count(event.client_id),
-                        "client must register before use");
                 event.dependencies.push_back(registered.at(event.client_id));
             }
             if (event.op == "MountSegment") {
-                Require(event.phase == "setup",
-                        "MountSegment is supported in setup only");
-                event.segment_id = StringField(row, "segment_id");
-                Require(!mounted.count(event.segment_id),
-                        "duplicate segment id");
-                Require(IsUInt64(row["size_bytes"]) &&
-                            row["size_bytes"].asUInt64() > 0,
-                        "size_bytes must be positive");
+                event.segment_id = row["segment_id"].asString();
                 event.size_bytes = row["size_bytes"].asUInt64();
                 mounted[event.segment_id] = trace.events.size();
             } else if (event.op == "UnmountSegment") {
-                Require(event.phase == "teardown",
-                        "UnmountSegment is supported in teardown only");
-                event.segment_id = StringField(row, "segment_id");
-                Require(mounted.count(event.segment_id) &&
-                            unmounted.insert(event.segment_id).second,
-                        "segment must be mounted and unmounted exactly once");
-                const auto mount = mounted.at(event.segment_id);
-                Require(trace.events[mount].client_id == event.client_id,
-                        "unmount must use segment owner");
-                event.dependencies.push_back(mount);
-            } else {
-                Require(!row.isMember("segment_id"),
-                        "segment_id is only valid for mount/unmount");
+                event.segment_id = row["segment_id"].asString();
+                event.dependencies.push_back(mounted.at(event.segment_id));
             }
-            Require(event.op == "MountSegment" || !row.isMember("size_bytes"),
-                    "size_bytes is only valid for mount");
-            Require(event.op == "ReMountSegment" || !row.isMember("segments"),
-                    "segments is only valid for remount");
-            Require(keyless || event.phase == "workload",
-                    "key operations must be in workload");
             if (event.op == "BatchPutStart") {
-                Require(
-                    row.isMember("value_sizes") != row.isMember("value_slices"),
-                    "provide exactly one of value_sizes or value_slices");
                 if (row.isMember("value_slices")) {
-                    Require(row["value_slices"].isArray() &&
-                                row["value_slices"].size() == event.keys.size(),
-                            "value_slices must match keys for BatchPutStart");
                     for (const auto& value : row["value_slices"]) {
-                        Require(value.isArray() && !value.empty(),
-                                "each value must have at least one slice");
                         std::vector<uint64_t> slices;
-                        uint64_t total = 0;
                         for (const auto& size : value) {
-                            Require(IsUInt64(size) && size.asUInt64() > 0,
-                                    "slice lengths must be positive integers");
-                            Require(size.asUInt64() <=
-                                        std::numeric_limits<uint64_t>::max() -
-                                            total,
-                                    "value slice total overflows uint64");
-                            total += size.asUInt64();
                             slices.push_back(size.asUInt64());
                         }
                         event.value_slices.push_back(std::move(slices));
                     }
                 } else {
-                    Require(row["value_sizes"].isArray() &&
-                                row["value_sizes"].size() == event.keys.size(),
-                            "value_sizes must match keys for BatchPutStart");
                     for (const auto& size : row["value_sizes"]) {
-                        Require(IsUInt64(size) && size.asUInt64() > 0,
-                                "value sizes must be positive integers");
                         event.value_sizes.push_back(size.asUInt64());
                     }
                 }
-                Require(
-                    std::set<std::string>(event.keys.begin(), event.keys.end())
-                            .size() == event.keys.size(),
-                    "duplicate write keys are not supported");
                 if (row.isMember("replica_num")) {
-                    Require(IsUInt64(row["replica_num"]) &&
-                                row["replica_num"].asUInt64() > 0,
-                            "replica_num must be a positive integer");
                     event.replica_num = row["replica_num"].asUInt64();
                 }
-            } else {
-                Require(!row.isMember("value_sizes") &&
-                            !row.isMember("value_slices") &&
-                            !row.isMember("replica_num"),
-                        "value_sizes/value_slices/replica_num are only valid "
-                        "for BatchPutStart");
             }
             if (event.op == "BatchPutEnd" || event.op == "BatchPutRevoke") {
-                const auto start_id = StringField(row, "put_start");
-                Require(ids.count(start_id),
-                        "put_start must reference an earlier id");
-                const auto start_index = ids.at(start_id);
-                const auto& start = trace.events[start_index];
-                Require(
-                    start.op == "BatchPutStart" &&
-                        start.client_id == event.client_id &&
-                        start.keys == event.keys,
-                    "put_start must match operation, client and ordered keys");
-                Require(finalized.insert(start_index).second,
-                        "a put_start may have only one End or Revoke");
+                const auto start_index = ids.at(row["put_start"].asString());
                 event.put_start = start_index;
                 event.dependencies.push_back(start_index);
-            } else {
-                Require(!row.isMember("put_start"),
-                        "put_start is only valid for End/Revoke");
             }
             std::sort(event.dependencies.begin(), event.dependencies.end());
             event.dependencies.erase(std::unique(event.dependencies.begin(),
@@ -405,15 +247,8 @@ RpcTrace ReadTrace(std::istream& input) {
                                         error.what());
         }
     }
-    Require(!input.bad(), "failed to read trace");
-    Require(header_seen && !trace.events.empty(), "trace must contain events");
-    Require(trace.version == 1 ||
-                (!mounted.empty() && mounted.size() == unmounted.size()),
-            "v2 must mount storage and unmount every segment");
-    for (size_t i = 0; i < trace.events.size(); ++i) {
-        Require(trace.events[i].op != "BatchPutStart" || finalized.count(i),
-                "BatchPutStart has no End/Revoke: " + trace.events[i].id);
-    }
+    Require(header_seen,
+            "expected master_rpc_trace v1/v2 header with time_unit=us");
     return trace;
 }
 
@@ -842,7 +677,7 @@ class MasterReplay {
         }
         std::vector<size_t> positions;
         for (size_t i = 0; i < event.keys.size(); ++i) {
-            if (!start || start->keys[i] == KeyStatus::OK)
+            if (!start || start->keys.at(i) == KeyStatus::OK)
                 positions.push_back(i);
         }
         if (positions.empty()) return result;
@@ -904,34 +739,8 @@ int main(int argc, char** argv) {
                 "trace and positive workers/segment_size are required");
         }
         const auto trace = LoadTrace(FLAGS_trace);
-        std::optional<RpcTrace> prefill;
-        if (!FLAGS_prefill_trace.empty())
-            prefill = LoadTrace(FLAGS_prefill_trace);
-        if (prefill && (trace.version != 1 || prefill->version != 1))
-            throw std::invalid_argument(
-                "prefill_trace is for v1 only; include initialization in v2 "
-                "workload");
-        if (FLAGS_validate_only) {
-            std::cout << "Validated " << trace.events.size()
-                      << " measured events\n";
-            return 0;
-        }
         MasterReplay runner;
         runner.Prepare(trace);
-        if (prefill) {
-            runner.Prepare(*prefill);
-            const auto samples = runner.Run(*prefill);
-            if (HasErrors(samples))
-                throw std::runtime_error("prefill contains failed calls");
-            for (const auto& sample : samples) {
-                for (auto status : sample.outcome.keys) {
-                    if (status != KeyStatus::OK) {
-                        throw std::runtime_error(
-                            "prefill did not fully succeed");
-                    }
-                }
-            }
-        }
         const auto samples = runner.Run(trace);
         auto result = SummarizeTrace(trace, samples);
         result["master_server"] = FLAGS_master_server;
@@ -940,7 +749,6 @@ int main(int argc, char** argv) {
         result["logical_clients"] = Json::UInt64(runner.client_count());
         if (trace.version == 1)
             result["segment_size_bytes"] = Json::UInt64(FLAGS_segment_size);
-        result["prefill_trace"] = FLAGS_prefill_trace;
         result["has_errors"] = HasErrors(samples);
         WriteSamples(FLAGS_samples, trace, samples);
         std::ofstream output(FLAGS_output);
