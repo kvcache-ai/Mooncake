@@ -20,8 +20,7 @@ target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
                                                       mooncake_store)
 
 # Offline, dependency-aware replay of master RPC operation traces.
-add_executable(master_rpc_trace_bench master_rpc_trace_bench.cpp
-                                      master_rpc_trace.cpp)
+add_executable(master_rpc_trace_bench master_rpc_trace_bench.cpp)
 target_link_libraries(
   master_rpc_trace_bench PRIVATE mooncake_store gflags::gflags JsonCpp::JsonCpp
                                  pthread)

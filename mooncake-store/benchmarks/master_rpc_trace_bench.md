@@ -5,6 +5,9 @@ master, and records latency, throughput and resource usage. Trace generation is
 external: neither a serving framework nor generated workload traces are needed
 in this repository. Stop the producer before running a measurement.
 
+The C++ replayer is contained in `master_rpc_trace_bench.cpp`;
+`run_master_rpc_trace.py` launches the processes and collects metrics.
+
 ## Build and verify
 
 ```bash
