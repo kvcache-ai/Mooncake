@@ -8,23 +8,19 @@ in this repository. Stop the producer before running a measurement.
 ## Build and verify
 
 ```bash
-cmake -S . -B build -DBUILD_BENCHMARK=ON -DBUILD_UNIT_TESTS=ON \
+cmake -S . -B build -DBUILD_BENCHMARK=ON -DBUILD_UNIT_TESTS=OFF \
   -DUSE_CUDA=OFF -DWITH_STORE_RUST=OFF
-cmake --build build --target master_rpc_trace_bench mooncake_master \
-  master_rpc_trace_test -j "$(nproc)"
-ctest --test-dir build -R '^master_rpc_trace_(test|monitor_test)$' --output-on-failure
-python3 mooncake-store/tests/test_master_rpc_trace_smoke.py \
-  --master build/mooncake-store/src/mooncake_master \
-  --replayer build/mooncake-store/benchmarks/master_rpc_trace_bench
+cmake --build build --target master_rpc_trace_bench mooncake_master -j "$(nproc)"
 ```
-
-The parser/scheduler and Python monitor tests use the existing Store test setup
-under `mooncake-store/tests/`; there is no separate test build. The C++ tests
-require C++20, JsonCpp and GoogleTest. Benchmark-only builds can set
-`BUILD_UNIT_TESTS=OFF`.
 
 The Python monitor uses only the standard library; it requires Linux and
 `taskset`. Lower build parallelism if compiler memory exceeds available RAM.
+
+To check the RPC path manually, run the launcher below with
+`--trace mooncake-store/benchmarks/master_rpc_trace_example.jsonl`. After cleanup,
+`result.json` should report `success: true` and zero remaining allocated bytes,
+capacity and keys. `replay.json` should show one Exist miss and two successful
+Get keys. This small example does not validate eviction.
 
 ## Run and monitor
 
