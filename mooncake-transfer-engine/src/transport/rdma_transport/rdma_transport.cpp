@@ -523,10 +523,6 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         // can retain "*" and select NICs on unrelated NUMA nodes.
         if (ci == 0 && name == kWildcardLocation) {
             const auto entries = getMemoryLocation(addr, length, true);
-            if (entries.empty()) {
-                unregisterChunkMRs(chunk_addr);
-                return -1;
-            }
             resolved_name = entries[0].location;
         }
 
