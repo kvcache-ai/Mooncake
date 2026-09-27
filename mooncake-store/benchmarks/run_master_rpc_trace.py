@@ -219,7 +219,6 @@ def main():
     parser.add_argument("--replay-cpus", required=True)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--rpc-threads", type=int, default=4)
-    parser.add_argument("--speed", type=float, default=1)
     parser.add_argument("--sample-interval", type=float, default=0.2)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--eviction-high-watermark-ratio", type=float)
@@ -241,10 +240,10 @@ def main():
         or args.rpc_threads < 1
         or any(
             not math.isfinite(value) or value <= 0
-            for value in (args.speed, args.sample_interval, args.timeout)
+            for value in (args.sample_interval, args.timeout)
         )
     ):
-        parser.error("counts, speed, intervals and timeout must be positive")
+        parser.error("counts, intervals and timeout must be positive")
     for value in (args.eviction_high_watermark_ratio, args.eviction_ratio):
         if value is not None and (not math.isfinite(value) or not 0 <= value <= 1):
             parser.error("eviction ratios must be between zero and one")
@@ -307,7 +306,6 @@ def main():
         f"--trace={trace}",
         f"--master_server=127.0.0.1:{rpc_port}",
         f"--workers={args.workers}",
-        f"--speed={args.speed}",
         f"--output={directory / 'replay.json'}",
         f"--samples={directory / 'samples.jsonl'}",
         "--logtostderr=1",

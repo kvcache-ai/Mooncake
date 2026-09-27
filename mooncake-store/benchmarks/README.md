@@ -126,7 +126,7 @@ python3 mooncake-store/benchmarks/run_master_rpc_trace.py \
   --replayer build/mooncake-store/benchmarks/master_rpc_trace_bench \
   --output-dir /outside/repo/results/run-001 \
   --master-cpus 0-3 --replay-cpus 4-7 \
-  --rpc-threads 4 --workers 16 --speed 1
+  --rpc-threads 4 --workers 16
 ```
 
 Choose CPU sets using `lscpu -e=CPU,CORE,SOCKET,NODE`; keep physical cores and
@@ -137,7 +137,7 @@ to 2, enables master metrics and uses zero default KV lease TTL for controlled
 remove tests. These choices are recorded in the manifest.
 
 For manual master management, invoke the C++ binary with `--trace`,
-`--master_server`, `--workers`, `--speed`, `--output` and `--samples`.
+`--master_server`, `--workers`, `--output` and `--samples`.
 `--validate_only` validates the entire file without contacting the master.
 
 ### Trace contract: version 2
@@ -173,7 +173,7 @@ The teardown barrier drains all workload calls before storage is removed.
 Mid-workload topology changes and nonempty remount recovery are unsupported.
 
 Ping is supported in every phase after client registration. Like other events,
-it uses the shared worker pool, timestamps, `--speed` and completion dependencies.
+it uses the shared worker pool, original timestamps and completion dependencies.
 For example, a v2 workload heartbeat can be recorded as:
 
 ```json
@@ -205,10 +205,10 @@ modeled. Do not silently discard these semantics in a producer.
 
 ### Arrival control and results
 
-`--speed=1` preserves intervals; larger values compress them and must be reported
-as stress-test transformations. `--workers` caps concurrent API calls, independent
-of logical client count. Overdue events stay queued; planned arrival times do
-not move to conceal overload. Dispatch lag includes worker and dependency waits.
+Timestamps are replayed unchanged, relative to each phase's start. `--workers`
+caps concurrent API calls, independent of logical client count. Overdue events
+stay queued; planned arrival times do not move to conceal overload. Dispatch lag
+includes worker and dependency waits.
 A fixed trace does not model serving feedback caused by a slow or failed master.
 
 The launcher saves:
@@ -282,7 +282,7 @@ per-operation results when comparing business RPC throughput with older runs
 that generated heartbeats outside the trace.
 
 High replay lag with low master utilization indicates a load-generator limit.
-Sweep workers or arrival compression and check offered versus achieved rates
+Vary workers or the input workload and check offered versus achieved rates
 before attributing a throughput ceiling to master locks. This benchmark reports
 whole-master load; lock attribution additionally requires profiling.
 

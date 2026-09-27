@@ -40,8 +40,6 @@ DEFINE_string(master_server, "127.0.0.1:50051",
 DEFINE_string(tenant, "default", "Tenant used for all trace clients");
 DEFINE_uint32(workers, 8,
               "Maximum concurrent trace calls (not simulated clients)");
-DEFINE_double(speed, 1.0,
-              "Arrival-time speedup; 1 preserves logical intervals");
 DEFINE_uint64(segment_size, 64ULL * 1024 * 1024,
               "Fake segment capacity per logical client, in bytes");
 DEFINE_string(output, "master_trace_result.json",
@@ -428,11 +426,8 @@ RpcTrace LoadTrace(const std::string& path) {
 // A bounded worker pool dispatches due, dependency-ready events. Slow dependent
 // calls do not block unrelated events. Worker saturation is visible as lag.
 std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
-                                     double speed,
                                      const TraceExecutor& execute) {
     Require(workers > 0, "workers must be positive");
-    Require(std::isfinite(speed) && speed > 0,
-            "speed must be finite and positive");
     Require(!trace.events.empty(), "trace must contain events");
     using Clock = std::chrono::steady_clock;
     using Micros = std::chrono::microseconds;
@@ -451,11 +446,11 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
         std::chrono::duration_cast<Micros>(Clock::time_point::max() - origin)
             .count();
     for (size_t i = 0; i < trace.events.size(); ++i) {
-        const auto scaled =
-            static_cast<long double>(trace.events[i].timestamp_us) / speed;
-        Require(scaled <= max_delay,
-                "scaled timestamp exceeds steady-clock range");
-        samples[i].scheduled_us = static_cast<int64_t>(scaled);
+        Require(
+            trace.events[i].timestamp_us <= static_cast<uint64_t>(max_delay),
+            "timestamp exceeds steady-clock range");
+        samples[i].scheduled_us =
+            static_cast<int64_t>(trace.events[i].timestamp_us);
         pending[i] = trace.events[i].dependencies.size();
         for (auto dependency : trace.events[i].dependencies) {
             Require(dependency < i, "invalid dependency index");
@@ -761,7 +756,7 @@ class MasterReplay {
             prepared.push_back(std::move(call));
         }
         return ReplayTrace(
-            trace, FLAGS_workers, FLAGS_speed,
+            trace, FLAGS_workers,
             [&](const TraceEvent& event, const RpcOutcome* start) {
                 const auto index = &event - trace.events.data();
                 return Execute(event, prepared[index], start);
@@ -904,10 +899,9 @@ int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     try {
         if (FLAGS_trace.empty() || FLAGS_workers == 0 ||
-            FLAGS_segment_size == 0 || !std::isfinite(FLAGS_speed) ||
-            FLAGS_speed <= 0) {
+            FLAGS_segment_size == 0) {
             throw std::invalid_argument(
-                "trace and positive workers/segment_size/speed are required");
+                "trace and positive workers/segment_size are required");
         }
         const auto trace = LoadTrace(FLAGS_trace);
         std::optional<RpcTrace> prefill;
@@ -946,7 +940,6 @@ int main(int argc, char** argv) {
         result["logical_clients"] = Json::UInt64(runner.client_count());
         if (trace.version == 1)
             result["segment_size_bytes"] = Json::UInt64(FLAGS_segment_size);
-        result["speed"] = FLAGS_speed;
         result["prefill_trace"] = FLAGS_prefill_trace;
         result["has_errors"] = HasErrors(samples);
         WriteSamples(FLAGS_samples, trace, samples);
