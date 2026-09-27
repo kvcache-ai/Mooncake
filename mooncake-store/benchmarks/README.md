@@ -109,7 +109,8 @@ To check the RPC path manually, run the launcher below with
 `--trace mooncake-store/benchmarks/master_rpc_trace_example.jsonl`. After cleanup,
 `result.json` should report `success: true` and zero remaining allocated bytes,
 capacity and keys. `replay.json` should show one Exist miss and two successful
-Get keys. This small example does not validate eviction.
+Get keys, plus two successful Ping calls. This small example does not validate
+eviction.
 
 ### Run and monitor
 
@@ -159,6 +160,7 @@ own measured phase and does not consume the workload's arrival-time budget.
 | `ReMountSegment` | `segments: []`; one initial handshake per client in setup. |
 | `MountSegment` | `segment_id`, positive `size_bytes`; setup only. |
 | `UnmountSegment` | `segment_id`; teardown only, same owner as mount. |
+| `Ping` | No additional fields; omit `keys`. Uses the event's client identity. |
 | `BatchExistKey`, `BatchGetReplicaList`, `BatchRemove` | Nonempty ordered `keys`. |
 | `BatchPutStart` | `keys`, either `value_sizes` or `value_slices`, optional `replica_num` (default 1). |
 | `BatchPutEnd`, `BatchPutRevoke` | Same client and ordered keys as Start, plus `put_start` referencing its ID. |
@@ -169,6 +171,14 @@ silently enlarge storage. A segment ID is trace-local; the replayer maps it to a
 fresh real UUID. Every mounted segment requires exactly one explicit unmount.
 The teardown barrier drains all workload calls before storage is removed.
 Mid-workload topology changes and nonempty remount recovery are unsupported.
+
+Ping is supported in every phase after client registration. Like other events,
+it uses the shared worker pool, timestamps, `--speed` and completion dependencies.
+For example, a v2 workload heartbeat can be recorded as:
+
+```json
+{"id":"ping-0","phase":"workload","timestamp_us":1000000,"client_id":"worker-0","op":"Ping","depends_on":["register-0"]}
+```
 
 All key operations belong to workload. Each Start requires exactly one End or
 Revoke. `put_start` implies a completion dependency; unsuccessful Start keys are
@@ -204,8 +214,9 @@ A fixed trace does not model serving feedback caused by a slow or failed master.
 The launcher saves:
 
 - `manifest.json`: commands, parameters, environment and input/binary SHA-256.
-- `replay.json`: per-operation and per-phase summaries, key outcomes, heartbeat
-  counts, P50/P95/P99/max call latency and dispatch lag.
+- `replay.json`: per-operation and per-phase summaries, key outcomes,
+  P50/P95/P99/max call latency and dispatch lag. Explicit Ping calls have their
+  own operation entry, with zero keys.
 - `samples.jsonl`: planned/start/finish times, phase origins, issued calls,
   original key counts, outcomes and errors. Written after timed replay.
 - `process.jsonl`: monotonic time, CPU seconds, RSS and thread counts for both
@@ -258,13 +269,17 @@ MasterClient API invocations; retries can create extra wire traffic. Compare
 server metrics as well. Miss, not-ready and already-exists outcomes have separate
 counts and are not successful-hit counts.
 
-Heartbeat calls are separate maintenance traffic. Each client is pinged after
-registration; a failed heartbeat invalidates the run instead of silently
-remounting. `--heartbeat_workers` (default 16) partitions clients across a bounded
-set of workers independently of workload calls. `--heartbeat_interval_ms`
-(default 1000) is the pause between sweeps within each partition. Slow sweeps
-still lengthen the effective client heartbeat period; inspect heartbeats and
-master liveness metrics when increasing client count or pressure.
+All heartbeats must be explicit `Ping` events in the input, including for
+storage-only clients. The replayer never generates background heartbeats or
+extends a heartbeat schedule while draining overdue calls. Producers should
+record the heartbeat cadence and its time span in metadata. Traces without Ping
+remain valid inputs and send no Ping calls. Under overload, delayed or exhausted
+heartbeats can let clients expire; the replay preserves that behavior instead
+of repairing it. A failed Ping RPC or a non-OK client status is a failed event
+and makes the run unsuccessful. Ping latency, lag and failures are reported like
+other operations, and workload traffic totals include these calls. Use
+per-operation results when comparing business RPC throughput with older runs
+that generated heartbeats outside the trace.
 
 High replay lag with low master utilization indicates a load-generator limit.
 Sweep workers or arrival compression and check offered versus achieved rates

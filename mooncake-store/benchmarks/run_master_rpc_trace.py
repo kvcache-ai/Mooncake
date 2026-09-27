@@ -438,7 +438,6 @@ def main():
             result.update(
                 {
                     "success": replayer.returncode == 0
-                    and replay["healthy_heartbeats"]
                     and not replay["has_errors"]
                     and (not args.require_eviction or evictions["observed"]),
                     "workload_evictions": evictions,

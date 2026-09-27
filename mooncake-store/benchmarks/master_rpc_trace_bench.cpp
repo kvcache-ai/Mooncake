@@ -40,10 +40,6 @@ DEFINE_string(master_server, "127.0.0.1:50051",
 DEFINE_string(tenant, "default", "Tenant used for all trace clients");
 DEFINE_uint32(workers, 8,
               "Maximum concurrent trace calls (not simulated clients)");
-DEFINE_uint32(heartbeat_interval_ms, 1000,
-              "Pause between heartbeat sweeps in each worker partition");
-DEFINE_uint32(heartbeat_workers, 16,
-              "Concurrent heartbeat workers, separate from replay workers");
 DEFINE_double(speed, 1.0,
               "Arrival-time speedup; 1 preserves logical intervals");
 DEFINE_uint64(segment_size, 64ULL * 1024 * 1024,
@@ -245,13 +241,16 @@ RpcTrace ReadTrace(std::istream& input) {
                 Require(!row.isMember("phase"), "phase requires v2");
             }
             const std::set<std::string> operations = {
-                "BatchExistKey",  "BatchGetReplicaList", "BatchPutStart",
-                "BatchPutEnd",    "BatchPutRevoke",      "BatchRemove",
-                "ReMountSegment", "MountSegment",        "UnmountSegment"};
+                "BatchExistKey",  "BatchGetReplicaList",
+                "BatchPutStart",  "BatchPutEnd",
+                "BatchPutRevoke", "BatchRemove",
+                "ReMountSegment", "MountSegment",
+                "UnmountSegment", "Ping"};
             Require(operations.count(event.op), "unsupported op: " + event.op);
             const bool lifecycle = event.op == "ReMountSegment" ||
                                    event.op == "MountSegment" ||
                                    event.op == "UnmountSegment";
+            const bool keyless = lifecycle || event.op == "Ping";
             Require(!lifecycle || trace.version == 2,
                     "lifecycle operations require v2");
             Require(IsUInt64(row["timestamp_us"]),
@@ -261,9 +260,10 @@ RpcTrace ReadTrace(std::istream& input) {
                         event.phase != trace.events.back().phase ||
                         event.timestamp_us >= trace.events.back().timestamp_us,
                     "timestamps must be nondecreasing within a phase");
-            Require(lifecycle ? !row.isMember("keys")
-                              : (row["keys"].isArray() && !row["keys"].empty()),
-                    "keys must be a nonempty array");
+            Require(keyless ? !row.isMember("keys")
+                            : (row["keys"].isArray() && !row["keys"].empty()),
+                    "key operations require nonempty keys; lifecycle/Ping "
+                    "must omit keys");
             for (const auto& key : row["keys"]) {
                 Require(key.isString() && !key.asString().empty(),
                         "keys must contain nonempty strings");
@@ -322,7 +322,7 @@ RpcTrace ReadTrace(std::istream& input) {
                     "size_bytes is only valid for mount");
             Require(event.op == "ReMountSegment" || !row.isMember("segments"),
                     "segments is only valid for remount");
-            Require(lifecycle || event.phase == "workload",
+            Require(keyless || event.phase == "workload",
                     "key operations must be in workload");
             if (event.op == "BatchPutStart") {
                 Require(
@@ -735,30 +735,10 @@ struct PreparedCall {
 
 class MasterReplay {
    public:
-    MasterReplay() {
-        try {
-            for (size_t i = 0; i < FLAGS_heartbeat_workers; ++i)
-                heartbeats_.emplace_back([this, i] { Heartbeats(i); });
-        } catch (...) {
-            stopping_.store(true);
-            wake_.notify_all();
-            for (auto& thread : heartbeats_) thread.join();
-            throw;
-        }
-    }
-
-    ~MasterReplay() {
-        stopping_.store(true);
-        wake_.notify_all();
-        for (auto& thread : heartbeats_) thread.join();
-        // Sessions are destroyed only after all heartbeat calls have stopped.
-    }
-
     void Prepare(const RpcTrace& trace) {
         for (const auto& event : trace.events) {
             if (!sessions_.count(event.client_id)) {
                 auto session = std::make_unique<Session>(trace.version == 1);
-                std::lock_guard lock(mutex_);
                 sessions_.emplace(event.client_id, std::move(session));
             }
         }
@@ -784,16 +764,10 @@ class MasterReplay {
             trace, FLAGS_workers, FLAGS_speed,
             [&](const TraceEvent& event, const RpcOutcome* start) {
                 const auto index = &event - trace.events.data();
-                if (heartbeat_failed_.load()) {
-                    throw std::runtime_error(
-                        "client heartbeat failed; run is invalid");
-                }
                 return Execute(event, prepared[index], start);
             });
     }
 
-    bool healthy() const { return !heartbeat_failed_.load(); }
-    uint64_t heartbeat_calls() const { return heartbeat_calls_.load(); }
     size_t client_count() const { return sessions_.size(); }
 
    private:
@@ -861,6 +835,16 @@ class MasterReplay {
         }
         if (!session.registered.load())
             throw std::runtime_error("client registration failed");
+        if (event.op == "Ping") {
+            result.rpc_sent = true;
+            const auto response = client.Ping();
+            if (!response) {
+                result.error = toString(response.error());
+            } else if (response->client_status != mooncake::ClientStatus::OK) {
+                result.error = "Ping returned a non-OK client status";
+            }
+            return result;
+        }
         std::vector<size_t> positions;
         for (size_t i = 0; i < event.keys.size(); ++i) {
             if (!start || start->keys[i] == KeyStatus::OK)
@@ -900,53 +884,7 @@ class MasterReplay {
         return result;
     }
 
-    void Heartbeats(size_t partition) {
-        std::unique_lock lock(mutex_);
-        while (!stopping_.load()) {
-            std::vector<std::pair<std::string, Session*>> clients;
-            size_t index = 0;
-            for (const auto& [id, session] : sessions_) {
-                if (index++ % FLAGS_heartbeat_workers == partition &&
-                    session->registered.load())
-                    clients.emplace_back(id, session.get());
-            }
-            // Sessions remain alive until all heartbeat workers have joined.
-            // Do not hold the session-map lock while waiting for network I/O.
-            lock.unlock();
-            for (const auto& [id, session] : clients) {
-                if (stopping_.load()) break;
-                ++heartbeat_calls_;
-                try {
-                    const auto result = session->client.Ping();
-                    if (!result) {
-                        heartbeat_failed_.store(true);
-                        LOG(ERROR) << "Trace client heartbeat failed: " << id
-                                   << ": " << toString(result.error());
-                    } else if (result->client_status !=
-                               mooncake::ClientStatus::OK) {
-                        heartbeat_failed_.store(true);
-                        LOG(ERROR) << "Trace client heartbeat failed: " << id
-                                   << ": " << result->client_status;
-                    }
-                } catch (const std::exception& error) {
-                    heartbeat_failed_.store(true);
-                    LOG(ERROR) << "Trace client heartbeat failed: " << id
-                               << ": " << error.what();
-                }
-            }
-            lock.lock();
-            wake_.wait_for(
-                lock, std::chrono::milliseconds(FLAGS_heartbeat_interval_ms),
-                [&] { return stopping_.load(); });
-        }
-    }
-
     std::map<std::string, std::unique_ptr<Session>> sessions_;
-    std::atomic<bool> stopping_{false}, heartbeat_failed_{false};
-    std::atomic<uint64_t> heartbeat_calls_{0};
-    std::mutex mutex_;
-    std::condition_variable wake_;
-    std::vector<std::thread> heartbeats_;
 };
 
 bool HasErrors(const std::vector<TraceSample>& samples) {
@@ -966,14 +904,10 @@ int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     try {
         if (FLAGS_trace.empty() || FLAGS_workers == 0 ||
-            FLAGS_heartbeat_interval_ms == 0 || FLAGS_heartbeat_workers == 0 ||
             FLAGS_segment_size == 0 || !std::isfinite(FLAGS_speed) ||
             FLAGS_speed <= 0) {
             throw std::invalid_argument(
-                "trace, positive "
-                "workers/heartbeat_interval_ms/heartbeat_workers/segment_size/"
-                "speed are "
-                "required");
+                "trace and positive workers/segment_size/speed are required");
         }
         const auto trace = LoadTrace(FLAGS_trace);
         std::optional<RpcTrace> prefill;
@@ -993,6 +927,8 @@ int main(int argc, char** argv) {
         if (prefill) {
             runner.Prepare(*prefill);
             const auto samples = runner.Run(*prefill);
+            if (HasErrors(samples))
+                throw std::runtime_error("prefill contains failed calls");
             for (const auto& sample : samples) {
                 for (auto status : sample.outcome.keys) {
                     if (status != KeyStatus::OK) {
@@ -1002,23 +938,16 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        const auto heartbeats_before = runner.heartbeat_calls();
         const auto samples = runner.Run(trace);
-        const auto heartbeats_after = runner.heartbeat_calls();
         auto result = SummarizeTrace(trace, samples);
         result["master_server"] = FLAGS_master_server;
         result["tenant"] = FLAGS_tenant;
         result["workers"] = FLAGS_workers;
-        result["heartbeat_interval_ms"] = FLAGS_heartbeat_interval_ms;
-        result["heartbeat_workers"] = FLAGS_heartbeat_workers;
         result["logical_clients"] = Json::UInt64(runner.client_count());
         if (trace.version == 1)
             result["segment_size_bytes"] = Json::UInt64(FLAGS_segment_size);
         result["speed"] = FLAGS_speed;
         result["prefill_trace"] = FLAGS_prefill_trace;
-        result["heartbeat_calls_during_replay"] =
-            Json::UInt64(heartbeats_after - heartbeats_before);
-        result["healthy_heartbeats"] = runner.healthy();
         result["has_errors"] = HasErrors(samples);
         WriteSamples(FLAGS_samples, trace, samples);
         std::ofstream output(FLAGS_output);
@@ -1027,7 +956,7 @@ int main(int argc, char** argv) {
         if (!output)
             throw std::runtime_error("cannot write summary: " + FLAGS_output);
         std::cout << result << '\n';
-        return runner.healthy() && !HasErrors(samples) ? 0 : 1;
+        return HasErrors(samples) ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << "master_rpc_trace_bench: " << error.what() << '\n';
         return 1;
