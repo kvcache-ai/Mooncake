@@ -377,18 +377,29 @@ and does not use an IB/RoCE NIC. Peers exchange a DTK VMM fabric handle
 (`hipMemAllocationHandleType` `0x8`, 512 bytes). The same handle works on one
 machine and across machines. An imported fabric address can be granted access
 only once, and only to one device, so each local GPU imports and maps the
-handle, then grants access on its own device.
+handle, then grants access on its own device. The TENT transport uses the same
+HSL fabric path by default, and remains selectable across machines. Set
+`MC_HYLINK_USE_VMM=0` on both sides of a TENT run to use HIP IPC in
+environments that do not support VMM. IPC cannot cross machines.
 
 **Status:** Select it with `transfer_engine_bench --protocol=hylink`.
+TENT selects it with `transports.hylink.enable=true` or
+`transfer_engine_bench --backend=tent --protocol=hylink`. It is off unless
+that switch is set, so a DTK build keeps using RDMA/TCP by default.
 
 **Use When:**
 - DCU copies on one machine or across machines should use HSL instead of a
   NIC path. The exporter must register VMM memory (`hipMemCreate`)
+- TENT only: set `MC_HYLINK_USE_VMM=0` in environments that do not support
+  VMM. That path uses same-machine `hipMalloc` buffers and a HIP IPC
+  handle, and cannot cross machines
 
 **Requirements:**
 - Built with `-DUSE_HYLINK=ON` (implies `USE_HIP`)
+- TENT builds also pass `-DUSE_TENT=ON`
 - Hygon DTK runtime
 - Both sides must support DTK VMM fabric
+- TENT IPC does not require VMM and stays on one machine
 
 ### TPU Transport (tpu) — Experimental
 

@@ -56,7 +56,11 @@
 #endif
 
 #if defined(USE_HYLINK)
+#if defined(USE_TENT)
+#include "tent/transport/hylink/hylink_transport.h"
+#else
 #include "transport/hylink_transport/hylink_transport.h"
+#endif
 #endif
 
 #if defined(USE_UBSHMEM)
@@ -173,8 +177,13 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
 #endif
         } else if (FLAGS_protocol == "hylink") {
 #if defined(USE_HYLINK)
+#if defined(USE_TENT)
+            d_buf = mooncake::tent::HylinkTransport::allocateFabricMemory(size);
+            LOG(INFO) << "Using TENT hylink fabric memory allocation";
+#else
             d_buf = mooncake::HylinkTransport::allocateFabricMemory(size);
             LOG(INFO) << "Using hylink fabric memory allocation";
+#endif
 #else
             LOG(ERROR) << "--protocol=hylink requires USE_HYLINK=ON";
             return nullptr;
@@ -235,7 +244,11 @@ static void freeMemoryPool(void* addr, size_t size) {
     } else if (FLAGS_protocol == "hylink") {
 #if defined(USE_HYLINK)
         if (FLAGS_use_vram) {
+#if defined(USE_TENT)
+            mooncake::tent::HylinkTransport::freeFabricMemory(addr);
+#else
             mooncake::HylinkTransport::freeFabricMemory(addr);
+#endif
             return;
         }
 #endif
@@ -695,6 +708,29 @@ std::shared_ptr<mooncake::tent::Config> createTentConfig() {
     config->set("metadata_servers", metadata_servers);
     config->set("local_segment_name", FLAGS_local_server_name);
     config->set("verbose", true);
+
+    // --protocol=hylink forces the TENT hylink transport and turns off the
+    // network fallbacks so a successful run cannot have gone through RDMA/TCP.
+#if defined(USE_HYLINK)
+    if (FLAGS_protocol == "hylink") {
+        config->set("transports/hylink/enable", true);
+        config->set("transports/rdma/enable", false);
+        config->set("transports/tcp/enable", false);
+        config->set("transports/hp_tcp/enable", false);
+        config->set("transports/shm/enable", false);
+        mooncake::tent::json policy = mooncake::tent::json::array(
+            {mooncake::tent::json{{"name", "hylink_memory"},
+                                  {"segment_type", "memory"},
+                                  {"transports", {"hylink"}}}});
+        config->set("policy", policy);
+        LOG(INFO) << "TENT hylink mode: RDMA/TCP/SHM disabled, policy=hylink";
+    }
+#else
+    if (FLAGS_protocol == "hylink") {
+        LOG(ERROR) << "--protocol=hylink requires -DUSE_HYLINK=ON";
+        exit(EXIT_FAILURE);
+    }
+#endif
 
     return config;
 }
