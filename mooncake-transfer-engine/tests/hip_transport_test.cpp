@@ -161,6 +161,11 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
 // allocation.
 
 DEFINE_bool(hip_ipc_dst, false, "Internal: run as the IPC destination.");
+DEFINE_int32(hip_ipc_dst_device, 0,
+             "Device ordinal, among the ones the IPC destination sees, that it "
+             "allocates its buffers on.");
+DEFINE_string(hip_ipc_dst_visible_devices, "",
+              "If set, HIP_VISIBLE_DEVICES for the IPC destination process.");
 
 namespace {
 constexpr size_t kAllocLen = 4 * 1024 * 1024;
@@ -218,7 +223,8 @@ int runIpcDestination() {
         return dstFailed(kDstSetupFailed, "installTransport");
 
     char* alloc = nullptr;
-    if (cudaSetDevice(0) != cudaSuccess ||
+    const int device = FLAGS_hip_ipc_dst_device;
+    if (cudaSetDevice(device) != cudaSuccess ||
         cudaMalloc(reinterpret_cast<void**>(&alloc), kAllocLen) !=
             cudaSuccess ||
         cudaMemset(alloc, 0, kAllocLen) != cudaSuccess ||
@@ -229,7 +235,8 @@ int runIpcDestination() {
     std::string report = kDstMarker + engine->getLocalIpAndPort();
     for (size_t off : kSliceOffsets) {
         if (engine->registerLocalMemory(alloc + off, kSliceLen,
-                                        GPU_PREFIX + "0") != 0)
+                                        GPU_PREFIX + std::to_string(device)) !=
+            0)
             return dstFailed(kDstRegisterFailed, "registerLocalMemory");
         report +=
             " " + std::to_string(reinterpret_cast<uintptr_t>(alloc + off));
@@ -263,6 +270,25 @@ int runIpcDestination() {
     return rc;
 }
 
+// A copy of this process's environment with `name` set to `value` (or
+// removed, for nullptr).
+std::vector<std::string> environWith(const std::string& name,
+                                     const char* value) {
+    std::vector<std::string> env;
+    for (char** e = environ; *e != nullptr; ++e) {
+        if (std::string(*e).rfind(name + "=", 0) != 0) env.emplace_back(*e);
+    }
+    if (value != nullptr) env.push_back(name + "=" + value);
+    return env;
+}
+
+std::vector<char*> cStrings(std::vector<std::string>& strings) {
+    std::vector<char*> out;
+    for (auto& s : strings) out.push_back(s.data());
+    out.push_back(nullptr);
+    return out;
+}
+
 // Owns the destination process and reaps it when destroyed.
 class DestinationProcess {
    public:
@@ -275,8 +301,16 @@ class DestinationProcess {
             return false;
         }
         char exe[] = "/proc/self/exe";
-        char flag[] = "--hip_ipc_dst";
-        char* argv[] = {exe, flag, nullptr};
+        std::vector<std::string> args = {
+            exe, "--hip_ipc_dst",
+            "--hip_ipc_dst_device=" + std::to_string(FLAGS_hip_ipc_dst_device)};
+        auto argv = cStrings(args);
+        std::vector<std::string> env_strings =
+            environWith("HIP_VISIBLE_DEVICES",
+                        FLAGS_hip_ipc_dst_visible_devices.empty()
+                            ? getenv("HIP_VISIBLE_DEVICES")
+                            : FLAGS_hip_ipc_dst_visible_devices.c_str());
+        auto envp = cStrings(env_strings);
         posix_spawn_file_actions_t actions;
         int rc = posix_spawn_file_actions_init(&actions);
         if (rc == 0) {
@@ -293,7 +327,8 @@ class DestinationProcess {
                     rc = posix_spawn_file_actions_addclose(&actions, fd);
             }
             if (rc == 0)
-                rc = posix_spawn(&pid_, exe, &actions, nullptr, argv, environ);
+                rc = posix_spawn(&pid_, exe, &actions, nullptr, argv.data(),
+                                 envp.data());
             posix_spawn_file_actions_destroy(&actions);
         }
         close(to_child[0]);
@@ -533,6 +568,71 @@ TEST(HipTransportTest, IpcTransfersHitBuffersInsideLargerAllocation) {
     (void)cudaFree(local);
     const int dst_rc = dst.finish();
     EXPECT_EQ(dst_rc, kDstOk) << describeDstExit(dst_rc);
+}
+
+// The devices this process sees, as HIP_VISIBLE_DEVICES entries a child
+// process started with the same ROCR_VISIBLE_DEVICES can use.
+static std::vector<std::string> visibleDeviceIds(int device_count) {
+    const char* hip = getenv("HIP_VISIBLE_DEVICES");
+    const char* cuda = getenv("CUDA_VISIBLE_DEVICES");
+    const char* list = hip != nullptr ? hip : cuda;
+    std::vector<std::string> ids;
+    if (list != nullptr) {
+        std::stringstream in(list);
+        std::string id;
+        while (std::getline(in, id, ',')) ids.push_back(id);
+    } else {
+        for (int d = 0; d < device_count; ++d) ids.push_back(std::to_string(d));
+    }
+    return ids;
+}
+
+// Same-node peers need not see the same devices: in SGLang PD each role sees
+// only its own GPUs, so a TP4 decode's rank 3 exports from device ordinal 3
+// while a TP2 prefill process sees two devices. hipIpcOpenMemHandle checks
+// the handle's owner ordinal against the importer's device count and fails
+// with hipErrorInvalidValue. This reruns the test above with the destination
+// seeing two devices and allocating on the second, and the source seeing
+// only the first.
+TEST(HipTransportTest, IpcOpensHandlesFromDeviceOrdinalsTheImporterLacks) {
+    int device_count = 0;
+    const auto count_err = cudaGetDeviceCount(&device_count);
+    if (count_err != cudaSuccess || device_count < 2)
+        GTEST_SKIP() << "Needs >= 2 GPUs.";
+    if (!FLAGS_hip_ipc_dst_visible_devices.empty())
+        GTEST_SKIP() << "Already running as the restricted rerun.";
+    const auto ids = visibleDeviceIds(device_count);
+    ASSERT_GE(ids.size(), 2u);
+
+    std::vector<std::string> args = {
+        "/proc/self/exe", "--hip_ipc_dst_device=1",
+        "--hip_ipc_dst_visible_devices=" + ids[0] + "," + ids[1]};
+    auto argv = cStrings(args);
+    std::vector<std::string> env_strings =
+        environWith("HIP_VISIBLE_DEVICES", ids[0].c_str());
+    // HIP also honors CUDA_VISIBLE_DEVICES; only HIP_VISIBLE_DEVICES may
+    // restrict the rerun. gflags rejects --gtest_* flags, so the filter goes
+    // through the environment.
+    for (auto it = env_strings.begin(); it != env_strings.end();) {
+        const bool drop = it->rfind("CUDA_VISIBLE_DEVICES=", 0) == 0 ||
+                          it->rfind("GTEST_FILTER=", 0) == 0;
+        it = drop ? env_strings.erase(it) : it + 1;
+    }
+    env_strings.push_back(
+        "GTEST_FILTER=HipTransportTest."
+        "IpcTransfersHitBuffersInsideLargerAllocation");
+    auto envp = cStrings(env_strings);
+    pid_t pid = -1;
+    ASSERT_EQ(
+        posix_spawn(&pid, argv[0], nullptr, nullptr, argv.data(), envp.data()),
+        0);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    ASSERT_TRUE(WIFEXITED(status)) << "the rerun was killed";
+    EXPECT_EQ(WEXITSTATUS(status), 0)
+        << "transfers to a destination on device ordinal 1 failed from a "
+           "process that sees one device (its output is above)";
 }
 
 int main(int argc, char** argv) {

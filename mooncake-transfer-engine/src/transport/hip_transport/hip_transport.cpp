@@ -184,10 +184,67 @@ static uint64_t ipcPayloadOffset(const std::vector<unsigned char>& buffer) {
     return offset;
 }
 
+// hipIpcGetMemHandle stamps the handle with the exporter's device as an
+// ordinal among the devices the exporter sees (HIP_VISIBLE_DEVICES), and
+// hipIpcOpenMemHandle reads that ordinal against the importer's own device
+// list: one at or past the importer's device count fails with
+// hipErrorInvalidValue, before the mapping is attempted. So peers that see
+// different numbers of devices, such as the ranks of a TP4 decode and a TP2
+// prefill on one node, cannot open each other's handles from the higher
+// ordinals. The field is not part of the mapping: the runtime only uses it
+// to enable peer access to "the owner" (which, across different visible
+// sets, is an unrelated local device anyway, and the constructor already
+// enabled every local pair) and the mapping comes from the ROCr handle. An
+// out-of-range ordinal is therefore replaced with the importer's current
+// device; an in-range one is left alone, so every open that already worked
+// is unchanged.
+//
+// The layout is ROCclr's amd::MemObjMap::IpcMemHandle (LP64), which fills
+// hipIpcMemHandle_t exactly. Runtimes that predate the field keep reserved
+// (zero) bytes there, which are never out of range.
+struct HipIpcMemHandleLayout {
+    char ipc_handle[32];
+    size_t psize;
+    size_t poffset;
+    int owners_process_id;
+    int owners_device_id;
+    char reserved[8];
+};
+static_assert(sizeof(HipIpcMemHandleLayout) == sizeof(hipIpcMemHandle_t),
+              "hipIpcMemHandle_t no longer matches ROCclr's IpcMemHandle");
+
+// Returns true if it changed the handle.
+static bool clampIpcHandleOwnerDevice(hipIpcMemHandle_t* handle,
+                                      int device_count, int current_device) {
+    HipIpcMemHandleLayout layout;
+    memcpy(&layout, handle, sizeof(layout));
+    if (layout.owners_device_id >= 0 &&
+        layout.owners_device_id < device_count) {
+        return false;
+    }
+    layout.owners_device_id = current_device;
+    memcpy(handle, &layout, sizeof(layout));
+    return true;
+}
+
 static int openIPCHandle(const std::vector<unsigned char>& buffer,
                          void** shm_addr) {
     hipIpcMemHandle_t handle;
     memcpy(&handle, buffer.data(), sizeof(handle));
+    int device_count = 0, current_device = 0;
+    if (!checkHip(hipGetDeviceCount(&device_count),
+                  "HipTransport: hipGetDeviceCount failed") ||
+        !checkHip(hipGetDevice(&current_device),
+                  "HipTransport: hipGetDevice failed")) {
+        return -1;
+    }
+    if (clampIpcHandleOwnerDevice(&handle, device_count, current_device) &&
+        globalConfig().trace) {
+        LOG(INFO) << "HipTransport: IPC handle's owner device is outside "
+                     "this process's "
+                  << device_count << " devices; opening it on device "
+                  << current_device;
+    }
     if (!checkHip(hipIpcOpenMemHandle(shm_addr, handle,
                                       hipIpcMemLazyEnablePeerAccess),
                   "HipTransport: hipIpcOpenMemHandle failed")) {
