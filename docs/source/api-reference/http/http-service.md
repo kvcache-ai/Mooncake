@@ -484,6 +484,42 @@ curl "http://localhost:9003/api/v1/segments/status?segment=segment_name"
 - `status` (integer): Numeric segment status
 - `status_name` (string): Segment status name. One of `UNDEFINED` (0), `OK` (1), `DRAINING` (2), `DRAINED` (3), `GRACEFULLY_UNMOUNTING` (4), `UNMOUNTING` (5)
 
+#### `PUT /api/v1/segments/status`
+Switch a segment between `OK` and `DRAINING` without creating a drain job.
+While a segment is `DRAINING`, new allocations skip it, and replicas already on
+it stay in place and remain readable. Setting `OK` makes it available for new
+allocations again.
+
+**Method**: `PUT`
+**Parameters**: `segment` (query parameter) - Segment name
+**Request Body**: JSON object with `status` set to `"OK"` or `"DRAINING"`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with `success`, `segment`, `status`, and
+`status_name`
+
+**Status Codes**:
+- `200 OK`: The segment is now in the requested status, including when it
+  already was
+- `400 Bad Request`: Missing `segment`, malformed body, or a `status` other
+  than `OK` or `DRAINING`
+- `404 Not Found`: No mounted segment has this name
+- `409 Conflict`: An unfinished drain job lists this segment as a source, or
+  the segment is in a status other than `OK` or `DRAINING`
+
+**Example**:
+```bash
+curl -X PUT "http://localhost:9003/api/v1/segments/status?segment=segment_0" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "DRAINING"}'
+```
+
+```json
+{"success":true,"segment":"segment_0","status":2,"status_name":"DRAINING","error_code":0,"error_message":""}
+```
+
+The change is not written to the HA operation log, so it is not guaranteed to
+survive a master failover.
+
 ### DFS Storage Endpoints
 
 These endpoints manage the shard layout of the descriptor-based DFS (shared
