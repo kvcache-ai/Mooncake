@@ -128,7 +128,11 @@ class RpcSmokeTest(unittest.TestCase):
         return result, rows
 
     def test_example_cross_client_reuse(self):
-        example = Path(__file__).resolve().parents[1] / "example.jsonl"
+        example = (
+            Path(__file__).resolve().parents[1]
+            / "benchmarks"
+            / "master_rpc_trace_example.jsonl"
+        )
         events = [json.loads(line) for line in example.read_text().splitlines()]
         events[-1]["timestamp_us"] = 1_100_000  # Include a heartbeat sweep.
         trace = self.directory / "reuse.jsonl"

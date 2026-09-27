@@ -8,17 +8,21 @@ in this repository. Stop the producer before running a measurement.
 ## Build and verify
 
 ```bash
-cmake -S . -B build -DBUILD_BENCHMARK=ON -DUSE_CUDA=OFF -DWITH_STORE_RUST=OFF
-cmake --build build --target master_rpc_trace_bench mooncake_master -j "$(nproc)"
-cmake -S mooncake-store/benchmarks/master_rpc_trace/tests -B build-trace-tests
-cmake --build build-trace-tests -j "$(nproc)"
-ctest --test-dir build-trace-tests --output-on-failure
-python3 mooncake-store/benchmarks/master_rpc_trace/tests/test_rpc_smoke.py \
+cmake -S . -B build -DBUILD_BENCHMARK=ON -DBUILD_UNIT_TESTS=ON \
+  -DUSE_CUDA=OFF -DWITH_STORE_RUST=OFF
+cmake --build build --target master_rpc_trace_bench mooncake_master \
+  master_rpc_trace_test -j "$(nproc)"
+ctest --test-dir build -R '^master_rpc_trace_(test|monitor_test)$' --output-on-failure
+python3 mooncake-store/tests/test_master_rpc_trace_smoke.py \
   --master build/mooncake-store/src/mooncake_master \
   --replayer build/mooncake-store/benchmarks/master_rpc_trace_bench
 ```
 
-The standalone parser/scheduler tests require C++20, JsonCpp and GoogleTest.
+The parser/scheduler and Python monitor tests use the existing Store test setup
+under `mooncake-store/tests/`; there is no separate test build. The C++ tests
+require C++20, JsonCpp and GoogleTest. Benchmark-only builds can set
+`BUILD_UNIT_TESTS=OFF`.
+
 The Python monitor uses only the standard library; it requires Linux and
 `taskset`. Lower build parallelism if compiler memory exceeds available RAM.
 
@@ -30,7 +34,7 @@ The launcher starts a loopback-only master, waits for readiness, runs the
 replayer, and stops both child processes on completion or error:
 
 ```bash
-python3 mooncake-store/benchmarks/master_rpc_trace/run_benchmark.py \
+python3 mooncake-store/benchmarks/run_master_rpc_trace.py \
   --trace /outside/repo/master-rpc.jsonl \
   --master build/mooncake-store/src/mooncake_master \
   --replayer build/mooncake-store/benchmarks/master_rpc_trace_bench \
@@ -184,8 +188,9 @@ whole-master load; lock attribution additionally requires profiling.
 
 ## Legacy version 1
 
-The handwritten `example.jsonl` and v1 contract remain accepted. V1 has a single
-workload phase and implicitly registers one fake segment per client before timing
+The handwritten `master_rpc_trace_example.jsonl` and v1 contract remain accepted.
+V1 has a single workload phase and implicitly registers one fake segment per
+client before timing
 (default 64 MiB, `--segment_size`). Cleanup occurs after timing. Use v2 for explicit
 and independently sized storage lifecycle. V1's optional `--prefill_trace` runs
 before workload and requires all keys to succeed; it cannot be combined with v2.

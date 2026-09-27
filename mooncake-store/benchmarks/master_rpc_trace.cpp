@@ -1,6 +1,6 @@
 // Copyright 2026 Alibaba Cloud and its affiliates
 // Licensed under the Apache License, Version 2.0.
-#include "trace.h"
+#include "master_rpc_trace.h"
 
 #include <algorithm>
 #include <chrono>

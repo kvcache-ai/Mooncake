@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from run_benchmark import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
+from run_master_rpc_trace import (
     eviction_summary,
     process_summary,
     store_metrics,

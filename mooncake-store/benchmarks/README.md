@@ -2,6 +2,12 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
+## Master RPC Trace Replay Benchmark
+
+See [master_rpc_trace_bench.md](master_rpc_trace_bench.md) for replaying an
+external timestamped RPC trace against a dedicated master and collecting load,
+latency and eviction metrics.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment

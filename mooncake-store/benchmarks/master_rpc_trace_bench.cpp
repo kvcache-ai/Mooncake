@@ -17,7 +17,7 @@
 #include <thread>
 
 #include "master_client.h"
-#include "master_rpc_trace/trace.h"
+#include "master_rpc_trace.h"
 
 DEFINE_string(trace, "", "Master RPC JSONL trace to replay");
 DEFINE_string(prefill_trace, "",

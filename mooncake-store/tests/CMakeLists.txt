@@ -37,6 +37,19 @@ function(add_ha_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+add_executable(master_rpc_trace_test master_rpc_trace_test.cpp
+                                     ../benchmarks/master_rpc_trace.cpp)
+target_include_directories(master_rpc_trace_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../benchmarks)
+target_link_libraries(master_rpc_trace_test PRIVATE JsonCpp::JsonCpp gtest_main
+                                                    pthread)
+add_test(NAME master_rpc_trace_test COMMAND master_rpc_trace_test)
+set_tests_properties(master_rpc_trace_test PROPERTIES TIMEOUT 20)
+add_test(
+  NAME master_rpc_trace_monitor_test
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/test_master_rpc_trace_monitor.py -v)
+
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)

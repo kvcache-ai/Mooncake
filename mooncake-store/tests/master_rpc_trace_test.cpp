@@ -9,7 +9,7 @@
 #include <sstream>
 #include <thread>
 
-#include "trace.h"
+#include "master_rpc_trace.h"
 
 namespace mooncake::bench {
 namespace {
@@ -218,7 +218,9 @@ TEST(TraceReplay, LifecyclePhasesDrainAndUseIndependentOrigins) {
                 queried = true;
                 return RpcOutcome{{KeyStatus::MISS}, true, {}};
             }
-            if (event.op == "UnmountSegment") EXPECT_TRUE(queried);
+            if (event.op == "UnmountSegment") {
+                EXPECT_TRUE(queried);
+            }
             return RpcOutcome{{}, true, {}};
         });
     EXPECT_GE(samples[2].phase_origin_us, samples[1].finish_us);
