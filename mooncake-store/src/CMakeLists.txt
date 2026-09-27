@@ -2,6 +2,7 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
+add_subdirectory(codec)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
     allocator_metric.cpp

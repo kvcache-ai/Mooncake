@@ -154,6 +154,14 @@ if(WITH_STORE)
     store/buffer_pool.cpp
     store/engram_store_py.cpp
     integration_utils.h)
+  pybind11_add_module(_kv_codec store/kv_codec_py.cpp)
+  target_link_libraries(_kv_codec PRIVATE mooncake_kv_codec)
+  install(TARGETS _kv_codec LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                                    COMPONENT python)
+  install(
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/codec_store.py"
+    DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+    COMPONENT python)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
   if(USE_ASCEND_DIRECT)
     target_link_libraries(
@@ -266,13 +274,12 @@ if(WITH_TE)
   install(TARGETS engine asio_shared
           LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   # Co-locate libtent_metrics.so with the python C extensions so engine.so and
-  # store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton
-  # must be loadable wherever the extensions are installed; otherwise
-  # `import mooncake.engine` / `mooncake.store` fails with a missing library.
+  # store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton must
+  # be loadable wherever the extensions are installed; otherwise `import
+  # mooncake.engine` / `mooncake.store` fails with a missing library.
   if(TARGET tent_metrics)
     install(TARGETS tent_metrics
-            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
-            COMPONENT python)
+            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 endif()
 
