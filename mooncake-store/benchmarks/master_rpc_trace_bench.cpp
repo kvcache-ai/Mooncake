@@ -17,7 +17,6 @@
 #include <iostream>
 #include <istream>
 #include <latch>
-#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -50,7 +49,6 @@ struct TraceEvent {
     std::string id;
     std::string client_id;
     std::string op;
-    std::string phase;
     std::string segment_id;
     uint64_t size_bytes = 0;
     uint64_t timestamp_us = 0;
@@ -78,7 +76,6 @@ struct RpcOutcome {
 
 struct TraceSample {
     int64_t replay_origin_monotonic_us = 0;
-    int64_t phase_origin_us = 0;
     int64_t scheduled_us = 0;
     int64_t start_us = 0;
     int64_t finish_us = 0;
@@ -181,7 +178,6 @@ RpcTrace ReadTrace(std::istream& input) {
             event.id = row["id"].asString();
             event.client_id = row["client_id"].asString();
             event.op = row["op"].asString();
-            event.phase = row["phase"].asString();
             event.timestamp_us = row["timestamp_us"].asUInt64();
             for (const auto& key : row["keys"]) {
                 event.keys.push_back(key.asString());
@@ -263,8 +259,6 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
     std::mutex mutex;
     std::condition_variable cv;
     size_t remaining = trace.events.size();
-    std::exception_ptr scheduling_error;
-    size_t phase_begin = 0, phase_end = 0, phase_remaining = 0;
     auto origin = Clock::now();
     const auto max_delay =
         std::chrono::duration_cast<Micros>(Clock::time_point::max() - origin)
@@ -276,6 +270,7 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
         samples[i].scheduled_us =
             static_cast<int64_t>(trace.events[i].timestamp_us);
         pending[i] = trace.events[i].dependencies.size();
+        if (pending[i] == 0) ready.push(i);
         for (auto dependency : trace.events[i].dependencies) {
             Require(dependency < i, "invalid dependency index");
             children[dependency].push_back(i);
@@ -285,23 +280,6 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
         return std::chrono::duration_cast<Micros>(Clock::now() - origin)
             .count();
     };
-    const auto activate_phase = [&](int64_t phase_origin) {
-        phase_end = phase_begin;
-        while (phase_end < trace.events.size() &&
-               trace.events[phase_end].phase ==
-                   trace.events[phase_begin].phase) {
-            auto& sample = samples[phase_end];
-            Require(sample.scheduled_us <=
-                        std::numeric_limits<int64_t>::max() - phase_origin,
-                    "phase timestamp overflow");
-            sample.scheduled_us += phase_origin;
-            sample.phase_origin_us = phase_origin;
-            if (pending[phase_end] == 0) ready.push(phase_end);
-            ++phase_end;
-        }
-        phase_remaining = phase_end - phase_begin;
-    };
-    activate_phase(0);
     const auto worker_count = std::min(workers, trace.events.size());
     std::latch initialized(worker_count), start(1);
     bool startup_cancelled = false;
@@ -351,19 +329,9 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
             {
                 std::lock_guard lock(mutex);
                 for (auto child : children[index]) {
-                    if (--pending[child] == 0 && child < phase_end)
-                        ready.push(child);
+                    if (--pending[child] == 0) ready.push(child);
                 }
                 --remaining;
-                if (--phase_remaining == 0 && remaining) {
-                    phase_begin = phase_end;
-                    try {
-                        activate_phase(elapsed());
-                    } catch (...) {
-                        scheduling_error = std::current_exception();
-                        remaining = 0;
-                    }
-                }
             }
             cv.notify_all();
         }
@@ -384,27 +352,24 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
                 .count();
     start.count_down();
     for (auto& thread : threads) thread.join();
-    if (scheduling_error) std::rethrow_exception(scheduling_error);
     return samples;
 }
 
-static Json::Value SummarizeEvents(const RpcTrace& trace,
-                                   const std::vector<TraceSample>& samples,
-                                   const char* phase = nullptr) {
+// Both per-operation summaries and per-event timing use real steady-clock time.
+Json::Value SummarizeTrace(const RpcTrace& trace,
+                           const std::vector<TraceSample>& samples) {
     Require(samples.size() == trace.events.size(), "sample count mismatch");
     Json::Value result(Json::objectValue);
-    result["trace_metadata"] = phase ? Json::Value{} : trace.metadata;
+    result["trace_metadata"] = trace.metadata;
     int64_t elapsed_us = 0;
     size_t event_count = 0;
     std::set<std::string> operations;
     for (size_t i = 0; i < samples.size(); ++i) {
-        if (phase && trace.events[i].phase != phase) continue;
         if (event_count++ == 0)
             result["replay_origin_monotonic_us"] =
                 Json::Int64(samples[i].replay_origin_monotonic_us);
         operations.insert(trace.events[i].op);
-        const auto origin = phase ? samples[i].phase_origin_us : 0;
-        elapsed_us = std::max(elapsed_us, samples[i].finish_us - origin);
+        elapsed_us = std::max(elapsed_us, samples[i].finish_us);
     }
     result["events"] = Json::UInt64(event_count);
     result["elapsed_us"] = Json::Int64(elapsed_us);
@@ -415,7 +380,6 @@ static Json::Value SummarizeEvents(const RpcTrace& trace,
         RpcOutcome outcomes;
         std::vector<int64_t> lag, latency, end_to_end;
         for (size_t i = 0; i < samples.size(); ++i) {
-            if (phase && trace.events[i].phase != phase) continue;
             if (trace.events[i].op != op) continue;
             const auto& sample = samples[i];
             ++planned;
@@ -450,16 +414,6 @@ static Json::Value SummarizeEvents(const RpcTrace& trace,
     return result;
 }
 
-// Both per-operation summaries and per-event timing use real steady-clock time.
-Json::Value SummarizeTrace(const RpcTrace& trace,
-                           const std::vector<TraceSample>& samples) {
-    auto result = SummarizeEvents(trace, samples);
-    for (const auto* phase : {"setup", "workload", "teardown"}) {
-        result["phases"][phase] = SummarizeEvents(trace, samples, phase);
-    }
-    return result;
-}
-
 void WriteSamples(const std::string& path, const RpcTrace& trace,
                   const std::vector<TraceSample>& samples) {
     Require(samples.size() == trace.events.size(), "sample count mismatch");
@@ -472,8 +426,6 @@ void WriteSamples(const std::string& path, const RpcTrace& trace,
         row["id"] = trace.events[i].id;
         row["client_id"] = trace.events[i].client_id;
         row["op"] = trace.events[i].op;
-        row["phase"] = trace.events[i].phase;
-        row["phase_origin_us"] = Json::Int64(samples[i].phase_origin_us);
         row["scheduled_us"] = Json::Int64(samples[i].scheduled_us);
         row["start_us"] = Json::Int64(samples[i].start_us);
         row["finish_us"] = Json::Int64(samples[i].finish_us);
@@ -504,15 +456,6 @@ class Session {
         const auto error = client.Connect(FLAGS_master_server);
         if (error != mooncake::ErrorCode::OK) {
             throw std::runtime_error("connect failed: " + toString(error));
-        }
-    }
-
-    ~Session() {
-        for (const auto& [id, value] : segments) {
-            const auto result = client.UnmountSegment(value.id);
-            if (!result)
-                LOG(ERROR) << "Trace segment cleanup failed: "
-                           << toString(result.error());
         }
     }
 

@@ -109,8 +109,9 @@ To check the RPC path manually, run the launcher below with
 `--trace mooncake-store/benchmarks/master_rpc_trace_example.jsonl`. After cleanup,
 `result.json` should report `success: true`.
 The example registers two request clients and one storage client, explicitly
-mounts a 64 MiB segment on the storage client, and unmounts it during teardown.
-`replay.json` should show 12 calls across all phases, including one Exist miss,
+mounts a 64 MiB segment after the request clients send Ping, and unmounts it
+after the reads complete. The storage client sends another Ping after unmount.
+`replay.json` should show 12 calls, including one Exist miss,
 two successful Get keys and three successful Ping calls. This small example
 does not validate eviction.
 
@@ -152,18 +153,17 @@ The first nonblank JSONL row is a header:
 {"type":"master_rpc_trace","time_unit":"us","metadata":{"initial_state":"empty","seed":42}}
 ```
 
-Every event has `id`, `client_id`, `op`, `phase` and `timestamp_us`. Phases are
-ordered `setup`, `workload`, `teardown`, with a completion barrier between them.
-Timestamps are nonnegative integer microseconds relative to **that phase's**
-origin, sorted within each phase. These differ from AutoBench request times in
-milliseconds. Parsing and connection setup precede replay; mount time has its
-own measured phase and does not consume the workload's arrival-time budget.
+Every event has `id`, `client_id`, `op` and `timestamp_us`. Timestamps are
+nonnegative integer microseconds relative to a single replay start, sorted
+throughout the file. These differ from AutoBench request times in milliseconds.
+Parsing and connection setup precede replay. Registration, mount, unmount, Ping
+and key operations share the same timeline and may be interleaved.
 
 | Operation | Additional fields |
 | --- | --- |
-| `ReMountSegment` | `segments: []`; one initial handshake per client in setup. |
-| `MountSegment` | `segment_id`, positive `size_bytes`; setup only. |
-| `UnmountSegment` | `segment_id`; teardown only, same owner as mount. |
+| `ReMountSegment` | `segments: []`; one initial handshake per client, before its other events. |
+| `MountSegment` | `segment_id`, positive `size_bytes`. |
+| `UnmountSegment` | `segment_id`; same owner as mount. |
 | `Ping` | No additional fields; omit `keys`. Uses the event's client identity. |
 | `BatchExistKey`, `BatchGetReplicaList`, `BatchRemove` | Nonempty ordered `keys`. |
 | `BatchPutStart` | `keys`, either `value_sizes` or `value_slices`, optional `replica_num` (default 1). |
@@ -172,21 +172,28 @@ own measured phase and does not consume the workload's arrival-time budget.
 Register request-only clients without mounting memory. Mount capacity belongs
 to independently configured storage clients: adding serving clients must not
 silently enlarge storage. A segment ID is trace-local; the replayer maps it to a
-fresh real UUID. Every mounted segment requires exactly one explicit unmount.
-The teardown barrier drains all workload calls before storage is removed.
-Mid-workload topology changes and nonempty remount recovery are unsupported.
+fresh real UUID. Use a new segment ID for each mount lifetime. Clients may
+register and segments may mount or unmount at any recorded time. Each client
+operation implicitly depends on its registration, and each unmount depends on
+its corresponding mount. Other ordering must be recorded in `depends_on`:
+for example, a put that requires newly mounted capacity should depend on that
+mount, and an unmount that must follow particular reads should depend on them.
+Unrelated calls remain concurrent; unmount does not drain all pending requests.
+The replayer sends only recorded lifecycle calls, including unmounts. A trace
+may end with segments still mounted; the launcher then stops its dedicated
+master. Nonempty remount recovery is unsupported.
 
-Ping is supported in every phase after client registration. Like other events,
+Ping is supported after client registration. Like other events,
 it uses the shared worker pool, original timestamps and completion dependencies.
 For example, a workload heartbeat can be recorded as:
 
 ```json
-{"id":"ping-0","phase":"workload","timestamp_us":1000000,"client_id":"worker-0","op":"Ping","depends_on":["register-0"]}
+{"id":"ping-0","timestamp_us":1000000,"client_id":"worker-0","op":"Ping","depends_on":["register-0"]}
 ```
 
-All key operations belong to workload. Each Start requires exactly one End or
-Revoke. `put_start` implies a completion dependency; unsuccessful Start keys are
-skipped at End/Revoke. If all keys are skipped, no finalization RPC is issued.
+Each Start requires exactly one End or Revoke. `put_start` implies a completion
+dependency; unsuccessful Start keys are skipped at End/Revoke. If all keys are
+skipped, no finalization RPC is issued.
 `value_sizes` gives one positive byte length per key, with one slice per value.
 For multi-slice objects, `value_slices` instead gives one nonempty array of
 positive slice lengths per key: `[[4194288, 4194288, 32], [8192]]` describes two
@@ -210,7 +217,7 @@ modeled. Do not silently discard these semantics in a producer.
 
 ### Arrival control and results
 
-Timestamps are replayed unchanged, relative to each phase's start. `--workers`
+Timestamps are replayed unchanged, relative to the replay start. `--workers`
 caps concurrent API calls, independent of logical client count. Overdue events
 stay queued; planned arrival times do not move to conceal overload. Dispatch lag
 includes worker and dependency waits.
@@ -218,23 +225,23 @@ A fixed trace does not model serving feedback caused by a slow or failed master.
 
 The launcher saves:
 
-- `replay.json`: per-operation and per-phase summaries, key outcomes,
+- `replay.json`: per-operation summaries, key outcomes,
   P50/P95/P99/max call latency and dispatch lag. Explicit Ping calls have their
   own operation entry, with zero keys.
-- `samples.jsonl`: planned/start/finish times, phase origins, issued calls,
+- `samples.jsonl`: planned/start/finish times, issued calls,
   original key counts, outcomes and errors. Written after timed replay.
 - `process.jsonl`: monotonic time, CPU seconds, RSS and thread counts for the
   master; `metrics.jsonl` and `metrics-before.prom` contain master Prometheus
-  metrics. Sampling continues during setup and teardown.
+  metrics. Sampling covers the full replay.
 - `result.json`: `master_process`, `store_sampled_peak`, `evictions` and `traffic`
-  summarize the full replay, including setup, workload and teardown.
+  summarize the full replay, including registration, mount and unmount.
   Traffic includes one-second offered, sent and completed call counts, issued
-  keys and peak calls in flight. All buckets use the replay's common time origin,
-  including phase-barrier waits. `offered_calls_per_second` uses the scheduled
-  arrival span, while completed throughput includes draining the backlog.
+  keys and peak calls in flight. All buckets use the replay's common time origin.
+  `offered_calls_per_second` uses the scheduled arrival span, while completed
+  throughput includes draining the backlog.
   For an all-at-once trace, the offered average is null; per-second buckets still
-  show the burst. `phases` retains separate operation and latency summaries for
-  setup, workload and teardown, including MountSegment and UnmountSegment.
+  show the burst. `operations` contains the per-operation counts and latency
+  summaries, including MountSegment and UnmountSegment.
 - Child process logs.
 
 For capacity-pressure experiments, grow the recorded KV working set beyond the
@@ -258,14 +265,14 @@ a closed-loop serving simulation, and injecting client `BatchRemove` calls is
 not a substitute for exercising the master's background eviction path.
 
 CPU utilization is expressed in cores (1 means one fully occupied core), derived
-from Linux process CPU time. Very short phases can have too few samples to estimate
+from Linux process CPU time. Very short replays can have too few samples to estimate
 CPU use. Sampled RSS is a sampled peak, not an exact high-water mark. Metrics
 scraping adds overhead; hold its interval fixed between comparisons.
 
 `master_total_capacity_bytes` and `master_allocated_bytes` describe logical Store
 capacity and allocation, which differ from the master's actual process RSS.
 Use the metrics to check capacity throughout the replay.
-Throughput includes phase-leading idle time and final drain. Client-call latency
+Throughput includes initial idle time and final drain. Client-call latency
 includes API/RPC work; it is not server-only processing time. Calls count
 MasterClient API invocations; retries can create extra wire traffic. Compare
 server metrics as well. Miss, not-ready and already-exists outcomes have separate

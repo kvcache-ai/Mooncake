@@ -113,7 +113,7 @@ def store_metrics(text):
 
 
 def eviction_summary(rows, start, finish):
-    """Count sampled eviction activity across all replay phases."""
+    """Count sampled eviction activity throughout replay."""
     before = [row for row in rows if row["monotonic_s"] <= start]
     during = [row for row in rows if start < row["monotonic_s"] <= finish]
     if not during:
@@ -354,7 +354,7 @@ def main():
                     "master_process": process_summary(rows, start, finish),
                     "replay_monotonic_window_s": [start, finish],
                     "traffic": traffic_summary(samples),
-                    "phases": replay["phases"],
+                    "operations": replay["operations"],
                 }
             )
     except Exception as error:
@@ -365,7 +365,9 @@ def main():
             stop(process)
         write_json(directory / "result.json", result)
     summary = {
-        key: value for key, value in result.items() if key not in ("phases", "traffic")
+        key: value
+        for key, value in result.items()
+        if key not in ("operations", "traffic")
     }
     if "evictions" in summary:
         summary["evictions"] = {
