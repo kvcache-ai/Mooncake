@@ -50,6 +50,9 @@
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
 #endif
+#ifdef USE_HYLINK
+#include "transport/hylink_transport/hylink_transport.h"
+#endif
 #ifdef USE_MACA
 #include "transport/maca_transport/maca_transport.h"
 #endif
@@ -490,6 +493,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new HipTransport();
     }
 #endif
+#ifdef USE_HYLINK
+    else if (std::string(proto) == "hylink") {
+        transport = new HylinkTransport();
+    }
+#endif
 #ifdef USE_MACA
     else if (std::string(proto) == "maca") {
         transport = new MacaTransport();
@@ -654,6 +662,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             // hip is intra-node GPU-IPC only. On a cross-node request a
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.
+            if (p == "hylink") return std::getenv("MC_DISABLE_HYLINK") ? 0 : 5;
             if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
             if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
             if (p == "musa") return std::getenv("MC_DISABLE_MUSA") ? 0 : 4;

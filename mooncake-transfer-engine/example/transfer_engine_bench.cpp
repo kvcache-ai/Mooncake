@@ -55,6 +55,10 @@
 #include "gpu_vendor/intra_nvlink.h"
 #endif
 
+#if defined(USE_HYLINK)
+#include "transport/hylink_transport/hylink_transport.h"
+#endif
+
 #if defined(USE_UBSHMEM)
 static void checkAclError(aclError result, const char* message) {
     if (result != ACL_ERROR_NONE) {
@@ -90,7 +94,8 @@ DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma",
               "Transfer protocol: "
-              "rdma|barex|tcp|efa|nvlink|musa|nvlink_intra|hip|sunrise_link");
+              "rdma|barex|tcp|efa|nvlink|musa|nvlink_intra|hip|sunrise_link|"
+              "hylink");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -166,6 +171,14 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
             LOG(ERROR) << "--protocol=ubshmem requires USE_UBSHMEM=ON";
             return nullptr;
 #endif
+        } else if (FLAGS_protocol == "hylink") {
+#if defined(USE_HYLINK)
+            d_buf = mooncake::HylinkTransport::allocateFabricMemory(size);
+            LOG(INFO) << "Using hylink fabric memory allocation";
+#else
+            LOG(ERROR) << "--protocol=hylink requires USE_HYLINK=ON";
+            return nullptr;
+#endif
         } else {
 #ifndef USE_UBSHMEM
             checkCudaError(cudaMalloc(&d_buf, size),
@@ -216,6 +229,13 @@ static void freeMemoryPool(void* addr, size_t size) {
 #ifdef USE_UBSHMEM
         if (FLAGS_use_vram) {
             freeFabricMemory(addr);
+            return;
+        }
+#endif
+    } else if (FLAGS_protocol == "hylink") {
+#if defined(USE_HYLINK)
+        if (FLAGS_use_vram) {
+            mooncake::HylinkTransport::freeFabricMemory(addr);
             return;
         }
 #endif
@@ -514,7 +534,7 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
         xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
                FLAGS_protocol == "musa" || FLAGS_protocol == "hip" ||
-               FLAGS_protocol == "nvlink_intra" ||
+               FLAGS_protocol == "hylink" || FLAGS_protocol == "nvlink_intra" ||
                FLAGS_protocol == "ubshmem" ||
                FLAGS_protocol == "sunrise_link" || FLAGS_protocol == "flagcx") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
