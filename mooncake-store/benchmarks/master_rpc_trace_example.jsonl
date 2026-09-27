@@ -1,4 +1,4 @@
-{"type":"master_rpc_trace","version":2,"time_unit":"us","metadata":{"source":"handwritten-smoke-test","initial_state":"empty"}}
+{"type":"master_rpc_trace","time_unit":"us","metadata":{"source":"handwritten-smoke-test","initial_state":"empty"}}
 {"id":"register-storage-0","phase":"setup","timestamp_us":0,"client_id":"storage-0","op":"ReMountSegment","segments":[]}
 {"id":"register-0","phase":"setup","timestamp_us":0,"client_id":"instance-0","op":"ReMountSegment","segments":[]}
 {"id":"register-1","phase":"setup","timestamp_us":0,"client_id":"instance-1","op":"ReMountSegment","segments":[]}

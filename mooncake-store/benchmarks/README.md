@@ -144,12 +144,12 @@ The replayer loads the trace once before issuing RPCs and checks that its header
 uses a supported format. There is no separate validation pass; the producer is
 responsible for satisfying the trace contract below.
 
-### Trace contract: version 2
+### Trace contract
 
-Only version 2 is supported. The first nonblank JSONL row is a header:
+The first nonblank JSONL row is a header:
 
 ```json
-{"type":"master_rpc_trace","version":2,"time_unit":"us","metadata":{"initial_state":"empty","seed":42}}
+{"type":"master_rpc_trace","time_unit":"us","metadata":{"initial_state":"empty","seed":42}}
 ```
 
 Every event has `id`, `client_id`, `op`, `phase` and `timestamp_us`. Phases are
@@ -178,7 +178,7 @@ Mid-workload topology changes and nonempty remount recovery are unsupported.
 
 Ping is supported in every phase after client registration. Like other events,
 it uses the shared worker pool, original timestamps and completion dependencies.
-For example, a v2 workload heartbeat can be recorded as:
+For example, a workload heartbeat can be recorded as:
 
 ```json
 {"id":"ping-0","phase":"workload","timestamp_us":1000000,"client_id":"worker-0","op":"Ping","depends_on":["register-0"]}
@@ -227,7 +227,7 @@ The launcher saves:
   master; `metrics.jsonl` and `metrics-before.prom` contain master Prometheus
   metrics. Sampling continues during setup and teardown.
 - `result.json`: `master_process`, `store_sampled_peak`, `evictions` and `traffic`
-  summarize the full replay, including v2 setup, workload and teardown.
+  summarize the full replay, including setup, workload and teardown.
   Traffic includes one-second offered, sent and completed call counts, issued
   keys and peak calls in flight. All buckets use the replay's common time origin,
   including phase-barrier waits. `offered_calls_per_second` uses the scheduled

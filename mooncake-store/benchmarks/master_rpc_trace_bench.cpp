@@ -170,12 +170,9 @@ RpcTrace ReadTrace(std::istream& input) {
         try {
             const auto row = ParseLine(line);
             if (!header_seen) {
-                Require(
-                    row["type"] == "master_rpc_trace" &&
-                        row["version"].isUInt64() &&
-                        row["version"].asUInt64() == 2 &&
-                        row["time_unit"] == "us",
-                    "expected master_rpc_trace v2 header with time_unit=us");
+                Require(row["type"] == "master_rpc_trace" &&
+                            row["time_unit"] == "us",
+                        "expected master_rpc_trace header with time_unit=us");
                 trace.metadata = row["metadata"];
                 header_seen = true;
                 continue;
@@ -240,8 +237,7 @@ RpcTrace ReadTrace(std::istream& input) {
                                         error.what());
         }
     }
-    Require(header_seen,
-            "expected master_rpc_trace v2 header with time_unit=us");
+    Require(header_seen, "expected master_rpc_trace header with time_unit=us");
     return trace;
 }
 
@@ -397,7 +393,6 @@ static Json::Value SummarizeEvents(const RpcTrace& trace,
                                    const char* phase = nullptr) {
     Require(samples.size() == trace.events.size(), "sample count mismatch");
     Json::Value result(Json::objectValue);
-    result["schema_version"] = 1;
     result["trace_metadata"] = phase ? Json::Value{} : trace.metadata;
     int64_t elapsed_us = 0;
     size_t event_count = 0;
@@ -459,7 +454,6 @@ static Json::Value SummarizeEvents(const RpcTrace& trace,
 Json::Value SummarizeTrace(const RpcTrace& trace,
                            const std::vector<TraceSample>& samples) {
     auto result = SummarizeEvents(trace, samples);
-    result["schema_version"] = 2;
     for (const auto* phase : {"setup", "workload", "teardown"}) {
         result["phases"][phase] = SummarizeEvents(trace, samples, phase);
     }
