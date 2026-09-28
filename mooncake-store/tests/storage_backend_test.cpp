@@ -1519,6 +1519,164 @@ TEST_F(StorageBackendTest,
 }
 
 //-----------------------------------------------------------------------------
+// Zero-copy BatchPin over the DAX arena.
+
+namespace {
+
+struct ZeroCopyDaxFixture {
+    FileStorageConfig config;
+    OffsetAllocatorBackendConfig dax_cfg;
+
+    explicit ZeroCopyDaxFixture(const std::string& dir) {
+        config.storage_filepath = dir;
+        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+        config.total_size_limit = 4 * 1024 * 1024;
+        config.total_keys_limit = 10000;
+        config.local_buffer_size = 1024 * 1024;
+        dax_cfg.dax_device_path = MakeFakeDaxDevice(dir, 8 * 1024 * 1024);
+        dax_cfg.dax_zero_copy = true;
+    }
+};
+
+std::string PinnedValue(const StorageBackendInterface::PinnedBatch& batch,
+                        size_t i, size_t size) {
+    return std::string(reinterpret_cast<const char*>(batch.pointers[i]), size);
+}
+
+}  // namespace
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinInPlace) {
+    ZeroCopyDaxFixture f(data_path);
+    OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
+    ASSERT_TRUE(backend.Init());
+    auto region = backend.ZeroCopyRegion();
+    ASSERT_TRUE(region.has_value());
+    const auto lo = reinterpret_cast<uintptr_t>(region->first);
+    const auto hi = lo + region->second;
+
+    const std::string a(10000, 'a'), b(20000, 'b');
+    OffloadOne(backend, "ka", a);
+    OffloadOne(backend, "kb", b);
+
+    auto pinned = backend.BatchPin({"ka", "kb"}, {10000, 20000});
+    ASSERT_TRUE(pinned.has_value());
+    ASSERT_EQ(pinned->pointers.size(), 2u);
+    for (auto p : pinned->pointers) {
+        // Inside the mapping: the value was not copied anywhere.
+        EXPECT_GE(p, lo);
+        EXPECT_LT(p, hi);
+    }
+    EXPECT_EQ(PinnedValue(*pinned, 0, a.size()), a);
+    EXPECT_EQ(PinnedValue(*pinned, 1, b.size()), b);
+    EXPECT_EQ(backend.GetPinnedBytesForTest(), 30000);
+
+    pinned->owner.reset();
+    EXPECT_EQ(backend.GetPinnedBytesForTest(), 0);
+
+    // Wrong size, missing key: the whole batch is refused, nothing stays
+    // pinned.
+    auto bad_size = backend.BatchPin({"ka"}, {9999});
+    ASSERT_FALSE(bad_size.has_value());
+    EXPECT_EQ(bad_size.error(), ErrorCode::INVALID_PARAMS);
+    auto missing = backend.BatchPin({"ka", "nope"}, {10000, 1});
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(backend.GetPinnedBytesForTest(), 0);
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_DaxBatchPinSurvivesOverwrite) {
+    ZeroCopyDaxFixture f(data_path);
+    OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
+    ASSERT_TRUE(backend.Init());
+
+    const std::string old_value(64 * 1024, 'o');
+    OffloadOne(backend, "k", old_value);
+    auto pinned = backend.BatchPin({"k"}, {64 * 1024});
+    ASSERT_TRUE(pinned.has_value());
+
+    // Overwrite the key several times; no new record may land on the pinned
+    // extent while the pin is held.
+    for (char c : {'1', '2', '3', '4'}) {
+        const std::string v(64 * 1024, c);
+        OffloadOne(backend, "k", v);
+        EXPECT_EQ(LoadOne(backend, "k", v.size()), v);
+        EXPECT_EQ(PinnedValue(*pinned, 0, old_value.size()), old_value);
+    }
+
+    auto repinned = backend.BatchPin({"k"}, {64 * 1024});
+    ASSERT_TRUE(repinned.has_value());
+    EXPECT_NE(repinned->pointers[0], pinned->pointers[0]);
+    EXPECT_EQ(PinnedValue(*repinned, 0, 64 * 1024),
+              std::string(64 * 1024, '4'));
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinCap) {
+    ZeroCopyDaxFixture f(data_path);
+    f.config.local_buffer_size = 100 * 1024;
+    OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
+    ASSERT_TRUE(backend.Init());
+    const std::string v(64 * 1024, 'c');
+    OffloadOne(backend, "k", v);
+
+    auto first = backend.BatchPin({"k"}, {64 * 1024});
+    ASSERT_TRUE(first.has_value());
+    auto second = backend.BatchPin({"k"}, {64 * 1024});
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(second.error(), ErrorCode::BUFFER_OVERFLOW);
+    EXPECT_EQ(backend.GetPinnedBytesForTest(), 64 * 1024);
+
+    first->owner.reset();
+    EXPECT_TRUE(backend.BatchPin({"k"}, {64 * 1024}).has_value());
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinRecovered) {
+    ZeroCopyDaxFixture f(data_path);
+    f.dax_cfg.persist_mode = OffsetPersistMode::kStrict;
+    const std::string v(16 * 1024, 'r');
+    {
+        OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
+        ASSERT_TRUE(backend.Init());
+        OffloadOne(backend, "k", v);
+    }
+    OffsetAllocatorStorageBackend restarted(f.config, f.dax_cfg);
+    ASSERT_TRUE(restarted.Init());
+    auto pinned = restarted.BatchPin({"k"}, {16 * 1024});
+    ASSERT_TRUE(pinned.has_value());
+    EXPECT_EQ(PinnedValue(*pinned, 0, v.size()), v);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_BatchPinUnsupported) {
+    ZeroCopyDaxFixture f(data_path);
+    const std::string v(4096, 'u');
+
+    // DAX arena without the flag.
+    f.dax_cfg.dax_zero_copy = false;
+    {
+        OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
+        ASSERT_TRUE(backend.Init());
+        OffloadOne(backend, "k", v);
+        EXPECT_FALSE(backend.ZeroCopyRegion().has_value());
+        auto res = backend.BatchPin({"k"}, {4096});
+        ASSERT_FALSE(res.has_value());
+        EXPECT_EQ(res.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+
+    // File-based arena: the flag alone does nothing.
+    f.config.storage_filepath = data_path + "/file_arena";
+    fs::create_directories(f.config.storage_filepath);
+    OffsetAllocatorBackendConfig file_cfg;
+    file_cfg.dax_zero_copy = true;
+    OffsetAllocatorStorageBackend backend(f.config, file_cfg);
+    ASSERT_TRUE(backend.Init());
+    OffloadOne(backend, "k", v);
+    EXPECT_FALSE(backend.ZeroCopyRegion().has_value());
+    auto res = backend.BatchPin({"k"}, {4096});
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+}
+
+//-----------------------------------------------------------------------------
 
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Overwrite) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =

@@ -128,6 +128,9 @@ class FileStorage {
         std::chrono::steady_clock::time_point lease_timeout;
         std::vector<uint64_t> pointers;
         uint64_t total_size;
+        // Set instead of handles/slices for a zero-copy batch: holds the
+        // pinned DAX extents until the batch is released or GC'd.
+        std::shared_ptr<void> pin_owner;
 
         AllocatedBatch() : batch_id(0), total_size(0) {}
         AllocatedBatch(AllocatedBatch&&) = default;
@@ -212,6 +215,12 @@ class FileStorage {
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
         ClientBufferAllocator& allocator);
 
+    // Pins the batch in place in the backend's zero-copy region. nullptr
+    // means "use the copy path" (zero-copy off, or the backend refused).
+    std::shared_ptr<AllocatedBatch> PinBatch(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+
     tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatch(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
         bool prefer_pinned);
@@ -233,6 +242,9 @@ class FileStorage {
     PinnedBufferPool::Buffer pinned_restore_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
+    // Base of the backend's zero-copy region once it is registered with the
+    // transfer engine; nullptr keeps BatchGet on the copy path.
+    std::atomic<void*> zero_copy_base_{nullptr};
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(

@@ -162,6 +162,7 @@ struct OffsetAllocatorBackendEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_DAX_DEVICE_PATH);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFSET_DAX_ALIGNMENT_BYTES);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFSET_DAX_ZERO_COPY);
 };
 
 struct ReplicaSelectionEnvironmentVariables {

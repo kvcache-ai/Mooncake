@@ -5639,6 +5639,97 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     LOG(INFO) << "OffsetAllocatorStorageBackend::RemoveAll: cleared all data";
 }
 
+std::optional<std::pair<void*, size_t>>
+OffsetAllocatorStorageBackend::ZeroCopyRegion() const {
+    if (!cfg_.dax_zero_copy) return std::nullopt;
+    // Only DaxFile is byte-addressable; the mapping is created once in Init
+    // and kept across RemoveAll, so the region never moves after Init.
+    auto* dax = dynamic_cast<DaxFile*>(data_file_.get());
+    if (!dax) return std::nullopt;
+    return std::make_pair(dax->base(), dax->size());
+}
+
+tl::expected<StorageBackendInterface::PinnedBatch, ErrorCode>
+OffsetAllocatorStorageBackend::BatchPin(const std::vector<std::string>& keys,
+                                        const std::vector<int64_t>& sizes) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!ZeroCopyRegion()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    if (keys.size() != sizes.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Holds each extent (so the allocator cannot hand it to a new write, even
+    // if the key is evicted or overwritten meanwhile) and the mapping itself
+    // until FileStorage drops the batch.
+    struct PinOwner {
+        std::shared_ptr<StorageFile> file;
+        std::vector<AllocationPtr> allocations;
+        std::shared_ptr<std::atomic<int64_t>> pinned_bytes;
+        int64_t bytes = 0;
+        ~PinOwner() { pinned_bytes->fetch_sub(bytes); }
+    };
+
+    int64_t total = 0;
+    for (int64_t size : sizes) {
+        if (size < 0) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        total += size;
+    }
+    // Reserve against the cap up front; the owner returns it on release.
+    const int64_t cap = file_storage_config_.local_buffer_size;
+    if (pinned_bytes_->fetch_add(total) + total > cap) {
+        pinned_bytes_->fetch_sub(total);
+        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+    }
+    auto owner = std::make_shared<PinOwner>();
+    owner->pinned_bytes = pinned_bytes_;
+    owner->bytes = total;
+    owner->allocations.reserve(keys.size());
+
+    PinnedBatch batch;
+    batch.pointers.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& key = keys[i];
+        auto& shard = shards_[ShardForKey(key)];
+        SharedMutexLocker lock(&shard.mutex, shared_lock);
+        auto it = shard.map.find(key);
+        if (it == shard.map.end()) {
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        const auto& entry = it->second;
+        if (static_cast<int64_t>(entry.value_size) != sizes[i]) {
+            LOG(ERROR) << "Size mismatch for key: " << key
+                       << ", expected: " << entry.value_size
+                       << ", got: " << sizes[i];
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!owner->file) owner->file = data_file_;
+        const char* record =
+            static_cast<const char*>(
+                static_cast<DaxFile*>(owner->file.get())->base()) +
+            entry.offset;
+
+        // Same header/key checks as BatchLoad. The CRC is not re-verified
+        // here either: records are checked once on recovery.
+        auto header = RecordHeader::ReadFrom(record);
+        if (!header.ValidateAgainstMetadata(entry.value_size) ||
+            header.key_len != key.size() ||
+            std::memcmp(record + RecordHeader::SIZE, key.data(), key.size()) !=
+                0) {
+            LOG(ERROR) << "Record header/key mismatch for key: " << key;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        owner->allocations.push_back(entry.allocation);
+        batch.pointers.push_back(reinterpret_cast<uintptr_t>(
+            record + RecordHeader::ValueOffsetInRecord(header.key_len)));
+    }
+    batch.owner = std::move(owner);
+    return batch;
+}
+
 //-----------------------------------------------------------------------------
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>

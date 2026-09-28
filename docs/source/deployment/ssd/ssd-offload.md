@@ -220,6 +220,7 @@ Set `MOONCAKE_OFFSET_DAX_DEVICE_PATH` to place the arena on byte-addressable mem
 | `MOONCAKE_OFFSET_DAX_DEVICE_PATH` | unset | Path to map as the data arena. Unset keeps the file-based arena under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. |
 | `MOONCAKE_OFFSET_DAX_ALIGNMENT_BYTES` | `2097152` | Capacity is rounded down to a multiple of this. Device-DAX rejects mapping lengths that are not a multiple of the device alignment (2 MiB, or 1 GiB for some namespaces). |
 | `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE` | `false` | x86-64 only. Write each record's CPU cache lines back to the device (CLWB, else CLFLUSHOPT, else CLFLUSH, then SFENCE) before the write returns. Enable on persistent memory without eADR (for example Intel Optane PMem) when the arena must survive power loss. Leave it off for volatile CXL memory, where it only costs write throughput. |
+| `MOONCAKE_OFFSET_DAX_ZERO_COPY` | `false` | Serve remote reads of offloaded objects straight out of the DAX mapping. The mapping is registered with the Transfer Engine at startup and readers RDMA-read each value in place, with no copy into the staging buffer. Falls back to the copy path if registration fails or the pin limit is reached. No effect without `MOONCAKE_OFFSET_DAX_DEVICE_PATH`. |
 
 Notes:
 
@@ -228,6 +229,7 @@ Notes:
 - `MOONCAKE_OFFLOAD_USE_URING` is ignored for the DAX arena.
 - Device memory outlives the process, so `MOONCAKE_OFFSET_PERSIST_MODE=strict` or `relaxed` restores the arena after a restart. Without `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE`, sync uses `msync`, which does not flush CPU caches to persistent media; treat the arena as volatile across power loss unless the platform has eADR. CXL memory expanders are volatile regardless, so their contents are lost on a host reboot or power loss.
 - The DAX arena is independent of the transfer engine's `cxl` protocol (`MC_CXL_DEV_PATH`). The backend refuses to start if both name the same device.
+- With `MOONCAKE_OFFSET_DAX_ZERO_COPY`, the whole arena is one memory registration. A device-DAX namespace can be pinned for RDMA; an fsdax file generally cannot without on-demand paging, in which case the client logs a warning and keeps copying. Values held by in-flight reads are pinned until `release_offload_buffer` or the buffer lease TTL (`MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS`), and are capped at `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`, the same bound as the copy path. Keep the TTL above the worst-case transfer time: once it expires the extent can be evicted and rewritten, as a reused staging slot can today.
 
 ---
 

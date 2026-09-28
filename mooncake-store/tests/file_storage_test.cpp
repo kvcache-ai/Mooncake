@@ -5,8 +5,10 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -251,6 +253,20 @@ class FileStorageTest : public ::testing::Test {
                              const std::vector<int64_t>& sizes) {
         return fileStorage.AllocateBatch(keys, sizes,
                                          *fileStorage.client_buffer_allocator_);
+    }
+
+    // Stands in for the transfer-engine registration FileStorage::Init does.
+    std::optional<std::pair<void*, size_t>> EnableZeroCopy(
+        FileStorage& fileStorage) {
+        auto region = fileStorage.storage_backend_->ZeroCopyRegion();
+        if (region) fileStorage.zero_copy_base_ = region->first;
+        return region;
+    }
+
+    int64_t PinnedBytes(FileStorage& fileStorage) {
+        return std::dynamic_pointer_cast<OffsetAllocatorStorageBackend>(
+                   fileStorage.storage_backend_)
+            ->GetPinnedBytesForTest();
     }
 
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
@@ -800,6 +816,83 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
                         sizes[i]),
             batch_data.at(keys[i]));
     }
+}
+
+TEST_F(FileStorageTest, BatchGetServesDaxArenaZeroCopy) {
+    const std::string dev = data_path + "/fake_dax.dev";
+    std::ofstream(dev, std::ios::binary).close();
+    fs::resize_file(dev, 16 * 1024 * 1024);
+    SetEnv("MOONCAKE_OFFSET_DAX_DEVICE_PATH", dev);
+    SetEnv("MOONCAKE_OFFSET_DAX_ZERO_COPY", "1");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.storage_filepath = data_path;
+    config.total_size_limit = 8 * 1024 * 1024;
+    // BatchOffloadUtil writes 100 values of 210 bytes (21000 in total), so
+    // one pinned batch fits under this cap and a second one does not.
+    config.local_buffer_size = 32 * 1024;
+    SsdMetric metric;
+    FileStorage fileStorage(config, nullptr, "localhost:9003", &metric);
+    UnsetEnv("MOONCAKE_OFFSET_DAX_DEVICE_PATH");
+    UnsetEnv("MOONCAKE_OFFSET_DAX_ZERO_COPY");
+
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> data;
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, data));
+    int64_t total = 0;
+    for (auto s : sizes) total += s;
+    ASSERT_EQ(total, 21000);
+
+    auto check = [&](const FileStorage::BatchGetResult& r) {
+        ASSERT_EQ(r.pointers.size(), keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            EXPECT_EQ(
+                std::string(reinterpret_cast<char*>(r.pointers[i]), sizes[i]),
+                data.at(keys[i]));
+        }
+    };
+    const auto n = static_cast<int64_t>(keys.size());
+
+    // Not registered: the copy path serves it and nothing is pinned.
+    auto copied = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(copied);
+    check(*copied);
+    EXPECT_EQ(PinnedBytes(fileStorage), 0);
+    EXPECT_EQ(metric.ssd_read_ops.value(), n);
+    EXPECT_EQ(metric.ssd_zero_copy_fallbacks.value(), 0);
+    ASSERT_TRUE(fileStorage.ReleaseBuffer(copied->batch_id));
+
+    auto region = EnableZeroCopy(fileStorage);
+    ASSERT_TRUE(region);
+    const auto lo = reinterpret_cast<uintptr_t>(region->first);
+    const auto hi = lo + region->second;
+
+    auto pinned = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(pinned);
+    check(*pinned);
+    for (auto p : pinned->pointers) {
+        EXPECT_GE(p, lo);
+        EXPECT_LT(p, hi);
+    }
+    EXPECT_EQ(PinnedBytes(fileStorage), total);
+    EXPECT_EQ(metric.ssd_zero_copy_ops.value(), n);
+    EXPECT_EQ(metric.ssd_zero_copy_bytes.value(), total);
+    EXPECT_EQ(metric.ssd_read_ops.value(), n);  // no SSD read counted
+
+    // Pin cap reached: served by copy instead of failing.
+    auto copied_again = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(copied_again);
+    check(*copied_again);
+    EXPECT_EQ(metric.ssd_zero_copy_fallbacks.value(), 1);
+    EXPECT_EQ(metric.ssd_read_ops.value(), 2 * n);
+    EXPECT_EQ(PinnedBytes(fileStorage), total);
+
+    // Releasing the pinned batch drops its pins.
+    ASSERT_TRUE(fileStorage.ReleaseBuffer(pinned->batch_id));
+    EXPECT_EQ(PinnedBytes(fileStorage), 0);
+    ASSERT_TRUE(fileStorage.ReleaseBuffer(copied_again->batch_id));
 }
 
 TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
