@@ -15,13 +15,27 @@ ci_start_service() {
   CI_SERVICE_ORDER+=("$name")
 }
 
+ci_report_service_startup_failure() {
+  local name=$1 detail=$2 log=${CI_SERVICE_LOGS[$1]:-}
+  if [ -s "$log" ]; then
+    detail+=$'\n'
+    detail+="$(tail -n 20 "$log")"
+  fi
+  # GitHub workflow commands need escaped newlines and percent signs to keep
+  # the recent log lines in one visible error annotation.
+  detail=${detail//%/%25}
+  detail=${detail//$'\r'/%0D}
+  detail=${detail//$'\n'/%0A}
+  printf '::error title=%s startup::%s\n' "$name" "$detail"
+}
+
 ci_wait_service() {
   local name=$1 port ready _
   shift
   local pid=${CI_SERVICE_PIDS[$name]}
   for _ in {1..50}; do
     if ! kill -0 "$pid" 2>/dev/null; then
-      echo "::error::$name exited before becoming ready"
+      ci_report_service_startup_failure "$name" "$name exited before becoming ready"
       return 1
     fi
     ready=true
@@ -36,7 +50,7 @@ ci_wait_service() {
     fi
     sleep 0.1
   done
-  echo "::error::$name did not listen on ports $* within 5 seconds"
+  ci_report_service_startup_failure "$name" "$name did not listen on ports $* within 5 seconds"
   return 1
 }
 

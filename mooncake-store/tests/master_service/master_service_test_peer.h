@@ -308,6 +308,13 @@ class MasterServiceTestPeer {
         return service.tenant_quota_table_;
     }
 
+    static auto& WeightMetadata(MasterService& service) {
+        return service.weight_manager_.weight_metadata_;
+    }
+    static const auto& WeightMetadata(const MasterService& service) {
+        return service.weight_manager_.weight_metadata_;
+    }
+
     auto AddReplicaForRetainedClient(const UUID& client_id,
                                      const std::string& key,
                                      const TenantId& tenant_id,

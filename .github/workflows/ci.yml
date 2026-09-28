@@ -23,6 +23,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  # Only push/schedule builds write: PR-scoped entries are invisible to
+  # other PRs and would evict the main entries every PR reads.
+  SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
+
 jobs:
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
@@ -207,6 +212,7 @@ jobs:
           -DUSE_UB=ON \
           -DUSE_ETCD=ON \
           -DUSE_CUDA=ON \
+          -DUSE_MNNVL=ON \
           -DWITH_P2P_STORE=ON \
           -DWITH_CONDUCTOR=ON \
           -DSTORE_USE_ETCD=ON \
@@ -242,6 +248,7 @@ jobs:
       uses: ./.github/actions/run-ctest
       with:
         junit-report: build/test-results/ctest.xml
+        label-exclude: '^nvlink_gpu$'
 
     - name: Preserve CTest diagnostics
       if: ${{ always() && steps.ctest.outcome == 'failure' }}
@@ -373,7 +380,7 @@ jobs:
     - name: Run focused release gate tests
       run: |
         python -m pip install --disable-pip-version-check \
-          packaging pytest==8.3.5
+          packaging pytest==8.3.5 pyyaml
         python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
       shell: bash
 
@@ -391,7 +398,7 @@ jobs:
     - name: Run focused shell regression tests
       run: |
         bash scripts/tone_tests/tests/test_common_cleanup.sh
-        python3 scripts/tone_tests/tests/test_hicache_model_selection.py
+        python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
       shell: bash
 
   clang-format:
@@ -480,7 +487,8 @@ jobs:
         fi
 
         ruff check "${python_files[@]}"
-        ruff format --check "${python_files[@]}"
+        python scripts/ci/check_changed_python_format.py \
+          "$base_ref" "${python_files[@]}"
       shell: bash
 
 

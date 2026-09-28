@@ -6,20 +6,68 @@ The Mooncake Store HTTP Service provides RESTful endpoints for cluster managemen
 
 The HTTP service serves multiple purposes:
 - **Metrics & Monitoring**: Prometheus-compatible metrics endpoints
+- **Health & HA Inspection**: Service availability, HA role/state, and leader information
 - **Cluster Management**: Query and manage distributed storage segments
 - **Data Inspection**: Examine stored objects and their replicas
-- **Health Checks**: Service availability and status verification
+- **Maintenance Operations**: Drain jobs, tenant quota policies, and bulk deletion
+
+The service listens on the master metrics port, configured with `--metrics_port`
+(default `9003`) and `--metrics_host` (default `0.0.0.0`). All examples below use
+port `9003`.
 
 The Python `mooncake.mooncake_store_service` module also provides a lightweight
 Store REST API for data operations and standalone segment mount/unmount
-workflows. Unless configured otherwise, it listens on port `8080`.
+workflows. Unless configured otherwise, it listens on port `8080`. See
+[Store REST API Endpoints](#store-rest-api-endpoints).
+
+## Common Behavior
+
+### Service-plane gating
+
+Endpoints that access stored metadata are only served when the master holds the
+active service plane. In HA mode, standby masters and masters that are still
+starting up reject these requests with HTTP `503`:
+
+```json
+{
+  "success": false,
+  "error_code": -1011,
+  "error_message": "service plane is not active"
+}
+```
+
+The gating does not apply to `/metrics`, `/metrics/summary`, `/health`,
+`/version`, `/role`, `/ha_status`, and `/leader`, which remain available in
+every HA role.
+
+### Error responses
+
+Most JSON endpoints report failures with a common structure:
+
+```json
+{
+  "success": false,
+  "error_code": -704,
+  "error_message": "OBJECT_NOT_FOUND"
+}
+```
+
+The HTTP status code is derived from the error code:
+
+| HTTP status | Error codes |
+|-------------|-------------|
+| `400 Bad Request` | `INVALID_PARAMS` |
+| `404 Not Found` | `JOB_NOT_FOUND`, `SEGMENT_NOT_FOUND`, `OBJECT_NOT_FOUND`, `TENANT_NOT_REGISTERED` |
+| `409 Conflict` | `UNAVAILABLE_IN_CURRENT_MODE`, `UNAVAILABLE_IN_CURRENT_STATUS`, `TENANT_NOT_EMPTY` |
+| `500 Internal Server Error` | all other error codes |
+| `503 Service Unavailable` | service plane is not active (see above) |
 
 ## HTTP Endpoints
 
 ### Metrics Endpoints
 
 #### `/metrics`
-Prometheus-compatible metrics endpoint providing detailed system metrics in text format.
+Prometheus-compatible metrics endpoint providing detailed system metrics in text format. When tenant quota is enabled, per-tenant quota gauges and counters are included as well.
 
 **Method**: `GET`
 **Content-Type**: `text/plain; version=0.0.4`
@@ -27,7 +75,7 @@ Prometheus-compatible metrics endpoint providing detailed system metrics in text
 
 **Example**:
 ```bash
-curl http://localhost:8080/metrics
+curl http://localhost:9003/metrics
 ```
 
 #### `/metrics/summary`
@@ -35,12 +83,157 @@ Human-readable metrics summary with key performance indicators.
 
 **Method**: `GET`
 **Content-Type**: `text/plain; version=0.0.4`
-**Response**: Condensed overview of system health and performance metrics
+**Response**: Single-line summary with HA role/state, service readiness, master and HA metric counters, and (in HA mode) the observed leader address and view version
 
 **Example**:
 ```bash
-curl http://localhost:8080/metrics/summary
+curl http://localhost:9003/metrics/summary
 ```
+
+```text
+role=primary, state=serving, service_ready=true, master={...}, ha={...}, leader=192.168.1.10:50051, view_version=7
+```
+
+### Health & HA Endpoints
+
+These endpoints reflect the local process state and are available in every HA
+role, including standby.
+
+#### `/health`
+Health check endpoint with role and readiness information.
+
+**Method**: `GET`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object describing process health
+
+**Example**:
+```bash
+curl http://localhost:9003/health
+```
+
+**Response Format**:
+```json
+{
+  "status": "ok",
+  "role": "primary",
+  "ha_state": "serving",
+  "service_ready": true,
+  "leader_address": "192.168.1.10:50051",
+  "view_version": 7
+}
+```
+
+**Fields**:
+- `status` (string): Always `"ok"` when the HTTP server is up
+- `role` (string): HA runtime role of this process (e.g. `primary`, `standby`)
+- `ha_state` (string): HA runtime state (e.g. `starting`, `serving`)
+- `service_ready` (boolean): Whether the metadata service plane is active on this process
+- `leader_address` (string, optional): Observed leader address; only present in HA mode
+- `view_version` (integer, optional): Leader view version; only present in HA mode
+
+#### `/version`
+Report the master version. Always available, including while the master is in
+standby.
+
+**Method**: `GET`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with:
+- `version` (string): Store version used for RPC handshake compatibility
+- `display_version` (string): Human-readable release plus short git hash
+
+**Example**:
+```bash
+curl http://localhost:9003/version
+```
+
+```json
+{"version":"2.0.0","display_version":"0.3.12.post1 (git: f9e8311f)"}
+```
+
+Real clients expose the same `/version` payload on their own client HTTP port
+when `enable_client_http_server` is on. See
+[Client Metrics Endpoint](../../getting_started/observability.md#client-metrics-endpoint).
+
+#### `/role`
+Return the HA runtime role of this process.
+
+**Method**: `GET`
+**Content-Type**: `text/plain; charset=utf-8`
+**Response**: Role string, e.g. `primary` or `standby`
+
+**Example**:
+```bash
+curl http://localhost:9003/role
+```
+
+#### `/ha_status`
+Return the HA runtime state of this process.
+
+**Method**: `GET`
+**Content-Type**: `text/plain; charset=utf-8`
+**Response**: State string, e.g. `starting` or `serving`
+
+**Example**:
+```bash
+curl http://localhost:9003/ha_status
+```
+
+#### `/leader`
+Return the leader currently observed by this process.
+
+**Method**: `GET`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with leader information
+
+**Example**:
+```bash
+curl http://localhost:9003/leader
+```
+
+**Response Format**:
+```json
+{
+  "present": true,
+  "leader_address": "192.168.1.10:50051",
+  "view_version": 7
+}
+```
+
+**Fields**:
+- `present` (boolean): Whether a leader view exists (always `false` in non-HA mode)
+- `leader_address` (string, optional): Leader address when `present` is `true`
+- `view_version` (integer, optional): Leader view version when `present` is `true`
+
+#### `/kv_events/status`
+Return publish statistics of the master's KV event publisher (ZeroMQ based event
+stream for cache consumers such as vLLM).
+
+**Method**: `GET`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with publisher statistics
+
+**Example**:
+```bash
+curl http://localhost:9003/kv_events/status
+```
+
+**Response Format**:
+```json
+{
+  "enabled": true,
+  "published_batches": 1024,
+  "published_events": 65536,
+  "dropped_events": 0,
+  "skipped_unparsed_keys": 3
+}
+```
+
+**Fields**:
+- `enabled` (boolean): Whether KV event publishing is enabled (`--enable_kv_events`)
+- `published_batches` (integer): Total published event batches
+- `published_events` (integer): Total published events
+- `dropped_events` (integer): Events dropped due to queue pressure
+- `skipped_unparsed_keys` (integer): Events skipped because the key could not be parsed
 
 ### Data Management Endpoints
 
@@ -50,11 +243,11 @@ Retrieve replica information for a specific key, including memory locations and 
 **Method**: `GET`
 **Parameters**: `key` (query parameter) - The object key to query
 **Content-Type**: `application/json; charset=utf-8`
-**Response**: JSON object with success status and replica data array
+**Response**: JSON object with success status and replica data array. Only memory replicas are included; use `/batch_query_keys` to inspect disk and NoF replicas.
 
 **Example**:
 ```bash
-curl "http://localhost:8080/query_key?key=my_object"
+curl "http://localhost:9003/query_key?key=my_object"
 ```
 
 **Success Response** (HTTP 200):
@@ -90,17 +283,24 @@ curl "http://localhost:8080/query_key?key=my_object"
 }
 ```
 
+```{note}
+`/query_key` queries the `default` tenant and goes through the regular
+read path: it grants a read lease on the object, may trigger promotion, and
+updates cache-hit metrics. Use `/batch_query_keys` for a purely read-only
+inspection.
+```
+
 #### `/batch_query_keys`
 Retrieve replica information for multiple keys in a single request, including memory locations and transport endpoints for each key. The endpoint performs a read-only metadata lookup and does not grant leases, trigger promotion, or update cache-hit metrics.
 
 **Method**: `GET`
-**Parameters**: `keys` (query parameter) - Comma-separated list of object keys to query (format: key1,key2,key3)
+**Parameters**: `keys` (query parameter) - Comma-separated list of object keys to query (format: key1,key2,key3). Keys are looked up in the `default` tenant.
 **Content-Type**: `application/json; charset=utf-8`
 **Response**: JSON-formatted mapping of keys to their respective replica descriptors
 
 **Example**:
 ```bash
-curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
+curl "http://localhost:9003/batch_query_keys?keys=key1,key2,key3"
 ```
 
 **Response Format**:
@@ -112,8 +312,10 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
       "ok": true,
       "values": [
         {
-          "transport_endpoint_": "hostname:port",
-          "buffer_descriptor": {...}
+          "size_": 1073741824,
+          "buffer_address_": 140732000000000,
+          "protocol_": "rdma",
+          "transport_endpoint_": "hostname:port"
         }
       ],
       "disk_values": [
@@ -131,8 +333,10 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
       ],
       "nof_values": [
         {
-          "transport_endpoint_": "hostname:port",
-          "buffer_descriptor": {...}
+          "size_": 1073741824,
+          "buffer_address_": 140732000000000,
+          "protocol_": "rdma",
+          "transport_endpoint_": "hostname:port"
         }
       ]
     },
@@ -146,6 +350,14 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
 
 The `values` field is always present (empty array when no memory replica exists). The `disk_values`, `local_disk_values`, and `nof_values` fields are optional and only appear when the corresponding replica type is present for the key.
 
+**Error Response** (missing keys parameter, HTTP 400):
+```json
+{
+  "success": false,
+  "error": "No keys provided. Use ?keys=key1,key2,..."
+}
+```
+
 #### `/get_all_keys`
 List all keys currently stored in the distributed system.
 
@@ -155,7 +367,7 @@ List all keys currently stored in the distributed system.
 
 **Example**:
 ```bash
-curl http://localhost:8080/get_all_keys
+curl http://localhost:9003/get_all_keys
 ```
 
 ### Segment Management Endpoints
@@ -169,7 +381,7 @@ List all mounted segments in the cluster.
 
 **Example**:
 ```bash
-curl http://localhost:8080/get_all_segments
+curl http://localhost:9003/get_all_segments
 ```
 
 #### `/query_segment`
@@ -182,7 +394,7 @@ Query detailed information about a specific segment, including used and availabl
 
 **Example**:
 ```bash
-curl "http://localhost:8080/query_segment?segment=segment_name"
+curl "http://localhost:9003/query_segment?segment=segment_name"
 ```
 
 **Response Format**:
@@ -201,7 +413,7 @@ Get detailed information of all segments in JSON format, including segment metad
 
 **Example**:
 ```bash
-curl http://localhost:8080/get_segments_detail
+curl http://localhost:9003/get_segments_detail
 ```
 
 **Response Format**:
@@ -243,45 +455,340 @@ curl http://localhost:8080/get_segments_detail
   - `allocator_capacity_bytes` (integer): Total allocator capacity in bytes
   - `allocator_usage_percent` (number): Percentage of allocator capacity used
 
-### Health Check Endpoints
-
-#### `/health`
-Basic health check endpoint for service availability verification.
+#### `/api/v1/segments/status`
+Query the lifecycle status of a single segment.
 
 **Method**: `GET`
-**Content-Type**: `text/plain; version=0.0.4`
-**Response**: `OK` when service is healthy
-**Status Codes**:
-- `200 OK`: Service is healthy
-- Other: Service may be experiencing issues
+**Parameters**: `segment` (query parameter) - Segment name to query
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with the segment status
 
 **Example**:
 ```bash
-curl http://localhost:8080/health
+curl "http://localhost:9003/api/v1/segments/status?segment=segment_name"
 ```
 
-#### `/version`
-Report the master version. Always available, including while the master is in
-standby.
+**Response Format**:
+```json
+{
+  "success": true,
+  "segment": "segment_name",
+  "status": 1,
+  "status_name": "OK"
+}
+```
+
+**Fields**:
+- `success` (boolean): Whether the query succeeded
+- `segment` (string): Segment name echoed back
+- `status` (integer): Numeric segment status
+- `status_name` (string): Segment status name. One of `UNDEFINED` (0), `OK` (1), `DRAINING` (2), `DRAINED` (3), `GRACEFULLY_UNMOUNTING` (4), `UNMOUNTING` (5)
+
+### DFS Storage Endpoints
+
+These endpoints manage the shard layout of the descriptor-based DFS (shared
+filesystem) storage tier. They return HTTP `409` with
+`UNAVAILABLE_IN_CURRENT_MODE` when DFS storage is not enabled on the master.
+
+#### `GET /api/v1/dfs/shard_count`
+Query the current number of DFS shards.
 
 **Method**: `GET`
 **Content-Type**: `application/json; charset=utf-8`
-**Response**: JSON object with:
-- `version` (string): Store version used for RPC handshake compatibility
-- `display_version` (string): Human-readable release plus short git hash
 
 **Example**:
 ```bash
-curl http://localhost:8080/version
+curl http://localhost:9003/api/v1/dfs/shard_count
 ```
+
+**Response Format**:
+```json
+{
+  "success": true,
+  "shard_count": 16
+}
+```
+
+#### `PUT /api/v1/dfs/shard_count`
+Expand the DFS storage to a new shard count. Shard counts can only grow.
+
+**Method**: `PUT`
+**Content-Type**: `application/json; charset=utf-8`
+
+**Request Body**:
+```json
+{
+  "shard_count": 32
+}
+```
+
+`shard_count` must be an integer in `[1, INT_MAX]`. Only one expansion can run
+at a time; a concurrent request is rejected with HTTP `409`
+(`UNAVAILABLE_IN_CURRENT_STATUS`).
+
+**Example**:
+```bash
+curl -X PUT http://localhost:9003/api/v1/dfs/shard_count \
+  -H "Content-Type: application/json" \
+  -d '{"shard_count": 32}'
+```
+
+**Success Response** (HTTP 200): the resulting shard count in `shard_count`.
+
+### Drain Job Endpoints
+
+Drain jobs migrate all objects away from one or more segments so they can be
+unmounted safely. Job states follow `CREATED -> PLANNING -> RUNNING ->
+SUCCEEDED | FAILED | CANCELED`.
+
+#### `POST /api/v1/drain_jobs`
+Create a drain job for the given segments.
+
+**Method**: `POST`
+**Content-Type**: `application/json; charset=utf-8`
+
+**Request Body**:
+```json
+{
+  "segments": ["segment_0"],
+  "target_segments": ["segment_1"],
+  "max_concurrency": 4
+}
+```
+
+**Fields**:
+- `segments` (array of string, required): Segments to drain
+- `target_segments` (array of string, optional): Preferred target segments for migrated objects
+- `max_concurrency` (integer, optional): Maximum number of concurrently migrating objects. Defaults to `4`
+
+**Example**:
+```bash
+curl -X POST http://localhost:9003/api/v1/drain_jobs \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["segment_0"], "target_segments": ["segment_1"], "max_concurrency": 4}'
+```
+
+**Success Response** (HTTP 200):
+```json
+{
+  "success": true,
+  "job_id": "00000000-0000-0000-0000-000000000003",
+  "status": "CREATED"
+}
+```
+
+#### `GET /api/v1/drain_jobs/query`
+Query the status and progress of a drain job.
+
+**Method**: `GET`
+**Parameters**: `job_id` (query parameter) - UUID returned by the create call
+**Content-Type**: `application/json; charset=utf-8`
+
+**Example**:
+```bash
+curl "http://localhost:9003/api/v1/drain_jobs/query?job_id=00000000-0000-0000-0000-000000000003"
+```
+
+**Response Format**:
+```json
+{
+  "success": true,
+  "job_id": "00000000-0000-0000-0000-000000000003",
+  "type": 0,
+  "type_name": "DRAIN",
+  "status": 2,
+  "status_name": "RUNNING",
+  "created_at_ms_epoch": 1767225600000,
+  "last_updated_at_ms_epoch": 1767225605000,
+  "segments": ["segment_0"],
+  "succeeded_units": 128,
+  "failed_units": 0,
+  "blocked_units": 0,
+  "active_units": 4,
+  "migrated_bytes": 137438953472,
+  "message": ""
+}
+```
+
+**Fields**:
+- `type` / `type_name` (integer / string): Job type; currently always `DRAIN` (0)
+- `status` / `status_name` (integer / string): Job status. One of `CREATED` (0), `PLANNING` (1), `RUNNING` (2), `SUCCEEDED` (3), `FAILED` (4), `CANCELED` (5)
+- `succeeded_units` / `failed_units` / `blocked_units` / `active_units` (integer): Per-object migration counters
+- `migrated_bytes` (integer): Total bytes migrated so far
+- `message` (string): Additional status or error message
+
+**Error Response** (unknown job, HTTP 404):
+```json
+{
+  "success": false,
+  "error_code": -1402,
+  "error_message": "JOB_NOT_FOUND"
+}
+```
+
+#### `POST /api/v1/drain_jobs/cancel`
+Cancel a running drain job. Objects already migrated stay migrated; objects not
+yet migrated remain on the source segments.
+
+**Method**: `POST`
+**Parameters**: `job_id` (query parameter) - UUID returned by the create call
+**Content-Type**: `application/json; charset=utf-8`
+
+**Example**:
+```bash
+curl -X POST "http://localhost:9003/api/v1/drain_jobs/cancel?job_id=00000000-0000-0000-0000-000000000003"
+```
+
+**Success Response** (HTTP 200):
+```json
+{
+  "success": true,
+  "job_id": "00000000-0000-0000-0000-000000000003",
+  "status": "CANCELED"
+}
+```
+
+### Tenant Quota Endpoints
+
+Tenant quota policies limit how much memory each tenant may cache. These
+endpoints require tenant quota to be enabled on the master; otherwise they
+return HTTP `409` with `UNAVAILABLE_IN_CURRENT_MODE`.
+
+A quota snapshot has the following structure:
 
 ```json
-{"version":"2.0.0","display_version":"0.3.12.post1 (git: f9e8311f)"}
+{
+  "tenant_id": "tenant-a",
+  "requested_quota_bytes": 107374182400,
+  "effective_quota_bytes": 85899345920,
+  "charged_bytes": 21474836480,
+  "admission_closed": false,
+  "over_quota": false,
+  "has_explicit_policy": true
+}
 ```
 
-Real clients expose the same `/version` payload on their own client HTTP port
-when `enable_client_http_server` is on. See
-[Client Metrics Endpoint](../../getting_started/observability.md#client-metrics-endpoint).
+**Fields**:
+- `tenant_id` (string): Tenant identifier
+- `requested_quota_bytes` (integer): Quota configured by the policy
+- `effective_quota_bytes` (integer): Quota actually enforced, after fair-share recomputation across tenants
+- `charged_bytes` (integer): Bytes currently charged to the tenant
+- `admission_closed` (boolean): Whether new allocations are currently rejected for the tenant
+- `over_quota` (boolean): Whether the tenant is currently over its effective quota
+- `has_explicit_policy` (boolean): Whether an explicit policy exists for the tenant
+
+#### `GET /api/v1/tenant_quotas`
+List quota snapshots for all tenants, or query a single tenant.
+
+**Method**: `GET`
+**Parameters**: `tenant_id` (query parameter, optional) - When provided, return only the snapshot of this tenant
+**Content-Type**: `application/json; charset=utf-8`
+
+**Example** (list all):
+```bash
+curl http://localhost:9003/api/v1/tenant_quotas
+```
+
+**Response Format** (list):
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "tenant_id": "tenant-a",
+      "requested_quota_bytes": 107374182400,
+      "effective_quota_bytes": 85899345920,
+      "charged_bytes": 21474836480,
+      "admission_closed": false,
+      "over_quota": false,
+      "has_explicit_policy": true
+    }
+  ]
+}
+```
+
+**Example** (single tenant):
+```bash
+curl "http://localhost:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
+```
+
+**Response Format** (single tenant): same JSON object, with `data` holding one
+snapshot instead of an array.
+
+#### `PUT /api/v1/tenant_quotas`
+Create or update the quota policy of a tenant.
+
+**Method**: `PUT`
+**Parameters**: `tenant_id` (query parameter, required) - Tenant the policy applies to
+**Content-Type**: `application/json; charset=utf-8`
+
+**Request Body**:
+```json
+{
+  "requested_quota_bytes": 107374182400
+}
+```
+
+`requested_quota_bytes` must be in the range `[1, 2^63 - 1]`.
+
+**Example**:
+```bash
+curl -X PUT "http://localhost:9003/api/v1/tenant_quotas?tenant_id=tenant-a" \
+  -H "Content-Type: application/json" \
+  -d '{"requested_quota_bytes": 107374182400}'
+```
+
+**Success Response** (HTTP 200): the resulting quota snapshot in `data`.
+
+#### `DELETE /api/v1/tenant_quotas`
+Delete the quota policy of a tenant.
+
+**Method**: `DELETE`
+**Parameters**: `tenant_id` (query parameter, required) - Tenant whose policy is deleted
+**Content-Type**: `application/json; charset=utf-8`
+
+**Example**:
+```bash
+curl -X DELETE "http://localhost:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
+```
+
+**Success Response** (HTTP 200): the removed quota snapshot in `data`, or
+`null` when the tenant had no explicit policy.
+
+```json
+{
+  "success": true,
+  "data": null
+}
+```
+
+### Data Deletion Endpoints
+
+#### `POST /api/v1/remove_all`
+Remove all stored objects. This is a destructive, cluster-wide operation.
+
+**Method**: `POST`
+**Parameters**:
+- `force` (query parameter, optional) - Set to `true` or `1` to force removal of objects that still have active leases
+- `tenant_id` (query parameter, optional) - Restrict removal to one tenant. When omitted, objects of all tenants are removed and connected clients are notified to drop their local data
+
+**Content-Type**: `application/json; charset=utf-8`
+
+**Example**:
+```bash
+curl -X POST "http://localhost:9003/api/v1/remove_all?force=true"
+```
+
+**Success Response** (HTTP 200):
+```json
+{
+  "success": true,
+  "removed_count": 12345
+}
+```
+
+**Fields**:
+- `removed_count` (integer): Number of objects removed
 
 ## Store REST API Endpoints
 
