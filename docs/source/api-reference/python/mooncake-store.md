@@ -2896,7 +2896,11 @@ Typical flow:
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
 Get sessions cache a filtered `QueryResult` (one complete supported replica,
-plus lease). Range calls only check the cached lease locally (zero Master RPCs).
+plus lease). Range calls only check the cached lease locally (zero Master RPCs),
+and each request re-checks it once its transfer completes: if the cached lease
+lapsed while the read was in flight, the call returns `LEASE_EXPIRED`, the
+result is discarded, and the session is dropped. LOCAL_DISK reads additionally
+report `OBJECT_HAS_LEASE` when the restored offload buffer outlives its GC TTL.
 The MEMORY path remains zero-copy via `BatchTransferReadRanges`. DFS replicas
 are read into request-scoped host staging and then scattered to host or device
 destinations; for device destinations, staging first uses the fixed-capacity

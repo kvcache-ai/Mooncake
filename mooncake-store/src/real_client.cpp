@@ -6769,18 +6769,24 @@ void RealClient::execute_session_local_disk_range_reads(
         }
         for (size_t k = 0; k < transfer.size(); ++k) {
             const auto *request = entry_requests[k];
-            if (transfer[k]) {
-                if (lease.LeaseExpired()) {
-                    results[request->result_index] =
-                        static_cast<int>(toInt(ErrorCode::OBJECT_HAS_LEASE));
-                } else {
-                    results[request->result_index] =
-                        static_cast<int>(transfer[k].value());
-                }
-            } else {
+            if (!transfer[k]) {
                 results[request->result_index] =
                     static_cast<int>(toInt(transfer[k].error()));
+                continue;
             }
+            // The restored buffer's GC TTL is not the Get Session lease: a
+            // successful transfer still has to be dropped if the session
+            // lease lapsed while it was in flight, matching MEMORY / DFS /
+            // DISK. Keep the GC TTL check as a separate offload-liveness
+            // guard.
+            if (invalidate_expired_get_session(*request, results)) continue;
+            if (lease.LeaseExpired()) {
+                results[request->result_index] =
+                    static_cast<int>(toInt(ErrorCode::OBJECT_HAS_LEASE));
+                continue;
+            }
+            results[request->result_index] =
+                static_cast<int>(transfer[k].value());
         }
     }
 }
