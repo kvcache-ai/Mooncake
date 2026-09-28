@@ -1654,6 +1654,51 @@ std::vector<std::string> MasterService::PromotionCandidateKeys(
             it->second.promotion_candidate_keys.end()};
 }
 
+std::vector<std::string> MasterService::TakePromotionCandidateSlice(
+    const TenantId& tenant_id, size_t limit) {
+    std::vector<std::string> slice;
+    if (limit == 0) {
+        return slice;
+    }
+    std::lock_guard<std::mutex> lock(replica_action_mutex_);
+    const auto state_it = replica_action_state_.find(tenant_id);
+    if (state_it == replica_action_state_.end()) {
+        return slice;
+    }
+    auto& state = state_it->second;
+    const auto& keys = state.promotion_candidate_keys;
+    if (keys.empty()) {
+        state.promotion_retry_resume_key.clear();
+        return slice;
+    }
+
+    // The index is ordered, so resuming after the last key of the previous
+    // slice costs a lookup rather than a walk over the keys already examined.
+    auto it = keys.upper_bound(state.promotion_retry_resume_key);
+    if (it == keys.end()) {
+        // The keys after the resume point are gone: start over at the beginning
+        // rather than skipping this tenant for the rest of the process.
+        it = keys.begin();
+    }
+    const auto start = it;
+    while (it != keys.end() && slice.size() < limit) {
+        slice.push_back(*it);
+        ++it;
+    }
+    if (it == keys.end()) {
+        auto wrapped = keys.begin();
+        while (wrapped != start && slice.size() < limit) {
+            slice.push_back(*wrapped);
+            ++wrapped;
+        }
+        // The whole index was examined: the next round starts at the beginning.
+        state.promotion_retry_resume_key.clear();
+    } else {
+        state.promotion_retry_resume_key = slice.back();
+    }
+    return slice;
+}
+
 // Erase any in-flight PromotionTask of the guarded entry, refund its pending
 // charge, and decrement the cluster-wide in-flight counter. The caller holds
 // the entry's own lock.
@@ -2833,9 +2878,6 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     std::optional<ErrorCode> first_persist_error;
-    // The tenants this sweep erased an object from, so their candidate index is
-    // shrunk once the walk is done.
-    std::unordered_set<TenantId, TenantIdHash> swept_tenants;
     tenants_.Visit([&](const TenantId& tenant_id,
                        const std::shared_ptr<metadata::Tenant>& tenant) {
         // The snapshot hands out handles to what the route published, so every
@@ -2889,7 +2931,6 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                             (void)EraseMetadata(*tenant, entry, metadata, state,
                                                 tenant_id,
                                                 QuotaEraseMode::kFull);
-                            swept_tenants.insert(tenant_id);
                         }
                         return;
                     }
@@ -2923,23 +2964,10 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     }
                     (void)EraseMetadata(*tenant, entry, metadata, state,
                                         tenant_id, QuotaEraseMode::kFull);
-                    swept_tenants.insert(tenant_id);
                 });
         }
     });
 
-    // erase() never returns bucket memory, so a tenant that lost most of its
-    // promotion candidates keeps a high-water bucket array unless the
-    // service-owned candidate index is shrunk here.
-    if (!swept_tenants.empty()) {
-        std::lock_guard<std::mutex> lock(replica_action_mutex_);
-        for (const auto& swept_tenant : swept_tenants) {
-            const auto it = replica_action_state_.find(swept_tenant);
-            if (it != replica_action_state_.end()) {
-                ShrinkBucketsIfSparse(it->second.promotion_candidate_keys);
-            }
-        }
-    }
     if (first_persist_error) {
         return tl::make_unexpected(*first_persist_error);
     }
@@ -7818,7 +7846,6 @@ long MasterService::RemoveAll(bool force) {
     size_t tenants_scanned = 0;
     tenants_.Visit([&](const TenantId& tenant_id,
                        const std::shared_ptr<metadata::Tenant>& tenant) {
-        bool erased_this_tenant = false;
         // The snapshot only names the keys to consider: each key is resolved
         // again below, so the checks and the erase stay atomic with it.
         for (const auto& snapshot_entry : tenant->SnapshotObjects()) {
@@ -7887,7 +7914,6 @@ long MasterService::RemoveAll(bool force) {
                                 total_freed_size +=
                                     metadata.size * mem_rep_count;
                                 removed_count++;
-                                erased_this_tenant = true;
                                 return;
                             }
                         }
@@ -7897,7 +7923,6 @@ long MasterService::RemoveAll(bool force) {
                         (void)EraseMetadata(*tenant, entry, metadata, state,
                                             tenant_id);
                         removed_count++;
-                        erased_this_tenant = true;
                     } else {
                         // Only a skipped object means the tenant is not empty.
                         // Under HA+oplog the erase is deferred to the durable
@@ -7909,16 +7934,6 @@ long MasterService::RemoveAll(bool force) {
                         }
                     }
                 });
-        }
-        // erase() never returns bucket memory, so a tenant this walk erased
-        // from keeps a high-water candidate index unless it is shrunk here.
-        if (erased_this_tenant) {
-            std::lock_guard<std::mutex> lock(replica_action_mutex_);
-            const auto state_it = replica_action_state_.find(tenant_id);
-            if (state_it != replica_action_state_.end()) {
-                ShrinkBucketsIfSparse(
-                    state_it->second.promotion_candidate_keys);
-            }
         }
         // The hook fires once per tenant, after that tenant's walk, so a test
         // can commit into the tenant the walk just finished.
@@ -7969,7 +7984,6 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
 
     const auto tenant_handle = tenants_.Lookup(normalized_tenant);
-    bool erased_any_object = false;
     if (tenant_handle != nullptr) {
         // The snapshot only names the keys to consider: each key is resolved
         // again below, so the checks and the erase stay atomic with it.
@@ -8035,7 +8049,6 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                                 total_freed_size +=
                                     metadata.size * mem_rep_count;
                                 removed_count++;
-                                erased_any_object = true;
                                 return;
                             }
                         }
@@ -8044,7 +8057,6 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                         (void)EraseMetadata(*tenant_handle, entry, metadata,
                                             state, normalized_tenant);
                         removed_count++;
-                        erased_any_object = true;
                     } else {
                         skipped_any_object = true;
                     }
@@ -8052,15 +8064,6 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
         }
     }
 
-    // erase() never returns bucket memory, so this tenant's candidate index
-    // keeps a high-water bucket array unless it is shrunk here.
-    if (erased_any_object) {
-        std::lock_guard<std::mutex> lock(replica_action_mutex_);
-        const auto state_it = replica_action_state_.find(normalized_tenant);
-        if (state_it != replica_action_state_.end()) {
-            ShrinkBucketsIfSparse(state_it->second.promotion_candidate_keys);
-        }
-    }
     // The hook fires once for this tenant, after the scan, so a test can commit
     // into the tenant the walk just finished.
     if (kv_remove_all_tenant_hook_) {
@@ -9344,21 +9347,42 @@ size_t MasterService::RunPromotionCandidateRetry() {
     const auto now = std::chrono::steady_clock::now();
     std::vector<ObjectIdentity> due_candidates;
     due_candidates.reserve(kPromotionRetryBatchSize);
+    size_t scanned = 0;
 
-    // A tenant's candidates are all reachable from its own sparse index, so
-    // there is no cross-tenant partitioning to do; the batch size bounds how
-    // much of the cluster one round of retries touches.
+    // One round examines at most kPromotionRetryScanBudget candidates, and no
+    // more than an equal share of them from one tenant, so a tenant whose index
+    // is mostly candidates that are not due yet cannot spend the round on
+    // itself and leave the later tenants unserved. The next round starts at the
+    // tenant after the last one this round reached.
     {
         std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
+        std::vector<TenantId> tenant_ids;
         tenants_.Visit([&](const TenantId& tenant_id,
                            const std::shared_ptr<metadata::Tenant>&) {
-            if (due_candidates.size() >= kPromotionRetryBatchSize) {
-                return;
-            }
-            for (const auto& key : PromotionCandidateKeys(tenant_id)) {
-                if (due_candidates.size() >= kPromotionRetryBatchSize) {
-                    break;
-                }
+            tenant_ids.push_back(tenant_id);
+        });
+        if (tenant_ids.empty()) {
+            promotion_retry_cursor_.store(0, std::memory_order_relaxed);
+            promotion_retry_last_scanned_.store(0, std::memory_order_relaxed);
+            return 0;
+        }
+
+        const size_t start =
+            promotion_retry_cursor_.load(std::memory_order_relaxed) %
+            tenant_ids.size();
+        const size_t per_tenant_share =
+            std::max<size_t>(1, kPromotionRetryScanBudget / tenant_ids.size());
+        for (size_t i = 0;
+             i < tenant_ids.size() && scanned < kPromotionRetryScanBudget &&
+             due_candidates.size() < kPromotionRetryBatchSize;
+             ++i) {
+            const TenantId& tenant_id =
+                tenant_ids[(start + i) % tenant_ids.size()];
+            const size_t slice_limit =
+                std::min(per_tenant_share, kPromotionRetryScanBudget - scanned);
+            for (const auto& key :
+                 TakePromotionCandidateSlice(tenant_id, slice_limit)) {
+                ++scanned;
                 (void)WithObjectMetadataForWriteAndCleanup(
                     ObjectIdentity{.tenant_id = tenant_id, .user_key = key},
                     [&](metadata::Tenant&,
@@ -9414,8 +9438,14 @@ size_t MasterService::RunPromotionCandidateRetry() {
                         due_candidates.push_back(ObjectIdentity{
                             .tenant_id = tenant_id, .user_key = key});
                     });
+                if (scanned >= kPromotionRetryScanBudget ||
+                    due_candidates.size() >= kPromotionRetryBatchSize) {
+                    break;
+                }
             }
-        });
+            promotion_retry_cursor_.store((start + i + 1) % tenant_ids.size(),
+                                          std::memory_order_relaxed);
+        }
     }
 
     size_t queued = 0;
@@ -9438,6 +9468,7 @@ size_t MasterService::RunPromotionCandidateRetry() {
         }
     }
 
+    promotion_retry_last_scanned_.store(scanned, std::memory_order_relaxed);
     return queued;
 }
 
@@ -12451,9 +12482,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
     bool stop_eviction_scan = false;
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
-    // Tenants that actually evicted this cycle; their per-tenant replica-action
-    // records are shrink candidates once eviction finishes.
-    std::vector<TenantId> evicted_tenants;
 
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
@@ -12493,9 +12521,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
                 evicted_count += evict_result.evicted_objects;
                 evicted_this_pass += evict_result.evicted_objects;
-                if (evict_result.evicted_objects > 0) {
-                    evicted_tenants.push_back(c.tenant_id);
-                }
                 if (evict_result.stop_scan) {
                     stop_eviction_scan = true;
                 }
@@ -12575,9 +12600,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     total_freed_size += evict_result.freed_bytes;
                     evicted_count += evict_result.evicted_objects;
                     target_evict_num -= evict_result.evicted_objects;
-                    if (evict_result.evicted_objects > 0) {
-                        evicted_tenants.push_back(c.first);
-                    }
                     if (evict_result.stop_scan) {
                         stop_eviction_scan = true;
                     }
@@ -12626,9 +12648,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     total_freed_size += evict_result.freed_bytes;
                     evicted_count += evict_result.evicted_objects;
                     target_evict_num -= evict_result.evicted_objects;
-                    if (evict_result.evicted_objects > 0) {
-                        evicted_tenants.push_back(c.first);
-                    }
                     if (evict_result.stop_scan) {
                         stop_eviction_scan = true;
                     }
@@ -12645,21 +12664,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                        << ", eviction_base=" << total_eviction_base
                        << ", evict_ratio_target=" << evict_ratio_target
                        << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
-        }
-    }
-
-    // erase() never returns bucket memory, so the promotion-candidate index of
-    // a tenant that just lost objects keeps a high-water bucket array unless it
-    // is shrunk here, under the one lock guarding that table.
-    if (!evicted_tenants.empty()) {
-        std::sort(evicted_tenants.begin(), evicted_tenants.end());
-        evicted_tenants.erase(
-            std::unique(evicted_tenants.begin(), evicted_tenants.end()),
-            evicted_tenants.end());
-        std::lock_guard<std::mutex> lock(replica_action_mutex_);
-        for (const auto& tenant_id : evicted_tenants) {
-            ShrinkBucketsIfSparse(
-                replica_action_state_[tenant_id].promotion_candidate_keys);
         }
     }
 
@@ -13448,6 +13452,22 @@ MasterService::MetadataSerializer::Deserialize(
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL, "Invalid weight_metadata snapshot"));
     }
+
+    // The payload is the whole metadata this service publishes, so decoding
+    // replaces what the routes held: a tenant the payload does not carry would
+    // otherwise keep publishing the keys of the state this call started from.
+    {
+        std::vector<TenantId> replaced_tenants;
+        service_->tenants_.Visit(
+            [&replaced_tenants](const TenantId& tenant_id,
+                                const std::shared_ptr<metadata::Tenant>&) {
+                replaced_tenants.push_back(tenant_id);
+            });
+        for (const auto& tenant_id : replaced_tenants) {
+            service_->tenants_.Remove(tenant_id);
+        }
+    }
+    service_->ResetReplicaActionStateForReload();
 
     // Iterate and deserialize each tenant entry
     for (uint32_t i = 0; i < shards_obj->via.map.size; ++i) {

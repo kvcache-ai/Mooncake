@@ -92,25 +92,6 @@ namespace test {
 class MasterServiceTestPeer;
 }  // namespace test
 
-// std::unordered_map/set never shrink their bucket array on erase, so a
-// container that once held millions of entries keeps its high-water bucket
-// memory (8 bytes per bucket) forever. ShrinkBucketsIfSparse rehashes a
-// container down to roughly twice its live size once the bucket array is
-// both large enough to matter and less than a quarter full. The bucket
-// floor avoids rehash churn on small containers; the 2x headroom keeps a
-// freshly shrunk container from growing again right away.
-// Rehashing invalidates iterators: callers must hold the lock guarding the
-// container and must not be iterating it.
-inline constexpr size_t kShrinkMinBucketCount = 1024;
-
-template <typename UnorderedContainer>
-void ShrinkBucketsIfSparse(UnorderedContainer& container) {
-    if (container.bucket_count() > kShrinkMinBucketCount &&
-        container.size() < container.bucket_count() / 4) {
-        container.rehash(container.size() * 2);
-    }
-}
-
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
@@ -1094,7 +1075,12 @@ class MasterService {
     struct TenantReplicaActionState {
         DynamicReplicationLeaseTable leases;
         // The keys whose published object carries a promotion candidate.
-        std::unordered_set<std::string> promotion_candidate_keys;
+        // Ordered, so the retry sweep resumes after the key it stopped on
+        // instead of walking the tenant's whole index again.
+        std::set<std::string> promotion_candidate_keys;
+        // Where that sweep stopped in `promotion_candidate_keys`; empty starts
+        // at the beginning.
+        std::string promotion_retry_resume_key;
     };
 
     // One control-plane lock over the whole table, and a known boundary of the
@@ -1146,6 +1132,14 @@ class MasterService {
                                    const std::string& key);
     [[nodiscard]] std::vector<std::string> PromotionCandidateKeys(
         const TenantId& tenant_id) const;
+    // The next slice of one tenant's candidate index for the retry sweep: at
+    // most `limit` keys, resuming after the key the previous slice stopped on
+    // and wrapping to the beginning once the end is reached. The resume
+    // position advances in the same step, so a tenant whose index is larger
+    // than one round's budget is still walked to its end over successive
+    // rounds.
+    [[nodiscard]] std::vector<std::string> TakePromotionCandidateSlice(
+        const TenantId& tenant_id, size_t limit);
 
     class SoftPinDeadlineIndex {
         friend class test::MasterServiceTestPeer;
@@ -1249,7 +1243,14 @@ class MasterService {
             std::invoke_result_t<Fn, metadata::Tenant&,
                                  const std::shared_ptr<ObjectEntry>&,
                                  ObjectMetadata&, ObjectEntry::State&>;
-        const auto tenant = GetOrCreateTenantHandle(object_id.tenant_id);
+        // A request for a key this service does not publish resolves no entry,
+        // so it must not register a tenant either: a client sending a random
+        // tenant id would otherwise grow the registry with empty tenants. The
+        // publish paths create their tenant themselves before inserting.
+        const auto tenant = tenants_.Lookup(object_id.tenant_id);
+        if (tenant == nullptr) {
+            return PublishedResult<Result>{};
+        }
         const auto entry = tenant->Get(object_id.user_key);
         if (entry == nullptr) {
             return PublishedResult<Result>{};
@@ -1711,6 +1712,9 @@ class MasterService {
         tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
             const WeightMetadataSnapshot* frozen_weight_metadata = nullptr);
 
+        // Replace the metadata this service publishes with the payload's: every
+        // tenant route is dropped first, so a key the payload does not carry
+        // cannot survive from the state this call started from.
         tl::expected<void, SerializationError> Deserialize(
             const std::vector<uint8_t>& data);
 
@@ -1815,6 +1819,8 @@ class MasterService {
     std::atomic<uint64_t> promotion_in_flight_{0};
     // Promotion retry candidate state.
     std::atomic<uint64_t> promotion_candidate_count_{0};
+    // The tenant the next retry round starts at, so the tenants a round's
+    // budget did not reach are the first ones it serves next time.
     std::atomic<size_t> promotion_retry_cursor_{0};
     static constexpr size_t kPromotionCandidateLimit = 50000;
     // Retry budget is sized to the condition it waits on: the watermark /
@@ -1826,6 +1832,13 @@ class MasterService {
     // bounds how long an unread key can keep a slot.
     static constexpr uint32_t kPromotionCandidateMaxRetries = 64;
     static constexpr size_t kPromotionRetryBatchSize = 128;
+    // One retry round examines at most this many candidates in total, whatever
+    // their state: kPromotionRetryBatchSize bounds the admissions a round
+    // produces, not the entries it locks on the way there.
+    static constexpr size_t kPromotionRetryScanBudget = 512;
+    // How many candidates the last round examined, so the work a round did is
+    // readable from outside it.
+    std::atomic<size_t> promotion_retry_last_scanned_{0};
     static constexpr size_t kPromotionRetryShardBatch = 64;
     static constexpr std::chrono::milliseconds kPromotionCandidateTtl{300000};
     static constexpr std::chrono::milliseconds

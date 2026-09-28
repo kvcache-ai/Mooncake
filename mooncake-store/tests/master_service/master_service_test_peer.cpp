@@ -149,6 +149,30 @@ size_t MasterServiceTestPeer::CountCandidatesForTesting(
     return service_.PromotionCandidateKeys(tenant_id).size();
 }
 
+void MasterServiceTestPeer::AgeCandidatesPastTtlForTesting() {
+    const auto aged = std::chrono::steady_clock::now() -
+                      MasterService::kPromotionCandidateTtl -
+                      std::chrono::seconds(1);
+    // The index only names keys, so each key is resolved again under its own
+    // entry lock; a key whose entry was replaced in between is skipped.
+    service_.tenants_.Visit(
+        [&](const TenantId& tenant_id,
+            const std::shared_ptr<metadata::Tenant>& handle) {
+            for (const auto& key : service_.PromotionCandidateKeys(tenant_id)) {
+                auto entry = handle->Get(key);
+                if (entry == nullptr) {
+                    continue;
+                }
+                entry->WithExclusiveAccess(
+                    [&](ObjectMetadata&, ObjectEntry::State& state) {
+                        if (state.promotion_candidate.has_value()) {
+                            state.promotion_candidate->last_seen = aged;
+                        }
+                    });
+            }
+        });
+}
+
 void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
     const auto epoch = std::chrono::steady_clock::time_point{};
     // The index only names keys, so each key is resolved again under its own

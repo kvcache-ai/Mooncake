@@ -40,6 +40,15 @@ class PromotionOnHitTest : public ::testing::Test {
         FLAGS_logtostderr = true;
     }
 
+    // Leaves no background pass running a retry round of its own, so a test
+    // that counts what one round examines and drops sees only its own.
+    static void QuiesceEvictionWorker(MasterService& service) {
+        MasterServiceTestPeer::EvictionRunning(service) = false;
+        if (MasterServiceTestPeer::EvictionThread(service).joinable()) {
+            MasterServiceTestPeer::EvictionThread(service).join();
+        }
+    }
+
     void TearDown() override {
         for (const auto& path : policy_files_) {
             std::error_code ec;
@@ -70,6 +79,10 @@ class PromotionOnHitTest : public ::testing::Test {
 
     static void ResetCandidateBackoffsForTesting(MasterService* service) {
         MasterServiceTestPeer(*service).ResetCandidateBackoffsForTesting();
+    }
+
+    static void AgeCandidatesPastTtlForTesting(MasterService* service) {
+        MasterServiceTestPeer(*service).AgeCandidatesPastTtlForTesting();
     }
 
     static size_t RunPromotionCandidateRetryForTesting(MasterService* service) {
@@ -3207,6 +3220,167 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
         0u);
     EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 0u);
     EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+
+    service->RemoveAll();
+}
+
+// One round of retries examines a bounded number of candidates, whatever their
+// state, and the round after it continues where this one stopped: a tenant
+// whose index is larger than the budget is still walked to its end.
+TEST_F(PromotionOnHitTest, RetryCandidate_ScanBudgetBoundsOneRound) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+    QuiesceEvictionWorker(*service);
+
+    constexpr size_t seg_size = 1024 * 1024 * 64;
+    auto seg =
+        PrepareSegment(*service, "budget_seg", kDefaultSegmentBase, seg_size);
+
+    // One candidate past a round's whole scan budget.
+    const size_t kCandidates =
+        MasterServiceTestPeer::kPromotionRetryScanBudget + 8;
+    for (size_t i = 0; i < kCandidates; ++i) {
+        const std::string key = "k_budget_" + std::to_string(i);
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 512,
+                                           seg.segment_name));
+        auto r = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(
+        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
+        kCandidates);
+
+    // Every candidate is expired, so each one this round examines is dropped
+    // and the drop count is the number of candidates the round examined.
+    AgeCandidatesPastTtlForTesting(service.get());
+
+    const size_t queued = RunPromotionCandidateRetryForTesting(service.get());
+    EXPECT_EQ(queued, 0u);
+    EXPECT_EQ(MasterServiceTestPeer::PromotionRetryLastScanned(*service).load(
+                  std::memory_order_relaxed),
+              MasterServiceTestPeer::kPromotionRetryScanBudget);
+    EXPECT_EQ(
+        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
+        kCandidates - MasterServiceTestPeer::kPromotionRetryScanBudget)
+        << "one round must not examine more candidates than its budget";
+
+    // The rounds after it resume instead of restarting, so the rest of the
+    // index is reached and the whole tenant drains.
+    for (size_t round = 0; round < 4; ++round) {
+        RunPromotionCandidateRetryForTesting(service.get());
+    }
+    EXPECT_EQ(
+        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
+        0u);
+
+    service->RemoveAll();
+}
+
+// A round serves every tenant it visits: a tenant whose index is far larger
+// than one round's share does not keep the others out of that round.
+TEST_F(PromotionOnHitTest, RetryCandidate_RoundServesEveryTenant) {
+    const std::string big_tenant = "tenant_share_big";
+    const std::string small_tenant = "tenant_share_small";
+
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.tenant_quota_connector_uri = WriteTenantQuotaPolicyFile(
+        {{big_tenant, 1024 * 1024}, {small_tenant, 1024 * 1024}});
+    auto service = std::make_unique<MasterService>(config);
+    QuiesceEvictionWorker(*service);
+
+    constexpr size_t seg_size = 1024 * 1024 * 64;
+    auto seg =
+        PrepareSegment(*service, "share_seg", kDefaultSegmentBase, seg_size);
+
+    const size_t kBigCandidates =
+        MasterServiceTestPeer::kPromotionRetryScanBudget;
+    for (size_t i = 0; i < kBigCandidates; ++i) {
+        const std::string key = "k_big_" + std::to_string(i);
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 512,
+                                           seg.segment_name, big_tenant));
+        auto r = service->GetReplicaList(key, TenantId(big_tenant));
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_small", 512,
+                                       seg.segment_name, small_tenant));
+    ASSERT_TRUE(
+        service->GetReplicaList("k_small", TenantId(small_tenant)).has_value());
+    ASSERT_EQ(
+        CountPromotionCandidatesForTesting(service.get(), TenantId(big_tenant)),
+        kBigCandidates);
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(),
+                                                 TenantId(small_tenant)),
+              1u);
+
+    AgeCandidatesPastTtlForTesting(service.get());
+
+    RunPromotionCandidateRetryForTesting(service.get());
+
+    EXPECT_LE(MasterServiceTestPeer::PromotionRetryLastScanned(*service).load(
+                  std::memory_order_relaxed),
+              MasterServiceTestPeer::kPromotionRetryScanBudget);
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(),
+                                                 TenantId(small_tenant)),
+              0u)
+        << "the round must reach the tenant after the large one";
+    EXPECT_GE(
+        CountPromotionCandidatesForTesting(service.get(), TenantId(big_tenant)),
+        1u)
+        << "the large tenant must not be drained by the small one's share";
+
+    service->RemoveAll();
+}
+
+// The slice a retry round takes resumes after the key the previous one stopped
+// on and wraps once, so successive slices cover the index without repeating a
+// key before it is exhausted.
+TEST_F(PromotionOnHitTest, RetryCandidate_SliceResumesThroughTheIndex) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "slice_seg", kDefaultSegmentBase, seg_size);
+
+    const std::vector<std::string> keys{"k_slice_a", "k_slice_b", "k_slice_c"};
+    for (const auto& key : keys) {
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 512,
+                                           seg.segment_name));
+        ASSERT_TRUE(
+            service->GetReplicaList(key, TenantId::Default()).has_value());
+    }
+
+    const auto slice = [&](size_t limit) {
+        return MasterServiceTestPeer::TakePromotionCandidateSlice(
+            *service, TenantId::Default(), limit);
+    };
+
+    // The index is ordered, so each slice is the next `limit` keys: the first
+    // two, then the key after them filled out by wrapping to the beginning.
+    // That wrap covered the whole index, so the slice after it starts over.
+    EXPECT_EQ(slice(2), (std::vector<std::string>{keys[0], keys[1]}));
+    EXPECT_EQ(slice(2), (std::vector<std::string>{keys[2], keys[0]}));
+    EXPECT_EQ(slice(2), (std::vector<std::string>{keys[0], keys[1]}));
+
+    // A slice is never larger than the limit it was asked for.
+    EXPECT_EQ(slice(1).size(), 1u);
 
     service->RemoveAll();
 }

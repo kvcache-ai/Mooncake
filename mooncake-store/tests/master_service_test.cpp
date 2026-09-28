@@ -1303,6 +1303,91 @@ TEST_F(MasterServiceTest, SnapshotReloadDropsReplicaActionState) {
     EXPECT_EQ(committed_quota, slice_length);
 }
 
+namespace {
+
+// The tenants the registry holds: one per tenant id a publish path created.
+size_t RegisteredTenantCount(MasterService& service) {
+    size_t count = 0;
+    MasterServiceTestPeer::Tenants(service).Visit(
+        [&](const TenantId&, const std::shared_ptr<metadata::Tenant>&) {
+            ++count;
+        });
+    return count;
+}
+
+}  // namespace
+
+// A request that publishes nothing must not register a tenant: a client naming
+// a tenant id this service never stored into would otherwise grow the registry
+// with an empty tenant per request.
+TEST_F(MasterServiceTest, MissDoesNotRegisterTenant) {
+    const TenantId tenant("tenant_miss_scope");
+    auto service = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({tenant.value()}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const size_t tenants_before = RegisteredTenantCount(*service);
+
+    // A remove for an unregistered tenant and for a key the registered tenant
+    // does not publish.
+    EXPECT_FALSE(service->Remove("missing_key", TenantId("tenant_never_used"))
+                     .has_value());
+    EXPECT_FALSE(service->Remove("missing_key", tenant).has_value());
+    EXPECT_FALSE(service
+                     ->PutRevoke(generate_uuid(), "missing_key", tenant,
+                                 ReplicaType::MEMORY)
+                     .has_value());
+    EXPECT_EQ(service->GetReplicaList("missing_key", tenant).has_value(),
+              false);
+    EXPECT_EQ(RegisteredTenantCount(*service), tenants_before);
+
+    // Publishing under a configured tenant registers it, and only it.
+    PutCompletedObject(*service, context.client_id, "published_key", tenant,
+                       ReplicateConfig{.replica_num = 1}, 1024);
+    EXPECT_EQ(RegisteredTenantCount(*service), tenants_before + 1);
+    EXPECT_EQ(MasterServiceTestPeer::FindObject(
+                  *service,
+                  MasterServiceTestPeer::ObjectIdentity{
+                      tenant, "published_key"}) != nullptr,
+              true);
+}
+
+// Decoding a snapshot replaces the metadata the routes hold: a payload that
+// carries no objects leaves no object behind, so a key the payload does not
+// carry cannot survive from the state the service was in.
+TEST_F(MasterServiceTest, SnapshotDecodeReplacesPublishedMetadata) {
+    const TenantId tenant("tenant_snapshot_scope");
+    const std::string key = "snapshot_key";
+
+    MasterService service(MakeStrictTenantConfig({tenant.value()}));
+    const auto context = PrepareSimpleSegment(service);
+    PutCompletedObject(service, context.client_id, key, tenant,
+                       ReplicateConfig{.replica_num = 1}, 1024);
+    ASSERT_NE(MasterServiceTestPeer::FindObject(
+                  service, MasterServiceTestPeer::ObjectIdentity{tenant, key}),
+              nullptr);
+    ASSERT_EQ(RegisteredTenantCount(service), 1u);
+
+    // The payload of a service that holds no object, which for a snapshot of
+    // this one would mean the tenant's objects are gone.
+    std::vector<uint8_t> empty_payload;
+    {
+        MasterService empty(MakeStrictTenantConfig({tenant.value()}));
+        MasterServiceTestPeer::MetadataSerializer serializer(&empty);
+        auto encoded = serializer.Serialize();
+        ASSERT_TRUE(encoded.has_value());
+        empty_payload = std::move(*encoded);
+    }
+
+    MasterServiceTestPeer::MetadataSerializer reader(&service);
+    ASSERT_TRUE(reader.Deserialize(empty_payload).has_value());
+
+    EXPECT_EQ(MasterServiceTestPeer::FindObject(
+                  service, MasterServiceTestPeer::ObjectIdentity{tenant, key}),
+              nullptr)
+        << "a key the payload does not carry must not survive the decode";
+    EXPECT_EQ(RegisteredTenantCount(service), 0u);
+}
+
 TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
     const TenantId tenant_a("tenant_get_all_keys_a");
     auto service_ = std::make_unique<MasterService>(MakeStrictTenantConfig(
@@ -2015,39 +2100,6 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
               << "Keys created: " << kNumKeys << "\n"
               << "Creation time: " << total_create_duration.count() << "ms\n"
               << "Unmount time: " << unmount_duration.count() << "ms\n";
-}
-
-TEST_F(MasterServiceTest, ShrinkBucketsIfSparseThresholds) {
-    // Small containers stay untouched regardless of sparsity: their bucket
-    // memory is negligible and rehash churn is not worth it.
-    std::unordered_map<std::string, int> small;
-    small.emplace("small_key", 0);
-    const size_t small_buckets = small.bucket_count();
-    ASSERT_LE(small_buckets, kShrinkMinBucketCount);
-    ShrinkBucketsIfSparse(small);
-    EXPECT_EQ(small.bucket_count(), small_buckets);
-
-    // Grow a map well past the bucket floor, then erase most entries: the
-    // bucket array keeps its high-water size until explicitly shrunk.
-    std::unordered_map<std::string, int> map;
-    for (size_t i = 0; i < 4 * kShrinkMinBucketCount; ++i) {
-        map.emplace("key" + std::to_string(i), 0);
-    }
-    const size_t high_water = map.bucket_count();
-    ASSERT_GT(high_water, kShrinkMinBucketCount);
-
-    // At exactly a quarter full there is nothing to shrink yet.
-    while (map.size() > high_water / 4) {
-        map.erase(map.begin());
-    }
-    ShrinkBucketsIfSparse(map);
-    EXPECT_EQ(map.bucket_count(), high_water);
-
-    // One more erase crosses the threshold and triggers the shrink.
-    map.erase(map.begin());
-    ShrinkBucketsIfSparse(map);
-    EXPECT_LT(map.bucket_count(), high_water);
-    EXPECT_GE(map.bucket_count(), map.size());
 }
 
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {

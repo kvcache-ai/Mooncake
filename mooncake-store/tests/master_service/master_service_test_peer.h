@@ -44,6 +44,8 @@ class MasterServiceTestPeer {
         MasterService::kObjectOperationLockStripes;
     static constexpr auto kPromotionCandidateMaxRetries =
         MasterService::kPromotionCandidateMaxRetries;
+    static constexpr auto kPromotionRetryScanBudget =
+        MasterService::kPromotionRetryScanBudget;
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
@@ -103,6 +105,10 @@ class MasterServiceTestPeer {
     size_t CountCandidatesForTesting(const TenantId& tenant_id);
 
     void ResetCandidateBackoffsForTesting();
+
+    // Ages every candidate past its TTL, so the next retry round that examines
+    // one drops it.
+    void AgeCandidatesPastTtlForTesting();
 
     size_t SoftPinHeapSize() const;
 
@@ -269,6 +275,20 @@ class MasterServiceTestPeer {
     }
     static const auto& PromotionRetryCursor(const MasterService& service) {
         return service.promotion_retry_cursor_;
+    }
+
+    static auto& PromotionRetryLastScanned(MasterService& service) {
+        return service.promotion_retry_last_scanned_;
+    }
+    static const auto& PromotionRetryLastScanned(const MasterService& service) {
+        return service.promotion_retry_last_scanned_;
+    }
+
+    // The next slice of one tenant's candidate index, as the retry sweep takes
+    // it.
+    static std::vector<std::string> TakePromotionCandidateSlice(
+        MasterService& service, const TenantId& tenant_id, size_t limit) {
+        return service.TakePromotionCandidateSlice(tenant_id, limit);
     }
 
     static auto& ReplicaCleanupWorker(MasterService& service) {
