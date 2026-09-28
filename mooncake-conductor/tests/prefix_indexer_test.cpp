@@ -72,6 +72,26 @@ HashProfile PickleProfile() {
             .index_projection = "low64_be"};
 }
 
+// SGLang chains carry no Python seed root, so the resolver pins an all-zero
+// sentinel digest for the registration wire contract.
+HashProfile SglangProfile() {
+    return {.strategy = "sglang",
+            .algorithm = "sha256_raw",
+            .python_hash_seed = "0",
+            .root_digest = std::string(64, '0'),
+            .index_projection = "first64_be"};
+}
+
+// The bigram chains hash token pairs, so they carry one fewer logical position
+// than the prompt has tokens.
+HashProfile SglangBigramProfile() {
+    return {.strategy = "sglang_bigram",
+            .algorithm = "sha256_raw",
+            .python_hash_seed = "0",
+            .root_digest = std::string(64, '0'),
+            .index_projection = "first64_be"};
+}
+
 EngineRegistration Registration(const std::string& instance_id = "instance-a",
                                 int64_t dp_rank = 0) {
     const ContextKey context = TestContext();
@@ -167,6 +187,49 @@ std::vector<ProjectedPrefix> Hashes(
     std::vector<HashBlock> blocks;
     error = strategy->Compute(TestContext(), tokens, std::move(cache_salt),
                               &blocks);
+    EXPECT_TRUE(error.empty()) << error;
+
+    std::vector<ProjectedPrefix> prefixes;
+    prefixes.reserve(blocks.size());
+    for (const HashBlock& block : blocks) {
+        prefixes.push_back(block.projected);
+    }
+    return prefixes;
+}
+
+std::vector<ProjectedPrefix> SglangHashes(const std::vector<int32_t>& tokens) {
+    std::string error;
+    auto strategy = mooncake::conductor::prefixindex::CreateHashStrategy(
+        SglangProfile(), &error);
+    EXPECT_TRUE(error.empty()) << error;
+    if (!strategy) {
+        return {};
+    }
+
+    std::vector<HashBlock> blocks;
+    error = strategy->Compute(TestContext(), tokens, std::nullopt, &blocks);
+    EXPECT_TRUE(error.empty()) << error;
+
+    std::vector<ProjectedPrefix> prefixes;
+    prefixes.reserve(blocks.size());
+    for (const HashBlock& block : blocks) {
+        prefixes.push_back(block.projected);
+    }
+    return prefixes;
+}
+
+std::vector<ProjectedPrefix> SglangBigramHashes(
+    const std::vector<int32_t>& tokens) {
+    std::string error;
+    auto strategy = mooncake::conductor::prefixindex::CreateHashStrategy(
+        SglangBigramProfile(), &error);
+    EXPECT_TRUE(error.empty()) << error;
+    if (!strategy) {
+        return {};
+    }
+
+    std::vector<HashBlock> blocks;
+    error = strategy->Compute(TestContext(), tokens, std::nullopt, &blocks);
     EXPECT_TRUE(error.empty()) << error;
 
     std::vector<ProjectedPrefix> prefixes;
@@ -610,6 +673,106 @@ TEST(Query, ExactTwoInstanceSharedCacheExample) {
         (std::map<int64_t, RankCacheHitResult>{{1, RankMatch(0, 48, 48)}}));
     EXPECT_EQ(second.cpu, 48);
     EXPECT_EQ(second.disk, 48);
+}
+
+TEST(Query, TrailingPartialBlockNeverReportsMoreThanPromptTokens) {
+    PrefixCacheTable table;
+    auto registration = Registration();
+    registration.profile = SglangProfile();
+    RegisterOrFail(table, registration);
+
+    // 40 tokens over a 16-token block size: two whole blocks plus a trailing
+    // block that only covers 8 tokens.
+    const auto tokens = Tokens(40);
+    const auto hashes = SglangHashes(tokens);
+    ASSERT_EQ(hashes.size(), 3u);
+
+    ASSERT_EQ(table.StoreGpu(Gpu({hashes[0], hashes[1], hashes[2]})), "");
+    ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kCpu)), "");
+    ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kDisk)), "");
+
+    const auto result = table.Query(TestContext(), tokens).at("instance-a");
+    EXPECT_EQ(result.longest_match_tokens, 40);
+    EXPECT_EQ(result.gpu, 40);
+    EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 40}}));
+    EXPECT_EQ(
+        result.rank_matches,
+        (std::map<int64_t, RankCacheHitResult>{{0, RankMatch(40, 40, 40)}}));
+    EXPECT_EQ(result.cpu, 40);
+    EXPECT_EQ(result.disk, 40);
+}
+
+TEST(Query, WholeBlockRunIsUnaffectedByThePromptLengthClamp) {
+    PrefixCacheTable table;
+    auto registration = Registration();
+    registration.profile = SglangProfile();
+    RegisterOrFail(table, registration);
+
+    const auto tokens = Tokens(40);
+    const auto hashes = SglangHashes(tokens);
+    ASSERT_EQ(hashes.size(), 3u);
+
+    // Only the two whole blocks are indexed; the partial tail misses.
+    ASSERT_EQ(
+        table.StoreShared(Shared({hashes[0], hashes[1]}, StorageTier::kDisk)),
+        "");
+
+    const auto result = table.Query(TestContext(), tokens).at("instance-a");
+    EXPECT_EQ(result.longest_match_tokens, 32);
+    EXPECT_EQ(result.gpu, 0);
+    EXPECT_EQ(result.cpu, 0);
+    EXPECT_EQ(result.disk, 32);
+}
+
+TEST(Query, BigramFullMatchReportsOneFewerPositionThanPromptTokens) {
+    PrefixCacheTable table;
+    auto registration = Registration();
+    registration.profile = SglangBigramProfile();
+    RegisterOrFail(table, registration);
+
+    // 40 raw tokens over a 16-token block size. The bigram chain covers 39
+    // logical positions, so it is two whole blocks plus a trailing block of 7.
+    const auto tokens = Tokens(40);
+    const auto hashes = SglangBigramHashes(tokens);
+    ASSERT_EQ(hashes.size(), 3u);
+
+    ASSERT_EQ(table.StoreGpu(Gpu({hashes[0], hashes[1], hashes[2]})), "");
+    ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kCpu)), "");
+    ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kDisk)), "");
+
+    // 39, not 40 and not the 48 a whole-block count would report.
+    const auto result = table.Query(TestContext(), tokens).at("instance-a");
+    EXPECT_EQ(result.longest_match_tokens, 39);
+    EXPECT_EQ(result.gpu, 39);
+    EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 39}}));
+    EXPECT_EQ(
+        result.rank_matches,
+        (std::map<int64_t, RankCacheHitResult>{{0, RankMatch(39, 39, 39)}}));
+    EXPECT_EQ(result.cpu, 39);
+    EXPECT_EQ(result.disk, 39);
+}
+
+TEST(Query, BigramWholeBlockRunIsUnaffectedByTheLogicalLengthClamp) {
+    PrefixCacheTable table;
+    auto registration = Registration();
+    registration.profile = SglangBigramProfile();
+    RegisterOrFail(table, registration);
+
+    const auto tokens = Tokens(40);
+    const auto hashes = SglangBigramHashes(tokens);
+    ASSERT_EQ(hashes.size(), 3u);
+
+    // Only the two whole blocks are indexed; the partial tail misses. The
+    // clamp must not pull this below the 32 positions those blocks hold.
+    ASSERT_EQ(
+        table.StoreShared(Shared({hashes[0], hashes[1]}, StorageTier::kDisk)),
+        "");
+
+    const auto result = table.Query(TestContext(), tokens).at("instance-a");
+    EXPECT_EQ(result.longest_match_tokens, 32);
+    EXPECT_EQ(result.gpu, 0);
+    EXPECT_EQ(result.cpu, 0);
+    EXPECT_EQ(result.disk, 32);
 }
 
 TEST(Query, GpuCpuAndDiskExtendOneCumulativePrefix) {

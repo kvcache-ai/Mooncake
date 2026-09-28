@@ -19,10 +19,25 @@
 /python/mooncake/allocator_ascend_npu.py @ShangmingCai @alogfans @ascend-direct-dev
 /python/mooncake/fabric_allocator_utils.py @ShangmingCai @alogfans
 /python/tests/allocators/ @ShangmingCai @alogfans
+/python/mooncake/http_metadata_server.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/async_store.py @ykwd @stmatengss @zxpdemonio
+/python/tests/store/async_store_integration.py @ykwd @stmatengss @zxpdemonio
+/python/tests/store/test_async_store.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/buffer_pool.py @ykwd @stmatengss
 /python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/mooncake_config.py @ykwd @stmatengss
 /python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
+/python/tests/services/test_http_metadata_server.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/cli.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/cli_client.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/cli_bench.py @ShangmingCai @alogfans @stmatengss
+/python/mooncake/transfer_engine_topology_dump.py @ShangmingCai @alogfans @stmatengss
+/python/tests/integration/test_cli.py @ShangmingCai @stmatengss @zxpdemonio
+/python/tests/unit/test_cli_modules.py @ShangmingCai @stmatengss @zxpdemonio
+/python/tests/store/ @ykwd @stmatengss
+/python/tests/unit/test_mooncake_config.py @ykwd @stmatengss
 /python/mooncake/mooncake_ssd_*.py @ykwd @stmatengss
 /python/mooncake/spdk_tgt_create.py @ykwd @stmatengss
 /python/tests/ssd/ @ykwd @stmatengss
@@ -33,4 +48,6 @@
 /mooncake-transfer-engine/*/transport/efa_transport/ @alogfans @whn09
 /mooncake-wheel @ShangmingCai @stmatengss @zxpdemonio
 /scripts/tone_tests @luketong777
+/scripts/rocm_tests @andyluo7
+/scripts/e2e @luketong777 @andyluo7 @Aionw
 /scripts/ascend/ @ascend-direct-dev @VNightMare @MingYang119

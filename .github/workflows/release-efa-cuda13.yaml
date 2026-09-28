@@ -11,8 +11,13 @@ jobs:
     if: ${{ !contains(github.ref_name, '-') }}
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x86_64, arm64]
     uses: ./.github/workflows/_build-efa-wheel.yaml
     with:
+      architecture: ${{ matrix.architecture }}
       variant: cuda13
       python-versions: '["3.10", "3.11", "3.12", "3.13"]'
       build-profile: release

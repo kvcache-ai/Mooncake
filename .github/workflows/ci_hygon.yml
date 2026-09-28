@@ -30,6 +30,7 @@ jobs:
       - name: Checkout PR source
         uses: actions/checkout@v4
         with:
+          allow-unsafe-pr-checkout: true
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
@@ -149,6 +150,7 @@ jobs:
       - name: Checkout authorized PR test scripts
         uses: actions/checkout@v4
         with:
+          allow-unsafe-pr-checkout: true
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
@@ -230,6 +232,7 @@ jobs:
       - name: Checkout authorized PR test scripts
         uses: actions/checkout@v4
         with:
+          allow-unsafe-pr-checkout: true
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1

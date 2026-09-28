@@ -194,6 +194,11 @@ Status TransferEngine::submitTransfer(
     return impl_->submitTransfer(batch_id, entries);
 }
 
+Status TransferEngine::submitScatterTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    return impl_->submitTransfer(batch_id, entries);
+}
+
 Status TransferEngine::submitTransferWithNotify(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     TransferMetadata::NotifyDesc notify_msg) {
@@ -459,6 +464,33 @@ TransferEngine::TransferEngine(bool auto_discover) {
     if (!use_tent_) {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover);
     }
+}
+
+Status TransferEngine::submitScatterTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    if (use_tent_) {
+        std::vector<mooncake::tent::Request> requests;
+        requests.reserve(entries.size());
+        for (const auto& item : entries) {
+            mooncake::tent::Request req;
+            req.opcode =
+                static_cast<mooncake::tent::Request::OpCode>(item.opcode);
+            req.length = item.length;
+            req.source = item.source;
+            req.target_id = item.target_id;
+            req.target_offset = item.target_offset;
+            req.transport_hint =
+                mooncake::tent::c_to_transport_hint(item.transport_hint);
+            requests.push_back(req);
+        }
+        auto status = impl_tent_->submitTransferRequiringPostSubmitCancellation(
+            batch_id, requests);
+        if (status.ok()) return Status::OK();
+        if (status.IsNotImplemented())
+            return Status::NotImplemented(status.message());
+        return Status::Context(status.ToString());
+    }
+    return impl_->submitTransfer(batch_id, entries);
 }
 
 TransferEngine::TransferEngine(bool auto_discover,
@@ -1313,6 +1345,80 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #endif
     }
 
+    bool legacyBatchPhysicallyDrained() {
+        if (useTent() || batch_id_ == INVALID_BATCH_ID) return false;
+        auto& batch = Transport::toBatchDesc(batch_id_);
+        for (auto& task : batch.task_list) {
+            if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE)) continue;
+            const auto slice_count =
+                __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+            const auto success_count =
+                __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+            const auto failure_count =
+                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+            if (legacy_submit_failed_ && slice_count == 0) {
+                __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+                continue;
+            }
+            if (slice_count == 0 || success_count > slice_count ||
+                failure_count > slice_count - success_count)
+                return false;
+            if (success_count + failure_count != slice_count) return false;
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            // The completion thread publishes is_finished only after its final
+            // access to the batch. Slice counters can become complete earlier.
+            return false;
+#endif
+        }
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+        for (auto& task : batch.task_list)
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+#endif
+        return true;
+    }
+
+    bool finishDrainedLegacyFailure(const Status& status) {
+        if (!legacyBatchPhysicallyDrained()) return false;
+        remember(status);
+        size_t request_index = 0;
+        for (size_t task_id = 0; task_id < task_sizes_.size(); ++task_id) {
+            const size_t request_start = request_index;
+            request_index += task_sizes_[task_id];
+            if (done_[request_start]) continue;
+
+            std::vector<TransferStatusEnum> request_statuses;
+            auto detail_status = backend_.legacy->getScatterRequestStatuses(
+                batch_id_, task_id, request_statuses);
+            if (!detail_status.ok() ||
+                request_statuses.size() != task_sizes_[task_id]) {
+                remember(detail_status.ok()
+                             ? Status::Context(
+                                   "invalid grouped scatter status count")
+                             : detail_status);
+                continue;
+            }
+            for (size_t i = request_start; i < request_index; ++i) {
+                const auto fragment_status =
+                    request_statuses[i - request_start] ==
+                            TransferStatusEnum::COMPLETED
+                        ? Status::OK()
+                        : Status::Socket("scatter transfer fragment failed");
+                completeRequest(i, fragment_status);
+            }
+        }
+        // Fragment callbacks may inspect state associated with the live batch.
+        // Resolve every callback before releasing that batch.
+        failPending(status);
+        auto free_status = freeBatch(batch_id_);
+        if (!free_status.ok()) {
+            remember(free_status);
+            return false;
+        }
+        batch_id_ = INVALID_BATCH_ID;
+        finish();
+        return true;
+    }
+
     void build(TransferEngine& engine,
                const std::vector<ScatterTransferRange>& ranges) {
         for (size_t range_index = 0; range_index < ranges.size();
@@ -1397,7 +1503,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
             task_sizes_.assign(requests_.size(), 1);
             batch_id_ = engine.allocateBatchID(requests_.size());
             if (batch_id_ != INVALID_BATCH_ID)
-                submit_status = engine.submitTransfer(batch_id_, requests_);
+                submit_status =
+                    engine.submitScatterTransfer(batch_id_, requests_);
         } else {
             MultiTransport::ScatterSubmission submission;
             submit_status =
@@ -1439,6 +1546,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #endif
 
         requestAbort(submit_status);
+        legacy_submit_failed_ = true;
         // Published tasks own the exact fragment results, even when submit
         // itself reports an error. Poll them to physical completion.
         if (!task_sizes_.empty()) return;
@@ -1458,6 +1566,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
             auto result = getStatus(batch_id_, task_id, status);
             if (!result.ok()) {
                 requestAbort(result);
+                if (finishDrainedLegacyFailure(result)) return;
                 continue;
             }
 
@@ -1498,7 +1607,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 fragment_status =
                     Status::Socket("scatter transfer fragment timed out");
                 requestAbort(fragment_status);
-                if (!useTent()) continue;
+                if (!useTent()) {
+                    if (finishDrainedLegacyFailure(fragment_status)) return;
+                    continue;
+                }
             } else {
                 fragment_status =
                     Status::Socket("scatter transfer fragment failed");
@@ -1529,6 +1641,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
     size_t remaining_ = 0;
     Status aggregate_status_;
     bool abort_requested_ = false;
+    // A failed submit with zero slices is unpublished because the Transport
+    // contract forbids publishing slices after submitTransferTask() returns.
+    bool legacy_submit_failed_ = false;
     bool completed_ = false;
 };
 
