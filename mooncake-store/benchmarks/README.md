@@ -108,11 +108,10 @@ The Python monitor uses only the standard library; it requires Linux and
 To check the RPC path manually, run the launcher below with
 `--trace mooncake-store/benchmarks/master_rpc_trace_example.jsonl`. After cleanup,
 `result.json` should report `success: true`.
-The example registers two request clients and one storage client, explicitly
-mounts a 64 MiB segment after the request clients send Ping, and unmounts it
-after the reads complete. The storage client sends another Ping after unmount.
-`replay.json` should show 12 calls, including one Exist miss,
-two successful Get keys and three successful Ping calls. This small example
+The example registers two request clients and one storage client, mounts a
+64 MiB segment, and unmounts it after the reads complete.
+`replay.json` should show 9 recorded calls, including one Exist miss and two
+successful Get keys. Background Ping calls are reported separately. This example
 does not validate eviction.
 
 ### Run and monitor
@@ -140,8 +139,9 @@ to 2 and enables master metrics. The master retains its default KV read lease
 TTL.
 
 For manual master management, invoke the C++ binary with `--trace`,
-`--master_server`, `--output` and `--samples`.
-It creates one worker per distinct `client_id`; worker count is not configurable.
+`--master_server`, `--output`, `--samples` and `--heartbeats`.
+It creates one trace worker per distinct `client_id`; worker count is not
+configurable. Each registered client also has an independent heartbeat thread.
 The replayer loads the trace once before issuing RPCs and checks that its header
 uses a supported format. There is no separate validation pass; the producer is
 responsible for satisfying the trace contract below.
@@ -157,15 +157,14 @@ The first nonblank JSONL row is a header:
 Every event has `id`, `client_id`, `op` and `timestamp_us`. Timestamps are
 nonnegative integer microseconds relative to a single replay start, sorted
 throughout the file. These differ from AutoBench request times in milliseconds.
-Parsing and connection setup precede replay. Registration, mount, unmount, Ping
-and key operations share the same timeline and may be interleaved.
+Parsing and connection setup precede replay. Registration, mount, unmount and
+key operations share the same timeline and may be interleaved.
 
 | Operation | Additional fields |
 | --- | --- |
 | `ReMountSegment` | `segments: []`; one initial handshake per client, before its other events. |
 | `MountSegment` | `segment_id`, positive `size_bytes`. |
 | `UnmountSegment` | `segment_id`; same owner as mount. |
-| `Ping` | No additional fields; omit `keys`. Uses the event's client identity. |
 | `BatchExistKey`, `BatchGetReplicaList`, `BatchRemove` | Nonempty ordered `keys`. |
 | `BatchPutStart` | `keys`, either `value_sizes` or `value_slices`, optional `replica_num` (default 1). |
 | `BatchPutEnd`, `BatchPutRevoke` | Same client and ordered keys as Start, plus `put_start` referencing its ID. |
@@ -185,13 +184,8 @@ The replayer sends only recorded lifecycle calls, including unmounts. A trace
 may end with segments still mounted; the launcher then stops its dedicated
 master. Nonempty remount recovery is unsupported.
 
-Ping is supported after client registration. Like other events,
-it uses its client's worker, original timestamps and completion dependencies.
-For example, a workload heartbeat can be recorded as:
-
-```json
-{"id":"ping-0","timestamp_us":1000000,"client_id":"worker-0","op":"Ping","depends_on":["register-0"]}
-```
+Do not include `Ping` events or dependencies on them. The replayer rejects
+recorded Ping events and owns heartbeat timing, as described below.
 
 Each Start requires exactly one End or Revoke. `put_start` implies a completion
 dependency; unsuccessful Start keys are skipped at End/Revoke. If all keys are
@@ -208,7 +202,7 @@ not imply success. Producers must preserve write/read/remove ordering for shared
 keys, including reads that must precede a later mutation. Producers must also
 preserve serial call-flow dependencies, including completion of a blocking put
 before the next batch in that flow. Different clients can execute concurrently;
-all flows sharing a client are serialized in file order by its single worker.
+all recorded flows sharing a client are serialized in file order by its worker.
 Unknown fields are ignored. Event fields and lifecycle
 consistency are not prevalidated; JSON decoding or dependency lookup can still
 fail while loading a malformed trace.
@@ -223,7 +217,8 @@ modeled. Do not silently discard these semantics in a producer.
 ### Arrival control and results
 
 Timestamps are replayed unchanged, relative to the replay start. Each client has
-one worker and at most one API call in flight. A slow call delays later calls
+one trace worker and at most one recorded API call in flight. Its background
+Ping may overlap that call. A slow recorded call delays later recorded calls
 from that client, even if their timestamps differ. Overdue events stay queued;
 planned arrival times do not move to conceal overload. Dispatch lag includes
 waiting for earlier calls from the same client, dependencies and scheduling.
@@ -237,6 +232,7 @@ directory:
 run-001/
   result.json
   samples.jsonl
+  heartbeats.jsonl
   traffic.json
   evictions.json
   replay.json
@@ -253,6 +249,7 @@ For example, `result.json` contains these references alongside its summaries:
 {
   "success": true,
   "samples": "samples.jsonl",
+  "heartbeats": "heartbeats.jsonl",
   "traffic": "traffic.json",
   "evictions": "evictions.json"
 }
@@ -261,16 +258,22 @@ For example, `result.json` contains these references alongside its summaries:
 The files contain:
 
 - `replay.json`: per-operation summaries, key outcomes,
-  P50/P95/P99/max call latency and dispatch lag. Explicit Ping calls have their
-  own operation entry, with zero keys.
+  P50/P95/P99/max call latency and dispatch lag for recorded operations.
+  `heartbeats` separately reports Ping calls, failures, client count, response
+  latency percentiles and the interval between a response and the next Ping.
 - `samples.jsonl`: planned/start/finish times, issued calls,
   original key counts, outcomes and errors. Written after timed replay.
+- `heartbeats.jsonl`: generated Ping client IDs, start/finish times relative to
+  the same replay origin, and errors. Rows are grouped by client, and are written
+  after the heartbeat threads stop. An in-flight Ping can finish after the last
+  trace event; it is included here and in the heartbeat summary.
 - `process.jsonl`: monotonic time, CPU seconds, RSS and thread counts for the
   master; `metrics.jsonl` and `metrics-before.prom` contain master Prometheus
   metrics. Sampling covers the full replay.
 - `result.json`: success status, `master_process`, `store_sampled_peak`, the
-  replay time window, and references to `samples.jsonl`, `traffic.json` and
-  `evictions.json`. `operations` contains the per-operation counts and latency
+  replay time window, `heartbeat_summary`, and references to `samples.jsonl`,
+  `heartbeats.jsonl`, `traffic.json` and `evictions.json`.
+  `operations` contains the per-operation counts and latency
   summaries, including MountSegment and UnmountSegment.
 - `traffic.json`: traffic totals, one-second offered, sent and completed call
   counts, issued keys and peak calls in flight. All buckets use the replay's
@@ -279,7 +282,8 @@ The files contain:
   throughput includes draining the backlog.
   For an all-at-once trace, the offered average is null; per-second buckets still
   show the burst. Traffic covers the full replay, including registration,
-  mount and unmount.
+  mount and unmount. Generated heartbeats are excluded from these trace traffic
+  statistics; their load is included in measured master CPU and server metrics.
 - `evictions.json`: sampled counter deltas and intervals with eviction activity,
   including allocation failures and incomplete-write discard/release counters.
 - Child process logs.
@@ -317,17 +321,18 @@ MasterClient API invocations; retries can create extra wire traffic. Compare
 server metrics as well. Miss, not-ready and already-exists outcomes have separate
 counts and are not successful-hit counts.
 
-All heartbeats must be explicit `Ping` events in the input, including for
-storage-only clients. The replayer never generates background heartbeats or
-extends a heartbeat schedule while draining overdue calls. Producers should
-record the heartbeat cadence and its time span in metadata. Traces without Ping
-remain valid inputs and send no Ping calls. Under overload, delayed or exhausted
-heartbeats can let clients expire; the replay preserves that behavior instead
-of repairing it. A failed Ping RPC or a non-OK client status is a failed event
-and makes the run unsuccessful. Ping latency, lag and failures are reported like
-other operations, and traffic totals include these calls. Use
-per-operation results when comparing business RPC throughput with older runs
-that generated heartbeats outside the trace.
+After successful registration, each client starts a background Ping loop that
+waits one second after each response before sending again. It shares that
+client's identity and RPC client, but does not wait on the trace worker or its
+dependencies. Every registered client, including storage-only clients, keeps
+pinging until all trace workers finish, covering overdue calls and teardown.
+Shutdown stops the loops and joins any in-flight Ping before writing results.
+The master retains its default liveness timeouts. Slow or failed Ping RPCs can
+still cause expiry; the replayer does not remount or hide these failures.
+A Ping error or non-OK client status makes the run unsuccessful.
+When migrating older traces, remove Ping events and their dependency edges;
+retain ordering between all remaining events. Compare recorded business calls
+separately from heartbeat traffic when comparing measurements.
 
 High replay lag with low master utilization indicates a load-generator limit.
 Vary the input workload or client count and check offered versus achieved rates

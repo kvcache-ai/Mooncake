@@ -255,6 +255,7 @@ def main():
         f"--master_server=127.0.0.1:{rpc_port}",
         f"--output={directory / 'replay.json'}",
         f"--samples={directory / 'samples.jsonl'}",
+        f"--heartbeats={directory / 'heartbeats.jsonl'}",
         "--logtostderr=1",
     ]
     processes = []
@@ -349,6 +350,8 @@ def main():
                 {
                     "success": replayer.returncode == 0 and not replay["has_errors"],
                     "samples": "samples.jsonl",
+                    "heartbeats": "heartbeats.jsonl",
+                    "heartbeat_summary": replay["heartbeats"],
                     "evictions": "evictions.json",
                     "master_process": process_summary(rows, start, finish),
                     "replay_monotonic_window_s": [start, finish],

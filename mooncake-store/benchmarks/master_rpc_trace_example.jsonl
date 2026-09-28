@@ -2,12 +2,9 @@
 {"id":"register-storage-0","timestamp_us":0,"client_id":"storage-0","op":"ReMountSegment","segments":[]}
 {"id":"register-0","timestamp_us":0,"client_id":"instance-0","op":"ReMountSegment","segments":[]}
 {"id":"register-1","timestamp_us":0,"client_id":"instance-1","op":"ReMountSegment","segments":[]}
-{"id":"ping-0","timestamp_us":1000,"client_id":"instance-0","op":"Ping"}
-{"id":"ping-1","timestamp_us":1000,"client_id":"instance-1","op":"Ping"}
 {"id":"mount-storage-0","timestamp_us":2000,"client_id":"storage-0","op":"MountSegment","segment_id":"storage-segment-0","size_bytes":67108864}
 {"id":"write-0","timestamp_us":3000,"client_id":"instance-0","op":"BatchPutStart","keys":["trace-demo/page-0","trace-demo/page-1"],"value_sizes":[4096,4096],"depends_on":["mount-storage-0"]}
 {"id":"commit-0","timestamp_us":4000,"client_id":"instance-0","op":"BatchPutEnd","keys":["trace-demo/page-0","trace-demo/page-1"],"put_start":"write-0"}
 {"id":"exists-1","timestamp_us":5000,"client_id":"instance-1","op":"BatchExistKey","keys":["trace-demo/page-0","trace-demo/missing"],"depends_on":["commit-0"]}
 {"id":"read-1","timestamp_us":5000,"client_id":"instance-1","op":"BatchGetReplicaList","keys":["trace-demo/page-0","trace-demo/page-1"],"depends_on":["commit-0"]}
 {"id":"unmount-storage-0","timestamp_us":6000,"client_id":"storage-0","op":"UnmountSegment","segment_id":"storage-segment-0","depends_on":["exists-1","read-1"]}
-{"id":"ping-storage-0","timestamp_us":7000,"client_id":"storage-0","op":"Ping","depends_on":["unmount-storage-0"]}
