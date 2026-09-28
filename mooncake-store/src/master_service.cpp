@@ -9749,9 +9749,21 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
     // filled in by PromotionAllocStart once the new MEMORY replica is
     // staged. No promotion mailbox push: the prefetch caller drives the
     // execution chain directly.
+    //
+    // Propagate the execution-failure count across the candidate's
+    // consumption, same contract as TryPushPromotionQueue: without it a
+    // persistently failing hot key would cycle prefetch -> fail -> on-hit
+    // retry -> re-record -> prefetch with the breaker reset to zero every
+    // time a probe re-triggers.
     source->inc_refcnt();
     const uint64_t object_size =
         source->get_descriptor().get_local_disk_descriptor().object_size;
+    uint32_t execution_failures = 0;
+    if (auto cit = tenant_state.promotion_candidates.find(object_id.user_key);
+        cit != tenant_state.promotion_candidates.end()) {
+        execution_failures = cit->second.execution_failures;
+    }
+    EraseCandidate(tenant_state, object_id.user_key);
     tenant_state.promotion_tasks.emplace(
         object_id.user_key,
         PromotionTask{.source_id = source->id(),
@@ -9759,7 +9771,7 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
                       .object_size = object_size,
                       .start_time = std::chrono::system_clock::now(),
                       .holder_id = holder_id.value(),
-                      .execution_failures = 0,
+                      .execution_failures = execution_failures,
                       .from_prefetch = true});
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_promotion_in_flight();
@@ -10092,6 +10104,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // Capture the chain's execution-failure count BEFORE erasing the task
     // (the iterator is invalidated by the erase).
     const uint32_t prior_failures = task_it->second.execution_failures;
+    const bool from_prefetch = task_it->second.from_prefetch;
     tenant_state.promotion_tasks.erase(task_it);
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     MasterMetricManager::instance().dec_promotion_in_flight();
@@ -10114,7 +10127,14 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // re-record -> re-admit -> fail -> re-record forever, monopolizing
     // delivery slots with no read demand. Once the bound is hit we stop
     // re-recording — a genuine read can still re-admit the key (fresh chain).
-    if (!metadata.HasReplica(&Replica::fn_is_memory_replica) &&
+    //
+    // from_prefetch tasks skip this re-record: prefetch retries are driven
+    // by the client-side throttle (probe re-trigger after its backoff), not
+    // by the on-hit retry pipeline. With promotion_on_hit off the sweeper
+    // never runs, so a recorded candidate would leak (and pin the tenant
+    // state) permanently.
+    if (!from_prefetch &&
+        !metadata.HasReplica(&Replica::fn_is_memory_replica) &&
         metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
         if (prior_failures >= kMaxPromotionExecutionFailures) {
             LOG(WARNING) << "promotion_execution_gave_up key="
