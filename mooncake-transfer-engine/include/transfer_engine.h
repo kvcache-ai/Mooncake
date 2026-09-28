@@ -58,6 +58,12 @@ const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
 using NicLoadStats = Transport::NicLoadStats;
 
+struct SegmentBufferInfo {
+    uint64_t addr;
+    uint64_t length;
+    std::string location;
+};
+
 enum class PeerLiveness : uint8_t {
     Alive = 0,
     Unreachable = 1,
@@ -124,6 +130,12 @@ class TransferEngine {
 
     SegmentHandle openSegment(const std::string& segment_name);
 
+    // Replace buffers with a snapshot of the segment's memory buffers.
+    // Return 0 on success (including an empty segment), or a negative ERR_*.
+    // On error, buffers is empty. Does not close the segment handle.
+    int getSegmentBuffers(SegmentHandle handle,
+                          std::vector<SegmentBufferInfo>& buffers);
+
     Status CheckSegmentStatus(SegmentID sid);
 
     int closeSegment(SegmentHandle handle);
@@ -135,11 +147,14 @@ class TransferEngine {
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
-    // Allocate POSIX shm that ShmTransport can export to same-host peers.
+    // Allocate shared memory that ShmTransport can export to same-host peers.
     // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
     // Caller must registerLocalMemory before remote access. Returns nullptr
-    // on failure.
+    // on failure. Default: POSIX /dev/shm. With
+    // SharedMemoryOptions.use_hugepage and hugepage_size 2MB/512MB/1GB:
+    // matching hugetlbfs (no silent tmpfs fallback).
     void* allocateSharedMemory(size_t length);
+    void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
 
     int freeSharedMemory(void* addr);
 
@@ -189,6 +204,10 @@ class TransferEngine {
         friend class TransferEngine;
     };
 
+    // Under TENT, scatter pins a direct transport route that supports
+    // post-submit cancellation. Non-cancellable and staged routes are
+    // rejected before transport work is published; runtime queue admission
+    // and automatic failover are not used for this operation.
     ScatterTransferOperation submitScatter(
         const std::vector<ScatterTransferRange>& ranges);
     Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
@@ -224,10 +243,14 @@ class TransferEngine {
 
     BatchID allocateBatchID(size_t batch_size);
 
+    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
+    // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
+    // RDMA success means queued on the notification QP, not remote delivery.
+    // Completion errors are processed asynchronously; TCP fallback is sync.
     int sendNotifyByID(SegmentID target_id,
                        TransferMetadata::NotifyDesc notify_msg);
 
@@ -295,6 +318,9 @@ class TransferEngine {
     std::string showLinks(bool json = false) const;
 
    private:
+    Status submitScatterTransfer(BatchID batch_id,
+                                 const std::vector<TransferRequest>& entries);
+
     std::shared_ptr<mooncake::tent::Config> buildTentConfig(
         const std::string& metadata_conn_string,
         const std::string& local_server_name) const;

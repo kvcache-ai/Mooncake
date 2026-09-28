@@ -23,7 +23,7 @@ from ..planner import (
     resolve_executor_plans,
 )
 from ..storage_manifest import StoredWeightManifest
-from .backend import RangeResults
+from .backend import RangedReadSnapshot, RangeResults
 from .contracts import WeightLoadPlan, _require_stored_load_operation
 from .errors import WeightStoreError
 from .registration import StoreRegistrationLease
@@ -223,6 +223,16 @@ class WeightLoadService:
                 pre_registered_lease=registration_lease,
                 lifetime_tokens=lifetime_tokens,
             ):
+                snapshot_keys = sorted(
+                    {
+                        operation.source.object_key
+                        for operations in operations_by_target.values()
+                        for operation in operations
+                    }
+                )
+                snapshot = self.client.store.prepare_get_into_ranges_snapshot(
+                    snapshot_keys
+                )
                 batch: list[RangeRequest] = []
                 for target in targets:
                     operations = sorted(
@@ -261,11 +271,11 @@ class WeightLoadService:
                                 )
                                 if len(batch) == self.client.max_ranges_per_request:
                                     store_io_started = True
-                                    self._load_range_batch(batch)
+                                    self._load_range_batch(batch, snapshot=snapshot)
                                     batch = []
                 if batch:
                     store_io_started = True
-                    self._load_range_batch(batch)
+                    self._load_range_batch(batch, snapshot=snapshot)
             terminal_state = TerminalTransferState.COMPLETED
         except BaseException:
             if store_io_started:
@@ -278,6 +288,8 @@ class WeightLoadService:
     def _load_range_batch(
         self,
         ranges: Sequence[tuple[RuntimeBindingFragment, str, int, int, int]],
+        *,
+        snapshot: Optional[RangedReadSnapshot],
     ) -> None:
         grouped: dict[
             str,
@@ -318,6 +330,7 @@ class WeightLoadService:
             all_target_offsets,
             all_source_offsets,
             all_sizes,
+            snapshot=snapshot,
         )
         self._validate_range_results(all_keys, all_sizes, results)
 

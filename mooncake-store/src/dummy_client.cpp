@@ -1322,6 +1322,36 @@ std::vector<int> DummyClient::batchIsExist(
     return results;
 }
 
+int DummyClient::probeKey(const std::string& key) {
+    auto result = invoke_rpc<&RealClient::probeKey_internal, bool>(key);
+
+    if (result.has_value()) {
+        return *result ? 1 : 0;  // 1 if exists, 0 if not
+    } else {
+        return toInt(result.error());
+    }
+}
+
+std::vector<int> DummyClient::batchProbeKey(
+    const std::vector<std::string>& keys) {
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batchProbeKey_internal, bool>(keys.size(),
+                                                                    keys);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+
+    for (const auto& result : internal_results) {
+        if (result.has_value()) {
+            results.push_back(result.value() ? 1 : 0);
+        } else {
+            LOG(ERROR) << "Batch probeKey failed: " << toString(result.error());
+            results.push_back(-1);
+        }
+    }
+
+    return results;
+}
+
 int64_t DummyClient::getSize(const std::string& key) {
     return to_py_ret(invoke_rpc<&RealClient::getSize_internal, int64_t>(key));
 }
@@ -1615,6 +1645,18 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
                               total_bytes, elapsed_us_since(start_time), true);
     }
     return results;
+}
+
+std::vector<std::vector<std::vector<int64_t>>>
+DummyClient::get_into_ranges_from_snapshot(
+    const std::vector<void*>& buffers,
+    const std::vector<std::vector<std::string>>& all_keys,
+    const std::vector<std::vector<std::vector<size_t>>>& all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_sizes,
+    const QueryResultCache& query_result_cache) {
+    return get_into_ranges(buffers, all_keys, all_dst_offsets, all_src_offsets,
+                           all_sizes, &query_result_cache);
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(

@@ -130,10 +130,9 @@ Status XpuPlatform::copy(void* dst, void* src, size_t length) {
 }
 
 MemoryType XpuPlatform::getMemoryType(void* addr) {
-    // Only USM allocated through this platform's backend is classified as XPU.
-    // Externally allocated device USM (e.g. a PyTorch XPU tensor) registered
-    // via registerLocalMemory is not in the backend's registry and is reported
-    // as CPU here; classifying such external pointers is future work.
+    // USM device memory is classified whether it was allocated through this
+    // platform or externally (e.g. a PyTorch XPU tensor registered via
+    // registerLocalMemory); see XpuSyclBackend::classifyLocked.
     if (backend().isDevicePtr(addr)) return MTYPE_XPU;
     return CpuPlatform::getMemoryType(addr);
 }

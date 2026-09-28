@@ -55,7 +55,15 @@ thread_local CoroRpcAgent tl_rpc_agent;
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
                                      std::string& response) {
     std::string request;
-    return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+    auto status =
+        tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+    if (status.IsRpcServiceError()) {
+        // A failed stale connection is discarded by the RPC agent. Retry this
+        // read-only operation once; other control RPCs may have side effects.
+        return tl_rpc_agent.call(server_addr, GetSegmentDesc, request,
+                                 response);
+    }
+    return status;
 }
 
 Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
@@ -666,8 +674,11 @@ void ControlClient::subscribeSegmentUpdateAsync(
         server_addr, SubscribeSegmentUpdate, request,
         [](const Status& status, const std::string&) {
             if (!status.ok()) {
-                LOG(ERROR) << "SubscribeSegmentUpdate RPC failed with: "
-                           << status.ToString();
+                VLOG(1) << "SubscribeSegmentUpdate RPC failed with: "
+                        << status.ToString();
+                LOG_EVERY_N(ERROR, 100)
+                    << "SubscribeSegmentUpdate RPC failed with: "
+                    << status.ToString();
             }
         });
 }

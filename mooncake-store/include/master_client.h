@@ -10,7 +10,9 @@
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#ifdef YLT_ENABLE_IBV
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
+#endif
 
 #include "client_metric.h"
 #include "config/rpc_protocol_config.h"
@@ -42,10 +44,12 @@ inline constexpr bool variant_contains_v =
 
 template <typename SocketConfigVariant>
 inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
+#ifdef YLT_ENABLE_IBV
     if constexpr (variant_contains_v<SocketConfigVariant,
                                      coro_io::ib_socket_t::config_t>) {
         socket_config = coro_io::ib_socket_t::config_t{};
     }
+#endif
 }
 
 // Applies the RPC timeout overrides to any mooncake-store RPC client config.
@@ -131,11 +135,29 @@ class MasterClient {
         const std::string& object_key);
 
     /**
+     * @brief Point-in-time existence check that grants no read lease
+     * @param object_key Key to query
+     * @return tl::expected<bool, ErrorCode> indicating exist or not at the
+     * time of the call; the object may still be evicted afterwards
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> ProbeKey(
+        const std::string& object_key);
+
+    /**
      * @brief Checks if multiple objects exist
      * @param object_keys Vector of keys to query
      * @return Vector containing existence status for each key
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+        const std::vector<std::string>& object_keys);
+
+    /**
+     * @brief Point-in-time existence check for multiple objects, granting no
+     * read leases
+     * @param object_keys Vector of keys to query
+     * @return Vector containing existence status for each key
+     */
+    [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
         const std::vector<std::string>& object_keys);
 
     /**

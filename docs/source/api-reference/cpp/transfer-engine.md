@@ -203,10 +203,15 @@ Unregisters the region.
 
 ```cpp
 void* allocateSharedMemory(size_t length);
+void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
 int freeSharedMemory(void* addr);
 ```
 
-Allocates a POSIX shared-memory region that `ShmTransport` can export to same-host peers. Ordinary `malloc` cannot be advertised this way. Requires `ShmTransport` (`MC_FORCE_SHM=1` or `installTransport("shm")`). Call `registerLocalMemory` on the returned pointer before remote access; a sub-range inside that allocation, or a length larger than the allocation, returns an error. Classic Transfer Engine only; TENT returns `nullptr` / `ERR_NOT_IMPLEMENTED`. Combining SHM with RDMA/TCP on one engine requires `-DENABLE_MULTI_PROTOCOL=ON`. Without that flag, `installTransport("shm")` logs a WARNING if it replaces an existing rdma/tcp segment protocol. Objects are created mode `0600` (same UID) with names `/mooncake_<pid>_xxxxxxxx`. `freeSharedMemory` only accepts pointers returned by `allocateSharedMemory`; a `malloc` pointer is rejected without unregistering other transports. Crash leftovers in `/dev/shm` are not reaped automatically. Peers detect an unlinked object on the next transfer, drop the orphaned mmap, and refetch metadata once; if realloc changes the virtual address, the initiator must use the new `BufferDesc.addr`.
+Allocates a shared-memory region that `ShmTransport` can export to same-host peers. Ordinary `malloc` cannot be advertised this way. Requires `ShmTransport` (`MC_FORCE_SHM=1` or `installTransport("shm")`). Call `registerLocalMemory` on the returned pointer before remote access; a sub-range inside that allocation, or a length larger than the allocation, returns an error. Classic Transfer Engine only; TENT returns `nullptr` / `ERR_NOT_IMPLEMENTED`. Combining SHM with RDMA/TCP on one engine requires `-DENABLE_MULTI_PROTOCOL=ON`. Without that flag, `installTransport("shm")` logs a WARNING if it replaces an existing rdma/tcp segment protocol.
+
+The no-options overload (and `SharedMemoryOptions{}`) creates a POSIX shm object in `/dev/shm` named `/mooncake_<pid>_xxxxxxxx`, mode `0600` (same UID). With `opt.use_hugepage` and `hugepage_size` of 2MB, 512MB, or 1GB, TE creates a file on a matching hugetlbfs mount (`opt.hugetlbfs_path`, or `/dev/hugepages`, `/dev/hugepages-512M`, `/dev/hugepages-1G`) named `<mount>/mooncake_<pid>_xxxxxxxx`. Hugepage `length` must already be a multiple of that page size; TE does not round up, and it does not fall back to tmpfs if the mount is missing or the page size mismatches. `freeSharedMemory` only accepts pointers returned by `allocateSharedMemory`; a `malloc` pointer is rejected without unregistering other transports.
+
+`freeSharedMemory` and `ShmTransport`'s destructor unlink the object. Crash or `SIGKILL` skips that. POSIX leftovers sit in `/dev/shm` until reboot or manual `shm_unlink`. Hugetlbfs leftovers stay on the mount and **keep hugepages reserved** until the file is unlinked or the node reboots — worse than tmpfs leftovers. There is no automatic startup reaper: several processes share a mount, so deleting every `mooncake_*` on start would remove live peers' files. After a crash, remove only files whose encoded pid is gone, for example `rm /dev/hugepages/mooncake_<dead-pid>_*` (and the 512MB/1GB mounts if used). Peers detect an unlinked object on the next transfer, drop the orphaned mmap, and refetch metadata once; if realloc changes the virtual address, the initiator must use the new `BufferDesc.addr`.
 
 #### TransferEngine::registerLocalMemoryBatch
 
@@ -248,6 +253,36 @@ int closeSegment(SegmentHandle segment_id);
 
 - `segment_id`: The unique identifier of the segment.
 - Return value: If successful, returns 0; otherwise, returns a negative value.
+
+#### TransferEngine::getSegmentBuffers
+
+```cpp
+struct SegmentBufferInfo {
+    uint64_t addr;
+    uint64_t length;
+    std::string location;
+};
+
+int getSegmentBuffers(SegmentHandle handle,
+                      std::vector<SegmentBufferInfo>& buffers);
+```
+
+Returns a snapshot of the memory buffers published in a segment, using the
+selected classic or TENT backend. This supports buffer inspection without
+accessing `getMetadata()`, which is unavailable under TENT.
+
+- `handle`: A segment handle returned by `openSegment()`.
+- `buffers`: Replaces any existing contents with buffer addresses, lengths in
+  bytes, and backend-reported location labels. Classic copies `BufferDesc::name`
+  (some transports, such as TCP, use a server name); TENT copies the native
+  location. Entries preserve the backend descriptor's order, which is not
+  guaranteed to be sorted by address. TENT internal buffers are excluded.
+- Return value: `0` on success, including a segment with no memory buffers;
+  `ERR_METADATA` if the descriptor cannot be retrieved; `ERR_NOT_IMPLEMENTED`
+  for file segments. On error, `buffers` is empty.
+- The call may fetch remote metadata and block. It does not close the handle,
+  register memory, or keep the reported buffers alive; the caller must coordinate
+  buffer lifetime with the owning peer.
 
 #### TransferEngine::removeLocalSegment
 
@@ -434,6 +469,18 @@ Returns a transport instance by protocol name, mainly for advanced inspection or
 ### Notifications
 
 TransferEngine can send and receive lightweight notifications across segments to coordinate data movement.
+
+Notifications are sent only when requested through the APIs below. For classic TE:
+
+- `MC_RDMA_NOTIFY_ENABLED=1` (default) enables RDMA notifications for both `rdma` and
+  `rdma_twosided`; set it to `0` before initialization to use TCP.
+- Ordinary `rdma` supports up to 65528 combined bytes of `name` and `msg`. Unsupported
+  peers or larger messages fall back to TCP when `MC_RDMA_NOTIFY_OOB_FALLBACK=1`
+  (default); set it to `0` to return an error instead.
+- A successful ordinary RDMA send indicates local submission, without confirming
+  remote receipt. Connection setup or backpressure may block; applications must
+  ensure delivery before shutting down either engine.
+- Ordinary RDMA notifications use 32 MiB of registered host memory per endpoint.
 
 #### TransferEngine::submitTransferWithNotify
 
