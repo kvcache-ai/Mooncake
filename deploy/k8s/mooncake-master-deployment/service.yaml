@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-master
+  labels:
+    app.kubernetes.io/name: mooncake-master
+    app.kubernetes.io/component: master
+    app.kubernetes.io/part-of: mooncake
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mooncake-master
+  ports:
+    - name: rpc
+      port: 50051
+      targetPort: rpc
+      protocol: TCP
+    - name: metadata
+      port: 8080
+      targetPort: metadata
+      protocol: TCP
+    - name: metrics
+      port: 9003
+      targetPort: metrics
+      protocol: TCP
