@@ -16,6 +16,7 @@
 #define TENT_ENDPOINT_H
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -312,6 +313,10 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::condition_variable notify_send_cv_;
     size_t notify_pending_count_ = 0;  // Number of pending sends
     uint64_t notify_send_wr_id_ = 0;   // Circular counter for wr_id
+    // A peer that stops consuming keeps every slot in flight for good (RNR
+    // NAKs retry without bound), so the wait for a slot has to be bounded.
+    static constexpr std::chrono::milliseconds kNotifySendStallTimeout{1000};
+    bool notify_send_stalled_ = false;
     std::atomic<bool> notify_connected_{false};
     // Notification WRs posted on the notify QP whose completion has not been
     // polled yet. finishDestroy() waits for it: the QP must not be destroyed
