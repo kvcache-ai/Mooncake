@@ -2,9 +2,11 @@
 #include "storage_backend.h"
 
 #include <fcntl.h>
+#include <fstream>
 #include <sys/file.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstdint>
@@ -3650,6 +3652,36 @@ std::string OffsetAllocatorStorageBackend::GetMetaFilePath() const {
     return (std::filesystem::path(storage_path_) / "kv_cache.meta").string();
 }
 
+namespace {
+
+// Transfer-engine location ("cpu:N") for a DAX arena. The transfer engine
+// only has topology entries for real NUMA nodes, and a location it cannot
+// resolve makes every RDMA read of the region fail, so do not leave it to
+// probing an untouched device page.
+std::string ResolveDaxLocation(const std::string& path, int64_t numa_node,
+                               void* base) {
+    if (numa_node >= 0) return "cpu:" + std::to_string(numa_node);
+    struct stat st{};
+    if (stat(path.c_str(), &st) == 0 && S_ISCHR(st.st_mode)) {
+        const std::string dev = "/sys/dev/char/" +
+                                std::to_string(major(st.st_rdev)) + ":" +
+                                std::to_string(minor(st.st_rdev));
+        for (const char* attr : {"/numa_node", "/device/numa_node"}) {
+            int node = -1;
+            std::ifstream(dev + attr) >> node;
+            if (node >= 0) return "cpu:" + std::to_string(node);
+        }
+        LOG(WARNING) << "No numa_node in sysfs for " << path
+                     << "; set MOONCAKE_OFFSET_DAX_NUMA_NODE";
+    }
+    // Regular or fsdax file: ordinary pages, which the transfer engine can
+    // place once page 0 is mapped in.
+    (void)*static_cast<volatile const char*>(base);
+    return "";
+}
+
+}  // namespace
+
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::OpenDaxDataFile() {
     // Drop a mapping left by a recovery attempt that failed after mapping, or
     // its flock would make this reopen fail against ourselves.
@@ -3664,7 +3696,14 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::OpenDaxDataFile() {
     if (file_storage_config_.use_uring) {
         LOG(INFO) << "use_uring ignored for DAX data arena " << data_file_path_;
     }
+    void* base = (*dax)->base();
     data_file_ = std::move(*dax);
+    if (cfg_.dax_zero_copy) {
+        dax_location_ =
+            ResolveDaxLocation(data_file_path_, cfg_.dax_numa_node, base);
+        LOG(INFO) << "DAX zero-copy location: "
+                  << (dax_location_.empty() ? "auto (page 0)" : dax_location_);
+    }
     return {};
 }
 
@@ -5639,14 +5678,14 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     LOG(INFO) << "OffsetAllocatorStorageBackend::RemoveAll: cleared all data";
 }
 
-std::optional<std::pair<void*, size_t>>
+std::optional<StorageBackendInterface::ZeroCopyRegionInfo>
 OffsetAllocatorStorageBackend::ZeroCopyRegion() const {
     if (!cfg_.dax_zero_copy) return std::nullopt;
     // Only DaxFile is byte-addressable; the mapping is created once in Init
     // and kept across RemoveAll, so the region never moves after Init.
     auto* dax = dynamic_cast<DaxFile*>(data_file_.get());
     if (!dax) return std::nullopt;
-    return std::make_pair(dax->base(), dax->size());
+    return ZeroCopyRegionInfo{dax->base(), dax->size(), dax_location_};
 }
 
 tl::expected<StorageBackendInterface::PinnedBatch, ErrorCode>
@@ -5655,7 +5694,7 @@ OffsetAllocatorStorageBackend::BatchPin(const std::vector<std::string>& keys,
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    if (!ZeroCopyRegion()) {
+    if (!cfg_.dax_zero_copy || !dynamic_cast<DaxFile*>(data_file_.get())) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     if (keys.size() != sizes.size()) {

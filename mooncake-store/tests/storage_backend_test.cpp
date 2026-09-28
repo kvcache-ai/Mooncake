@@ -1551,8 +1551,8 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinInPlace) {
     ASSERT_TRUE(backend.Init());
     auto region = backend.ZeroCopyRegion();
     ASSERT_TRUE(region.has_value());
-    const auto lo = reinterpret_cast<uintptr_t>(region->first);
-    const auto hi = lo + region->second;
+    const auto lo = reinterpret_cast<uintptr_t>(region->base);
+    const auto hi = lo + region->size;
 
     const std::string a(10000, 'a'), b(20000, 'b');
     OffloadOne(backend, "ka", a);
@@ -1644,6 +1644,26 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxBatchPinRecovered) {
     auto pinned = restarted.BatchPin({"k"}, {16 * 1024});
     ASSERT_TRUE(pinned.has_value());
     EXPECT_EQ(PinnedValue(*pinned, 0, v.size()), v);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DaxZeroCopyLocation) {
+    ZeroCopyDaxFixture f(data_path);
+    {
+        // A regular file has no sysfs numa_node: left to the transfer
+        // engine's page-0 probe.
+        OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
+        ASSERT_TRUE(backend.Init());
+        auto region = backend.ZeroCopyRegion();
+        ASSERT_TRUE(region.has_value());
+        EXPECT_EQ(region->location, "");
+    }
+    f.dax_cfg.dax_numa_node = 1;
+    OffsetAllocatorStorageBackend backend(f.config, f.dax_cfg);
+    ASSERT_TRUE(backend.Init());
+    EXPECT_EQ(backend.ZeroCopyRegion()->location, "cpu:1");
+
+    f.dax_cfg.dax_numa_node = -2;
+    EXPECT_FALSE(f.dax_cfg.Validate());
 }
 
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_BatchPinUnsupported) {

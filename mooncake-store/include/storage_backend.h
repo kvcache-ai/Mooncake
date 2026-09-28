@@ -318,7 +318,14 @@ class StorageBackendInterface {
     // memory that a NIC can reach exposes that memory here so FileStorage can
     // register it with the transfer engine. std::nullopt means "copy path
     // only". The region must stay mapped for the backend's lifetime.
-    virtual std::optional<std::pair<void*, size_t>> ZeroCopyRegion() const {
+    // `location` is the transfer-engine location to register it under
+    // ("cpu:N"), or empty when unknown.
+    struct ZeroCopyRegionInfo {
+        void* base;
+        size_t size;
+        std::string location;
+    };
+    virtual std::optional<ZeroCopyRegionInfo> ZeroCopyRegion() const {
         return std::nullopt;
     }
 
@@ -1249,7 +1256,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     void RemoveAll() override;
 
     // Non-empty only for a DAX arena with dax_zero_copy set.
-    std::optional<std::pair<void*, size_t>> ZeroCopyRegion() const override;
+    std::optional<ZeroCopyRegionInfo> ZeroCopyRegion() const override;
 
     // Pins each record's extent and returns the value's address inside the
     // DAX mapping. Refuses (BUFFER_OVERFLOW) once the bytes held by
@@ -1534,6 +1541,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Counter for keys skipped due to fallback eviction exhaustion.
     // See GetEvictionSkips() for the public accessor.
     std::atomic<int64_t> eviction_skips_{0};
+
+    // Transfer-engine location of the DAX mapping, resolved once when it is
+    // mapped (see ZeroCopyRegion). Empty when unknown.
+    std::string dax_location_;
 
     // Value bytes held by outstanding BatchPin owners. Shared with each
     // owner's deleter so a release never touches a destroyed backend.

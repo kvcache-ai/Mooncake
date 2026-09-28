@@ -256,10 +256,10 @@ class FileStorageTest : public ::testing::Test {
     }
 
     // Stands in for the transfer-engine registration FileStorage::Init does.
-    std::optional<std::pair<void*, size_t>> EnableZeroCopy(
+    std::optional<StorageBackendInterface::ZeroCopyRegionInfo> EnableZeroCopy(
         FileStorage& fileStorage) {
         auto region = fileStorage.storage_backend_->ZeroCopyRegion();
-        if (region) fileStorage.zero_copy_base_ = region->first;
+        if (region) fileStorage.zero_copy_base_ = region->base;
         return region;
     }
 
@@ -866,8 +866,8 @@ TEST_F(FileStorageTest, BatchGetServesDaxArenaZeroCopy) {
 
     auto region = EnableZeroCopy(fileStorage);
     ASSERT_TRUE(region);
-    const auto lo = reinterpret_cast<uintptr_t>(region->first);
-    const auto hi = lo + region->second;
+    const auto lo = reinterpret_cast<uintptr_t>(region->base);
+    const auto hi = lo + region->size;
 
     auto pinned = fileStorage.BatchGet(keys, sizes);
     ASSERT_TRUE(pinned);

@@ -151,14 +151,15 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     if (auto region = storage_backend_->ZeroCopyRegion()) {
         // Remote readers RDMA-read offloaded values straight out of this
         // region. Failure is not fatal (e.g. fsdax without ODP refuses
-        // long-term pinning, or the MR is too large for the NIC): reads
-        // then go through ClientBuffer copies as before.
-        auto reg = client_->RegisterLocalMemory(region->first, region->second,
-                                                kWildcardLocation, true, true);
+        // long-term pinning): reads then go through ClientBuffer copies.
+        const std::string& location =
+            region->location.empty() ? kWildcardLocation : region->location;
+        auto reg = client_->RegisterLocalMemory(region->base, region->size,
+                                                location, true, true);
         if (reg) {
-            zero_copy_base_ = region->first;
+            zero_copy_base_ = region->base;
             LOG(INFO) << "Zero-copy offload reads enabled, region size="
-                      << region->second;
+                      << region->size << ", location=" << location;
         } else {
             LOG(WARNING) << "Failed to register zero-copy region ("
                          << reg.error() << "); serving reads by copy";
