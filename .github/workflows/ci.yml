@@ -570,6 +570,19 @@ jobs:
       artifact-prefix: mooncake-wheel-cu130
       version-override: 0.0.0.dev0
 
+  # arm64 default wheels use a different transport set (USE_MNNVL) than
+  # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
+  build-wheel-cu13-arm64:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: arm64
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-cu130-arm64
+      version-override: 0.0.0.dev0
+
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
@@ -757,6 +770,7 @@ jobs:
       - build-flags
       - test-wheel-ubuntu
       - build-wheel-cu13
+      - build-wheel-cu13-arm64
       - build-wheel-efa
       - build-wheel-rocm
       - tent-ci
@@ -788,6 +802,7 @@ jobs:
             ${{ needs.build-flags.result }}
             ${{ needs.test-wheel-ubuntu.result }}
             ${{ needs.build-wheel-cu13.result }}
+            ${{ needs.build-wheel-cu13-arm64.result }}
             ${{ needs.build-wheel-efa.result }}
             ${{ needs.build-wheel-rocm.result }}
         run: |
