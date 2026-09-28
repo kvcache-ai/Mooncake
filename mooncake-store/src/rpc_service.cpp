@@ -1809,9 +1809,11 @@ RequestContext BridgeRequestContext(const std::string& attachment,
     RequestContext request_context;
     if (!attachment.empty()) {
         request_context = deserialize_request_context(attachment);
-        VLOG(2) << "hop-B " << handler_name
-                << " request_id=" << request_context.request_id
-                << " trace_id=" << request_context.trace_id;
+        VLOG(2) << "hop-B " << handler_name << " att_sz=" << attachment.size()
+                << " request_id=[" << request_context.request_id << "]"
+                << " trace_id=[" << request_context.trace_id << "]"
+                << " span_id=[" << request_context.span_id << "]"
+                << " parent_span_id=[" << request_context.parent_span_id << "]";
     }
     return request_context;
 }
