@@ -8,9 +8,9 @@
 namespace mooncake {
 
 struct CxlBootstrapConfig {
-    bool enabled = false;
-    std::string path = DEFAULT_CXL_PATH;
-    size_t size = DEFAULT_CXL_SIZE;
+    bool enabled{false};
+    std::string path{DEFAULT_CXL_PATH};
+    size_t size{DEFAULT_CXL_SIZE};
 };
 
 }  // namespace mooncake
