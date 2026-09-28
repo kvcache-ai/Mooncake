@@ -37,7 +37,9 @@ This installs all system packages, git submodules (pybind11), and Go.
 
 ## Installing from PyPI (recommended)
 
-Pre-built EFA wheels are published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so separate CUDA 12, CUDA 13, and non-CUDA variants are published:
+The default wheels (`mooncake-transfer-engine`, `-cuda13`, `-non-cuda`) are built with the EFA transport, so the same package works on AWS EFA and on IB/RoCE. Use `protocol=efa` (e.g. `MOONCAKE_PROTOCOL=efa` in SGLang) on EFA. With `rdma`, EFA NICs are skipped and IB/RoCE NICs are used when present. Unlike the dedicated EFA wheels below, the default wheels also include Mooncake EP/PG.
+
+Pre-built EFA wheels are also published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so separate CUDA 12, CUDA 13, and non-CUDA variants are published:
 
 ```bash
 # GPU memory transfers with CUDA 12 — built with USE_CUDA=ON

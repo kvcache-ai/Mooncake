@@ -112,6 +112,10 @@ jobs:
               ;;
           esac
           cmake_args="$cmake_args -DENABLE_KV_EVENTS=ON"
+          # AWS EFA transport. It dlopens libfabric when protocol=efa is used,
+          # so the wheel only needs the headers (fetched below) and still
+          # imports on hosts without libfabric.
+          cmake_args="$cmake_args -DUSE_EFA=ON -DLIBFABRIC_INCLUDE_DIR=$RUNNER_TEMP/libfabric-headers/include"
 
           {
             echo "VARIANT_FLAG=$variant_flag"
@@ -152,6 +156,19 @@ jobs:
           script: |
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Fetch libfabric headers
+        # Pin the oldest libfabric API the EFA transport accepts, so the wheel
+        # works with any runtime libfabric >= 1.18 (e.g. the AWS EFA installer's).
+        env:
+          LIBFABRIC_HEADERS_VERSION: "1.18.3"
+        run: |
+          dest="$RUNNER_TEMP/libfabric-headers"
+          mkdir -p "$dest"
+          curl --retry 3 --retry-delay 2 -fsSL \
+            "https://github.com/ofiwg/libfabric/archive/refs/tags/v${LIBFABRIC_HEADERS_VERSION}.tar.gz" |
+            tar xz -C "$dest" --strip-components=1 "libfabric-${LIBFABRIC_HEADERS_VERSION}/include/rdma"
+          test -f "$dest/include/rdma/fabric.h"
 
       - name: Configure project
         run: |
@@ -270,6 +287,19 @@ jobs:
           fi
 
           "$smoke_venv/bin/mooncake_master" --version
+
+          # EFA support must not add a link-time libfabric dependency: the
+          # builder image has no libfabric, so importing the engine here also
+          # proves the wheel works on hosts without it.
+          site_packages=$("$smoke_venv/bin/python" -c \
+            'import sysconfig; print(sysconfig.get_paths()["platlib"])')
+          if find "$site_packages"/mooncake* -name '*.so*' -type f -print0 |
+              xargs -0 -r readelf -d 2>/dev/null | grep -F 'Shared library: [libfabric.so'; then
+            echo "::error::The wheel links libfabric; the EFA transport must dlopen it"
+            exit 1
+          fi
+          "$smoke_venv/bin/python" -c \
+            'from mooncake import engine; assert engine.SUPPORT_EFA, "EFA support missing"'
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
