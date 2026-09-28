@@ -243,8 +243,8 @@ RpcTrace LoadTrace(const std::string& path) {
     return ReadTrace(input);
 }
 
-// A bounded worker pool dispatches due, dependency-ready events. Slow dependent
-// calls do not block unrelated events. Worker saturation is visible as lag.
+// One dispatcher times dependency-ready events and wakes only the workers
+// needed to execute them. Slow dependent calls do not block unrelated events.
 std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
                                      const TraceExecutor& execute) {
     Require(workers > 0, "workers must be positive");
@@ -256,9 +256,12 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
     std::vector<std::vector<size_t>> children(trace.events.size());
     std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>>
         ready;
+    std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>>
+        runnable;
     std::mutex mutex;
-    std::condition_variable cv;
+    std::condition_variable work_available, schedule_changed;
     size_t remaining = trace.events.size();
+    size_t waiting_workers = 0;
     auto origin = Clock::now();
     const auto max_delay =
         std::chrono::duration_cast<Micros>(Clock::time_point::max() - origin)
@@ -291,22 +294,13 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
             size_t index;
             {
                 std::unique_lock lock(mutex);
-                while (true) {
-                    if (remaining == 0) return;
-                    if (ready.empty()) {
-                        cv.wait(lock);
-                    } else {
-                        index = ready.top();
-                        const auto due =
-                            origin + Micros(samples[index].scheduled_us);
-                        if (Clock::now() < due) {
-                            cv.wait_until(lock, due);
-                        } else {
-                            ready.pop();
-                            break;
-                        }
-                    }
-                }
+                ++waiting_workers;
+                work_available.wait(
+                    lock, [&] { return remaining == 0 || !runnable.empty(); });
+                --waiting_workers;
+                if (remaining == 0) return;
+                index = runnable.top();
+                runnable.pop();
             }
             const auto& event = trace.events[index];
             auto& sample = samples[index];
@@ -326,14 +320,18 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
                 sample.outcome.error = error.what();
             }
             sample.finish_us = elapsed();
+            bool changed = false;
             {
                 std::lock_guard lock(mutex);
                 for (auto child : children[index]) {
-                    if (--pending[child] == 0) ready.push(child);
+                    if (--pending[child] == 0) {
+                        ready.push(child);
+                        changed = true;
+                    }
                 }
-                --remaining;
+                if (--remaining == 0) changed = true;
             }
-            cv.notify_all();
+            if (changed) schedule_changed.notify_one();
         }
     };
     std::vector<std::jthread> threads;
@@ -351,6 +349,33 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
             std::chrono::duration_cast<Micros>(origin.time_since_epoch())
                 .count();
     start.count_down();
+    {
+        std::unique_lock lock(mutex);
+        while (remaining != 0) {
+            if (ready.empty()) {
+                schedule_changed.wait(lock);
+                continue;
+            }
+            const auto due = origin + Micros(samples[ready.top()].scheduled_us);
+            if (Clock::now() < due) {
+                schedule_changed.wait_until(lock, due);
+                continue;
+            }
+            const auto now = Clock::now();
+            size_t added = 0;
+            while (!ready.empty() &&
+                   origin + Micros(samples[ready.top()].scheduled_us) <= now) {
+                runnable.push(ready.top());
+                ready.pop();
+                ++added;
+            }
+            const auto wake = std::min(added, waiting_workers);
+            lock.unlock();
+            for (size_t i = 0; i < wake; ++i) work_available.notify_one();
+            lock.lock();
+        }
+    }
+    work_available.notify_all();
     for (auto& thread : threads) thread.join();
     return samples;
 }
