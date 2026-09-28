@@ -448,6 +448,7 @@ void RdmaEndPoint::rollbackNotificationConstruction() {
         } else {
             LOG(ERROR) << "Failed to destroy notification QP during rollback: "
                        << strerror(ret);
+            return;
         }
     }
     if (s.send_mr) {
