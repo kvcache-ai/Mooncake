@@ -62,7 +62,8 @@ class PrefetchThrottle {
 
     // Reconfigure (values come in as seconds, stored as ms). Negative values
     // keep the current setting. A 0 cooldown disables the memory-pressure
-    // backoff; a 0 dedup TTL disables per-key rate-limiting.
+    // backoff; a 0 dedup TTL disables per-key rate-limiting (and with it all
+    // per-key state tracking — see reserve()).
     void configure(int64_t cooldown_sec, int64_t dedup_ttl_sec) {
         if (cooldown_sec >= 0) {
             cooldown_ms_.store(cooldown_sec * 1000, std::memory_order_relaxed);
@@ -95,8 +96,15 @@ class PrefetchThrottle {
     // Effective window per state: kFailed entries only block for the
     // (usually much shorter) cooldown window so transient failures retry
     // quickly; all other states block for the full dedup TTL.
+    //
+    // With dedup disabled (ttl == 0) every key passes and NO entry is
+    // stored: expired entries would never be swept (MaybeSweep is driven by
+    // the TTL), so recording them would grow the table without bound.
     std::vector<std::string> reserve(const std::vector<std::string>& keys) {
         const int64_t ttl_ms = dedup_ttl_ms_.load(std::memory_order_relaxed);
+        if (ttl_ms <= 0) {
+            return keys;
+        }
         const int64_t now = NowMs();
         std::vector<std::string> out;
         out.reserve(keys.size());
@@ -133,9 +141,13 @@ class PrefetchThrottle {
         std::lock_guard<std::mutex> lock(shard.mutex);
         auto it = shard.entries.find(key);
         if (it == shard.entries.end()) {
-            shard.entries[key] = Entry{.trigger_ms = now,
-                                       .completed_ms = now,
-                                       .state = State::kCompleted};
+            // Only record completions for keys we are tracking; with dedup
+            // disabled nothing is stored (see reserve()).
+            if (dedup_ttl_ms_.load(std::memory_order_relaxed) > 0) {
+                shard.entries[key] = Entry{.trigger_ms = now,
+                                           .completed_ms = now,
+                                           .state = State::kCompleted};
+            }
             return;
         }
         it->second.state = State::kCompleted;
