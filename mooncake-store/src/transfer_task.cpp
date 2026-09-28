@@ -15,6 +15,7 @@
 #include "config/transfer_submitter_config.h"
 #include "config/nof_debug_config.h"
 #include "config/fileread_worker_pool_config.h"
+#include "config/nof_worker_pool_config.h"
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -61,12 +62,6 @@ static int GetSpdkNofInflightBytesLimit() {
     static const int value =
         GetPositiveEnvOrDefault("MC_NOF_INFLIGHT_BYTES_LIMIT",
                                 mooncake::kDefaultSpdkNofInflightBytesLimit);
-    return value;
-}
-
-static int GetSpdkNofWorkerCount() {
-    static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_WORKERS", mooncake::kDefaultSpdkNofWorkers);
     return value;
 }
 
@@ -260,7 +255,7 @@ void FilereadWorkerPool::workerThread() {
 
 #ifdef USE_NOF
 SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
-    : worker_count_(GetSpdkNofWorkerCount()),
+    : worker_count_(NoFWorkerPoolConfig::AtFirstUse().worker_count),
       numa_socket_id_(numa_socket_id),
       task_queue_(std::make_unique<std::queue<SpdkNofTask>[]>(worker_count_)),
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
