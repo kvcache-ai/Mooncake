@@ -96,7 +96,7 @@ run_single_model()
         status=1
     else
         # Remote start server
-        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
+        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$E2E_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
             echo "ERROR: Failed to start remote server for model $model_name"
             status=1
         else

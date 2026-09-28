@@ -40,6 +40,7 @@
 #include "client_buffer.h"
 #include "common/network.h"
 #include "config/client_host_identity_config.h"
+#include "config/client_object_checksum_config.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "config/client_auto_discovery_config.h"
@@ -48,7 +49,6 @@
 #include "gpu_vendor/intra_nvlink.h"
 #endif
 #include "crc_checksum.h"
-#include "environ.h"
 #include "config/client_numa_config.h"
 #include "storage/distributed/distributed_storage_backend.h"
 
@@ -183,17 +183,17 @@ class ScatterRangeBuilder {
 
     // `error_slot` is shared by every fragment of one entry and keeps the first
     // failure. Callbacks run on the waiting thread, so no locking is needed.
-    void Add(TransferRequest::OpCode opcode,
-             const AllocatedBuffer::Descriptor& handle, const Slice& slice,
+    void Add(TransferRequest::OpCode opcode, const std::string& remote_segment,
+             uint64_t remote_base, size_t remote_size, const Slice& slice,
              uint64_t remote_offset, std::optional<ErrorCode>* error_slot) {
         const size_t index = remote_offsets_.size();
         remote_offsets_.push_back(static_cast<size_t>(remote_offset));
         lengths_.push_back(slice.size);
         ranges_.push_back(TransferEngine::ScatterTransferRange{
             .opcode = opcode,
-            .remote_segment = handle.transport_endpoint_,
-            .remote_base_offset = handle.buffer_address_,
-            .remote_size = static_cast<size_t>(handle.size_),
+            .remote_segment = remote_segment,
+            .remote_base_offset = remote_base,
+            .remote_size = remote_size,
             .local_buffer = slice.ptr,
             .local_capacity = slice.size,
             .local_offsets = std::span<const size_t>(&zero_offsets_[index], 1),
@@ -209,6 +209,14 @@ class ScatterRangeBuilder {
         });
     }
 
+    void Add(TransferRequest::OpCode opcode,
+             const AllocatedBuffer::Descriptor& handle, const Slice& slice,
+             uint64_t remote_offset, std::optional<ErrorCode>* error_slot) {
+        Add(opcode, handle.transport_endpoint_, handle.buffer_address_,
+            static_cast<size_t>(handle.size_), slice, remote_offset,
+            error_slot);
+    }
+
     bool empty() const { return ranges_.empty(); }
 
     const std::vector<TransferEngine::ScatterTransferRange>& ranges() const {
@@ -221,6 +229,35 @@ class ScatterRangeBuilder {
     std::vector<size_t> lengths_;
     std::vector<TransferEngine::ScatterTransferRange> ranges_;
 };
+
+void CompleteScatterRanges(
+    Client& client, ScatterRangeBuilder& builder,
+    std::vector<tl::expected<int64_t, ErrorCode>>& results,
+    const std::vector<std::optional<ErrorCode>>& entry_errors,
+    const char* submit_fail_msg, const char* entry_fail_prefix) {
+    if (builder.empty()) {
+        return;
+    }
+    auto operation = client.SubmitScatter(builder.ranges());
+    if (!operation) {
+        LOG(ERROR) << submit_fail_msg;
+        for (auto& result : results) {
+            if (result.has_value()) {
+                result = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+        return;
+    }
+    (void)operation->wait();
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value() || !entry_errors[i].has_value()) {
+            continue;
+        }
+        LOG(ERROR) << entry_fail_prefix << ", entry=" << i
+                   << ", error=" << static_cast<int>(entry_errors[i].value());
+        results[i] = tl::unexpected(entry_errors[i].value());
+    }
+}
 
 struct ReplicaTransferSummary {
     size_t allocated_memory_replicas = 0;
@@ -413,7 +450,8 @@ Client::Client(const std::string& local_hostname,
           ClientHostIdentityConfig::FromEnvironment(local_hostname).host_id),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
-      object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
+      object_checksum_enabled_(
+          ClientObjectChecksumConfig::IsEnabledAtFirstUse()),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
@@ -4711,13 +4749,63 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         results[i] = transferred;  // optimistic; corrected on await
     }
 
+    CompleteScatterRanges(*this, builder, results, entry_errors,
+                          "Failed to submit batch range read",
+                          "Range read failed");
+    return results;
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+Client::BatchTransferReadOffloadRanges(
+    const std::string& transfer_engine_addr,
+    const std::vector<uint64_t>& remote_bases,
+    const std::vector<size_t>& remote_sizes,
+    const std::vector<std::vector<Slice>>& slices,
+    const std::vector<std::vector<uint64_t>>& src_offsets) {
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        remote_bases.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (remote_bases.size() != remote_sizes.size() ||
+        remote_bases.size() != slices.size() ||
+        remote_bases.size() != src_offsets.size()) {
+        LOG(ERROR) << "BatchTransferReadOffloadRanges size mismatch: bases="
+                   << remote_bases.size() << ", sizes=" << remote_sizes.size()
+                   << ", slices=" << slices.size()
+                   << ", offsets=" << src_offsets.size();
+        return results;
+    }
+
+    size_t fragment_count = 0;
+    for (const auto& entry : slices) {
+        fragment_count += entry.size();
+    }
+
+    ScatterRangeBuilder builder(fragment_count);
+    std::vector<std::optional<ErrorCode>> entry_errors(remote_bases.size());
+    for (size_t i = 0; i < remote_bases.size(); ++i) {
+        if (slices[i].size() != src_offsets[i].size()) {
+            LOG(ERROR)
+                << "BatchTransferReadOffloadRanges fragment count mismatch, "
+                << "entry=" << i << ", slices=" << slices[i].size()
+                << ", offsets=" << src_offsets[i].size();
+            continue;
+        }
+        int64_t transferred = 0;
+        for (size_t j = 0; j < slices[i].size(); ++j) {
+            builder.Add(TransferRequest::READ, transfer_engine_addr,
+                        remote_bases[i], remote_sizes[i], slices[i][j],
+                        src_offsets[i][j], &entry_errors[i]);
+            transferred += static_cast<int64_t>(slices[i][j].size);
+        }
+        results[i] = transferred;  // optimistic; corrected on await
+    }
+
     if (builder.empty()) {
         return results;
     }
 
-    auto operation = SubmitScatterNative(builder.ranges(), intent);
+    auto operation = SubmitScatterNative(builder.ranges());
     if (!operation) {
-        LOG(ERROR) << "Failed to submit batch range read";
+        LOG(ERROR) << "Failed to submit batch offload range read";
         for (auto& result : results) {
             if (result.has_value()) {
                 result = tl::unexpected(ErrorCode::TRANSFER_FAIL);
@@ -4725,9 +4813,9 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         }
         return results;
     }
-    const auto status = operation->wait();
+    const auto status = operation.wait();
     if (!status.ok()) {
-        LOG(ERROR) << "Batch range read scatter operation failed: "
+        LOG(ERROR) << "Batch offload range read scatter operation failed: "
                    << status.ToString();
         MarkScatterOperationFailure(results, entry_errors, status);
     }
@@ -4736,7 +4824,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         if (!results[i].has_value() || !entry_errors[i].has_value()) {
             continue;
         }
-        LOG(ERROR) << "Range read failed, entry=" << i
+        LOG(ERROR) << "Offload range read failed, entry=" << i
                    << ", error=" << static_cast<int>(entry_errors[i].value());
         results[i] = tl::unexpected(entry_errors[i].value());
     }

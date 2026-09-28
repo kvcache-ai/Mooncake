@@ -14,7 +14,9 @@
 #include <string>
 #include <vector>
 #include "config/transfer_submitter_config.h"
+#include "config/nof_debug_config.h"
 #include "config/fileread_worker_pool_config.h"
+#include "config/nof_worker_pool_config.h"
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -46,38 +48,12 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
-static bool IsTruthyEnv(const char* value) {
-    if (!value) {
-        return false;
-    }
-    std::string normalized(value);
-    std::transform(
-        normalized.begin(), normalized.end(), normalized.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return normalized == "1" || normalized == "true" || normalized == "yes" ||
-           normalized == "on";
-}
-
 static bool IsSpdkNofDebugEnabled() {
-    static const bool enabled = IsTruthyEnv(std::getenv("MC_NOF_DEBUG"));
-    return enabled;
+    return mooncake::NoFDebugConfig::IsEnabledAtFirstUse();
 }
 
-static int GetSpdkNofDebugIntervalMs() {
-    static const int interval_ms = []() {
-        const char* raw_value = std::getenv("MC_NOF_DEBUG_INTERVAL_MS");
-        if (!raw_value) {
-            return 1000;
-        }
-        char* end_ptr = nullptr;
-        long parsed = std::strtol(raw_value, &end_ptr, 10);
-        if (end_ptr == raw_value || (end_ptr != nullptr && *end_ptr != '\0') ||
-            parsed <= 0) {
-            return 1000;
-        }
-        return static_cast<int>(parsed);
-    }();
-    return interval_ms;
+static std::chrono::milliseconds GetSpdkNofDebugIntervalMs() {
+    return mooncake::NoFDebugConfig::IntervalMsAtFirstUse();
 }
 
 static int GetSpdkNofSubmitChunkBytes() {
@@ -90,12 +66,6 @@ static int GetSpdkNofInflightBytesLimit() {
     static const int value =
         GetPositiveEnvOrDefault("MC_NOF_INFLIGHT_BYTES_LIMIT",
                                 mooncake::kDefaultSpdkNofInflightBytesLimit);
-    return value;
-}
-
-static int GetSpdkNofWorkerCount() {
-    static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_WORKERS", mooncake::kDefaultSpdkNofWorkers);
     return value;
 }
 
@@ -361,7 +331,7 @@ void FilereadWorkerPool::workerThread() {
 
 #ifdef USE_NOF
 SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
-    : worker_count_(GetSpdkNofWorkerCount()),
+    : worker_count_(NoFWorkerPoolConfig::AtFirstUse().worker_count),
       numa_socket_id_(numa_socket_id),
       task_queue_(std::make_unique<std::queue<SpdkNofTask>[]>(worker_count_)),
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
@@ -622,7 +592,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_debug_snapshot);
-            if (elapsed.count() >= GetSpdkNofDebugIntervalMs()) {
+            if (elapsed >= GetSpdkNofDebugIntervalMs()) {
                 for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx

@@ -55,6 +55,9 @@ struct WeightMetadataSnapshot {
 YLT_REFL(WeightMetadataSnapshot, schema_version, metadata, leases, operations,
          next_lease_id, next_operation_id);
 
+tl::expected<void, WeightManagementError> ValidateWeightMetadataSnapshot(
+    const WeightMetadataSnapshot& snapshot);
+
 class WeightMetadataStore {
    public:
     template <typename T>

@@ -12,6 +12,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     uds_transport.cpp
     config/distributed_storage_config.cpp
     config/rpc_protocol_config.cpp
+    config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp)
@@ -19,7 +20,9 @@ set(MOONCAKE_STORE_SHARED_SOURCES
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    config/dfs_enablement_config.cpp
     config/ha_cluster_namespace_config.cpp
+    config/master_metadata_config.cpp
     config/local_file_snapshot_config.cpp
     config/metrics_bootstrap_config_loader.cpp
     config/redis_connection_config.cpp
@@ -27,6 +30,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment_allocator_registration.cpp
     client_offboarding.cpp
     master_service.cpp
+    master_store_backend.cpp
+    weight_store_manager.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
@@ -105,6 +110,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/backend.cpp
     nvme_kv/connector.cpp
     nvme_kv/config/connector_config.cpp
+    nvme_kv/config/executor_config.cpp
     nvme_kv/config/io_concurrency_config.cpp
     nvme_kv/config/u32_parser.cpp
     nvme_kv/executor_io_uring.cpp
@@ -114,7 +120,9 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/key_conflict_policy.cpp
     nvme_kv/object_layout.cpp
     transfer_task.cpp
+    config/nof_debug_config.cpp
     config/fileread_worker_pool_config.cpp
+    config/nof_worker_pool_config.cpp
     posix_file.cpp
     client_buffer.cpp
     aligned_client_buffer.cpp
@@ -123,9 +131,11 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     registered_pinned_memory.cpp
     dummy_client.cpp
     shm_helper.cpp
+    config/shm_spdk_registration_config.cpp
     file_storage.cpp
     config/client_host_identity_config.cpp
     config/client_metric_config.cpp
+    config/client_object_checksum_config.cpp
     config/file_storage_config.cpp
     config/bucket_backend_config.cpp
     config/file_per_key_config.cpp
