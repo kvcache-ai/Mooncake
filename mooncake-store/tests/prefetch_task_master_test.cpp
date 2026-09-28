@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -112,6 +113,60 @@ class PrefetchTaskMasterTest : public ::testing::Test {
             return false;
         }
         return !accessor.Get().IsLeaseExpired();
+    }
+
+    // The candidate's execution-failure count if a candidate exists.
+    static std::optional<uint32_t> CandidateFailuresForTesting(
+        MasterService* service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                   .user_key = key});
+        const auto* tenant_state = accessor.GetTenantState();
+        if (tenant_state == nullptr) {
+            return std::nullopt;
+        }
+        auto it = tenant_state->promotion_candidates.find(key);
+        if (it == tenant_state->promotion_candidates.end()) {
+            return std::nullopt;
+        }
+        return it->second.execution_failures;
+    }
+
+    // The in-flight task's execution-failure count if a task exists.
+    static std::optional<uint32_t> TaskFailuresForTesting(
+        MasterService* service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                   .user_key = key});
+        const auto* tenant_state = accessor.GetTenantState();
+        if (tenant_state == nullptr) {
+            return std::nullopt;
+        }
+        auto it = tenant_state->promotion_tasks.find(key);
+        if (it == tenant_state->promotion_tasks.end()) {
+            return std::nullopt;
+        }
+        return it->second.execution_failures;
+    }
+
+    // Seed an on-hit candidate carrying a prior execution-failure history,
+    // the way the retry pipeline leaves it after a failed chain.
+    static void SeedCandidateForTesting(MasterService* service,
+                                        const TenantId& tenant_id,
+                                        const std::string& key,
+                                        uint32_t failures) {
+        MasterService::MetadataAccessorRW accessor(
+            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                   .user_key = key});
+        if (!accessor.Exists()) {
+            return;
+        }
+        service->RecordOrUpdateCandidate(
+            accessor.GetTenantState(), key, /*sketch_score=*/0,
+            PromotionCandidateReason::kExecutionFailed, ErrorCode::OK,
+            failures);
     }
 };
 
@@ -236,6 +291,67 @@ TEST_F(PrefetchTaskMasterTest, NotifyPromotionSuccessGrantsLeaseForPrefetch) {
         }
     }
     EXPECT_TRUE(has_memory);
+
+    service->RemoveAll();
+}
+
+TEST_F(PrefetchTaskMasterTest, PrefetchFailureDoesNotRecordCandidate) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    auto service = std::make_unique<MasterService>(config);
+
+    UUID holder = PrepareHolderClient(*service, "prefetch_seg_leak");
+    ASSERT_TRUE(InjectLocalDiskOnlyKey(*service, holder, "pkl", 1024,
+                                       "prefetch_seg_leak"));
+    ASSERT_TRUE(
+        service->RegisterPrefetchTask(holder, "pkl", TenantId::Default())
+            .has_value());
+    ASSERT_TRUE(
+        service->NotifyPromotionFailure(holder, "pkl", TenantId::Default())
+            .has_value());
+
+    // A from_prefetch failure must not re-record an on-hit candidate: with
+    // promotion_on_hit off the retry sweeper never consumes it, so the
+    // entry would leak and pin the tenant state permanently.
+    EXPECT_FALSE(CandidateFailuresForTesting(service.get(),
+                                             TenantId::Default(), "pkl")
+                     .has_value());
+
+    service->RemoveAll();
+}
+
+TEST_F(PrefetchTaskMasterTest, RegisterPropagatesCandidateFailureCount) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    auto service = std::make_unique<MasterService>(config);
+
+    UUID holder = PrepareHolderClient(*service, "prefetch_seg_prop");
+    ASSERT_TRUE(InjectLocalDiskOnlyKey(*service, holder, "pkp", 1024,
+                                       "prefetch_seg_prop"));
+    // A previous chain (e.g. on-hit retries) already failed twice on this
+    // key; the candidate carries that history.
+    SeedCandidateForTesting(service.get(), TenantId::Default(), "pkp", 2);
+
+    ASSERT_TRUE(
+        service->RegisterPrefetchTask(holder, "pkp", TenantId::Default())
+            .has_value());
+    // The candidate is consumed and its failure count moves onto the task —
+    // hardcoding zero here would re-arm a persistently failing key on every
+    // probe, defeating kMaxPromotionExecutionFailures.
+    EXPECT_EQ(TaskFailuresForTesting(service.get(), TenantId::Default(),
+                                     "pkp"),
+              std::optional<uint32_t>(2));
+    EXPECT_FALSE(CandidateFailuresForTesting(service.get(),
+                                             TenantId::Default(), "pkp")
+                     .has_value());
+
+    // A prefetch failure then ends the chain instead of re-recording.
+    ASSERT_TRUE(
+        service->NotifyPromotionFailure(holder, "pkp", TenantId::Default())
+            .has_value());
+    EXPECT_FALSE(CandidateFailuresForTesting(service.get(),
+                                             TenantId::Default(), "pkp")
+                     .has_value());
 
     service->RemoveAll();
 }

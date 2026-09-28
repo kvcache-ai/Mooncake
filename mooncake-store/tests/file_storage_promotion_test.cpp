@@ -394,6 +394,30 @@ TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     EXPECT_EQ(got.count("k_notify_fail"), 1u);
 }
 
+TEST_F(FileStoragePromotionTest, PrefetchKeysStopsBatchOnDramPressure) {
+    // First key's AllocStart hits NO_AVAILABLE_HANDLE (DRAM saturated).
+    fake->alloc_overrides["pk1"] = ErrorCode::NO_AVAILABLE_HANDLE;
+
+    bool dram_pressure = false;
+    std::vector<std::string> attempted;
+    auto res = file_storage->PrefetchKeys(
+        {"pk1", "pk2", "pk3", "pk4"}, {1024, 1024, 1024, 1024},
+        &dram_pressure,
+        [&attempted](const std::string& key, bool) {
+            attempted.push_back(key);
+        });
+    ASSERT_TRUE(res.has_value());
+    EXPECT_TRUE(dram_pressure);
+
+    // The first pressure failure must stop the batch: one alloc
+    // round-trip (plus its slot-release notify), not one per key.
+    EXPECT_EQ(fake->alloc_calls.load(), 1);
+    EXPECT_EQ(attempted, std::vector<std::string>({"pk1"}));
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1);
+    EXPECT_EQ(fake->notify_failure_keys,
+              std::vector<std::string>({"pk1"}));
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

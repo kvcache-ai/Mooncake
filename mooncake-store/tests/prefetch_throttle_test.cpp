@@ -56,6 +56,21 @@ TEST(PrefetchThrottleTest, ZeroTtlDisablesDedup) {
     EXPECT_EQ(throttle.reserve({"a"}).size(), 1u);
 }
 
+TEST(PrefetchThrottleTest, ZeroTtlKeepsNoPerKeyState) {
+    PrefetchThrottle throttle;
+    throttle.configure(1, 0);
+
+    // Dedup disabled: every reserve passes every key, but nothing may be
+    // recorded — expired entries are only swept on TTL cadence, so storing
+    // them would grow the table without bound.
+    EXPECT_EQ(throttle.reserve({"a", "b"}).size(), 2u);
+    throttle.markCompleted("a");
+    throttle.markInFlight("b");
+    // stateOf reports kFailed for keys with no entry.
+    EXPECT_EQ(throttle.stateOf("a"), PrefetchThrottle::State::kFailed);
+    EXPECT_EQ(throttle.stateOf("b"), PrefetchThrottle::State::kFailed);
+}
+
 TEST(PrefetchThrottleTest, FailedKeyRetriesAfterBackoffNotFullTtl) {
     PrefetchThrottle throttle;
     // cooldown (== failed retry backoff) 0s -> failed entries expire
