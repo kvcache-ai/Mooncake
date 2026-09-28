@@ -591,31 +591,6 @@ TEST(HipTransportTest, IpcTransfersHitBuffersInsideLargerAllocation) {
             open(FLAGS_hip_ipc_rerun_marker.c_str(), O_CREAT | O_WRONLY, 0600));
 }
 
-// The devices this process sees, as HIP_VISIBLE_DEVICES entries a child
-// process started with the same ROCR_VISIBLE_DEVICES can use. Mirrors how HIP
-// reads the variables: an empty HIP_VISIBLE_DEVICES falls back to
-// CUDA_VISIBLE_DEVICES, and a repeated entry is dropped.
-static std::vector<std::string> visibleDeviceIds(int device_count) {
-    const char* hip = getenv("HIP_VISIBLE_DEVICES");
-    const char* cuda = getenv("CUDA_VISIBLE_DEVICES");
-    const char* list =
-        hip != nullptr && *hip != '\0'
-            ? hip
-            : (cuda != nullptr && *cuda != '\0' ? cuda : nullptr);
-    std::vector<std::string> ids;
-    if (list != nullptr) {
-        std::stringstream in(list);
-        std::string id;
-        while (std::getline(in, id, ',')) {
-            if (std::find(ids.begin(), ids.end(), id) == ids.end())
-                ids.push_back(id);
-        }
-    } else {
-        for (int d = 0; d < device_count; ++d) ids.push_back(std::to_string(d));
-    }
-    return ids;
-}
-
 // Same-node peers need not see the same devices: in SGLang PD each role sees
 // only its own GPUs, so a TP4 decode's rank 3 exports from device ordinal 3
 // while a TP2 prefill process sees two devices. hipIpcOpenMemHandle checks
@@ -633,16 +608,21 @@ TEST(HipTransportTest, IpcOpensHandlesFromDeviceOrdinalsTheImporterLacks) {
         (count_err == cudaSuccess && device_count < 2))
         GTEST_SKIP() << "Needs >= 2 GPUs.";
     ASSERT_EQ(count_err, cudaSuccess);
-    const auto ids = visibleDeviceIds(device_count);
-    ASSERT_EQ(ids.size(), static_cast<size_t>(device_count))
-        << "cannot map this process's devices to HIP_VISIBLE_DEVICES entries";
+    // The children's device sets are written as HIP_VISIBLE_DEVICES indices
+    // into what ROCr exposes, which only matches this process's ordinals
+    // when HIP applies no filter of its own.
+    for (const char* name : {"HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"}) {
+        const char* value = getenv(name);
+        if (value != nullptr && *value != '\0')
+            GTEST_SKIP() << name << " is set; this test sets it itself, so "
+                         << "restrict GPUs with ROCR_VISIBLE_DEVICES instead.";
+    }
     // The source's only device must reach the destination's second one.
     int peer = -1;
     for (int d = 1; d < device_count && peer < 0; ++d) {
         int can_access = 0;
-        if (cudaDeviceCanAccessPeer(&can_access, 0, d) == cudaSuccess &&
-            can_access)
-            peer = d;
+        ASSERT_EQ(cudaDeviceCanAccessPeer(&can_access, 0, d), cudaSuccess);
+        if (can_access) peer = d;
     }
     if (peer < 0) GTEST_SKIP() << "No GPU has peer access to GPU 0.";
 
@@ -654,13 +634,13 @@ TEST(HipTransportTest, IpcOpensHandlesFromDeviceOrdinalsTheImporterLacks) {
     std::vector<std::string> args = {
         "/proc/self/exe",
         "--hip_ipc_dst_device=1",
-        "--hip_ipc_dst_visible_devices=" + ids[0] + "," + ids[peer],
+        "--hip_ipc_dst_visible_devices=0," + std::to_string(peer),
         "--hip_ipc_dst_expect_devices=2",
         "--hip_ipc_expect_devices=1",
         std::string("--hip_ipc_rerun_marker=") + marker};
     auto argv = cStrings(args);
     std::vector<std::string> env_strings =
-        environWith("HIP_VISIBLE_DEVICES", ids[0].c_str());
+        environWith("HIP_VISIBLE_DEVICES", "0");
     // HIP also honors CUDA_VISIBLE_DEVICES; only HIP_VISIBLE_DEVICES may
     // restrict the rerun. gflags rejects --gtest_* flags, so the filter goes
     // through the environment, and inherited sharding must not drop the test.
@@ -675,10 +655,17 @@ TEST(HipTransportTest, IpcOpensHandlesFromDeviceOrdinalsTheImporterLacks) {
         "GTEST_FILTER=HipTransportTest."
         "IpcTransfersHitBuffersInsideLargerAllocation");
     auto envp = cStrings(env_strings);
+    // Its own process group, so a timeout also kills the destination the
+    // rerun starts.
+    posix_spawnattr_t attr;
+    ASSERT_EQ(posix_spawnattr_init(&attr), 0);
+    ASSERT_EQ(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP), 0);
+    ASSERT_EQ(posix_spawnattr_setpgroup(&attr, 0), 0);
     pid_t pid = -1;
-    ASSERT_EQ(
-        posix_spawn(&pid, argv[0], nullptr, nullptr, argv.data(), envp.data()),
-        0);
+    const int spawn_rc =
+        posix_spawn(&pid, argv[0], nullptr, &attr, argv.data(), envp.data());
+    posix_spawnattr_destroy(&attr);
+    ASSERT_EQ(spawn_rc, 0);
     int status = 0;
     pid_t waited = 0;
     for (int i = 0; i < 2400 && waited == 0; ++i) {  // up to 240 s
@@ -687,7 +674,7 @@ TEST(HipTransportTest, IpcOpensHandlesFromDeviceOrdinalsTheImporterLacks) {
         if (waited == 0) usleep(100 * 1000);
     }
     if (waited == 0) {
-        kill(pid, SIGKILL);
+        kill(-pid, SIGKILL);
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
         }
         unlink(marker);
