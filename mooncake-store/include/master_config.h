@@ -370,7 +370,7 @@ class MasterServiceSupervisorConfig {
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat.interval.count();
         nof_heartbeat_probe_timeout_ms =
-            static_cast<uint32_t>(config.nof_heartbeat.probe_timeout.count());
+            config.nof_heartbeat.probe_timeout.count();
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat.failures_threshold;
         enable_offload = config.enable_offload;
@@ -673,7 +673,7 @@ class WrappedMasterServiceConfig {
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat.interval.count();
         nof_heartbeat_probe_timeout_ms =
-            static_cast<uint32_t>(config.nof_heartbeat.probe_timeout.count());
+            config.nof_heartbeat.probe_timeout.count();
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat.failures_threshold;
         enable_ha = config.enable_ha;

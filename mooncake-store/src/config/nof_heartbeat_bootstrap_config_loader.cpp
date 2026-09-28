@@ -9,8 +9,7 @@ NofHeartbeatBootstrapConfig ResolveNofHeartbeatBootstrapConfig(
     const NofHeartbeatCommandLineOverrides& command_line) {
     NofHeartbeatBootstrapConfig result;
     int64_t interval_seconds = result.interval.count();
-    uint32_t probe_timeout_ms =
-        static_cast<uint32_t>(result.probe_timeout.count());
+    uint32_t probe_timeout_ms = result.probe_timeout.count();
 
     if (file_config != nullptr) {
         if (file_config->Contains("nof_heartbeat_interval_sec")) {
@@ -38,7 +37,7 @@ NofHeartbeatBootstrapConfig ResolveNofHeartbeatBootstrapConfig(
     }
 
     result.interval = std::chrono::seconds(interval_seconds);
-    result.probe_timeout = std::chrono::milliseconds(probe_timeout_ms);
+    result.probe_timeout = NofHeartbeatProbeTimeout(probe_timeout_ms);
     return result;
 }
 

@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <type_traits>
 
 #include "config/metrics_bootstrap_config_loader.h"
 #include "config/nof_heartbeat_bootstrap_config_loader.h"
@@ -263,8 +264,12 @@ TEST(NofHeartbeatBootstrapConfigPropagationTest,
     MasterConfig master_config{};
     master_config.allocation_strategy = "random";
     master_config.nof_heartbeat.interval = std::chrono::seconds(-7);
-    master_config.nof_heartbeat.probe_timeout = std::chrono::milliseconds(250);
+    master_config.nof_heartbeat.probe_timeout = NofHeartbeatProbeTimeout(250);
     master_config.nof_heartbeat.failures_threshold = 9;
+    // The probe timeout stays unsigned by type, so no signed value can be
+    // narrowed into the serving field while it is forwarded.
+    static_assert(std::is_unsigned_v<
+                  decltype(master_config.nof_heartbeat.probe_timeout)::rep>);
 
     WrappedMasterServiceConfig standalone(master_config, 0);
     EXPECT_EQ(standalone.nof_heartbeat_interval_sec, -7);
