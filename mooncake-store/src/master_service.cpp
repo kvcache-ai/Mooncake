@@ -3356,7 +3356,7 @@ auto MasterService::ExistKeyImpl(const std::string& key,
     // since the read accessor only reports a live publication.
     bool metadata_invalid = false;
     const auto published = WithObjectMetadataForRead(
-        MakeObjectIdentityForRequest(key, tenant_id),
+        ResolveRequestTenantId(tenant_id), key,
         [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
             const ObjectMetadata& metadata, const ObjectEntry::State&) -> bool {
             if (!metadata.IsValid()) {
@@ -4412,13 +4412,13 @@ auto MasterService::GetReplicaList(const std::string& key,
                                    const TenantId& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    const TenantId& tenant = ResolveRequestTenantId(tenant_id);
 
     bool promotion_eligible = false;
     bool dynamic_replication_observed = false;
     MasterMetricManager::instance().inc_total_get_nums();
     auto outcome = WithObjectMetadataForRead(
-        object_id,
+        tenant, key,
         [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
             const ObjectMetadata& metadata, const ObjectEntry::State&)
             -> tl::expected<GetReplicaListResponse, ErrorCode> {
@@ -4505,10 +4505,10 @@ auto MasterService::GetReplicaList(const std::string& key,
     }
     // The read is released. Safe to take a fresh write access now.
     if (promotion_eligible) {
-        TryPushPromotionQueue(object_id);
+        TryPushPromotionQueue(ObjectIdentity{tenant, key});
     }
     if (dynamic_replication_observed) {
-        MaybeQueueDynamicReplicaProposal(object_id);
+        MaybeQueueDynamicReplicaProposal(ObjectIdentity{tenant, key});
     }
     return std::move(*outcome);
 }
@@ -4517,11 +4517,10 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
                                            const TenantId& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     assert(tenant_id.IsValid());
-    const auto object_id = MakeObjectIdentity(key, tenant_id);
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto outcome = WithObjectMetadataForRead(
-        object_id,
+        tenant_id, key,
         [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
             const ObjectMetadata& metadata, const ObjectEntry::State&)
             -> tl::expected<GetReplicaListResponse, ErrorCode> {
@@ -4573,9 +4572,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         const std::string& key = keys[original_idx];
         MasterMetricManager::instance().inc_total_get_nums();
 
-        const ObjectIdentity object_id{normalized_tenant, key};
         auto outcome = WithObjectMetadataForRead(
-            object_id,
+            normalized_tenant, key,
             [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
                 const ObjectMetadata& metadata,
                 const ObjectEntry::State&) -> GetResult {
@@ -4622,7 +4620,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                             return descriptor.is_local_disk_replica();
                         });
                     if (!any_memory && any_local_disk) {
-                        promotion_candidates.push_back(object_id);
+                        promotion_candidates.push_back(
+                            ObjectIdentity{normalized_tenant, key});
                     }
                 }
                 if (DynamicReplicationEnabled()) {
@@ -4635,10 +4634,10 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                         memory_replicas <
                             dynamic_replication_max_memory_replicas_) {
                         if (dynamic_replication_seen
-                                .insert(object_id.tenant_id.MakeScopedKey(
-                                    object_id.user_key))
+                                .insert(normalized_tenant.MakeScopedKey(key))
                                 .second) {
-                            dynamic_replication_candidates.push_back(object_id);
+                            dynamic_replication_candidates.push_back(
+                                ObjectIdentity{normalized_tenant, key});
                         }
                     }
                 }
@@ -4682,9 +4681,8 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     for (size_t original_idx = 0; original_idx < keys.size(); ++original_idx) {
         const std::string& key = keys[original_idx];
-        const ObjectIdentity object_id{normalized_tenant, key};
         auto outcome = WithObjectMetadataForRead(
-            object_id,
+            normalized_tenant, key,
             [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
                 const ObjectMetadata& metadata,
                 const ObjectEntry::State&) -> GetResult {

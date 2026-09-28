@@ -1281,25 +1281,48 @@ class MasterService {
     // object do not exclude each other. The invalid-replica cleanup of the
     // write form above is skipped, because a reader must not mutate what it
     // reads.
+    //
+    // The registry is the authority on which tenant instance is current, so the
+    // tenant is resolved for the key being read. A batch uses this form per key
+    // and passes the key as a view it keeps alive for the call only, instead of
+    // building an owning identity per key.
+    template <typename Fn>
+    [[nodiscard]] auto WithObjectMetadataForRead(const TenantId& tenant_id,
+                                                 std::string_view user_key,
+                                                 Fn&& fn) const {
+        return WithPublishedObjectForRead(tenants_.Lookup(tenant_id), user_key,
+                                          std::forward<Fn>(fn));
+    }
+
+    // The same read through an identity the caller already holds.
     template <typename Fn>
     [[nodiscard]] auto WithObjectMetadataForRead(
         const ObjectIdentity& object_id, Fn&& fn) const {
+        return WithObjectMetadataForRead(
+            object_id.tenant_id, object_id.user_key, std::forward<Fn>(fn));
+    }
+
+    // The read form once the tenant is in hand. `user_key` must stay alive for
+    // the call: the access holds it only long enough to resolve and re-check
+    // the entry it publishes.
+    template <typename Fn>
+    [[nodiscard]] auto WithPublishedObjectForRead(
+        const std::shared_ptr<metadata::Tenant>& tenant,
+        std::string_view user_key, Fn&& fn) const {
         using Result = std::invoke_result_t<
             Fn, const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
             const ObjectMetadata&, const ObjectEntry::State&>;
-        const auto tenant = tenants_.Lookup(object_id.tenant_id);
         if (tenant == nullptr) {
             return PublishedResult<Result>{};
         }
-        const auto entry = tenant->Get(object_id.user_key);
+        const auto entry = tenant->Get(user_key);
         if (entry == nullptr) {
             return PublishedResult<Result>{};
         }
         return entry->WithSharedAccess(
             [&](const ObjectMetadata& metadata,
                 const ObjectEntry::State& state) -> PublishedResult<Result> {
-                if (state.is_torn_down ||
-                    tenant->Get(object_id.user_key) != entry) {
+                if (state.is_torn_down || tenant->Get(user_key) != entry) {
                     return PublishedResult<Result>{};
                 }
                 if constexpr (std::is_void_v<Result>) {
