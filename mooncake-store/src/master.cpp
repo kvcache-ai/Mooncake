@@ -187,9 +187,11 @@ DEFINE_string(rpc_address, "0.0.0.0",
 DEFINE_string(rpc_interface, "",
               "Network interface name for RPC server address resolution. "
               "When set, its IPv4 address overrides rpc_address");
-DEFINE_int32(rpc_conn_timeout_seconds, 0,
+DEFINE_int32(rpc_conn_timeout_seconds,
+             mooncake::RpcConnectionBootstrapConfig::kDefaultTimeoutSeconds,
              "Connection timeout in seconds (0 = no timeout)");
-DEFINE_bool(rpc_enable_tcp_no_delay, true,
+DEFINE_bool(rpc_enable_tcp_no_delay,
+            mooncake::RpcConnectionBootstrapConfig::kDefaultTcpNoDelay,
             "Enable TCP_NODELAY for RPC connections");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
