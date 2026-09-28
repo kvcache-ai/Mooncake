@@ -161,6 +161,7 @@ class MasterMetricManager {
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
+    void inc_put_start_object_already_exists(int64_t val = 1);
     void inc_put_start_alloc_failures(int64_t val = 1);
     void inc_put_start_partial_allocations(int64_t val = 1);
     void inc_put_end_requests(int64_t val = 1);
@@ -214,6 +215,7 @@ class MasterMetricManager {
     void inc_batch_get_replica_list_partial_success(int64_t failed_items);
     void inc_batch_put_start_requests(int64_t items);
     void inc_batch_put_start_failures(int64_t failed_items);
+    void inc_batch_put_start_object_already_exists(int64_t items);
     void inc_batch_put_start_partial_success(int64_t failed_items);
     void inc_batch_put_end_requests(int64_t items);
     void inc_batch_put_end_failures(int64_t failed_items);
@@ -225,6 +227,7 @@ class MasterMetricManager {
     // Operation Statistics Getters
     int64_t get_put_start_requests();
     int64_t get_put_start_failures();
+    int64_t get_put_start_object_already_exists();
     int64_t get_put_start_alloc_failures();
     int64_t get_put_start_partial_allocations();
     int64_t get_put_end_requests();
@@ -275,6 +278,7 @@ class MasterMetricManager {
     int64_t get_batch_get_replica_list_failed_items();
     int64_t get_batch_put_start_requests();
     int64_t get_batch_put_start_failures();
+    int64_t get_batch_put_start_object_already_exists();
     int64_t get_batch_put_start_partial_successes();
     int64_t get_batch_put_start_items();
     int64_t get_batch_put_start_failed_items();
@@ -618,6 +622,7 @@ class MasterMetricManager {
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;
     ylt::metric::counter_t put_start_failures_;
+    ylt::metric::counter_t put_start_object_already_exists_;
     ylt::metric::counter_t put_start_alloc_failures_;
     ylt::metric::counter_t put_start_partial_allocations_;
     ylt::metric::counter_t put_end_requests_;
@@ -679,6 +684,7 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_get_replica_list_failed_items_;
     ylt::metric::counter_t batch_put_start_requests_;
     ylt::metric::counter_t batch_put_start_failures_;
+    ylt::metric::counter_t batch_put_start_object_already_exists_;
     ylt::metric::counter_t batch_put_start_partial_successes_;
     ylt::metric::counter_t batch_put_start_items_;
     ylt::metric::counter_t batch_put_start_failed_items_;

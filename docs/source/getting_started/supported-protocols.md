@@ -18,6 +18,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
 | **shm** | None (POSIX shm, same host) | Same-host DRAM copies without NIC loopback | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
+| **hylink** | Hygon DCU + DTK | Hygon DCU HSL fabric communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
 | **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
 | **flagcx** | RDMA-capable NIC(s) | Unified P2P transfer through FlagOS FlagCX | ⚠️ Advanced |
@@ -368,6 +369,38 @@ export MC_INTRANODE_NVLINK=true
 - [Heterogeneous Ascend](../design/transfer-engine/transport/heterogeneous_ascend.md)
 - [Ascend Transport](../design/transfer-engine/transport/ascend_transport.md)
 
+### Hylink Transport (hylink)
+
+**Description:** Transfer Engine transport for Hygon DCU memory over HSL
+(Hygon Scale-up Link). HSL connects DCUs directly, including across machines,
+and does not use an IB/RoCE NIC. Peers exchange a DTK VMM fabric handle
+(`hipMemAllocationHandleType` `0x8`, 512 bytes). The same handle works on one
+machine and across machines. An imported fabric address can be granted access
+only once, and only to one device, so each local GPU imports and maps the
+handle, then grants access on its own device. The TENT transport uses the same
+HSL fabric path by default, and remains selectable across machines. Set
+`MC_HYLINK_USE_VMM=0` on both sides of a TENT run to use HIP IPC in
+environments that do not support VMM. IPC cannot cross machines.
+
+**Status:** Select it with `transfer_engine_bench --protocol=hylink`.
+TENT selects it with `transports.hylink.enable=true` or
+`transfer_engine_bench --backend=tent --protocol=hylink`. It is off unless
+that switch is set, so a DTK build keeps using RDMA/TCP by default.
+
+**Use When:**
+- DCU copies on one machine or across machines should use HSL instead of a
+  NIC path. The exporter must register VMM memory (`hipMemCreate`)
+- TENT only: set `MC_HYLINK_USE_VMM=0` in environments that do not support
+  VMM. That path uses same-machine `hipMalloc` buffers and a HIP IPC
+  handle, and cannot cross machines
+
+**Requirements:**
+- Built with `-DUSE_HYLINK=ON` (implies `USE_HIP`)
+- TENT builds also pass `-DUSE_TENT=ON`
+- Hygon DTK runtime
+- Both sides must support DTK VMM fabric
+- TENT IPC does not require VMM and stays on one machine
+
 ### TPU Transport (tpu) — Experimental
 
 **Description:** Google TPU support in the TENT runtime. Because TPU HBM is not
@@ -539,6 +572,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
 | Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
+| Hygon DCU Clusters | rdma + hylink | Build with `-DUSE_HYLINK=ON`; use hylink for HSL fabric communication |
 | Multi-vendor or cross-vendor clusters | flagcx | Build with `-DUSE_FLAGCX=ON`; transfers use the FlagCX P2P Engine over RDMA-capable NICs |
 
 ## Troubleshooting

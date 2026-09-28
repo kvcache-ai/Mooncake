@@ -154,6 +154,12 @@ class MasterServiceTest : public ::testing::Test {
         return MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
     }
 
+    std::unique_ptr<SharedMutexLocker> LockMetadataShardForTest(
+        MasterService& service, size_t shard_idx) {
+        return std::make_unique<SharedMutexLocker>(
+            &MasterServiceTestPeer::MetadataShards(service)[shard_idx].mutex);
+    }
+
     size_t MetadataBucketCount(
         MasterService& service, size_t shard_idx,
         const TenantId& tenant_id = TenantId::Default()) {

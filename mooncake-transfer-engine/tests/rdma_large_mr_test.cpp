@@ -226,9 +226,10 @@ class RDMAGpuDmabufChunkTest : public ::testing::Test {
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 
 #if defined(USE_CUDA)
-        ASSERT_FALSE(Environ::Get().GetWithNvidiaPeermem())
-            << "Launch with WITH_NVIDIA_PEERMEM=0 so this test exercises "
-               "ibv_reg_dmabuf_mr instead of the nvidia-peermem fallback";
+        ASSERT_TRUE(Environ::Get().GetRdmaDataDirect() ||
+                    !Environ::Get().GetWithNvidiaPeermem())
+            << "Launch with WITH_NVIDIA_PEERMEM=0 or MC_RDMA_DATA_DIRECT=1 "
+               "so this test exercises DMA-BUF registration";
 #endif
 
         engine = std::make_unique<TransferEngine>(true);
