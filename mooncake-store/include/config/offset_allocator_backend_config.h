@@ -79,6 +79,12 @@ struct OffsetAllocatorBackendConfig {
     // returns (x86-64 only). Needed for power-fail durability on PMEM without
     // eADR; pure overhead on volatile CXL memory, so off by default.
     bool dax_flush_cpu_cache = false;
+
+    // Serve remote reads straight out of the DAX mapping: FileStorage
+    // registers it with the transfer engine and BatchGet pins records instead
+    // of copying them into ClientBuffer. Falls back to the copy path when
+    // registration fails. No effect unless dax_device_path is set.
+    bool dax_zero_copy = false;
 };
 
 }  // namespace mooncake

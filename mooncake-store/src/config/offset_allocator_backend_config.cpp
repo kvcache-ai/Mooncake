@@ -146,6 +146,8 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     cfg.dax_flush_cpu_cache =
         Environ::ReadOr(Variables::MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE,
                         cfg.dax_flush_cpu_cache);
+    cfg.dax_zero_copy = Environ::ReadOr(
+        Variables::MOONCAKE_OFFSET_DAX_ZERO_COPY, cfg.dax_zero_copy);
 
     return cfg;
 }
