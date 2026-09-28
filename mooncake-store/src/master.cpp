@@ -455,7 +455,8 @@ DEFINE_uint32(max_retry_attempts, 10,
 DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
-DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+DEFINE_bool(enable_cxl, mooncake::CxlBootstrapConfig::kDefaultEnabled,
+            "Whether to enable CXL memory support");
 
 namespace {
 

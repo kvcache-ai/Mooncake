@@ -8,7 +8,11 @@
 namespace mooncake {
 
 struct CxlBootstrapConfig {
-    bool enabled{false};
+    // The flag definition in master.cpp reuses this default, so the config
+    // default and the flag default cannot drift apart.
+    static constexpr bool kDefaultEnabled = false;
+
+    bool enabled{kDefaultEnabled};
     std::string path{DEFAULT_CXL_PATH};
     size_t size{DEFAULT_CXL_SIZE};
 };
