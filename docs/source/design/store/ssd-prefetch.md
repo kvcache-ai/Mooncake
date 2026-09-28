@@ -112,8 +112,8 @@ MEMORY replica and the actual transfer the replica could in principle be
 evicted. That race is accepted (best-effort): the transfer simply fails and
 the caller retries/falls back per the existing error path.
 
-A/B replay (fill → overflow → settle → measure c=2) and the vLLM bench
-screen logs live in `scripts/ssd-prefetch-ttft-ab/`.
+Measured TTFT results and the A/B methodology (fill → overflow → settle →
+measure) are in PR #4272's description.
 
 
 ## Detailed design
