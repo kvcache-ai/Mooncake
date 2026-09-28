@@ -56,8 +56,8 @@ run_test()
             sed -i '/class TestDisaggregationMooncakeDecodeLargerTP/,/def start_decode(cls):/ {
             /"--enable-metrics"/ {
                 i\\
-            "--mem-fraction-static",\\
-            "0.70",
+            \"--mem-fraction-static\",\\
+            \"0.70\",
             }
         }' test_disaggregation_different_tp.py && \
             echo 'Model and memory override applied successfully' && \
