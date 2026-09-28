@@ -389,6 +389,21 @@ Status TransferEngineImpl::construct() {
             : 1;
     CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, rpc_threads_default,
                                                rpc_server_threads));
+    {
+        using std::chrono::milliseconds;
+        ControlClient::setRequestTimeout(
+            milliseconds(conf_->get("rpc/request_timeout_ms", int64_t{-1})));
+
+        PeerHealth::Config peer_health;
+        peer_health.enabled = conf_->get("peer_health/enable", true);
+        peer_health.cooldown =
+            milliseconds(conf_->get("peer_health/cooldown_ms", int64_t{5000}));
+        peer_health.probe_interval = milliseconds(
+            conf_->get("peer_health/probe_interval_ms", int64_t{1000}));
+        peer_health.probe_timeout =
+            milliseconds(conf_->get("rpc/probe_timeout_ms", int64_t{2000}));
+        PeerHealth::instance().configure(peer_health);
+    }
     merge_requests_ = conf_->get("merge_requests", true);
     notify_rpc_fallback_ = conf_->get("notification/rpc_fallback", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);

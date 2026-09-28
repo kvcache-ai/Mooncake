@@ -85,6 +85,11 @@ class SegmentDescRetryTest : public ::testing::Test {
         return StartServer("epoch2");
     }
 
+    void SetUp() override {
+        // Process-wide: a mark one case leaves must not outlive it.
+        PeerHealth::instance().clear();
+    }
+
     void TearDown() override {
         // A fatal assertion must still release and join the parked worker.
         if (worker_.joinable()) {

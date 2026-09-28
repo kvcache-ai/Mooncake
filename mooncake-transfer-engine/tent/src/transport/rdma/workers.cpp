@@ -604,7 +604,8 @@ void Workers::markPosted(WorkerContext& worker, RdmaSlice* slice,
     worker.inflight_slice_set.insert(slice);
 }
 
-std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
+std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path,
+                                                   Status* failure) {
     std::string rpc_server_addr, target_seg_name, target_dev_name,
         target_nic_path_name;
     RouteHint hint;
@@ -635,6 +636,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
 
     if (!status.ok()) {
         LOG(ERROR) << status.ToString();
+        if (failure) *failure = status;
         return nullptr;
     }
 
@@ -662,6 +664,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
                 LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
                            << status.ToString();
             }
+            if (failure) *failure = status;
             return nullptr;
         }
     }
@@ -775,8 +778,12 @@ void Workers::asyncPostSend() {
                                     }),
                      slices.end());
         if (slices.empty()) continue;
-        auto endpoint = getEndpoint(path);
+        Status failure;
+        auto endpoint = getEndpoint(path, &failure);
         if (!endpoint) {
+            // A failed control-plane RPC is no fault of this NIC pair: do not
+            // charge its rail or reset its endpoint.
+            const bool control_plane = failure.IsRpcServiceError();
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);
             for (auto slice : clone) {
@@ -795,7 +802,15 @@ void Workers::asyncPostSend() {
                         << "Slice " << slice << " failed: retry count exceeded";
                     LOG_EVERY_N(WARNING, 100)
                         << "Slice " << slice << " failed: retry count exceeded";
-                    disableEndpoint(slice);
+                    if (control_plane) {
+                        if (auto* rail = slice->rail_monitor)
+                            rail->cancelProbe(slice->source_dev_id,
+                                              slice->target_dev_id);
+                        if (auto ep = slice->ep_weak_ptr.lock())
+                            ep->acknowledge(slice, FAILED);
+                    } else {
+                        disableEndpoint(slice);
+                    }
                     discountFromOwner(worker, slice);
                     updateSliceStatus(slice, FAILED);
                 } else {
