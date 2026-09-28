@@ -328,6 +328,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
     auto param_status = convertConfToRdmaParams(conf_, params_);
     if (!param_status.ok()) return param_status;
     metadata_ = metadata;
+    notify_rpc_fallback_ = conf_->get("notification/rpc_fallback", true);
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
 
@@ -369,6 +370,12 @@ Status RdmaTransport::install(std::string& local_segment_name,
     workers_ = std::make_unique<Workers>(this);
     workers_->start();
 
+    // A resend may bootstrap a new endpoint, so not on the completion poller.
+    // Started before the notify worker: uninstall() joins it even when
+    // install() fails later.
+    notify_resend_running_ = true;
+    notify_resend_worker_ =
+        std::thread(&RdmaTransport::notifyResendThread, this);
     // Start notification worker thread
     notify_worker_running_ = true;
     notify_worker_ = std::thread(&RdmaTransport::notifyWorkerThread, this);
@@ -384,6 +391,13 @@ Status RdmaTransport::install(std::string& local_segment_name,
 }
 
 Status RdmaTransport::quiesce() {
+    // Before the engine tears anything down: a resend still dials peers.
+    {
+        std::lock_guard<std::mutex> lock(notify_resend_mutex_);
+        notify_resend_running_ = false;
+    }
+    notify_resend_cv_.notify_all();
+    if (notify_resend_worker_.joinable()) notify_resend_worker_.join();
     uint64_t timeout_ns = kDefaultRdmaQuiesceTimeoutNs;
     if (conf_) {
         timeout_ns = conf_->get("transports/rdma/max_timeout_ns", timeout_ns);
@@ -886,6 +900,21 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                                                          int device_id,
                                                          Status* failure) {
+    // context_set_ is NicID-indexed, so slot 0 may be inert; take the first
+    // enabled context instead.
+    for (size_t i = 0; i < context_set_.size(); ++i) {
+        if (context_set_[i]->status() == RdmaContext::DEVICE_ENABLED)
+            return getEndpointOn(i, target_id, device_id, failure);
+    }
+    if (failure)
+        *failure = Status::DeviceNotFound("No enabled RDMA context" LOC_MARK);
+    return nullptr;
+}
+
+std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpointOn(size_t local_ctx,
+                                                           SegmentID target_id,
+                                                           int device_id,
+                                                           Status* failure) {
     std::string rpc_server_addr, target_seg_name, target_dev_name,
         target_nic_path_name;
 
@@ -917,19 +946,11 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
 
-    // context_set_ is NicID-indexed, so slot 0 may be inert; take the first
-    // enabled context instead.
-    RdmaContext* context = nullptr;
-    for (auto& ctx : context_set_) {
-        if (ctx->status() == RdmaContext::DEVICE_ENABLED) {
-            context = ctx.get();
-            break;
-        }
-    }
-    if (!context) {
+    RdmaContext* context = context_set_[local_ctx].get();
+    if (context->status() != RdmaContext::DEVICE_ENABLED) {
         if (failure) {
             *failure =
-                Status::DeviceNotFound("No enabled RDMA context" LOC_MARK);
+                Status::DeviceNotFound("RDMA context not enabled" LOC_MARK);
         }
         return nullptr;
     }
@@ -985,11 +1006,117 @@ Status RdmaTransport::sendNotification(SegmentID target_id,
     if (!endpoint) return notifyStatusForEndpointFailure(failure);
     // Notify QP not connected (the peer has none, or it was disabled after a
     // fault), or the post itself was refused.
-    if (!endpoint->sendNotification(notify)) {
+    PendingNotify track;
+    track.target = target_id;
+    if (!endpoint->sendNotification(notify, &track)) {
         return Status::RdmaError(
             "RDMA notification channel unavailable" LOC_MARK);
     }
     return Status::OK();
+}
+
+Status RdmaTransport::sendNotificationOnAnyPath(const PendingNotify& pending) {
+    std::vector<bool> rdma_nic;  // by the peer's NicID
+    auto status = metadata_->segmentManager().withCachedSegment(
+        pending.target, [&](SegmentDesc* segment) {
+            if (segment->type != SegmentType::Memory) {
+                return Status::NeedsRefreshCache(
+                    "Segment type is not Memory" LOC_MARK);
+            }
+            const auto& topology =
+                std::get<MemorySegmentDesc>(segment->detail).topology;
+            for (size_t nic = 0; nic < topology.getNicCount(); ++nic)
+                rdma_nic.push_back(topology.getNicType(nic) ==
+                                   Topology::NIC_RDMA);
+            return Status::OK();
+        });
+    if (!status.ok()) return notifyStatusForEndpointFailure(status);
+    std::vector<size_t> locals;
+    for (size_t i = 0; i < context_set_.size(); ++i) {
+        if (context_set_[i]->status() == RdmaContext::DEVICE_ENABLED)
+            locals.push_back(i);
+    }
+    Status last = Status::DeviceNotFound("No RDMA notification path" LOC_MARK);
+    // Start after the pair that just failed, like the data path; that pair
+    // comes last.
+    const size_t pairs = locals.size() * rdma_nic.size();
+    const size_t start = static_cast<size_t>(pending.last_path + 1);
+    for (size_t n = 0; n < pairs; ++n) {
+        const size_t i = (start + n) % pairs;
+        const size_t remote = i % rdma_nic.size();
+        if (!rdma_nic[remote]) continue;
+        Status failure;
+        auto endpoint =
+            getEndpointOn(locals[i / rdma_nic.size()], pending.target,
+                          static_cast<int>(remote), &failure);
+        if (!endpoint) {
+            last = notifyStatusForEndpointFailure(failure);
+            if (last.IsRpcServiceError()) return last;  // no pair will do
+            continue;
+        }
+        const PendingNotify track{
+            pending.target, {}, pending.attempts, static_cast<int>(i)};
+        if (endpoint->sendNotification(pending.notifi, &track))
+            return Status::OK();
+        last =
+            Status::RdmaError("RDMA notification channel unavailable" LOC_MARK);
+    }
+    return last;
+}
+
+void RdmaTransport::requeueNotifications(std::vector<PendingNotify>&& drained) {
+    {
+        std::lock_guard<std::mutex> lock(notify_resend_mutex_);
+        for (auto& pending : drained)
+            notify_resend_queue_.push_back(std::move(pending));
+    }
+    notify_resend_cv_.notify_one();
+}
+
+bool RdmaTransport::resendOne(PendingNotify& pending) {
+    Status status =
+        Status::RdmaError("notification resend budget spent" LOC_MARK);
+    if (++pending.attempts <= kMaxNotifyResendAttempts) {
+        status = sendNotificationOnAnyPath(pending);
+        if (status.ok()) return true;
+    }
+    // Past the RDMA rounds, or with none left: the control-plane RPC, the
+    // same leg TcpTransport uses. Not for a peer whose control plane did
+    // not answer.
+    if (notify_rpc_fallback_ && !status.IsRpcServiceError() && metadata_) {
+        status = metadata_->segmentManager().withPeerRpcAddr(
+            pending.target, [&](const std::string& rpc_server_addr) {
+                return ControlClient::notify(rpc_server_addr, pending.notifi);
+            });
+        if (status.ok()) return true;
+    }
+    LOG_EVERY_N(WARNING, 100)
+        << "Dropped a notification to segment " << pending.target << " after "
+        << pending.attempts << " attempt(s), " << google::COUNTER
+        << " so far: " << status.ToString();
+    return false;
+}
+
+void RdmaTransport::notifyResendThread() {
+    std::unique_lock<std::mutex> lock(notify_resend_mutex_);
+    while (true) {
+        notify_resend_cv_.wait(lock, [this] {
+            return !notify_resend_running_ || !notify_resend_queue_.empty();
+        });
+        if (!notify_resend_running_) return;
+        PendingNotify pending = std::move(notify_resend_queue_.front());
+        notify_resend_queue_.pop_front();
+        lock.unlock();
+        try {
+            (void)resendOne(pending);
+        } catch (const std::exception& e) {
+            // E.g. a msg the RPC leg cannot encode: nothing above us catches.
+            LOG_EVERY_N(WARNING, 100)
+                << "Dropped a notification to segment " << pending.target
+                << ", " << google::COUNTER << " so far: " << e.what();
+        }
+        lock.lock();
+    }
 }
 
 Status RdmaTransport::receiveNotification(

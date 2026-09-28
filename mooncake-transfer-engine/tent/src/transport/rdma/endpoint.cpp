@@ -337,11 +337,14 @@ void RdmaEndPoint::beginDestroyNoLock() {
     // this endpoint. The flushes that follow the ERR transition stay quiet
     // because the endpoint is no longer ready; deconstruct() unpublishes
     // under notify_resource_mutex_ before it frees the buffers.
+    std::vector<PendingNotify> drained;
     {
         std::lock_guard<std::mutex> notify_guard(notify_send_mutex_);
         notify_connected_ = false;
         notify_send_cv_.notify_all();
+        drained = takeResendableNoLock();
     }
+    requeueDrained(std::move(drained));
 
     // Only EP_READY can own submitted WRs. QPs in EP_UNINIT/EP_HANDSHAKING may
     // still be RESET/INIT, where a transition to ERR is invalid on providers.
@@ -1234,7 +1237,8 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     return sendNotification(notifi);
 }
 
-bool RdmaEndPoint::sendNotification(const Notification& notifi) {
+bool RdmaEndPoint::sendNotification(const Notification& notifi,
+                                    const PendingNotify* track) {
     // Flow control: wait for pending sends to complete
     std::unique_lock<std::mutex> lock(notify_send_mutex_);
     auto slot_free = [this] {
@@ -1269,11 +1273,12 @@ bool RdmaEndPoint::sendNotification(const Notification& notifi) {
     header.session = notifi.session;
     header.seq = notifi.seq;
     // Too big for the frame header as well: send it raw, without dedup.
-    const bool encoded =
-        (useTypedNotifyFrame(peer_notify_proto_, notifi.seq) &&
-         encodeNotifyFrame(header, notifi.name, notifi.msg, slot_ptr,
-                           kNotifyBufferSize, &total_size)) ||
-        encodeNotifyPayload(slot_ptr, notifi.name, notifi.msg, &total_size);
+    const bool typed =
+        useTypedNotifyFrame(peer_notify_proto_, notifi.seq) &&
+        encodeNotifyFrame(header, notifi.name, notifi.msg, slot_ptr,
+                          kNotifyBufferSize, &total_size);
+    const bool encoded = typed || encodeNotifyPayload(slot_ptr, notifi.name,
+                                                      notifi.msg, &total_size);
     if (!encoded) {
         LOG(ERROR) << "Failed to encode notification payload";
         return false;
@@ -1303,6 +1308,12 @@ bool RdmaEndPoint::sendNotification(const Notification& notifi) {
         return false;
     }
 
+    // Only a stamped frame can be resent safely: its receiver drops copies.
+    if (typed && track) {
+        notify_resendable_.emplace(
+            wr.wr_id, PendingNotify{track->target, notifi, track->attempts,
+                                    track->last_path});
+    }
     notify_pending_count_++;
     notify_inflight_.fetch_add(1, std::memory_order_release);
     return true;
@@ -1362,6 +1373,7 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
 
 void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
     std::lock_guard<std::mutex> lock(notify_send_mutex_);
+    notify_resendable_.erase(wr_id);
     if (notify_pending_count_ > 0) {
         notify_pending_count_--;
         notify_send_stalled_ = false;
@@ -1370,17 +1382,36 @@ void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
 }
 
 void RdmaEndPoint::disableNotification(const std::string& reason) {
+    std::vector<PendingNotify> drained;
     {
         std::lock_guard<std::mutex> send_guard(notify_send_mutex_);
         // A second failing completion on the same QP must not report again.
         if (!notify_connected_.exchange(false)) return;
         notify_send_cv_.notify_all();
+        drained = takeResendableNoLock();
     }
     LOG(WARNING) << "Notifications disabled on endpoint " << endpoint_name_
                  << ", data path kept alive: " << reason;
+    requeueDrained(std::move(drained));
     // The QP stays published: notifications already in the CQ are still
     // handed out, and the worker keeps the flushes of the posted WRs quiet
     // now that notify_connected_ is off.
+}
+
+std::vector<PendingNotify> RdmaEndPoint::takeResendableNoLock() {
+    std::vector<PendingNotify> drained;
+    drained.reserve(notify_resendable_.size());
+    for (auto& entry : notify_resendable_)
+        drained.push_back(std::move(entry.second));
+    notify_resendable_.clear();
+    return drained;
+}
+
+void RdmaEndPoint::requeueDrained(std::vector<PendingNotify>&& drained) {
+    if (drained.empty()) return;
+    LOG(INFO) << "Endpoint " << endpoint_name_ << " hands back "
+              << drained.size() << " in-flight notification(s) for resend";
+    context_->transport_.requeueNotifications(std::move(drained));
 }
 }  // namespace tent
 }  // namespace mooncake
