@@ -163,6 +163,35 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     return result;
 }
 
+tl::expected<bool, ErrorCode> WrappedMasterService::ProbeKey(
+    const std::string& key, const std::string& tenant_id) {
+    return execute_rpc(
+        "ProbeKey",
+        [&] {
+            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
+                                         ? std::string_view(tenant_id)
+                                         : TenantId::kDefaultValue,
+                                     [&](const TenantId& resolved_tenant_id) {
+                                         return master_service_.ProbeKey(
+                                             key, resolved_tenant_id);
+                                     });
+        },
+        [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
+}
+
+std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchProbeKey(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchProbeKey");
+    timer.LogRequest("keys_count=", keys.size());
+
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchProbeKey(keys, resolved_tenant_id);
+        });
+}
+
 tl::expected<
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
     ErrorCode>
@@ -206,17 +235,23 @@ WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
-    const std::string& segment_name) {
+    const std::string& segment_name, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchReplicaClear");
     const size_t total_keys = object_keys.size();
     timer.LogRequest("object_keys_count=", total_keys,
-                     ", client_id=", client_id,
-                     ", segment_name=", segment_name);
+                     ", client_id=", client_id, ", segment_name=", segment_name,
+                     ", tenant_id=", tenant_id);
     MasterMetricManager::instance().inc_batch_replica_clear_requests(
         total_keys);
 
-    auto result =
-        master_service_.BatchReplicaClear(object_keys, client_id, segment_name);
+    auto result = WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchReplicaClear(
+                object_keys, client_id, segment_name,
+                resolved_tenant_id.value());
+        });
 
     size_t failure_count = 0;
     if (!result.has_value()) {
@@ -375,7 +410,7 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
                                const ReplicateConfig& config,
                                const std::string& tenant_id) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "PutStart",
         [&] {
             return WithWriteTenant(tenant_id,
@@ -392,6 +427,10 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    if (!result && result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+        MasterMetricManager::instance().inc_put_start_object_already_exists();
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
@@ -506,14 +545,14 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     }
 
     size_t failure_count = 0;
+    int64_t already_exists_count = 0;
     int no_available_handle_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
-                        << keys[i] << "': " << toString(error);
+                ++already_exists_count;
             } else if (error == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
             } else {
@@ -522,6 +561,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     }
+
+    MasterMetricManager::instance().inc_batch_put_start_object_already_exists(
+        already_exists_count);
 
     if (no_available_handle_count > 0) {
         LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
@@ -1742,9 +1784,10 @@ KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
 tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const WeightMetadataSnapshot& weight_metadata) {
     return master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments);
+        objects, initial_oplog_sequence_id, segments, weight_metadata);
 }
 
 tl::expected<void, ErrorCode>
@@ -1758,6 +1801,8 @@ void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ProbeKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);
@@ -1836,6 +1881,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchProbeKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);

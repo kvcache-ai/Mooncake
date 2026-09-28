@@ -130,6 +130,21 @@ Errors in this part usually indicate that the error occurred within the `mooncak
    - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
    - If the leak persists under sustained peer failures (many `endpoint evicted` log lines accompanying the QP growth), update to a version that includes the fix for [issue #1845](https://github.com/kvcache-ai/Mooncake/issues/1845). Prior to that fix, the endpoint store's `waiting_list_` only drained when new endpoints were inserted, so evictions under failure load accumulated QPs until the driver limit was hit. The fix adds a periodic reclaim tick to `monitorWorker`.
 
+8. If you encounter `Failed to register memory 0x...: Bad address [14]` when registering **GPU** memory (for example a vLLM or SGLang KV cache), usually followed by `Memory region not registered by any active device(s)` and `AddressNotRegistered` on every transfer, Mooncake is registering GPU memory with the legacy `ibv_reg_mr` path, which needs the `nvidia-peermem` kernel module. This is the default while `WITH_NVIDIA_PEERMEM` is unset.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Is nvidia-peermem loaded? (no output: it is not)
+   lsmod | grep nvidia_peermem
+
+   # Open kernel modules? DMA-BUF needs them (and Linux >= 5.12)
+   cat /proc/driver/nvidia/version    # "Open Kernel Module" in the first line
+   ```
+
+   **Solutions:**
+   - Set `WITH_NVIDIA_PEERMEM=0` before starting Mooncake to register GPU memory through DMA-BUF (`cuMemGetHandleForAddressRange` + `ibv_reg_dmabuf_mr`), which does not need `nvidia-peermem`. This also works on MIG GPU instances.
+   - Or install and load `nvidia-peermem` (it requires MLNX_OFED or DOCA-OFED) and keep the legacy path.
+
 ## RDMA Transfer Period
 ### Recommended Troubleshooting Directions
 
@@ -227,7 +242,7 @@ lsmod | grep -E 'ib_core|mlx4_core|mlx5_core|nvidia_peer_mem'
 If no RDMA devices appear: (1) Confirm physical NIC presence via lspci
 (2) Install vendor-specific drivers (e.g., Mellanox MLNX_OFED)
 
-2. check GDR driver is ready, and peer_memory module (part of MLNX_OFED) should be installed
+2. check GDR driver is ready. With the legacy `ibv_reg_mr` path (the default while `WITH_NVIDIA_PEERMEM` is unset), the peer_memory module (part of MLNX_OFED) should be installed. Without it, set `WITH_NVIDIA_PEERMEM=0` to use the DMA-BUF path instead, which needs the NVIDIA open kernel modules and Linux 5.12 or later (see item 8 under RDMA Resource Initialization)
 ```
 # Check peer_memory module (from MLNX_OFED)
 lsmod | grep peer_mem

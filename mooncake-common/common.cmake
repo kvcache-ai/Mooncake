@@ -125,6 +125,8 @@ option(
   OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
+option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -476,6 +478,11 @@ if(USE_COREX)
   endif()
 endif()
 
+# Hylink builds on the HIP runtime; enable it automatically.
+if(USE_HYLINK AND NOT USE_HIP)
+  set(USE_HIP ON)
+endif()
+
 if(USE_HIP)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
   find_package(HIP REQUIRED)
@@ -764,4 +771,16 @@ if(USE_FLAGCX)
     STATUS
       "FlagCX transport enabled, include=${FLAGCX_INCLUDE_DIR}, library=${FLAGCX_LIBRARY}"
   )
+endif()
+
+if(USE_SHCA)
+  add_compile_definitions(USE_SHCA)
+elseif(YLT_ENABLE_IBV)
+  # YLT_ENABLE_IBV is set in FindYLT.cmake (OFF on macOS).
+  add_compile_definitions(YLT_ENABLE_IBV)
+endif()
+
+if(USE_HYLINK)
+  add_compile_definitions(USE_HYLINK)
+  message(STATUS "Hylink transport is enabled")
 endif()

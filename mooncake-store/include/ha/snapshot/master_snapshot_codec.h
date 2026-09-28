@@ -16,6 +16,7 @@ class SegmentManager;
 class LocalSsdManager;
 class NoFSegmentManager;
 class ClientTaskManager;
+struct WeightMetadataSnapshot;
 
 namespace ha {
 
@@ -91,6 +92,8 @@ class MasterSnapshotCodec {
      * @brief Encode master state into serialized buffers.
      *
      * @param state_view View of the live master state
+     * @param frozen_weight_metadata Parent-captured weights for fork snapshots;
+     *        nullptr exports the live weight state
      * @return Structured payloads containing serialized data, or error
      *
      * The returned struct contains:
@@ -99,7 +102,8 @@ class MasterSnapshotCodec {
      * - task_manager: serialized task manager state
      */
     tl::expected<MasterSnapshotPayloads, SerializationError> Encode(
-        MasterSnapshotStateView& state_view) const;
+        MasterSnapshotStateView& state_view,
+        const WeightMetadataSnapshot* frozen_weight_metadata = nullptr) const;
 
     /**
      * @brief Decode snapshot payloads and restore into master service.
@@ -135,7 +139,8 @@ class MasterSnapshotCodec {
    private:
     // Metadata encoding/decoding (delegates to MetadataSerializer for now)
     tl::expected<std::vector<uint8_t>, SerializationError> EncodeMetadata(
-        MasterService& master_service) const;
+        MasterService& master_service,
+        const WeightMetadataSnapshot* frozen_weight_metadata) const;
     tl::expected<void, SerializationError> DecodeMetadata(
         MasterService* master_service, const std::vector<uint8_t>& data) const;
 

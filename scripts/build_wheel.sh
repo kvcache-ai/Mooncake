@@ -63,8 +63,8 @@ if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
-    # Copy async_store.py
-    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
+    # Stage the canonical async Store client for the legacy wheel builder.
+    cp python/mooncake/async_store.py mooncake-wheel/mooncake/async_store.py
 else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
@@ -187,6 +187,14 @@ MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 MIGRATED_PYTHON_MODULES=(
     mooncake_connector_v1.py
     vllm_v1_proxy_server.py
+    http_metadata_server.py
+    _launcher.py
+    cli.py
+    cli_bench.py
+    cli_client.py
+    transfer_engine_topology_dump.py
+    buffer_pool.py
+    mooncake_config.py
     ep.py
     mooncake_ep_buffer.py
     mooncake_elastic_buffer.py
@@ -503,6 +511,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \
+    --exclude libgalaxyhip.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \
     --exclude libc10.so* \

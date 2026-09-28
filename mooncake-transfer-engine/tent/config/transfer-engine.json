@@ -114,6 +114,9 @@
             "fabric_mem": false,
             "global_resource_config": "",
             "agent_mode": false
+        },
+        "hylink": {
+            "enable": false
         }
     },
     "policy": [
