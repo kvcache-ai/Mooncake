@@ -223,7 +223,36 @@ stay queued; planned arrival times do not move to conceal overload. Dispatch lag
 includes worker and dependency waits.
 A fixed trace does not model serving feedback caused by a slow or failed master.
 
-The launcher saves:
+The launcher saves all outputs under `--output-dir`. `result.json` keeps the
+run summary and references the detail files using paths relative to that
+directory:
+
+```text
+run-001/
+  result.json
+  samples.jsonl
+  traffic.json
+  evictions.json
+  replay.json
+  process.jsonl
+  metrics.jsonl
+  metrics-before.prom
+  master.log
+  replayer.log
+```
+
+For example, `result.json` contains these references alongside its summaries:
+
+```json
+{
+  "success": true,
+  "samples": "samples.jsonl",
+  "traffic": "traffic.json",
+  "evictions": "evictions.json"
+}
+```
+
+The files contain:
 
 - `replay.json`: per-operation summaries, key outcomes,
   P50/P95/P99/max call latency and dispatch lag. Explicit Ping calls have their
@@ -233,22 +262,26 @@ The launcher saves:
 - `process.jsonl`: monotonic time, CPU seconds, RSS and thread counts for the
   master; `metrics.jsonl` and `metrics-before.prom` contain master Prometheus
   metrics. Sampling covers the full replay.
-- `result.json`: `master_process`, `store_sampled_peak`, `evictions` and `traffic`
-  summarize the full replay, including registration, mount and unmount.
-  Traffic includes one-second offered, sent and completed call counts, issued
-  keys and peak calls in flight. All buckets use the replay's common time origin.
+- `result.json`: success status, `master_process`, `store_sampled_peak`, the
+  replay time window, and references to `samples.jsonl`, `traffic.json` and
+  `evictions.json`. `operations` contains the per-operation counts and latency
+  summaries, including MountSegment and UnmountSegment.
+- `traffic.json`: traffic totals, one-second offered, sent and completed call
+  counts, issued keys and peak calls in flight. All buckets use the replay's
+  common time origin.
   `offered_calls_per_second` uses the scheduled arrival span, while completed
   throughput includes draining the backlog.
   For an all-at-once trace, the offered average is null; per-second buckets still
-  show the burst. `operations` contains the per-operation counts and latency
-  summaries, including MountSegment and UnmountSegment.
+  show the burst. Traffic covers the full replay, including registration,
+  mount and unmount.
+- `evictions.json`: sampled counter deltas and intervals with eviction activity,
+  including allocation failures and incomplete-write discard/release counters.
 - Child process logs.
 
 For capacity-pressure experiments, grow the recorded KV working set beyond the
 trace's fixed mounted capacity and let the real master select eviction victims.
 The launcher uses the master's default eviction and incomplete-write timeout
-settings. `result.json` includes `evictions` with sampled counter deltas
-and the intervals in which eviction occurred, including allocation failures.
+settings. `result.json` links to `evictions.json` for the sampled observations.
 Eviction observations are reported separately from replay success; use them to
 evaluate the experiment's capacity-pressure requirements.
 Use a separate profiling run when measuring profiler overhead matters.

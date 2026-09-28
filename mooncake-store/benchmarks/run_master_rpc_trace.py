@@ -346,14 +346,19 @@ def main():
                 )
                 if any(name in row for row in selected_metrics)
             }
-            evictions = eviction_summary(metric_rows, start, finish)
+            write_json(
+                directory / "evictions.json",
+                eviction_summary(metric_rows, start, finish),
+            )
+            write_json(directory / "traffic.json", traffic_summary(samples))
             result.update(
                 {
                     "success": replayer.returncode == 0 and not replay["has_errors"],
-                    "evictions": evictions,
+                    "samples": "samples.jsonl",
+                    "evictions": "evictions.json",
                     "master_process": process_summary(rows, start, finish),
                     "replay_monotonic_window_s": [start, finish],
-                    "traffic": traffic_summary(samples),
+                    "traffic": "traffic.json",
                     "operations": replay["operations"],
                 }
             )
@@ -364,17 +369,7 @@ def main():
         for process in reversed(processes):
             stop(process)
         write_json(directory / "result.json", result)
-    summary = {
-        key: value
-        for key, value in result.items()
-        if key not in ("operations", "traffic")
-    }
-    if "evictions" in summary:
-        summary["evictions"] = {
-            key: value
-            for key, value in summary["evictions"].items()
-            if key != "intervals"
-        }
+    summary = {key: value for key, value in result.items() if key != "operations"}
     print(json.dumps(summary, indent=2))
     return 0 if result["success"] else 1
 
