@@ -74,7 +74,8 @@ Key output columns:
   size-class round-up charged on top of it. The split separates the capacity a
   finer mantissa can recover from the capacity lost to placement.
 - `Fail@Util%` is `Useful%` at the first failed allocation, so a run that fails
-  with most of the pool free is visible without reading the log.
+  with most of the pool free is visible without reading the log. It prints `-`
+  when no allocation failed.
 - `Survive%` is the share of objects that reached their own removal instead of
   being evicted to make room for another object.
 - `Evictions` counts fail-triggered eviction rounds during measurement.

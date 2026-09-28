@@ -1538,8 +1538,7 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
         }
     }
     res.saw_failure = saw_failure;
-    res.useful_util_at_first_failure =
-        saw_failure ? useful_util_at_first_failure : res.useful_util;
+    res.useful_util_at_first_failure = useful_util_at_first_failure;
     const size_t puts = success_count + partial_count +
                         prefill_stats.full_count + prefill_stats.partial_count;
     if (puts > 0) {
@@ -1711,6 +1710,16 @@ static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
     double final_largest_free_mb =
         static_cast<double>(r.final_fragmentation.largest_free_region) / MiB;
 
+    // A bare "-" when nothing failed, so a column scraper cannot mistake the
+    // cell for a negative number.
+    std::ostringstream fail_util_ss;
+    if (r.saw_failure) {
+        fail_util_ss << std::fixed << std::setprecision(2)
+                     << (r.useful_util_at_first_failure * 100.0) << "%";
+    } else {
+        fail_util_ss << "-";
+    }
+
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(9)
               << r.replica_num << std::setw(10) << r.num_segments
               << std::setw(14) << r.pattern_name << std::setw(12)
@@ -1727,10 +1736,9 @@ static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
               << std::setw(9) << (r.final_avg_util * 100.0) << "%"
               << std::setw(9) << (r.useful_util * 100.0) << "%" << std::setw(9)
               << ((r.charged_util - r.useful_util) * 100.0) << "%"
-              << std::setw(11) << (r.useful_util_at_first_failure * 100.0)
-              << (r.saw_failure ? "%" : "-") << std::setw(9) << r.survival_pct
-              << "%" << std::setw(24) << alloc_ratio << std::setw(14)
-              << r.evict_count << std::endl;
+              << std::setw(12) << fail_util_ss.str() << std::setw(9)
+              << r.survival_pct << "%" << std::setw(24) << alloc_ratio
+              << std::setw(14) << r.evict_count << std::endl;
 
     std::cout << "Prefill summary [" << r.strategy_name
               << ", pattern=" << r.pattern_name
