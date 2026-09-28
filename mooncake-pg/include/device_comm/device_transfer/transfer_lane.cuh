@@ -7,7 +7,7 @@
 #include <transport/device/device_ops.cuh>
 
 #include "common_types.h"
-#include "device_comm/device_utils/device_assert.cuh"
+#include "pg_assert.h"
 #include "device_comm/device_utils/device_timeout.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cuh"
@@ -25,18 +25,17 @@ __device__ __forceinline__ bool signalReached(uint64_t observed,
 
 __device__ __forceinline__ void validateRemoteSignal(
     const SignalAction& signal, uint64_t remote_region_size) {
-    PG_DEVICE_ASSERT(signal.kind == SignalAction::Kind::None ||
-                     signal.kind == SignalAction::Kind::Add ||
-                     signal.kind == SignalAction::Kind::Set);
+    PG_ASSERT(signal.kind == SignalAction::Kind::None ||
+              signal.kind == SignalAction::Kind::Add ||
+              signal.kind == SignalAction::Kind::Set);
     if (signal.kind == SignalAction::Kind::None) return;
 
-    PG_DEVICE_ASSERT(signal.remote_offset % alignof(uint64_t) == 0);
-    PG_DEVICE_ASSERT(signal.remote_offset <= remote_region_size &&
-                     sizeof(uint64_t) <=
-                         remote_region_size - signal.remote_offset);
+    PG_ASSERT(signal.remote_offset % alignof(uint64_t) == 0);
+    PG_ASSERT(signal.remote_offset <= remote_region_size &&
+              sizeof(uint64_t) <= remote_region_size - signal.remote_offset);
     if (signal.kind == SignalAction::Kind::Add) {
-        PG_DEVICE_ASSERT(signal.add.delta != 0 &&
-                         signal.add.delta < (uint64_t{1} << 63));
+        PG_ASSERT(signal.add.delta != 0 &&
+                  signal.add.delta < (uint64_t{1} << 63));
     }
 }
 
@@ -67,7 +66,7 @@ class TransferTicket {
             case DeviceRouteType::Unreachable:
                 return TransferResult::RouteUnavailable;
         }
-        PG_DEVICE_UNREACHABLE();
+        PG_UNREACHABLE();
         return TransferResult::Failed;
     }
 
@@ -100,17 +99,17 @@ class TransferLane {
     __device__ __forceinline__ TransferTicket
     put(GlobalRank rank, const PutRequest& request,
         cooperative_groups::thread_block block) const {
-        PG_DEVICE_ASSERT(rank >= 0 && static_cast<uint32_t>(rank) <
-                                          service_->max_world_size);
+        PG_ASSERT(rank >= 0 &&
+                  static_cast<uint32_t>(rank) < service_->max_world_size);
         const auto& route = service_->routes[rank];
-        PG_DEVICE_ASSERT(service_->peer_accessible_region.contains(
-                             request.local_ptr, request.size) ||
-                         service_->local_staging_region.contains(
-                             request.local_ptr, request.size));
+        PG_ASSERT(service_->peer_accessible_region.contains(request.local_ptr,
+                                                            request.size) ||
+                  service_->local_staging_region.contains(request.local_ptr,
+                                                          request.size));
         if (route.type != DeviceRouteType::Unreachable) {
-            PG_DEVICE_ASSERT(request.remote_offset <= route.region_size &&
-                             request.size <=
-                                 route.region_size - request.remote_offset);
+            PG_ASSERT(request.remote_offset <= route.region_size &&
+                      request.size <=
+                          route.region_size - request.remote_offset);
             validateRemoteSignal(request.signal, route.region_size);
         }
 
@@ -135,15 +134,15 @@ class TransferLane {
             case DeviceRouteType::Unreachable:
                 return TransferTicket();
         }
-        PG_DEVICE_UNREACHABLE();
+        PG_UNREACHABLE();
         return TransferTicket();
     }
 
     __device__ __forceinline__ TransferTicket
     signal(GlobalRank rank, const SignalRequest& request,
            cooperative_groups::thread_block block) const {
-        PG_DEVICE_ASSERT(rank >= 0 && static_cast<uint32_t>(rank) <
-                                          service_->max_world_size);
+        PG_ASSERT(rank >= 0 &&
+                  static_cast<uint32_t>(rank) < service_->max_world_size);
         const auto& route = service_->routes[rank];
         if (route.type != DeviceRouteType::Unreachable) {
             validateRemoteSignal(request.signal, route.region_size);
@@ -166,7 +165,7 @@ class TransferLane {
             case DeviceRouteType::Unreachable:
                 return TransferTicket();
         }
-        PG_DEVICE_UNREACHABLE();
+        PG_UNREACHABLE();
         return TransferTicket();
     }
 
@@ -210,7 +209,7 @@ class TransferLane {
     __device__ __forceinline__ TransferLane(const DeviceTransferHandle* service,
                                             uint32_t lane_index)
         : service_(service), lane_index_(lane_index) {
-        PG_DEVICE_ASSERT(service_ && lane_index_ < kTransferLaneCount);
+        PG_ASSERT(service_ && lane_index_ < kTransferLaneCount);
     }
 
     const DeviceTransferHandle* service_ = nullptr;
