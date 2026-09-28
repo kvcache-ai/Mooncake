@@ -14,6 +14,7 @@
 #include <vector>
 #include "config/transfer_submitter_config.h"
 #include "config/fileread_worker_pool_config.h"
+#include "config/nof_qos_config.h"
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -74,19 +75,6 @@ static int GetSpdkNofDebugIntervalMs() {
         return static_cast<int>(parsed);
     }();
     return interval_ms;
-}
-
-static int GetSpdkNofSubmitChunkBytes() {
-    static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_SUBMIT_CHUNK_BYTES", mooncake::kDefaultSpdkNofSubmitChunkBytes);
-    return value;
-}
-
-static int GetSpdkNofInflightBytesLimit() {
-    static const int value =
-        GetPositiveEnvOrDefault("MC_NOF_INFLIGHT_BYTES_LIMIT",
-                                mooncake::kDefaultSpdkNofInflightBytesLimit);
-    return value;
 }
 
 static int GetSpdkNofWorkerCount() {
@@ -156,15 +144,15 @@ namespace mooncake {
 
 #ifdef USE_NOF
 SpdkNofQos::SpdkNofQos(uint32_t block_size) {
+    const auto& config = NoFQosConfig::AtFirstUse();
     int block_size_int = static_cast<int>(block_size);
     if (block_size_int <= 0) {
         block_size_int = 1;
     }
 
-    blocks_per_chunk =
-        std::max(1, GetSpdkNofSubmitChunkBytes() / block_size_int);
+    blocks_per_chunk = std::max(1, config.submit_chunk_bytes / block_size_int);
     inflight_blocks_limit =
-        std::max(1, GetSpdkNofInflightBytesLimit() / block_size_int);
+        std::max(1, config.inflight_bytes_limit / block_size_int);
     for (int i = 0; i < kSpdkNofOpNum; ++i) {
         inflight_blocks[i] = 0;
         head[i] = nullptr;
