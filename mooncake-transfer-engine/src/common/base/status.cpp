@@ -59,6 +59,8 @@ std::string_view Status::CodeToString(Status::Code code) {
             return "AddressNotRegistered";
         case Code::kBatchBusy:
             return "BatchBusy";
+        case Code::kBatchCleanupDeferred:
+            return "BatchCleanupDeferred";
         case Code::kDeviceNotFound:
             return "DeviceNotFound";
         case Code::kAddressOverlapped:

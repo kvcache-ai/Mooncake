@@ -166,4 +166,19 @@ done
   [[ "$SNAPSHOT_CHUNK_OBJECT_COUNT" == 1000000 ]]
 ) || fail "older cluster.env did not retain pure OpLog defaults"
 
+for command in capacity-soak capacity-nospace; do
+  expect_failure 1 "build directory does not exist" \
+    "$SCRIPT" "$command" --build-dir "$TEST_ROOT/missing-build"
+  expect_failure 1 "external endpoints are forbidden" \
+    "$SCRIPT" "$command" --build-dir "$TEST_ROOT" --etcd-endpoints localhost:2379
+  expect_failure 1 "capacity-seconds must be positive" \
+    "$SCRIPT" "$command" --build-dir "$TEST_ROOT" --capacity-seconds 0
+  expect_failure 1 "capacity-seconds must be at least 30" \
+    "$SCRIPT" "$command" --build-dir "$TEST_ROOT" --capacity-seconds 29
+  expect_failure 1 "capacity-max-batches must be positive" \
+    "$SCRIPT" "$command" --build-dir "$TEST_ROOT" --capacity-max-batches invalid
+  expect_failure 1 "fresh run directory" \
+    "$SCRIPT" "$command" --build-dir "$TEST_ROOT" --run-dir "$EMPTY_RUN"
+done
+python3 "$SCRIPT_DIR/../ha/snapshot/batch_oplog/capacity_test.py"
 echo "PASS"

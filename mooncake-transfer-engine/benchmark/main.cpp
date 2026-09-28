@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "utils.h"
+#include "split_output.h"
 #include "common.h"
 
 #include "bench_runner.h"
@@ -307,6 +308,13 @@ int main(int argc, char* argv[]) {
         "Usage: ./tebench [options]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
+    if (!XferBenchConfig::split_output_jsonl.empty()) {
+        std::string error;
+        if (!openSplitOutput(XferBenchConfig::split_output_jsonl, &error)) {
+            LOG(ERROR) << error;
+            return EXIT_FAILURE;
+        }
+    }
     if (XferBenchConfig::use_hugepage) {
         if (XferBenchConfig::backend != "classic" ||
             (XferBenchConfig::xport_type != "shm" &&

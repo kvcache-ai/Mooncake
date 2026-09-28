@@ -7,6 +7,11 @@ store:
   - changed-files:
     - any-glob-to-any-file:
       - 'mooncake-store/**/*'
+      - 'python/mooncake/http_metadata_server.py'
+      - 'python/tests/services/test_http_metadata_server.py'
+      - 'python/mooncake/async_store.py'
+      - 'python/mooncake/cli.py'
+      - 'python/mooncake/cli_client.py'
       - 'python/mooncake/buffer_pool.py'
       - 'python/mooncake/mooncake_config.py'
       - 'python/tests/store/**/*'
@@ -21,7 +26,10 @@ Mooncake Conductor:
 
 Transfer Engine:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-transfer-engine/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-transfer-engine/**/*'
+      - 'python/mooncake/cli_bench.py'
+      - 'python/mooncake/transfer_engine_topology_dump.py'
 
 PyTorch Backend:
   - changed-files:
@@ -38,7 +46,13 @@ Mooncake EP:
 
 Installation:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-wheel/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-wheel/**/*'
+      - 'python/mooncake/http_metadata_server.py'
+      - 'python/mooncake/cli.py'
+      - 'python/mooncake/cli_client.py'
+      - 'python/mooncake/cli_bench.py'
+      - 'python/mooncake/transfer_engine_topology_dump.py'
 
 P2P Store:
   - changed-files:
@@ -76,6 +90,8 @@ Tests:
       - 'mooncake-reshard/tests/**/*'
       - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
+      - 'scripts/rocm_tests/**/*'
+      - 'scripts/e2e/**/*'
 
 Ascend/NPU:
   - changed-files:

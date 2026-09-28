@@ -38,6 +38,10 @@ function(add_ha_test name)
 endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
+add_store_test(weight_management_contract_test
+               weight_management_contract_test.cpp)
+add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)
+add_store_test(weight_revision_lease_test weight_revision_lease_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
@@ -71,6 +75,10 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_metadata_config_test master_metadata_config_test.cpp)
+add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
+add_store_test(master_service_weight_management_test
+               master_service_weight_management_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
@@ -141,6 +149,8 @@ endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(batch_replica_clear_tenant_rpc_test
+               batch_replica_clear_tenant_rpc_test.cpp)
 add_test(
   NAME object_checksum_client_test
   COMMAND
@@ -195,8 +205,11 @@ add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(object_entry_test object_entry_test.cpp)
 add_store_test(object_index_test object_index_test.cpp)
-add_store_test(dynamic_replication_lease_table_test dynamic_replication_lease_table_test.cpp)
+add_store_test(dynamic_replication_lease_table_test
+               dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
+add_store_test(metadata_tenant_test metadata_tenant_test.cpp)
+add_store_test(metadata_tenant_registry_test metadata_tenant_registry_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -210,6 +223,8 @@ add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
 add_store_test(hugepage_config_test hugepage_config_test.cpp)
+add_store_test(shm_spdk_registration_config_test
+               shm_spdk_registration_config_test.cpp)
 add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
 add_store_test(store_shm_alloc_test store_shm_alloc_test.cpp)
 add_store_test(random_test random_test.cpp)
@@ -217,6 +232,8 @@ add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
 add_store_test(client_auto_discovery_config_test
                client_auto_discovery_config_test.cpp)
+add_store_test(client_object_checksum_config_test
+               client_object_checksum_config_test.cpp)
 add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
@@ -233,9 +250,23 @@ add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(client_host_identity_config_test
                client_host_identity_config_test.cpp)
 add_store_test(client_metric_config_test client_metric_config_test.cpp)
+add_test(
+  NAME client_metric_cluster_id_test
+  COMMAND
+    client_metric_config_test
+    --gtest_filter=ClientMetricClusterIdTest.MergeLabelsUsesConfiguredClusterId)
+set_tests_properties(client_metric_cluster_id_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_CLUSTER_ID=test-cluster")
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
+add_store_test(allocator_metric_test allocator_metric_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
 add_store_test(dfs_posix_test dfs_posix_test.cpp)
+add_store_test(dfs_immutable_bucket_allocator_test
+               dfs_immutable_bucket_allocator_test.cpp)
+add_store_test(dfs_immutable_bucket_backend_test
+               dfs_immutable_bucket_backend_test.cpp)
+add_store_test(dfs_immutable_bucket_client_test
+               dfs_immutable_bucket_client_test.cpp)
 add_store_test(distributed_storage_config_test
                distributed_storage_config_test.cpp)
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
@@ -289,6 +320,7 @@ add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_connector_config_test nvme_kv/connector_config_test.cpp)
+add_store_test(nvme_kv_executor_config_test nvme_kv/executor_config_test.cpp)
 add_store_test(ha_cluster_namespace_config_test
                ha_cluster_namespace_config_test.cpp)
 add_store_test(redis_connection_config_test redis_connection_config_test.cpp)
@@ -307,6 +339,8 @@ add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
 add_store_test(fileread_worker_pool_config_test
                fileread_worker_pool_config_test.cpp)
+add_store_test(nof_worker_pool_config_test nof_worker_pool_config_test.cpp)
+add_store_test(nof_debug_config_test nof_debug_config_test.cpp)
 add_store_test(fileread_worker_pool_test fileread_worker_pool_test.cpp)
 if(MOONCAKE_OSS_ADAPTER_ENABLED)
   target_compile_definitions(file_storage_test PRIVATE HAVE_OSS_ADAPTER)
@@ -315,6 +349,7 @@ add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
+add_store_test(dummy_client_probe_key_test dummy_client_probe_key_test.cpp)
 add_test(
   NAME dummy_client_object_checksum_test
   COMMAND

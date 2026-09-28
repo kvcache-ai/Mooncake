@@ -1,10 +1,13 @@
 #pragma once
 
 #include <cstddef>
-#include <linux/memfd.h>
-#include <linux/mman.h>
 #include <string>
 #include <vector>
+
+#ifdef __linux__
+#include <linux/memfd.h>
+#include <linux/mman.h>
+#endif  // __linux__
 
 #include <Slab.h>
 
@@ -13,14 +16,16 @@ namespace mooncake {
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
 constexpr size_t SZ_512MB = 512 * 1024 * 1024;
 
-// 512MiB hugepages on arm64 kernels with 64K base pages may not be
-// defined by older glibc/kernel headers.
+#ifdef __linux__
+// 512MiB hugepages on arm64 kernels with 64K base pages may not be defined by
+// older glibc/kernel headers.
 #ifndef MAP_HUGE_512MB
 #define MAP_HUGE_512MB (29 << 26)  // MAP_HUGE_SHIFT = 26
 #endif
 #ifndef MFD_HUGE_512MB
 #define MFD_HUGE_512MB (29 << 26)  // MFD_HUGE_SHIFT = 26
 #endif
+#endif  // __linux__
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 

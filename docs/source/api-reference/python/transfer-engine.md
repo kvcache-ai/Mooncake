@@ -58,6 +58,14 @@ TransferOpcode.READ   # Read operation
 TransferOpcode.WRITE  # Write operation
 ```
 
+### Scatter Transfer Completion
+
+`ScatterTransferTicket` keeps the native operation alive and exposes:
+
+- `status`: `COMPLETED`, `FAILED_DRAINED`, or `COMPLETION_UNKNOWN`.
+- `drained`: whether the native operation reached a terminal state.
+- `drain(timeout_ms)`: wait again for an unknown operation to become terminal.
+
 ### Initialization Methods
 
 #### initialize()
@@ -351,6 +359,39 @@ Performs a batch synchronous read operation to transfer multiple data chunks fro
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
+
+#### scatter_transfer_sync_write_with_ticket() / scatter_transfer_sync_read_with_ticket()
+
+```python
+scatter_transfer_sync_write_with_ticket(
+    endpoint,
+    local_base_addresses,
+    local_capacities,
+    remote_base_addresses,
+    remote_capacities,
+    local_offsets,
+    remote_offsets,
+    lengths,
+)
+```
+
+Transfers multiple offset ranges while preserving their backing-allocation
+bounds. The write form copies local ranges to remote ranges; the read form
+copies remote ranges into local ranges.
+
+**Parameters:**
+- `endpoint` (str): The remote Transfer Engine segment.
+- `local_base_addresses` / `remote_base_addresses` (List[int]): Base addresses for each allocation pair.
+- `local_capacities` / `remote_capacities` (List[int]): Registered allocation sizes.
+- `local_offsets` / `remote_offsets` (List[List[int]]): Per-allocation fragment offsets.
+- `lengths` (List[List[int]]): Per-allocation fragment lengths.
+
+All outer lists have the same length. For each allocation pair, the local
+offset, remote offset, and length lists also have the same length. Every
+fragment must fit within both declared capacities.
+
+**Returns:**
+- `ScatterTransferTicket`: A drainable completion handle for the native scatter operation.
 
 #### batch_transfer_sync()
 

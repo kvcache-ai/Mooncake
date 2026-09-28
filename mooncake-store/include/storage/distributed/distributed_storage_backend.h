@@ -100,6 +100,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     tl::expected<ShardFile*, ErrorCode> GetOrOpenShard(
         const DistributedFSDescriptor& descriptor);
+    tl::expected<int, ErrorCode> OpenBucket(
+        const DistributedFSDescriptor& descriptor);
+    bool UsesBucketAllocator() const;
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
