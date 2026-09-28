@@ -9,11 +9,29 @@
 namespace mooncake {
 void* ascend_allocate_memory(size_t total_size, const std::string& protocol);
 
+// Matches store allocate_buffer_mmap_memory(size, alignment, defer_populate).
+using AscendHostAllocFn = void* (*)(size_t, size_t, bool);
+
+// Allocate on the current agent-mode device (round-robin).
+// Fabric-mem: try 100%/90%/.../50% of target (1G-aligned); host_alloc is
+// ignored. Otherwise: exact-size via host_alloc, or aclrtMallocHost if
+// host_alloc is null. Sets *actual_size on success.
+void* ascend_allocate_memory_best_effort(size_t target_size,
+                                         const std::string& protocol,
+                                         size_t* actual_size,
+                                         AscendHostAllocFn host_alloc = nullptr,
+                                         size_t host_alignment = 0,
+                                         bool defer_hugetlb_population = false);
+
 void ascend_free_memory(const std::string& protocol, void* ptr);
 
 // Check if [addr, addr+length) overlaps with any store memory range.
-// Used by registerLocalMemory to decide RoCE+store registration policy.
 bool ascend_is_store_memory(void* addr, size_t length);
+
+// Check whether addr starts inside a direct ACL VMM allocation (allocated via
+// ascend_allocate_vmm_memory_direct). Returns false for adxl::MallocMem
+// allocations and non-VMM host buffers.
+bool ascend_is_direct_vmm_memory(void* addr, size_t length);
 
 // Direct ACL VMM allocation, always bypasses adxl MallocMem.
 // For use by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.

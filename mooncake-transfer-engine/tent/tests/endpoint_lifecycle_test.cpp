@@ -14,132 +14,435 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
+
+#include "tent/common/utils/string_builder.h"
+#include "tent/transport/rdma/endpoint.h"
+#include "tent/transport/rdma/slice.h"
 
 namespace mooncake {
 namespace tent {
+
+class EndpointTestAccess {
+   public:
+    // Puts a context-less endpoint into the state a completed bootstrap
+    // leaves behind, so accept() can be driven without an RDMA device.
+    static void markConnected(RdmaEndPoint& endpoint,
+                              const std::string& peer_server_name,
+                              const std::string& peer_nic_name,
+                              const std::vector<uint32_t>& peer_qp_num_list) {
+        endpoint.peer_server_name_ = peer_server_name;
+        endpoint.peer_nic_name_ = peer_nic_name;
+        endpoint.peer_qp_num_list_ = peer_qp_num_list;
+        endpoint.status_.store(RdmaEndPoint::EP_READY,
+                               std::memory_order_relaxed);
+    }
+
+    static void markNotifyConnected(RdmaEndPoint& endpoint) {
+        endpoint.notify_connected_.store(true, std::memory_order_relaxed);
+    }
+
+    static void beginDestroy(RdmaEndPoint& endpoint) {
+        endpoint.beginDestroy();
+    }
+
+    // Stands in for notification WRs posted on the notify QP whose
+    // completions the worker has not polled yet.
+    static void setNotifyInflight(RdmaEndPoint& endpoint, uint32_t count) {
+        endpoint.notify_inflight_.store(count, std::memory_order_release);
+    }
+
+    static bool notifyConnected(const RdmaEndPoint& endpoint) {
+        return endpoint.notify_connected_.load(std::memory_order_relaxed);
+    }
+
+    static constexpr size_t notifyBufferSize() {
+        return RdmaEndPoint::kNotifyBufferSize;
+    }
+
+    static constexpr size_t notifyMaxPendingSends() {
+        return RdmaEndPoint::kNotifyMaxPendingSends;
+    }
+
+    static char* notifySlotPtr(char* base, size_t idx) {
+        return RdmaEndPoint::notifySlotPtr(base, idx);
+    }
+
+    static bool encodeNotifyPayload(char* slot, const std::string& name,
+                                    const std::string& msg, uint32_t* out_len) {
+        return RdmaEndPoint::encodeNotifyPayload(slot, name, msg, out_len);
+    }
+
+    static bool decodeNotifyPayload(const char* data, size_t byte_len,
+                                    std::string* name, std::string* msg) {
+        return RdmaEndPoint::decodeNotifyPayload(data, byte_len, name, msg);
+    }
+};
+
 namespace {
 
-// ---------------------------------------------------------------------------
-// Minimal stub to validate weak_ptr lifecycle without RDMA dependencies.
-// The real RdmaEndPoint inherits enable_shared_from_this; we mirror that
-// pattern here so the test proves the ownership model works.
-// ---------------------------------------------------------------------------
+TEST(EndpointLifecycleTest, DefaultConstructedEndpointOwnsNoResources) {
+    RdmaEndPoint endpoint;
 
-class FakeEndPoint : public std::enable_shared_from_this<FakeEndPoint> {
-   public:
-    int acknowledge_calls = 0;
-    int reset_calls = 0;
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_UNINIT);
+    EXPECT_TRUE(endpoint.qpNum().empty());
+    EXPECT_EQ(endpoint.getInflightSlices(), 0);
+    EXPECT_EQ(endpoint.notifyQpNum(), 0);
+}
 
-    void acknowledge() { ++acknowledge_calls; }
-    void reset() { ++reset_calls; }
-};
+TEST(EndpointLifecycleTest, DefaultConstructedEndpointCanBeDestroyed) {
+    RdmaEndPoint endpoint;
 
-// ---------------------------------------------------------------------------
-// weak_ptr basic lifecycle
-// ---------------------------------------------------------------------------
+    EXPECT_EQ(endpoint.deconstruct(), 0);
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+    EXPECT_TRUE(endpoint.qpNum().empty());
+}
 
-TEST(EndpointLifecycleTest, WeakPtrLocksWhileAlive) {
-    auto ep = std::make_shared<FakeEndPoint>();
-    std::weak_ptr<FakeEndPoint> weak = ep;
+TEST(EndpointLifecycleTest, DeconstructIsIdempotent) {
+    RdmaEndPoint endpoint;
+
+    ASSERT_EQ(endpoint.deconstruct(), 0);
+    EXPECT_EQ(endpoint.deconstruct(), 0);
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+}
+
+TEST(EndpointLifecycleTest, DestroyedEndpointCannotBeConstructedAgain) {
+    RdmaEndPoint endpoint;
+
+    ASSERT_EQ(endpoint.deconstruct(), 0);
+    EXPECT_NE(endpoint.construct(nullptr, nullptr, "reused"), 0);
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+}
+
+TEST(EndpointLifecycleTest, TwoPhaseDestroyHandlesUninitializedEndpoint) {
+    RdmaEndPoint endpoint;
+
+    endpoint.beginDestroy();
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
+    EXPECT_TRUE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+}
+
+TEST(EndpointLifecycleTest, FinishDestroyRejectsNonRetiringEndpoint) {
+    RdmaEndPoint endpoint;
+
+    EXPECT_FALSE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_UNINIT);
+}
+
+TEST(EndpointLifecycleTest, FinishDestroyIsIdempotent) {
+    RdmaEndPoint endpoint;
+
+    endpoint.beginDestroy();
+    ASSERT_TRUE(endpoint.finishDestroy());
+    EXPECT_TRUE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+}
+
+TEST(EndpointLifecycleTest, NotificationFailsWhenEndpointIsNotConnected) {
+    RdmaEndPoint endpoint;
+
+    EXPECT_FALSE(endpoint.sendNotification("name", "message"));
+}
+
+TEST(EndpointLifecycleTest, NotifySlotsAreAdjacentAndNonOverlapping) {
+    std::vector<char> buf(EndpointTestAccess::notifyMaxPendingSends() *
+                          EndpointTestAccess::notifyBufferSize());
+    char* slot0 = EndpointTestAccess::notifySlotPtr(buf.data(), 0);
+    char* slot1 = EndpointTestAccess::notifySlotPtr(buf.data(), 1);
+    char* last = EndpointTestAccess::notifySlotPtr(
+        buf.data(), EndpointTestAccess::notifyMaxPendingSends() - 1);
+    EXPECT_EQ(slot0, buf.data());
+    EXPECT_EQ(static_cast<size_t>(slot1 - slot0),
+              EndpointTestAccess::notifyBufferSize());
+    EXPECT_EQ(static_cast<size_t>(last - slot0),
+              (EndpointTestAccess::notifyMaxPendingSends() - 1) *
+                  EndpointTestAccess::notifyBufferSize());
+    EXPECT_EQ(last + EndpointTestAccess::notifyBufferSize(),
+              buf.data() + buf.size());
+}
+
+TEST(EndpointLifecycleTest, NotifyAdjacentSlotsDoNotCrosstalk) {
+    // Recv used to be 256 independent vectors. After coalescing, a wrong
+    // offset would mix payload from a neighbor slot.
+    const size_t slot_size = EndpointTestAccess::notifyBufferSize();
+    const size_t nslots = EndpointTestAccess::notifyMaxPendingSends();
+    std::vector<char> buf(nslots * slot_size, '\xee');
+    const size_t indices[] = {0, 1, 2, 127, 254, 255};
+    uint32_t encoded[6] = {};
+    for (size_t i = 0; i < 6; ++i) {
+        const size_t idx = indices[i];
+        std::string name = "n" + std::to_string(idx);
+        std::string msg =
+            "payload-" + std::to_string(idx) + std::string(2048, 'x');
+        ASSERT_TRUE(EndpointTestAccess::encodeNotifyPayload(
+            EndpointTestAccess::notifySlotPtr(buf.data(), idx), name, msg,
+            &encoded[i]));
+        ASSERT_GT(encoded[i], 8u);
+        ASSERT_LE(encoded[i], slot_size);
+    }
+    for (size_t i = 0; i < 6; ++i) {
+        const size_t idx = indices[i];
+        std::string name;
+        std::string msg;
+        ASSERT_TRUE(EndpointTestAccess::decodeNotifyPayload(
+            EndpointTestAccess::notifySlotPtr(buf.data(), idx), encoded[i],
+            &name, &msg))
+            << "slot " << idx;
+        EXPECT_EQ(name, "n" + std::to_string(idx));
+        EXPECT_EQ(msg,
+                  "payload-" + std::to_string(idx) + std::string(2048, 'x'));
+        // Trailing bytes in the 64KiB slot stay the fill pattern, so a
+        // too-long read would have picked up 0xee as name_len.
+        ASSERT_TRUE(EndpointTestAccess::decodeNotifyPayload(
+            EndpointTestAccess::notifySlotPtr(buf.data(), idx), slot_size,
+            &name, &msg));
+        EXPECT_EQ(name, "n" + std::to_string(idx));
+    }
+    // Slot 3 was never written; decoding the fill pattern must fail rather
+    // than returning a neighbor's payload.
+    std::string name;
+    std::string msg;
+    EXPECT_FALSE(EndpointTestAccess::decodeNotifyPayload(
+        EndpointTestAccess::notifySlotPtr(buf.data(), 3), slot_size, &name,
+        &msg));
+}
+
+TEST(EndpointLifecycleTest, NotifyPayloadRejectedWhenLargerThanSlot) {
+    std::vector<char> slot(EndpointTestAccess::notifyBufferSize());
+    uint32_t encoded = 0;
+    std::string too_big(EndpointTestAccess::notifyBufferSize(), 'z');
+    EXPECT_FALSE(EndpointTestAccess::encodeNotifyPayload(slot.data(), "n",
+                                                         too_big, &encoded));
+}
+
+// The notify QP must take its path and retry attributes from EndPointParams
+// like the data QPs do (setupOneQP), not from hard-coded tutorial values:
+// with timeout=0x12 and retry_cnt=7 a dead peer path took ~8.6 s to report
+// on the notify QP while the data QPs of the same endpoint gave up in ~0.5 s,
+// and no configuration could change that.
+TEST(EndpointLifecycleTest, NotifyQpAttrsFollowEndpointParams) {
+    EndPointParams params;
+    params.path_mtu = IBV_MTU_1024;
+    params.min_rnr_timer = 5;
+    params.send_timeout = 20;
+    params.send_retry_count = 3;
+    params.send_rnr_count = 2;
+
+    const NotifyQpRtrAttrs rtr = buildNotifyQpRtrAttrs(params);
+    EXPECT_EQ(rtr.path_mtu, IBV_MTU_1024);
+    EXPECT_EQ(rtr.min_rnr_timer, 5);
+    // SEND/RECV only: one outstanding read/atomic, independent of the
+    // data-QP setting.
+    EXPECT_EQ(rtr.max_dest_rd_atomic, 1);
+
+    const NotifyQpRtsAttrs rts = buildNotifyQpRtsAttrs(params);
+    EXPECT_EQ(rts.timeout, 20);
+    EXPECT_EQ(rts.retry_cnt, 3);
+    // rnr_retry is pinned: RNR NAKs are flow control on the notify QP, not
+    // a fault, so send_rnr_count (2 above) must not reach it.
+    EXPECT_EQ(rts.rnr_retry, 7);
+    EXPECT_EQ(rts.max_rd_atomic, 1);
+}
+
+// With default EndPointParams the notify QP gets the data QPs' budget:
+// timeout 14 (4.096us * 2^14 ~= 67 ms per attempt), 7 retries and the
+// 0.64 ms RNR timer, plus the pinned unbounded RNR retry. The notify QP
+// follows these defaults now, so a change to them must show up here as a
+// deliberate decision.
+TEST(EndpointLifecycleTest, NotifyQpAttrsDefaultsMatchDataQp) {
+    EndPointParams defaults;
+    const NotifyQpRtrAttrs rtr = buildNotifyQpRtrAttrs(defaults);
+    EXPECT_EQ(rtr.path_mtu, IBV_MTU_4096);
+    EXPECT_EQ(rtr.min_rnr_timer, 12);
+    const NotifyQpRtsAttrs rts = buildNotifyQpRtsAttrs(defaults);
+    EXPECT_EQ(rts.timeout, 14);
+    EXPECT_EQ(rts.retry_cnt, 7);
+    EXPECT_EQ(rts.rnr_retry, 7);
+}
+
+TEST(EndpointLifecycleTest, NotifyLocalFaultKeepsEndpointServingData) {
+    // A fault confined to the notify QP must not retire the endpoint: doing so
+    // moves every data QP to ERR and flushes in-flight transfers.
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+
+    endpoint.disableNotification("notify QP local completion error");
+
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_READY);
+    EXPECT_FALSE(EndpointTestAccess::notifyConnected(endpoint));
+    // The caller now learns notifications are gone instead of silently posting
+    // to a dead QP.
+    EXPECT_FALSE(endpoint.sendNotification("name", "message"));
+}
+
+TEST(EndpointLifecycleTest, DisableNotificationIsIdempotent) {
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+
+    endpoint.disableNotification("first");
+    endpoint.disableNotification("second");
+
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_READY);
+    EXPECT_FALSE(EndpointTestAccess::notifyConnected(endpoint));
+}
+
+TEST(EndpointLifecycleTest, SharedFromThisUsesRealEndpointOwnership) {
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    std::weak_ptr<RdmaEndPoint> weak = endpoint->shared_from_this();
 
     auto locked = weak.lock();
     ASSERT_NE(locked, nullptr);
-    locked->acknowledge();
-    EXPECT_EQ(ep->acknowledge_calls, 1);
-}
+    EXPECT_EQ(locked.get(), endpoint.get());
 
-TEST(EndpointLifecycleTest, WeakPtrExpiresAfterRelease) {
-    std::weak_ptr<FakeEndPoint> weak;
-    {
-        auto ep = std::make_shared<FakeEndPoint>();
-        weak = ep;
-        EXPECT_FALSE(weak.expired());
-    }  // ep destroyed here
+    locked.reset();
+    endpoint.reset();
     EXPECT_TRUE(weak.expired());
-    EXPECT_EQ(weak.lock(), nullptr);
 }
-
-TEST(EndpointLifecycleTest, SharedFromThisProducesValidWeakPtr) {
-    auto ep = std::make_shared<FakeEndPoint>();
-    // Simulate what submitSlices() does: shared_from_this() assigned to
-    // weak_ptr
-    std::weak_ptr<FakeEndPoint> weak = ep->shared_from_this();
-
-    auto locked = weak.lock();
-    ASSERT_NE(locked, nullptr);
-    EXPECT_EQ(locked.get(), ep.get());
-}
-
-// ---------------------------------------------------------------------------
-// Simulate the slice → endpoint dereference pattern used in workers.cpp
-// ---------------------------------------------------------------------------
-
-struct FakeSlice {
-    std::weak_ptr<FakeEndPoint> ep_weak_ptr;
-};
 
 TEST(EndpointLifecycleTest, SliceAccessWhileEndpointAlive) {
-    auto ep = std::make_shared<FakeEndPoint>();
-    FakeSlice slice;
-    slice.ep_weak_ptr = ep;
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    RdmaSlice slice;
+    slice.ep_weak_ptr = endpoint;
 
-    // Simulate workers.cpp completion path
-    if (auto locked = slice.ep_weak_ptr.lock()) {
-        locked->acknowledge();
-        locked->reset();
-    }
-    EXPECT_EQ(ep->acknowledge_calls, 1);
-    EXPECT_EQ(ep->reset_calls, 1);
+    auto locked = slice.ep_weak_ptr.lock();
+    ASSERT_NE(locked, nullptr);
+    EXPECT_EQ(locked.get(), endpoint.get());
 }
 
 TEST(EndpointLifecycleTest, SliceAccessAfterEndpointEvicted) {
-    FakeSlice slice;
+    RdmaSlice slice;
     {
-        auto ep = std::make_shared<FakeEndPoint>();
-        slice.ep_weak_ptr = ep;
-    }  // endpoint evicted — shared_ptr destroyed
-
-    // Simulate workers.cpp: lock() returns nullptr, gracefully skip
-    auto locked = slice.ep_weak_ptr.lock();
-    EXPECT_EQ(locked, nullptr);
-    // No crash — the slice safely detected endpoint destruction
-}
-
-TEST(EndpointLifecycleTest, MultipleSlicesSameEndpoint) {
-    auto ep = std::make_shared<FakeEndPoint>();
-    FakeSlice slices[3];
-    for (auto& s : slices) s.ep_weak_ptr = ep;
-
-    // All slices can lock while endpoint alive
-    for (auto& s : slices) {
-        auto locked = s.ep_weak_ptr.lock();
-        ASSERT_NE(locked, nullptr);
-        locked->acknowledge();
+        auto endpoint = std::make_shared<RdmaEndPoint>();
+        slice.ep_weak_ptr = endpoint;
+        ASSERT_FALSE(slice.ep_weak_ptr.expired());
     }
-    EXPECT_EQ(ep->acknowledge_calls, 3);
 
-    // Simulate eviction: drop the owning shared_ptr
-    ep.reset();
-
-    // All slices now get nullptr
-    for (auto& s : slices) {
-        EXPECT_EQ(s.ep_weak_ptr.lock(), nullptr);
-    }
-}
-
-TEST(EndpointLifecycleTest, WeakPtrResetClearsReference) {
-    auto ep = std::make_shared<FakeEndPoint>();
-    FakeSlice slice;
-    slice.ep_weak_ptr = ep;
-
-    // Simulate rdma_transport.cpp slice initialization: reset()
-    slice.ep_weak_ptr.reset();
     EXPECT_TRUE(slice.ep_weak_ptr.expired());
     EXPECT_EQ(slice.ep_weak_ptr.lock(), nullptr);
+}
 
-    // Original endpoint still alive
-    EXPECT_NE(ep, nullptr);
+TEST(EndpointLifecycleTest, MultipleSlicesShareEndpointLifetime) {
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    RdmaSlice slices[3];
+    for (auto& slice : slices) slice.ep_weak_ptr = endpoint;
+
+    for (auto& slice : slices) {
+        auto locked = slice.ep_weak_ptr.lock();
+        ASSERT_NE(locked, nullptr);
+        EXPECT_EQ(locked.get(), endpoint.get());
+    }
+
+    endpoint.reset();
+    for (auto& slice : slices) {
+        EXPECT_TRUE(slice.ep_weak_ptr.expired());
+        EXPECT_EQ(slice.ep_weak_ptr.lock(), nullptr);
+    }
+}
+
+TEST(EndpointLifecycleTest, SliceWeakPtrResetClearsReference) {
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    RdmaSlice slice;
+    slice.ep_weak_ptr = endpoint;
+
+    slice.ep_weak_ptr.reset();
+
+    EXPECT_TRUE(slice.ep_weak_ptr.expired());
+    EXPECT_EQ(slice.ep_weak_ptr.lock(), nullptr);
+    EXPECT_NE(endpoint, nullptr);
+}
+
+TEST(EndpointLifecycleTest, BootstrapWithNewPeerQpsRetiresEstablishedEndpoint) {
+    // The peer dropped its endpoint (store eviction or a transfer failure)
+    // and bootstraps again with a fresh QP set. The established endpoint now
+    // points at QPs that no longer exist, so it must retire instead of
+    // staying EP_READY and rejecting every later bootstrap from that peer.
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+
+    BootstrapDesc peer_desc, local_desc;
+    peer_desc.local_nic_path = MakeNicPath("10.0.0.1:12345", "mlx5_0");
+    peer_desc.qp_num = {200, 201};
+
+    EXPECT_FALSE(endpoint.accept(peer_desc, local_desc).ok());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
+    // The failed accept does not populate a GID. The transport retries on a
+    // newly inserted endpoint in the same bootstrap RPC so the initiator is
+    // not left with an empty reply.
+    EXPECT_TRUE(local_desc.local_gid.empty());
+}
+
+TEST(EndpointLifecycleTest, ExternalOwnerCanReleaseAfterExplicitDeconstruct) {
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    std::weak_ptr<RdmaEndPoint> weak = endpoint;
+
+    ASSERT_EQ(endpoint->deconstruct(), 0);
+    EXPECT_EQ(endpoint->status(), RdmaEndPoint::EP_DESTROYED);
+
+    endpoint.reset();
+    EXPECT_TRUE(weak.expired());
+}
+
+// Destroying the notify QP takes its completions with it, so an endpoint
+// whose notify CQ has not caught up is not finished yet. The data QPs have
+// their own counters; this is the notify side of the same gate.
+TEST(EndpointLifecycleTest, FinishDestroyWaitsForNotifyCompletions) {
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+    EndpointTestAccess::setNotifyInflight(endpoint, 3);
+    EndpointTestAccess::beginDestroy(endpoint);
+
+    EXPECT_FALSE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
+    endpoint.noteNotifyCompletion();
+    endpoint.noteNotifyCompletion();
+    EXPECT_FALSE(endpoint.finishDestroy());
+
+    endpoint.noteNotifyCompletion();
+    EXPECT_EQ(endpoint.notifyInflight(), 0u);
+    // Never below zero, whatever order the completions arrive in.
+    endpoint.noteNotifyCompletion();
+    EXPECT_EQ(endpoint.notifyInflight(), 0u);
+
+    EXPECT_TRUE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
+}
+
+// A consumed notify RECV slot is posted again only while the endpoint is
+// ready and its notify QP connected. Retirement moves the QP to ERR, and so
+// does the local fault that disables notifications, so neither may re-arm.
+TEST(EndpointLifecycleTest, NotifyRecvIsRearmedOnlyWhileReady) {
+    using S = RdmaEndPoint;
+    EXPECT_TRUE(S::shouldRearmNotifyRecv(S::EP_READY, true));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_READY, false));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_DESTROYING, true));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_DESTROYED, false));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_HANDSHAKING, true));
+
+    // The states the endpoint actually passes through.
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+    EXPECT_TRUE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                         endpoint.notifyConnected()));
+    endpoint.disableNotification("test");
+    EXPECT_EQ(endpoint.status(), S::EP_READY);
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                          endpoint.notifyConnected()));
+    EndpointTestAccess::beginDestroy(endpoint);
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                          endpoint.notifyConnected()));
 }
 
 }  // namespace

@@ -415,4 +415,25 @@ TEST_F(ClientTaskManagerTest, SerializerReset) {
     auto tasks = manager.get_read_access();
     EXPECT_EQ(tasks.size(), 0u);
 }
+
+TEST_F(ClientTaskManagerTest, FailPendingTaskSkipsQueuedAssignment) {
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
+    UUID client_id = generate_uuid();
+
+    auto task_id =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+            client_id, ReplicaCopyPayload{.tenant_id = "default",
+                                          .key = "failed-pending-key",
+                                          .source = "source",
+                                          .targets = {"target"}});
+    ASSERT_TRUE(task_id.has_value());
+
+    auto fail_result = manager.get_write_access().fail_task_if_pending(
+        *task_id, "test failure");
+    EXPECT_EQ(fail_result, ErrorCode::OK);
+
+    auto tasks = manager.get_write_access().pop_tasks(client_id, 10);
+    EXPECT_TRUE(tasks.empty());
+}
+
 }  // namespace mooncake

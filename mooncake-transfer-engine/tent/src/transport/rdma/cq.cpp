@@ -55,7 +55,8 @@ int RdmaCQ::construct(RdmaContext* context, int cqe_limit, int index) {
 }
 
 bool RdmaCQ::reserveQuota(int num_entries) {
-    int prev_cqe_now = __sync_fetch_and_add(&cqe_now_, num_entries);
+    int prev_cqe_now =
+        cqe_now_.fetch_add(num_entries, std::memory_order_acq_rel);
     if (prev_cqe_now + num_entries > cqe_limit_) {
         cancelQuota(num_entries);
         return false;
@@ -64,11 +65,11 @@ bool RdmaCQ::reserveQuota(int num_entries) {
 }
 
 void RdmaCQ::cancelQuota(int num_entries) {
-    __sync_fetch_and_sub(&cqe_now_, num_entries);
+    cqe_now_.fetch_sub(num_entries, std::memory_order_acq_rel);
 }
 
 int RdmaCQ::poll(int num_entries, ibv_wc* wc) {
-    if (!cqe_now_) return 0;
+    if (cqe_now_.load(std::memory_order_relaxed) == 0) return 0;
     int rc = ibv_poll_cq(cq_, num_entries, wc);
     if (rc < 0) {
         PLOG(ERROR) << "ibv_poll_cq";

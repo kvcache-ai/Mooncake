@@ -1,6 +1,5 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 
-#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -9,6 +8,9 @@
 #include <glog/logging.h>
 
 #include "types.h"
+#include "config/ha_cluster_namespace_config.h"
+#include "ascii_string.h"
+#include "integer_parser.h"
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
 #endif
@@ -43,11 +45,11 @@ tl::expected<long long, ErrorCode> ParseSnapshotScore(
         }
     }
 
-    try {
-        return std::stoll(digits);
-    } catch (const std::exception&) {
+    const auto score = TryParseInteger<long long>(digits);
+    if (!score.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    return *score;
 }
 
 tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
@@ -211,9 +213,8 @@ RedisSnapshotCatalogStore::GetLatest() {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
 
-    auto latest_snapshot_id =
-        snapshot_catalog_store_detail::TrimAsciiWhitespace(
-            std::string(reply->str, reply->len));
+    std::string latest_snapshot_id(reply->str, reply->len);
+    latest_snapshot_id = std::string(TrimAsciiWhitespace(latest_snapshot_id));
     if (latest_snapshot_id.empty()) {
         return std::optional<SnapshotDescriptor>();
     }
@@ -330,11 +331,7 @@ ClusterNamespace RedisSnapshotCatalogStore::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
-    if (env_cluster_id != nullptr && *env_cluster_id != '\0') {
-        return env_cluster_id;
-    }
-    return DEFAULT_CLUSTER_ID;
+    return HaClusterNamespaceConfig::FromEnvironment().cluster_namespace;
 }
 
 std::string RedisSnapshotCatalogStore::BuildLatestKey(

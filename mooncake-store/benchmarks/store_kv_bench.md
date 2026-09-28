@@ -202,3 +202,8 @@ Each phase prints:
 - aggregated error counts
 
 An overall summary is printed after all phases complete.
+
+If a worker raises an exception, the benchmark waits for all workers to finish,
+reports the failed phase and lane, and exits with code `1`. This error path does
+not write a new summary or journal; any output files from an earlier run remain
+unchanged.

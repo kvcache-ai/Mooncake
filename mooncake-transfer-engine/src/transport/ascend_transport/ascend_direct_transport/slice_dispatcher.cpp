@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <tuple>
 #include <utility>
 
 #include <acl/acl.h>
@@ -63,15 +64,17 @@ DefaultSliceDispatcher::DefaultSliceDispatcher(
 
 void DefaultSliceDispatcher::enqueue(
     std::vector<Transport::Slice *> slice_list) {
-    std::unordered_map<Transport::SegmentID, std::vector<Transport::Slice *>>
+    std::map<
+        std::pair<Transport::SegmentID, Transport::TransferRequest::OpCode>,
+        std::vector<Transport::Slice *>>
         seg_to_slices;
     for (auto slice : slice_list) {
-        seg_to_slices[slice->target_id].push_back(slice);
+        seg_to_slices[{slice->target_id, slice->opcode}].push_back(slice);
     }
     auto *executor = transfer_executor_;
     auto contexts = local_engine_contexts_;
     auto *pool = thread_pool_.get();
-    for (auto &[seg_id, slices] : seg_to_slices) {
+    for (auto &[key, slices] : seg_to_slices) {
         pool->enqueue([executor, contexts, moved_slices = std::move(slices)] {
             size_t engine_idx = 0;
             if (!moved_slices.empty() &&
@@ -127,7 +130,8 @@ RoceDummyRealSliceDispatcher::~RoceDummyRealSliceDispatcher() {
 
 void RoceDummyRealSliceDispatcher::enqueue(
     std::vector<Transport::Slice *> slice_list) {
-    std::map<std::pair<size_t, Transport::SegmentID>,
+    std::map<std::tuple<size_t, Transport::SegmentID,
+                        Transport::TransferRequest::OpCode>,
              std::vector<Transport::Slice *>>
         grouped;
     for (auto slice : slice_list) {
@@ -144,10 +148,10 @@ void RoceDummyRealSliceDispatcher::enqueue(
             slice->markFailed();
             continue;
         }
-        grouped[{engine_idx, slice->target_id}].push_back(slice);
+        grouped[{engine_idx, slice->target_id, slice->opcode}].push_back(slice);
     }
     for (auto &[key, slices] : grouped) {
-        size_t engine_idx = key.first;
+        size_t engine_idx = std::get<0>(key);
         SliceTask task{std::move(slices)};
         {
             std::lock_guard<std::mutex> lock(queue_mutexes_[engine_idx]);

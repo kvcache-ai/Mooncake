@@ -1,0 +1,115 @@
+[build-system]
+requires = [
+    "scikit-build-core>=1.0",
+    "pybind11>=2.13",
+    "numpy>=1.24",
+    # Mooncake PG still builds its Torch ABI extensions through setup.py.
+    "setuptools>=61",
+    # Multi-ABI PG builds install the requested Torch wheels at build time.
+    "pip>=23",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "mooncake-transfer-engine"
+version = "0.3.12.post1"
+description = "A KVCache-centric disaggregated architecture for large-scale LLM inference and training."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE-APACHE" }
+authors = [
+    { name = "Mooncake Authors" },
+]
+dependencies = [
+    "aiohttp",
+    "msgpack",
+    "requests",
+]
+keywords = ["mooncake", "transfer engine", "kv cache", "llm inference", "rdma"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.optional-dependencies]
+structured = [
+    "numpy",
+    "pillow",
+]
+vllm = [
+    "fastapi",
+    "httpx",
+    "msgspec",
+    "numpy",
+    "pyzmq",
+    "torch",
+    "vllm",
+]
+administration = [
+    "paramiko",
+]
+hardware = [
+    "torch",
+]
+dev = [
+    "build",
+    "cmake-format==0.6.13",
+    "codespell==2.2.6",
+    "pre-commit==3.7.1",
+    "pyright==1.1.411",
+    "pytest",
+    "ruff==0.6.9",
+    "tomli; python_version < '3.11'",
+    "twine",
+]
+
+[project.urls]
+Homepage = "https://github.com/kvcache-ai/Mooncake"
+Documentation = "https://kvcache-ai.github.io/Mooncake"
+Source = "https://github.com/kvcache-ai/Mooncake"
+Issues = "https://github.com/kvcache-ai/Mooncake/issues"
+Blog = "https://kvcache.ai/blog"
+Changelog = "https://github.com/kvcache-ai/Mooncake/releases"
+Slack = "https://join.slack.com/t/mooncake-project/shared_invite/zt-3qx4x35ea-zSSTqTHItHJs9SCoXLOSPA"
+
+[project.scripts]
+mooncake_master = "mooncake.cli:main"
+mooncake_client = "mooncake.cli_client:main"
+transfer_engine_bench = "mooncake.cli_bench:main"
+mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
+mc_store_rest_server = "mooncake.mooncake_store_service:sync_main"
+transfer_engine_topology_dump = "mooncake.transfer_engine_topology_dump:main"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/python/{wheel_tag}"
+wheel.packages = ["python/mooncake"]
+install.components = ["python"]
+sdist.include = [
+    "extern/yalantinglibs/**",
+    "!extern/yalantinglibs/.git",
+]
+sdist.exclude = ["extern/yalantinglibs/.git"]
+
+[tool.scikit-build.cmake.define]
+BUILD_BENCHMARK = false
+BUILD_UNIT_TESTS = false
+USE_CUDA = false
+WITH_EP = false
+WITH_P2P_STORE = false
+WITH_STORE_GO = false
+WITH_STORE_RUST = false

@@ -41,6 +41,8 @@ class RailMonitor {
         "transports/rdma/rail_error_window_secs";
     static constexpr const char *kCfgCooldownSecs =
         "transports/rdma/rail_cooldown_secs";
+    static constexpr const char *kCfgProbeIntervalSecs =
+        "transports/rdma/rail_probe_interval_secs";
 
    public:
     RailMonitor() = default;
@@ -51,25 +53,48 @@ class RailMonitor {
     RailMonitor &operator=(const RailMonitor &) = delete;
 
    public:
+    // The shared topology references keep segment snapshots alive while rail
+    // failure handling uses their derived mappings.
     // rail_topo_json: optional JSON string describing rail topology.
     // conf: optional Config pointer; when non-null, overrides the default
     //   error_threshold / error_window_secs / cooldown_secs values via
     //   kCfgErrorThreshold / kCfgErrorWindowSecs / kCfgCooldownSecs.
-    Status load(const Topology *local, const Topology *remote,
+    // A later call with the same NIC/memory layout only refreshes the pins
+    // (segment COW snapshots); it does not rebuild rail_states_ or reprint
+    // the config banner.
+    Status load(std::shared_ptr<const Topology> local,
+                std::shared_ptr<const Topology> remote,
                 const std::string &rail_topo_json = "",
                 const Config *conf = nullptr);
 
     bool ready() { return ready_; }
 
-    bool available(int local_nic, int remote_nic);
+    bool isAvailable(int local_nic, int remote_nic) const;
+
+    // Mutating admit: the ONLY path that arms a probe/trial. Returns true when
+    // a transfer may use this rail -- Closed (no-op), or an exploratory probe /
+    // Half-Open trial. Sets probe_in_flight for paused rails so a second probe
+    // cannot race the first while it is on the wire. Callers that select a rail
+    // but fail to post must call cancelProbe() to clear the flag.
+    //
+    // The check-then-set on probe_in_flight is not atomic, but each RailMonitor
+    // is owned by exactly one worker thread (WorkerContext::rails[machine_id]
+    // is per-worker, never shared -- see the class comment), so admit() and
+    // the completion-path mutators all run single-threaded on that worker; no
+    // two workers arm a probe on the same rail.
+    bool admit(int local_nic, int remote_nic);
 
     void markFailed(int local_nic, int remote_nic);
 
     void markRecovered(int local_nic, int remote_nic);
 
+    void cancelProbe(int local_nic, int remote_nic);
+
     int findBestRemoteDevice(int local_nic, int remote_numa);
 
-    const Topology *remote() { return remote_; }
+    const Topology *local() const { return local_.get(); }
+
+    const Topology *remote() const { return remote_.get(); }
 
    private:
     Status loadFromJson(const std::string &rail_topo_json);
@@ -80,8 +105,8 @@ class RailMonitor {
 
    private:
     bool ready_{false};
-    const Topology *local_{nullptr};
-    const Topology *remote_{nullptr};
+    std::shared_ptr<const Topology> local_;
+    std::shared_ptr<const Topology> remote_;
 
     struct PairHash {
         std::size_t operator()(const std::pair<int, int> &p) const noexcept {
@@ -95,8 +120,10 @@ class RailMonitor {
         std::chrono::seconds cooldown{0};
         std::chrono::steady_clock::time_point last_error{};
         std::chrono::steady_clock::time_point resume_time{};
+        std::chrono::steady_clock::time_point last_probe_time{};
+        bool half_open = false;
+        bool probe_in_flight = false;
 
-        // Derived: a rail is paused iff a resume_time has been armed.
         bool paused() const {
             return resume_time != std::chrono::steady_clock::time_point{};
         }
@@ -109,6 +136,7 @@ class RailMonitor {
     int error_threshold_ = 3;
     std::chrono::seconds error_window_{10};
     std::chrono::seconds cooldown_{30};
+    std::chrono::seconds probe_interval_{1};
 };
 
 }  // namespace tent

@@ -308,7 +308,7 @@ void tent_free_notifs(tent_notifi_info* info) {
 int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
                      size_t task_id, tent_status_t* xfer_status) {
     CHECK_POINTER(engine);
-    CHECK_POINTER(batch_id);
+    if (!batch_id) return -1;
     CHECK_POINTER(xfer_status);
     mooncake::tent::TransferStatus internal_status;
     auto status =
@@ -322,10 +322,22 @@ int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
     return 0;
 }
 
+int tent_cancel_task(tent_engine_t engine, tent_batch_id_t batch_id,
+                     size_t task_id) {
+    CHECK_POINTER(engine);
+    if (!batch_id) return -1;
+    auto status = CAST(engine)->cancelTransfer(batch_id, task_id);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_cancel_task: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
 int tent_overall_status(tent_engine_t engine, tent_batch_id_t batch_id,
                         tent_status_t* xfer_status) {
     CHECK_POINTER(engine);
-    CHECK_POINTER(batch_id);
+    if (!batch_id) return -1;
     CHECK_POINTER(xfer_status);
     mooncake::tent::TransferStatus internal_status;
     auto status = CAST(engine)->getTransferStatus(batch_id, internal_status);
@@ -463,7 +475,7 @@ int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
 int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
                           tent_status_t* statuses, size_t* count) {
     CHECK_POINTER(engine);
-    CHECK_POINTER(batch_id);
+    if (!batch_id) return -1;
     CHECK_POINTER(statuses);
     CHECK_POINTER(count);
     std::vector<mooncake::tent::TransferStatus> status_list;
@@ -478,5 +490,27 @@ int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
         statuses[i].transferred_bytes = status_list[i].transferred_bytes;
     }
     *count = status_list.size();
+    return 0;
+}
+
+int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
+                            size_t* count) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(stats);
+    CHECK_POINTER(count);
+    std::vector<mooncake::tent::NicLoadStats> native_stats;
+    auto status = CAST(engine)->getNicLoadStats(native_stats);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_get_nic_load_stats: " << status.ToString();
+        return -1;
+    }
+    size_t to_copy = std::min(native_stats.size(), *count);
+    for (size_t i = 0; i < to_copy; ++i) {
+        snprintf(stats[i].device_name, sizeof(stats[i].device_name), "%s",
+                 native_stats[i].device_name.c_str());
+        stats[i].inflight_bytes = native_stats[i].inflight_bytes;
+        stats[i].ewma_bandwidth_bps = native_stats[i].ewma_bandwidth_bps;
+    }
+    *count = native_stats.size();
     return 0;
 }

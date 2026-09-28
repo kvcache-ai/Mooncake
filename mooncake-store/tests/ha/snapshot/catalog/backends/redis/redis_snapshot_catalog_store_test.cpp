@@ -1,7 +1,9 @@
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,6 +20,27 @@ DEFINE_string(redis_endpoint, "",
               "Redis endpoint for snapshot catalog integration tests");
 
 namespace {
+
+class ScopedClusterId {
+   public:
+    ScopedClusterId() {
+        if (const char* value = std::getenv("MC_STORE_CLUSTER_ID")) {
+            original_ = value;
+        }
+        EXPECT_EQ(unsetenv("MC_STORE_CLUSTER_ID"), 0);
+    }
+
+    ~ScopedClusterId() {
+        if (original_) {
+            EXPECT_EQ(setenv("MC_STORE_CLUSTER_ID", original_->c_str(), 1), 0);
+        } else {
+            EXPECT_EQ(unsetenv("MC_STORE_CLUSTER_ID"), 0);
+        }
+    }
+
+   private:
+    std::optional<std::string> original_;
+};
 
 class FakeObjectStore final : public SnapshotObjectStore {
    public:
@@ -77,6 +100,39 @@ class FakeObjectStore final : public SnapshotObjectStore {
     std::vector<std::string> deleted_prefixes;
     std::unordered_map<std::string, std::string> objects_;
 };
+
+TEST(RedisSnapshotClusterNamespaceTest, ReadsFallbackForEachConstruction) {
+    ScopedClusterId env;
+    FakeObjectStore object_store;
+    using ha::backends::redis::RedisSnapshotCatalogStore;
+
+    RedisSnapshotCatalogStore missing(&object_store, "", "");
+    EXPECT_EQ(missing.GetSnapshotRoot(),
+              "mooncake_master_snapshot/mooncake_cluster/");
+
+    ASSERT_EQ(setenv("MC_STORE_CLUSTER_ID", "", 1), 0);
+    RedisSnapshotCatalogStore empty(&object_store, "", "");
+    EXPECT_EQ(empty.GetSnapshotRoot(),
+              "mooncake_master_snapshot/mooncake_cluster/");
+
+    ASSERT_EQ(setenv("MC_STORE_CLUSTER_ID", "team a", 1), 0);
+    RedisSnapshotCatalogStore configured(&object_store, "", "");
+    EXPECT_EQ(configured.GetSnapshotRoot(), "mooncake_master_snapshot/team a/");
+
+    ASSERT_EQ(setenv("MC_STORE_CLUSTER_ID", "team b", 1), 0);
+    RedisSnapshotCatalogStore changed(&object_store, "", "");
+    EXPECT_EQ(changed.GetSnapshotRoot(), "mooncake_master_snapshot/team b/");
+    EXPECT_EQ(configured.GetSnapshotRoot(), "mooncake_master_snapshot/team a/");
+}
+
+TEST(RedisSnapshotClusterNamespaceTest, ExplicitNamespaceOverridesEnvironment) {
+    ScopedClusterId env;
+    FakeObjectStore object_store;
+    ASSERT_EQ(setenv("MC_STORE_CLUSTER_ID", "environment", 1), 0);
+    ha::backends::redis::RedisSnapshotCatalogStore store(&object_store, "",
+                                                         "explicit");
+    EXPECT_EQ(store.GetSnapshotRoot(), "mooncake_master_snapshot/explicit/");
+}
 
 ha::SnapshotDescriptor MakeDescriptor(const std::string& snapshot_root,
                                       const std::string& snapshot_id) {

@@ -13,11 +13,13 @@
 // limitations under the License.
 
 #include "environ.h"
+#include "environment_variable.h"
 
 #include <gtest/gtest.h>
 
 #include <climits>
 #include <cstdlib>
+#include <optional>
 
 using mooncake::Environ;
 
@@ -28,9 +30,14 @@ class EnvironTest : public ::testing::Test {
 
     void clearTestEnvVars() {
         unsetenv("MC_TEST_INT");
+        unsetenv("MC_TEST_INT64");
+        unsetenv("MC_TEST_UINT32");
+        unsetenv("MC_TEST_UINT64");
         unsetenv("MC_TEST_SIZET");
+        unsetenv("MC_TEST_DOUBLE");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
+        unsetenv("MOONCAKE_STORE_CHECKSUM");
     }
 };
 
@@ -85,6 +92,82 @@ TEST_F(EnvironTest, GetIntMinValue) {
     EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), INT_MIN);
 }
 
+TEST_F(EnvironTest, GetIntSupportsTrimmedLeadingPlus) {
+    setenv("MC_TEST_INT", " \t+42\r\n", 1);
+    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), 42);
+}
+
+// --- GetInt64 ---
+
+TEST_F(EnvironTest, GetInt64ValidValue) {
+    setenv("MC_TEST_INT64", "123456789012", 1);
+    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 0), 123456789012LL);
+}
+
+TEST_F(EnvironTest, GetInt64Missing) {
+    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 9999), 9999);
+}
+
+TEST_F(EnvironTest, GetInt64Empty) {
+    setenv("MC_TEST_INT64", "", 1);
+    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
+}
+
+TEST_F(EnvironTest, GetInt64NonNumeric) {
+    setenv("MC_TEST_INT64", "abc", 1);
+    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
+}
+
+TEST_F(EnvironTest, GetInt64Overflow) {
+    setenv("MC_TEST_INT64", "99999999999999999999999999", 1);
+    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
+}
+
+TEST_F(EnvironTest, UnsignedGettersUseRequestedDefaultForInvalidValues) {
+    setenv("MC_TEST_UINT32", "4294967296", 1);
+    setenv("MC_TEST_UINT64", "-1", 1);
+    EXPECT_EQ(Environ::GetUInt32("MC_TEST_UINT32", 17), 17U);
+    EXPECT_EQ(Environ::GetUInt64("MC_TEST_UINT64", 23), 23U);
+}
+
+// --- GetDouble ---
+
+TEST_F(EnvironTest, GetDoubleValidValue) {
+    setenv("MC_TEST_DOUBLE", " 0.75 ", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.75);
+}
+
+TEST_F(EnvironTest, GetDoubleMissingOrInvalidUsesRequestedDefault) {
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+    setenv("MC_TEST_DOUBLE", "0.75garbage", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+    setenv("MC_TEST_DOUBLE", "nan", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+}
+
+TEST_F(EnvironTest, StoreChecksumPopulatesFromEnv) {
+    setenv("MOONCAKE_STORE_CHECKSUM", "1", 1);
+
+    const auto& e = Environ::Get();
+    EXPECT_TRUE(e.GetStoreChecksumEnabled());
+}
+
+TEST_F(EnvironTest, RdmaDataDirectIsOptIn) {
+    class Source : public mooncake::EnvironSource {
+       public:
+        const char* value = nullptr;
+        const char* Get(const char* name) const override {
+            return std::string(name) == "MC_RDMA_DATA_DIRECT" ? value : nullptr;
+        }
+    } source;
+
+    EXPECT_FALSE(Environ(source).GetRdmaDataDirect());
+    source.value = "1";
+    EXPECT_TRUE(Environ(source).GetRdmaDataDirect());
+    source.value = "0";
+    EXPECT_FALSE(Environ(source).GetRdmaDataDirect());
+}
+
 // --- GetSizeT ---
 
 TEST_F(EnvironTest, GetSizeTValidValue) {
@@ -134,18 +217,25 @@ TEST_F(EnvironTest, GetSizeTOverflow) {
 // --- GetBool ---
 
 TEST_F(EnvironTest, GetBoolTrue) {
-    for (const char* v :
-         {"1", "true", "TRUE", "True", "on", "ON", "yes", "YES"}) {
+    for (const char* v : {"1", "true", "TRUE", "True", "on", "ON", "yes", "YES",
+                          "enable", "EnAbLe", " true "}) {
         setenv("MC_TEST_BOOL", v, 1);
         EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", false)) << "for: " << v;
     }
 }
 
 TEST_F(EnvironTest, GetBoolFalse) {
-    for (const char* v : {"0", "false", "FALSE", "off", "no", "whatever"}) {
+    for (const char* v :
+         {"0", "false", "FALSE", "off", "no", "disable", "DiSaBlE"}) {
         setenv("MC_TEST_BOOL", v, 1);
         EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false)) << "for: " << v;
     }
+}
+
+TEST_F(EnvironTest, GetBoolInvalidUsesRequestedDefault) {
+    setenv("MC_TEST_BOOL", "whatever", 1);
+    EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", true));
+    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false));
 }
 
 TEST_F(EnvironTest, GetBoolMissing) {
@@ -155,7 +245,8 @@ TEST_F(EnvironTest, GetBoolMissing) {
 
 TEST_F(EnvironTest, GetBoolEmpty) {
     setenv("MC_TEST_BOOL", "", 1);
-    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", true));
+    EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", true));
+    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false));
 }
 
 // --- GetString ---
@@ -177,6 +268,36 @@ TEST_F(EnvironTest, GetStringEmpty) {
 TEST_F(EnvironTest, GetStringWithSpaces) {
     setenv("MC_TEST_STRING", "hello world", 1);
     EXPECT_EQ(Environ::GetString("MC_TEST_STRING", ""), "hello world");
+}
+
+TEST_F(EnvironTest, ReadsTypedEnvironmentVariableDefinitions) {
+    constexpr mooncake::EnvironmentVariable<int64_t> number{"MC_TEST_INT64"};
+    constexpr mooncake::EnvironmentVariable<bool> enabled{"MC_TEST_BOOL"};
+    constexpr mooncake::EnvironmentVariable<std::string> text{"MC_TEST_STRING"};
+
+    EXPECT_FALSE(Environ::Read(number).has_value());
+    EXPECT_EQ(Environ::ReadOr(number, int64_t{17}), 17);
+
+    setenv(number.name, "42", 1);
+    setenv(enabled.name, "off", 1);
+    setenv(text.name, "", 1);
+
+    EXPECT_EQ(Environ::Read(number), 42);
+    EXPECT_EQ(Environ::Read(enabled), false);
+    ASSERT_TRUE(Environ::Read(text).has_value());
+    EXPECT_TRUE(Environ::Read(text)->empty());
+}
+
+TEST_F(EnvironTest, TypedReadOrWarnsAndUsesDefaultForInvalidValues) {
+    constexpr mooncake::EnvironmentVariable<int64_t> number{"MC_TEST_INT64"};
+    setenv(number.name, "invalid", 1);
+
+    testing::internal::CaptureStderr();
+    EXPECT_EQ(Environ::ReadOr(number, int64_t{17}), 17);
+    const std::string logs = testing::internal::GetCapturedStderr();
+
+    EXPECT_NE(logs.find("MC_TEST_INT64"), std::string::npos);
+    EXPECT_NE(logs.find("using default 17"), std::string::npos);
 }
 
 int main(int argc, char** argv) {

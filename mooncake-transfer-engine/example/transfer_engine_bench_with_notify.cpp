@@ -41,7 +41,7 @@
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 #include <cassert>
 
-#ifdef USE_MNNVL
+#if defined(USE_MNNVL) || defined(USE_MUSA)
 #include "gpu_vendor/mnnvl.h"
 #endif
 
@@ -74,7 +74,7 @@ DEFINE_string(mode, "initiator",
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp|nvlink|hip");
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp|nvlink|musa|hip");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -108,7 +108,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-#ifdef USE_MNNVL
+#if defined(USE_MNNVL) || defined(USE_MUSA)
         d_buf = allocateFabricMemory(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
@@ -130,12 +130,12 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
-#ifdef USE_MNNVL
+#if defined(USE_MNNVL) || defined(USE_MUSA)
     if (FLAGS_use_vram) {
         freeFabricMemory(addr);
         return;
     }
-#endif  // USE_MNNVL
+#endif  // USE_MNNVL || USE_MUSA
 
     // check pointer on GPU
     cudaPointerAttributes attributes;
@@ -328,6 +328,8 @@ int initiator() {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             xport = engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "musa") {
+            xport = engine->installTransport("musa", nullptr);
         } else if (FLAGS_protocol == "nvlink_intra") {
             xport = engine->installTransport("nvlink_intra", nullptr);
         } else if (FLAGS_protocol == "hip") {
@@ -431,6 +433,8 @@ int target() {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "musa") {
+            engine->installTransport("musa", nullptr);
         } else if (FLAGS_protocol == "hip") {
             engine->installTransport("hip", nullptr);
         } else {

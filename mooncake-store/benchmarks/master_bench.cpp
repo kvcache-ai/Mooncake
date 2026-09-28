@@ -195,8 +195,8 @@ class BenchClient {
             return false;
         }
 
-        auto put_end_result =
-            master_client_.PutEnd(key, mooncake::ReplicaType::MEMORY);
+        auto put_end_result = master_client_.PutEnd(
+            {key, std::nullopt}, mooncake::ReplicaType::MEMORY);
         if (!put_end_result.has_value()) {
             return false;
         }
@@ -228,7 +228,12 @@ class BenchClient {
             return 0;
         }
 
-        auto put_end_result = master_client_.BatchPutEnd(started_keys);
+        std::vector<mooncake::ObjectMeta> object_metas;
+        object_metas.reserve(started_keys.size());
+        for (const auto& key : started_keys) {
+            object_metas.emplace_back(mooncake::ObjectMeta{key, std::nullopt});
+        }
+        auto put_end_result = master_client_.BatchPutEnd(object_metas);
         for (auto& result : put_end_result) {
             if (result.has_value()) {
                 success_cnt++;
@@ -455,7 +460,13 @@ int main(int argc, char** argv) {
             }
 
             if (!started_keys.empty()) {
-                auto put_end_result = prefill_client.BatchPutEnd(started_keys);
+                std::vector<mooncake::ObjectMeta> object_metas;
+                object_metas.reserve(started_keys.size());
+                for (const auto& key : started_keys) {
+                    object_metas.emplace_back(
+                        mooncake::ObjectMeta{key, std::nullopt});
+                }
+                auto put_end_result = prefill_client.BatchPutEnd(object_metas);
                 for (auto& result : put_end_result) {
                     if (result.has_value()) {
                         filled_objects++;

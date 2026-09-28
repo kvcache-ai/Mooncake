@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
@@ -14,8 +15,10 @@ def _basic_init_worker(ctx: MooncakePGWorkerContext) -> None:
     """Test basic init works and rank/world_size are correct."""
     device = ctx.init_group()
     # Verify rank and world_size are accessible
-    assert dist.get_rank() == ctx.rank, f"rank mismatch: {dist.get_rank()} != {ctx.rank}"
-    assert dist.get_world_size() == ctx.world_size, f"world_size mismatch"
+    assert (
+        dist.get_rank() == ctx.rank
+    ), f"rank mismatch: {dist.get_rank()} != {ctx.rank}"
+    assert dist.get_world_size() == ctx.world_size, "world_size mismatch"
     # Simple collective to verify group works
     tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
@@ -64,10 +67,12 @@ def _subgroup_create_destroy_worker(ctx: MooncakePGWorkerContext) -> None:
         world_tensor = torch.tensor([1], dtype=torch.int32, device=device)
         dist.all_reduce(world_tensor, op=dist.ReduceOp.SUM)
 
-        ctx.record_result({
-            "subgroup_sum": subgroup_sum,
-            "world_sum": int(world_tensor.cpu().item()),
-        })
+        ctx.record_result(
+            {
+                "subgroup_sum": subgroup_sum,
+                "world_sum": int(world_tensor.cpu().item()),
+            }
+        )
     finally:
         for g in (even_group, odd_group):
             if g is not None:
@@ -77,7 +82,7 @@ def _subgroup_create_destroy_worker(ctx: MooncakePGWorkerContext) -> None:
                     pass
 
 
-def _destroy_and_reinit_worker(ctx: MooncakePGWorkerContext) -> None:
+def _destroy_and_reinit_worker(ctx: MooncakePGWorkerContext, destroyed) -> None:
     """Test destroy and re-init process group."""
     # First init
     device = ctx.init_group()
@@ -86,10 +91,9 @@ def _destroy_and_reinit_worker(ctx: MooncakePGWorkerContext) -> None:
     sum1 = int(tensor1.cpu().item())
 
     # Destroy WORLD group
-    try:
-        dist.destroy_process_group(dist.group.WORLD)
-    except Exception:
-        pass
+    dist.destroy_process_group(dist.group.WORLD)
+    # Reinitialization should start after every old communicator unregisters.
+    destroyed.wait(timeout=10)
 
     # Re-init
     device = ctx.init_group()
@@ -116,6 +120,13 @@ class _InitFunctionalMixin:
         expected_sum = sum(range(1, self.world_size + 1))
         for row in rows:
             self.assertEqual(row["sum"], expected_sum)
+
+    def test_world_size_one(self) -> None:
+        """Test a process group with world size 1 initializes and works."""
+        rows = self.spawn_backend_and_collect(_basic_init_worker, world_size=1)
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["sum"], 1)
 
     def test_subgroup_create_destroy(self) -> None:
         """Test subgroup creation and destruction."""
@@ -144,7 +155,8 @@ class _InitFunctionalMixin:
 
     def test_destroy_and_reinit(self) -> None:
         """Test destroy and re-init process group."""
-        rows = self.spawn_backend_and_collect(_destroy_and_reinit_worker)
+        destroyed = mp.get_context("spawn").Barrier(self.world_size)
+        rows = self.spawn_backend_and_collect(_destroy_and_reinit_worker, destroyed)
         self.assert_all_ok(rows)
 
         expected = sum(range(1, self.world_size + 1))
@@ -153,11 +165,15 @@ class _InitFunctionalMixin:
             self.assertEqual(row["sum2"], expected)
 
 
-class TestMooncakePGInitFunctionalCPU(_InitFunctionalMixin, MooncakePGCPUBackendTestCase):
+class TestMooncakePGInitFunctionalCPU(
+    _InitFunctionalMixin, MooncakePGCPUBackendTestCase
+):
     world_size = 4
 
 
-class TestMooncakePGInitFunctionalCUDA(_InitFunctionalMixin, MooncakePGCUDABackendTestCase):
+class TestMooncakePGInitFunctionalCUDA(
+    _InitFunctionalMixin, MooncakePGCUDABackendTestCase
+):
     world_size = 4
 
     @classmethod

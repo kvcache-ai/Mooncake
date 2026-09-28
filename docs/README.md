@@ -11,7 +11,7 @@ cd docs
 - Install the dependencies:
 
 ```bash
-pip install -r ../requirements_docs.txt
+pip install -r requirements-docs.txt
 ```
 
 - Clean the previous build (optional but recommended):

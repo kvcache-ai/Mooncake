@@ -1,4 +1,3 @@
-import os
 import socket
 import unittest
 import torch

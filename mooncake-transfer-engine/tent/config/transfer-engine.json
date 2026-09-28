@@ -17,18 +17,7 @@
         "http_port": 9100,
         "http_host": "0.0.0.0",
         "http_server_threads": 2,
-        "report_interval_seconds": 30,
-        "enable_prometheus": true,
-        "enable_json": true,
-        "latency_buckets": [
-            0.000125, 0.00015, 0.0002, 0.00025, 0.0003, 0.0004, 0.0005,
-            0.00075, 0.001, 0.0015, 0.002, 0.003, 0.005, 0.007,
-            0.015, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0
-        ],
-        "size_buckets": [
-            1024, 4096, 16384, 65536, 262144, 1048576, 4194304,
-            16777216, 67108864, 268435456, 1073741824
-        ]
+        "report_interval_seconds": 30
     },
     "transports": {
         "rdma": {
@@ -71,6 +60,21 @@
                 "rail_topo_path": "/path/to/rail_topo.json"
             }
         },
+        "ub": {
+            "enable": false,
+            "device_filter": [],
+            "worker_count": 4,
+            "poller_count": 1,
+            "jfc_per_context": 1,
+            "jetty_per_endpoint": 4,
+            "max_endpoints": 4096,
+            "slice_size": 65536,
+            "max_retries": 3,
+            "slice_timeout_ms": 10000,
+            "endpoint_cooldown_ms": 30000,
+            "enable_bandwidth_estimation": true,
+            "enable_notifications": false
+        },
         "tcp": {
             "enable": true,
             "max_retry_count": 3,
@@ -78,16 +82,38 @@
             "retry_max_delay_ms": 2000,
             "max_concurrent_tasks": 16
         },
+        "hp_tcp": {
+            "enable": false,
+            "bind_address": "",
+            "advertise_address": "",
+            "rail_addresses": [],
+            "port": 0,
+            "worker_count": 16,
+            "connections_per_peer": 4,
+            "max_outstanding_tasks": 4096,
+            "max_outstanding_bytes": 4294967296,
+            "max_transfer_bytes": 1073741824,
+            "connect_timeout_ms": 2000,
+            "progress_timeout_ms": 30000
+        },
         "gds": {
             "enable" : true
         },
         "shm": {
             "enable" : true,
-            "cxl_mount_path": "",
-            "async_memcpy_threshold": 4
+            "cxl_mount_path": ""
         },
         "mnnvl": {
             "enable" : false
+        },
+        "ascend_direct": {
+            "enable": true,
+            "transfer_timeout_ms": 10000,
+            "rdma_tc": "",
+            "rdma_sl": "",
+            "fabric_mem": false,
+            "global_resource_config": "",
+            "agent_mode": false
         }
     },
     "policy": [
@@ -95,7 +121,7 @@
             "name": "default_memory",
             "segment_type": "memory",
             "devices": ["mlx5_0", "mlx5_2"],
-            "transports": ["nvlink", "rdma", "shm"]
+            "transports": ["nvlink", "rdma", "shm", "hp_tcp"]
         },
         {
             "name": "file_storage",

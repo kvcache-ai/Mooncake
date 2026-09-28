@@ -1,71 +1,48 @@
+#define _GNU_SOURCE
+
 #include <glog/logging.h>
 
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 #include <thread>
+#include "config/spdk_controller_config.h"
 #include "spdk/spdk_wrapper.h"
 
 namespace mooncake {
 namespace {
 
-bool ParseEnvU64(const char *name, uint64_t *out) {
-    const char *val = std::getenv(name);
-    if (!val || *val == '\0') {
-        return false;
-    }
-
-    errno = 0;
-    char *end = nullptr;
-    unsigned long long parsed = std::strtoull(val, &end, 10);
-    if (errno != 0 || end == val || (end && *end != '\0')) {
-        LOG(WARNING) << "Invalid value for " << name << ": " << val;
-        return false;
-    }
-
-    *out = static_cast<uint64_t>(parsed);
-    return true;
-}
-
-bool ParseEnvBool(const char *name, bool *out) {
-    uint64_t v = 0;
-    if (!ParseEnvU64(name, &v)) {
-        return false;
-    }
-    *out = (v != 0);
-    return true;
-}
-
 void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
-    uint64_t v = 0;
-    bool bv = false;
     opts->keep_alive_timeout_ms = 0;
-
-    if (ParseEnvU64("MC_NVME_NUM_IO_QUEUES", &v)) {
-        opts->num_io_queues = static_cast<uint32_t>(v);
+    const auto config = SpdkControllerConfig::FromEnvironment();
+    if (config.num_io_queues.has_value()) {
+        opts->num_io_queues = *config.num_io_queues;
     }
-    if (ParseEnvU64("MC_NVME_IO_QUEUE_SIZE", &v)) {
-        opts->io_queue_size = static_cast<uint32_t>(v);
+    if (config.io_queue_size.has_value()) {
+        opts->io_queue_size = *config.io_queue_size;
     }
-    if (ParseEnvU64("MC_NVME_IO_QUEUE_REQUESTS", &v)) {
-        opts->io_queue_requests = static_cast<uint32_t>(v);
+    if (config.io_queue_requests.has_value()) {
+        opts->io_queue_requests = *config.io_queue_requests;
     }
-    if (ParseEnvU64("MC_NVME_TRANSPORT_ACK_TIMEOUT", &v)) {
-        opts->transport_ack_timeout = static_cast<uint8_t>(v);
+    if (config.transport_ack_timeout.has_value()) {
+        opts->transport_ack_timeout = *config.transport_ack_timeout;
     }
-    if (ParseEnvU64("MC_NVME_ADMIN_QUEUE_SIZE", &v)) {
-        opts->admin_queue_size = static_cast<uint16_t>(v);
+    if (config.admin_queue_size.has_value()) {
+        opts->admin_queue_size = *config.admin_queue_size;
     }
-    if (ParseEnvU64("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", &v)) {
-        opts->fabrics_connect_timeout_us = v;
+    if (config.fabrics_connect_timeout_us.has_value()) {
+        opts->fabrics_connect_timeout_us = *config.fabrics_connect_timeout_us;
     }
-    if (ParseEnvBool("MC_NVME_HEADER_DIGEST", &bv)) {
-        opts->header_digest = bv;
+    if (config.header_digest.has_value()) {
+        opts->header_digest = *config.header_digest;
     }
-    if (ParseEnvBool("MC_NVME_DATA_DIGEST", &bv)) {
-        opts->data_digest = bv;
+    if (config.data_digest.has_value()) {
+        opts->data_digest = *config.data_digest;
     }
     LOG(INFO) << "NVMe ctrlr opts: num_io_queues=" << opts->num_io_queues
               << ", io_queue_size=" << opts->io_queue_size
@@ -118,11 +95,41 @@ bool SpdkWrapper::InitializeEnv() {
         return true;
     }
 
+    // rte_eal_init registers the calling thread as DPDK's main lcore and may
+    // restrict its CPU affinity to the configured EAL cores (default
+    // core_mask "0x1"). Linux threads inherit the creator's affinity mask, so
+    // without restoring it, every thread the host app spawns after Mooncake's
+    // setup would be pinned to a single core and KV read/write throughput
+    // would drop sharply. Save the original affinity and restore it around
+    // spdk_env_init to stop that propagation. DPDK's main-lcore identity is a
+    // thread registration, not the kernel affinity, so later SPDK calls are
+    // unaffected by the restore. pthread affinity APIs are glibc-specific, so
+    // this is gated to Linux; other platforms see the previous behavior.
+#if defined(__linux__)
+    cpu_set_t orig_cpuset;
+    CPU_ZERO(&orig_cpuset);
+    bool affinity_saved =
+        pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t),
+                               &orig_cpuset) == 0;
+#endif
+
     struct spdk_env_opts opts;
     spdk_env_opts_init(&opts);
     opts.name = "mooncake";
 
     int rc = spdk_env_init(&opts);
+
+    // Best-effort restore of the caller's original affinity.
+#if defined(__linux__)
+    if (affinity_saved) {
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t),
+                                   &orig_cpuset) != 0) {
+            LOG(WARNING) << "Failed to restore calling thread CPU affinity "
+                            "after SPDK env init";
+        }
+    }
+#endif
+
     if (rc != 0) {
         fprintf(stderr, "SPDK init failed: %d\n", rc);
         return false;
@@ -182,6 +189,64 @@ void SpdkWrapper::Free(void *ptr) {
     if (ptr) {
         spdk_free(ptr);
     }
+}
+
+int SpdkWrapper::RegisterMemory(void *addr, size_t size) {
+    if (!addr || size == 0) {
+        return -1;
+    }
+    if (!InitializeEnv()) {
+        LOG(ERROR) << "SPDK env init failed, cannot register memory";
+        return -1;
+    }
+    int rc = spdk_mem_register(addr, size);
+    if (rc != 0) {
+        LOG(ERROR) << "spdk_mem_register failed (addr=" << addr
+                   << ", size=" << size << "): " << strerror(-rc);
+    }
+    return rc;
+}
+
+bool SpdkWrapper::IsRegistrableRange(void *addr, size_t size) {
+    // spdk_mem_register() rejects a range up front (memory.c:339-348) when the
+    // address is outside the 256TB window it can represent (MASK_256TB) or when
+    // addr/size is not 2MB-aligned. Those rejections happen before anything is
+    // marked, so a caller that skips the registration for such a range can
+    // still munmap it; every other failure may have left state behind.
+    constexpr uintptr_t kSpdkAddressMask = (1ULL << 48) - 1;  // MASK_256TB
+    constexpr uintptr_t kSpdk2MbAlignment = 2ULL * 1024 * 1024;
+    const uintptr_t vaddr = reinterpret_cast<uintptr_t>(addr);
+    return addr != nullptr && size != 0 && (vaddr & ~kSpdkAddressMask) == 0 &&
+           (vaddr % kSpdk2MbAlignment) == 0 && (size % kSpdk2MbAlignment) == 0;
+}
+
+int SpdkWrapper::UnregisterMemory(void *addr, size_t size) {
+    if (!addr || size == 0) {
+        return -1;
+    }
+    // SPDK env may not be initialized (registration is opt-in) or may already
+    // have been finalized by Cleanup() -> spdk_env_fini(). In both cases there
+    // is no registered memory to release; calling spdk_mem_unregister would
+    // walk a torn-down or never-created global mem_map. (With ShmHelper
+    // destroyed before SpdkWrapper, the `initialized` atomic is still alive
+    // here.)
+    if (!initialized.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    int rc = spdk_mem_unregister(addr, size);
+    if (rc != 0) {
+        // Every code is reported, -EINVAL included: it does NOT mean "the range
+        // was never registered" (spdk_mem_unregister returns it at memory.c:426
+        // when a page of the range is not REG_MAP_REGISTERED -- exactly what
+        // spdk_mem_register leaves behind when it fails after marking the range
+        // but before its notify callbacks run, memory.c:370-384). In iova=va it
+        // is also returned by the notify callback when the translation does not
+        // cover the range, *before* the IOMMU unmap at memory.c:1224, so a live
+        // DMA mapping can remain. Callers must keep the mapping unless rc == 0.
+        LOG(ERROR) << "spdk_mem_unregister failed (addr=" << addr
+                   << ", size=" << size << "): " << strerror(-rc);
+    }
+    return rc;
 }
 
 void SpdkWrapper::ProbeReadComplete(void *ctx,
@@ -303,6 +368,18 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
 }
 
 nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
+    // ConnectController -> spdk_nvme_probe() uses env-provided sockets and
+    // memory, so the SPDK env must be up. Do not rely on an earlier
+    // RegisterMemory() to have initialized it: callers now skip the
+    // registration for ranges SPDK would reject (IsRegistrableRange), and that
+    // must not decide whether NoF can be used at all. Every other entry point
+    // (Alloc, RegisterMemory, ProbeNofSegment) already initializes the env
+    // itself; this makes OpenNofSegment self-sufficient too.
+    if (!InitializeEnv()) {
+        LOG(ERROR) << "SPDK env init failed, cannot open NoF segment";
+        return nullptr;
+    }
+
     tr_info tr;
     int ret = ParseTransPortStr(tr_str, &tr);
     if (ret != 0) {

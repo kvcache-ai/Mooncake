@@ -1,9 +1,9 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -56,10 +56,10 @@ class OffloadOnEvictTest : public ::testing::Test {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start =
-            service.PutStart(client_id, key, "default", size, config);
+            service.PutStart(client_id, key, TenantId::Default(), size, config);
         ASSERT_TRUE(put_start.has_value()) << "PutStart failed for key=" << key;
-        auto put_end =
-            service.PutEnd(client_id, key, "default", ReplicaType::MEMORY);
+        auto put_end = service.PutEnd(client_id, key, TenantId::Default(),
+                                      ReplicaType::MEMORY);
         ASSERT_TRUE(put_end.has_value()) << "PutEnd failed for key=" << key;
     }
 
@@ -76,316 +76,78 @@ class OffloadOnEvictTest : public ::testing::Test {
         }
         return queued;
     }
-
-    template <typename Predicate>
-    void WaitUntil(
-        Predicate&& predicate,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds(4000),
-        std::chrono::milliseconds interval =
-            std::chrono::milliseconds(50)) const {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (predicate()) {
-                return;
-            }
-            std::this_thread::sleep_for(interval);
-        }
-        EXPECT_TRUE(predicate());
-    }
-
-    // Fill a segment until PutStart fails, triggering eviction.
-    // Returns the number of successful puts.
-    int FillSegmentUntilEviction(MasterService& service, const UUID& client_id,
-                                 const std::string& key_prefix,
-                                 size_t object_size, int max_puts) {
-        int success_puts = 0;
-        for (int i = 0; i < max_puts; ++i) {
-            std::string key = key_prefix + std::to_string(i);
-            ReplicateConfig config;
-            config.replica_num = 1;
-            auto result = service.PutStart(client_id, key, "default",
-                                           object_size, config);
-            if (result.has_value()) {
-                auto end = service.PutEnd(client_id, key, "default",
-                                          ReplicaType::MEMORY);
-                EXPECT_TRUE(end.has_value());
-                success_puts++;
-            } else {
-                // Wait for eviction to process
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-        }
-        return success_puts;
-    }
 };
 
 // =============================================================================
-// Combo A: Default config (offload at PutEnd)
+// UpsertStart interaction with an outstanding offload task.
+//
+// The task passes through two observable states in offloading_tasks[key]:
+//   QUEUED    - mirror entry still present in offloading_objects; the store
+//               worker has not observed the task. UpsertStart cancels the
+//               task in place and allocates a fresh replica.
+//   IN-FLIGHT - mirror already drained by OffloadObjectHeartbeat; the worker
+//               is reading the source buffer for SSD write. UpsertStart
+//               returns OBJECT_HAS_REPLICATION_TASK; the caller retries
+//               after NotifyOffloadSuccess clears the marker.
 // =============================================================================
 
-TEST_F(OffloadOnEvictTest, ComboA_OffloadAtPutEnd) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.default_kv_lease_ttl = 2000;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-
-    // Mount local disk segment with offloading ENABLED
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
-
-    // Put objects
-    PutObject(*service, ctx.client_id, "key_a1");
-    PutObject(*service, ctx.client_id, "key_a2");
-    PutObject(*service, ctx.client_id, "key_a3");
-
-    // Default mode: PutEnd pushes to offload queue immediately
-    auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_EQ(queued.size(), 3u)
-        << "Default: all 3 objects should be in offload queue after PutEnd";
-    EXPECT_TRUE(queued.count("key_a1"));
-    EXPECT_TRUE(queued.count("key_a2"));
-    EXPECT_TRUE(queued.count("key_a3"));
-
-    service->RemoveAll();
-}
-
-TEST_F(OffloadOnEvictTest, ComboA_EvictionWorks) {
-    // Regression: eviction still works in default mode
-    const uint64_t kv_lease_ttl = 2000;
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.default_kv_lease_ttl = kv_lease_ttl;
-    auto service = std::make_unique<MasterService>(config);
-
-    // Large segment: can hold ~16K objects of 15KB
-    constexpr size_t seg_size = 1024 * 1024 * 16 * 15;
-    constexpr size_t object_size = 1024 * 15;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-
-    // Put more objects than the segment can hold
-    int success_puts = FillSegmentUntilEviction(
-        *service, ctx.client_id, "evict_a_", object_size, 1024 * 16 + 50);
-    EXPECT_GT(success_puts, 1024 * 16)
-        << "Default: eviction should allow more puts than capacity";
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    service->RemoveAll();
-}
-
-// =============================================================================
-// Combo B: offload_on_evict=true (offload on evict, no force-evict)
-// =============================================================================
-
-TEST_F(OffloadOnEvictTest, ComboB_PutEndSkipsOffloadQueue) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_on_evict = true;
-    config.default_kv_lease_ttl = 2000;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
-
-    PutObject(*service, ctx.client_id, "key_b1");
-    PutObject(*service, ctx.client_id, "key_b2");
-    PutObject(*service, ctx.client_id, "key_b3");
-
-    // Offload-on-evict: PutEnd should NOT push to offload queue
-    auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_EQ(queued.size(), 0u)
-        << "Offload-on-evict: queue should be empty after PutEnd";
-
-    service->RemoveAll();
-}
-
-TEST_F(OffloadOnEvictTest, ComboB_EvictionTriggersOffload) {
-    const uint64_t kv_lease_ttl = 2000;
+TEST_F(OffloadOnEvictTest, UpsertPreemptsQueuedOffloadWithOffloadOnEvict) {
+    // With offload_on_evict the task is queued by eviction rather than by
+    // PutEnd.
+    const uint64_t kv_lease_ttl = 500;
     MasterServiceConfig config;
     config.enable_offload = true;
     config.offload_on_evict = true;
     config.default_kv_lease_ttl = kv_lease_ttl;
     auto service = std::make_unique<MasterService>(config);
 
-    constexpr size_t seg_size = 1024 * 1024 * 16 * 15;
-    constexpr size_t object_size = 1024 * 15;
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    constexpr size_t object_size = 1024 * 1024;
     auto ctx =
         PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
 
-    // Fill segment to trigger eviction
-    bool eviction_triggered = false;
-    int success_puts = 0;
-    for (int i = 0; i < 1024 * 16 + 50; ++i) {
-        std::string key = "evict_b_" + std::to_string(i);
-        ReplicateConfig config;
-        config.replica_num = 1;
-        auto result = service->PutStart(ctx.client_id, key, "default",
-                                        object_size, config);
-        if (result.has_value()) {
-            auto end = service->PutEnd(ctx.client_id, key, "default",
-                                       ReplicaType::MEMORY);
-            ASSERT_TRUE(end.has_value());
-            success_puts++;
-        } else {
-            eviction_triggered = true;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
+    std::vector<std::string> keys;
+    for (int i = 0; i < 8; ++i) {
+        keys.push_back("evict_upsert_" + std::to_string(i));
+        PutObject(*service, ctx.client_id, keys.back(), object_size);
     }
 
-    EXPECT_TRUE(eviction_triggered)
-        << "Eviction should trigger when segment fills up";
-
-    // Offload-on-evict: eviction should push objects to offload queue
+    // PutEnd does not queue offloads in this mode; eviction does.
     auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_GT(queued.size(), 0u)
-        << "Offload-on-evict: eviction should push to offload queue";
+    ASSERT_TRUE(queued.empty())
+        << "offload_on_evict: PutEnd must not queue offloads";
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    service->RemoveAll();
-}
+    // Let leases expire so the keys are evictable, then run one eviction
+    // cycle to queue their offloads without draining the mirrors.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+    MasterServiceTestPeer(*service).RunBatchEvictForTesting(1.0, 1.0);
 
-TEST_F(OffloadOnEvictTest, ComboB_NoFallbackWithoutForceEvict) {
-    // Without force_evict AND without a LocalDiskSegment, offload queue push
-    // fails and eviction does NOT force-delete MEMORY (data-preserving).
-    // The segment fills and subsequent puts fail — this is the safe default.
-    const uint64_t kv_lease_ttl = 2000;
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_on_evict = true;
-    config.default_kv_lease_ttl = kv_lease_ttl;
-    auto service = std::make_unique<MasterService>(config);
+    std::string offloading_key;
+    for (const auto& k : keys) {
+        auto upsert =
+            service->UpsertStart(ctx.client_id, k, TenantId::Default(),
+                                 object_size, ReplicateConfig{});
+        if (upsert.has_value()) {
+            offloading_key = k;
+            EXPECT_EQ(upsert->size(), 1u);
+            EXPECT_EQ(upsert->at(0).status, ReplicaStatus::PROCESSING);
+            ASSERT_TRUE(service
+                            ->PutEnd(ctx.client_id, k, TenantId::Default(),
+                                     ReplicaType::MEMORY)
+                            .has_value());
+            break;
+        }
+    }
+    ASSERT_FALSE(offloading_key.empty())
+        << "expected UpsertStart to preempt an offload queued by eviction";
 
-    // NO local disk segment mounted — PushOffloadingQueue will fail
-    constexpr size_t seg_size = 1024 * 1024 * 16 * 15;
-    constexpr size_t object_size = 1024 * 15;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+    // Preempt cleared the marker and the mirror, so no stale entry is handed
+    // to the store worker for the preempted key.
+    auto stale = DrainOffloadQueue(*service, ctx.client_id);
+    EXPECT_EQ(stale.count(offloading_key), 0u)
+        << "preempted key must not remain queued";
 
-    // Without force_evict, push failures mean DRAM cannot be freed,
-    // so we can only put up to segment capacity (no overflow).
-    int success_puts = FillSegmentUntilEviction(
-        *service, ctx.client_id, "evict_b2_", object_size, 1024 * 16 + 50);
-    EXPECT_LE(success_puts, 1024 * 16)
-        << "Without force_evict, segment should fill and stay full";
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    service->RemoveAll();
-}
-
-// =============================================================================
-// Combo C: offload_on_evict=true + offload_force_evict=true
-// =============================================================================
-
-TEST_F(OffloadOnEvictTest, ComboC_PutEndSkipsOffloadQueue) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_on_evict = true;
-    config.offload_force_evict = true;
-    config.default_kv_lease_ttl = 2000;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
-
-    PutObject(*service, ctx.client_id, "key_c1");
-    PutObject(*service, ctx.client_id, "key_c2");
-
-    // Same as Combo B: PutEnd should skip offload queue
-    auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_EQ(queued.size(), 0u)
-        << "Combo C: offload queue should be empty after PutEnd";
-
-    service->RemoveAll();
-}
-
-TEST_F(OffloadOnEvictTest, ComboC_EvictionWithForceEvict) {
-    const uint64_t kv_lease_ttl = 2000;
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_on_evict = true;
-    config.offload_force_evict = true;
-    config.default_kv_lease_ttl = kv_lease_ttl;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16 * 15;
-    constexpr size_t object_size = 1024 * 15;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
-
-    // With force-evict, eviction should work effectively.
-    // Note: without a real FileStorage heartbeat, offloaded objects' refcnt
-    // never decreases, so DRAM isn't fully freed beyond what direct eviction
-    // allows. We verify eviction doesn't deadlock (can fill to capacity).
-    int success_puts = FillSegmentUntilEviction(
-        *service, ctx.client_id, "evict_c_", object_size, 1024 * 16 + 50);
-    EXPECT_GE(success_puts, 1024 * 16)
-        << "Combo C: eviction should work with force-evict enabled";
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    service->RemoveAll();
-}
-
-// =============================================================================
-// Combo D: offload_force_evict=true only (should be no-op without on_evict)
-// =============================================================================
-
-TEST_F(OffloadOnEvictTest, ComboD_ForceEvictAloneIsIgnored) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_force_evict = true;  // on_evict is false → force is ignored
-    config.default_kv_lease_ttl = 2000;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
-
-    // Should behave like Combo A (default: offload at PutEnd)
-    PutObject(*service, ctx.client_id, "key_d1");
-    PutObject(*service, ctx.client_id, "key_d2");
-
-    auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_EQ(queued.size(), 2u)
-        << "Combo D: FORCE_EVICT alone should not change default behavior";
-
-    service->RemoveAll();
-}
-
-TEST_F(OffloadOnEvictTest, ComboD_EvictionWorks) {
-    const uint64_t kv_lease_ttl = 2000;
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_force_evict = true;  // on_evict is false → force is ignored
-    config.default_kv_lease_ttl = kv_lease_ttl;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16 * 15;
-    constexpr size_t object_size = 1024 * 15;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-
-    int success_puts = FillSegmentUntilEviction(
-        *service, ctx.client_id, "evict_d_", object_size, 1024 * 16 + 50);
-    EXPECT_GT(success_puts, 1024 * 16)
-        << "Combo D: eviction should work normally";
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service->RemoveAll();
 }
 

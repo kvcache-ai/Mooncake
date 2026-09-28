@@ -2,13 +2,13 @@
 #define MOONCAKE_P2P_PROXY_H
 
 #include <mooncake_worker.cuh>
-#include <torch/torch.h>
 #include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -63,7 +63,7 @@ namespace mooncake {
 //     sender to write data into the designated RecvPool offset.
 //   - The SENDER is passive. It polls its local CreditLane (written by the
 //     receiver via RDMA). Only after receiving a credit does it allocate
-//     a staging buffer from SendPool, copy user tensor data into it, and
+//     a staging buffer from SendPool, copy user buffer data into it, and
 //     perform the RDMA Write to the remote RecvPool.
 //   - After the RDMA Write finishes, the sender writes an AckSlot back
 //     to the receiver's AckLane to acknowledge the transfer.
@@ -84,7 +84,7 @@ namespace mooncake {
 //     "all chunks are reserved for receiving and none are left for sending"
 //     can never happen.
 //
-// Data flow example -- Rank 0 sends a 24 MiB tensor to Rank 1.
+// Data flow example -- Rank 0 sends a 24 MiB buffer to Rank 1.
 // The five steps below are separated between Sender (Rank 0) and
 // Receiver (Rank 1) to make the protocol explicit.
 //
@@ -98,11 +98,11 @@ namespace mooncake {
 //   | chunk 1 : free        | -----------> | slot 2 : {seq=2,off=1,len=8M} |
 //   +-----------------------+              +-------------------------------+
 //
-//   Step 2 -- Rank 0 stages user tensor into SendPool
+//   Step 2 -- Rank 0 stages the user buffer into SendPool
 //   ------------------------------------------------------------------------
 //   Rank 0 (Sender)
 //   +-----------------------+
-//   | User tensor           |
+//   | User buffer           |
 //   |[0..8M)[8..16M)[16..24)|
 //   +-----------------------+
 //            |
@@ -144,10 +144,10 @@ namespace mooncake {
 //   | chunk 1 : [16..24M)   |
 //   +-----------------------+
 //            |
-//            | cudaMemcpyAsync (RecvPool -> user tensor)
+//            | cudaMemcpyAsync (RecvPool -> user buffer)
 //            v
 //   +-----------------------+
-//   | User tensor (ready)   |
+//   | User buffer (ready)   |
 //   |[0..8M)[8..16M)[16..24)|
 //   +-----------------------+
 //            |
@@ -274,29 +274,32 @@ class P2PProxy {
    public:
     friend class P2PDeviceWorker;
 
-    enum class OpStatus : uint8_t { kPending = 0, kSuccess = 1, kFailed = 2 };
+    enum class IssueResult : uint8_t { kIssued, kNoCredit, kFailed };
 
     struct Options {
         bool is_cpu = false;
         int rank = 0;
         int size = 0;
         int cuda_device_index = -1;
-        std::chrono::milliseconds transfer_timeout_ms{30000};
+        const int64_t* p2p_timeout_us = nullptr;
     };
 
     struct SendOp {
-        at::Tensor tensor_;
+        const void* buffer_ = nullptr;
+        size_t size_ = 0;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
-        std::shared_ptr<std::atomic<OpStatus>> status_;
+        std::shared_ptr<std::promise<void>> completion_;
+        int32_t* failed_ranks_hint_ = nullptr;
     };
 
     struct RecvOp {
-        at::Tensor tensor_;
-        at::Tensor original_tensor_;
+        void* buffer_ = nullptr;
+        size_t size_ = 0;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
-        std::shared_ptr<std::atomic<OpStatus>> status_;
+        std::shared_ptr<std::promise<void>> completion_;
+        int32_t* failed_ranks_hint_ = nullptr;
     };
 
     P2PProxy(TransferEngine* engine, const Options& options);
@@ -332,19 +335,10 @@ class P2PProxy {
      */
     void abandonResources();
 
-    // Epoch for fault recovery.  All control slots carry this
-    // value so that stale messages from before a Reset can be detected.
-    uint32_t getEpoch(int peer_rank) const {
-        return peer_epoch_[peer_rank].load(std::memory_order_acquire);
-    }
-    void setEpoch(int peer_rank, uint32_t epoch) {
-        peer_epoch_[peer_rank].store(epoch, std::memory_order_release);
-    }
-
    private:
     // Sender-side per-chunk state machine.
     enum class SendTaskState {
-        kCopyIn,  // Copying tensor slice into local SendPool staging buffer.
+        kCopyIn,  // Copying buffer slice into local SendPool staging buffer.
                   // On CPU this is synchronous; on GPU we record a
                   // cudaEvent on the op's stream and poll it.
         kWriteRemote,  // Write from SendPool -> remote RecvPool.
@@ -357,7 +351,7 @@ class P2PProxy {
     enum class RecvTaskState {
         kIssueCredit,  // CreditSlot Write is in flight.
         kWaitAck,      // Waiting for sender's AckSlot.
-        kCopyOut,      // GPU: cudaMemcpyAsync RecvPool -> tensor in flight.
+        kCopyOut,      // GPU: cudaMemcpyAsync RecvPool -> buffer in flight.
         kFinished,     // Copy-out done, chunk returned to pool.
         kFailed,       // Transport error or timeout; chunk returned to pool.
     };
@@ -365,22 +359,21 @@ class P2PProxy {
     struct SendOpContext;
     struct RecvOpContext;
 
-    // One chunk of a SendOp.  The sender copies data from the user tensor
+    // One chunk of a SendOp.  The sender copies data from the user buffer
     // into a SendPool staging buffer and then RDMA-writes it to the remote
     // RecvPool offset that the receiver issued in the CreditSlot.
     struct SendTransferTask {
         SendTransferTask() = default;
-        SendTransferTask(uint64_t tensor_offset_in, uint32_t chunk_len_in,
+        SendTransferTask(uint64_t buffer_offset_in, uint32_t chunk_len_in,
                          void* staging_addr_in, uint64_t remote_addr_in,
-                         uint32_t sequence_in, uint32_t epoch_in);
+                         uint32_t sequence_in);
 
         SendTaskState state_ = SendTaskState::kCopyIn;
-        uint64_t tensor_offset_ = 0;  // Offset inside the user tensor.
+        uint64_t buffer_offset_ = 0;  // Offset inside the user buffer.
         uint32_t chunk_len_ = 0;      // Bytes in this chunk (<= kP2PChunkSize).
         void* staging_addr_ = nullptr;  // Address inside SendPool.
         uint64_t remote_addr_ = 0;      // Address inside REMOTE RecvPool.
         uint32_t sequence_ = 0;         // Sequence number in the control ring.
-        uint32_t epoch_ = 0;            // Epoch for Reset detection.
         std::optional<BatchID> transfer_batch_id_;  // RDMA Write batch id.
         std::optional<BatchID> ack_batch_id_;       // AckSlot write batch id.
         cudaEvent_t copy_ready_event_ = nullptr;  // Signals Copy-In done (GPU).
@@ -395,16 +388,19 @@ class P2PProxy {
         SendOpContext(SendOp&& op_in);
 
         std::deque<SendTransferTask> tasks_;
-        std::shared_ptr<std::atomic<OpStatus>> status_;
+        std::shared_ptr<std::promise<void>> completion_;
 
-        at::Tensor tensor_;
+        const void* buffer_ = nullptr;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         uint64_t total_bytes_ = 0;
-        // Number of bytes already pulled from the user tensor into SendPool
+        // Number of bytes already pulled from the user buffer into SendPool
         // staging buffers.  When bytes_staged_ == total_bytes_ every chunk
         // has at least entered the Copy-In stage.
         uint64_t bytes_staged_ = 0;
+        // Epoch of the first accepted credit, used for all ACKs.
+        std::optional<uint32_t> credit_epoch_;
+        int32_t* failed_ranks_hint_ = nullptr;
 
         std::chrono::steady_clock::time_point last_update_time_;
     };
@@ -412,19 +408,17 @@ class P2PProxy {
     // One chunk of a RecvOp.  The receiver allocates a RecvPool chunk,
     // issues it to the sender via a CreditSlot, waits for the sender
     // to RDMA-write data into it, and finally copies the data into the user
-    // tensor before returning the chunk to RecvPool.
+    // buffer before returning the chunk to RecvPool.
     struct RecvTransferTask {
         RecvTransferTask() = default;
-        RecvTransferTask(uint64_t tensor_offset_in, uint32_t chunk_len_in,
-                         void* local_addr_in, uint32_t sequence_in,
-                         uint32_t epoch_in);
+        RecvTransferTask(uint64_t buffer_offset_in, uint32_t chunk_len_in,
+                         void* local_addr_in, uint32_t sequence_in);
 
         RecvTaskState state_ = RecvTaskState::kIssueCredit;
-        uint64_t tensor_offset_ = 0;  // Offset inside the user tensor.
+        uint64_t buffer_offset_ = 0;  // Offset inside the user buffer.
         uint32_t chunk_len_ = 0;      // Bytes in this chunk.
         void* local_addr_ = nullptr;  // Address inside local RecvPool.
         uint32_t sequence_ = 0;       // Sequence number in the control ring.
-        uint32_t epoch_ = 0;          // Epoch for Reset detection.
         std::optional<BatchID>
             credit_batch_id_;  // CreditSlot RDMA Write batch id.
         cudaEvent_t copy_ready_event_ =
@@ -437,20 +431,22 @@ class P2PProxy {
     // kWaitAck -> kCopyOut -> kFinished).
     struct RecvOpContext {
         RecvOpContext() = default;
-        RecvOpContext(RecvOp&& op_in);
+        RecvOpContext(RecvOp&& op_in, uint32_t credit_epoch);
 
         std::deque<RecvTransferTask> tasks_;
-        std::shared_ptr<std::atomic<OpStatus>> status_;
+        std::shared_ptr<std::promise<void>> completion_;
 
-        at::Tensor tensor_;
-        at::Tensor original_tensor_;
+        void* buffer_ = nullptr;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         uint64_t total_bytes_ = 0;
+        int32_t* failed_ranks_hint_ = nullptr;
         // Number of bytes for which a RecvPool chunk has been reserved and a
         // CreditSlot has been sent to the peer.  When bytes_credited_ ==
-        // total_bytes_ the entire tensor has been offered to the sender.
+        // total_bytes_ the entire buffer has been offered to the sender.
         uint64_t bytes_credited_ = 0;
+        // Epoch captured at enqueue, used for credits and ACK matching.
+        uint32_t credit_epoch_ = 0;
     };
 
     // Per-peer sender state.  The sender consumes CreditSlots that the
@@ -459,8 +455,11 @@ class P2PProxy {
         std::deque<SendOpContext> pending_send_ops_;
         std::optional<SendOpContext> active_send_op_;
         // Sequence number of the next CreditSlot to consume from this peer.
-        // Monotonically increases; wraps around the ring via modulo.
+        // Increases between resets; indexes the ring modulo its size.
         uint64_t credit_consume_seq_ = 0;
+        // Group epoch observed at the last reset; older credits are rejected.
+        // This cannot distinguish credits across resets within the same epoch.
+        uint32_t minimum_credit_epoch_ = 0;
         std::array<cudaEvent_t, kP2PControlRingSize> copy_ready_events_;
     };
 
@@ -468,7 +467,7 @@ class P2PProxy {
     // to the peer to write data, and consumes AckSlots that the peer writes
     // back to acknowledge finished transfers.
     struct RecvPeerLane {
-        std::deque<RecvOp> pending_recv_ops_;
+        std::deque<RecvOpContext> pending_recv_ops_;
         std::optional<RecvOpContext> active_recv_op_;
         // Sequence number of the next CreditSlot to issue to this peer.
         uint64_t credit_issue_seq_ = 0;
@@ -498,15 +497,13 @@ class P2PProxy {
     bool isRecvOpCompleted(const RecvOpContext& op_ctx) const;
     void performRecvReset(int peer_rank);
 
-    bool tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane);
+    IssueResult tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane);
     bool stepSendTask(SendOpContext& op_ctx, SendTransferTask& task);
     bool stepSendCopyIn(SendTransferTask& task);
     bool stepSendWriteRemote(SendOpContext& op_ctx, SendTransferTask& task);
     bool stepSendAck(SendOpContext& op_ctx, SendTransferTask& task);
     bool isSendOpCompleted(const SendOpContext& op_ctx) const;
     void performSendReset(int peer_rank);
-
-    void reportBrokenPeer(int peer_rank);
 
     // These helpers are used only during reset or shutdown.
     // In the normal execution path, task and lane resources are released
@@ -515,7 +512,16 @@ class P2PProxy {
     void releaseRecvTaskResources(RecvTransferTask& task) const;
     void resetSendLane(SendPeerLane& lane);
     void resetRecvLane(RecvPeerLane& lane);
-    void resetPeerControlLanes(int peer_rank);
+    void resetPeerCreditLanes(int peer_rank);
+    void resetPeerAckLanes(int peer_rank);
+    // Clean up the active op on a lane
+    void cleanupFailedSendOp(SendOpContext& op_ctx);
+    void cleanupFailedRecvOp(RecvOpContext& op_ctx);
+    // Request a lane reset and report the link failure to the Agent.
+    void reportPeerFailure(int peer_rank);
+    // Clean up, mark kFailed, and report the failure.
+    void handleFailedSendOp(SendOpContext& op_ctx);
+    void handleFailedRecvOp(RecvOpContext& op_ctx);
 
     // Control lane addressing.
     //
@@ -539,7 +545,7 @@ class P2PProxy {
     template <typename T>
     bool isTimeout(const T& obj) const {
         return std::chrono::steady_clock::now() - obj.last_update_time_ >
-               transfer_timeout_ms_;
+               std::chrono::microseconds(*p2p_timeout_us_);
     }
 
    private:
@@ -559,7 +565,7 @@ class P2PProxy {
     int rank_ = 0;
     int size_ = 0;
     int cuda_device_index_ = -1;
-    std::chrono::milliseconds transfer_timeout_ms_{5000};  // 5s
+    const int64_t* p2p_timeout_us_ = nullptr;
     P2PResources resources_;
     bool resource_abandoned_{false};
 
@@ -571,7 +577,7 @@ class P2PProxy {
     std::queue<SendOpContext> send_queue_;
     std::mutex send_queue_mutex_;
 
-    std::queue<RecvOp> recv_queue_;
+    std::queue<RecvOpContext> recv_queue_;
     std::mutex recv_queue_mutex_;
 
     std::array<std::atomic<bool>, kMaxNumRanks> reset_send_req_;
@@ -580,18 +586,13 @@ class P2PProxy {
     std::atomic<int> active_send_tasks_{0};
     std::atomic<int> active_recv_tasks_{0};
 
-    // Per-peer epoch for fault recovery.  Incremented in resetPeerState
-    // and performSend/RecvReset so that stale messages from a previous epoch
-    // can be detected on a per-peer basis.
-    std::array<std::atomic<uint32_t>, kMaxNumRanks> peer_epoch_;
-
     std::array<SendPeerLane, kMaxNumRanks> send_peer_lanes_;
     std::array<RecvPeerLane, kMaxNumRanks> recv_peer_lanes_;
 };
 
-// P2PDeviceWorker instances are shared across multiple backends within the same
-// process. Therefore, they must not be instantiated directly. Instead, obtain
-// an instance through P2PDeviceWorkerManager.
+// P2PDeviceWorker instances are shared across multiple communicators within the
+// same process. Therefore, they must not be instantiated directly. Instead,
+// obtain an instance through P2PDeviceWorkerManager.
 class P2PDeviceWorker {
    public:
     friend class P2PDeviceWorkerManager;
@@ -636,7 +637,8 @@ class P2PDeviceWorker {
     // Memory footprint (with default env values):
     //   - One direction (send or recv)    : 128 MiB
     //   - Total per device (send + recv)  : 256 MiB
-    // This stays constant no matter how many backends or peer ranks are active.
+    // This stays constant no matter how many communicators or peer ranks are
+    // active.
     TransferEngine* engine_ = nullptr;
     P2PChunkPool send_pool_;
     P2PChunkPool recv_pool_;
@@ -651,11 +653,7 @@ class P2PDeviceWorker {
 
 class P2PDeviceWorkerManager {
    public:
-    static P2PDeviceWorkerManager& getInstance() {
-        // leaky singleton to avoid destructor fiasco problem
-        static P2PDeviceWorkerManager* manager = new P2PDeviceWorkerManager;
-        return *manager;
-    }
+    P2PDeviceWorkerManager() = default;
 
     std::shared_ptr<P2PDeviceWorker> getCPUWorker(TransferEngine* engine);
     std::shared_ptr<P2PDeviceWorker> getCUDAWorker(int cuda_device_index,

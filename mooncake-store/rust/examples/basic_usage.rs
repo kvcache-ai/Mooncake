@@ -45,7 +45,7 @@
 //! cargo run --example basic_usage
 //! ```
 
-use mooncake_store::{MooncakeStore, ReplicateConfig, StoreError};
+use mooncake_store::{MooncakeStore, ReplicateConfig, SoftPinAction, StoreError};
 
 fn main() {
     println!("=== Mooncake Store Rust Bindings — Basic Usage ===\n");
@@ -67,8 +67,8 @@ fn main() {
     // In CI or environments without a running metadata server the setup
     // call is expected to fail – this is not an error in the bindings
     // themselves.
-    let metadata_server =
-        std::env::var("MC_METADATA_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8080/metadata".to_string());
+    let metadata_server = std::env::var("MC_METADATA_SERVER")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080/metadata".to_string());
 
     println!("Connecting to metadata server: {metadata_server}");
 
@@ -78,7 +78,7 @@ fn main() {
         512 << 20, // global_segment_size  = 512 MiB
         128 << 20, // local_buffer_size    = 128 MiB
         "tcp",
-        "",        // device_name (auto-select)
+        "", // device_name (auto-select)
         "127.0.0.1:50051",
     ) {
         eprintln!(
@@ -98,13 +98,16 @@ fn main() {
         eprintln!("[FAIL] put() failed: {e}");
         std::process::exit(1);
     }
-    println!("[OK] put(\"{key}\", {:?})", std::str::from_utf8(value).unwrap());
+    println!(
+        "[OK] put(\"{key}\", {:?})",
+        std::str::from_utf8(value).unwrap()
+    );
 
     // Step 4: Check existence.
     match store.is_exist(key) {
-        Ok(true)  => println!("[OK] is_exist(\"{key}\") = true"),
+        Ok(true) => println!("[OK] is_exist(\"{key}\") = true"),
         Ok(false) => println!("[WARN] is_exist(\"{key}\") = false (unexpected)"),
-        Err(e)    => eprintln!("[FAIL] is_exist() failed: {e}"),
+        Err(e) => eprintln!("[FAIL] is_exist() failed: {e}"),
     }
 
     // Step 5: Get size.
@@ -125,7 +128,8 @@ fn main() {
     // Step 7: Put with explicit replication config.
     let config = ReplicateConfig {
         replica_num: 2,
-        with_soft_pin: true,
+        soft_pin_action: SoftPinAction::Enable,
+        soft_pin_ttl_ms: None,
         with_hard_pin: false,
         preferred_segments: vec!["seg-0".to_string()],
     };
@@ -133,7 +137,9 @@ fn main() {
     if let Err(e) = store.put("replicated-key", b"replicated value", Some(&config)) {
         eprintln!("[FAIL] put() with ReplicateConfig failed: {e}");
     } else {
-        println!("[OK] put(\"replicated-key\") with replica_num=2, soft_pin=true, hard_pin=false");
+        println!(
+            "[OK] put(\"replicated-key\") with replica_num=2, soft_pin=enable, hard_pin=false"
+        );
     }
 
     // Step 8: Remove the keys.

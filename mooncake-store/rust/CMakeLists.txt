@@ -49,3 +49,16 @@ add_custom_command(
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMENT "Building mooncake_store Rust tests"
   VERBATIM)
+
+# Maintainer target: regenerate the committed dlopen bindings from store_c.h
+# (run after the C ABI changes). CI should run this then `git diff --exit-code`.
+add_custom_target(generate_store_rust_dlopen_bindings)
+add_custom_command(
+  TARGET generate_store_rust_dlopen_bindings
+  COMMAND
+    ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
+    MOONCAKE_STORE_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../include cargo run
+    --example generate_dlopen_bindings
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  COMMENT "Regenerating committed mooncake_store Rust dlopen bindings"
+  VERBATIM)

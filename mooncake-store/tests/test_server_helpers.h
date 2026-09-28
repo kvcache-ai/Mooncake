@@ -17,7 +17,7 @@
 #include "rpc_service.h"
 #include "types.h"
 #include <ylt/util/tl/expected.hpp>
-#include "utils.h"
+#include "common/network.h"
 
 namespace mooncake {
 namespace testing {
@@ -92,7 +92,12 @@ class InProcMaster {
                 std::chrono::seconds(0), /*tcp_no_delay=*/true);
             const char* value = std::getenv("MC_RPC_PROTOCOL");
             if (value && std::string_view(value) == "rdma") {
+#ifdef YLT_ENABLE_IBV
                 server_->init_ibv();
+#else
+                LOG(WARNING)
+                    << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
             }
 
             uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
@@ -222,6 +227,7 @@ class InProcMaster {
         return std::string("http://127.0.0.1:") +
                std::to_string(http_metrics_port_);
     }
+    std::shared_ptr<WrappedMasterService> service() const { return wrapped_; }
 
    private:
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;

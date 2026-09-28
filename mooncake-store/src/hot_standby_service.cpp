@@ -2,25 +2,27 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
 #include "etcd_helper.h"
+#ifdef STORE_USE_ETCD
+#include "ha/kv/etcd_ha_kv_backend.h"
+#endif
 #include "ha_metric_manager.h"
 #include "ha/oplog/oplog_applier.h"
-#include "ha/oplog/oplog_manager.h"
-#include "ha/oplog/oplog_replicator.h"
-#include "ha/oplog/oplog_store_factory.h"
+#include "ha/oplog/oplog_batch_standby_reader.h"
+#include "ha/oplog/oplog_test_failpoint.h"
+#include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
 namespace mooncake {
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
     metadata_store_ = std::make_unique<StandbyMetadataStore>();
-    // OpLogApplier will be re-created in Start() with the resolved cluster_id
-    // to enable etcd-based operations (e.g. requesting missing OpLog entries).
-    // Here we construct a minimal instance so that local metadata operations
-    // are available before etcd wiring is completed.
+    // OpLogApplier is re-created in Start() with the resolved cluster_id.
     oplog_applier_ = std::make_unique<OpLogApplier>(metadata_store_.get());
 
     // Register callback for state change logging and metrics.
@@ -45,73 +47,6 @@ HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
 
         NotifySyncStatus();
     });
-}
-
-// StandbyMetadataStore implementation
-bool HotStandbyService::StandbyMetadataStore::PutMetadata(
-    const std::string& key, const StandbyObjectMetadata& metadata) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
-    VLOG(2) << "StandbyMetadataStore: stored metadata for key=" << key
-            << ", replicas=" << metadata.replicas.size()
-            << ", size=" << metadata.size;
-    return true;
-}
-
-bool HotStandbyService::StandbyMetadataStore::Put(const std::string& key,
-                                                  const std::string& payload) {
-    // Legacy interface - create empty metadata
-    StandbyObjectMetadata metadata;
-    std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
-    return true;
-}
-
-std::optional<StandbyObjectMetadata>
-HotStandbyService::StandbyMetadataStore::GetMetadata(
-    const std::string& key) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
-    if (it != store_.end()) {
-        return it->second;
-    }
-    return std::nullopt;
-}
-
-bool HotStandbyService::StandbyMetadataStore::Remove(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
-    if (it != store_.end()) {
-        store_.erase(it);
-        return true;
-    }
-    return false;
-}
-
-bool HotStandbyService::StandbyMetadataStore::Exists(
-    const std::string& key) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return store_.find(key) != store_.end();
-}
-
-size_t HotStandbyService::StandbyMetadataStore::GetKeyCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return store_.size();
-}
-
-void HotStandbyService::StandbyMetadataStore::Clear() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    store_.clear();
-}
-
-void HotStandbyService::StandbyMetadataStore::Snapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    out.clear();
-    out.reserve(store_.size());
-    for (const auto& kv : store_) {
-        out.emplace_back(kv.first, kv.second);
-    }
 }
 
 HotStandbyService::~HotStandbyService() {
@@ -140,6 +75,31 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         return ErrorCode::OK;
     }
 
+    // A failed asynchronous run leaves joinable worker threads behind. Reap
+    // them before constructing the next run's readers and workers.
+    replication_loop_running_.store(false, std::memory_order_release);
+    replication_loop_cv_.notify_all();
+    if (replication_thread_.joinable()) {
+        replication_thread_.join();
+    }
+    if (verification_thread_.joinable()) {
+        verification_thread_.join();
+    }
+    if (!metadata_store_) {
+        metadata_store_ = std::make_unique<StandbyMetadataStore>();
+    }
+    batch_standby_reader_.reset();
+    batch_standby_kv_backend_.reset();
+    batch_snapshot_baseline_.reset();
+    batch_snapshot_producer_view_version_ = 0;
+    {
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_.reset();
+    }
+
+    last_error_.store(ErrorCode::OK, std::memory_order_release);
+    recovering_.store(false, std::memory_order_release);
+
     // Trigger START event
     auto result = state_machine_.ProcessEvent(StandbyEvent::START);
     if (!result.allowed) {
@@ -147,13 +107,17 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         return ErrorCode::INTERNAL_ERROR;  // State machine rejected START
     }
 
+    HAMetricManager::instance().reset_snapshot_runtime(
+        config_.enable_snapshot_bootstrap &&
+        batch_oplog_snapshot_provider_ != nullptr);
     config_.primary_address = primary_address;
     oplog_endpoints_ = oplog_endpoints;
     cluster_id_ = cluster_id;
 
     if (config_.enable_oplog_following) {
-        // Connect to etcd only when using ETCD backend
-        if (config_.oplog_store_type == OpLogStoreType::ETCD) {
+        // Injected test backends exercise the production Start/replication
+        // path without a live etcd cluster (and without STORE_USE_ETCD).
+        if (!catch_up_batch_kv_backend_for_testing_) {
 #ifdef STORE_USE_ETCD
             ErrorCode err =
                 EtcdHelper::ConnectToEtcdStoreClient(oplog_endpoints.c_str());
@@ -163,9 +127,10 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
                 return err;
             }
 #else
+            // Without STORE_USE_ETCD, the following loop needs an injected
+            // test backend.
             state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-            LOG(ERROR) << "ETCD backend requested but STORE_USE_ETCD is not "
-                          "enabled at compile time";
+            LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
             return ErrorCode::INTERNAL_ERROR;
 #endif
         }
@@ -213,6 +178,9 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 
     oplog_applier_ =
         std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id_);
+    if (batch_oplog_snapshot_provider_ && config_.enable_snapshot_bootstrap) {
+        return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id);
+    }
     if (!config_.enable_oplog_following) {
         if (metadata_store_ && metadata_store_->GetKeyCount() > 0) {
             LOG(INFO) << "Snapshot-only restart discards local metadata and "
@@ -286,62 +254,90 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << snapshot.snapshot_id
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
               << ", keys=" << snapshot.metadata.size();
-    for (const auto& kv : snapshot.metadata) {
-        metadata_store_->PutMetadata(kv.first, kv.second);
+    for (const auto& entry : snapshot.metadata) {
+        if (!metadata_store_->RestoreMetadata(entry.tenant_id, entry.key,
+                                              entry.metadata)) {
+            LOG(ERROR) << "Snapshot baseline contains duplicate object: tenant="
+                       << entry.tenant_id << ", key=" << entry.key;
+            metadata_store_->Clear();
+            return ErrorCode::DESERIALIZE_FAIL;
+        }
+    }
+    if (!metadata_store_->RestoreWeightMetadata(snapshot.weight_metadata)) {
+        LOG(ERROR) << "Snapshot baseline contains invalid weight metadata";
+        metadata_store_->Clear();
+        return ErrorCode::DESERIALIZE_FAIL;
+    }
+    // Load segment registry from snapshot
+    if (oplog_applier_) {
+        oplog_applier_->LoadSegmentRegistry(snapshot.segments);
     }
     oplog_applier_->Recover(snapshot.snapshot_sequence_id);
     baseline_seq_id = snapshot.snapshot_sequence_id;
     return ErrorCode::OK;
 }
 
+ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
+    uint64_t& baseline_seq_id) {
+    baseline_seq_id = 0;
+    auto temporary_metadata = std::make_unique<StandbyMetadataStore>();
+    auto temporary_applier =
+        std::make_unique<OpLogApplier>(temporary_metadata.get(), cluster_id_);
+    StandbySegmentRegistry temporary_registry;
+    auto restored = batch_oplog_snapshot_provider_->RestoreBaseline(
+        *temporary_metadata, temporary_registry, temporary_applier.get());
+    if (!restored) {
+        return restored.error();
+    }
+
+    LOG(INFO) << "Batch snapshot bootstrap complete: snapshot_seq="
+              << restored->last_included_seq
+              << " applied_seq=" << restored->last_applied_seq;
+    // The provider has already replayed the suffix in temporary state. The
+    // running reader/applier starts from that proven final sequence.
+    metadata_store_ = std::move(temporary_metadata);
+    oplog_applier_ = std::move(temporary_applier);
+    baseline_seq_id = oplog_applier_->GetExpectedSequenceId() - 1;
+    batch_snapshot_baseline_ =
+        DurablePrefix{.batch_id = restored->last_applied_batch_id,
+                      .last_seq = restored->last_applied_seq};
+    batch_snapshot_producer_view_version_ = restored->producer_view_version;
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.applied_batch = batch_snapshot_baseline_->batch_id;
+    });
+    applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    return ErrorCode::OK;
+}
+
 ErrorCode HotStandbyService::StartOplogFollowingLocked(
     uint64_t baseline_seq_id) {
-    // Create OpLogStore, OpLogChangeNotifier, and OpLogReplicator via factory
-    watcher_oplog_store_ = OpLogStoreFactory::Create(
-        config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
-        config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
-    if (watcher_oplog_store_) {
-        // Wire OpLogStore into OpLogApplier so gap resolution works
-        oplog_applier_->SetOpLogStore(watcher_oplog_store_.get());
-        oplog_change_notifier_ =
-            watcher_oplog_store_->CreateChangeNotifier(cluster_id_);
-    }
-    if (oplog_change_notifier_) {
-        oplog_replicator_ = std::make_unique<OpLogReplicator>(
-            oplog_change_notifier_.get(), oplog_applier_.get());
-        oplog_replicator_->SetStateCallback(
-            [this](StandbyEvent event) { OnWatcherEvent(event); });
+    (void)baseline_seq_id;
+    if (catch_up_batch_kv_backend_for_testing_) {
+        batch_standby_kv_backend_ = catch_up_batch_kv_backend_for_testing_;
     } else {
-        LOG(ERROR) << "Failed to create OpLogChangeNotifier for replicator";
+#ifdef STORE_USE_ETCD
+        batch_standby_kv_backend_ = std::make_shared<EtcdHaKvBackend>();
+#else
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
         return ErrorCode::INTERNAL_ERROR;
+#endif
     }
-
-    static constexpr int kMaxStartRetries = 3;
-    static constexpr int kStartRetryBaseMs = 500;
-    bool watcher_started = false;
-    for (int attempt = 0; attempt < kMaxStartRetries; ++attempt) {
-        if (oplog_replicator_->StartFromSequenceId(baseline_seq_id)) {
-            watcher_started = true;
-            break;
+    batch_standby_reader_ = std::make_unique<OpLogBatchStandbyReader>(
+        cluster_id_, *batch_standby_kv_backend_, *oplog_applier_);
+    if (batch_snapshot_baseline_) {
+        const ErrorCode cursor_error =
+            batch_standby_reader_->SetBaselineCursor(*batch_snapshot_baseline_);
+        if (cursor_error != ErrorCode::OK) {
+            return cursor_error;
         }
-        LOG(WARNING) << "Failed to start OpLogReplicator from sequence_id="
-                     << baseline_seq_id << " (attempt " << (attempt + 1) << "/"
-                     << kMaxStartRetries << ")";
-        if (attempt + 1 < kMaxStartRetries) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kStartRetryBaseMs * (1 << attempt)));
-        }
-    }
-
-    if (!watcher_started) {
-        LOG(ERROR) << "Failed to start OpLogReplicator after "
-                   << kMaxStartRetries << " attempts, aborting Start()";
-        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-        return ErrorCode::INTERNAL_ERROR;
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_ = *batch_snapshot_baseline_;
     }
 
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
+    replication_loop_running_.store(true, std::memory_order_release);
     replication_thread_ =
         std::thread(&HotStandbyService::ReplicationLoop, this);
     if (config_.enable_verification) {
@@ -382,8 +378,18 @@ void HotStandbyService::NotifySyncStatus() {
     }
 }
 
-void HotStandbyService::OnWatcherEvent(StandbyEvent event) {
-    state_machine_.ProcessEvent(event);
+void HotStandbyService::SetCatchUpBatchKvBackendForTesting(
+    std::shared_ptr<HaKvBackend> backend) {
+    catch_up_batch_kv_backend_for_testing_ = std::move(backend);
+}
+
+void HotStandbyService::StopReplicationLoop() {
+    CancelSnapshotCapture();
+    replication_loop_running_.store(false, std::memory_order_release);
+    replication_loop_cv_.notify_all();
+    if (replication_thread_.joinable()) {
+        replication_thread_.join();
+    }
 }
 
 void HotStandbyService::Stop() {
@@ -395,18 +401,13 @@ void HotStandbyService::Stop() {
         return;
     }
 
-    state_machine_.ProcessEvent(StandbyEvent::STOP);
-
-    // Stop OpLogReplicator
-    if (oplog_replicator_) {
-        oplog_replicator_->Stop();
-        oplog_replicator_.reset();
+    if (current_state != StandbyState::PROMOTED) {
+        NotifySnapshotStop();
     }
+    state_machine_.ProcessEvent(StandbyEvent::STOP);
+    StopReplicationLoop();
 
     // Wait for threads to finish
-    if (replication_thread_.joinable()) {
-        replication_thread_.join();
-    }
     if (verification_thread_.joinable()) {
         verification_thread_.join();
     }
@@ -415,19 +416,62 @@ void HotStandbyService::Stop() {
               << StandbyStateToString(GetState());
 }
 
+std::optional<DurablePrefix>
+HotStandbyService::GetLastAppliedBatchOpLogSnapshotPrefix() const {
+    std::lock_guard<std::mutex> lock(batch_snapshot_cursor_mutex_);
+    return last_applied_batch_snapshot_prefix_;
+}
+
+void HotStandbyService::CancelBatchOpLogSnapshotCapture() {
+    CancelSnapshotCapture();
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotCaptureReleasedCallback(
+    SnapshotLifecycleCallback callback) {
+    std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+    snapshot_capture_released_callback_ = std::move(callback);
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotPromotionCallback(
+    SnapshotLifecycleCallback callback) {
+    std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+    snapshot_promotion_callback_ = std::move(callback);
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotStopCallback(
+    SnapshotLifecycleCallback callback) {
+    std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+    snapshot_stop_callback_ = std::move(callback);
+}
+
+void HotStandbyService::NotifySnapshotPromotion() {
+    SnapshotLifecycleCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+        callback = snapshot_promotion_callback_;
+    }
+    if (callback) {
+        callback();
+    }
+}
+
+void HotStandbyService::NotifySnapshotStop() {
+    SnapshotLifecycleCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+        callback = snapshot_stop_callback_;
+    }
+    if (callback) {
+        callback();
+    }
+}
+
 StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     StandbySyncStatus status;
 
-    // Get applied sequence ID from OpLogApplier
-    if (oplog_applier_) {
-        uint64_t expected = oplog_applier_->GetExpectedSequenceId();
-        status.applied_seq_id = (expected > 0) ? (expected - 1) : 0;
-        if (status.applied_seq_id == 0) {
-            status.applied_seq_id = applied_seq_id_.load();  // Fallback
-        }
-    } else {
-        status.applied_seq_id = applied_seq_id_.load();
-    }
+    // Callbacks can query status while mutex_ is held or state is swapped.
+    status.applied_seq_id = applied_seq_id_.load();
+    status.is_recovering = recovering_.load(std::memory_order_acquire);
 
     // Primary sequence ID (best-effort): updated by ReplicationLoop via etcd
     // `/latest`.
@@ -436,6 +480,7 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     // Use state machine for connection status
     status.is_connected = IsConnected();
     status.state = GetState();
+    status.last_error = last_error_.load(std::memory_order_acquire);
     status.time_in_state = state_machine_.GetTimeInCurrentState();
 
     if (status.primary_seq_id > status.applied_seq_id) {
@@ -453,6 +498,9 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
 }
 
 bool HotStandbyService::IsReadyForPromotion() const {
+    if (recovering_.load(std::memory_order_acquire)) {
+        return false;
+    }
     // Use state machine to check if ready for promotion
     if (!state_machine_.IsReadyForPromotion()) {
         return false;
@@ -471,102 +519,114 @@ bool HotStandbyService::IsReadyForPromotion() const {
             << "will be synced after promotion.";
     }
 
+    // NOTE: unresolved-gap check is deferred to PreparePromotionLocked, which
+    // runs gap resolution + final catch-up first and only rejects promotion
+    // when gaps remain after both attempts. Checking here would return a
+    // misleading UNAVAILABLE_IN_CURRENT_STATUS before gap resolution runs.
     return true;
 }
 
-void HotStandbyService::ResolvePromotionGapsLocked() {
-    if (!config_.enable_oplog_following || !oplog_applier_) {
-        return;
-    }
-
-    static constexpr int kMaxGapResolveRetries = 3;
-    for (int retry = 0; retry < kMaxGapResolveRetries; ++retry) {
-        auto res = oplog_applier_->TryResolveGapsOnceForPromotion(
-            /*max_ids=*/1024);
-        if (res.attempted == 0) {
-            return;
-        }
-
-        LOG(INFO) << "Promotion gap resolve (attempt " << (retry + 1) << "/"
-                  << kMaxGapResolveRetries << "): attempted=" << res.attempted
-                  << ", fetched=" << res.fetched
-                  << ", applied_deletes=" << res.applied_deletes;
-        if (res.fetched == res.attempted) {
-            return;
-        }
-        if (retry + 1 < kMaxGapResolveRetries) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-}
-
 ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
-    uint64_t current_applied_seq_id) {
+    uint64_t current_applied_seq_id, PromotionCatchUpPolicy policy) {
+    (void)current_applied_seq_id;
     if (!config_.enable_oplog_following) {
         LOG(INFO) << "Promotion does not require final OpLog catch-up";
         return ErrorCode::OK;
     }
-
-    LOG(INFO) << "Final catch-up sync before promotion...";
-    auto catch_up_store = OpLogStoreFactory::Create(
-        config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
-        config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
-    if (!catch_up_store) {
-        LOG(ERROR) << "Failed to create oplog_store for final catch-up";
+    if (!oplog_applier_) {
+        LOG(ERROR) << "Final catch-up requires OpLogApplier";
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    static constexpr size_t kBatchSize = 1000;
-    static constexpr size_t kMaxCatchUpBatches = 100;
-    static constexpr auto kMaxCatchUpDuration = std::chrono::seconds(30);
-
-    uint64_t read_from_seq = current_applied_seq_id;
-    auto catch_up_start = std::chrono::steady_clock::now();
-    size_t total_applied = 0;
-    size_t batch_count = 0;
-
-    for (;;) {
-        auto elapsed = std::chrono::steady_clock::now() - catch_up_start;
-        if (elapsed > kMaxCatchUpDuration) {
-            LOG(WARNING) << "Final catch-up: timeout after "
-                         << std::chrono::duration_cast<std::chrono::seconds>(
-                                elapsed)
-                                .count()
-                         << "s. Proceeding with promotion. total_applied="
-                         << total_applied;
-            break;
-        }
-
-        if (batch_count >= kMaxCatchUpBatches) {
-            LOG(WARNING) << "Final catch-up: reached max batch limit ("
-                         << kMaxCatchUpBatches
-                         << "). Proceeding with promotion. total_applied="
-                         << total_applied;
-            break;
-        }
-
-        std::vector<OpLogEntry> batch;
-        ErrorCode read_err =
-            catch_up_store->ReadOpLogSince(read_from_seq, kBatchSize, batch);
-        if (read_err != ErrorCode::OK) {
-            LOG(WARNING) << "Final catch-up: failed to read OpLog since seq="
-                         << read_from_seq
-                         << ", err=" << static_cast<int>(read_err)
-                         << ". Proceeding with promotion.";
-            break;
-        }
-        if (batch.empty()) {
-            break;
-        }
-
-        total_applied += oplog_applier_->ApplyOpLogEntries(batch);
-        read_from_seq = batch.back().sequence_id;
-        ++batch_count;
+    if (catch_up_batch_kv_backend_for_testing_) {
+        return FinalCatchUpBatchRecordsLocked(
+            *catch_up_batch_kv_backend_for_testing_, policy);
     }
 
-    LOG(INFO) << "Final catch-up sync done. total_applied=" << total_applied
-              << ", batches=" << batch_count;
-    return ErrorCode::OK;
+#ifdef STORE_USE_ETCD
+    EtcdHaKvBackend batch_backend;
+    return FinalCatchUpBatchRecordsLocked(batch_backend, policy);
+#else
+    LOG(ERROR) << "Final OpLog catch-up requires STORE_USE_ETCD";
+    return ErrorCode::INTERNAL_ERROR;
+#endif
+}
+
+ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
+    HaKvBackend& backend, PromotionCatchUpPolicy policy) {
+    std::unique_ptr<OpLogBatchStandbyReader> local_reader;
+    OpLogBatchStandbyReader* reader = batch_standby_reader_.get();
+    if (reader == nullptr) {
+        local_reader = std::make_unique<OpLogBatchStandbyReader>(
+            cluster_id_, backend, *oplog_applier_);
+        reader = local_reader.get();
+    }
+    const auto initial_retry_delay =
+        std::chrono::milliseconds(std::max(config_.oplog_poll_interval_ms, 1));
+    const auto max_retry_delay =
+        std::max(initial_retry_delay, std::chrono::milliseconds(1000));
+    const auto no_progress_timeout =
+        std::chrono::seconds(config_.batch_oplog_retry_timeout_sec);
+    const auto legacy_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto last_progress = std::chrono::steady_clock::now();
+    auto retry_delay = initial_retry_delay;
+    auto wait_to_retry = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        const auto deadline =
+            policy == PromotionCatchUpPolicy::kLegacyTotalDeadline
+                ? legacy_deadline
+                : last_progress + no_progress_timeout;
+        if (now >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::min(
+            retry_delay, std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - now)));
+        retry_delay = std::min(retry_delay * 2, max_retry_delay);
+        return true;
+    };
+    for (;;) {
+        if (policy == PromotionCatchUpPolicy::kLegacyTotalDeadline &&
+            std::chrono::steady_clock::now() >= legacy_deadline) {
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
+        const uint64_t expected_before =
+            oplog_applier_->GetExpectedSequenceId();
+        const auto cursor_before = reader->GetLastAppliedDurablePrefix();
+        auto result = reader->PollOnce();
+        const uint64_t expected_after = oplog_applier_->GetExpectedSequenceId();
+        const auto cursor_after = reader->GetLastAppliedDurablePrefix();
+        const bool made_progress =
+            expected_after > expected_before || cursor_after != cursor_before;
+        if (made_progress) {
+            last_progress = std::chrono::steady_clock::now();
+            retry_delay = initial_retry_delay;
+        } else if (policy == PromotionCatchUpPolicy::kLegacyTotalDeadline &&
+                   result.error == ErrorCode::OK) {
+            retry_delay = initial_retry_delay;
+        }
+        if (result.error != ErrorCode::OK) {
+            if (result.disposition !=
+                    OpLogBatchStandbyPollDisposition::RETRYABLE ||
+                !wait_to_retry()) {
+                return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            }
+            continue;
+        }
+        if (!result.durable_prefix_present) {
+            return GetLocalLastAppliedSequenceIdLocked() == 0
+                       ? ErrorCode::OK
+                       : ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
+        if (GetLocalLastAppliedSequenceIdLocked() >=
+            result.durable_prefix.last_seq) {
+            return ErrorCode::OK;
+        }
+        if (!made_progress && !wait_to_retry()) {
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
+    }
 }
 
 ErrorCode HotStandbyService::Promote() {
@@ -590,29 +650,17 @@ ErrorCode HotStandbyService::Promote() {
 
     LOG(INFO) << "Promoting Standby to Primary. Applied seq_id: "
               << current_applied_seq_id << ", lag: " << status.lag_entries
-              << " entries" << ", state: " << StandbyStateToString(GetState());
+              << " entries"
+              << ", state: " << StandbyStateToString(GetState());
 
-    if (oplog_replicator_) {
-        oplog_replicator_->Stop();
+    auto internal_err = PreparePromotionLocked(
+        current_applied_seq_id, PromotionCatchUpPolicy::kLegacyTotalDeadline);
+    if (internal_err != ErrorCode::OK) {
+        return internal_err;
     }
-
-    ResolvePromotionGapsLocked();
-
-    auto catch_up_err = FinalCatchUpForPromotionLocked(current_applied_seq_id);
-    if (catch_up_err != ErrorCode::OK) {
-        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
-        return catch_up_err;
-    }
-
-    uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
-    applied_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
-    primary_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
-
-    auto promotion_success =
-        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_SUCCESS);
-    if (!promotion_success.allowed) {
-        LOG(ERROR) << "Cannot finish promotion: " << promotion_success.reason;
-        return ErrorCode::INTERNAL_ERROR;
+    internal_err = CompletePromotionLocked();
+    if (internal_err != ErrorCode::OK) {
+        return internal_err;
     }
 
     lock.unlock();
@@ -625,6 +673,181 @@ ErrorCode HotStandbyService::Promote() {
         LOG(INFO) << "Standby promoted to Primary from snapshot baseline.";
     }
     return ErrorCode::OK;
+}
+
+ErrorCode HotStandbyService::PreparePromotionLocked(
+    uint64_t current_applied_seq_id, PromotionCatchUpPolicy policy) {
+    NotifySnapshotPromotion();
+    StopReplicationLoop();
+    if (recovering_.load(std::memory_order_acquire)) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+    ErrorCode catch_up_err =
+        FinalCatchUpForPromotionLocked(current_applied_seq_id, policy);
+    if (catch_up_err != ErrorCode::OK) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return catch_up_err;
+    }
+    TestFailPoint::Wait("promotion_final_catch_up_before_complete");
+    uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
+    applied_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
+    primary_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
+
+    return ErrorCode::OK;
+}
+
+ErrorCode HotStandbyService::CompletePromotionLocked() {
+    auto promotion_success =
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_SUCCESS);
+    if (!promotion_success.allowed) {
+        LOG(ERROR) << "Cannot finish promotion: " << promotion_success.reason;
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    if (!IsReadyForPromotion()) {
+        LOG(ERROR) << "Standby is not ready for promotion, state="
+                   << StandbyStateToString(GetState());
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    // Trigger PROMOTE event
+    auto result = state_machine_.ProcessEvent(StandbyEvent::PROMOTE);
+    if (!result.allowed) {
+        LOG(ERROR) << "Cannot promote: " << result.reason;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    StandbySyncStatus status = GetSyncStatus();
+    uint64_t current_applied_seq_id = status.applied_seq_id;
+
+    LOG(INFO) << "Promoting Standby to Primary. Applied seq_id: "
+              << current_applied_seq_id << ", lag: " << status.lag_entries
+              << " entries"
+              << ", state: " << StandbyStateToString(GetState());
+
+    auto internal_err = PreparePromotionLocked(
+        current_applied_seq_id, PromotionCatchUpPolicy::kLegacyTotalDeadline);
+    if (internal_err != ErrorCode::OK) {
+        return internal_err;
+    }
+    internal_err = CompletePromotionLocked();
+    if (internal_err != ErrorCode::OK) {
+        return internal_err;
+    }
+
+    // Export snapshot BEFORE unlocking mutex (atomic promotion + export)
+    uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
+    out.oplog_sequence_id = latest_applied_seq_id;
+    if (metadata_store_) {
+        metadata_store_->Snapshot(out.objects);
+        out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+    } else {
+        out.objects.clear();
+        out.weight_metadata = WeightMetadataSnapshot{};
+    }
+    if (oplog_applier_) {
+        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    } else {
+        out.segments.clear();
+    }
+
+    lock.unlock();
+    Stop();
+
+    if (config_.enable_oplog_following) {
+        LOG(INFO) << "Standby promoted to Primary successfully. "
+                  << "All remaining OpLog entries have been synced.";
+    } else {
+        LOG(INFO) << "Standby promoted to Primary from snapshot baseline.";
+    }
+    return ErrorCode::OK;
+}
+
+bool HotStandbyService::IsBatchOpLogSnapshotMode() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return config_.enable_oplog_following &&
+           batch_oplog_snapshot_provider_ != nullptr &&
+           batch_standby_reader_ != nullptr;
+}
+
+tl::expected<BatchOpLogPromotionHandoff, ErrorCode>
+HotStandbyService::PromoteAndDetachBatchOpLogStore() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!batch_oplog_snapshot_provider_ || !config_.enable_oplog_following ||
+        !batch_standby_reader_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (!IsReadyForPromotion()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    auto transition = state_machine_.ProcessEvent(StandbyEvent::PROMOTE);
+    if (!transition.allowed) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    const uint64_t current_applied_seq_id = GetSyncStatus().applied_seq_id;
+    ErrorCode err = PreparePromotionLocked(
+        current_applied_seq_id, PromotionCatchUpPolicy::kBoundedNoProgress);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    const uint64_t latest_applied_seq_id =
+        GetLocalLastAppliedSequenceIdLocked();
+    auto applied_cursor =
+        batch_standby_reader_
+            ? batch_standby_reader_->GetLastAppliedDurablePrefix()
+            : std::nullopt;
+    if (!applied_cursor && latest_applied_seq_id == 0 && metadata_store_ &&
+        metadata_store_->GetKeyCount() == 0) {
+        applied_cursor = DurablePrefix{};
+    }
+    if (!metadata_store_ || !applied_cursor ||
+        applied_cursor->last_seq != latest_applied_seq_id) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
+    }
+
+    ReplicaID max_replica_id = 0;
+    if (!metadata_store_->ValidateReplicaIds(max_replica_id)) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ViewVersionId producer_view_version = batch_snapshot_producer_view_version_;
+    ViewVersionId current_producer_view = 0;
+    if (batch_standby_reader_->ReadProducerView(current_producer_view) ==
+        ErrorCode::OK) {
+        producer_view_version = current_producer_view;
+    }
+
+    auto segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    err = CompletePromotionLocked();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    BatchOpLogPromotionHandoff handoff{
+        .metadata_store = std::move(metadata_store_),
+        .segments = std::move(segments),
+        .applied_cursor = *applied_cursor,
+        .producer_view_version = producer_view_version,
+        .max_replica_id = max_replica_id,
+    };
+    batch_standby_reader_.reset();
+    oplog_applier_.reset();
+
+    lock.unlock();
+    Stop();
+    return handoff;
 }
 
 size_t HotStandbyService::GetMetadataCount() const {
@@ -644,7 +867,7 @@ uint64_t HotStandbyService::GetLatestAppliedSequenceId() const {
 }
 
 bool HotStandbyService::ExportMetadataSnapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
+    std::vector<StandbyObjectEntry>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!metadata_store_) {
         out.clear();
@@ -652,6 +875,154 @@ bool HotStandbyService::ExportMetadataSnapshot(
     }
     metadata_store_->Snapshot(out);
     return true;
+}
+
+bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!IsRunning()) {
+        return false;
+    }
+
+    // Get applied sequence ID (inline to avoid recursive mutex lock)
+    if (oplog_applier_) {
+        uint64_t expected_seq = oplog_applier_->GetExpectedSequenceId();
+        out.oplog_sequence_id = expected_seq > 0 ? expected_seq - 1 : 0;
+    } else {
+        out.oplog_sequence_id = applied_seq_id_.load();
+    }
+
+    // Export object metadata
+    if (metadata_store_) {
+        metadata_store_->Snapshot(out.objects);
+        out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+    } else {
+        out.objects.clear();
+        out.weight_metadata = WeightMetadataSnapshot{};
+    }
+
+    // Export segments from OpLogApplier's registry (Patch B)
+    if (oplog_applier_) {
+        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    } else {
+        out.segments.clear();
+    }
+
+    return true;
+}
+
+std::optional<BatchOpLogSnapshotCapture>
+HotStandbyService::BeginBatchOpLogSnapshotCapture() {
+    std::unique_lock<std::mutex> service_lock(mutex_);
+    auto state = snapshot_capture_state_;
+    std::unique_lock<std::mutex> capture_lock(state->mutex);
+    if (!IsRunning() || recovering_.load(std::memory_order_acquire) ||
+        !batch_standby_reader_ || state->requested || state->active) {
+        return std::nullopt;
+    }
+
+    ++state->generation;
+    state->requested = true;
+    service_lock.unlock();
+    replication_loop_cv_.notify_all();
+    state->cv.wait(capture_lock, [&state] { return !state->requested; });
+    if (!ready_snapshot_capture_ || !state->active) {
+        return std::nullopt;
+    }
+
+    auto capture = std::move(*ready_snapshot_capture_);
+    ready_snapshot_capture_.reset();
+    return capture;
+}
+
+bool HotStandbyService::CopyNextBatchOpLogSnapshotChunk(
+    size_t count, BatchOpLogSnapshotCapture& capture,
+    std::vector<StandbyObjectEntry>& out) {
+    auto state = snapshot_capture_state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (capture.lease_state_ != state || !state->active ||
+        capture.generation_ != state->generation || !metadata_store_) {
+        out.clear();
+        return false;
+    }
+    return metadata_store_->CopyNextSnapshotChunk(count, capture.cursor_, out);
+}
+
+void HotStandbyService::EndBatchOpLogSnapshotCapture(
+    BatchOpLogSnapshotCapture& capture) {
+    if (capture.lease_state_ == snapshot_capture_state_) {
+        capture.Release();
+        SnapshotLifecycleCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(
+                snapshot_lifecycle_callback_mutex_);
+            callback = snapshot_capture_released_callback_;
+        }
+        if (callback) {
+            callback();
+        }
+    }
+}
+
+void HotStandbyService::HandleSnapshotCaptureRequest(
+    const OpLogBatchStandbyPollResult& result) {
+    auto state = snapshot_capture_state_;
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->requested) {
+        return;
+    }
+
+    const auto pause_start = std::chrono::steady_clock::now();
+    state->requested = false;
+    auto applied_prefix = batch_standby_reader_->GetLastAppliedDurablePrefix();
+    ViewVersionId producer_view_version = 0;
+    const ErrorCode producer_view_error =
+        batch_standby_reader_->ReadProducerView(producer_view_version);
+    const uint64_t expected = oplog_applier_->GetExpectedSequenceId();
+    const bool consistent =
+        result.error == ErrorCode::OK && result.durable_prefix_present &&
+        (producer_view_error == ErrorCode::OK ||
+         producer_view_error == ErrorCode::ETCD_KEY_NOT_EXIST) &&
+        applied_prefix && *applied_prefix == result.durable_prefix &&
+        expected > 0 && expected - 1 == applied_prefix->last_seq;
+    if (consistent && IsRunning() && metadata_store_) {
+        BatchOpLogSnapshotCapture capture(
+            applied_prefix->last_seq, applied_prefix->batch_id,
+            producer_view_version,
+            oplog_applier_->GetSegmentRegistry().GetAllSegments(),
+            metadata_store_->BeginSnapshotTraversal(), state->generation,
+            state);
+        capture.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        ready_snapshot_capture_ = std::move(capture);
+        state->active = true;
+    }
+    state->cv.notify_all();
+
+    state->cv.wait(lock, [this, &state] {
+        return !state->active ||
+               !replication_loop_running_.load(std::memory_order_acquire);
+    });
+    if (consistent) {
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            metrics.capture_pause_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - pause_start)
+                    .count();
+        });
+    }
+}
+
+void HotStandbyService::CancelSnapshotCapture() {
+    auto state = snapshot_capture_state_;
+    std::optional<BatchOpLogSnapshotCapture> ready_capture;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->requested = false;
+        state->active = false;
+        ready_capture = std::move(ready_snapshot_capture_);
+        ready_snapshot_capture_.reset();
+        state->cv.notify_all();
+    }
+    ready_capture.reset();
 }
 
 void HotStandbyService::SetSnapshotProvider(
@@ -664,32 +1035,251 @@ void HotStandbyService::SetSnapshotProvider(
     }
 }
 
+void HotStandbyService::SetBatchOpLogSnapshotProvider(
+    std::unique_ptr<BatchOpLogSnapshotProvider> provider) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    batch_oplog_snapshot_provider_ = std::move(provider);
+}
+
+ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
+    HAMetricManager::SnapshotOperationTimer metric_timer(
+        HAMetricManager::SnapshotOperation::Rebootstrap);
+    recovering_.store(true, std::memory_order_release);
+    CancelSnapshotCapture();
+    {
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_.reset();
+    }
+    NotifySyncStatus();
+
+    // Stop/promotion can hold mutex_ while joining this worker. Never block
+    // on that mutex once the worker has been asked to stop.
+    auto lock_while_running = [this](std::unique_lock<std::mutex>& lock) {
+        while (replication_loop_running_.load(std::memory_order_acquire)) {
+            if (lock.try_lock()) {
+                return replication_loop_running_.load(
+                    std::memory_order_acquire);
+            }
+            std::unique_lock<std::mutex> wait_lock(replication_loop_mutex_);
+            replication_loop_cv_.wait_for(
+                wait_lock, std::chrono::milliseconds(1),
+                [this] { return !replication_loop_running_.load(); });
+        }
+        return false;
+    };
+    std::shared_ptr<BatchOpLogSnapshotProvider> provider;
+    {
+        std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+        if (!lock_while_running(lock)) return ErrorCode::ETCD_CTX_CANCELLED;
+        provider = batch_oplog_snapshot_provider_;
+    }
+    if (!provider) return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+
+    auto metadata = std::make_unique<StandbyMetadataStore>();
+    auto applier = std::make_unique<OpLogApplier>(metadata.get(), cluster_id_);
+    StandbySegmentRegistry registry;
+    auto restored = provider->RestoreBaseline(
+        *metadata, registry, applier.get(), floor, [this] {
+            return !replication_loop_running_.load(std::memory_order_acquire);
+        });
+    if (!restored) return restored.error();
+    auto reader = std::make_unique<OpLogBatchStandbyReader>(
+        cluster_id_, *batch_standby_kv_backend_, *applier);
+    const DurablePrefix baseline{.batch_id = restored->last_applied_batch_id,
+                                 .last_seq = restored->last_applied_seq};
+    auto err = reader->SetBaselineCursor(baseline);
+    if (err != ErrorCode::OK) return err;
+    // Recheck the floor and durable suffix after restoring the candidate.
+    OpLogBatchStandbyPollResult poll;
+    do {
+        if (!replication_loop_running_.load(std::memory_order_acquire)) {
+            return ErrorCode::ETCD_CTX_CANCELLED;
+        }
+        poll = reader->PollOnce();
+        if (poll.error != ErrorCode::OK) return poll.error;
+    } while (poll.durable_prefix_present &&
+             applier->GetExpectedSequenceId() - 1 <
+                 poll.durable_prefix.last_seq);
+    auto cursor = reader->GetLastAppliedDurablePrefix();
+    if (!poll.durable_prefix_present || !cursor ||
+        *cursor != poll.durable_prefix ||
+        cursor->last_seq < applied_seq_id_.load()) {
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+    TestFailPoint::Wait("standby_rebootstrap_before_swap");
+    uint64_t current_floor = 0;
+    OpLogBatchStorage storage(cluster_id_, *batch_standby_kv_backend_);
+    err = storage.ReadCompactionFloor(current_floor);
+    if (err != ErrorCode::OK && err != ErrorCode::ETCD_KEY_NOT_EXIST)
+        return err;
+    if (err == ErrorCode::OK) {
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            metrics.compaction_floor =
+                std::max(metrics.compaction_floor, current_floor);
+        });
+    }
+    if (err == ErrorCode::OK &&
+        restored->last_included_batch_id < current_floor) {
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+    std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+    if (!lock_while_running(lock) || !IsRunning()) {
+        return ErrorCode::ETCD_CTX_CANCELLED;
+    }
+    // Swapping preserves old state until all replacement references exist.
+    // Locals destroy the old reader before its applier and metadata store.
+    metadata_store_.swap(metadata);
+    oplog_applier_.swap(applier);
+    batch_standby_reader_.swap(reader);
+    batch_snapshot_baseline_ = *cursor;
+    batch_snapshot_producer_view_version_ = restored->producer_view_version;
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.applied_batch = batch_snapshot_baseline_->batch_id;
+    });
+    {
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_ = *cursor;
+    }
+    applied_seq_id_.store(cursor->last_seq);
+    primary_seq_id_.store(cursor->last_seq);
+    last_error_.store(ErrorCode::OK);
+    recovering_.store(false, std::memory_order_release);
+    return metric_timer.Success(ErrorCode::OK);
+}
+
 void HotStandbyService::ReplicationLoop() {
     LOG(INFO) << "Replication loop started (OpLog sync)";
 
-    // OpLogReplicator handles the actual watching in its own thread.
-    // This loop monitors the status and updates metrics.
-
-    // Create OpLogStore once before the loop to query primary sequence_id.
-    // Reuse watcher_oplog_store_ if available, otherwise create a new one.
-    std::shared_ptr<OpLogStore> repl_oplog_store = watcher_oplog_store_;
-    if (!repl_oplog_store && !cluster_id_.empty()) {
-        repl_oplog_store = OpLogStoreFactory::Create(
-            config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
-            config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
-        if (!repl_oplog_store) {
-            LOG(ERROR) << "Failed to create oplog_store in replication loop";
-        }
-    }
-
     uint64_t last_reported_applied_seq_id = applied_seq_id_.load();
     uint64_t last_reported_primary_seq_id = primary_seq_id_.load();
+    const auto retry_base =
+        std::chrono::milliseconds(std::max(config_.oplog_poll_interval_ms, 1));
+    const auto retry_limit =
+        std::chrono::seconds(config_.batch_oplog_retry_timeout_sec);
+    const auto max_retry_delay =
+        std::max(retry_base, std::chrono::milliseconds(5000));
+    auto retry_delay = retry_base;
+    std::optional<std::chrono::steady_clock::time_point> retry_started;
+    uint64_t recovery_floor = 0;
 
-    while (IsRunning()) {
+    auto wait_for_next_poll = [this](std::chrono::milliseconds delay) {
+        std::unique_lock<std::mutex> lock(replication_loop_mutex_);
+        replication_loop_cv_.wait_for(lock, delay, [this] {
+            return !replication_loop_running_.load(std::memory_order_acquire);
+        });
+    };
+
+    while (replication_loop_running_.load(std::memory_order_acquire) &&
+           IsRunning()) {
         if (!IsConnected()) {
-            // Not connected - wait a bit before checking again
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            wait_for_next_poll(std::chrono::seconds(1));
             continue;
+        }
+
+        if (recovering_.load(std::memory_order_acquire)) {
+            const auto error = RebootstrapBatchOpLog(recovery_floor);
+            last_error_.store(error, std::memory_order_release);
+            NotifySyncStatus();
+            if (error != ErrorCode::OK) {
+                wait_for_next_poll(retry_delay);
+                retry_delay = std::min(retry_delay * 2, max_retry_delay);
+            } else {
+                retry_started.reset();
+                retry_delay = retry_base;
+            }
+            continue;
+        }
+
+        if (batch_standby_reader_) {
+            const uint64_t expected_before =
+                oplog_applier_->GetExpectedSequenceId();
+            auto result = batch_standby_reader_->PollOnce();
+            if (result.durable_prefix_present ||
+                result.disposition ==
+                    OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
+                const auto applied =
+                    batch_standby_reader_->GetLastAppliedDurablePrefix();
+                HAMetricManager::instance().update_snapshot_runtime(
+                    [&](auto& metrics) {
+                        metrics.applied_batch = applied ? applied->batch_id : 0;
+                        if (result.durable_prefix_present)
+                            metrics.durable_batch =
+                                std::max(metrics.durable_batch,
+                                         result.durable_prefix.batch_id);
+                        metrics.compaction_floor = std::max(
+                            metrics.compaction_floor, result.compaction_floor);
+                        if (applied &&
+                            applied->batch_id >=
+                                metrics.catch_up_target_batch &&
+                            !IsSequenceOlder(
+                                applied->last_seq,
+                                metrics.catch_up_target_sequence)) {
+                            metrics.catch_up_target_batch = 0;
+                            metrics.catch_up_target_sequence = 0;
+                        }
+                    });
+            }
+            {
+                std::lock_guard<std::mutex> cursor_lock(
+                    batch_snapshot_cursor_mutex_);
+                last_applied_batch_snapshot_prefix_ =
+                    batch_standby_reader_->GetLastAppliedDurablePrefix();
+            }
+            HandleSnapshotCaptureRequest(result);
+            if (result.durable_prefix_present) {
+                const uint64_t current_primary = primary_seq_id_.load();
+                if (result.durable_prefix.last_seq > current_primary) {
+                    primary_seq_id_.store(result.durable_prefix.last_seq);
+                }
+            }
+
+            const uint64_t expected_after =
+                oplog_applier_->GetExpectedSequenceId();
+            if (expected_after > 0) {
+                applied_seq_id_.store(expected_after - 1);
+            }
+            if (result.error != ErrorCode::OK) {
+                last_error_.store(result.error, std::memory_order_release);
+                const bool made_progress = expected_after > expected_before;
+                if (result.disposition ==
+                    OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
+                    recovery_floor = result.compaction_floor;
+                    recovering_.store(true, std::memory_order_release);
+                    continue;
+                }
+                if (result.disposition ==
+                    OpLogBatchStandbyPollDisposition::RETRYABLE) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!retry_started || made_progress) {
+                        retry_started = now;
+                        retry_delay = retry_base;
+                    }
+                    if (now - *retry_started < retry_limit) {
+                        LOG(WARNING)
+                            << "Transient batch-record standby poll failure, "
+                            << "retrying in " << retry_delay.count()
+                            << " ms, err=" << static_cast<int>(result.error);
+                        NotifySyncStatus();
+                        wait_for_next_poll(retry_delay);
+                        retry_delay =
+                            std::min(retry_delay * 2, max_retry_delay);
+                        continue;
+                    }
+                    LOG(ERROR)
+                        << "Batch-record standby retry timeout after "
+                        << config_.batch_oplog_retry_timeout_sec
+                        << " seconds, err=" << static_cast<int>(result.error);
+                } else {
+                    LOG(ERROR) << "Fatal batch-record standby poll failure, "
+                               << "err=" << static_cast<int>(result.error);
+                }
+                state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                replication_loop_cv_.notify_all();
+                break;
+            }
+            retry_started.reset();
+            retry_delay = retry_base;
+            last_error_.store(ErrorCode::OK, std::memory_order_release);
         }
 
         // Update applied_seq_id from OpLogApplier
@@ -698,17 +1288,6 @@ void HotStandbyService::ReplicationLoop() {
             uint64_t current_applied = (expected > 0) ? (expected - 1) : 0;
             if (current_applied > 0) {
                 applied_seq_id_.store(current_applied);
-            }
-        }
-
-        // Update primary_seq_id by querying etcd `/latest` (best-effort).
-        // Note: `/latest` is batch-updated on Primary, so this is for
-        // monitoring only.
-        if (repl_oplog_store) {
-            uint64_t latest_seq = 0;
-            ErrorCode err = repl_oplog_store->GetLatestSequenceId(latest_seq);
-            if (err == ErrorCode::OK) {
-                primary_seq_id_.store(latest_seq);
             }
         }
 
@@ -721,10 +1300,13 @@ void HotStandbyService::ReplicationLoop() {
             NotifySyncStatus();
         }
 
-        // Sleep and check again
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        wait_for_next_poll(
+            std::chrono::milliseconds(config_.oplog_poll_interval_ms));
     }
 
+    replication_loop_running_.store(false, std::memory_order_release);
+    CancelSnapshotCapture();
+    replication_loop_cv_.notify_all();
     LOG(INFO) << "Replication loop stopped";
 }
 
@@ -732,8 +1314,20 @@ void HotStandbyService::VerificationLoop() {
     LOG(INFO) << "Verification loop started";
 
     while (IsRunning()) {
-        std::this_thread::sleep_for(
-            std::chrono::seconds(config_.verification_interval_sec));
+        std::unique_lock<std::mutex> lock(replication_loop_mutex_);
+        replication_loop_cv_.wait_for(
+            lock, std::chrono::seconds(config_.verification_interval_sec),
+            [this] {
+                return !replication_loop_running_.load(
+                           std::memory_order_acquire) ||
+                       !IsRunning();
+            });
+        lock.unlock();
+
+        if (!IsRunning() ||
+            !replication_loop_running_.load(std::memory_order_acquire)) {
+            break;
+        }
 
         if (!IsConnected()) {
             continue;
@@ -751,47 +1345,6 @@ void HotStandbyService::VerificationLoop() {
     }
 
     LOG(INFO) << "Verification loop stopped";
-}
-
-void HotStandbyService::ApplyOpLogEntry(const OpLogEntry& entry) {
-    // NOTE: This method is deprecated. OpLog entries are now applied via
-    // OpLogApplier, which is called by OpLogReplicator. This method is kept
-    // for backward compatibility but should not be used in the new etcd-based
-    // implementation.
-
-    // Update applied_seq_id for status tracking
-    applied_seq_id_.store(entry.sequence_id);
-
-    // The actual application is handled by OpLogApplier via OpLogReplicator
-    VLOG(2) << "ApplyOpLogEntry called (deprecated), sequence_id="
-            << entry.sequence_id
-            << ", op_type=" << static_cast<int>(entry.op_type)
-            << ", key=" << entry.object_key;
-}
-
-void HotStandbyService::ProcessOpLogBatch(
-    const std::vector<OpLogEntry>& entries) {
-    for (const auto& entry : entries) {
-        ApplyOpLogEntry(entry);
-    }
-}
-
-bool HotStandbyService::ConnectToPrimary() {
-    // With etcd-based OpLog sync, connection is handled by OpLogReplicator
-    // This method is kept for compatibility but is no longer used
-    LOG(INFO) << "ConnectToPrimary called (no-op with etcd-based sync)";
-    return true;
-}
-
-void HotStandbyService::DisconnectFromPrimary() {
-    // With etcd-based OpLog sync, disconnection is handled by OpLogReplicator
-    // This method is kept for compatibility
-    if (IsConnected()) {
-        state_machine_.ProcessEvent(StandbyEvent::DISCONNECTED);
-        replication_stream_.reset();
-        LOG(INFO) << "Disconnected from Primary (etcd-based sync), state="
-                  << StandbyStateToString(GetState());
-    }
 }
 
 }  // namespace mooncake

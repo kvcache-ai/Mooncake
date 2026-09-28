@@ -71,10 +71,10 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     void* src = allocOnDevice(kLen, kSourceDevice);
     void* dst = allocOnDevice(kLen, kSourceDevice);
     ASSERT_EQ(engine->registerLocalMemory(
-                  src, kLen, "cuda:" + std::to_string(kSourceDevice)),
+                  src, kLen, GPU_PREFIX + std::to_string(kSourceDevice)),
               0);
     ASSERT_EQ(engine->registerLocalMemory(
-                  dst, kLen, "cuda:" + std::to_string(kSourceDevice)),
+                  dst, kLen, GPU_PREFIX + std::to_string(kSourceDevice)),
               0);
 
     auto segment_id = engine->openSegment(server_name);

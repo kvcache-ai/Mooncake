@@ -137,6 +137,11 @@ class MemoryPool {
   // @throw std::run_time_error if the slab class information is corrupted.
   void free(void* memory);
 
+  bool importSlab(Slab* slab,
+                  ClassId classId,
+                  const std::vector<uint32_t>& occupiedChunkIndexes);
+  void importFreeSlab(Slab* slab);
+
   // resize the memory pool. This only adjusts the Pool size. It does not
   // release the slabs back to the SlabAllocator if the new size is less than
   // the current size. The caller is responsible for doing that through

@@ -3,19 +3,21 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
 
 #include "metadata_store.h"
+#include "weight_metadata_store.h"
 
 namespace mooncake {
 
 struct LoadedSnapshot {
     std::string snapshot_id;
     uint64_t snapshot_sequence_id{0};
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> metadata;
+    std::vector<StandbyObjectEntry> metadata;
+    std::vector<StandbySegmentInfo> segments;
+    WeightMetadataSnapshot weight_metadata;
 };
 
 /**

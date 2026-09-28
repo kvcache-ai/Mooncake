@@ -71,7 +71,7 @@
                    libnuma-dev \
                    libcurl4-openssl-dev \
                    libhiredis-dev
-    
+
     # For centos/alibaba linux os
     yum install cmake \
                 gflags-devel \
@@ -157,17 +157,7 @@
     make -j
     ```
 
-7. 安装 yalantinglibs
-    ```bash
-    git clone https://github.com/alibaba/yalantinglibs.git
-    cd yalantinglibs
-    mkdir build && cd build
-    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-    make -j$(nproc)
-    make install
-    ```
-
-8. 进入项目根目录，运行下列命令进行编译
+7. 进入项目根目录，运行下列命令进行编译
    ```bash
    mkdir build
    cd build
@@ -175,7 +165,7 @@
    make -j
    ```
 
-9. 安装 Mooncake python 包和 mooncake_master 可执行文件
+8. 安装 Mooncake python 包和 mooncake_master 可执行文件
    ```bash
    make install
    ```
@@ -193,6 +183,7 @@
 - `-DNEUWARE_ROOT=/path/to/neuware`: 在 `-DUSE_MLU=ON` 时覆盖默认 Neuware SDK 根路径；未设置时使用 `NEUWARE_HOME` 或 `/usr/local/neuware`。
 - `-DMLU_INCLUDE_DIR=/path/to/include` / `-DMLU_LIB_DIR=/path/to/lib64`: 在 `-DUSE_MLU=ON` 时覆盖 Neuware 头文件与库目录。
 - `-DUSE_HIP=[ON|OFF]`: 通过 HIP/ROCm 启用对 AMD GPU 的支持
+- `-DUSE_SHCA=[ON|OFF]`: 启用 ScaleFabric SHCA InfiniBand 支持。默认 OFF；仅支持 Transfer Engine/TENT RDMA 路径，不支持 Mooncake-EP IBGDA；SHCA 构建下不支持 `MC_RPC_PROTOCOL=rdma`。
 - `-DUSE_HYGON=[ON|OFF]`: 通过 DTK SDK 启用对海光 DCU 的支持。默认 OFF；使用 CUDA 兼容运行时。
 - `-DDTK_ROOT=/path/to/dtk`: 在 `-DUSE_HYGON=ON` 时覆盖默认 DTK SDK 根路径；未设置时使用 `DTK_HOME` 或 `/opt/dtk`。
 - `-DDTK_INCLUDE_DIR=/path/to/include` / `-DDTK_LIB_DIR=/path/to/lib64`: 在 `-DUSE_HYGON=ON` 时覆盖 DTK 头文件与库目录。
@@ -253,4 +244,3 @@ cd /app/build/mooncake-transfer-engine/example
 --ulimit memlock=-1 解除内存锁定限制，RDMA 操作需要
 
 --net=host 让容器使用宿主机的网络命名空间
-

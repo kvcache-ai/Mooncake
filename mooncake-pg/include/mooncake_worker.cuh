@@ -1,25 +1,21 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
-#if !defined(__MUSA__)
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/util/intrusive_ptr.h>
-#include <torch/csrc/distributed/c10d/Types.hpp>
-#include <torch/csrc/distributed/c10d/Work.hpp>
-#include <torch/csrc/distributed/c10d/Store.hpp>
-#else
-// MUSA device compilation: minimal includes to avoid mcc compiler crash
-#include <cstddef>
-#include <cstdint>
-#endif
+#include <array>
+#include <atomic>
+#include <functional>
 
-#include <cuda_alike.h>
+#include "control_plane/control_types.h"
+#include "gpu_runtime.h"
+
 #include <transfer_engine.h>
+#include <mooncake_worker_kernels.cuh>
+#include "comm_types.h"
 
 #include <memory>
-#include <atomic>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -27,130 +23,137 @@
 namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
-static constexpr size_t kMaxNumRanks = 64;
 
-struct SegmentInfo {
-    uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
-        warmup_buffer[2];
-    uint64_t p2p_credit_region;
-    uint64_t p2p_ack_region;
+class MooncakeCommunicator;
+
+// Local collective extension state. Every communicator starts in Isolated.
+//
+// Founding member:
+//   Isolated --(Active view)--> Normal
+//
+// Joining member:
+//   Isolated ---------(joinGroup: drain operations)--------> Quiescing
+//            -----------------(Active view)----------------> Normal
+//
+// In-place rejoining member:
+//   Normal + inactive --(joinGroup: drain operations)------> Quiescing
+//                     ---------(Active view)---------------> Normal
+//
+// Isolated admits local-only collectives with an {self} active ranks mask.
+// Quiescing rejects new collectives while waiting for activation. Normal uses
+// the Coordinator's committed membership as active ranks. These are local
+// extension phases, not membership states: an auto-deactivated communicator
+// remains Normal and fails its next collective through the inactive self bit.
+enum class CollectiveExtensionState : uint8_t {
+    Isolated = 0,   // Local-only collectives
+    Quiescing = 1,  // awaiting activation; no collectives may be issued.
+    Normal = 2,  // Collectives use the membership committed by the coordinator.
 };
 
 struct TransferGroupMeta {
-    int rank;
-    int size;        // capacity: number of slots allocated (incl. inactive)
-    int activeSize;  // visible group size: number of ranks that participate
+    InGroupRank rank;
+    GlobalRank globalRank;
+    // rank_order maps InGroupRank (0 .. maxGroupSize-1) to GlobalRank.
+    GlobalRank rank_order[kMaxNumRanks];
+
+    int maxGroupSize;
+    // Highest active InGroupRank plus one.
+    std::atomic<int> activeSize{0};
     int taskCount;
+
+    GroupId group_id;
+    std::atomic<uint64_t> epoch{0};
+    std::atomic<CollectiveExtensionState> extensionMode{
+        CollectiveExtensionState::Isolated};
+
     bool* activeRanks;
     bool* activeRanksDevice;
-#if !defined(__MUSA__)
-    at::Tensor activeRanksTensor;
-#endif
-    bool peerConnected[kMaxNumRanks]{};
+    int32_t* activeRanksMirrorDevice = nullptr;
+    bool* maybeActivatable;
+    RankState rankStates[kMaxNumRanks];  // per GlobalRank
+    uint64_t rankEpochs[kMaxNumRanks];
     TransferEngine* engine;
-#if !defined(__MUSA__)
-    c10::intrusive_ptr<::c10d::Store> store;
-#endif
-    int bufferBaseIndex;
-    int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
-    SegmentInfo segmentInfos[kMaxNumRanks];
+    GroupEndpointInfo segmentInfos[kMaxNumRanks];
+    const size_t* collectiveTimeoutUs = nullptr;
+    MooncakeCommunicator* communicator = nullptr;
+    bool autoSyncOnFailure = true;
 };
 
-#if defined(__CUDACC__) || defined(__MUSA__)
-__global__
-#endif
-    struct Task {
-    volatile bool active = false;
-    int opType =
-        0;  // c10d::OpType as int, for ABI compatibility with kernel code
-    size_t tensorSize;  // In bytes
-    int64_t broadcastRoot;
-    int bufferOffset;
-    uint64_t submitSequence = 0;
-    BatchID batchID;
-    void* transferGroupMeta;
-};
+void launchReduceKernel(void* dst, DataType datatype, size_t pos,
+                        size_t realSize, void* src, size_t numRanks,
+                        ReduceOp op, bool* activeRanks, cudaStream_t stream);
 
-#if !defined(__MUSA__)
-void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                        size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        cudaStream_t stream);
-
-void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks);
-void preloadReduceKernels();
-
-class ConnectionContext;
-
-struct CudaTaskSubmissionToken {
-    size_t task_id;
-    uint64_t sequence;
-};
+void launchReduceCpu(void* dst, DataType datatype, size_t pos, size_t realSize,
+                     void* src, size_t numRanks, ReduceOp op,
+                     bool* activeRanks);
 
 class MooncakeWorker {
    public:
     explicit MooncakeWorker(int cuda_device_index = -1);
     ~MooncakeWorker();
 
-    c10::intrusive_ptr<c10d::Work> putTaskCpu(
-        c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
+    std::unique_ptr<WorkCompletion> putTaskCpu(
+        OpType opType, size_t dataSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
-        const std::shared_ptr<ConnectionContext>& connection_ctx,
+        int32_t* failedRanksHint,
         const std::function<void(void* dst, size_t pos, size_t realSize)>&
-            tensorToBuffer,
+            copyToSendBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize)>&
-            bufferToTensor);
+            copyFromRecvBuffer);
 
-    c10::intrusive_ptr<c10d::Work> putTaskCuda(
-        c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
+    void putTaskCuda(
+        OpType opType, size_t dataSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
-        const std::shared_ptr<ConnectionContext>& connection_ctx,
-        const at::cuda::CUDAStream& issue_stream,
+        cudaStream_t issueStream, int32_t* failedRanksHint,
         const std::function<void(void* dst, size_t pos, size_t realSize,
-                                 const at::cuda::CUDAStream&)>& tensorToBuffer,
+                                 cudaStream_t)>& copyToSendBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize,
-                                 const at::cuda::CUDAStream&)>& bufferToTensor);
+                                 cudaStream_t)>& copyFromRecvBuffer);
 
     void Start();
 
+    bool hasPendingActiveRanksMirrorUpdate(const TransferGroupMeta* meta) const;
+
     /**
-     * @brief Waits for all active collective tasks for the given backend to
-     * complete.
+     * @brief Waits for all active collective tasks for the given communicator
+     * to complete.
      *
      * Used during graceful shutdown to ensure no pending collective operations
      * are active before releasing resources. Blocks until all tasks complete
      * or the timeout expires.
      *
-     * @param meta The transfer group metadata identifying the backend.
+     * @param meta The transfer group metadata identifying the communicator.
      * @return True if all tasks completed within the timeout; false if timed
      * out.
      */
     bool drainTasks(const TransferGroupMeta* meta) const;
 
-    bool waitUntilTasksSubmitted(
-        const std::vector<CudaTaskSubmissionToken>& tasks,
-        std::chrono::milliseconds timeout) const;
-
    private:
     void startWorker();
+    void waitUntilTasksSubmitted(
+        const std::vector<CudaTaskSubmissionToken>& tasks) const;
 
-    static constexpr size_t kNumTasks_ = 4;
+    static constexpr size_t kNumCpuTasks_ = 2;
+    static constexpr size_t kNumCudaTasks_ = 2;
+    static constexpr size_t kCudaTaskOffset_ = kNumCpuTasks_;
+    static constexpr size_t kNumTasks_ = kNumCpuTasks_ + kNumCudaTasks_;
 
-    static constexpr size_t kPingTimeoutMicroseconds_ = 100;
     static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
     std::atomic<bool> running_{false};
     std::atomic<bool> started_{false};
     int cuda_device_index_;
+    std::array<std::optional<GpuStream>, kNumCudaTasks_> enqueue_streams_;
 
     Task *tasks_, *tasks_device_;
     bool hasCallback_[kNumTasks_]{};
     std::function<void()> callbacks_[kNumTasks_]{};
 
     int cpuTaskCount = 0;
-    int cudaTaskCount = 0;
+    size_t cudaOpCount = 0;
     std::atomic<uint64_t> next_cuda_task_sequence_{1};
+    std::atomic<uint64_t> next_active_ranks_mirror_generation_{1};
     std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
 
     std::thread worker_thread_;
@@ -158,11 +161,7 @@ class MooncakeWorker {
 
 class MooncakeWorkerManager {
    public:
-    static MooncakeWorkerManager& GetInstance() {
-        // leaky singleton to avoid destructor fiasco problem
-        static MooncakeWorkerManager* manager = new MooncakeWorkerManager;
-        return *manager;
-    }
+    MooncakeWorkerManager() = default;
 
     std::shared_ptr<MooncakeWorker> GetCPUWorker();
     std::shared_ptr<MooncakeWorker> GetCUDAWorker(int cuda_device_index);
@@ -175,7 +174,6 @@ class MooncakeWorkerManager {
     // detached threads must not outlive the MooncakeWorker object.
     std::unordered_map<int, std::shared_ptr<MooncakeWorker>> workers_;
 };
-#endif  // !defined(__MUSA__)
 
 }  // namespace mooncake
 

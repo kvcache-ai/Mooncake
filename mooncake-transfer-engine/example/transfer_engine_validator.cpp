@@ -70,7 +70,8 @@ DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp|nvlink|hip");
+DEFINE_string(protocol, "rdma",
+              "Transfer protocol: rdma|tcp|nvlink|musa|maca|hip");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -415,6 +416,8 @@ int initiator() {
             xport = engine->installTransport("nvlink_intra", nullptr);
         } else if (FLAGS_protocol == "maca") {
             xport = engine->installTransport("maca", nullptr);
+        } else if (FLAGS_protocol == "musa") {
+            xport = engine->installTransport("musa", nullptr);
         } else if (FLAGS_protocol == "hip") {
             xport = engine->installTransport("hip", nullptr);
         } else {
@@ -540,6 +543,8 @@ int target() {
             engine->installTransport("nvlink", nullptr);
         } else if (FLAGS_protocol == "maca") {
             engine->installTransport("maca", nullptr);
+        } else if (FLAGS_protocol == "musa") {
+            engine->installTransport("musa", nullptr);
         } else if (FLAGS_protocol == "hip") {
             engine->installTransport("hip", nullptr);
         } else {

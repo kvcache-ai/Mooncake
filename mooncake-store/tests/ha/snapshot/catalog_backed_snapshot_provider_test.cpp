@@ -2,18 +2,21 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
+
+#include <msgpack.hpp>
 
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 #include "ha/snapshot/snapshot_test_utils.h"
+#include "weight_metadata_store.h"
 
 namespace mooncake::test {
 
@@ -23,6 +26,29 @@ DEFINE_string(redis_endpoint, "",
 namespace {
 
 namespace fs = std::filesystem;
+
+std::vector<uint8_t> AddWeightMetadataStore(
+    const std::vector<uint8_t>& metadata,
+    const WeightMetadataSnapshot& weight_metadata) {
+    auto root = msgpack::unpack(reinterpret_cast<const char*>(metadata.data()),
+                                metadata.size());
+    const auto& object = root.get();
+    EXPECT_EQ(msgpack::type::MAP, object.type);
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    packer.pack_map(object.via.map.size + 1);
+    for (uint32_t i = 0; i < object.via.map.size; ++i) {
+        packer.pack(object.via.map.ptr[i].key);
+        packer.pack(object.via.map.ptr[i].val);
+    }
+    packer.pack("weight_metadata");
+    const auto encoded = struct_pack::serialize(weight_metadata);
+    packer.pack_bin(encoded.size());
+    packer.pack_bin_body(encoded.data(), encoded.size());
+    return std::vector<uint8_t>(
+        reinterpret_cast<const uint8_t*>(buffer.data()),
+        reinterpret_cast<const uint8_t*>(buffer.data()) + buffer.size());
+}
 
 class CatalogBackedSnapshotProviderTest
     : public ::testing::TestWithParam<CatalogBackendParam> {
@@ -71,7 +97,7 @@ class CatalogBackedSnapshotProviderTest
 
     // Loads the published snapshot and asserts the single default object
     // round-trips intact, regardless of the metadata on-wire format.
-    void ExpectLoadsDefaultObject() {
+    void ExpectLoadsDefaultObject(bool expected_hard_pinned = false) {
         auto provider = CreateProvider();
         ASSERT_TRUE(provider.has_value()) << toString(provider.error());
 
@@ -80,10 +106,13 @@ class CatalogBackedSnapshotProviderTest
         ASSERT_TRUE(snapshot->has_value());
         ASSERT_EQ(snapshot->value().metadata.size(), 1u);
 
-        const auto& [key, metadata] = snapshot->value().metadata.front();
+        const auto& [tenant_id, key, metadata] =
+            snapshot->value().metadata.front();
+        EXPECT_EQ(tenant_id, "default");
         EXPECT_EQ(key, kDefaultTestObjectKey);
         EXPECT_EQ(metadata.client_id, (UUID{1, 2}));
         EXPECT_EQ(metadata.size, kDefaultTestObjectSize);
+        EXPECT_EQ(metadata.hard_pinned.value_or(false), expected_hard_pinned);
         ASSERT_EQ(metadata.replicas.size(), 1u);
 
         const auto& replica = metadata.replicas.front();
@@ -134,20 +163,81 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
               descriptor_.last_included_seq);
     ASSERT_EQ(snapshot->value().metadata.size(), 1u);
 
-    const auto& [key, metadata] = snapshot->value().metadata.front();
-    EXPECT_EQ(key, kDefaultTestObjectKey);
-    EXPECT_EQ(metadata.client_id, (UUID{1, 2}));
-    EXPECT_EQ(metadata.size, kDefaultTestObjectSize);
-    EXPECT_EQ(metadata.last_sequence_id, descriptor_.last_included_seq);
-    ASSERT_EQ(metadata.replicas.size(), 1u);
+    // The test snapshot's segment payload is built from an empty
+    // SegmentManager (BuildSegmentsPayload), so the loaded snapshot
+    // must report no StandbySegmentInfo entries. This pins the contract
+    // documented at the extraction site in
+    // catalog_backed_snapshot_provider.cpp: only memory segments
+    // (mounted_segments_) populate snapshot.segments; local-disk and
+    // NoF segments arrive via SEGMENT_MOUNT OpLog replay instead.
+    EXPECT_TRUE(snapshot->value().segments.empty())
+        << "Empty segment manager must produce zero StandbySegmentInfo "
+           "entries";
 
-    const auto& replica = metadata.replicas.front();
+    const auto& entry = snapshot->value().metadata.front();
+    EXPECT_EQ(entry.key, kDefaultTestObjectKey);
+    EXPECT_EQ(entry.metadata.client_id, (UUID{1, 2}));
+    EXPECT_EQ(entry.metadata.size, kDefaultTestObjectSize);
+    ASSERT_EQ(entry.metadata.replicas.size(), 1u);
+
+    const auto& replica = entry.metadata.replicas.front();
     EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
     ASSERT_TRUE(replica.is_disk_replica());
     EXPECT_EQ(replica.get_disk_descriptor().file_path,
               kDefaultTestDiskFilePath);
     EXPECT_EQ(replica.get_disk_descriptor().object_size,
               kDefaultTestObjectSize);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadsWeightMetadataStoreFromMetadata) {
+    WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    WeightMetadataSnapshot weight_metadata{
+        .metadata = {WeightRevisionMetadata{
+            .identity = identity,
+            .manifest =
+                WeightManifestReference{
+                    .manifest_key =
+                        "weights/production/llama-70b/step-100/7/manifest",
+                    .manifest_sha256 = std::string(64, 'a'),
+                    .payload_group_id = MakeWeightPayloadGroupId(identity),
+                    .payload_keys_sha256 = std::string(64, 'b'),
+                    .payload_count = 1,
+                    .logical_bytes = 1024,
+                },
+            .availability = WeightAvailabilityState::READY,
+            .residency = WeightResidencyState::HOT,
+            .operation = WeightOperationState::NONE,
+            .metadata_generation = 2,
+            .created_at_ms = 100,
+            .updated_at_ms = 101,
+        }},
+        .leases = {},
+        .operations = {},
+        .next_lease_id = 1,
+        .next_operation_id = 1,
+    };
+    auto metadata = AddWeightMetadataStore(
+        BuildMetadataPayload(UUID{1, 2}, kDefaultTestObjectKey,
+                             kDefaultTestDiskFilePath, kDefaultTestObjectSize),
+        weight_metadata);
+    auto published = mooncake::test::PublishSnapshotPayloadBytes(
+        *object_store_, *catalog_store_, descriptor_, std::move(metadata));
+    ASSERT_TRUE(published.has_value()) << published.error();
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    EXPECT_EQ(weight_metadata, snapshot->value().weight_metadata);
 }
 
 // The master snapshot writer evolved its per-object metadata layout over time
@@ -166,14 +256,14 @@ TEST_P(CatalogBackedSnapshotProviderTest,
     // 8 + replica_count: trailing hard_pinned flag, no data_type. Exercises the
     // type-based disambiguation (first replica is not a positive integer).
     PublishSnapshotPayload(SnapshotMetadataFormat::kHardPinnedOnly);
-    ExpectLoadsDefaultObject();
+    ExpectLoadsDefaultObject(true);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest,
        LoadLatestSnapshotWithDataTypeAndHardPinned) {
     // 9 + replica_count: data_type + trailing hard_pinned.
     PublishSnapshotPayload(SnapshotMetadataFormat::kDataTypeAndHardPinned);
-    ExpectLoadsDefaultObject();
+    ExpectLoadsDefaultObject(true);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
@@ -181,7 +271,37 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
     // trailing group_id). Regression test for the live snapshot restore
     // failure against the latest metadata layout.
     PublishSnapshotPayload(SnapshotMetadataFormat::kWithGroupId);
-    ExpectLoadsDefaultObject();
+    ExpectLoadsDefaultObject(true);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotIgnoresObjectChecksum) {
+    PublishSnapshotPayload(SnapshotMetadataFormat::kWithObjectChecksum);
+    ExpectLoadsDefaultObject(true);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotIgnoresSoftPinForRetention) {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    ASSERT_GT(now_ms, 0);
+    auto published = mooncake::test::PublishSnapshotPayloadBytes(
+        *object_store_, *catalog_store_, descriptor_,
+        BuildMetadataPayload(
+            UUID{1, 2}, kDefaultTestObjectKey, kDefaultTestDiskFilePath,
+            kDefaultTestObjectSize, kDefaultTestPutStartTimeMs,
+            static_cast<uint64_t>(now_ms - 1), SnapshotMetadataFormat::kLegacy,
+            static_cast<uint64_t>(now_ms + 60'000)));
+    ASSERT_TRUE(published.has_value()) << published.error();
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    EXPECT_TRUE(snapshot->value().metadata.empty());
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, RejectsOverflowingReplicaCount) {

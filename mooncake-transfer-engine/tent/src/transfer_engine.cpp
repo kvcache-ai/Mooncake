@@ -15,6 +15,7 @@
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/topology.h"
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -49,6 +50,15 @@ const std::string TransferEngine::getRpcServerAddress() const {
 
 uint16_t TransferEngine::getRpcServerPort() const {
     return impl_->getRpcServerPort();
+}
+
+std::shared_ptr<Topology> TransferEngine::getLocalTopology() const {
+    return impl_->getLocalTopology();
+}
+
+std::string TransferEngine::getLocalTopologyString() const {
+    auto topo = impl_->getLocalTopology();
+    return topo ? topo->toString() : "{}";
 }
 
 Status TransferEngine::exportLocalSegment(std::string& shared_handle) {
@@ -134,10 +144,20 @@ Status TransferEngine::submitTransfer(
     return impl_->submitTransfer(batch_id, request_list);
 }
 
+Status TransferEngine::submitTransferRequiringPostSubmitCancellation(
+    BatchID batch_id, const std::vector<Request>& request_list) {
+    return impl_->submitTransferRequiringPostSubmitCancellation(batch_id,
+                                                                request_list);
+}
+
 Status TransferEngine::submitTransfer(BatchID batch_id,
                                       const std::vector<Request>& request_list,
                                       const Notification& notifi) {
     return impl_->submitTransfer(batch_id, request_list, notifi);
+}
+
+Status TransferEngine::cancelTransfer(BatchID batch_id, size_t task_id) {
+    return impl_->cancelTransfer(batch_id, task_id);
 }
 
 Status TransferEngine::sendNotification(SegmentID target_id,
@@ -172,6 +192,10 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
 Status TransferEngine::progressBatch(BatchID batch_id,
                                      TransferStatus& overall_status) {
     return impl_->progressBatch(batch_id, overall_status);
+}
+
+Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    return impl_->getNicLoadStats(stats);
 }
 
 }  // namespace tent

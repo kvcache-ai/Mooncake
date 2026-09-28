@@ -96,8 +96,13 @@ struct ReplicaCopyPayload {
     std::string key;
     std::string source;
     std::vector<std::string> targets;
+    uint64_t dynamic_replication_lease_id_high{0};
+    uint64_t dynamic_replication_lease_id_low{0};
+    uint64_t dynamic_replication_version_epoch{0};
 };
-YLT_REFL(ReplicaCopyPayload, tenant_id, key, source, targets);
+YLT_REFL(ReplicaCopyPayload, tenant_id, key, source, targets,
+         dynamic_replication_lease_id_high, dynamic_replication_lease_id_low,
+         dynamic_replication_version_epoch);
 
 struct ReplicaMovePayload {
     std::string tenant_id = "default";
@@ -177,6 +182,9 @@ class ScopedTaskWriteAccess {
                             TaskStatus status, const std::string& message);
 
     void restore_task(Task&& task);
+
+    ErrorCode fail_task_if_pending(const UUID& task_id,
+                                   const std::string& message);
 
     void clear_all();
 

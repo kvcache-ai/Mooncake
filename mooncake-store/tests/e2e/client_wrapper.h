@@ -69,6 +69,7 @@ class ClientTestWrapper {
     ErrorCode Get(const std::string& key, std::string& value);
     ErrorCode Put(const std::string& key, const std::string& value);
     ErrorCode Delete(const std::string& key);
+    ErrorCode BatchSmoke(const std::string& key_prefix);
 
     // Returns true if the key has a DISK replica
     // (master-assigned, written by PutToLocalFile).
