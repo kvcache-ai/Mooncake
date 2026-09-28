@@ -78,7 +78,7 @@ class Tenant {
         if (entry == nullptr) {
             return false;
         }
-        return object_index_.WithExclusiveRoute([&](auto& route) {
+        return object_index_.WithExclusiveRoute(entry->key(), [&](auto& route) {
             const auto it = route.find(entry->key());
             if (it == route.end() || it->second != entry) {
                 return false;
