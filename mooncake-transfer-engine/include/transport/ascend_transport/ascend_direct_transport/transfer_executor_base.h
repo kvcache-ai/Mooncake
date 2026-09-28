@@ -54,7 +54,7 @@ class TransferExecutorBase {
         int32_t connect_timeout = 10000;
         int32_t transfer_timeout = 10000;
         bool use_async_transfer = false;
-        bool auto_connect = true;
+        bool auto_connect = false;
         bool use_short_connection = false;
         bool use_buffer_pool = false;
         bool agent_mode = false;
@@ -79,7 +79,7 @@ class TransferExecutorBase {
     void processSliceList(const std::vector<Transport::Slice*>& slice_list);
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
-                    bool use_buffer_pool);
+                    bool use_buffer_pool, bool remote_accessible);
     int deregisterMem(void* addr);
 
     const size_t getNumEngines() const { return adxl_engines_.size(); }

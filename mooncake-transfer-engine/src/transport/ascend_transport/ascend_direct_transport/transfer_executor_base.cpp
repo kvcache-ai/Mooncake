@@ -477,7 +477,8 @@ void TransferExecutorBase::rollbackRegisteredMem(
 
 int TransferExecutorBase::registerMem(void* addr, size_t length,
                                       adxl::MemType mem_type,
-                                      bool use_buffer_pool) {
+                                      bool use_buffer_pool,
+                                      bool remote_accessible) {
     if (mem_type == adxl::MEM_HOST && use_buffer_pool) {
         LOG(INFO) << "Ignore register host mem:" << addr
                   << " when buffer pool is enabled.";
@@ -507,6 +508,8 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
     adxl::MemDesc mem_desc{};
     mem_desc.addr = reinterpret_cast<uintptr_t>(addr);
     mem_desc.len = length;
+    // HIXL MemDesc.local_only is the inverse of TransferEngine remote_accessible.
+    mem_desc.local_only = !remote_accessible;
 
     std::vector<EngineMemHandle> registered_mem_handles;
     registered_mem_handles.reserve(engine_indices.size());
@@ -540,6 +543,7 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
         LOG(INFO) << "TransferExecutor register mem addr:" << addr
                   << ", length:" << length << ", mem type:"
                   << (mem_type == adxl::MEM_HOST ? "host" : "device")
+                  << ", local_only:" << mem_desc.local_only
                   << ", engine index:" << engine_idx;
     }
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
