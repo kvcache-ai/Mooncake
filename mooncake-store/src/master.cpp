@@ -15,6 +15,7 @@
 #include <ylt/easylog/record.hpp>
 
 #include "allocator_status.h"
+#include "config/cxl_bootstrap_config_loader.h"
 #include "config/metrics_bootstrap_config_loader.h"
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
@@ -465,6 +466,23 @@ std::string ResolveHABackendConnstring(
         master_config.etcd_endpoints);
 }
 
+mooncake::CxlBootstrapCommandLineOverrides
+GetCxlBootstrapCommandLineOverrides() {
+    mooncake::CxlBootstrapCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("enable_cxl", &info) &&
+        !info.is_default) {
+        command_line.enabled = FLAGS_enable_cxl;
+    }
+    if (google::GetCommandLineFlagInfo("cxl_path", &info) && !info.is_default) {
+        command_line.path = FLAGS_cxl_path;
+    }
+    if (google::GetCommandLineFlagInfo("cxl_size", &info) && !info.is_default) {
+        command_line.size = FLAGS_cxl_size;
+    }
+    return command_line;
+}
+
 mooncake::MetricsBootstrapCommandLineOverrides
 GetMetricsBootstrapCommandLineOverrides() {
     mooncake::MetricsBootstrapCommandLineOverrides command_line;
@@ -514,14 +532,6 @@ void ResolveRpcAddressFromInterfaceOrDie(
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
-    default_config.GetBool("enable_cxl", &master_config.enable_cxl,
-                           FLAGS_enable_cxl);
-    default_config.GetString("cxl_path", &master_config.cxl_path,
-                             FLAGS_cxl_path);
-    // cxl_size is size_t, which is not uint64_t on every platform (macOS).
-    uint64_t cxl_size = master_config.cxl_size;
-    default_config.GetUInt64("cxl_size", &cxl_size, FLAGS_cxl_size);
-    master_config.cxl_size = cxl_size;
     default_config.GetUInt32("rpc_port", &master_config.rpc_port,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
@@ -851,21 +861,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     }
 
     google::CommandLineFlagInfo info;
-    if ((google::GetCommandLineFlagInfo("enable_cxl", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_cxl = FLAGS_enable_cxl;
-    }
-    if ((google::GetCommandLineFlagInfo("cxl_path", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.cxl_path = FLAGS_cxl_path;
-    }
-    if ((google::GetCommandLineFlagInfo("cxl_size", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.cxl_size = FLAGS_cxl_size;
-    }
     if ((google::GetCommandLineFlagInfo("rpc_address", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1566,6 +1561,13 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
     try {
+        master_config.cxl = mooncake::ResolveCxlBootstrapConfig(
+            loaded_default_config, GetCxlBootstrapCommandLineOverrides());
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Invalid CXL bootstrap configuration: " << error.what();
+        return 1;
+    }
+    try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());
     } catch (const std::exception& error) {
@@ -1763,9 +1765,9 @@ int main(int argc, char* argv[]) {
         << ", snapshot_retention_count="
         << master_config.snapshot_retention_count
         << ", max_retry_attempts=" << master_config.max_retry_attempts
-        << ", enable_cxl=" << master_config.enable_cxl
-        << ", cxl_path=" << master_config.cxl_path
-        << ", cxl_size=" << master_config.cxl_size;
+        << ", enable_cxl=" << master_config.cxl.enabled
+        << ", cxl_path=" << master_config.cxl.path
+        << ", cxl_size=" << master_config.cxl.size;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

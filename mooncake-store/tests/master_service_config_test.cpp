@@ -4,10 +4,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 
-#include "../src/config/metrics_bootstrap_config_loader.h"
+#include "config/cxl_bootstrap_config_loader.h"
+#include "config/metrics_bootstrap_config_loader.h"
 #include "default_config.h"
 #include "ha/snapshot/batch_oplog/config.h"
 #include "master_config.h"
@@ -144,6 +146,119 @@ TEST_F(MetricsBootstrapConfigTest, RejectsOutOfRangeCommandLinePort) {
     command_line.port = UINT32_MAX;
     EXPECT_THROW(ResolveMetricsBootstrapConfig(nullptr, command_line),
                  std::invalid_argument);
+}
+
+class CxlBootstrapConfigTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        std::string pattern = (std::filesystem::temp_directory_path() /
+                               "cxl_bootstrap_config_test_XXXXXX")
+                                  .string();
+        char* directory = mkdtemp(pattern.data());
+        ASSERT_NE(directory, nullptr);
+        temp_dir_ = directory;
+    }
+
+    void TearDown() override {
+        if (!temp_dir_.empty()) {
+            std::filesystem::remove_all(temp_dir_);
+        }
+    }
+
+    std::unique_ptr<DefaultConfig> LoadConfig(const std::string& extension,
+                                              const std::string& contents) {
+        const auto path = temp_dir_ / ("config" + extension);
+        {
+            std::ofstream file(path);
+            EXPECT_TRUE(file.is_open());
+            file << contents;
+        }
+        auto config = std::make_unique<DefaultConfig>();
+        config->SetPath(path.string());
+        config->Load();
+        return config;
+    }
+
+    std::filesystem::path temp_dir_;
+};
+
+TEST_F(CxlBootstrapConfigTest, UsesExistingDefaultsWithoutSources) {
+    const auto resolved = ResolveCxlBootstrapConfig(nullptr, {});
+    EXPECT_FALSE(resolved.enabled);
+    EXPECT_EQ(resolved.path, "/dev/dax0.0");
+    EXPECT_EQ(resolved.size, 8ULL * 1024 * 1024 * 1024);
+}
+
+TEST_F(CxlBootstrapConfigTest, LoadsExistingFlatYamlAndJsonKeys) {
+    const auto yaml = LoadConfig(
+        ".yaml", "enable_cxl: true\ncxl_path: /dev/dax1.0\ncxl_size: 4096\n");
+    const auto from_yaml = ResolveCxlBootstrapConfig(yaml.get(), {});
+    EXPECT_TRUE(from_yaml.enabled);
+    EXPECT_EQ(from_yaml.path, "/dev/dax1.0");
+    EXPECT_EQ(from_yaml.size, 4096u);
+
+    const auto json = LoadConfig(
+        ".json",
+        R"({"enable_cxl":true,"cxl_path":"/dev/dax2.0","cxl_size":8192})");
+    const auto from_json = ResolveCxlBootstrapConfig(json.get(), {});
+    EXPECT_TRUE(from_json.enabled);
+    EXPECT_EQ(from_json.path, "/dev/dax2.0");
+    EXPECT_EQ(from_json.size, 8192u);
+}
+
+TEST_F(CxlBootstrapConfigTest, ExplicitCommandLineOverridesFileValues) {
+    const auto file = LoadConfig(
+        ".yaml", "enable_cxl: true\ncxl_path: /dev/dax1.0\ncxl_size: 4096\n");
+    const CxlBootstrapCommandLineOverrides command_line{
+        .enabled = false, .path = "", .size = 0};
+
+    const auto resolved = ResolveCxlBootstrapConfig(file.get(), command_line);
+    EXPECT_FALSE(resolved.enabled);
+    EXPECT_TRUE(resolved.path.empty());
+    EXPECT_EQ(resolved.size, 0u);
+}
+
+TEST_F(CxlBootstrapConfigTest, ChecksSizeRepresentabilityForAllSources) {
+    const auto yaml = LoadConfig(".yaml", "cxl_size: 18446744073709551615\n");
+    const auto json =
+        LoadConfig(".json", R"({"cxl_size":18446744073709551615})");
+    CxlBootstrapCommandLineOverrides command_line;
+    command_line.size = std::numeric_limits<uint64_t>::max();
+
+    if constexpr (sizeof(size_t) < sizeof(uint64_t)) {
+        EXPECT_THROW(ResolveCxlBootstrapConfig(yaml.get(), {}),
+                     std::invalid_argument);
+        EXPECT_THROW(ResolveCxlBootstrapConfig(json.get(), {}),
+                     std::invalid_argument);
+        EXPECT_THROW(ResolveCxlBootstrapConfig(nullptr, command_line),
+                     std::invalid_argument);
+    } else {
+        EXPECT_EQ(ResolveCxlBootstrapConfig(yaml.get(), {}).size,
+                  std::numeric_limits<size_t>::max());
+        EXPECT_EQ(ResolveCxlBootstrapConfig(json.get(), {}).size,
+                  std::numeric_limits<size_t>::max());
+        EXPECT_EQ(ResolveCxlBootstrapConfig(nullptr, command_line).size,
+                  std::numeric_limits<size_t>::max());
+    }
+}
+
+TEST(CxlBootstrapConfigPropagationTest, ReachesServingConfiguration) {
+    MasterConfig master_config{};
+    master_config.cxl.enabled = true;
+    master_config.cxl.path = "/dev/dax1.0";
+    master_config.cxl.size = 4096;
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    WrappedMasterServiceConfig direct_config(master_config, 1);
+    WrappedMasterServiceConfig wrapped_config(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped_config);
+
+    EXPECT_TRUE(direct_config.enable_cxl);
+    EXPECT_EQ(direct_config.cxl_path, "/dev/dax1.0");
+    EXPECT_EQ(direct_config.cxl_size, 4096u);
+    EXPECT_TRUE(service_config.enable_cxl);
+    EXPECT_EQ(service_config.cxl_path, "/dev/dax1.0");
+    EXPECT_EQ(service_config.cxl_size, 4096u);
 }
 
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
