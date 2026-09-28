@@ -263,6 +263,14 @@ class FileStorageTest : public ::testing::Test {
         return region;
     }
 
+    static void RegisterZeroCopy(FileStorage& fileStorage) {
+        fileStorage.RegisterZeroCopyRegion();
+    }
+
+    static bool ZeroCopyActive(FileStorage& fileStorage) {
+        return fileStorage.zero_copy_base_.load() != nullptr;
+    }
+
     int64_t PinnedBytes(FileStorage& fileStorage) {
         return std::dynamic_pointer_cast<OffsetAllocatorStorageBackend>(
                    fileStorage.storage_backend_)
@@ -893,6 +901,81 @@ TEST_F(FileStorageTest, BatchGetServesDaxArenaZeroCopy) {
     ASSERT_TRUE(fileStorage.ReleaseBuffer(pinned->batch_id));
     EXPECT_EQ(PinnedBytes(fileStorage), 0);
     ASSERT_TRUE(fileStorage.ReleaseBuffer(copied_again->batch_id));
+}
+
+// End to end over the TCP transport: the owner registers the arena through a
+// real Client, and a second Client reads the pinned values out of it with the
+// Transfer Engine, as a remote batch_get_offload_object caller does.
+TEST_F(FileStorageTest, RemoteReaderFetchesPinnedDaxValuesOverTcp) {
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_default_kv_lease_ttl(0)
+                                 .set_root_fs_dir("")
+                                 .build()));
+    auto make_client = [&](std::string& endpoint) {
+        endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        return Client::Create(endpoint, master.metadata_url(), "tcp",
+                              std::nullopt, master.master_address());
+    };
+    std::string owner_endpoint, reader_endpoint;
+    auto owner = make_client(owner_endpoint);
+    ASSERT_TRUE(owner.has_value());
+    auto reader = make_client(reader_endpoint);
+    ASSERT_TRUE(reader.has_value());
+
+    const std::string dev = data_path + "/fake_dax.dev";
+    std::ofstream(dev, std::ios::binary).close();
+    fs::resize_file(dev, 16 * 1024 * 1024);
+    SetEnv("MOONCAKE_OFFSET_DAX_DEVICE_PATH", dev);
+    SetEnv("MOONCAKE_OFFSET_DAX_ZERO_COPY", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.storage_filepath = data_path;
+    config.total_size_limit = 8 * 1024 * 1024;
+    config.local_buffer_size = 1024 * 1024;
+    auto file_storage =
+        std::make_unique<FileStorage>(config, owner.value(), owner_endpoint);
+    UnsetEnv("MOONCAKE_OFFSET_DAX_DEVICE_PATH");
+    UnsetEnv("MOONCAKE_OFFSET_DAX_ZERO_COPY");
+
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> data;
+    ASSERT_TRUE(FileStorageBatchOffload(*file_storage, keys, sizes, data));
+    RegisterZeroCopy(*file_storage);
+    ASSERT_TRUE(ZeroCopyActive(*file_storage));
+
+    auto batch = file_storage->BatchGet(keys, sizes);
+    ASSERT_TRUE(batch);
+    EXPECT_GT(PinnedBytes(*file_storage), 0);
+
+    size_t total = 0;
+    for (auto s : sizes) total += static_cast<size_t>(s);
+    std::vector<char> dst(total, 0);
+    ASSERT_TRUE(reader.value()->RegisterLocalMemory(dst.data(), dst.size(),
+                                                    "cpu:0", false, false));
+    std::unordered_map<std::string, std::vector<Slice>> slices;
+    size_t offset = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        slices[keys[i]] = {
+            Slice{dst.data() + offset, static_cast<size_t>(sizes[i])}};
+        offset += static_cast<size_t>(sizes[i]);
+    }
+    ASSERT_TRUE(reader.value()->BatchGetOffloadObject(
+        owner.value()->GetSegmentEndpoint(), keys, batch->pointers, slices));
+
+    offset = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(std::string(dst.data() + offset, sizes[i]), data.at(keys[i]));
+        offset += static_cast<size_t>(sizes[i]);
+    }
+
+    EXPECT_TRUE(file_storage->ReleaseBuffer(batch->batch_id));
+    EXPECT_EQ(PinnedBytes(*file_storage), 0);
+    EXPECT_TRUE(reader.value()->unregisterLocalMemory(dst.data()));
+    // Deregisters the arena before the backend unmaps it.
+    file_storage.reset();
 }
 
 TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {

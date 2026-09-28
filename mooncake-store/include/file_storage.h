@@ -215,6 +215,11 @@ class FileStorage {
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
         ClientBufferAllocator& allocator);
 
+    // Registers the backend's zero-copy region (if any) with the transfer
+    // engine and enables pinned BatchGet. Failure only logs: reads keep
+    // using the copy path.
+    void RegisterZeroCopyRegion();
+
     // Pins the batch in place in the backend's zero-copy region. nullptr
     // means "use the copy path" (zero-copy off, or the backend refused).
     std::shared_ptr<AllocatedBatch> PinBatch(
