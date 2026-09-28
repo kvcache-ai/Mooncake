@@ -399,12 +399,17 @@ DEFINE_bool(enable_disk_eviction, true,
 DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
-DEFINE_bool(enable_multi_tenants, false,
+DEFINE_bool(enable_multi_tenants,
+            mooncake::TenantQuotaBootstrapConfig::kDefaultEnableMultiTenants,
             "Enable strict multi-tenant namespace and quota admission");
-DEFINE_string(tenant_quota_connector_type, "file",
-              "Tenant quota policy connector type");
-DEFINE_string(tenant_quota_connector_uri, "",
-              "Tenant quota policy connector URI");
+DEFINE_string(
+    tenant_quota_connector_type,
+    std::string(mooncake::TenantQuotaBootstrapConfig::kDefaultConnectorType),
+    "Tenant quota policy connector type");
+DEFINE_string(
+    tenant_quota_connector_uri,
+    std::string(mooncake::TenantQuotaBootstrapConfig::kDefaultConnectorUri),
+    "Tenant quota policy connector URI");
 
 // Snapshot related configuration flags (migrated from global_flags)
 DEFINE_string(snapshot_backup_dir, "",
