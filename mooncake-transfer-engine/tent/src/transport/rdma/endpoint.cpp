@@ -1249,10 +1249,18 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
                                     const std::string& msg) {
     // Flow control: wait for pending sends to complete
     std::unique_lock<std::mutex> lock(notify_send_mutex_);
-    notify_send_cv_.wait(lock, [this] {
+    auto slot_free = [this] {
         return !notify_connected_ ||
                notify_pending_count_ < kNotifyMaxPendingSends;
-    });
+    };
+    if (notify_send_stalled_ && !slot_free()) return false;
+    if (!notify_send_cv_.wait_for(lock, kNotifySendStallTimeout, slot_free)) {
+        notify_send_stalled_ = true;
+        LOG(WARNING) << "Notification send queue stalled on endpoint "
+                     << endpoint_name_ << ": " << notify_pending_count_
+                     << " sends unacknowledged";
+        return false;
+    }
     if (!notify_connected_) {
         // Every send on this endpoint fails the same way until it is
         // rebuilt, and the caller has a fallback path; one line per hundred
@@ -1347,6 +1355,7 @@ void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
     std::lock_guard<std::mutex> lock(notify_send_mutex_);
     if (notify_pending_count_ > 0) {
         notify_pending_count_--;
+        notify_send_stalled_ = false;
         notify_send_cv_.notify_one();
     }
 }
