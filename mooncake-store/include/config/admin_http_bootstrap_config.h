@@ -11,8 +11,8 @@ struct AdminHttpBootstrapConfig {
     static constexpr uint16_t kDefaultPort = 8080;
     static constexpr std::string_view kDefaultHost = "0.0.0.0";
 
-    bool enabled = kDefaultEnabled;
-    uint16_t port = kDefaultPort;
+    bool enabled{kDefaultEnabled};
+    uint16_t port{kDefaultPort};
     std::string host{kDefaultHost};
 };
 
