@@ -1,4 +1,4 @@
-// Tests for the current vLLM msgspec and Mooncake publisher map protocols.
+// Tests for the current vLLM, SGLang and Mooncake publisher map protocols.
 
 #include <gtest/gtest.h>
 #include <msgpack.hpp>
@@ -16,12 +16,14 @@
 
 #include "conductor/zmq/msg_decoder.h"
 #include "conductor/kvevent/object_key_parser.h"
+#include "test_fixtures.h"
 
 namespace {
 
 using mooncake::conductor::kvevent::ParsedSglangObjectKey;
 using mooncake::conductor::kvevent::ParseSglangObjectKey;
 using mooncake::conductor::kvevent::ParseVllmObjectKey;
+using mooncake::conductor::test::LoadJsonFixture;
 using mooncake::conductor::zmq::DecodeMooncakeEventBatch;
 using mooncake::conductor::zmq::DecodeSglangEventBatch;
 using mooncake::conductor::zmq::DecodeVllmEventBatch;
@@ -108,6 +110,72 @@ void PackBinary(Packer& packer, const std::vector<uint8_t>& bytes) {
     packer.pack_bin(bytes.size());
     packer.pack_bin_body(reinterpret_cast<const char*>(bytes.data()),
                          bytes.size());
+}
+
+// SGLang's EventBatch stays a positional [ts, events, attn_dp_rank] array while
+// each event is a tagged map, so the envelope is packed separately from events.
+template <typename PackEvents>
+std::string PackSglangBatch(uint32_t event_count, PackEvents pack_events,
+                            std::optional<int64_t> dp_rank = 4) {
+    std::stringstream buffer;
+    Packer packer(buffer);
+    packer.pack_array(3);
+    packer.pack_double(12.5);
+    packer.pack_array(event_count);
+    pack_events(packer);
+    if (dp_rank.has_value()) {
+        packer.pack(*dp_rank);
+    } else {
+        packer.pack_nil();
+    }
+    return buffer.str();
+}
+
+// BlockStored as the current publisher emits it: parent_block_hash, token_ids
+// and lora_id have no upstream default and are always present, while medium,
+// cache_salt and session_id are omitted when left at None.
+void PackSglangStored(Packer& packer, int64_t block_hash = -1,
+                      bool include_medium = true) {
+    packer.pack_map(include_medium ? 7 : 6);
+    packer.pack("type");
+    packer.pack("BlockStored");
+    packer.pack("block_hashes");
+    packer.pack_array(1);
+    packer.pack_int64(block_hash);
+    packer.pack("parent_block_hash");
+    packer.pack_nil();
+    packer.pack("token_ids");
+    packer.pack_array(2);
+    packer.pack_int32(1);
+    packer.pack_int32(2);
+    packer.pack("block_size");
+    packer.pack_int64(2);
+    packer.pack("lora_id");
+    packer.pack_nil();
+    if (include_medium) {
+        packer.pack("medium");
+        packer.pack("GPU");
+    }
+}
+
+void PackSglangRemoved(Packer& packer, int64_t block_hash = -1,
+                       bool include_medium = true) {
+    packer.pack_map(include_medium ? 3 : 2);
+    packer.pack("type");
+    packer.pack("BlockRemoved");
+    packer.pack("block_hashes");
+    packer.pack_array(1);
+    packer.pack_int64(block_hash);
+    if (include_medium) {
+        packer.pack("medium");
+        packer.pack("GPU");
+    }
+}
+
+void PackSglangCleared(Packer& packer) {
+    packer.pack_map(1);
+    packer.pack("type");
+    packer.pack("AllBlocksCleared");
 }
 
 void PackVllmStored(Packer& packer, bool include_unknown = false) {
@@ -1060,75 +1128,31 @@ TEST(MessagePackEnvelope, RejectsEmptyGarbageAndTrailingBytes) {
     ExpectErrorContains(trailing_vllm.error, "trailing bytes");
 }
 
-TEST(DecodeSglangEventBatch, DecodesTaggedArrayAndPreservesHashBits) {
-    std::stringstream buffer;
-    Packer packer(buffer);
-    packer.pack_array(3);
-    packer.pack_double(12.5);
-    packer.pack_array(3);
-
-    // BlockStored(tag, block_hashes, parent, token_ids, block_size, lora_id,
-    // medium).  The first hash is -1 on the wire and must become UINT64_MAX.
-    packer.pack_array(7);
-    packer.pack("BlockStored");
-    packer.pack_array(1);
-    packer.pack_int64(-1);
-    packer.pack_nil();
-    packer.pack_array(2);
-    packer.pack_int32(1);
-    packer.pack_int32(2);
-    packer.pack_int64(2);
-    packer.pack_nil();
-    packer.pack("GPU");
-
-    packer.pack_array(3);
-    packer.pack("BlockRemoved");
-    packer.pack_array(1);
-    packer.pack_int64(-1);
-    packer.pack("GPU");
-
-    packer.pack_array(1);
-    packer.pack("AllBlocksCleared");
-    packer.pack_int64(4);
-
-    const std::string payload = buffer.str();
-    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
-    ASSERT_TRUE(result.ok) << result.error;
-    ASSERT_EQ(result.batch.events.size(), 3u);
-    const auto* stored =
-        std::get_if<SglangStoredEvent>(&*result.batch.events[0].event);
-    ASSERT_NE(stored, nullptr) << result.batch.events[0].error;
-    ASSERT_EQ(stored->block_hashes.size(), 1u);
-    EXPECT_EQ(stored->block_hashes[0], std::numeric_limits<uint64_t>::max());
-    const auto* removed =
-        std::get_if<SglangRemovedEvent>(&*result.batch.events[1].event);
-    ASSERT_NE(removed, nullptr) << result.batch.events[1].error;
-    EXPECT_EQ(removed->block_hashes[0], std::numeric_limits<uint64_t>::max());
-    EXPECT_NE(std::get_if<SglangClearedEvent>(&*result.batch.events[2].event),
-              nullptr);
-}
-
 TEST(DecodeSglangEventBatch, AcceptsOmittedMediumAndBigramTokens) {
     std::stringstream buffer;
     Packer packer(buffer);
     packer.pack_array(3);
     packer.pack_double(1.0);
     packer.pack_array(2);
-    packer.pack_array(6);
+    // Omitting medium is normal: omit_defaults drops fields left at None.
+    packer.pack_map(6);
+    packer.pack("type");
     packer.pack("BlockStored");
+    packer.pack("block_hashes");
     packer.pack_array(1);
     packer.pack_int64(7);
+    packer.pack("parent_block_hash");
     packer.pack_nil();
+    packer.pack("token_ids");
     packer.pack_array(1);
     packer.pack_array(2);
     packer.pack_int32(11);
     packer.pack_int32(12);
+    packer.pack("block_size");
     packer.pack_int64(2);
+    packer.pack("lora_id");
     packer.pack_nil();
-    packer.pack_array(2);
-    packer.pack("BlockRemoved");
-    packer.pack_array(1);
-    packer.pack_int64(7);
+    PackSglangRemoved(packer, 7, /*include_medium=*/false);
     packer.pack_int64(0);
 
     const std::string payload = buffer.str();
@@ -1148,16 +1172,9 @@ TEST(DecodeSglangEventBatch, AcceptsOmittedMediumAndBigramTokens) {
     EXPECT_FALSE(removed->medium.has_value());
 }
 
-TEST(DecodeSglangEventBatch, RejectsMooncakeMapEvents) {
-    const std::string payload = PackMooncakeBatch(
-        1, [](Packer& packer) { PackMooncakeStored(packer); });
-
-    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
-    EXPECT_FALSE(result.ok);
-    ExpectErrorContains(result.error, "event entries must be arrays");
-}
-
-TEST(DecodeSglangEventBatch, RejectsUnsignedHashOutsideSignedWireRange) {
+// The obsolete tagged-array event shape is a rejected input, not a supported
+// compatibility path: there is no format switch and no auto-dispatch.
+TEST(DecodeSglangEventBatch, RejectsLegacyTaggedArrayEvents) {
     std::stringstream buffer;
     Packer packer(buffer);
     packer.pack_array(3);
@@ -1166,17 +1183,373 @@ TEST(DecodeSglangEventBatch, RejectsUnsignedHashOutsideSignedWireRange) {
     packer.pack_array(3);
     packer.pack("BlockRemoved");
     packer.pack_array(1);
-    packer.pack_uint64(std::numeric_limits<uint64_t>::max());
-    packer.pack_nil();
-    packer.pack_nil();
+    packer.pack_int64(-1);
+    packer.pack("GPU");
+    packer.pack_int64(0);
 
     const std::string payload = buffer.str();
+    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
+    // The envelope stays valid, so the rejection is event-local: a malformed
+    // event never discards its valid siblings.
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_EQ(result.batch.events.size(), 1u);
+    EXPECT_FALSE(result.batch.events[0].ok());
+    ExpectErrorContains(result.batch.events[0].error, "expected event map");
+}
+
+TEST(DecodeSglangEventBatch, RejectsUnsignedHashOutsideSignedWireRange) {
+    const std::string payload = PackSglangBatch(1, [](Packer& packer) {
+        packer.pack_map(2);
+        packer.pack("type");
+        packer.pack("BlockRemoved");
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_uint64(std::numeric_limits<uint64_t>::max());
+    });
     const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
     ASSERT_TRUE(result.ok) << result.error;
     ASSERT_EQ(result.batch.events.size(), 1u);
     EXPECT_FALSE(result.batch.events[0].ok());
     ExpectErrorContains(result.batch.events[0].error,
                         "expected signed 64-bit hash");
+}
+
+// Golden payloads encoded by the upstream msgspec definitions.  This is the
+// check that the decoder accepts what the publisher actually emits rather than
+// what the hand-written packers above assume.
+TEST(DecodeSglangEventBatch, DecodesUpstreamGeneratedGoldenPayloads) {
+    const Json::Value fixture =
+        LoadJsonFixture("sglang_map_event_vectors.json");
+    const Json::Value& cases = fixture["cases"];
+    ASSERT_TRUE(cases.isArray());
+    ASSERT_GT(cases.size(), 0u);
+
+    for (const auto& test_case : cases) {
+        const std::string name = test_case["name"].asString();
+        SCOPED_TRACE(name);
+        const std::string payload =
+            BytesFromHex(test_case["payload_hex"].asString());
+        const auto result =
+            DecodeSglangEventBatch(payload.data(), payload.size());
+        ASSERT_TRUE(result.ok) << result.error;
+
+        const Json::Value& expected = test_case["expected"];
+        EXPECT_DOUBLE_EQ(result.batch.timestamp_seconds,
+                         expected["ts"].asDouble());
+        if (expected["attn_dp_rank"].isNull()) {
+            EXPECT_FALSE(result.batch.data_parallel_rank.has_value());
+        } else {
+            ASSERT_TRUE(result.batch.data_parallel_rank.has_value());
+            EXPECT_EQ(*result.batch.data_parallel_rank,
+                      expected["attn_dp_rank"].asInt64());
+        }
+
+        const Json::Value& expected_events = expected["events"];
+        ASSERT_EQ(result.batch.events.size(), expected_events.size());
+        for (Json::ArrayIndex index = 0; index < expected_events.size();
+             ++index) {
+            const Json::Value& expected_event = expected_events[index];
+            const auto& decoded = result.batch.events[index];
+            ASSERT_TRUE(decoded.ok()) << decoded.error;
+            const std::string type = expected_event["type"].asString();
+
+            // Signed wire hashes are recorded as decimal strings and must
+            // arrive as the same 64-bit pattern in uint64.
+            const auto expect_hashes =
+                [&](const std::vector<uint64_t>& actual) {
+                    const Json::Value& hashes = expected_event["block_hashes"];
+                    ASSERT_EQ(actual.size(), hashes.size());
+                    for (Json::ArrayIndex i = 0; i < hashes.size(); ++i) {
+                        EXPECT_EQ(actual[i], static_cast<uint64_t>(std::stoll(
+                                                 hashes[i].asString())));
+                    }
+                };
+
+            if (type == "BlockStored") {
+                const auto* stored =
+                    std::get_if<SglangStoredEvent>(&*decoded.event);
+                ASSERT_NE(stored, nullptr);
+                expect_hashes(stored->block_hashes);
+                if (expected_event["parent_block_hash"].isNull()) {
+                    EXPECT_FALSE(stored->parent_block_hash.has_value());
+                } else {
+                    ASSERT_TRUE(stored->parent_block_hash.has_value());
+                    EXPECT_EQ(
+                        *stored->parent_block_hash,
+                        static_cast<uint64_t>(std::stoll(
+                            expected_event["parent_block_hash"].asString())));
+                }
+                EXPECT_EQ(stored->block_size,
+                          expected_event["block_size"].asInt64());
+                ASSERT_TRUE(stored->token_ids.has_value());
+                ASSERT_EQ(stored->token_ids->size(),
+                          expected_event["token_ids"].size());
+                for (Json::ArrayIndex i = 0;
+                     i < expected_event["token_ids"].size(); ++i) {
+                    EXPECT_EQ((*stored->token_ids)[i],
+                              expected_event["token_ids"][i].asInt());
+                }
+                if (expected_event["lora_id"].isNull()) {
+                    EXPECT_FALSE(stored->lora_id.has_value());
+                } else {
+                    ASSERT_TRUE(stored->lora_id.has_value());
+                    EXPECT_EQ(*stored->lora_id,
+                              expected_event["lora_id"].asInt64());
+                }
+                // An absent key in the fixture means omit_defaults dropped it.
+                if (expected_event.isMember("medium")) {
+                    ASSERT_TRUE(stored->medium.has_value());
+                    EXPECT_EQ(*stored->medium,
+                              expected_event["medium"].asString());
+                } else {
+                    EXPECT_FALSE(stored->medium.has_value());
+                }
+                if (expected_event.isMember("cache_salt")) {
+                    ASSERT_TRUE(stored->cache_salt.has_value());
+                    EXPECT_EQ(*stored->cache_salt,
+                              expected_event["cache_salt"].asString());
+                } else {
+                    EXPECT_FALSE(stored->cache_salt.has_value());
+                }
+            } else if (type == "BlockRemoved") {
+                const auto* removed =
+                    std::get_if<SglangRemovedEvent>(&*decoded.event);
+                ASSERT_NE(removed, nullptr);
+                expect_hashes(removed->block_hashes);
+                if (expected_event.isMember("medium")) {
+                    ASSERT_TRUE(removed->medium.has_value());
+                    EXPECT_EQ(*removed->medium,
+                              expected_event["medium"].asString());
+                } else {
+                    EXPECT_FALSE(removed->medium.has_value());
+                }
+            } else {
+                ASSERT_EQ(type, "AllBlocksCleared");
+                EXPECT_NE(std::get_if<SglangClearedEvent>(&*decoded.event),
+                          nullptr);
+            }
+        }
+    }
+}
+
+TEST(DecodeSglangEventBatch, AcceptsShuffledKeysAndSkipsUnknownFields) {
+    const std::string payload = PackSglangBatch(1, [](Packer& packer) {
+        // Map key order is not significant, and a field added by a newer
+        // publisher must remain skippable.
+        packer.pack_map(8);
+        packer.pack("lora_id");
+        packer.pack_nil();
+        packer.pack("future_field");
+        packer.pack("ignored");
+        packer.pack("block_size");
+        packer.pack_int64(4);
+        packer.pack("token_ids");
+        packer.pack_array(1);
+        packer.pack_int32(5);
+        packer.pack("type");
+        packer.pack("BlockStored");
+        packer.pack("parent_block_hash");
+        packer.pack_int64(-2);
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_int64(9);
+        packer.pack("cache_salt");
+        packer.pack("salt-a");
+    });
+
+    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_TRUE(result.batch.events[0].ok()) << result.batch.events[0].error;
+    const auto* stored =
+        std::get_if<SglangStoredEvent>(&*result.batch.events[0].event);
+    ASSERT_NE(stored, nullptr);
+    EXPECT_EQ(stored->block_size, 4);
+    ASSERT_TRUE(stored->parent_block_hash.has_value());
+    EXPECT_EQ(*stored->parent_block_hash,
+              std::numeric_limits<uint64_t>::max() - 1);
+    ASSERT_TRUE(stored->cache_salt.has_value());
+    EXPECT_EQ(*stored->cache_salt, "salt-a");
+}
+
+TEST(DecodeSglangEventBatch, ValidatesThenDiscardsSessionId) {
+    const std::string payload = PackSglangBatch(2, [](Packer& packer) {
+        packer.pack_map(7);
+        packer.pack("type");
+        packer.pack("BlockStored");
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_int64(3);
+        packer.pack("parent_block_hash");
+        packer.pack_nil();
+        packer.pack("token_ids");
+        packer.pack_array(1);
+        packer.pack_int32(1);
+        packer.pack("block_size");
+        packer.pack_int64(1);
+        packer.pack("lora_id");
+        packer.pack_nil();
+        packer.pack("session_id");
+        packer.pack("session-a");
+
+        // A malformed session_id is still reported rather than ignored.
+        packer.pack_map(7);
+        packer.pack("type");
+        packer.pack("BlockStored");
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_int64(3);
+        packer.pack("parent_block_hash");
+        packer.pack_nil();
+        packer.pack("token_ids");
+        packer.pack_array(1);
+        packer.pack_int32(1);
+        packer.pack("block_size");
+        packer.pack_int64(1);
+        packer.pack("lora_id");
+        packer.pack_nil();
+        packer.pack("session_id");
+        packer.pack_int64(7);
+    });
+
+    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_EQ(result.batch.events.size(), 2u);
+    ASSERT_TRUE(result.batch.events[0].ok()) << result.batch.events[0].error;
+    EXPECT_FALSE(result.batch.events[1].ok());
+    ExpectErrorContains(result.batch.events[1].error, "invalid session_id");
+}
+
+TEST(DecodeSglangEventBatch, RejectsDuplicateAndMissingRecognizedKeys) {
+    const std::string duplicate = PackSglangBatch(1, [](Packer& packer) {
+        packer.pack_map(3);
+        packer.pack("type");
+        packer.pack("BlockRemoved");
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_int64(1);
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_int64(2);
+    });
+    const auto duplicate_result =
+        DecodeSglangEventBatch(duplicate.data(), duplicate.size());
+    ASSERT_TRUE(duplicate_result.ok) << duplicate_result.error;
+    EXPECT_FALSE(duplicate_result.batch.events[0].ok());
+    ExpectErrorContains(duplicate_result.batch.events[0].error,
+                        "duplicate recognized key: block_hashes");
+
+    // lora_id has no upstream default, so its absence is a protocol error even
+    // though the field is nullable.
+    const std::string missing = PackSglangBatch(1, [](Packer& packer) {
+        packer.pack_map(5);
+        packer.pack("type");
+        packer.pack("BlockStored");
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_int64(1);
+        packer.pack("parent_block_hash");
+        packer.pack_nil();
+        packer.pack("token_ids");
+        packer.pack_array(0);
+        packer.pack("block_size");
+        packer.pack_int64(1);
+    });
+    const auto missing_result =
+        DecodeSglangEventBatch(missing.data(), missing.size());
+    ASSERT_TRUE(missing_result.ok) << missing_result.error;
+    EXPECT_FALSE(missing_result.batch.events[0].ok());
+    ExpectErrorContains(missing_result.batch.events[0].error,
+                        "missing required key: lora_id");
+}
+
+TEST(DecodeSglangEventBatch, RejectsCacheContentKeysOnRemovedAndCleared) {
+    const std::string removed = PackSglangBatch(1, [](Packer& packer) {
+        packer.pack_map(3);
+        packer.pack("type");
+        packer.pack("BlockRemoved");
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_int64(1);
+        packer.pack("token_ids");
+        packer.pack_array(0);
+    });
+    const auto removed_result =
+        DecodeSglangEventBatch(removed.data(), removed.size());
+    ASSERT_TRUE(removed_result.ok) << removed_result.error;
+    EXPECT_FALSE(removed_result.batch.events[0].ok());
+    ExpectErrorContains(removed_result.batch.events[0].error,
+                        "BlockRemoved contains recognized key: token_ids");
+
+    const std::string cleared = PackSglangBatch(1, [](Packer& packer) {
+        packer.pack_map(2);
+        packer.pack("type");
+        packer.pack("AllBlocksCleared");
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_int64(1);
+    });
+    const auto cleared_result =
+        DecodeSglangEventBatch(cleared.data(), cleared.size());
+    ASSERT_TRUE(cleared_result.ok) << cleared_result.error;
+    EXPECT_FALSE(cleared_result.batch.events[0].ok());
+    ExpectErrorContains(cleared_result.batch.events[0].error,
+                        "AllBlocksCleared contains recognized key");
+}
+
+TEST(DecodeSglangEventBatch, KeepsValidSiblingsWhenOneEventIsInvalid) {
+    const std::string payload = PackSglangBatch(3, [](Packer& packer) {
+        PackSglangStored(packer, 5);
+        packer.pack_map(2);
+        packer.pack("type");
+        packer.pack("BlockStored");
+        packer.pack("block_size");
+        packer.pack_int64(0);
+        PackSglangCleared(packer);
+    });
+
+    const auto result = DecodeSglangEventBatch(payload.data(), payload.size());
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_EQ(result.batch.events.size(), 3u);
+    EXPECT_TRUE(result.batch.events[0].ok()) << result.batch.events[0].error;
+    EXPECT_FALSE(result.batch.events[1].ok());
+    EXPECT_TRUE(result.batch.events[2].ok()) << result.batch.events[2].error;
+}
+
+TEST(DecodeSglangEventBatch, RejectsNonPositiveBlockSizeAndUnknownType) {
+    const std::string bad_size = PackSglangBatch(1, [](Packer& packer) {
+        packer.pack_map(6);
+        packer.pack("type");
+        packer.pack("BlockStored");
+        packer.pack("block_hashes");
+        packer.pack_array(1);
+        packer.pack_int64(1);
+        packer.pack("parent_block_hash");
+        packer.pack_nil();
+        packer.pack("token_ids");
+        packer.pack_array(0);
+        packer.pack("block_size");
+        packer.pack_int64(0);
+        packer.pack("lora_id");
+        packer.pack_nil();
+    });
+    const auto size_result =
+        DecodeSglangEventBatch(bad_size.data(), bad_size.size());
+    ASSERT_TRUE(size_result.ok) << size_result.error;
+    EXPECT_FALSE(size_result.batch.events[0].ok());
+    ExpectErrorContains(size_result.batch.events[0].error,
+                        "invalid block_size");
+
+    const std::string unknown = PackSglangBatch(1, [](Packer& packer) {
+        packer.pack_map(1);
+        packer.pack("type");
+        packer.pack("BlockUpdated");
+    });
+    const auto unknown_result =
+        DecodeSglangEventBatch(unknown.data(), unknown.size());
+    ASSERT_TRUE(unknown_result.ok) << unknown_result.error;
+    EXPECT_FALSE(unknown_result.batch.events[0].ok());
+    ExpectErrorContains(unknown_result.batch.events[0].error,
+                        "unknown SGLang event type: BlockUpdated");
 }
 
 TEST(SglangObjectKeyParser, CanonicalizesPhysicalComponents) {

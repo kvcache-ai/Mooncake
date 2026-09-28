@@ -246,22 +246,31 @@ std::string PackVllmRemovedBatch(uint64_t hash, int64_t dp_rank = 3) {
     return buf.str();
 }
 
+// SGLang wraps tagged map events in a positional [ts, events, attn_dp_rank]
+// envelope; hashes are signed on the wire.
 std::string PackSglangStoredBatch(int64_t hash, int64_t dp_rank = 3) {
     std::stringstream buf;
     msgpack::packer<std::stringstream> pk(buf);
     pk.pack_array(3);
     pk.pack_double(1.25);
     pk.pack_array(1);
-    pk.pack_array(7);
+    pk.pack_map(7);
+    pk.pack(std::string("type"));
     pk.pack(std::string("BlockStored"));
+    pk.pack(std::string("block_hashes"));
     pk.pack_array(1);
     pk.pack_int64(hash);
+    pk.pack(std::string("parent_block_hash"));
     pk.pack_nil();
+    pk.pack(std::string("token_ids"));
     pk.pack_array(2);
     pk.pack_int32(1);
     pk.pack_int32(2);
+    pk.pack(std::string("block_size"));
     pk.pack_int64(2);
+    pk.pack(std::string("lora_id"));
     pk.pack_nil();
+    pk.pack(std::string("medium"));
     pk.pack(std::string("GPU"));
     pk.pack_int64(dp_rank);
     return buf.str();
@@ -334,14 +343,16 @@ class MockPublisher {
     explicit MockPublisher(bool replay_with_topic = false,
                            std::string replay_topic = "",
                            bool bad_delimiter = false,
-                           bool bad_sequence = false)
+                           bool bad_sequence = false,
+                           PublisherKind publisher_kind = PublisherKind::kVllm)
         : ctx_(1),
           pub_(ctx_, ::zmq::socket_type::pub),
           router_(ctx_, ::zmq::socket_type::router),
           replay_with_topic_(replay_with_topic),
           replay_topic_(std::move(replay_topic)),
           bad_delimiter_(bad_delimiter),
-          bad_sequence_(bad_sequence) {
+          bad_sequence_(bad_sequence),
+          publisher_kind_(publisher_kind) {
         pub_.set(::zmq::sockopt::ipv6, 1);
         pub_.bind("tcp://127.0.0.1:*");
         router_.set(::zmq::sockopt::ipv6, 1);
@@ -453,7 +464,9 @@ class MockPublisher {
                         static_cast<unsigned char>(value & 0xFF);
                     value >>= 8;
                 }
-                const auto payload = PackVllmStoredBatch(sequence);
+                const auto payload = publisher_kind_ == PublisherKind::kSglang
+                                         ? PackSglangStoredBatch(sequence)
+                                         : PackVllmStoredBatch(sequence);
                 // SGLang/older vLLM omit topic; newer vLLM includes it.
                 const std::string delimiter = bad_delimiter_ ? "bad" : "";
                 std::vector<::zmq::const_buffer> reply = {
@@ -493,6 +506,7 @@ class MockPublisher {
     const std::string replay_topic_;
     const bool bad_delimiter_;
     const bool bad_sequence_;
+    const PublisherKind publisher_kind_;
     std::atomic<bool> closed_{false};
     std::atomic<size_t> replay_requests_{0};
     std::atomic<size_t> replay_events_{0};
@@ -869,35 +883,44 @@ TEST(ZMQClient, SequenceTrackingWithReplayConfigured) {
 }
 
 TEST(ZMQClient, EventGapReplaysMissingMessagesBeforeLiveMessage) {
-    MockPublisher publisher;
-    auto handler = std::make_shared<MockEventHandler>();
-    const auto config = TestConfig(publisher);
-    const std::string endpoint = config.endpoint;
-    ZMQClient client(config, handler);
-    ASSERT_EQ(client.Start(), "");
+    for (auto kind : {PublisherKind::kVllm, PublisherKind::kSglang}) {
+        SCOPED_TRACE(static_cast<int>(kind));
+        MockPublisher publisher(false, "", false, false, kind);
+        auto handler = std::make_shared<MockEventHandler>();
+        auto config = TestConfig(publisher);
+        config.publisher_kind = kind;
+        const auto pack = [kind](int64_t hash) {
+            return kind == PublisherKind::kSglang ? PackSglangStoredBatch(hash)
+                                                  : PackVllmStoredBatch(hash);
+        };
+        const std::string endpoint = config.endpoint;
+        ZMQClient client(config, handler);
+        ASSERT_EQ(client.Start(), "");
 
-    const auto first_payload = PackVllmStoredBatch(1);
-    ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
-        publisher.Publish("", first_payload, 10);
-    }));
-    EXPECT_EQ(client.GetDroppedEvents(), 0);
-    EXPECT_EQ(client.GetGapCount(), 0);
+        const auto first_payload = pack(1);
+        ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
+            publisher.Publish("", first_payload, 10);
+        }));
+        EXPECT_EQ(client.GetDroppedEvents(), 0);
+        EXPECT_EQ(client.GetGapCount(), 0);
 
-    publisher.Publish("", PackVllmStoredBatch(2), 15);
-    for (int64_t sequence = 11; sequence <= 14; ++sequence) {
+        publisher.Publish("", pack(2), 15);
+        for (int64_t sequence = 11; sequence <= 14; ++sequence) {
+            ASSERT_TRUE(handler->WaitForBatch(sequence, endpoint,
+                                              std::chrono::seconds(2)));
+        }
         ASSERT_TRUE(
-            handler->WaitForBatch(sequence, endpoint, std::chrono::seconds(2)));
+            handler->WaitForBatch(15, endpoint, std::chrono::seconds(2)));
+        EXPECT_EQ(client.GetLastSequence(), 15);
+        EXPECT_EQ(publisher.ReplayRequestCount(), 1u);
+        EXPECT_EQ(publisher.ReplayEventCount(), 5u);
+        EXPECT_EQ(handler->CountBatches(15, endpoint), 1u);
+        EXPECT_EQ(handler->Sequences(endpoint, 11),
+                  (std::vector<int64_t>{11, 12, 13, 14, 15}));
+        EXPECT_EQ(client.GetDroppedEvents(), 4);
+        EXPECT_EQ(client.GetGapCount(), 1);
+        client.Stop();
     }
-    ASSERT_TRUE(handler->WaitForBatch(15, endpoint, std::chrono::seconds(2)));
-    EXPECT_EQ(client.GetLastSequence(), 15);
-    EXPECT_EQ(publisher.ReplayRequestCount(), 1u);
-    EXPECT_EQ(publisher.ReplayEventCount(), 5u);
-    EXPECT_EQ(handler->CountBatches(15, endpoint), 1u);
-    EXPECT_EQ(handler->Sequences(endpoint, 11),
-              (std::vector<int64_t>{11, 12, 13, 14, 15}));
-    EXPECT_EQ(client.GetDroppedEvents(), 4);
-    EXPECT_EQ(client.GetGapCount(), 1);
-    client.Stop();
 }
 
 TEST(ZMQClient, ReplayWithTopicRecoversGapAndPreservesMetadata) {

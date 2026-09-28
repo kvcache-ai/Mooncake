@@ -1,17 +1,20 @@
 // Focused EventManager, HTTP contract, registration lifecycle, event adapter,
-// and static configuration tests.
+// static configuration, and one ingest-to-query integration test.
 
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 #include <asio.hpp>
 #include <json/json.h>
 #include <msgpack.hpp>
+#include <zmq.hpp>
+#include <zmq_addon.hpp>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <ctime>
 #include <fstream>
@@ -22,6 +25,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "conductor/common/types.h"
@@ -30,6 +34,7 @@
 #include "conductor/prefixindex/hash_strategy.h"
 #include "event_manager_test_peer.h"
 #include "prefix_indexer_test_peer.h"
+#include "test_fixtures.h"
 
 namespace mooncake::conductor::kvevent {
 
@@ -3201,6 +3206,141 @@ TEST(ParseConfigDeathTest, MalformedJsonExits) {
     EXPECT_EXIT(mooncake::conductor::kvevent::ParseConfig(&port),
                 ::testing::ExitedWithCode(1), "");
     std::remove(path.c_str());
+}
+
+// Real upstream msgspec bytes and hashes traverse ZMQ, the handler and HTTP.
+// This tests the event-to-query contract without starting an inference engine.
+class RealZmqPublisher {
+   public:
+    RealZmqPublisher() : context_(1), pub_(context_, ::zmq::socket_type::xpub) {
+        pub_.set(::zmq::sockopt::linger, 0);
+        pub_.set(::zmq::sockopt::rcvtimeo, 5000);
+        pub_.bind("tcp://127.0.0.1:*");
+    }
+
+    std::string Endpoint() { return pub_.get(::zmq::sockopt::last_endpoint); }
+
+    bool WaitForSubscriber() {
+        ::zmq::message_t subscription;
+        const auto size = pub_.recv(subscription);
+        return size && *size > 0 &&
+               static_cast<const unsigned char*>(subscription.data())[0] == 1;
+    }
+
+    void Publish(const std::string& hex) {
+        std::string payload;
+        for (size_t index = 0; index < hex.size(); index += 2) {
+            payload.push_back(static_cast<char>(
+                std::stoul(hex.substr(index, 2), nullptr, 16)));
+        }
+        uint64_t sequence = ++sequence_;
+        unsigned char sequence_bytes[8];
+        for (int index = 7; index >= 0; --index) {
+            sequence_bytes[index] = static_cast<unsigned char>(sequence & 0xFF);
+            sequence >>= 8;
+        }
+        std::array<::zmq::const_buffer, 3> frames = {
+            ::zmq::buffer(std::string_view("")),
+            ::zmq::buffer(sequence_bytes, sizeof(sequence_bytes)),
+            ::zmq::buffer(payload),
+        };
+        ::zmq::send_multipart(pub_, frames);
+    }
+
+   private:
+    ::zmq::context_t context_;
+    ::zmq::socket_t pub_;
+    uint64_t sequence_ = 0;
+};
+
+TEST(SglangIngestToQuery, UpstreamMapsPreserveLocalLifecycle) {
+    const auto fixture = mooncake::conductor::test::LoadJsonFixture(
+        "sglang_map_event_vectors.json");
+    ASSERT_TRUE(fixture.isMember("integration"));
+    const auto& data = fixture["integration"];
+    const auto& tiers = data["tier_publishes"];
+    ASSERT_EQ(tiers.size(), 3u);
+    std::vector<int32_t> tokens;
+    for (const auto& token : data["token_ids"]) {
+        tokens.push_back(token.asInt());
+    }
+
+    RealZmqPublisher publisher;
+    RealZmqPublisher sibling_publisher;
+    EventManager manager({}, 0);
+    ASSERT_TRUE(manager.StartHTTPServer());
+    const auto port = EventManagerTestPeer::HttpPort(manager);
+    auto engine = SglangScopeService("sg-e2e");
+    engine.block_size = data["block_size"].asInt64();
+    engine.endpoint = publisher.Endpoint();
+    engine.replay_endpoint.clear();
+    auto sibling = engine;
+    sibling.instance_id = "sg-sibling";
+    sibling.endpoint = sibling_publisher.Endpoint();
+    for (const auto* service : {&engine, &sibling}) {
+        ASSERT_EQ(HttpPostMsgpack(port, "/register",
+                                  MsgpackDocument(ServiceJson(*service)))
+                      .status,
+                  200);
+    }
+    ASSERT_TRUE(publisher.WaitForSubscriber());
+    ASSERT_TRUE(sibling_publisher.WaitForSubscriber());
+
+    const auto query = [&](const std::string& instance) {
+        const auto response = HttpPostMsgpack(
+            port, "/query",
+            MsgpackDocument(QueryJson(ContextFor(engine), tokens)));
+        EXPECT_EQ(response.status, 200);
+        return ParseMsgpackResponse(response)["instances"][instance];
+    };
+    const auto wait_for = [&](auto predicate) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    };
+
+    for (const auto& tier : tiers) {
+        publisher.Publish(tier["payload_hex"].asString());
+    }
+    const auto& expected = data["expected_cumulative_tokens"];
+    ASSERT_TRUE(wait_for(
+        [&] { return query(engine.instance_id)["disk"] == expected["disk"]; }));
+    const auto before = query(engine.instance_id);
+    for (const auto* field : {"npu", "cpu_local", "cpu_share", "disk"}) {
+        EXPECT_EQ(before[field], expected[field]) << field;
+    }
+    // Local Host/disk presence must not leak to another registered engine.
+    EXPECT_EQ(query(sibling.instance_id)["disk"].asInt64(), 0);
+    sibling_publisher.Publish(tiers[0]["payload_hex"].asString());
+    ASSERT_TRUE(wait_for([&] {
+        return query(sibling.instance_id)["npu"].asInt64() == engine.block_size;
+    }));
+
+    for (const auto& tier : tiers) {
+        publisher.Publish(tier["payload_hex"].asString());
+    }
+    // Ordered remove is a processing barrier for the repeated stores. Unlike
+    // a fixed sleep plus unchanged counts, it proves the stream progressed.
+    publisher.Publish(data["remove_first_block_hex"].asString());
+    ASSERT_TRUE(wait_for(
+        [&] { return query(engine.instance_id)["npu"].asInt64() == 0; }));
+    const auto removed = query(engine.instance_id);
+    for (const auto* field : {"cpu_local", "cpu_share", "disk"}) {
+        EXPECT_EQ(removed[field], before[field]) << field;
+    }
+
+    publisher.Publish(data["clear_all_hex"].asString());
+    ASSERT_TRUE(wait_for(
+        [&] { return query(engine.instance_id)["disk"].asInt64() == 0; }));
+    const auto cleared = query(engine.instance_id);
+    for (const auto* field : {"npu", "cpu_local", "cpu_share", "disk"}) {
+        EXPECT_EQ(cleared[field].asInt64(), 0) << field;
+    }
+    EXPECT_EQ(query(sibling.instance_id)["npu"].asInt64(), engine.block_size);
 }
 
 }  // namespace

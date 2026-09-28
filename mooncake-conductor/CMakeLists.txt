@@ -72,6 +72,7 @@ add_library(
   src/prefixindex/hash_strategy.cpp
   src/prefixindex/prefix_indexer.cpp
   src/zmq/msg_decoder.cpp
+  src/zmq/msgpack_reader.cpp
   src/zmq/zmq_client.cpp
   src/kvevent/object_key_parser.cpp
   src/kvevent/config.cpp
