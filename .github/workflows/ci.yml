@@ -23,6 +23,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  # Only push/schedule builds write: PR-scoped entries are invisible to
+  # other PRs and would evict the main entries every PR reads.
+  SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
+
 jobs:
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
