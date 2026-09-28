@@ -48,7 +48,13 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::put_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_batch_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_parts_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::put_dummy_helper_rpc>(&real_client);
+    server.register_handler<&RealClient::put_batch_dummy_helper_rpc>(
+        &real_client);
+    server.register_handler<&RealClient::put_parts_dummy_helper_rpc>(
+        &real_client);
     server.register_handler<&RealClient::remove_internal>(&real_client);
+    server.register_handler<&RealClient::remove_internal_rpc>(&real_client);
     server.register_handler<&RealClient::removeByRegex_internal>(&real_client);
     server.register_handler<&RealClient::removeAll_internal>(&real_client);
     server.register_handler<&RealClient::batchRemove_internal>(&real_client);
@@ -58,13 +64,19 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::batchIsExistWithOptions_internal>(
         &real_client);
+    server.register_handler<&RealClient::isExist_internal_rpc>(&real_client);
+    server.register_handler<&RealClient::batchIsExist_internal_rpc>(
+        &real_client);
     server.register_handler<&RealClient::probeKey_internal>(&real_client);
     server.register_handler<&RealClient::batchProbeKey_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
     server.register_handler<&RealClient::get_replica_desc>(&real_client);
     server.register_handler<&RealClient::batch_get_replica_desc>(&real_client);
     server.register_handler<&RealClient::batch_get_query_results>(&real_client);
+    server.register_handler<&RealClient::getSize_internal_rpc>(&real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::batch_put_from_dummy_helper_rpc>(
         &real_client);
     server.register_handler<
         &RealClient::batch_put_from_multi_buffers_dummy_helper>(&real_client);
@@ -86,6 +98,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::upsert_batch_dummy_helper>(
         &real_client);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::batch_get_into_dummy_helper_rpc>(
         &real_client);
     server.register_handler<
         &RealClient::batch_get_into_multi_buffers_dummy_helper>(&real_client);
