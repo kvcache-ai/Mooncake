@@ -6,8 +6,13 @@ from math import prod
 import pytest
 
 import mooncake.reshard.weight._planner.contracts as planner_contracts
-from mooncake.reshard.weight._planner.contracts import TransferRegion
-from mooncake.reshard.weight.manifest import ParallelRank, PlacementFragment
+from mooncake.reshard.weight._planner.contracts import (
+    BoundWeightFragment,
+    TransferRegion,
+)
+from mooncake.reshard.weight.manifest import ParallelRank
+
+from .helpers import bound_fragment
 
 
 def test_canonical_contract_exposes_only_n_dim_transfer_regions() -> None:
@@ -19,13 +24,18 @@ def n_dim_fragment(
     fragment_id: str,
     global_offset: tuple[int, ...],
     local_shape: tuple[int, ...],
-) -> PlacementFragment:
-    return PlacementFragment(
-        placement_fragment_id=fragment_id,
+    address: int,
+) -> BoundWeightFragment:
+    return bound_fragment(
+        fragment_id=fragment_id,
         tensor_id="layers.2.experts.w1",
         global_offset=global_offset,
         local_shape=local_shape,
+        address=address,
         nbytes=2 * prod(local_shape),
+        worker_id=fragment_id,
+        endpoint=f"{fragment_id}:12345",
+        device="cuda:0",
         rank=ParallelRank(),
     )
 
@@ -86,11 +96,13 @@ def test_transfer_region_describes_cross_dim_logical_overlap(
         fragment_id="source",
         global_offset=(1, 0, 0),
         local_shape=(2, 6, 8),
+        address=0x10000,
     )
     target = n_dim_fragment(
         fragment_id="target",
         global_offset=target_offset,
         local_shape=target_shape,
+        address=0x20000,
     )
 
     region = TransferRegion(
@@ -124,16 +136,22 @@ def test_transfer_region_describes_cross_dim_logical_overlap(
     with pytest.raises(ValueError, match="exceeds max_segments"):
         tuple(region.iter_segments(max_segments=region.segment_count - 1))
 
+    # TransferPlan is the live, runtime-attested boundary. This test only
+    # exercises address-free N-D region geometry.
+
+
 def test_transfer_region_mixed_radix_iteration_and_n_dim_bounds() -> None:
     source = n_dim_fragment(
         fragment_id="source",
         global_offset=(1, 0, 0),
         local_shape=(2, 6, 8),
+        address=0x10000,
     )
     target = n_dim_fragment(
         fragment_id="target",
         global_offset=(0, 2, 0),
         local_shape=(4, 3, 8),
+        address=0x20000,
     )
     region = TransferRegion(
         tensor_id=source.tensor_id,
@@ -163,11 +181,13 @@ def test_transfer_region_rejects_noncanonical_same_volume_geometry() -> None:
         fragment_id="source",
         global_offset=(1, 0, 0),
         local_shape=(2, 6, 8),
+        address=0x10000,
     )
     target = n_dim_fragment(
         fragment_id="target",
         global_offset=(0, 2, 0),
         local_shape=(4, 3, 8),
+        address=0x20000,
     )
 
     with pytest.raises(ValueError, match="canonical"):

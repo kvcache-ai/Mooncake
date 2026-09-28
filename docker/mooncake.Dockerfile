@@ -15,7 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
-ARG EP_TORCH_VERSIONS="2.13.0"
+ARG EP_TORCH_VERSIONS="2.14.0"
 ARG TORCH_CUDA_ARCH_LIST=""
 # CI can opt in to removing /workspace/build from the builder layer.
 ARG CLEAN_BUILD_ARTIFACTS=0

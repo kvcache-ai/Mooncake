@@ -146,12 +146,55 @@ void TcpTransport::clearQueuedBytesLocked(PeerConnectionGroup& group) {
     group.queued_bytes_saturated = false;
 }
 
+bool TcpTransport::hasQueuedByteCapacityLocked(const PeerConnectionGroup& group,
+                                               uint64_t length) {
+    if (group.queued_byte_capacity == 0) return true;
+    return length <= group.queued_byte_capacity &&
+           group.admitted_bytes <= group.queued_byte_capacity - length;
+}
+
+void TcpTransport::addAdmittedBytesLocked(PeerConnectionGroup& group,
+                                          uint64_t length) {
+    if (group.queued_byte_capacity != 0) group.admitted_bytes += length;
+}
+
+void TcpTransport::removeAdmittedBytesLocked(PeerConnectionGroup& group,
+                                             uint64_t length) {
+    if (group.queued_byte_capacity == 0) return;
+    group.admitted_bytes =
+        group.admitted_bytes >= length ? group.admitted_bytes - length : 0;
+}
+
+void TcpTransport::recomputeAdmittedBytesLocked(PeerConnectionGroup& group) {
+    if (group.queued_byte_capacity == 0) {
+        group.admitted_bytes = 0;
+        return;
+    }
+
+    group.admitted_bytes = 0;
+    auto add_remaining = [&group](const auto& entries) {
+        for (const auto& item : entries) {
+            const uint64_t length = item.slice->length;
+            if (length > group.queued_byte_capacity - group.admitted_bytes) {
+                group.admitted_bytes = group.queued_byte_capacity;
+                return;
+            }
+            group.admitted_bytes += length;
+        }
+    };
+    add_remaining(group.queue);
+    if (group.admitted_bytes < group.queued_byte_capacity)
+        add_remaining(group.pending_admissions);
+}
+
 size_t TcpTransport::expirePendingAdmissionsLocked(
     PeerConnectionGroup& group, std::chrono::steady_clock::time_point now,
     std::deque<TcpWorkItem>& expired) {
     size_t count = 0;
     while (!group.pending_admissions.empty() &&
            group.pending_admissions.front().admission_deadline <= now) {
+        removeAdmittedBytesLocked(
+            group, group.pending_admissions.front().slice->length);
         expired.emplace_back(std::move(group.pending_admissions.front()));
         group.pending_admissions.pop_front();
         ++count;
@@ -209,6 +252,8 @@ void TcpTransport::refreshAdmissionTimerLocked(
         if (group->admission_timer)
             timer_to_cancel = std::move(group->admission_timer);
         while (!group->pending_admissions.empty()) {
+            removeAdmittedBytesLocked(
+                *group, group->pending_admissions.front().slice->length);
             runtime_failed.emplace_back(
                 std::move(group->pending_admissions.front()));
             group->pending_admissions.pop_front();
@@ -244,6 +289,9 @@ void TcpTransport::handleAdmissionTimer(
                 // is therefore stale. Keep this guard for other Asio timer
                 // errors delivered while the matching timer is still active.
                 while (!group->pending_admissions.empty()) {
+                    removeAdmittedBytesLocked(
+                        *group,
+                        group->pending_admissions.front().slice->length);
                     runtime_failed.emplace_back(
                         std::move(group->pending_admissions.front()));
                     group->pending_admissions.pop_front();
@@ -365,7 +413,133 @@ uint64_t TcpTransport::requestGroupPumpLocked(PeerConnectionGroup& group) {
     return group.pump_epoch;
 }
 
-void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
+bool TcpTransport::requestGroupRetirementLocked(PeerConnectionGroup& group) {
+    if (!group.retiring || group.retirement_scheduled ||
+        group.state != GroupState::OPEN) {
+        return false;
+    }
+    group.retirement_scheduled = true;
+    return true;
+}
+
+void TcpTransport::postGroupRetirement(
+    const std::shared_ptr<PeerConnectionGroup>& group) {
+    try {
+        asio::post(group->executor, [group] { runGroupRetirement(group); });
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        group->retirement_scheduled = false;
+    }
+}
+
+void TcpTransport::scheduleGroupRetirement(
+    const std::shared_ptr<PeerConnectionGroup>& group) {
+    bool scheduled = false;
+    {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        scheduled = requestGroupRetirementLocked(*group);
+    }
+    if (scheduled) postGroupRetirement(group);
+}
+
+void TcpTransport::runGroupRetirement(
+    const std::shared_ptr<PeerConnectionGroup>& group) {
+    std::shared_ptr<asio::steady_timer> retry_timer;
+    std::shared_ptr<asio::steady_timer> admission_timer;
+    // Each lane's asio objects live on that lane's shard executor; collect them
+    // together with the executor so teardown can run on the owning shard.
+    struct LaneTeardown {
+        asio::io_context::executor_type executor;
+        std::shared_ptr<ClientSession> session;
+        std::shared_ptr<asio::ip::tcp::resolver> resolver;
+        std::shared_ptr<asio::ip::tcp::socket> socket;
+    };
+    std::vector<LaneTeardown> teardowns;
+    uint64_t pump_epoch = 0;
+    bool retired = false;
+    {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        group->retirement_scheduled = false;
+        if (!group->retiring || group->state != GroupState::OPEN) return;
+
+        if (!group->queue.empty() || !group->pending_admissions.empty()) {
+            pump_epoch = requestGroupPumpLocked(*group);
+        } else {
+            const bool owned_work = std::any_of(
+                group->lanes.begin(), group->lanes.end(), [](const auto& lane) {
+                    return lane->state == LaneState::BUSY ||
+                           lane->state == LaneState::COMPLETING ||
+                           lane->current.has_value();
+                });
+            if (owned_work) return;
+
+            group->state = GroupState::CLOSING;
+            group->pump_scheduled = false;
+            ++group->pump_epoch;
+            ++group->retry_epoch;
+            if (group->retry_epoch == 0) ++group->retry_epoch;
+            ++group->admission_epoch;
+            if (group->admission_epoch == 0) ++group->admission_epoch;
+            retry_timer = std::move(group->retry_timer);
+            admission_timer = std::move(group->admission_timer);
+            for (const auto& lane : group->lanes) {
+                ++lane->operation_epoch;
+                if (lane->operation_epoch == 0) ++lane->operation_epoch;
+                if (lane->session || lane->resolver || lane->socket)
+                    teardowns.push_back(
+                        {lane->executor, std::move(lane->session),
+                         std::move(lane->resolver), std::move(lane->socket)});
+                lane->connect_stage = LaneConnectStage::NONE;
+                lane->state = LaneState::CLOSED;
+            }
+            group->probes_in_flight = 0;
+            group->state = GroupState::CLOSED;
+            retired = true;
+        }
+    }
+
+    if (pump_epoch != 0) {
+        postGroupPump(group, pump_epoch);
+        return;
+    }
+    if (!retired) return;
+
+    // Cancel/close each lane's socket, session and resolver ON ITS OWN SHARD
+    // so these asio objects are only touched by their owning io thread. With
+    // MC_NUM_TCP_IO_THREADS == 1 asio::dispatch runs inline (unchanged
+    // behavior); with more shards it hops to the lane's io thread, avoiding
+    // concurrent close()/cancel() against an outstanding async op.
+    for (auto& teardown : teardowns) {
+        auto session = std::move(teardown.session);
+        auto resolver = std::move(teardown.resolver);
+        auto socket = std::move(teardown.socket);
+        asio::dispatch(teardown.executor, [session, resolver, socket] {
+            if (session) session->cancel();
+            if (resolver) {
+                try {
+                    resolver->cancel();
+                } catch (...) {
+                }
+            }
+            closeSocketNoThrow(socket);
+        });
+    }
+    // Retry/admission timers are group->executor objects and we are running on
+    // that executor, so cancel them here.
+    cancelTimerNoThrow(retry_timer);
+    cancelTimerNoThrow(admission_timer);
+
+    if (auto state = group->owner_state.lock()) {
+        std::lock_guard<std::mutex> state_lock(state->mutex);
+        auto it = std::find(state->retiring_groups.begin(),
+                            state->retiring_groups.end(), group);
+        if (it != state->retiring_groups.end())
+            state->retiring_groups.erase(it);
+    }
+}
+
+void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
+                                         const ConnectionKey& key,
                                          TcpWorkItem work) {
     const auto state = lane_state_;
     std::shared_ptr<PeerConnectionGroup> group;
@@ -373,6 +547,7 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
     std::deque<TcpWorkItem> expired;
     std::deque<TcpWorkItem> runtime_failed;
     std::shared_ptr<asio::steady_timer> timer_to_cancel;
+    std::shared_ptr<PeerConnectionGroup> retiring_group;
     WorkFailureReason rejection_reason = WorkFailureReason::QUEUE_FULL;
     uint64_t pump_epoch = 0;
     [[maybe_unused]] size_t promoted = 0;
@@ -381,6 +556,7 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
     [[maybe_unused]] bool pending_admission = false;
     [[maybe_unused]] bool hard_rejection = false;
     bool timer_armed = false;
+    bool retirement_scheduled = false;
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     size_t queue_depth = 0;
     uint64_t queued_bytes = 0;
@@ -398,21 +574,51 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
                 rejected.emplace(std::move(work));
                 rejection_reason = WorkFailureReason::RUNTIME_UNAVAILABLE;
             } else {
+                auto current_it = state->current_key_by_peer.find(logical_peer);
+                if (current_it == state->current_key_by_peer.end()) {
+                    state->current_key_by_peer.emplace(logical_peer, key);
+                } else if (!(current_it->second == key)) {
+                    const ConnectionKey old_key = current_it->second;
+                    current_it->second = key;
+                    const bool old_key_still_current =
+                        std::any_of(state->current_key_by_peer.begin(),
+                                    state->current_key_by_peer.end(),
+                                    [&old_key](const auto& entry) {
+                                        return entry.second == old_key;
+                                    });
+                    if (!old_key_still_current) {
+                        auto old_group_it = state->groups.find(old_key);
+                        if (old_group_it != state->groups.end()) {
+                            retiring_group = old_group_it->second;
+                            state->retiring_groups.push_back(retiring_group);
+                            state->groups.erase(old_group_it);
+                            std::lock_guard<std::mutex> old_group_lock(
+                                retiring_group->mutex);
+                            retiring_group->retiring = true;
+                            retirement_scheduled =
+                                requestGroupRetirementLocked(*retiring_group);
+                        }
+                    }
+                }
+
                 auto group_it = state->groups.find(key);
                 if (group_it == state->groups.end()) {
                     group = std::make_shared<PeerConnectionGroup>(
-                        key, runtime->executor,
+                        key,
+                        runtime->coordinatorExecutor(ConnectionKeyHash{}(key)),
                         state->max_queued_transfers_per_peer,
                         state->max_pending_admissions_per_peer,
+                        state->max_queued_bytes_per_peer,
                         state->admission_timeout, state->failure_counters);
                     group->lanes.reserve(state->lanes_per_peer);
                     for (size_t i = 0; i < state->lanes_per_peer; ++i) {
-                        group->lanes.push_back(
-                            std::make_shared<ConnectionLane>(i, group));
+                        group->lanes.push_back(std::make_shared<ConnectionLane>(
+                            i, group, runtime->nextLaneExecutor()));
                     }
                     auto [inserted_it, inserted] =
                         state->groups.emplace(key, group);
                     if (!inserted) group = inserted_it->second;
+                    group->owner_state = state;
                 } else {
                     group = group_it->second;
                 }
@@ -432,17 +638,27 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
                                                   expired);
                     promoted = promotePendingAdmissionsLocked(*group);
 
-                    if (group->pending_admissions.empty() &&
-                        group->queue.size() < group->queue_capacity) {
+                    const bool has_byte_capacity =
+                        hasQueuedByteCapacityLocked(*group, work.slice->length);
+                    if (!has_byte_capacity) {
+                        rejected.emplace(std::move(work));
+                        hard_rejection = true;
+                    } else if (group->pending_admissions.empty() &&
+                               group->queue.size() < group->queue_capacity) {
                         group->queue.emplace_back(std::move(work));
                         addQueuedBytesLocked(*group,
                                              group->queue.back().slice->length);
+                        addAdmittedBytesLocked(
+                            *group, group->queue.back().slice->length);
                         direct_admission = true;
                     } else if (group->pending_admissions.size() <
                                group->pending_admission_capacity) {
                         work.admission_deadline =
                             admission_time + group->admission_timeout;
                         group->pending_admissions.emplace_back(std::move(work));
+                        addAdmittedBytesLocked(
+                            *group,
+                            group->pending_admissions.back().slice->length);
                         pending_admission = true;
                     } else {
                         rejected.emplace(std::move(work));
@@ -474,6 +690,7 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
     }
 
     cancelTimerNoThrow(timer_to_cancel);
+    if (retirement_scheduled) postGroupRetirement(retiring_group);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     if (rejected) {
         invokeLaneObserverHook(kLaneQueueRejected, queue_depth, queued_bytes,
@@ -504,8 +721,7 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
     if (rejected)
         failWorkItem(std::move(*rejected), rejection_reason,
                      state->failure_counters);
-    else if (pump_epoch != 0)
-        postGroupPump(group, pump_epoch);
+    if (pump_epoch != 0) postGroupPump(group, pump_epoch);
 }
 
 void TcpTransport::postGroupPump(
@@ -521,6 +737,7 @@ void TcpTransport::postGroupPump(
                 failed_queue.swap(group->queue);
                 clearQueuedBytesLocked(*group);
                 failed_pending.swap(group->pending_admissions);
+                recomputeAdmittedBytesLocked(*group);
                 ++group->admission_epoch;
                 if (group->admission_epoch == 0) ++group->admission_epoch;
                 admission_timer = std::move(group->admission_timer);
@@ -537,6 +754,7 @@ void TcpTransport::postGroupPump(
                    << ":" << group->key.port
                    << (error && *error ? ". Error: " : "")
                    << (error && *error ? error : "");
+        scheduleGroupRetirement(group);
     };
 
     try {
@@ -595,6 +813,7 @@ void TcpTransport::runGroupPump(
             const uint64_t length = lane->current->slice->length;
             group->queue.pop_front();
             removeQueuedBytesLocked(*group, length);
+            removeAdmittedBytesLocked(*group, length);
             if (group->queue.empty()) clearQueuedBytesLocked(*group);
             promoted += promotePendingAdmissionsLocked(*group);
             lane->state = LaneState::BUSY;
@@ -617,6 +836,7 @@ void TcpTransport::runGroupPump(
             if (!hasUsableLaneLocked(*group) && !cooldown_already_started) {
                 failed.swap(group->queue);
                 clearQueuedBytesLocked(*group);
+                recomputeAdmittedBytesLocked(*group);
                 enterReconnectCooldownLocked(*group);
                 failure_reason = WorkFailureReason::CONNECT_FAILED;
                 queue_detached_after_scheduling = true;
@@ -632,6 +852,7 @@ void TcpTransport::runGroupPump(
                 } else {
                     failed.swap(group->queue);
                     clearQueuedBytesLocked(*group);
+                    recomputeAdmittedBytesLocked(*group);
                     failure_reason = WorkFailureReason::RUNTIME_UNAVAILABLE;
                     queue_detached_after_scheduling = true;
                 }
@@ -680,6 +901,7 @@ void TcpTransport::runGroupPump(
                 if (!hasUsableLaneLocked(*group)) {
                     failed.swap(group->queue);
                     clearQueuedBytesLocked(*group);
+                    recomputeAdmittedBytesLocked(*group);
                     enterReconnectCooldownLocked(*group);
                     queue_detached_after_scheduling = true;
                 } else {
@@ -710,10 +932,26 @@ void TcpTransport::runGroupPump(
         invokeLaneObserverHook(kLaneAdmissionTimerArmed, pending_depth, 0, 0,
                                false);
 #endif
-    for (size_t i = 0; i < connect_count; ++i)
-        startLaneConnect(group, connects[i].lane, connects[i].epoch);
-    for (size_t i = 0; i < session_count; ++i)
-        startLaneSession(group, sessions[i].lane, sessions[i].epoch);
+    // Dispatch each lane's connect/session onto that lane's shard executor so
+    // its socket I/O runs on the owning io thread. asio::dispatch runs inline
+    // when already on the target executor (the single-shard/N=1 case stays
+    // identical to the historical inline calls) and hops otherwise.
+    for (size_t i = 0; i < connect_count; ++i) {
+        auto connect_lane = connects[i].lane;
+        uint64_t connect_epoch = connects[i].epoch;
+        asio::dispatch(connect_lane->executor,
+                       [group, connect_lane, connect_epoch] {
+                           startLaneConnect(group, connect_lane, connect_epoch);
+                       });
+    }
+    for (size_t i = 0; i < session_count; ++i) {
+        auto session_lane = sessions[i].lane;
+        uint64_t session_epoch = sessions[i].epoch;
+        asio::dispatch(session_lane->executor,
+                       [group, session_lane, session_epoch] {
+                           startLaneSession(group, session_lane, session_epoch);
+                       });
+    }
     failWorkItems(std::move(failed), failure_reason, group->failure_counters);
     failWorkItems(std::move(expired), WorkFailureReason::QUEUE_TIMEOUT,
                   group->failure_counters);
@@ -721,6 +959,7 @@ void TcpTransport::runGroupPump(
                   WorkFailureReason::RUNTIME_UNAVAILABLE,
                   group->failure_counters);
     if (followup_pump_epoch != 0) postGroupPump(group, followup_pump_epoch);
+    scheduleGroupRetirement(group);
 }
 
 void TcpTransport::startLaneConnect(
@@ -746,9 +985,9 @@ void TcpTransport::startLaneConnect(
 #endif
             try {
                 lane->resolver =
-                    std::make_shared<asio::ip::tcp::resolver>(group->executor);
+                    std::make_shared<asio::ip::tcp::resolver>(lane->executor);
                 lane->socket =
-                    std::make_shared<asio::ip::tcp::socket>(group->executor);
+                    std::make_shared<asio::ip::tcp::socket>(lane->executor);
                 lane->connect_stage = LaneConnectStage::RESOLVING;
                 lane->resolver->async_resolve(
                     group->key.host, std::to_string(group->key.port),
@@ -868,6 +1107,7 @@ void TcpTransport::handleLaneConnected(
     } else if (pump_epoch != 0) {
         postGroupPump(group, pump_epoch);
     }
+    scheduleGroupRetirement(group);
 }
 
 void TcpTransport::handleLaneConnectFailure(
@@ -910,6 +1150,7 @@ void TcpTransport::handleLaneConnectFailure(
                 !hasUntriedDisconnectedLaneLocked(*group)) {
                 failed.swap(group->queue);
                 clearQueuedBytesLocked(*group);
+                recomputeAdmittedBytesLocked(*group);
                 enterReconnectCooldownLocked(*group);
                 cooldown_started = true;
                 expirePendingAdmissionsLocked(
@@ -958,6 +1199,7 @@ void TcpTransport::handleLaneConnectFailure(
                   WorkFailureReason::RUNTIME_UNAVAILABLE,
                   group->failure_counters);
     if (pump_epoch != 0) postGroupPump(group, pump_epoch);
+    scheduleGroupRetirement(group);
 }
 
 void TcpTransport::startLaneSession(
@@ -1117,6 +1359,7 @@ void TcpTransport::handleLaneTerminal(
                            active_sockets, false);
 #endif
     if (pump_epoch != 0) postGroupPump(group, pump_epoch);
+    scheduleGroupRetirement(group);
 }
 
 void TcpTransport::completeTerminalAction(TerminalAction action) noexcept {
@@ -1216,8 +1459,10 @@ void TcpTransport::shutdownConnectionLanes() {
         std::lock_guard<std::mutex> state_lock(state->mutex);
         if (state->shutting_down) return;
         state->shutting_down = true;
-        groups.reserve(state->groups.size());
+        groups.reserve(state->groups.size() + state->retiring_groups.size());
         for (const auto& entry : state->groups) groups.push_back(entry.second);
+        for (const auto& group : state->retiring_groups)
+            groups.push_back(group);
     }
 
     for (const auto& group : groups) {
@@ -1231,6 +1476,7 @@ void TcpTransport::shutdownConnectionLanes() {
             accepted_queue.swap(group->queue);
             accepted_pending.swap(group->pending_admissions);
             clearQueuedBytesLocked(*group);
+            recomputeAdmittedBytesLocked(*group);
             ++group->retry_epoch;
             if (group->retry_epoch == 0) ++group->retry_epoch;
             ++group->admission_epoch;
@@ -1249,49 +1495,70 @@ void TcpTransport::shutdownConnectionLanes() {
     }
 
     auto cancellation_posts = std::make_shared<LaneCancellationPostTracker>();
-    if (context_ && running_) {
+    if (io_pool_ && running_) {
+        struct LaneTeardown {
+            asio::io_context::executor_type executor;
+            std::shared_ptr<ClientSession> session;
+            std::shared_ptr<asio::ip::tcp::resolver> resolver;
+            std::shared_ptr<asio::ip::tcp::socket> socket;
+        };
         for (const auto& group : groups) {
-            cancellation_posts->add();
-            try {
-                asio::post(group->executor, [group, cancellation_posts] {
-                    std::vector<std::shared_ptr<ClientSession>> sessions;
-                    std::vector<std::shared_ptr<asio::ip::tcp::resolver>>
-                        resolvers;
-                    std::vector<std::shared_ptr<asio::ip::tcp::socket>> sockets;
-                    std::shared_ptr<asio::steady_timer> retry_timer;
-                    std::shared_ptr<asio::steady_timer> admission_timer;
-                    {
-                        std::lock_guard<std::mutex> lock(group->mutex);
-                        retry_timer = group->retry_timer;
-                        admission_timer = group->admission_timer;
-                        for (const auto& lane : group->lanes) {
-                            if (lane->session)
-                                sessions.push_back(lane->session);
-                            if (lane->resolver)
-                                resolvers.push_back(lane->resolver);
-                            if (lane->socket) sockets.push_back(lane->socket);
-                        }
-                    }
-                    for (const auto& session : sessions)
-                        if (session) session->cancel();
-                    for (const auto& resolver : resolvers) {
-                        if (!resolver) continue;
-                        try {
-                            resolver->cancel();
-                        } catch (...) {
-                        }
-                    }
-                    for (const auto& socket : sockets)
-                        closeSocketNoThrow(socket);
-                    if (retry_timer) {
-                        asio::error_code timer_ec;
-                        retry_timer->cancel(timer_ec);
-                    }
-                    cancelTimerNoThrow(admission_timer);
+            std::vector<LaneTeardown> teardowns;
+            std::shared_ptr<asio::steady_timer> retry_timer;
+            std::shared_ptr<asio::steady_timer> admission_timer;
+            {
+                std::lock_guard<std::mutex> lock(group->mutex);
+                retry_timer = group->retry_timer;
+                admission_timer = group->admission_timer;
+                for (const auto& lane : group->lanes) {
+                    if (lane->session || lane->resolver || lane->socket)
+                        teardowns.push_back({lane->executor, lane->session,
+                                             lane->resolver, lane->socket});
+                }
+            }
+            // Cancel/close each lane's asio objects on the lane's own shard;
+            // the group timers stay on the coordinator (group) executor. Each
+            // post is tracked so waitUntil() waits for all of them. At N=1
+            // asio::dispatch runs inline on the single io thread.
+            for (auto& teardown : teardowns) {
+                cancellation_posts->add();
+                auto session = teardown.session;
+                auto resolver = teardown.resolver;
+                auto socket = teardown.socket;
+                try {
+                    asio::dispatch(
+                        teardown.executor,
+                        [session, resolver, socket, cancellation_posts] {
+                            if (session) session->cancel();
+                            if (resolver) {
+                                try {
+                                    resolver->cancel();
+                                } catch (...) {
+                                }
+                            }
+                            closeSocketNoThrow(socket);
+                            cancellation_posts->done();
+                        });
+                } catch (...) {
                     cancellation_posts->done();
-                });
-            } catch (...) {
-                cancellation_posts->done();
+                }
+            }
+            if (retry_timer || admission_timer) {
+                cancellation_posts->add();
+                try {
+                    asio::dispatch(
+                        group->executor,
+                        [retry_timer, admission_timer, cancellation_posts] {
+                            if (retry_timer) {
+                                asio::error_code timer_ec;
+                                retry_timer->cancel(timer_ec);
+                            }
+                            cancelTimerNoThrow(admission_timer);
+                            cancellation_posts->done();
+                        });
+                } catch (...) {
+                    cancellation_posts->done();
+                }
             }
         }
         cancellation_posts->waitUntil(std::chrono::steady_clock::now() +
@@ -1299,8 +1566,10 @@ void TcpTransport::shutdownConnectionLanes() {
     }
 
     running_ = false;
-    if (context_) context_->io_context.stop();
-    if (thread_.joinable()) thread_.join();
+    // Stopping the pool stops every shard io_context and joins every io
+    // thread; after this returns no handler can run, which is the quiescence
+    // barrier for the synchronous teardown below.
+    if (io_pool_) io_pool_->stop();
 
     std::deque<TcpWorkItem> deferred;
     std::vector<std::shared_ptr<ClientSession>> sessions;
@@ -1379,6 +1648,8 @@ void TcpTransport::shutdownConnectionLanes() {
     {
         std::lock_guard<std::mutex> state_lock(state->mutex);
         state->groups.clear();
+        state->current_key_by_peer.clear();
+        state->retiring_groups.clear();
         state->runtime.reset();
     }
     groups.clear();

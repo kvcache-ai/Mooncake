@@ -10,7 +10,7 @@ die() {
 }
 
 usage() {
-  echo "Usage: $0 <up|status|collect|restart|down|smoke|restart-smoke|failpoint-smoke|failpoint-crash-smoke|remove-boundary-smoke|standby-read-smoke|promotion-catchup-smoke|ha-failover-smoke|allocator-recovery-smoke|allocator-recovery-matrix|non-ha-smoke> [options]" >&2
+  echo "Usage: $0 <up|status|collect|restart|down|smoke|restart-smoke|failpoint-smoke|failpoint-crash-smoke|remove-boundary-smoke|standby-read-smoke|promotion-catchup-smoke|ha-failover-smoke|allocator-recovery-smoke|allocator-recovery-matrix|non-ha-smoke|capacity-soak|capacity-nospace> [options]" >&2
 }
 
 parse_up_options() {
@@ -24,6 +24,8 @@ parse_up_options() {
   OPLOG_STORE_TYPE=etcd_batch_record
   BATCH_ENTRIES=1024
   RETRY_TIMEOUT_SEC=180
+  ENABLE_OPLOG_SNAPSHOT=false
+  SNAPSHOT_CHUNK_OBJECT_COUNT=1000000
   MASTER_CONFIG=""
   USE_ETCD_OBSERVER=true
   NON_HA_WORKERS=4
@@ -39,6 +41,8 @@ parse_up_options() {
   RECOVERY_REFILL_OBJECTS=120
   RECOVERY_PRESSURE_SEC=10
   RECOVERY_SEGMENT_BYTES=268435456
+  CAPACITY_SECONDS=3600
+  CAPACITY_MAX_BATCHES=2048
   ETCD_ENDPOINTS=""
   ETCD_BIN=${ETCD_BIN:-etcd}
   while (($#)); do
@@ -86,6 +90,15 @@ parse_up_options() {
       --retry-timeout-sec)
         (($# >= 2)) || die "--retry-timeout-sec requires a value"
         RETRY_TIMEOUT_SEC=$2
+        shift 2
+        ;;
+      --enable-oplog-snapshot)
+        ENABLE_OPLOG_SNAPSHOT=true
+        shift
+        ;;
+      --snapshot-chunk-object-count)
+        (($# >= 2)) || die "--snapshot-chunk-object-count requires a value"
+        SNAPSHOT_CHUNK_OBJECT_COUNT=$2
         shift 2
         ;;
       --master-config)
@@ -162,6 +175,16 @@ parse_up_options() {
         FAILPOINT_TIMEOUT_SEC=$2
         shift 2
         ;;
+      --capacity-seconds)
+        (($# >= 2)) || die "--capacity-seconds requires a value"
+        CAPACITY_SECONDS=$2
+        shift 2
+        ;;
+      --capacity-max-batches)
+        (($# >= 2)) || die "--capacity-max-batches requires a value"
+        CAPACITY_MAX_BATCHES=$2
+        shift 2
+        ;;
       --etcd-endpoints)
         (($# >= 2)) || die "--etcd-endpoints requires a value"
         ETCD_ENDPOINTS=$2
@@ -176,10 +199,14 @@ parse_up_options() {
     esac
   done
   [[ -d "$BUILD_DIR" ]] || die "build directory does not exist: $BUILD_DIR"
+  [[ "$CAPACITY_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "capacity-seconds must be positive"
+  [[ "$CAPACITY_MAX_BATCHES" =~ ^[1-9][0-9]*$ ]] || die "capacity-max-batches must be positive"
   [[ "$MASTER_COUNT" =~ ^[1-9][0-9]*$ ]] || die "masters must be positive"
   [[ "$CLIENT_COUNT" =~ ^[0-9]+$ ]] || die "clients must be non-negative"
   [[ "$BATCH_ENTRIES" =~ ^[1-9][0-9]*$ ]] ||
     die "batch-entries must be positive"
+  [[ "$SNAPSHOT_CHUNK_OBJECT_COUNT" =~ ^[1-9][0-9]*$ ]] ||
+    die "snapshot-chunk-object-count must be positive"
   [[ "$START_TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] ||
     die "timeout-sec must be positive"
   [[ "$FAILPOINT_TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] ||
@@ -220,7 +247,7 @@ require_executable() {
 up_cluster() {
   MASTER_BIN="$BUILD_DIR/mooncake-store/src/mooncake_master"
   INSPECTOR_BIN="$BUILD_DIR/mooncake-store/tools/oplog_batch_inspector"
-  METADATA_SCRIPT="$REPO_ROOT/mooncake-wheel/mooncake/http_metadata_server.py"
+  METADATA_SCRIPT="$REPO_ROOT/python/mooncake/http_metadata_server.py"
   require_executable "$MASTER_BIN"
   [[ "$USE_ETCD_OBSERVER" != true ]] || require_executable "$INSPECTOR_BIN"
   [[ -f "$METADATA_SCRIPT" ]] || die "missing executable: $METADATA_SCRIPT"
@@ -350,11 +377,20 @@ start_master() {
     environment=(env "MOONCAKE_TEST_FAILPOINT_DIR=$FAILPOINT_DIR"
       "MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC=$FAILPOINT_TIMEOUT_SEC")
   fi
+  if [[ "$ENABLE_OPLOG_SNAPSHOT" == true ]]; then
+    mkdir -p "$RUN_DIR/snapshots"
+    if ((${#environment[@]} == 0)); then
+      environment=(env)
+    fi
+    environment+=("MOONCAKE_SNAPSHOT_LOCAL_PATH=$RUN_DIR/snapshots")
+  fi
   local -a ha_args=(--enable_ha=false)
   local -a non_ha_args=()
   local -a config_args=()
   local -a allocator_args=()
   [[ -z "$MASTER_CONFIG" ]] || config_args=(--config_path="$MASTER_CONFIG")
+  [[ "$SNAPSHOT_CHUNK_OBJECT_COUNT" =~ ^[1-9][0-9]*$ ]] ||
+    die "snapshot-chunk-object-count must be positive"
   [[ -z "$MEMORY_ALLOCATOR" ]] ||
     allocator_args=(--memory_allocator="$MEMORY_ALLOCATOR")
   if [[ "$ENABLE_HA" == true ]]; then
@@ -362,6 +398,9 @@ start_master() {
       --ha_backend_connstring="$ETCD_ENDPOINTS"
       --etcd_endpoints="$ETCD_ENDPOINTS" --cluster_id="$CLUSTER_ID"
       --enable_oplog=true
+      --enable_oplog_snapshot="$ENABLE_OPLOG_SNAPSHOT"
+      --snapshot_chunk_object_count="$SNAPSHOT_CHUNK_OBJECT_COUNT"
+      --snapshot_object_store_type=local
       --oplog_batch_max_entries="$BATCH_ENTRIES"
       --batch_oplog_retry_timeout_sec="$RETRY_TIMEOUT_SEC")
   else
@@ -388,6 +427,8 @@ write_cluster_env() {
     printf 'OPLOG_STORE_TYPE=%q\n' "$OPLOG_STORE_TYPE"
     printf 'BATCH_ENTRIES=%q\n' "$BATCH_ENTRIES"
     printf 'RETRY_TIMEOUT_SEC=%q\n' "$RETRY_TIMEOUT_SEC"
+    printf 'ENABLE_OPLOG_SNAPSHOT=%q\n' "$ENABLE_OPLOG_SNAPSHOT"
+    printf 'SNAPSHOT_CHUNK_OBJECT_COUNT=%q\n' "$SNAPSHOT_CHUNK_OBJECT_COUNT"
     printf 'MASTER_CONFIG=%q\n' "$MASTER_CONFIG"
     printf 'USE_ETCD_OBSERVER=%q\n' "$USE_ETCD_OBSERVER"
     printf 'NON_HA_WORKERS=%q\n' "$NON_HA_WORKERS"
@@ -424,6 +465,8 @@ load_cluster_env() {
   OPLOG_STORE_TYPE=${OPLOG_STORE_TYPE:-etcd_batch_record}
   BATCH_ENTRIES=${BATCH_ENTRIES:-1024}
   RETRY_TIMEOUT_SEC=${RETRY_TIMEOUT_SEC:-180}
+  ENABLE_OPLOG_SNAPSHOT=${ENABLE_OPLOG_SNAPSHOT:-false}
+  SNAPSHOT_CHUNK_OBJECT_COUNT=${SNAPSHOT_CHUNK_OBJECT_COUNT:-1000000}
   MASTER_CONFIG=${MASTER_CONFIG:-}
   USE_ETCD_OBSERVER=${USE_ETCD_OBSERVER:-true}
   NON_HA_WORKERS=${NON_HA_WORKERS:-4}
@@ -1856,7 +1899,7 @@ main() {
   local command=$1
   shift
   case "$command" in
-    up | smoke | restart-smoke | failpoint-smoke | failpoint-crash-smoke | remove-boundary-smoke | standby-read-smoke | promotion-catchup-smoke | ha-failover-smoke | allocator-recovery-smoke | allocator-recovery-matrix | non-ha-smoke)
+    up | smoke | restart-smoke | failpoint-smoke | failpoint-crash-smoke | remove-boundary-smoke | standby-read-smoke | promotion-catchup-smoke | ha-failover-smoke | allocator-recovery-smoke | allocator-recovery-matrix | non-ha-smoke | capacity-soak | capacity-nospace)
       parse_up_options "$@"
       if [[ "$command" == allocator-recovery-smoke ||
             "$command" == allocator-recovery-matrix ]] &&
@@ -1870,7 +1913,10 @@ main() {
       if [[ "$USE_ETCD_OBSERVER" != true && "$ENABLE_HA" == true ]]; then
         die "--no-etcd-observer is only supported by non-ha-smoke"
       fi
-      if [[ "$command" == up ]]; then
+      if [[ "$command" == capacity-soak || "$command" == capacity-nospace ]]; then
+        source "$SCRIPT_DIR/../ha/snapshot/batch_oplog/capacity.sh"
+        capacity_cluster "$command"
+      elif [[ "$command" == up ]]; then
         up_cluster
       elif [[ "$command" == smoke ]]; then
         smoke_cluster
@@ -1915,4 +1961,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -3,14 +3,22 @@
 #include <gtest/gtest.h>
 #include <xxhash.h>
 
+#include <unistd.h>
+
+#include <cstdlib>
+#include <functional>
 #include <limits>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "etcd_helper.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_types.h"
+#include "ha/snapshot/batch_oplog/metadata.h"
 
 namespace mooncake::test {
 namespace {
@@ -63,6 +71,31 @@ class FakeHaKvBackend : public HaKvBackend {
     }
 
     bool SupportsTxn() const override { return supports_txn_; }
+
+    ErrorCode DeleteRange(std::string_view begin_key,
+                          std::string_view end_key) override {
+        delete_ranges.push_back({std::string(begin_key), std::string(end_key)});
+        if (before_delete) {
+            auto callback = std::move(before_delete);
+            before_delete = nullptr;
+            callback();
+        }
+        size_t deleted = 0;
+        auto it = kvs_.lower_bound(std::string(begin_key));
+        while (it != kvs_.end() && it->first < end_key) {
+            if (deleted == delete_fail_after) {
+                return ErrorCode::ETCD_OPERATION_ERROR;
+            }
+            it = kvs_.erase(it);
+            ++deleted;
+        }
+        return delete_result;
+    }
+
+    std::vector<BatchRecordRange> delete_ranges;
+    std::function<void()> before_delete;
+    size_t delete_fail_after{std::numeric_limits<size_t>::max()};
+    ErrorCode delete_result{ErrorCode::OK};
 
     ErrorCode Txn(const KvTxn& txn) override {
         if (!supports_txn_) {
@@ -327,12 +360,33 @@ TEST(OpLogBatchStorageTest, RejectsLegacyEntry) {
 
 TEST(OpLogBatchStorageTest, RejectsLegacySnapshotSidecar) {
     FakeHaKvBackend backend;
+    for (const std::string_view key :
+         {"compaction_floor", "fallback", "latest", "maintenance"}) {
+        ASSERT_EQ(ErrorCode::OK,
+                  backend.Put("/oplog/clusterA/snapshot/" + std::string(key),
+                              "control"));
+    }
     ASSERT_EQ(ErrorCode::OK,
               backend.Put("/oplog/clusterA/snapshot/old/sequence_id", "42"));
     OpLogBatchStorage storage("clusterA", backend);
 
     DurablePrefix prefix;
     EXPECT_NE(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageTest, AllowsBatchSnapshotControlKeys) {
+    FakeHaKvBackend backend;
+    for (const std::string_view key :
+         {"compaction_floor", "fallback", "latest", "maintenance"}) {
+        ASSERT_EQ(ErrorCode::OK,
+                  backend.Put("/oplog/clusterA/snapshot/" + std::string(key),
+                              "control"));
+    }
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+    EXPECT_EQ((DurablePrefix{.batch_id = 0, .last_seq = 0}), prefix);
 }
 
 TEST(OpLogBatchStorageTest, InitDurablePrefixFailsClosedWhenBatchesExist) {
@@ -908,5 +962,181 @@ TEST(OpLogBatchStorageBackendErrorTest, TxnErrorDoesNotAdvanceDurablePrefix) {
     EXPECT_EQ(1u, prefix.batch_id);
     EXPECT_EQ(3u, prefix.last_seq);
 }
+
+TEST(OpLogBatchStorageDeleteTest, InclusiveBoundariesAndProtectedKeys) {
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage("clusterA", backend);
+    const std::vector<uint64_t> ids{0, 1, 2, 9, 10, UINT64_MAX - 1, UINT64_MAX};
+    const std::vector<std::string> protected_keys{
+        BuildDurablePrefixKey("clusterA"),
+        BuildProducerViewKey("clusterA"),
+        ha::BuildBatchOpLogSnapshotLatestKey("clusterA"),
+        ha::BuildBatchOpLogSnapshotFallbackKey("clusterA"),
+        ha::BuildBatchOpLogSnapshotCompactionFloorKey("clusterA"),
+        ha::BuildBatchOpLogSnapshotMaintenanceKey("clusterA"),
+        BuildBatchRecordKey("clusterAB", 1),
+        BuildBatchRecordKey("clusterB", 0)};
+    for (const auto& key : protected_keys) {
+        ASSERT_EQ(ErrorCode::OK, backend.Put(key, "protected"));
+    }
+    for (auto id : ids) {
+        ASSERT_EQ(ErrorCode::OK,
+                  backend.Put(BuildBatchRecordKey("clusterA", id), "record"));
+    }
+    for (auto cutoff : ids) {
+        ASSERT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(cutoff));
+        ASSERT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(cutoff));
+        std::string value;
+        for (auto id : ids) {
+            EXPECT_EQ(
+                id <= cutoff ? ErrorCode::ETCD_KEY_NOT_EXIST : ErrorCode::OK,
+                backend.Get(BuildBatchRecordKey("clusterA", id), value));
+        }
+        for (const auto& key : protected_keys) {
+            ASSERT_EQ(ErrorCode::OK, backend.Get(key, value)) << key;
+            EXPECT_EQ("protected", value);
+        }
+    }
+}
+
+TEST(OpLogBatchStorageDeleteTest, EmptyNamespaceAndInvalidCluster) {
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage("clusterA", backend);
+    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(0));
+    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(UINT64_MAX));
+    backend.delete_ranges.clear();
+    for (const auto* cluster : {"", "/", "a/b"}) {
+        OpLogBatchStorage invalid(cluster, backend);
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, invalid.DeleteBatchesThrough(1));
+    }
+    EXPECT_TRUE(backend.delete_ranges.empty());
+}
+
+TEST(OpLogBatchStorageDeleteTest, AppendInterleavedBeforeDeleteSurvives) {
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage("clusterA", backend);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+    ASSERT_EQ(ErrorCode::OK,
+              storage.WriteBatchAndAdvancePrefix(MakeBatch(1, 1, 1), prefix));
+    backend.before_delete = [&] {
+        EXPECT_EQ(ErrorCode::OK,
+                  storage.WriteBatchAndAdvancePrefix(
+                      MakeBatch(2, 2, 1), {.batch_id = 1, .last_seq = 1}));
+    };
+    ASSERT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(1));
+    OpLogBatchRecord record;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, record));
+    EXPECT_EQ(ErrorCode::OK, storage.ReadBatch(2, record));
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(2u, prefix.batch_id);
+}
+
+TEST(OpLogBatchStorageDeleteTest, FailureDoesNotRetryOrExpandRange) {
+    // Before mutation, partial deletion, and committed-but-response-lost.
+    for (size_t fail_after : {0u, 1u, 3u}) {
+        FakeHaKvBackend backend;
+        OpLogBatchStorage storage("clusterA", backend);
+        for (uint64_t id = 1; id <= 4; ++id) {
+            ASSERT_EQ(
+                ErrorCode::OK,
+                backend.Put(BuildBatchRecordKey("clusterA", id), "record"));
+        }
+        backend.delete_fail_after = fail_after;
+        backend.delete_result = ErrorCode::ETCD_OPERATION_ERROR;
+        EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+                  storage.DeleteBatchesThrough(3));
+        ASSERT_EQ(1u, backend.delete_ranges.size());
+        const auto attempted = backend.delete_ranges.front();
+        EXPECT_EQ(BuildBatchRecordKey("clusterA", 0), attempted.begin_key);
+        EXPECT_EQ(BuildBatchRecordKey("clusterA", 4), attempted.end_key);
+        std::string value;
+        for (uint64_t id = 1; id <= 4; ++id) {
+            EXPECT_EQ(id <= fail_after ? ErrorCode::ETCD_KEY_NOT_EXIST
+                                       : ErrorCode::OK,
+                      backend.Get(BuildBatchRecordKey("clusterA", id), value));
+        }
+        backend.delete_fail_after = std::numeric_limits<size_t>::max();
+        backend.delete_result = ErrorCode::OK;
+        EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(3));
+        ASSERT_EQ(2u, backend.delete_ranges.size());
+        EXPECT_EQ(attempted.begin_key, backend.delete_ranges.back().begin_key);
+        EXPECT_EQ(attempted.end_key, backend.delete_ranges.back().end_key);
+        EXPECT_EQ(ErrorCode::OK,
+                  backend.Get(BuildBatchRecordKey("clusterA", 4), value));
+    }
+}
+
+TEST(EtcdHaKvBackendDeleteTest, RejectsUnboundedAndReversedRanges) {
+    EtcdHaKvBackend backend;
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, backend.DeleteRange("", "z"));
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, backend.DeleteRange("a", ""));
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              backend.DeleteRange("a", std::string_view("\0", 1)));
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, backend.DeleteRange("z", "a"));
+    EXPECT_EQ(ErrorCode::OK, backend.DeleteRange("a", "a"));
+}
+
+#ifdef STORE_USE_ETCD
+TEST(EtcdHaKvBackendDeleteTest, RealEtcdDeleteWhileAppending) {
+    const char* endpoints = std::getenv("MOONCAKE_N10_TEST_ETCD_ENDPOINTS");
+    if (endpoints == nullptr) {
+        GTEST_SKIP()
+            << "Set MOONCAKE_N10_TEST_ETCD_ENDPOINTS for isolated etcd";
+    }
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::ConnectToEtcdStoreClient(endpoints));
+    EtcdHaKvBackend backend;
+    const std::string cluster = "n10-delete-" + std::to_string(getpid());
+    OpLogBatchStorage storage(cluster, backend);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+    ASSERT_EQ(ErrorCode::OK, storage.ClaimProducerView(1));
+    ASSERT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(
+                                 MakeBatch(1, 1, 1), prefix, 1));
+    const std::vector<std::string> protected_keys{
+        ha::BuildBatchOpLogSnapshotLatestKey(cluster),
+        ha::BuildBatchOpLogSnapshotFallbackKey(cluster),
+        ha::BuildBatchOpLogSnapshotMaintenanceKey(cluster),
+        ha::BuildBatchOpLogSnapshotCompactionFloorKey(cluster),
+        BuildBatchRecordKey(cluster + "-other", 1)};
+    for (const auto& key : protected_keys) {
+        ASSERT_EQ(ErrorCode::OK, backend.Put(key, "protected"));
+    }
+    std::thread append([&] {
+        for (uint64_t id = 2; id <= 16; ++id) {
+            EXPECT_EQ(ErrorCode::OK,
+                      storage.WriteBatchAndAdvancePrefix(
+                          MakeBatch(id, id, 1),
+                          {.batch_id = id - 1, .last_seq = id - 1}, 1));
+        }
+    });
+    for (int i = 0; i < 16; ++i) {
+        EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(1));
+    }
+    append.join();
+    OpLogBatchRecord record;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, record));
+    for (uint64_t id = 2; id <= 16; ++id) {
+        EXPECT_EQ(ErrorCode::OK, storage.ReadBatch(id, record));
+    }
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(16u, prefix.batch_id);
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, UINT64_MAX), "record"));
+    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(UINT64_MAX));
+    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesThrough(UINT64_MAX));
+    std::string value;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+              backend.Get(BuildBatchRecordKey(cluster, UINT64_MAX), value));
+    EXPECT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    ViewVersionId view = 0;
+    EXPECT_EQ(ErrorCode::OK, storage.ReadProducerView(view));
+    EXPECT_EQ(1, view);
+    for (const auto& key : protected_keys) {
+        EXPECT_EQ(ErrorCode::OK, backend.Get(key, value));
+        EXPECT_EQ("protected", value);
+    }
+}
+#endif
 
 }  // namespace mooncake::test

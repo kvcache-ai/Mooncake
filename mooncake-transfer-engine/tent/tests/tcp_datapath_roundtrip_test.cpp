@@ -13,10 +13,11 @@
 // limitations under the License.
 
 // End-to-end payload integrity test for the TENT TCP data path: a forked
-// server process serves a registered DRAM buffer over loopback, the client
-// WRITEs a pattern into it and READs it back, comparing byte for byte. This
-// covers the SendData/RecvData RPC handlers (including the copy-reduction
-// paths in ControlClient/ControlService) on any machine, no RDMA required.
+// server process serves a registered buffer over loopback, the client WRITEs
+// a pattern into it and READs it back, comparing byte for byte. This covers the
+// SendData/RecvData RPC handlers (including the copy-reduction paths in
+// ControlClient/ControlService) with DRAM and, when enabled, CUDA memory. No
+// RDMA is required.
 
 #include <gtest/gtest.h>
 #include <sys/wait.h>
@@ -31,6 +32,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
@@ -44,6 +49,59 @@ constexpr size_t kTaskCount = 8;
 constexpr size_t kStride = 8 * 1024 * 1024;
 constexpr size_t kBufferLength =
     2 * kTaskCount * kStride;  // sources in first half, READ dests in second
+
+enum class TestMemory { Dram, Cuda };
+
+class TestBuffer {
+   public:
+    TestBuffer(size_t size, TestMemory memory) : host_(size), memory_(memory) {
+        if (memory_ == TestMemory::Dram) {
+            data_ = host_.data();
+            return;
+        }
+#ifdef USE_CUDA
+        if (cudaMalloc(&data_, size) != cudaSuccess) data_ = nullptr;
+#endif
+    }
+
+    ~TestBuffer() {
+#ifdef USE_CUDA
+        if (memory_ == TestMemory::Cuda && data_) (void)cudaFree(data_);
+#endif
+    }
+
+    TestBuffer(const TestBuffer&) = delete;
+    TestBuffer& operator=(const TestBuffer&) = delete;
+
+    bool available() const { return data_ != nullptr; }
+    void* data() { return data_; }
+    uint8_t* hostData() { return host_.data(); }
+
+    bool copyFromHost() {
+#ifdef USE_CUDA
+        if (memory_ == TestMemory::Cuda) {
+            return cudaMemcpy(data_, host_.data(), host_.size(),
+                              cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+#endif
+        return true;
+    }
+
+    bool copyToHost() {
+#ifdef USE_CUDA
+        if (memory_ == TestMemory::Cuda) {
+            return cudaMemcpy(host_.data(), data_, host_.size(),
+                              cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+#endif
+        return true;
+    }
+
+   private:
+    std::vector<uint8_t> host_;
+    TestMemory memory_;
+    void* data_{nullptr};
+};
 
 class ChildProcessGuard {
    public:
@@ -103,7 +161,8 @@ bool waitBatchDone(TransferEngine& engine, BatchID batch) {
 
 // Drives WRITE-then-READ of kTaskCount non-contiguous slices between two
 // forked processes and verifies the pattern survives the round trip.
-void runWriteThenReadAcrossProcesses(size_t rpc_server_threads) {
+void runWriteThenReadAcrossProcesses(size_t rpc_server_threads,
+                                     TestMemory memory = TestMemory::Dram) {
     int ready_pipe[2];
     int stop_pipe[2];
     ASSERT_EQ(pipe(ready_pipe), 0);
@@ -117,22 +176,23 @@ void runWriteThenReadAcrossProcesses(size_t rpc_server_threads) {
 
         TransferEngine server(makeTcpConfig(rpc_server_threads));
         if (!server.available()) _exit(2);
-        std::vector<uint8_t> buffer(kBufferLength);
-        if (!server.registerLocalMemory(buffer.data(), buffer.size()).ok())
-            _exit(3);
+        TestBuffer buffer(kBufferLength, memory);
+        if (!buffer.available()) _exit(3);
+        if (!server.registerLocalMemory(buffer.data(), kBufferLength).ok())
+            _exit(4);
 
         const std::string segment = server.getSegmentName();
         uint32_t length = static_cast<uint32_t>(segment.size());
         if (write(ready_pipe[1], &length, sizeof(length)) != sizeof(length))
-            _exit(4);
+            _exit(5);
         if (write(ready_pipe[1], segment.data(), length) !=
             static_cast<ssize_t>(length))
-            _exit(5);
+            _exit(6);
 
         char stop = 0;
         const ssize_t stop_result = read(stop_pipe[0], &stop, 1);
         (void)stop_result;
-        (void)server.unregisterLocalMemory(buffer.data(), buffer.size());
+        (void)server.unregisterLocalMemory(buffer.data(), kBufferLength);
         _exit(0);
     }
 
@@ -140,11 +200,25 @@ void runWriteThenReadAcrossProcesses(size_t rpc_server_threads) {
     close(stop_pipe[0]);
     ChildProcessGuard child_guard(child, stop_pipe[1]);
 
+#ifdef USE_CUDA
+    if (memory == TestMemory::Cuda) {
+        int device_count = 0;
+        if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
+            device_count <= 0) {
+            GTEST_SKIP() << "No CUDA device available";
+        }
+    }
+#endif
+
     uint32_t segment_length = 0;
     ssize_t received =
         read(ready_pipe[0], &segment_length, sizeof(segment_length));
     if (received != static_cast<ssize_t>(sizeof(segment_length))) {
         const int status = child_guard.reap();
+        if (memory == TestMemory::Cuda) {
+            FAIL() << "CUDA TCP server initialization failed, child status "
+                   << status;
+        }
         GTEST_SKIP() << "TCP server initialization failed, child status "
                      << status;
     }
@@ -154,14 +228,16 @@ void runWriteThenReadAcrossProcesses(size_t rpc_server_threads) {
 
     TransferEngine client(makeTcpConfig(rpc_server_threads));
     ASSERT_TRUE(client.available());
-    std::vector<uint8_t> buffer(kBufferLength, 0);
+    TestBuffer buffer(kBufferLength, memory);
+    ASSERT_TRUE(buffer.available());
     for (size_t task = 0; task < kTaskCount; ++task) {
-        uint8_t* slice = buffer.data() + task * kStride;
+        uint8_t* slice = buffer.hostData() + task * kStride;
         for (size_t i = 0; i < kDataLength; ++i) {
             slice[i] = static_cast<uint8_t>((task * 131 + i * 7) & 0xff);
         }
     }
-    ASSERT_TRUE(client.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    ASSERT_TRUE(buffer.copyFromHost());
+    ASSERT_TRUE(client.registerLocalMemory(buffer.data(), kBufferLength).ok());
 
     SegmentID segment = 0;
     Status result;
@@ -176,13 +252,15 @@ void runWriteThenReadAcrossProcesses(size_t rpc_server_threads) {
     ASSERT_TRUE(client.getSegmentInfo(segment, info).ok());
     ASSERT_FALSE(info.buffers.empty());
 
+    auto* registered_buffer = static_cast<uint8_t*>(buffer.data());
+
     // READ destination: a second region of the same registered buffer.
     std::vector<Request> write_requests;
     std::vector<Request> read_requests;
     for (size_t task = 0; task < kTaskCount; ++task) {
         Request write_request{};
         write_request.opcode = Request::WRITE;
-        write_request.source = buffer.data() + task * kStride;
+        write_request.source = registered_buffer + task * kStride;
         write_request.target_id = segment;
         write_request.target_offset = info.buffers[0].base + task * kStride;
         write_request.length = kDataLength;
@@ -192,7 +270,7 @@ void runWriteThenReadAcrossProcesses(size_t rpc_server_threads) {
         Request read_request{};
         read_request.opcode = Request::READ;
         read_request.source =
-            buffer.data() + kBufferLength / 2 + task * kDataLength;
+            registered_buffer + kBufferLength / 2 + task * kDataLength;
         read_request.target_id = segment;
         read_request.target_offset = info.buffers[0].base + task * kStride;
         read_request.length = kDataLength;
@@ -212,20 +290,21 @@ void runWriteThenReadAcrossProcesses(size_t rpc_server_threads) {
     ASSERT_TRUE(waitBatchDone(client, batch));
     ASSERT_TRUE(client.freeBatch(batch).ok());
 
+    ASSERT_TRUE(buffer.copyToHost());
     for (size_t task = 0; task < kTaskCount; ++task) {
-        const uint8_t* written = buffer.data() + task * kStride;
+        const uint8_t* written = buffer.hostData() + task * kStride;
         // Patterned sources occupy the first 4MB of each 8MB stride in the
         // buffer's first half; READ destinations are packed contiguously
         // into the second half, so they never overlap a source.
         const uint8_t* read_back =
-            buffer.data() + kBufferLength / 2 + task * kDataLength;
+            buffer.hostData() + kBufferLength / 2 + task * kDataLength;
         EXPECT_EQ(std::memcmp(written, read_back, kDataLength), 0)
             << "slice " << task << " mismatch";
     }
 
     EXPECT_TRUE(client.closeSegment(segment).ok());
     EXPECT_TRUE(
-        client.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+        client.unregisterLocalMemory(buffer.data(), kBufferLength).ok());
 
     const int status = child_guard.finish();
     ASSERT_TRUE(WIFEXITED(status));
@@ -236,11 +315,18 @@ TEST(TcpDataPathRoundtripTest, WriteThenReadAcrossProcesses) {
     runWriteThenReadAcrossProcesses(1);
 }
 
-// Same round trip with a multi-threaded RPC server, as used by bulk-TCP
-// deployments (MC_TENT_RPC_THREADS / rpc_server_threads).
+// Same round trip with a multi-threaded RPC server. SendData/RecvData are
+// offloaded, so this also covers concurrent bulk copies overlapping other
+// RPCs (MC_TENT_RPC_THREADS / rpc_server_threads).
 TEST(TcpDataPathRoundtripTest, WriteThenReadAcrossProcessesMultiThreadedRpc) {
     runWriteThenReadAcrossProcesses(4);
 }
+
+#ifdef USE_CUDA
+TEST(TcpDataPathRoundtripTest, WriteThenReadCudaAcrossProcesses) {
+    runWriteThenReadAcrossProcesses(1, TestMemory::Cuda);
+}
+#endif
 
 }  // namespace
 }  // namespace tent

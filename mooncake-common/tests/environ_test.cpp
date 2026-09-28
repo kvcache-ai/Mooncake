@@ -37,18 +37,6 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MC_TEST_DOUBLE");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
-        // Make sure AWS vars don't leak in from the test runner's env.
-        unsetenv("MOONCAKE_AWS_REGION");
-        unsetenv("MOONCAKE_AWS_S3_ENDPOINT");
-        unsetenv("MOONCAKE_AWS_BUCKET_NAME");
-        unsetenv("MOONCAKE_AWS_ACCESS_KEY_ID");
-        unsetenv("MOONCAKE_AWS_SECRET_ACCESS_KEY");
-        unsetenv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING");
-        unsetenv("MOONCAKE_AWS_USE_HTTPS");
-        unsetenv("MOONCAKE_AWS_REQUEST_CHECKSUM_CALCULATION");
-        unsetenv("MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION");
-        unsetenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS");
-        unsetenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS");
         unsetenv("MOONCAKE_STORE_CHECKSUM");
     }
 };
@@ -157,44 +145,27 @@ TEST_F(EnvironTest, GetDoubleMissingOrInvalidUsesRequestedDefault) {
     EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
 }
 
-// --- AWS / S3 fields ---
-//
-// NOTE: Environ is a singleton whose constructor caches every value the
-// first time Get() is called. So all AWS env vars must be set BEFORE the
-// first Environ::Get() in this process. We therefore cover the populate
-// path in a single test that takes the singleton's "first call" for
-// itself; the default-path behavior is implicitly covered by Environ's
-// constructor defaults (any earlier test would lock the cache to defaults
-// and prevent us from observing populated values here).
-
-TEST_F(EnvironTest, AwsFieldsPopulateFromEnv) {
-    setenv("MOONCAKE_AWS_REGION", "us-east-1", 1);
-    setenv("MOONCAKE_AWS_S3_ENDPOINT", "https://s3.example.com", 1);
-    setenv("MOONCAKE_AWS_BUCKET_NAME", "my-bucket", 1);
-    setenv("MOONCAKE_AWS_ACCESS_KEY_ID", "AKIA-test", 1);
-    setenv("MOONCAKE_AWS_SECRET_ACCESS_KEY", "secret", 1);
-    setenv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING", "0", 1);
-    setenv("MOONCAKE_AWS_USE_HTTPS", "0", 1);
-    setenv("MOONCAKE_AWS_REQUEST_CHECKSUM_CALCULATION", "when_required", 1);
-    setenv("MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION", "when_supported", 1);
-    setenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS", "5000", 1);
-    // Bogus request timeout should fall back to the registered default.
-    setenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS", "bogus", 1);
+TEST_F(EnvironTest, StoreChecksumPopulatesFromEnv) {
     setenv("MOONCAKE_STORE_CHECKSUM", "1", 1);
 
     const auto& e = Environ::Get();
-    EXPECT_EQ(e.GetAwsRegion(), "us-east-1");
-    EXPECT_EQ(e.GetAwsS3Endpoint(), "https://s3.example.com");
-    EXPECT_EQ(e.GetAwsBucketName(), "my-bucket");
-    EXPECT_EQ(e.GetAwsAccessKeyId(), "AKIA-test");
-    EXPECT_EQ(e.GetAwsSecretAccessKey(), "secret");
-    EXPECT_FALSE(e.GetAwsUseVirtualAddressing());
-    EXPECT_FALSE(e.GetAwsUseHttps());
-    EXPECT_EQ(e.GetAwsRequestChecksumCalculation(), "when_required");
-    EXPECT_EQ(e.GetAwsResponseChecksumValidation(), "when_supported");
-    EXPECT_EQ(e.GetAwsConnectTimeoutMs(), 5000);
-    EXPECT_EQ(e.GetAwsRequestTimeoutMs(), 30000);
     EXPECT_TRUE(e.GetStoreChecksumEnabled());
+}
+
+TEST_F(EnvironTest, RdmaDataDirectIsOptIn) {
+    class Source : public mooncake::EnvironSource {
+       public:
+        const char* value = nullptr;
+        const char* Get(const char* name) const override {
+            return std::string(name) == "MC_RDMA_DATA_DIRECT" ? value : nullptr;
+        }
+    } source;
+
+    EXPECT_FALSE(Environ(source).GetRdmaDataDirect());
+    source.value = "1";
+    EXPECT_TRUE(Environ(source).GetRdmaDataDirect());
+    source.value = "0";
+    EXPECT_FALSE(Environ(source).GetRdmaDataDirect());
 }
 
 // --- GetSizeT ---

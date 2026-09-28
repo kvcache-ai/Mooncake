@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "cuda_alike.h"
+#include "common.h"
 
 namespace mooncake {
 namespace device {

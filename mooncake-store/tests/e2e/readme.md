@@ -93,7 +93,7 @@ The script first verifies steady-state `put/get` success with `memory + nof` rep
   - `mooncake-store/src/mooncake_master`
   - `mooncake-integration/store*.so`
 - SPDK has already been built under `extern/spdk`
-- Python environment contains `aiohttp` because the script launches a standalone metadata process with `mooncake-wheel/mooncake/http_metadata_server.py`
+- Python environment contains `aiohttp` because the script launches a standalone metadata process with `python/mooncake/http_metadata_server.py`
 - The script uses `sudo -n` to set hugepages and mount `/dev/hugepages`, so the current user must have passwordless sudo
 
 **Usage**:
@@ -118,7 +118,7 @@ PRE_FAULT_SUCCESS_TARGET=10 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e
 **Notes**:
 
 - The client payload size defaults to `4096` bytes because the current NoF path requires 4K-aligned I/O.
-- The script uses a standalone metadata server process (`mooncake-wheel/mooncake/http_metadata_server.py`) instead of the embedded master metadata server so all four components remain explicit during the test.
+- The script uses a standalone metadata server process (`python/mooncake/http_metadata_server.py`) instead of the embedded master metadata server so all four components remain explicit during the test.
 - In default mode, the script verifies **service continuity** after NoF unmount by checking that post-fault I/O still succeeds.
 - In `CLIENT_GLOBAL_SEGMENT_SIZE=0` mode, the script verifies **NoF-only failure behavior** by checking that post-fault I/O starts failing after the NoF segment is removed.
 - Logs are written under `LOG_DIR` (default `/tmp/mooncake_nof_heartbeat_e2e`) and the final pass/fail summary is printed from `summary.log`.
@@ -149,3 +149,70 @@ python3 store_client_e2e.py \
 - `--payload-size 4096`: keep NoF writes 4K aligned
 - `--duration-sec`: total workload duration
 - `--sleep-ms`: interval between operations
+
+### run_oplog_snapshot_smoke.sh
+
+Runs the batch OpLog snapshot path with two real master processes and a local
+etcd instance. It publishes two snapshots with multiple object chunks, stops
+and restarts the standby, verifies suffix replay and promotion, and audits
+surviving and removed objects.
+
+```bash
+./run_oplog_snapshot_smoke.sh \
+  --build-dir /path/to/build \
+  --run-dir /tmp/mooncake-oplog-snapshot-smoke
+```
+
+Set `--failpoint-dir` to verify the same launcher environment path used by
+crash tests. The script requires `mooncake_master`, `oplog_ha_client`,
+`oplog_batch_inspector`, `hot_standby_snapshot_bootstrap_test`, `etcd`,
+`etcdctl`, `curl`, `setsid`, and Python `aiohttp`. It is a manual real-etcd
+check and is not registered in CI/nightly.
+
+The run directory must be new. The script stores configurations, master and
+client logs, snapshot artifacts, and audit results there, and stops its test
+processes on exit. Local snapshot storage is shared by the two test masters;
+for multi-host deployment, every master must be able to read the same durable
+snapshot artifacts.
+
+The production mode is opt-in with `enable_oplog_snapshot=true` together with
+`enable_oplog=true`, HA/etcd and a configured snapshot object store. The default
+chunk size is 1,000,000 objects and the default snapshot interval is 600 seconds.
+The smoke overrides these to two objects and two seconds. A chunk bounds object
+count, not byte size or total standby memory. Legacy catalog restore is not
+used by this mode. Snapshot upload failures do not stop OpLog apply, but a node
+must not serve if its recovery history cannot be proven complete.
+
+This smoke does not cover the full crash/corruption/lease-contention matrix,
+S3 outages, large-scale memory/freeze-time measurements, or safe OpLog pruning.
+Keep batch history until retention/pruning has its own verified recovery gate.
+
+## Batch OpLog capacity tests
+
+Build `mooncake_master`, `oplog_batch_inspector`, and `oplog_ha_client` with
+`STORE_USE_ETCD=ON`. Put matching etcd/etcdctl 3.5+ binaries on `PATH` and install
+Python `aiohttp`. From the repository root:
+
+```bash
+bash mooncake-store/tests/e2e/run_oplog_batch_cluster_test.sh
+mooncake-store/tests/e2e/run_oplog_batch_cluster.sh capacity-soak \
+  --build-dir /path/to/build --run-dir /tmp/n13-soak \
+  --capacity-seconds 3600 --capacity-max-batches 2048
+mooncake-store/tests/e2e/run_oplog_batch_cluster.sh capacity-nospace \
+  --build-dir /path/to/build --run-dir /tmp/n13-nospace
+```
+
+Both commands require a fresh directory and reject external etcd endpoints. They
+create two masters, one etcd member and shared local snapshots; multi-member quorum
+availability and S3 are not tested. Processes stop on exit; artifacts remain.
+
+The soak checks bounded live batch keys, snapshot/floor progress and periodic
+compact/defrag reclamation. NOSPACE fills history under a 16 MiB quota after
+quiescing masters, then verifies the alarm, reclamation, disarm and recovered writes.
+Both audit surviving/deleted keys across restart and promotion, then test new writes.
+A 30-second soak is only a smoke test; report the actual measured duration.
+
+`<run-dir>/capacity/` contains consistent-revision key/control samples, raw metrics,
+maintenance status before/after compact and defrag, `soak-result.json`, and
+`audits.log`. Process logs and acknowledgement manifests are in `logs/` and
+`workload/`. Batch-specific helpers are in `tests/ha/snapshot/batch_oplog/`.

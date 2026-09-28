@@ -15,7 +15,6 @@
 #include "client_wrapper.h"
 #include "e2e_utils.h"
 #include "types.h"
-#include "utils.h"
 
 USE_engine_flags;
 DEFINE_string(master_server_entry, "etcd://0.0.0.0:2379",

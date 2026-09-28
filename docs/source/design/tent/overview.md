@@ -93,6 +93,14 @@ metrics
 transport-selector
 :::
 
+## TENT High-Performance TCP
+
+:::{toctree}
+:maxdepth: 1
+
+hp-tcp
+:::
+
 ## TENT Quality of Service
 
 :::{toctree}
@@ -107,6 +115,14 @@ qos
 :maxdepth: 1
 
 slice-spraying
+:::
+
+## TENT Deadline Scheduling
+
+:::{toctree}
+:maxdepth: 1
+
+deadline-scheduling
 :::
 
 ## TENT Failover

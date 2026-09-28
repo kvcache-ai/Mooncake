@@ -73,9 +73,12 @@ def create_shared_segment(
     1. ``tp_group`` is a deprecated alias of ``comm_group``. ``device_id``
     defaults to the rank's current accelerator.
 
-    ``mmap`` (default True) uses POSIX shm. Set ``mmap=False`` for the platform
-    VMM fabric path. ``host_register`` (default False) HostRegister's mmap pages
-    for ``device_id`` so ``tensors().data_ptr()`` is a device VA suitable for TE
+    ``mmap`` (default True) uses an unnamed memfd and asks the kernel for THP
+    (``MADV_HUGEPAGE``) so the span can be 2MiB pages without a HugeTLB pool;
+    4KiB pages if THP cannot allocate. Ranks share those pages through the
+    memfd. Set ``mmap=False`` for the platform VMM fabric path.
+    ``host_register`` (default False) HostRegister's mmap pages for
+    ``device_id`` so ``tensors().data_ptr()`` is a device VA suitable for TE
     ``location=\"npu\"`` ROCE D2rH; requires ``mmap=True``. Ascend VMM
     (``mmap=False``) also exposes NPU tensors: the host SVM VA is already
     device-accessible after ``MemSetAccess`` (owner ``MallocMem``, peer
@@ -127,9 +130,7 @@ def create_shared_segment(
     except RuntimeError as exc:
         create_error = str(exc)
 
-    _raise_if_any_rank_failed(
-        create_error, world_size, rank_id, comm_group, "create"
-    )
+    _raise_if_any_rank_failed(create_error, world_size, rank_id, comm_group, "create")
     if segment is None:
         raise SharedSegmentError("Shared segment create returned no segment")
 

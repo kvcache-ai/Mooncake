@@ -4,8 +4,13 @@
 #include <type_traits>
 
 #include <mooncake_ep_utils.cuh>
+#include <elastic/mooncake_ep_elastic_launch.cuh>
+#include <elastic/mooncake_ep_elastic_layout.cuh>
 #include <elastic/mooncake_ep_elastic_ptx.cuh>
 #include <transport/device/comm_device.cuh>
+#ifdef USE_NCCL_DEVICE
+#include <transport/device/nccl_device.cuh>
+#endif
 
 namespace mooncake::elastic::transport {
 
@@ -31,7 +36,27 @@ constexpr int kRedAddReleaseLowWordLast = 1 << 0;
 //
 // Team tags are kept as types so official DeepEP template code can remain close
 // to the source while the actual routing is decided by Mooncake CommCtx.
-struct MooncakeGin {
+struct IbgdaOps {
+    using Context = device::CommCtx;
+    static constexpr bool kIsNccl = false;
+    static constexpr int kNumQPs = MAX_QP_COUNT;
+    static constexpr int kAggregateRequests = 0;
+    // Preserve the established IPC + IBGDA tail-publication granularity.
+    static constexpr int kScaleoutUpdateInterval = 3;
+#ifdef MOONCAKE_EP_USE_MUSA
+    static constexpr int kNumDispatchWarps = 4;
+    static constexpr int kNumDispatchEpilogueWarps = 4;
+    static constexpr int kNumCombineWarps = 4;
+    static constexpr int kNumCombineEpilogueWarps = 4;
+#else
+    static constexpr int kNumDispatchWarps = 8;
+    static constexpr int kNumDispatchEpilogueWarps = 8;
+    static constexpr int kNumCombineWarps = 8;
+    static constexpr int kNumCombineEpilogueWarps = 8;
+#endif
+    static constexpr int kNumHybridScaleoutWarps = 4;
+    static constexpr int kNumHybridForwardWarps = 4;
+    static constexpr int kNumHybridScaleupWarps = 4;
     device::CommCtx ctx;
     int qp_idx = 0;
     int sharing_mode = 0;
@@ -40,10 +65,12 @@ struct MooncakeGin {
     int scaleup_rank_idx = 0;
     int num_scaleup_ranks = 0;
 
-    __device__ __forceinline__ MooncakeGin(
-        const device::CommCtx& ctx, int qp_idx, int sharing_mode, int num_qps,
-        int scaleout_rank_idx = 0, int scaleup_rank_idx = 0,
-        int num_scaleup_ranks = 0, int num_ranks = 1)
+    __device__ __forceinline__ IbgdaOps(const device::CommCtx& ctx, int qp_idx,
+                                        int sharing_mode, int num_qps,
+                                        int scaleout_rank_idx = 0,
+                                        int scaleup_rank_idx = 0,
+                                        int num_scaleup_ranks = 0,
+                                        int num_ranks = 1)
         : ctx(ctx),
           qp_idx(qp_idx),
           sharing_mode(sharing_mode),
@@ -255,7 +282,279 @@ struct MooncakeGin {
         }
     }
 
+    template <typename team_t>
+    __device__ __forceinline__ void reset_completion_tail(
+        int /*channel_idx*/, int /*sender_rank*/) const {}
+
+    template <typename team_t, typename value_t>
+    __device__ __forceinline__ value_t read_completion_tail(
+        value_t* ptr, int /*channel_idx*/, int /*sender_rank*/) const {
+        return ptx::ld_acquire_sys<value_t>(ptr);
+    }
+
+    template <typename team_t, typename value_t>
+    __device__ __forceinline__ void clear_completion_tail(
+        value_t* ptr, int /*channel_idx*/, int /*sender_rank*/) const {
+        *ptr = 0;
+    }
+
+    template <typename team_t, typename value_t>
+    __device__ __forceinline__ void publish_tail(value_t* dst_ptr,
+                                                 int channel_idx,
+                                                 value_t absolute_value,
+                                                 value_t delta, int dst_rank,
+                                                 int flags = 0) const {
+        (void)channel_idx;
+        (void)absolute_value;
+        red_add_rel<team_t>(dst_ptr, delta, dst_rank, flags);
+    }
+
     __device__ __forceinline__ void flush() const { __threadfence_system(); }
 };
+
+#ifdef USE_NCCL_DEVICE
+
+// NCCL implementation of the same compile-time kernel surface as IbgdaOps.
+// LSA peers use direct symmetric pointers. Hybrid scale-out uses NCCL's rail
+// team, while non-hybrid GIN operations use the full world team.
+struct NcclOps {
+    using Context = NcclContext;
+    static constexpr bool kIsNccl = true;
+    static constexpr int kNumQPs = 65;
+    static constexpr int kAggregateRequests = ncclGinOptFlagsAggregateRequests;
+    // Match current DeepEP v2 NCCL rail tail batching.
+    static constexpr int kScaleoutUpdateInterval = 6;
+    static constexpr int kNumDispatchWarps = 27;
+    static constexpr int kNumDispatchEpilogueWarps = 27;
+    static constexpr int kNumCombineWarps = 28;
+    static constexpr int kNumCombineEpilogueWarps = 28;
+    static constexpr int kNumHybridScaleoutWarps = 8;
+    static constexpr int kNumHybridForwardWarps = 8;
+    static constexpr int kNumHybridScaleupWarps = 8;
+
+    // Keep this adapter compact: it is captured by several kernel lambdas.
+    // Team/rank/window state already lives in the pre-bound handle, so
+    // retaining a second NcclContext here would create per-thread local-memory
+    // spills.
+    device::NcclGinHandle gin;
+
+    __device__ __forceinline__ NcclOps(const Context& ctx, int qp_idx,
+                                       int sharing_mode, int /*num_qps*/,
+                                       int /*scaleout_rank_idx*/ = 0,
+                                       int /*scaleup_rank_idx*/ = 0,
+                                       int /*num_scaleup_ranks*/ = 0,
+                                       int /*num_ranks*/ = 1)
+        : gin(ctx.device, static_cast<unsigned int>(qp_idx),
+              sharing_mode == 0 ? device::NcclGinResourceSharing::kCta
+                                : device::NcclGinResourceSharing::kGpu) {}
+
+    template <typename team_t>
+    __device__ __forceinline__ bool is_nvlink_accessible(int dst_rank) const {
+        if constexpr (std::is_same_v<team_t, ScaleupTeam>) {
+            return true;
+        } else if constexpr (std::is_same_v<team_t, ScaleoutTeam>) {
+            return gin.railRank() == dst_rank;
+        } else {
+            return gin.worldRankInLsa(dst_rank);
+        }
+    }
+
+    template <typename team_t>
+    __device__ __forceinline__ bool is_gin_peer(int dst_rank) const {
+        return !is_nvlink_accessible<team_t>(dst_rank);
+    }
+
+    template <typename team_t, typename ptr_t>
+    __device__ __forceinline__ ptr_t* get_sym_ptr_impl(ptr_t* ptr,
+                                                       int dst_rank) const {
+        if constexpr (std::is_same_v<team_t, ScaleupTeam>) {
+            return static_cast<ptr_t*>(gin.lsaPeerPointer(dst_rank, ptr));
+        } else if constexpr (std::is_same_v<team_t, ScaleoutTeam>) {
+            return gin.railRank() == dst_rank ? ptr : nullptr;
+        } else {
+            if (!gin.worldRankInLsa(dst_rank)) return nullptr;
+            return static_cast<ptr_t*>(gin.worldPeerPointer(dst_rank, ptr));
+        }
+    }
+
+    template <typename team_t>
+    __device__ __forceinline__ void* get_sym_ptr(void* ptr,
+                                                 int dst_rank) const {
+        return get_sym_ptr_impl<team_t>(static_cast<uint8_t*>(ptr), dst_rank);
+    }
+
+    template <typename team_t>
+    __device__ __forceinline__ const void* get_sym_ptr(const void* ptr,
+                                                       int dst_rank) const {
+        return get_sym_ptr_impl<team_t>(static_cast<const uint8_t*>(ptr),
+                                        dst_rank);
+    }
+
+    template <typename team_t>
+    __device__ __forceinline__ void put(void* dst_ptr, const void* src_ptr,
+                                        int num_bytes, int dst_rank,
+                                        int flags = 0) const {
+        if constexpr (std::is_same_v<team_t, ScaleupTeam>) {
+            auto* routed =
+                static_cast<uint8_t*>(get_sym_ptr<team_t>(dst_ptr, dst_rank));
+            const auto src_addr = reinterpret_cast<uintptr_t>(src_ptr);
+            const auto dst_addr = reinterpret_cast<uintptr_t>(routed);
+            if (((src_addr | dst_addr | static_cast<uintptr_t>(num_bytes)) &
+                 (sizeof(int4) - 1)) == 0) {
+                const auto* src = reinterpret_cast<const int4*>(src_ptr);
+                auto* dst = reinterpret_cast<int4*>(routed);
+                const int count = num_bytes / static_cast<int>(sizeof(int4));
+                for (int i = 0; i < count; ++i)
+                    dst[i] = device::mc_ld_nc(src + i);
+            } else {
+                const auto* src = static_cast<const uint8_t*>(src_ptr);
+                for (int i = 0; i < num_bytes; ++i) routed[i] = src[i];
+            }
+            __threadfence_system();
+        } else if constexpr (std::is_same_v<team_t, ScaleoutTeam>) {
+            // Match NCCL's native GIN contract: world/rail puts always use the
+            // selected network context. Callers use get_sym_ptr explicitly
+            // when they want an LSA/local bypass.
+            gin.put<device::NcclGinTeam::kRail>(
+                dst_rank, src_ptr, dst_ptr, static_cast<uint32_t>(num_bytes),
+                static_cast<uint32_t>(flags));
+        } else {
+            gin.put<device::NcclGinTeam::kWorld>(
+                dst_rank, src_ptr, dst_ptr, static_cast<uint32_t>(num_bytes),
+                static_cast<uint32_t>(flags));
+        }
+    }
+
+    template <typename team_t, typename value_t>
+    __device__ __forceinline__ void put_value(value_t* dst_ptr, value_t value,
+                                              int dst_rank,
+                                              int flags = 0) const {
+        static_assert(
+            std::is_scalar_v<value_t> && std::is_trivially_copyable_v<value_t>,
+            "NCCL EP put_value requires a trivially copyable scalar");
+        static_assert(sizeof(value_t) == sizeof(uint32_t) ||
+                          sizeof(value_t) == sizeof(uint64_t),
+                      "NCCL EP put_value supports only 4- or 8-byte values");
+        auto* routed = get_sym_ptr_impl<team_t>(dst_ptr, dst_rank);
+        if (routed != nullptr) {
+            ptx::st_relaxed_sys(routed, value);
+        } else if constexpr (std::is_same_v<team_t, ScaleoutTeam>) {
+            gin.putValue<device::NcclGinTeam::kRail>(
+                dst_rank, dst_ptr, value, static_cast<uint32_t>(flags));
+        } else {
+            gin.putValue<device::NcclGinTeam::kWorld>(
+                dst_rank, dst_ptr, value, static_cast<uint32_t>(flags));
+        }
+    }
+
+    template <typename team_t, typename value_t>
+    __device__ __forceinline__ void red_add_rel(value_t* dst_ptr, value_t value,
+                                                int dst_rank,
+                                                int /*flags*/ = 0) const {
+        auto* routed = get_sym_ptr_impl<team_t>(dst_ptr, dst_rank);
+        if (routed != nullptr) {
+            const bool use_gpu_scope =
+                std::is_same_v<team_t, ScaleoutTeam> || routed == dst_ptr;
+            if constexpr (sizeof(value_t) == sizeof(int32_t)) {
+                if (use_gpu_scope) {
+                    ptx::red_add_rel_gpu(reinterpret_cast<int*>(routed),
+                                         static_cast<int>(value));
+                } else {
+                    ptx::red_add_rel_sys(reinterpret_cast<int*>(routed),
+                                         static_cast<int>(value));
+                }
+            } else if constexpr (sizeof(value_t) == sizeof(uint64_t) ||
+                                 sizeof(value_t) == sizeof(int64_t)) {
+                if (use_gpu_scope) {
+                    ptx::red_add_rel_gpu(reinterpret_cast<int64_t*>(routed),
+                                         static_cast<int64_t>(value));
+                } else {
+                    ptx::red_add_rel_sys(reinterpret_cast<int64_t*>(routed),
+                                         static_cast<int64_t>(value));
+                }
+            }
+        } else if constexpr (sizeof(value_t) == sizeof(uint64_t) ||
+                             sizeof(value_t) == sizeof(int64_t)) {
+            if constexpr (std::is_same_v<team_t, ScaleoutTeam>) {
+                gin.signalAdd<device::NcclGinTeam::kRail>(
+                    dst_rank, reinterpret_cast<uint64_t*>(dst_ptr),
+                    static_cast<uint64_t>(value));
+            } else {
+                gin.signalAdd<device::NcclGinTeam::kWorld>(
+                    dst_rank, reinterpret_cast<uint64_t*>(dst_ptr),
+                    static_cast<uint64_t>(value));
+            }
+        }
+    }
+
+    template <typename team_t, typename value_t>
+    __device__ __forceinline__ value_t read_completion_tail(
+        value_t* direct_ptr, int /*channel_idx*/, int /*sender_rank*/) const {
+        static_assert(sizeof(value_t) == sizeof(uint64_t),
+                      "NCCL completion tails must be 64-bit");
+        // NCCL's VA-signal read path resolves this same local window pointer
+        // and performs an acquire atomic load. Keep that operation explicit so
+        // the compiler does not instantiate unrelated runtime backend paths.
+        return ptx::ld_acquire_sys<value_t>(direct_ptr);
+    }
+
+    template <typename team_t, typename value_t>
+    __device__ __forceinline__ void clear_completion_tail(
+        value_t* direct_ptr, int /*channel_idx*/, int /*sender_rank*/) const {
+        // Every NCCL backend resets a VA signal by storing zero to its local
+        // window address. The tail protocol guarantees that remote writers are
+        // quiescent before this cleanup.
+        *direct_ptr = 0;
+    }
+
+    template <typename team_t, typename value_t>
+    __device__ __forceinline__ void publish_tail(value_t* dst_ptr,
+                                                 int /*channel_idx*/,
+                                                 value_t absolute_value,
+                                                 value_t delta, int dst_rank,
+                                                 int flags = 0) const {
+        static_assert(sizeof(value_t) == sizeof(uint64_t),
+                      "NCCL completion tails must be 64-bit");
+        (void)absolute_value;
+        red_add_rel<team_t>(dst_ptr, delta, dst_rank, flags);
+    }
+
+    template <typename team_t>
+    __device__ __forceinline__ void gin_barrier_signal_inc(
+        int dst_team_rank, int signal_id) const {
+        if constexpr (std::is_same_v<team_t, ScaleoutTeam>) {
+            gin.signalIncContext0<device::NcclGinTeam::kRail>(dst_team_rank,
+                                                              signal_id);
+        } else {
+            gin.signalIncContext0<device::NcclGinTeam::kWorld>(dst_team_rank,
+                                                               signal_id);
+        }
+    }
+
+    __device__ __forceinline__ uint64_t
+    gin_barrier_advance_shadow(int signal_id) const {
+        return gin.advanceSignalShadowContext0(signal_id);
+    }
+
+    __device__ __forceinline__ uint64_t
+    gin_barrier_read_signal(int signal_id) const {
+        return gin.readSignalContext0(signal_id);
+    }
+
+    __device__ __forceinline__ void flush_channel() const { gin.flushWarp(); }
+
+    __device__ __forceinline__ void flush() const {
+        const int warps_per_block = static_cast<int>(blockDim.x) / warpSize;
+        const int global_warp = static_cast<int>(blockIdx.x) * warps_per_block +
+                                static_cast<int>(threadIdx.x) / warpSize;
+        const int num_warps = static_cast<int>(gridDim.x) * warps_per_block;
+        for (int context_idx = global_warp; context_idx < gin.contextCount();
+             context_idx += num_warps) {
+            gin.flushContextWarp(context_idx);
+        }
+    }
+};
+
+#endif  // USE_NCCL_DEVICE
 
 }  // namespace mooncake::elastic::transport

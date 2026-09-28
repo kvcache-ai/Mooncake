@@ -36,6 +36,12 @@ else()
   message(STATUS "ROCm/HIP: Disabled")
 endif()
 
+# TENT hylink on Hygon DTK, built on the HIP runtime (requires USE_HIP).
+if(USE_HYLINK)
+  message(STATUS "TENT hylink (DTK): Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_HYLINK)
+endif()
+
 # GDS
 find_library(CUFILE_LIB cufile HINTS ${CUDAToolkit_LIBRARY_DIR})
 find_path(CUFILE_INCLUDE cufile.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
@@ -61,6 +67,31 @@ if(IBVERBS_LIB AND IBVERBS_INCLUDE)
   target_compile_definitions(tent_interface INTERFACE USE_RDMA)
   target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
   target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
+  # ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
+  # newer rdma-core adds active_speed_ex to carry it.
+  include(CheckStructHasMember)
+  set(CMAKE_REQUIRED_INCLUDES ${IBVERBS_INCLUDE})
+  check_struct_has_member(
+    "struct ibv_port_attr" active_speed_ex infiniband/verbs.h
+    HAVE_IBV_ACTIVE_SPEED_EX LANGUAGE CXX)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(HAVE_IBV_ACTIVE_SPEED_EX)
+    target_compile_definitions(tent_interface
+                               INTERFACE HAVE_IBV_ACTIVE_SPEED_EX)
+  endif()
+  # IBV_EVENT_DEVICE_SPEED_CHANGE (rdma-core >= 62) reports a port speed change
+  # without a link flap. It is an enumerator, so probe by compiling.
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${IBVERBS_INCLUDE})
+  check_cxx_source_compiles(
+    "#include <infiniband/verbs.h>
+     int main() { return IBV_EVENT_DEVICE_SPEED_CHANGE == IBV_EVENT_PORT_ACTIVE; }"
+    HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE)
+    target_compile_definitions(tent_interface
+                               INTERFACE HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE)
+  endif()
 else()
   message(STATUS "RDMA: Disabled")
 endif()
@@ -106,6 +137,7 @@ target_link_libraries(tent PUBLIC tent_runtime tent_interface)
 
 add_library(tent_shared SHARED ${TENT_ENGINE_SOURCES})
 target_link_libraries(tent_shared PUBLIC tent_runtime tent_interface)
+set_target_properties(tent_shared PROPERTIES INSTALL_RPATH "$ORIGIN")
 
 add_library(tent_link_group INTERFACE)
 target_link_libraries(tent_link_group INTERFACE "-Wl,--start-group" tent)
@@ -120,6 +152,7 @@ foreach(
   platform_ascend
   platform_sunrise
   platform_tpu
+  platform_xpu
   tent_xport_gds
   tent_xport_uring
   tent_xport_bufio
@@ -128,11 +161,15 @@ foreach(
   tent_xport_rdma
   tent_xport_shm
   tent_xport_tcp
+  tent_xport_hp_tcp
+  tent_xport_hp_tcp_core
   tent_xport_ub
   tent_xport_ascend_direct
   tent_xport_sunrise_link
   tent_xport_tpu
+  tent_xport_xpu
   tent_xport_mpcomm
+  tent_xport_hylink
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})
