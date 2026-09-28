@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -57,13 +58,37 @@ FlushFn PickFlush() {
 
 // Writes [addr, addr + len) back to the persistence domain, fenced before any
 // later store (e.g. the metadata checkpoint that references the record).
-// ponytail: memcpy then flush; non-temporal stores (PMDK's memcpy_persist)
-// skip the cache for large records if flush throughput ever matters.
 void PersistRange(const void *addr, size_t len) {
     static const FlushFn flush = PickFlush();
     const auto begin = reinterpret_cast<uintptr_t>(addr);
     flush(begin & ~(kCacheLine - 1), begin + len);
     _mm_sfence();
+}
+
+// Below this a cached memcpy is as fast; above it Optane write bandwidth is
+// highest with non-temporal stores (Yang et al., FAST '20).
+constexpr size_t kStreamMin = 256;
+
+// memcpy with non-temporal stores for the whole cache lines of dst. A cached
+// store first reads each destination line in (read-for-ownership), which on
+// PMEM costs a media read per line and evicts at 64 B, below Optane's 256 B
+// internal granularity. The caller must _mm_sfence() before publishing dst.
+void StreamCopy(char *dst, const char *src, size_t len) {
+    const size_t head = std::min(
+        len, (kCacheLine - reinterpret_cast<uintptr_t>(dst) % kCacheLine) %
+                 kCacheLine);
+    std::memcpy(dst, src, head);
+    dst += head, src += head, len -= head;
+    for (; len >= kCacheLine;
+         dst += kCacheLine, src += kCacheLine, len -= kCacheLine) {
+        auto *d = reinterpret_cast<__m128i *>(dst);
+        const auto *s = reinterpret_cast<const __m128i *>(src);
+        _mm_stream_si128(d, _mm_loadu_si128(s));
+        _mm_stream_si128(d + 1, _mm_loadu_si128(s + 1));
+        _mm_stream_si128(d + 2, _mm_loadu_si128(s + 2));
+        _mm_stream_si128(d + 3, _mm_loadu_si128(s + 3));
+    }
+    std::memcpy(dst, src, len);
 }
 #endif
 
@@ -212,14 +237,25 @@ tl::expected<size_t, ErrorCode> DaxFile::vector_write(const iovec *iov,
     }
     char *dst = static_cast<char *>(base_) + offset;
     for (int i = 0; i < iovcnt; ++i) {
-        if (iov[i].iov_len > 0) {
-            std::memcpy(dst, iov[i].iov_base, iov[i].iov_len);
-            dst += iov[i].iov_len;
+        const auto *src = static_cast<const char *>(iov[i].iov_base);
+        const size_t len = iov[i].iov_len;
+#if defined(__x86_64__)
+        if (len >= kStreamMin) {
+            StreamCopy(dst, src, len);
+            dst += len;
+            continue;
         }
+#endif
+        if (len > 0) std::memcpy(dst, src, len);
+        dst += len;
     }
 #if defined(__x86_64__)
+    // PersistRange fences too. Streamed lines are already out of the cache,
+    // so re-flushing them is only a cheap miss.
     if (flush_cpu_cache_ && total > 0) {
         PersistRange(static_cast<char *>(base_) + offset, total);
+    } else {
+        _mm_sfence();  // order streamed stores before the caller publishes
     }
 #endif
     return total;

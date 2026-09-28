@@ -1374,6 +1374,37 @@ TEST_F(StorageBackendTest, DaxFile_FlushCpuCache) {
 #endif
 }
 
+TEST_F(StorageBackendTest, DaxFile_StreamedWriteUnaligned) {
+    // Large iovecs take the non-temporal path on x86-64: unaligned head,
+    // whole lines, and a partial tail must all land, next to a small iovec
+    // that stays on memcpy, with and without the cache flush.
+    const size_t size = 64 * 1024;
+    const auto path = MakeFakeDaxDevice(data_path, size);
+    for (bool flush : {false, true}) {
+#if !defined(__x86_64__)
+        if (flush) continue;
+#endif
+        auto opened = DaxFile::Open(path, size, flush);
+        ASSERT_TRUE(opened.has_value());
+        auto& file = *opened;
+
+        std::string small(40, 's'), big(1000, '\0');
+        for (size_t i = 0; i < big.size(); ++i) big[i] = char(i * 7 + flush);
+        iovec wiov[2] = {{small.data(), small.size()},
+                         {big.data(), big.size()}};
+        const off_t offset = 4096 + 37;
+        ASSERT_EQ(file->vector_write(wiov, 2, offset).value(),
+                  small.size() + big.size());
+
+        std::string out(small.size() + big.size() + 2, '\0');
+        iovec riov{out.data(), out.size()};
+        ASSERT_TRUE(file->vector_read(&riov, 1, offset - 1).has_value());
+        EXPECT_EQ(out.substr(1, small.size() + big.size()), small + big);
+        EXPECT_EQ(out.front(), '\0');  // neighbours untouched
+        EXPECT_EQ(out.back(), '\0');
+    }
+}
+
 TEST_F(StorageBackendTest, DaxFile_ExclusiveOwner) {
     const size_t size = 64 * 1024;
     const auto path = MakeFakeDaxDevice(data_path, size);
