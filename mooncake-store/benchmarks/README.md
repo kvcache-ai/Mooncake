@@ -98,12 +98,16 @@ The C++ replayer is contained in `master_rpc_trace_bench.cpp`;
 
 ```bash
 cmake -S . -B build -DBUILD_BENCHMARK=ON -DBUILD_UNIT_TESTS=OFF \
-  -DUSE_CUDA=OFF -DWITH_STORE_RUST=OFF
+  -DUSE_CUDA=OFF -DWITH_STORE_RUST=OFF -DSTORE_USE_JEMALLOC=ON
 cmake --build build --target master_rpc_trace_bench mooncake_master -j "$(nproc)"
 ```
 
 The Python monitor uses only the standard library; it requires Linux and
-`taskset`. Lower build parallelism if compiler memory exceeds available RAM.
+`taskset`. Install the jemalloc development package (for example,
+`libjemalloc-dev` on Ubuntu) before configuring the build. The launcher checks
+that the master has loaded the shared jemalloc library before replay and records
+its path in `result.json` under `master_allocator`. A master without this library
+is rejected. Lower build parallelism if compiler memory exceeds available RAM.
 
 To check the RPC path manually, run the launcher below with
 `--trace mooncake-store/benchmarks/master_rpc_trace_example.jsonl`. After cleanup,

@@ -79,6 +79,19 @@ def proc_sample(pid):
     }
 
 
+def master_jemalloc(pid):
+    libraries = set()
+    for line in Path(f"/proc/{pid}/maps").read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and Path(fields[5]).name.startswith("libjemalloc.so"):
+            libraries.add(fields[5])
+    if not libraries:
+        raise RuntimeError(
+            "master must load jemalloc; rebuild with -DSTORE_USE_JEMALLOC=ON"
+        )
+    return {"name": "jemalloc", "mapped_libraries": sorted(libraries)}
+
+
 def process_summary(rows, start, finish):
     values = [
         (row["monotonic_s"], row["master"])
@@ -290,6 +303,7 @@ def main():
                     break
                 except (OSError, urllib.error.URLError):
                     time.sleep(0.05)
+            result["master_allocator"] = master_jemalloc(master.pid)
             (directory / "metrics-before.prom").write_text(initial_metrics)
             replayer = subprocess.Popen(
                 replay_command,
