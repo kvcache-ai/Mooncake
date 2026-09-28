@@ -60,14 +60,27 @@ std::optional<SsdPrefetchRoute> ClassifySsdPrefetchRoute(
 // Register a promotion task per key on the master (this node is the holder),
 // then run the shared promotion execution chain. PROMOTION_ALREADY_EXISTS is
 // the normal "already resident / already in flight" outcome: skip quietly.
+//
+// Registration and execution are interleaved per key (not register-all-then-
+// promote-all) so that DRAM pressure stops the batch after a single doomed
+// round-trip: a pre-registered batch would burn a register + alloc + notify
+// triple for every remaining key before the cooldown could engage, and leave
+// registered-but-never-executed tasks behind on the master. Keys past the
+// stop point were never registered, so there is nothing to release.
 void RegisterAndPromote(Client& client, FileStorage& file_storage,
                         const std::shared_ptr<PrefetchThrottle>& throttle,
                         const std::vector<std::string>& keys,
                         const std::vector<int64_t>& sizes) {
-    std::vector<std::string> promote_keys;
-    std::vector<int64_t> promote_sizes;
-    promote_keys.reserve(keys.size());
-    promote_sizes.reserve(keys.size());
+    auto on_key_done = [throttle](const std::string& key, bool success) {
+        if (!throttle) {
+            return;
+        }
+        if (success) {
+            throttle->markCompleted(key);
+        } else {
+            throttle->markFailed(key);
+        }
+    };
     for (size_t i = 0; i < keys.size(); ++i) {
         auto register_result = client.RegisterPrefetchTask(keys[i]);
         if (!register_result) {
@@ -81,41 +94,28 @@ void RegisterAndPromote(Client& client, FileStorage& file_storage,
             }
             continue;
         }
-        promote_keys.push_back(keys[i]);
-        promote_sizes.push_back(sizes[i]);
         if (throttle) {
             throttle->markInFlight(keys[i]);
         }
-    }
-    if (promote_keys.empty()) {
-        return;
-    }
-
-    bool dram_pressure = false;
-    auto on_key_done = [throttle](const std::string& key, bool success) {
-        if (!throttle) {
-            return;
+        bool dram_pressure = false;
+        auto prefetch_res =
+            file_storage.PrefetchKeys({keys[i]}, {sizes[i]}, &dram_pressure,
+                                      on_key_done);
+        if (!prefetch_res) {
+            LOG(WARNING) << "SSD prefetch: PrefetchKeys failed for key="
+                         << keys[i] << ", error=" << prefetch_res.error();
         }
-        if (success) {
-            throttle->markCompleted(key);
-        } else {
-            throttle->markFailed(key);
+        if (dram_pressure) {
+            // DRAM saturated: back off so eviction/offload can reclaim
+            // memory instead of competing with promotion. Keys after this
+            // one were never registered on the master.
+            if (throttle) {
+                throttle->enterCooldown();
+            }
+            LOG(INFO) << "SSD prefetch: DRAM saturated, backing off "
+                         "(ssd_prefetch_cooldown_sec)";
+            break;
         }
-    };
-    auto prefetch_res = file_storage.PrefetchKeys(promote_keys, promote_sizes,
-                                                  &dram_pressure, on_key_done);
-    if (!prefetch_res) {
-        LOG(WARNING) << "SSD prefetch: PrefetchKeys failed, error="
-                     << prefetch_res.error();
-    } else {
-        VLOG(1) << "PrefetchKeys completed keys=" << promote_keys.size();
-    }
-    if (dram_pressure && throttle) {
-        // DRAM saturated: back off so eviction/offload can reclaim memory
-        // instead of competing with promotion.
-        throttle->enterCooldown();
-        LOG(INFO) << "SSD prefetch: DRAM saturated, backing off "
-                     "(ssd_prefetch_cooldown_sec)";
     }
 }
 

@@ -1029,6 +1029,15 @@ tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
         if (on_key_done) {
             on_key_done(key, result.has_value());
         }
+        if (key_dram_pressure) {
+            // DRAM saturated: stop the batch here. Each further key would
+            // burn the same doomed alloc round-trip while eviction fights
+            // for the same memory; the caller enters cooldown instead.
+            VLOG(1) << "PrefetchKeys: DRAM pressure at key=" << key
+                    << ", skipping " << (keys.size() - i - 1)
+                    << " remaining keys";
+            break;
+        }
     }
     return {};
 }
