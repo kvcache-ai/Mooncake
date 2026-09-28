@@ -143,9 +143,11 @@ def run() -> int:
     if any(rc != 0 for rc in revoke_rcs):
         return 51
 
+    assert mc.unregister_buffer(_ptr(src)) == 0
+    assert mc.unregister_buffer(_ptr(dst)) == 0
     print("session_ranges_tcp_e2e PASSED", flush=True)
-    mc.close()
-    return 0
+    # Skip C++ atexit teardown: mixed CANN/conda allocators can abort in close().
+    os._exit(0)
 
 
 if __name__ == "__main__":

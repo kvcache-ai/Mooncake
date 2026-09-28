@@ -9,12 +9,29 @@ store:
       - 'mooncake-store/**/*'
       - 'python/mooncake/_fast_copy.c'
       - 'python/mooncake/structured_object_store.py'
-      - 'python/tests/store/test_fast_copy.py'
-      - 'python/tests/store/test_structured_object_store.py'
+      - 'python/mooncake/http_metadata_server.py'
+      - 'python/tests/services/test_http_metadata_server.py'
+      - 'python/mooncake/async_store.py'
+      - 'python/mooncake/cli.py'
+      - 'python/mooncake/cli_client.py'
+      - 'python/mooncake/buffer_pool.py'
+      - 'python/mooncake/mooncake_config.py'
+      - 'python/tests/store/**/*'
+      - 'python/tests/unit/test_mooncake_config.py'
+      - 'python/mooncake/mooncake_ssd_*.py'
+      - 'python/mooncake/spdk_tgt_create.py'
+      - 'python/tests/ssd/**/*'
+
+Mooncake Conductor:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-conductor/**/*'
 
 Transfer Engine:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-transfer-engine/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-transfer-engine/**/*'
+      - 'python/mooncake/cli_bench.py'
+      - 'python/mooncake/transfer_engine_topology_dump.py'
 
 PyTorch Backend:
   - changed-files:
@@ -22,7 +39,12 @@ PyTorch Backend:
 
 Mooncake EP:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-ep/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-ep/**/*'
+      - 'python/mooncake/ep.py'
+      - 'python/mooncake/mooncake_elastic_buffer.py'
+      - 'python/mooncake/mooncake_ep_buffer.py'
+      - 'python/tests/ep/**/*'
 
 Installation:
   - changed-files:
@@ -32,6 +54,11 @@ Installation:
       - 'python/mooncake/structured_object_store.py'
       - 'python/tests/store/test_fast_copy.py'
       - 'python/tests/store/test_structured_object_store.py'
+      - 'python/mooncake/http_metadata_server.py'
+      - 'python/mooncake/cli.py'
+      - 'python/mooncake/cli_client.py'
+      - 'python/mooncake/cli_bench.py'
+      - 'python/mooncake/transfer_engine_topology_dump.py'
 
 P2P Store:
   - changed-files:
@@ -67,9 +94,10 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
-      - 'python/tests/store/test_fast_copy.py'
-      - 'python/tests/store/test_structured_object_store.py'
+      - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
+      - 'scripts/rocm_tests/**/*'
+      - 'scripts/e2e/**/*'
 
 Ascend/NPU:
   - changed-files:

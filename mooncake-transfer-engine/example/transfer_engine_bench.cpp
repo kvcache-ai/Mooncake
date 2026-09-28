@@ -55,6 +55,14 @@
 #include "gpu_vendor/intra_nvlink.h"
 #endif
 
+#if defined(USE_HYLINK)
+#if defined(USE_TENT)
+#include "tent/transport/hylink/hylink_transport.h"
+#else
+#include "transport/hylink_transport/hylink_transport.h"
+#endif
+#endif
+
 #if defined(USE_UBSHMEM)
 static void checkAclError(aclError result, const char* message) {
     if (result != ACL_ERROR_NONE) {
@@ -90,7 +98,8 @@ DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma",
               "Transfer protocol: "
-              "rdma|barex|tcp|efa|nvlink|musa|nvlink_intra|hip|sunrise_link");
+              "rdma|barex|tcp|efa|nvlink|musa|nvlink_intra|hip|sunrise_link|"
+              "hylink");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -166,6 +175,19 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
             LOG(ERROR) << "--protocol=ubshmem requires USE_UBSHMEM=ON";
             return nullptr;
 #endif
+        } else if (FLAGS_protocol == "hylink") {
+#if defined(USE_HYLINK)
+#if defined(USE_TENT)
+            d_buf = mooncake::tent::HylinkTransport::allocateFabricMemory(size);
+            LOG(INFO) << "Using TENT hylink fabric memory allocation";
+#else
+            d_buf = mooncake::HylinkTransport::allocateFabricMemory(size);
+            LOG(INFO) << "Using hylink fabric memory allocation";
+#endif
+#else
+            LOG(ERROR) << "--protocol=hylink requires USE_HYLINK=ON";
+            return nullptr;
+#endif
         } else {
 #ifndef USE_UBSHMEM
             checkCudaError(cudaMalloc(&d_buf, size),
@@ -216,6 +238,17 @@ static void freeMemoryPool(void* addr, size_t size) {
 #ifdef USE_UBSHMEM
         if (FLAGS_use_vram) {
             freeFabricMemory(addr);
+            return;
+        }
+#endif
+    } else if (FLAGS_protocol == "hylink") {
+#if defined(USE_HYLINK)
+        if (FLAGS_use_vram) {
+#if defined(USE_TENT)
+            mooncake::tent::HylinkTransport::freeFabricMemory(addr);
+#else
+            mooncake::HylinkTransport::freeFabricMemory(addr);
+#endif
             return;
         }
 #endif
@@ -514,9 +547,9 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
         xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
                FLAGS_protocol == "musa" || FLAGS_protocol == "hip" ||
-               FLAGS_protocol == "nvlink_intra" ||
+               FLAGS_protocol == "hylink" || FLAGS_protocol == "nvlink_intra" ||
                FLAGS_protocol == "ubshmem" ||
-               FLAGS_protocol == "sunrise_link") {
+               FLAGS_protocol == "sunrise_link" || FLAGS_protocol == "flagcx") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
@@ -675,6 +708,29 @@ std::shared_ptr<mooncake::tent::Config> createTentConfig() {
     config->set("metadata_servers", metadata_servers);
     config->set("local_segment_name", FLAGS_local_server_name);
     config->set("verbose", true);
+
+    // --protocol=hylink forces the TENT hylink transport and turns off the
+    // network fallbacks so a successful run cannot have gone through RDMA/TCP.
+#if defined(USE_HYLINK)
+    if (FLAGS_protocol == "hylink") {
+        config->set("transports/hylink/enable", true);
+        config->set("transports/rdma/enable", false);
+        config->set("transports/tcp/enable", false);
+        config->set("transports/hp_tcp/enable", false);
+        config->set("transports/shm/enable", false);
+        mooncake::tent::json policy = mooncake::tent::json::array(
+            {mooncake::tent::json{{"name", "hylink_memory"},
+                                  {"segment_type", "memory"},
+                                  {"transports", {"hylink"}}}});
+        config->set("policy", policy);
+        LOG(INFO) << "TENT hylink mode: RDMA/TCP/SHM disabled, policy=hylink";
+    }
+#else
+    if (FLAGS_protocol == "hylink") {
+        LOG(ERROR) << "--protocol=hylink requires -DUSE_HYLINK=ON";
+        exit(EXIT_FAILURE);
+    }
+#endif
 
     return config;
 }

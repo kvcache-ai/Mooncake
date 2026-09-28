@@ -45,7 +45,7 @@
 //! cargo run --example basic_usage
 //! ```
 
-use mooncake_store::{MooncakeStore, ReplicateConfig, StoreError};
+use mooncake_store::{MooncakeStore, ReplicateConfig, SoftPinAction, StoreError};
 
 fn main() {
     println!("=== Mooncake Store Rust Bindings — Basic Usage ===\n");
@@ -128,7 +128,8 @@ fn main() {
     // Step 7: Put with explicit replication config.
     let config = ReplicateConfig {
         replica_num: 2,
-        with_soft_pin: true,
+        soft_pin_action: SoftPinAction::Enable,
+        soft_pin_ttl_ms: None,
         with_hard_pin: false,
         preferred_segments: vec!["seg-0".to_string()],
     };
@@ -136,7 +137,9 @@ fn main() {
     if let Err(e) = store.put("replicated-key", b"replicated value", Some(&config)) {
         eprintln!("[FAIL] put() with ReplicateConfig failed: {e}");
     } else {
-        println!("[OK] put(\"replicated-key\") with replica_num=2, soft_pin=true, hard_pin=false");
+        println!(
+            "[OK] put(\"replicated-key\") with replica_num=2, soft_pin=enable, hard_pin=false"
+        );
     }
 
     // Step 8: Remove the keys.

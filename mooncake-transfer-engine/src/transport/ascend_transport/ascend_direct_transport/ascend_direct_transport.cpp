@@ -186,13 +186,11 @@ int AscendDirectTransport::allocateLocalSegmentID() {
 
     agent_mode_ = globalConfig().ascend_agent_mode;
     roce_mode_ = IsRoceModeEnabled();
-    // Store path: ASCEND_ENABLE_USE_FABRIC_MEM sets the process-global flag,
-    // gated on ascend_store_te_init so a P2P TE does not inherit it.
-    // Normal/P2P path: enable when the resolved ASCEND_GLOBAL_RESOURCE_CONFIG
-    // for this TE role contains fabric_memory (flat or nested).
-    use_fabric_mem_ = (globalConfig().ascend_use_fabric_mem &&
-                       globalConfig().ascend_store_te_init) ||
-                      IsFabricMemEnabledFromGlobalResourceConfig();
+    // Only a Store-init TE may use fabric mem; gate on ascend_store_te_init so
+    // a P2P/HCCS TE does not inherit a Store TE's fabric flag left in the
+    // process-global config.
+    use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
+                      globalConfig().ascend_store_te_init;
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
               << ", roce_mode=" << (roce_mode_ ? "true" : "false")
@@ -332,9 +330,13 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
@@ -375,6 +377,16 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     int type_ret = ResolveAscendMemType(location, addr, mem_type);
     if (type_ret != 0) {
         return type_ret;
+    }
+    if (use_fabric_mem_ && ascend_is_direct_vmm_memory(addr, length)) {
+        // Direct ACL VMM allocations bypass adxl::MallocMem and are not known
+        // to ADXL's allocation bookkeeping, so they must be registered as
+        // device memory. adxl::MallocMem allocations keep MEM_HOST: ADXL
+        // exports them through its own host-memory path. The gate is this TE's
+        // own fabric flag, not the process-wide allocation table: a co-located
+        // non-fabric TE has no fabric-enabled ADXL engine, so it must keep
+        // treating that memory as host.
+        mem_type = adxl::MEM_DEVICE;
     }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);

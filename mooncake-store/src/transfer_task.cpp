@@ -12,6 +12,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "config/transfer_submitter_config.h"
+#include "config/fileread_worker_pool_config.h"
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -19,6 +21,7 @@
 #include "spdk/spdk_wrapper.h"
 #endif
 
+#ifdef USE_NOF
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
     if (!raw_value || raw_value[0] == '\0') {
@@ -39,7 +42,6 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
-#ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
     if (!value) {
         return false;
@@ -174,22 +176,10 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 // ============================================================================
 // FilereadWorkerPool Implementation
 // ============================================================================
-// to fully utilize the available ssd bandwidth, we use a default of 10 worker
-// threads.
-constexpr int kDefaultFilereadWorkers = 10;
-
-// The number of fileread workers can be tuned via the MC_FILEREAD_WORKERS
-// environment variable. Falls back to kDefaultFilereadWorkers when unset,
-// empty, or invalid.
-static int GetFilereadWorkerCount() {
-    static const int value =
-        GetPositiveEnvOrDefault("MC_FILEREAD_WORKERS", kDefaultFilereadWorkers);
-    return value;
-}
-
 FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     : shutdown_(false) {
-    const int num_workers = GetFilereadWorkerCount();
+    static const auto config = FilereadWorkerPoolConfig::FromEnvironment();
+    const int num_workers = config.worker_count;
     VLOG(1) << "Creating FilereadWorkerPool with " << num_workers << " workers";
 
     // Start worker threads
@@ -830,60 +820,67 @@ void TransferEngineOperationState::wait_for_completion() {
     constexpr int64_t timeout_milliseconds = 60 * 1000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
+    // TENT batches do not use the classic transport BatchDesc layout.
+    if (!engine_.isUsingTent()) {
+        VLOG(1) << "Waiting for transfer engine completion for batch "
+                << batch_id_;
 
-    // Wait directly on BatchDesc's condition variable.
-    auto& batch_desc = Transport::toBatchDesc(batch_id_);
-    bool completed;
-    bool failed = false;
+        // Wait directly on BatchDesc's condition variable.
+        auto& batch_desc = Transport::toBatchDesc(batch_id_);
+        bool completed;
+        bool failed = false;
 
-    // Fast path: if already finished, avoid taking the mutex and waiting.
-    // Use acquire here to pair with the writer's release-store, because this
-    // path may skip taking the mutex. It ensures all prior updates are visible.
-    completed = batch_desc.is_finished.load(std::memory_order_acquire);
-    if (!completed) {
-        // Use the same mutex as the notifier when updating the predicate to
-        // avoid missed notifications. The predicate is re-checked under the
-        // lock. Under the mutex, relaxed is sufficient; the mutex acquire
-        // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
-        const int64_t elapsed_milliseconds =
-            getCurrentTimeInMilli() - start_ts_;
-        if (elapsed_milliseconds < timeout_milliseconds) {
-            completed = batch_desc.completion_cv.wait_for(
-                lock,
-                std::chrono::milliseconds(timeout_milliseconds -
-                                          elapsed_milliseconds),
-                [&batch_desc] {
-                    return batch_desc.is_finished.load(
-                        std::memory_order_relaxed);
-                });
+        // Fast path: if already finished, avoid taking the mutex and waiting.
+        // Use acquire here to pair with the writer's release-store, because
+        // this path may skip taking the mutex. It ensures all prior updates are
+        // visible.
+        completed = batch_desc.is_finished.load(std::memory_order_acquire);
+        if (!completed) {
+            // Use the same mutex as the notifier when updating the predicate to
+            // avoid missed notifications. The predicate is re-checked under the
+            // lock. Under the mutex, relaxed is sufficient; the mutex acquire
+            // orders prior writes.
+            std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+            const int64_t elapsed_milliseconds =
+                getCurrentTimeInMilli() - start_ts_;
+            if (elapsed_milliseconds < timeout_milliseconds) {
+                completed = batch_desc.completion_cv.wait_for(
+                    lock,
+                    std::chrono::milliseconds(timeout_milliseconds -
+                                              elapsed_milliseconds),
+                    [&batch_desc] {
+                        return batch_desc.is_finished.load(
+                            std::memory_order_relaxed);
+                    });
+            }
+        }  // Explicitly release completion_mutex before acquiring mutex_
+
+        // Once completion is observed, read failure flag.
+        if (completed) {
+            failed = batch_desc.has_failure.load(std::memory_order_relaxed);
         }
-    }  // Explicitly release completion_mutex before acquiring mutex_
 
-    // Once completion is observed, read failure flag.
-    if (completed) {
-        failed = batch_desc.has_failure.load(std::memory_order_relaxed);
+        ErrorCode error_code =
+            completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
+                      : ErrorCode::TRANSFER_FAIL;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            set_result_internal(error_code);
+        }
+
+        if (completed) {
+            VLOG(1) << "Transfer engine operation completed for batch "
+                    << batch_id_
+                    << " with result: " << static_cast<int>(error_code);
+        } else {
+            LOG(ERROR) << "Failed to complete transfers after "
+                       << timeout_milliseconds << " milliseconds for batch "
+                       << batch_id_;
+        }
+        return;
     }
-
-    ErrorCode error_code =
-        completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
-                  : ErrorCode::TRANSFER_FAIL;
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        set_result_internal(error_code);
-    }
-
-    if (completed) {
-        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
-                << " with result: " << static_cast<int>(error_code);
-    } else {
-        LOG(ERROR) << "Failed to complete transfers after "
-                   << timeout_milliseconds << " milliseconds for batch "
-                   << batch_id_;
-    }
-#else
+#endif
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
     while (true) {
@@ -907,7 +904,6 @@ void TransferEngineOperationState::wait_for_completion() {
         VLOG(1) << "Transfer engine operation still pending for batch "
                 << batch_id_;
     }
-#endif
 }
 
 // ============================================================================
@@ -959,29 +955,15 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
     // When not set, auto-detect based on transport type:
     //   - TCP-only environment: enable memcpy (avoids TCP loopback overhead)
     //   - RDMA/other transports: disable memcpy (RDMA is more efficient)
-    const char* env_value = std::getenv("MC_STORE_MEMCPY");
-    if (env_value == nullptr) {
+    const auto config = TransferSubmitterConfig::FromEnvironment();
+    if (config.memcpy_enabled_override.has_value()) {
+        memcpy_enabled_ = *config.memcpy_enabled_override;
+    } else {
         memcpy_enabled_ = engine_.isTcpOnly();
         LOG(INFO) << "MC_STORE_MEMCPY not set, auto-detected: "
                   << (memcpy_enabled_ ? "TCP-only environment, memcpy enabled"
                                       : "non-TCP transport available, memcpy "
                                         "disabled");
-    } else {
-        std::string env_str(env_value);
-        // Convert to lowercase for case-insensitive comparison
-        std::transform(env_str.begin(), env_str.end(), env_str.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (env_str == "false" || env_str == "0" || env_str == "no" ||
-            env_str == "off") {
-            memcpy_enabled_ = false;
-        } else if (env_str == "true" || env_str == "1" || env_str == "yes" ||
-                   env_str == "on") {
-            memcpy_enabled_ = true;
-        } else {
-            LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_str
-                         << ", defaulting to enabled";
-            memcpy_enabled_ = true;
-        }
     }
 
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="

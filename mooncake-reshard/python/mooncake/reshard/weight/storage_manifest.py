@@ -12,7 +12,14 @@ from typing import Optional, Union, cast
 from .._typing import TypeAlias
 
 from .._compat import _strict_zip
-from ..contracts import ResourceId, ResourceKind, RevisionId, StoredFragmentId, TensorId
+from ..contracts import (
+    ResourceId,
+    ResourceKind,
+    RevisionId,
+    StoredFragmentSnapshotId,
+    StoredResourceManifest,
+    TensorId,
+)
 from .serde import _axis_from_wire, _axis_to_wire
 from .types import (
     TensorDescriptor,
@@ -71,15 +78,14 @@ class StoredManifestIdentity:
             _require_nonempty_string(getattr(self, name), name)
         _require_u64(self.weight_generation, "weight_generation")
         if len(self.content_sha256) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in self.content_sha256
+            character not in "0123456789abcdef" for character in self.content_sha256
         ):
             raise ValueError("content_sha256 must be a SHA-256 hex digest")
 
 
 @dataclass(frozen=True)
-class StoredFragment:
-    fragment_id: StoredFragmentId
+class StoredFragmentSnapshot:
+    fragment_id: StoredFragmentSnapshotId
     tensor_id: TensorId
     global_offset: tuple[int, ...]
     local_shape: tuple[int, ...]
@@ -112,16 +118,11 @@ class StoredFragment:
 
 
 @dataclass(frozen=True)
-class WeightManifest:
-    namespace: str
-    resource_id: ResourceId
+class StoredWeightManifest(StoredResourceManifest):
     revision: RevisionId
     weight_generation: int
-    group_id: str
-    manifest_key: str
     tensors: tuple[TensorDescriptor, ...]
-    fragments: tuple[StoredFragment, ...]
-    created_at: str
+    fragments: tuple[StoredFragmentSnapshot, ...]
     manifest_digest: str = field(init=False)
 
     @property
@@ -143,7 +144,7 @@ class WeightManifest:
             "tensors",
             _require_manifest_items(
                 self.tensors,
-                "WeightManifest tensors",
+                "StoredWeightManifest tensors",
                 TensorDescriptor,
             ),
         )
@@ -152,8 +153,8 @@ class WeightManifest:
             "fragments",
             _require_manifest_items(
                 self.fragments,
-                "WeightManifest fragments",
-                StoredFragment,
+                "StoredWeightManifest fragments",
+                StoredFragmentSnapshot,
             ),
         )
         _require_u64(self.weight_generation, "weight_generation")
@@ -174,6 +175,43 @@ class WeightManifest:
             "manifest_digest",
             hashlib.sha256(self.to_json().encode("utf-8")).hexdigest(),
         )
+
+    def __getstate__(self) -> tuple[object, ...]:
+        """Serialize logical state and recompute the digest on restore."""
+
+        return (
+            self.namespace,
+            self.resource_id,
+            self.revision,
+            self.weight_generation,
+            self.group_id,
+            self.manifest_key,
+            self.tensors,
+            self.fragments,
+            self.created_at,
+        )
+
+    def __setstate__(self, state: tuple[object, ...]) -> None:
+        """Restore only a fully validated persisted manifest state."""
+
+        if not isinstance(state, tuple) or len(state) != 9:
+            raise ValueError("StoredWeightManifest pickle state is invalid")
+        for name, value in zip(
+            (
+                "namespace",
+                "resource_id",
+                "revision",
+                "weight_generation",
+                "group_id",
+                "manifest_key",
+                "tensors",
+                "fragments",
+                "created_at",
+            ),
+            state,
+        ):
+            object.__setattr__(self, name, value)
+        self.__post_init__()
 
     @property
     def manifest_identity(self) -> StoredManifestIdentity:
@@ -227,7 +265,10 @@ class WeightManifest:
         )
 
     @classmethod
-    def from_json(cls, value: Union[str, bytes, bytearray]) -> WeightManifest:
+    def from_json(
+        cls,
+        value: Union[str, bytes, bytearray],
+    ) -> StoredWeightManifest:
         def reject_constant(constant: str) -> None:
             raise ValueError(f"non-finite JSON number is unsupported: {constant}")
 
@@ -252,7 +293,7 @@ class WeightManifest:
         return cls.from_dict(_require_mapping(cast(object, raw), "weight manifest"))
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, object]) -> WeightManifest:
+    def from_dict(cls, raw: Mapping[str, object]) -> StoredWeightManifest:
         raw = _require_exact_fields(
             raw,
             frozenset(
@@ -300,7 +341,7 @@ class WeightManifest:
         if raw["resource_kind"] != ResourceKind.MODEL_WEIGHT.value:
             raise ValueError("weight manifest resource_kind must be model_weight")
         for index, item in enumerate(
-            _require_sequence(raw["tensors"], "WeightManifest tensors")
+            _require_sequence(raw["tensors"], "StoredWeightManifest tensors")
         ):
             tensor_values: dict[str, object] = dict(
                 _require_exact_fields(item, tensor_fields, "tensor descriptor")
@@ -351,9 +392,12 @@ class WeightManifest:
                     parallel_axes=parallel_axes,
                 )
             )
-        fragments: tuple[StoredFragment, ...] = tuple(
+        fragments: tuple[StoredFragmentSnapshot, ...] = tuple(
             _stored_fragment_from_wire(item, fragment_fields)
-            for item in _require_sequence(raw["fragments"], "WeightManifest fragments")
+            for item in _require_sequence(
+                raw["fragments"],
+                "StoredWeightManifest fragments",
+            )
         )
         return cls(
             namespace=_require_nonempty_string(raw["namespace"], "namespace"),
@@ -372,13 +416,15 @@ class WeightManifest:
         )
 
 
-def validate_weight_manifest_snapshot(manifest: WeightManifest) -> WeightManifest:
+def validate_weight_manifest_snapshot(
+    manifest: StoredWeightManifest,
+) -> StoredWeightManifest:
     """Rebuild a typed manifest before it is trusted at a plan boundary."""
 
-    if not isinstance(manifest, WeightManifest):
+    if not isinstance(manifest, StoredWeightManifest):
         raise ValueError("weight manifest snapshot is invalid")
     try:
-        return WeightManifest(
+        return StoredWeightManifest(
             namespace=manifest.namespace,
             resource_id=manifest.resource_id,
             revision=manifest.revision,
@@ -427,10 +473,10 @@ def _optional_integer(
 def _stored_fragment_from_wire(
     value: object,
     fragment_fields: frozenset[str],
-) -> StoredFragment:
+) -> StoredFragmentSnapshot:
     fragment = _require_exact_fields(value, fragment_fields, "stored fragment")
-    return StoredFragment(
-        fragment_id=StoredFragmentId(
+    return StoredFragmentSnapshot(
+        fragment_id=StoredFragmentSnapshotId(
             _require_nonempty_string(
                 fragment["fragment_id"], "stored fragment fragment_id"
             )
@@ -464,7 +510,7 @@ def _stored_fragment_from_wire(
 
 def _validate_stored_fragments(
     tensors: Sequence[TensorDescriptor],
-    fragments: Sequence[StoredFragment],
+    fragments: Sequence[StoredFragmentSnapshot],
 ) -> None:
     tensor_by_id: dict[TensorId, TensorDescriptor] = {}
     for tensor in tensors:
@@ -472,7 +518,7 @@ def _validate_stored_fragments(
             raise ValueError(f"duplicate tensor_id: {tensor.tensor_id}")
         tensor_by_id[tensor.tensor_id] = tensor
 
-    fragment_ids: set[StoredFragmentId] = set()
+    fragment_ids: set[StoredFragmentSnapshotId] = set()
     for fragment in fragments:
         if fragment.fragment_id in fragment_ids:
             raise ValueError(f"duplicate fragment_id: {fragment.fragment_id}")
@@ -491,9 +537,9 @@ def _validate_stored_fragments(
 
 def _validate_stored_coverage(
     tensors: Sequence[TensorDescriptor],
-    fragments: Sequence[StoredFragment],
+    fragments: Sequence[StoredFragmentSnapshot],
 ) -> None:
-    by_tensor: dict[TensorId, list[StoredFragment]] = {}
+    by_tensor: dict[TensorId, list[StoredFragmentSnapshot]] = {}
     geometries: set[StoredGeometryKey] = set()
     for fragment in fragments:
         geometry = (
@@ -534,12 +580,14 @@ def _stored_alias_descriptor_key(
 
 def _validate_stored_aliases(
     tensors: Sequence[TensorDescriptor],
-    fragments: Sequence[StoredFragment],
+    fragments: Sequence[StoredFragmentSnapshot],
 ) -> None:
     tensor_by_id: dict[TensorId, TensorDescriptor] = {
         tensor.tensor_id: tensor for tensor in tensors
     }
-    by_group_and_geometry: dict[StoredAliasGeometryKey, list[StoredFragment]] = {}
+    by_group_and_geometry: dict[
+        StoredAliasGeometryKey, list[StoredFragmentSnapshot]
+    ] = {}
     for fragment in fragments:
         if not fragment.aliases:
             continue
@@ -567,9 +615,9 @@ def _validate_stored_aliases(
 
 
 def _validate_stored_object_ranges(
-    fragments: Sequence[StoredFragment],
+    fragments: Sequence[StoredFragmentSnapshot],
 ) -> None:
-    by_object: dict[str, list[StoredFragment]] = {}
+    by_object: dict[str, list[StoredFragmentSnapshot]] = {}
     for fragment in fragments:
         by_object.setdefault(fragment.object_key, []).append(fragment)
 
@@ -584,7 +632,7 @@ def _validate_stored_object_ranges(
                 )
 
 
-def _has_overlapping_boxes(fragments: Sequence[StoredFragment]) -> bool:
+def _has_overlapping_boxes(fragments: Sequence[StoredFragmentSnapshot]) -> bool:
     if len(fragments) < 2:
         return False
 
@@ -602,7 +650,7 @@ def _has_overlapping_boxes(fragments: Sequence[StoredFragment]) -> bool:
         ),
     )
     ordered = sorted(fragments, key=lambda item: item.global_offset[sweep_dim])
-    active: list[StoredFragment] = []
+    active: list[StoredFragmentSnapshot] = []
     for fragment in ordered:
         begin = fragment.global_offset[sweep_dim]
         active = [

@@ -50,6 +50,9 @@
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
 #endif
+#ifdef USE_HYLINK
+#include "transport/hylink_transport/hylink_transport.h"
+#endif
 #ifdef USE_MACA
 #include "transport/maca_transport/maca_transport.h"
 #endif
@@ -62,8 +65,12 @@
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
 #endif
+#include "transport/shm_transport/shm_transport.h"
 #ifdef USE_UBSHMEM
 #include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
+#endif
+#ifdef USE_FLAGCX
+#include "transport/flagcx_transport/flagcx_transport.h"
 #endif
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
@@ -103,6 +110,11 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
+    return freeBatchID(batch_id, std::function<void()>());
+}
+
+Status MultiTransport::freeBatchID(BatchID batch_id,
+                                   const std::function<void()>& before_delete) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
@@ -110,6 +122,9 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
+    }
+    if (before_delete) {
+        before_delete();
     }
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
@@ -135,14 +150,8 @@ Status MultiTransport::submitTransfer(
     }
 
     std::vector<Transport*> transports;
-    transports.reserve(entries.size());
-    for (const auto& request : entries) {
-        Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
-        assert(transport);
-        transports.push_back(transport);
-    }
+    auto select_status = selectTransports(entries, transports);
+    if (!select_status.ok()) return select_status;
 
     auto& task_list = batch_desc.task_list;
     task_list.reserve(task_list.size() + entries.size());
@@ -297,11 +306,14 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
 
     // Fallback for tasks without a transport pointer (legacy path)
-    status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
         __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the byte updates made by
+    // Slice::markSuccess().
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     assert(task.slice_count);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
@@ -363,7 +375,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
+    if (batch_desc.status_cached.load(std::memory_order_acquire) ||
         task_count == 0) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
@@ -395,9 +407,10 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
-        batch_desc.is_finished.store(true, std::memory_order_release);
         batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
-                                                 std::memory_order_release);
+                                                 std::memory_order_relaxed);
+        batch_desc.status_cached.store(true, std::memory_order_release);
+        batch_desc.is_finished.store(true, std::memory_order_release);
     } else if (status.s == Transport::TransferStatusEnum::FAILED) {
         batch_desc.has_failure.store(true, std::memory_order_release);
     }
@@ -480,6 +493,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new HipTransport();
     }
 #endif
+#ifdef USE_HYLINK
+    else if (std::string(proto) == "hylink") {
+        transport = new HylinkTransport();
+    }
+#endif
 #ifdef USE_MACA
     else if (std::string(proto) == "maca") {
         transport = new MacaTransport();
@@ -500,9 +518,17 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new CxlTransport();
     }
 #endif
+    else if (std::string(proto) == "shm") {
+        transport = new ShmTransport();
+    }
 #ifdef USE_UBSHMEM
     else if (std::string(proto) == "ubshmem") {
         transport = new UBShmemTransport();
+    }
+#endif
+#ifdef USE_FLAGCX
+    else if (std::string(proto) == "flagcx") {
+        transport = new FlagCxTransport();
     }
 #endif
 #ifdef USE_EFA
@@ -570,13 +596,58 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     return transport;
 }
 
+Status MultiTransport::selectTransports(
+    const std::vector<TransferRequest>& entries,
+    std::vector<Transport*>& transports) {
+    transports.clear();
+    transports.reserve(entries.size());
+    Transport* reused_transport = nullptr;
+    Transport::SegmentID reused_target = 0;
+    bool reuse_allowed = false;
+    const bool metacache = globalConfig().metacache;
+    for (const auto& request : entries) {
+        Transport* transport = nullptr;
+        // Reuse only address-independent routes within this submission. Mixed
+        // protocol segments must still resolve each address independently, and
+        // disabling the metadata cache must retain the explicit refresh
+        // behavior. This restores MultiTransport routing (protocol to
+        // Transport*), not RDMA's per-target SegmentDesc fetch inside
+        // submitTransferTask.
+        if (reuse_allowed && reused_transport && metacache &&
+            request.target_id == reused_target) {
+            transport = reused_transport;
+        } else {
+            auto status = selectTransport(request, transport, &reuse_allowed);
+            if (!status.ok()) return status;
+            assert(transport);
+            reused_transport = transport;
+            reused_target = request.target_id;
+        }
+        transports.push_back(transport);
+    }
+    return Status::OK();
+}
+
 Status MultiTransport::selectTransport(const TransferRequest& entry,
-                                       Transport*& transport) {
+                                       Transport*& transport,
+                                       bool* allows_reuse) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
+        if (allows_reuse) *allows_reuse = false;
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Offset-based routing is only compiled for mixed-protocol segments.
+    // A homogeneous batch can reuse this Transport*.
+    if (allows_reuse) {
+        *allows_reuse =
+            target_segment_desc->protocol.find(',') == std::string::npos;
+    }
+#else
+    if (allows_reuse) *allows_reuse = true;
+#endif
+
     auto proto = target_segment_desc->protocol;
 #ifdef ENABLE_MULTI_PROTOCOL
     // Multi-protocol segment (e.g. "rdma,hip"): a single batch may target
@@ -591,9 +662,11 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             // hip is intra-node GPU-IPC only. On a cross-node request a
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.
+            if (p == "hylink") return std::getenv("MC_DISABLE_HYLINK") ? 0 : 5;
             if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
             if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
             if (p == "musa") return std::getenv("MC_DISABLE_MUSA") ? 0 : 4;
+            if (p == "shm") return 4;
             if (p == "cxl") return 3;
             if (p == "rdma") return 2;
             if (p == "tcp") return 1;
@@ -605,7 +678,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         // This makes the intra-node fast path (hip) and the cross-node path
         // (rdma) work automatically from a single multi-protocol segment,
         // without requiring the operator to set MC_DISABLE_HIP.
-        const bool gpu_ipc_reachable = isGpuIpcReachableTarget(
+        const bool local_ipc_reachable = isLocalIpcReachableTarget(
             target_segment_desc->name, local_server_name_);
         std::string chosen;
         int chosen_priority = -1;
@@ -618,8 +691,9 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                     : buffer.addr;
             if (entry.target_offset >= start &&
                 entry.target_offset < start + buffer.length) {
-                if ((buffer.protocol == "hip" || buffer.protocol == "musa") &&
-                    !gpu_ipc_reachable) {
+                if ((buffer.protocol == "hip" || buffer.protocol == "musa" ||
+                     buffer.protocol == "shm") &&
+                    !local_ipc_reachable) {
                     continue;
                 }
                 int priority = protocol_priority(buffer.protocol);
@@ -646,7 +720,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         if (globalConfig().trace) {
             LOG(INFO) << "MultiTransport::selectTransport route: target_id="
                       << entry.target_id << " segment_protocol=\"" << proto
-                      << "\" gpu_ipc_reachable=" << gpu_ipc_reachable
+                      << "\" local_ipc_reachable=" << local_ipc_reachable
                       << " chosen=" << chosen;
         }
         transport = transport_map_[chosen].get();
@@ -693,12 +767,13 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
         if (!item.empty()) protos.push_back(item);
     }
 
-    // hip GPU IPC cannot reach a remote host; downgrade an explicit hip
-    // preference to a cross-host-capable transport for a cross-host target
+    // hip GPU IPC and POSIX SHM cannot reach a remote host; downgrade an
+    // explicit intra-node preference to a cross-host-capable transport
     // (mirrors the locality gate in selectTransport). Prefer rdma, then tcp.
-    if ((preferred_proto == "hip" || preferred_proto == "musa") &&
-        !isGpuIpcReachableTarget(target_segment_desc->name,
-                                 local_server_name_)) {
+    if ((preferred_proto == "hip" || preferred_proto == "musa" ||
+         preferred_proto == "shm") &&
+        !isLocalIpcReachableTarget(target_segment_desc->name,
+                                   local_server_name_)) {
         std::string fallback;
         for (const char* candidate : {"rdma", "tcp"}) {
             if (std::find(protos.begin(), protos.end(), candidate) !=
@@ -753,7 +828,11 @@ Transport* MultiTransport::getTransport(const std::string& proto) {
 }
 
 bool MultiTransport::isTcpOnly() const {
-    return transport_map_.size() == 1 && transport_map_.count("tcp") == 1;
+    // SHM is intra-node DRAM IPC, not a cross-host fabric. Ignore it so a
+    // tcp+shm engine still auto-enables Store same-process memcpy.
+    size_t n = transport_map_.size();
+    if (transport_map_.count("shm")) --n;
+    return n == 1 && transport_map_.count("tcp") == 1;
 }
 
 std::vector<Transport*> MultiTransport::listTransports() {

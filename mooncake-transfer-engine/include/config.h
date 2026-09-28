@@ -91,6 +91,12 @@ struct GlobalConfig {
     // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
     // Override via MC_CONN_PAUSE_TTL_MS.
     int conn_pause_ttl_ms = 0;
+    // Context-level circuit-breaker pause. Repeated local WC failures
+    // deactivate the local RNIC context for this many milliseconds. The
+    // monitor then reactivates it with a reset failure count. Must be positive
+    // so a breaker trip cannot recreate the legacy permanent latch. Override
+    // via MC_CONTEXT_PAUSE_TTL_MS.
+    int context_pause_ttl_ms = 5000;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
@@ -131,7 +137,7 @@ struct GlobalConfig {
     // Install RdmaTwoSidedTransport (CtrlChannel notify) instead of classic
     // one-sided RdmaTransport. MC_USE_RDMA_TWOSIDED.
     bool use_rdma_twosided = false;
-    // RDMA CtrlChannel notify path. MC_RDMA_NOTIFY_ENABLED.
+    // RDMA notifications for rdma and rdma_twosided. MC_RDMA_NOTIFY_ENABLED.
     bool rdma_notify_enabled = true;
     // Ctrl recv/send slot count and slot size. MC_RDMA_NOTIFY_RECV_COUNT /
     // MC_RDMA_NOTIFY_BUFFER_SIZE.
@@ -140,7 +146,7 @@ struct GlobalConfig {
     // Local pending SEND cap; actual cap is min(this, peer notify_rq_depth).
     // MC_RDMA_NOTIFY_MAX_PENDING_SENDS.
     size_t rdma_notify_max_pending_sends = 64;
-    // Fall back to OOB RPC notify when CtrlChannel is unavailable.
+    // Allow OOB RPC fallback when the RDMA notification path is unavailable.
     // MC_RDMA_NOTIFY_OOB_FALLBACK.
     bool rdma_notify_oob_fallback = true;
     // Upper bound for waiting on an in-flight CtrlChannel connect to the same

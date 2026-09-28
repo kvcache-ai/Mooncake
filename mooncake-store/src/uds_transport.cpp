@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -17,6 +18,22 @@ namespace {
 
 std::string errnoMessage(const std::string &operation) {
     return operation + ": " + strerror(errno);
+}
+
+int createCloexecUdsSocket() {
+#ifdef SOCK_CLOEXEC
+    return socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
+    // SOCK_CLOEXEC is Linux-specific; set FD_CLOEXEC after creation instead.
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd >= 0 && fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+#endif
 }
 
 tl::expected<void, std::string> makeAbstractAddress(
@@ -36,11 +53,12 @@ tl::expected<void, std::string> makeAbstractAddress(
 tl::expected<void, std::string> setSendTimeout(
     int fd, std::chrono::milliseconds timeout) {
     timeval tv = {
-        .tv_sec =
-            std::chrono::duration_cast<std::chrono::seconds>(timeout).count(),
-        .tv_usec = std::chrono::duration_cast<std::chrono::microseconds>(
-                       timeout % std::chrono::seconds(1))
-                       .count(),
+        .tv_sec = static_cast<decltype(tv.tv_sec)>(
+            std::chrono::duration_cast<std::chrono::seconds>(timeout).count()),
+        .tv_usec = static_cast<decltype(tv.tv_usec)>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                timeout % std::chrono::seconds(1))
+                .count()),
     };
     if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
         return tl::make_unexpected(
@@ -55,7 +73,7 @@ tl::expected<int, std::string> createConnectedSocket(
         return tl::make_unexpected("UDS connect timeout must be positive");
     }
 
-    int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int sock_fd = createCloexecUdsSocket();
     if (sock_fd < 0) {
         return tl::make_unexpected(errnoMessage("Failed to create UDS socket"));
     }
@@ -259,7 +277,7 @@ tl::expected<void, std::string> UdsAcceptor::start() {
         return tl::make_unexpected("UDS acceptor handler is not registered");
     }
 
-    listen_fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    listen_fd_ = createCloexecUdsSocket();
     if (listen_fd_ < 0) {
         return tl::make_unexpected(errnoMessage("Failed to create UDS socket"));
     }

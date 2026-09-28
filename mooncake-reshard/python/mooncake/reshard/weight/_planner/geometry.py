@@ -9,7 +9,7 @@ from ..._typing import TypeAlias
 from ..._compat import _strict_zip
 from ...contracts import TensorId
 from ..types import TensorDescriptor
-from ..storage_manifest import StoredFragment
+from ..storage_manifest import StoredFragmentSnapshot
 from .fragments import (
     GeometryFragment,
     LogicalSourceFragment,
@@ -79,7 +79,7 @@ def _geometry_key(fragment: LogicalSourceFragment) -> GeometryKey:
 
 
 def _source_sort_key(fragment: LogicalSourceFragment) -> SourceSortKey:
-    if isinstance(fragment, StoredFragment):
+    if isinstance(fragment, StoredFragmentSnapshot):
         return (0, 0, 0, 0, fragment.object_key, fragment.fragment_id)
     return (
         fragment.rank.dp,

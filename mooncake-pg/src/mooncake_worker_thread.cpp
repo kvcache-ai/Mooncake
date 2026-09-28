@@ -27,6 +27,30 @@ void MooncakeWorker::Start() {
     }
 }
 
+bool MooncakeWorker::hasPendingActiveRanksMirrorUpdate(
+    const TransferGroupMeta* meta) const {
+    for (size_t i = kCudaTaskOffset_; i < kNumTasks_; ++i) {
+        auto& task = tasks_[i];
+        // The request generation is the publication token for this pending
+        // update. Keep this acquire before reading transferGroupMeta so the
+        // task-to-group association is observed after the request is
+        // published.
+        const uint64_t requested =
+            std::atomic_ref(task.activeRanksMirrorRequestGeneration)
+                .load(std::memory_order_acquire);
+        if (task.transferGroupMeta != meta) {
+            continue;
+        }
+        const uint64_t applied =
+            std::atomic_ref(task.activeRanksMirrorAppliedGeneration)
+                .load(std::memory_order_acquire);
+        if (requested != applied) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool MooncakeWorker::drainTasks(const TransferGroupMeta* meta) const {
     BackoffWaiter waiter;
     return waiter.wait_for(
@@ -370,6 +394,22 @@ void MooncakeWorker::startWorker() {
                                     failedRanks[i][rank];
                             }
                             active_failed_ranks_hint[i] = nullptr;
+                        }
+
+                        // Mark the resident-kernel mirror update as pending
+                        // before publishing the link event. The resulting
+                        // ViewUpdate must observe request != applied and skip
+                        // the host H2D path. The kernel consumes this request
+                        // and copies the updated active ranks.
+                        if (task_detected_failure[i] &&
+                            group->autoSyncOnFailure &&
+                            group->activeRanksMirrorDevice) {
+                            const uint64_t generation =
+                                next_active_ranks_mirror_generation_.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            std::atomic_ref(
+                                task.activeRanksMirrorRequestGeneration)
+                                .store(generation, std::memory_order_release);
                         }
 
                         // Push link event via communicator's Agent.

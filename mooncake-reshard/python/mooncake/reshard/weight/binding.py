@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from ..contracts import RuntimeInstanceId, validate_resource_binding_identity
+from ..contracts import (
+    RuntimeFragmentId,
+    RuntimeInstanceId,
+    validate_resource_binding_identity,
+)
 from .placement import WeightPlacementManifest
 from .runtime import WeightRuntimeBindingManifest
 from .types import canonical_strides_bytes, require_manifest_items
@@ -100,8 +104,16 @@ def _validate_runtime_binding_subset(
     participant_ids = [item.participant_id for item in items]
     if len(participant_ids) != len(set(participant_ids)):
         raise ValueError("duplicate runtime binding participant")
+    runtime_fragment_ids: set[RuntimeFragmentId] = set()
     for binding in items:
         validate_runtime_binding(placement, binding)
+        for fragment in binding.fragments:
+            if fragment.fragment_id in runtime_fragment_ids:
+                raise ValueError(
+                    f"duplicate runtime fragment_id across participants: "
+                    f"{fragment.fragment_id}"
+                )
+            runtime_fragment_ids.add(fragment.fragment_id)
 
     part_by_participant = {part.participant_id: part for part in placement.parts}
     by_instance: dict[RuntimeInstanceId, list[WeightRuntimeBindingManifest]] = {}
