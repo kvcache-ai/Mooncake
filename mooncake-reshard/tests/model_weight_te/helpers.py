@@ -357,6 +357,24 @@ def multi_worker_participant_inputs(
     return RuntimeInputs(placement, (binding,))
 
 
+def with_fragment_address(
+    inputs: RuntimeInputs,
+    fragment_index: int,
+    address: int,
+) -> RuntimeInputs:
+    binding = inputs.bindings[0]
+    fragments = list(binding.fragments)
+    fragments[fragment_index] = replace(
+        fragments[fragment_index],
+        address=address,
+        storage_address=address,
+    )
+    return RuntimeInputs(
+        inputs.placement,
+        (replace(binding, fragments=tuple(fragments)),),
+    )
+
+
 def registration_leases(inputs: RuntimeInputs) -> tuple[MemoryRegistrationLease, ...]:
     return tuple(
         MemoryRegistrationLease.from_fragment(

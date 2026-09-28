@@ -22,6 +22,7 @@ from .helpers import (
     participant_inputs,
     plan_transfer_to_local_target,
     registration_leases,
+    with_fragment_address,
 )
 
 
@@ -94,6 +95,50 @@ def test_te_reader_scopes_peer_validation_within_one_participant() -> None:
         target_pre_registered=True,
         target_registrations=(registration_leases(targets)[0],),
         source_allocation_guards=allocation_guards(sources),
+        target_allocation_guards=allocation_guards(targets),
+    )
+
+    assert sum(receipt.nbytes for receipt in receipts) == 4
+
+
+def test_te_reader_ignores_unselected_local_worker_snapshot_changes() -> None:
+    sources = multi_worker_participant_inputs("source", 0x10000)
+    planned_targets = multi_worker_participant_inputs("target", 0x40000)
+    current_targets = with_fragment_address(planned_targets, 1, 0x90000)
+
+    receipts = MooncakeTransferEngineReader(FakeTransferEngine()).execute(
+        plan_transfer_to_local_target(sources, planned_targets),
+        sources.placement,
+        sources.bindings,
+        current_targets.placement,
+        current_targets.bindings[0],
+        target_worker_id="target-worker-0",
+        source_registrations=(registration_leases(sources)[0],),
+        target_pre_registered=True,
+        target_registrations=(registration_leases(current_targets)[0],),
+        source_allocation_guards=allocation_guards(sources),
+        target_allocation_guards=allocation_guards(current_targets),
+    )
+
+    assert sum(receipt.nbytes for receipt in receipts) == 4
+
+
+def test_te_reader_ignores_unselected_peer_worker_snapshot_changes() -> None:
+    planned_sources = multi_worker_participant_inputs("source", 0x10000)
+    current_sources = with_fragment_address(planned_sources, 1, 0x90000)
+    targets = multi_worker_participant_inputs("target", 0x40000)
+
+    receipts = MooncakeTransferEngineReader(FakeTransferEngine()).execute(
+        plan_transfer_to_local_target(planned_sources, targets),
+        current_sources.placement,
+        current_sources.bindings,
+        targets.placement,
+        targets.bindings[0],
+        target_worker_id="target-worker-0",
+        source_registrations=(registration_leases(current_sources)[0],),
+        target_pre_registered=True,
+        target_registrations=(registration_leases(targets)[0],),
+        source_allocation_guards=allocation_guards(current_sources),
         target_allocation_guards=allocation_guards(targets),
     )
 

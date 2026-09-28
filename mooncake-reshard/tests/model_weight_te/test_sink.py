@@ -22,6 +22,7 @@ from .helpers import (
     plan_transfer,
     registration_leases,
     with_revision,
+    with_fragment_address,
 )
 
 
@@ -94,6 +95,46 @@ def test_te_sink_scopes_peer_validation_within_one_participant() -> None:
         target_registrations=(registration_leases(targets)[0],),
         source_allocation_guards=allocation_guards(sources),
         target_allocation_guards=allocation_guards(targets),
+    )
+
+    assert sum(receipt.nbytes for receipt in receipts) == 4
+
+
+def test_te_sink_ignores_unselected_local_worker_snapshot_changes() -> None:
+    planned_sources = multi_worker_participant_inputs("source", 0x10000)
+    current_sources = with_fragment_address(planned_sources, 1, 0x90000)
+    targets = multi_worker_participant_inputs("target", 0x40000)
+
+    receipts = MooncakeTransferEngineSink(FakeTransferEngine()).execute(
+        plan_transfer(planned_sources, targets),
+        current_sources.placement,
+        current_sources.bindings[0],
+        targets.placement,
+        targets.bindings,
+        source_worker_id="source-worker-0",
+        target_registrations=(registration_leases(targets)[0],),
+        source_allocation_guards=allocation_guards(current_sources),
+        target_allocation_guards=allocation_guards(targets),
+    )
+
+    assert sum(receipt.nbytes for receipt in receipts) == 4
+
+
+def test_te_sink_ignores_unselected_peer_worker_snapshot_changes() -> None:
+    sources = multi_worker_participant_inputs("source", 0x10000)
+    planned_targets = multi_worker_participant_inputs("target", 0x40000)
+    current_targets = with_fragment_address(planned_targets, 1, 0x90000)
+
+    receipts = MooncakeTransferEngineSink(FakeTransferEngine()).execute(
+        plan_transfer(sources, planned_targets),
+        sources.placement,
+        sources.bindings[0],
+        current_targets.placement,
+        current_targets.bindings,
+        source_worker_id="source-worker-0",
+        target_registrations=(registration_leases(current_targets)[0],),
+        source_allocation_guards=allocation_guards(sources),
+        target_allocation_guards=allocation_guards(current_targets),
     )
 
     assert sum(receipt.nbytes for receipt in receipts) == 4

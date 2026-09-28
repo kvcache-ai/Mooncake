@@ -16,7 +16,6 @@ from ..planner import (
     LiveTransferOperation,
     RuntimeFragmentSnapshot,
     TransferPlan,
-    resolve_executor_plans,
 )
 from .completion import TransferEngineError
 
@@ -184,41 +183,29 @@ def validate_execution_input_types(
             )
 
 
-def resolve_runtime_executors(
+def planned_executors_for_binding(
     plan: TransferPlan,
-    placement: WeightPlacementManifest,
     binding: WeightRuntimeBindingManifest,
     label: str,
 ) -> tuple[ExecutorTransferPlan, ...]:
-    return resolve_executor_plans(plan, placement, binding, label)
-
-
-def validate_selected_executor_snapshot(
-    plan: TransferPlan,
-    placement: WeightPlacementManifest,
-    binding: WeightRuntimeBindingManifest,
-    label: str,
-) -> tuple[ExecutorTransferPlan, ...]:
-    """Validate a planned participant before its framework guard is acquired.
-
-    The guard is the allocation-lifetime authority, but it must never be asked
-    to pin an arbitrary participant or fragment set. This check uses only the
-    manifest snapshot and plan identity; the executor repeats the same check
-    against the fresh binding returned under the framework pin.
-    """
-
-    expected_participants = {
-        executor.participant_id
-        for executor in (
-            plan.source_executors if label == "source" else plan.target_executors
-        )
-    }
-    if binding.participant_id not in expected_participants:
+    executors = plan.source_executors if label == "source" else plan.target_executors
+    participant_executors = tuple(
+        executor
+        for executor in executors
+        if executor.participant_id == binding.participant_id
+    )
+    if not participant_executors:
         return ()
-    try:
-        return resolve_runtime_executors(plan, placement, binding, label)
-    except (KeyError, ValueError) as error:
-        raise TransferEngineError(str(error)) from error
+    matching = tuple(
+        executor
+        for executor in participant_executors
+        if executor.instance_id == binding.instance_id
+    )
+    if not matching:
+        raise TransferEngineError(
+            f"{label} executor snapshot mismatch: unknown instance"
+        )
+    return matching
 
 
 def select_worker_executors(
@@ -258,6 +245,13 @@ def validate_scoped_executor_snapshot(
         and executor.participant_id == binding.participant_id
         and required.intersection(executor.fragment_ids)
     )
+    if any(
+        executor.placement_id != placement.placement_id
+        or executor.placement_digest != placement.digest
+        or executor.runtime_lease_id != binding.lease_id
+        for executor in matching
+    ):
+        raise TransferEngineError(f"{label} executor snapshot mismatch")
     covered = frozenset(
         fragment_id
         for executor in matching
