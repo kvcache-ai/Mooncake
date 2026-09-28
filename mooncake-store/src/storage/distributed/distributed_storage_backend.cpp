@@ -33,6 +33,27 @@ std::optional<int> ParseShardFileName(std::string_view name) {
     return index;
 }
 
+std::optional<int> ParseBucketFileName(std::string_view name) {
+    constexpr std::string_view prefix = "bucket_";
+    constexpr std::string_view suffix = ".data";
+    if (!name.starts_with(prefix) || !name.ends_with(suffix)) {
+        return std::nullopt;
+    }
+    name.remove_prefix(prefix.size());
+    name.remove_suffix(suffix.size());
+    if (name.empty()) return std::nullopt;
+
+    int index = 0;
+    for (char digit : name) {
+        if (digit < '0' || digit > '9' ||
+            index > (std::numeric_limits<int>::max() - (digit - '0')) / 10) {
+            return std::nullopt;
+        }
+        index = index * 10 + (digit - '0');
+    }
+    return index;
+}
+
 bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
                                const DistributedStorageConfig& config) {
     if (config.alignment == 0 || desc.object_size == 0 ||
@@ -50,6 +71,64 @@ bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
         static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
     return desc.offset <= kMaxFileOffset &&
            desc.aligned_size <= kMaxFileOffset - desc.offset;
+}
+
+bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
+                                  const DistributedStorageConfig& config) {
+    if (config.alignment == 0 || desc.shard_idx < 0 || desc.object_size == 0 ||
+        desc.aligned_size < desc.object_size ||
+        desc.offset % config.alignment != 0 ||
+        desc.aligned_size % config.alignment != 0 ||
+        desc.offset > config.bucket_capacity ||
+        desc.aligned_size > config.bucket_capacity - desc.offset ||
+        desc.object_size > config.bucket_capacity - desc.offset) {
+        return false;
+    }
+    constexpr uint64_t kMaxOffset =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    return desc.offset <= kMaxOffset &&
+           desc.object_size <= kMaxOffset - desc.offset &&
+           desc.aligned_size <= kMaxOffset - desc.offset;
+}
+
+tl::expected<void, ErrorCode> TransferAll(FileSystemAdapter& adapter, int fd,
+                                          std::vector<iovec> iovs,
+                                          int64_t offset, uint64_t total,
+                                          bool write) {
+    size_t index = 0;
+    uint64_t transferred = 0;
+    while (transferred < total) {
+        while (index < iovs.size() && iovs[index].iov_len == 0) ++index;
+        if (index == iovs.size() ||
+            iovs.size() - index >
+                static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto count = static_cast<int>(iovs.size() - index);
+        auto result =
+            write ? adapter.WriteAt(fd, iovs.data() + index, count, offset)
+                  : adapter.ReadAt(fd, iovs.data() + index, count, offset);
+        if (!result) return tl::make_unexpected(result.error());
+        if (*result == 0 || *result > total - transferred) {
+            return tl::make_unexpected(write ? ErrorCode::FILE_WRITE_FAIL
+                                             : ErrorCode::FILE_READ_FAIL);
+        }
+        size_t consumed = *result;
+        transferred += *result;
+        offset += static_cast<int64_t>(*result);
+        while (consumed > 0 && index < iovs.size()) {
+            if (consumed >= iovs[index].iov_len) {
+                consumed -= iovs[index].iov_len;
+                ++index;
+            } else {
+                iovs[index].iov_base =
+                    static_cast<char*>(iovs[index].iov_base) + consumed;
+                iovs[index].iov_len -= consumed;
+                consumed = 0;
+            }
+        }
+    }
+    return {};
 }
 
 }  // namespace
@@ -194,6 +273,41 @@ DistributedStorageBackend::GetOrOpenShard(
     return shard;
 }
 
+bool DistributedStorageBackend::UsesBucketAllocator() const {
+    return distributed_config_.allocator_type == "bucket";
+}
+
+tl::expected<int, ErrorCode> DistributedStorageBackend::OpenBucket(
+    const DistributedFSDescriptor& descriptor) {
+    const auto path =
+        std::filesystem::path(descriptor.file_path).lexically_normal();
+    auto root = std::filesystem::path(root_dir_).lexically_normal();
+    if (root.filename().empty()) root = root.parent_path();
+    auto parent = path.parent_path();
+    if (parent.empty()) parent = ".";
+    const auto bucket_id = ParseBucketFileName(path.filename().string());
+    if (!bucket_id || *bucket_id != descriptor.shard_idx || parent != root) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const std::string file_path = path.string();
+    auto file_size = fs_adapter_->GetFileSize(file_path);
+    if (!file_size) return tl::make_unexpected(file_size.error());
+    if (*file_size != distributed_config_.bucket_capacity) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::error_code error;
+    const auto canonical_root = std::filesystem::canonical(root, error);
+    if (error) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    const auto canonical_path = std::filesystem::canonical(path, error);
+    if (error) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    if (canonical_path.parent_path() != canonical_root ||
+        canonical_path.filename() != path.filename()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return fs_adapter_->OpenExistingFile(file_path);
+}
+
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -301,18 +415,30 @@ DistributedStorageBackend::BatchWrite(
 
     for (const auto& request : requests) {
         const auto& desc = request.descriptor;
-        if (!IsDfsDescriptorRangeValid(desc, distributed_config_)) {
+        const bool bucket_mode = UsesBucketAllocator();
+        const bool range_valid =
+            bucket_mode
+                ? IsBucketDescriptorRangeValid(desc, distributed_config_)
+                : IsDfsDescriptorRangeValid(desc, distributed_config_);
+        if (!range_valid) {
             LOG(ERROR) << "Invalid DFS descriptor range for key " << request.key
                        << ", offset=" << desc.offset
                        << ", object_size=" << desc.object_size
                        << ", aligned_size=" << desc.aligned_size
-                       << ", shard_capacity="
-                       << distributed_config_.shard_capacity;
+                       << ", capacity="
+                       << (bucket_mode ? distributed_config_.bucket_capacity
+                                       : distributed_config_.shard_capacity);
             results.emplace_back(
                 tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
 
+        if (request.slices.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
         std::vector<iovec> iovs;
         iovs.reserve(request.slices.size());
         uint64_t total_size = 0;
@@ -333,6 +459,26 @@ DistributedStorageBackend::BatchWrite(
                          << ", actual=" << total_size;
             results.emplace_back(
                 tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        if (bucket_mode) {
+            auto fd = OpenBucket(desc);
+            if (!fd) {
+                results.emplace_back(tl::make_unexpected(fd.error()));
+                continue;
+            }
+            auto write_result = TransferAll(*fs_adapter_, *fd, std::move(iovs),
+                                            static_cast<int64_t>(desc.offset),
+                                            total_size, true);
+            auto close_result = fs_adapter_->CloseFile(*fd);
+            if (!write_result) {
+                results.emplace_back(tl::make_unexpected(write_result.error()));
+            } else if (!close_result) {
+                results.emplace_back(tl::make_unexpected(close_result.error()));
+            } else {
+                results.emplace_back();
+            }
             continue;
         }
 
@@ -386,13 +532,19 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
 
     for (const auto& request : requests) {
         const auto& desc = request.descriptor;
-        if (!IsDfsDescriptorRangeValid(desc, distributed_config_)) {
+        const bool bucket_mode = UsesBucketAllocator();
+        const bool range_valid =
+            bucket_mode
+                ? IsBucketDescriptorRangeValid(desc, distributed_config_)
+                : IsDfsDescriptorRangeValid(desc, distributed_config_);
+        if (!range_valid) {
             LOG(ERROR) << "Invalid DFS descriptor range for key " << request.key
                        << ", offset=" << desc.offset
                        << ", object_size=" << desc.object_size
                        << ", aligned_size=" << desc.aligned_size
-                       << ", shard_capacity="
-                       << distributed_config_.shard_capacity;
+                       << ", capacity="
+                       << (bucket_mode ? distributed_config_.bucket_capacity
+                                       : distributed_config_.shard_capacity);
             results.emplace_back(
                 tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;
@@ -429,6 +581,26 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
                          << ", expected capacity at least=" << desc.object_size;
             results.emplace_back(
                 tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        if (bucket_mode) {
+            auto fd = OpenBucket(desc);
+            if (!fd) {
+                results.emplace_back(tl::make_unexpected(fd.error()));
+                continue;
+            }
+            auto read_result = TransferAll(*fs_adapter_, *fd, std::move(iovs),
+                                           static_cast<int64_t>(desc.offset),
+                                           desc.object_size, false);
+            auto close_result = fs_adapter_->CloseFile(*fd);
+            if (!read_result) {
+                results.emplace_back(tl::make_unexpected(read_result.error()));
+            } else if (!close_result) {
+                results.emplace_back(tl::make_unexpected(close_result.error()));
+            } else {
+                results.emplace_back();
+            }
             continue;
         }
 

@@ -185,6 +185,7 @@ echo "Building wheel package..."
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 MIGRATED_PYTHON_MODULES=(
+    http_metadata_server.py
     _launcher.py
     cli.py
     cli_bench.py
@@ -509,6 +510,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \
+    --exclude libgalaxyhip.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \
     --exclude libc10.so* \

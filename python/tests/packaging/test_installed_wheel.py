@@ -47,6 +47,10 @@ def test_wheel_imports_outside_the_repository(
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
     python = environment / "bin" / "python"
     subprocess.run(
+        [str(python), "-m", "pip", "install", "aiohttp"],
+        check=True,
+    )
+    subprocess.run(
         [str(python), "-m", "pip", "install", "--no-deps", str(wheel)],
         check=True,
     )
@@ -78,6 +82,7 @@ assert "mooncake.engine" not in sys.modules
 
 import mooncake.async_store
 import mooncake.engine
+import mooncake.http_metadata_server
 import mooncake.mooncake_config
 import mooncake.reshard
 import mooncake.store
@@ -94,6 +99,7 @@ assert issubclass(
 )
 assert Path(mooncake.async_store.__file__).resolve().parent == package_path.parent
 assert mooncake.engine.TransferEngine is not None
+assert mooncake.http_metadata_server.KVBootstrapServer is not None
 assert mooncake.mooncake_config.MooncakeConfig is not None
 for ep_module in (
     "ep.py",
@@ -146,6 +152,12 @@ assert pg.installed_wheel_marker is backend.installed_wheel_marker
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],
+        cwd=tmp_path,
+        env=clean_environment,
+        check=True,
+    )
+    subprocess.run(
+        [str(environment / "bin" / "mooncake_http_metadata_server"), "--help"],
         cwd=tmp_path,
         env=clean_environment,
         check=True,

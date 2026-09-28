@@ -99,6 +99,10 @@ MasterMetricManager::MasterMetricManager()
                           "Total number of PutStart requests received"),
       put_start_failures_("master_put_start_failures_total",
                           "Total number of failed PutStart requests"),
+      put_start_object_already_exists_(
+          "master_put_start_object_already_exists_total",
+          "Total PutStart requests returning "
+          "OBJECT_ALREADY_EXISTS"),
       put_start_alloc_failures_(
           "master_put_start_alloc_failures_total",
           "Total number of PutStart failures caused by replica allocation "
@@ -267,6 +271,9 @@ MasterMetricManager::MasterMetricManager()
       batch_put_start_failures_(
           "master_batch_put_start_failures_total",
           "Total number of failed BatchPutStart requests"),
+      batch_put_start_object_already_exists_(
+          "master_batch_put_start_object_already_exists_total",
+          "Total BatchPutStart response items with OBJECT_ALREADY_EXISTS"),
       batch_put_start_partial_successes_(
           "master_batch_put_start_partial_successes_total",
           "Total number of partially successful BatchPutStart requests"),
@@ -588,6 +595,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_candidate_dropped_limit_.inc(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
+    put_start_object_already_exists_.inc(0);
     put_start_alloc_failures_.inc(0);
     put_start_partial_allocations_.inc(0);
     put_end_requests_.inc(0);
@@ -665,6 +673,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_get_replica_list_failed_items_.inc(0);
     batch_put_start_requests_.inc(0);
     batch_put_start_failures_.inc(0);
+    batch_put_start_object_already_exists_.inc(0);
     batch_put_start_partial_successes_.inc(0);
     batch_put_start_items_.inc(0);
     batch_put_start_failed_items_.inc(0);
@@ -1088,6 +1097,9 @@ void MasterMetricManager::inc_exist_key_failures(int64_t val) {
 void MasterMetricManager::inc_put_start_requests(int64_t val) {
     put_start_requests_.inc(val);
 }
+void MasterMetricManager::inc_put_start_object_already_exists(int64_t val) {
+    put_start_object_already_exists_.inc(val);
+}
 void MasterMetricManager::inc_put_start_failures(int64_t val) {
     put_start_failures_.inc(val);
 }
@@ -1267,6 +1279,10 @@ void MasterMetricManager::inc_batch_put_start_failures(int64_t failed_items) {
     batch_put_start_failures_.inc(1);
     batch_put_start_failed_items_.inc(failed_items);
 }
+void MasterMetricManager::inc_batch_put_start_object_already_exists(
+    int64_t items) {
+    batch_put_start_object_already_exists_.inc(items);
+}
 void MasterMetricManager::inc_batch_put_start_partial_success(
     int64_t failed_items) {
     batch_put_start_partial_successes_.inc(1);
@@ -1419,6 +1435,9 @@ int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
 
+int64_t MasterMetricManager::get_put_start_object_already_exists() {
+    return put_start_object_already_exists_.value();
+}
 int64_t MasterMetricManager::get_put_start_failures() {
     return put_start_failures_.value();
 }
@@ -1613,6 +1632,10 @@ int64_t MasterMetricManager::get_batch_put_start_requests() {
 
 int64_t MasterMetricManager::get_batch_put_start_failures() {
     return batch_put_start_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_start_object_already_exists() {
+    return batch_put_start_object_already_exists_.value();
 }
 
 int64_t MasterMetricManager::get_batch_put_start_partial_successes() {
@@ -2022,6 +2045,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(exist_key_failures_);
     serialize_metric(put_start_requests_);
     serialize_metric(put_start_failures_);
+    serialize_metric(put_start_object_already_exists_);
     serialize_metric(put_start_alloc_failures_);
     serialize_metric(put_start_partial_allocations_);
     serialize_metric(put_end_requests_);
@@ -2111,6 +2135,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(batch_get_replica_list_failed_items_);
     serialize_metric(batch_put_start_requests_);
     serialize_metric(batch_put_start_failures_);
+    serialize_metric(batch_put_start_object_already_exists_);
     serialize_metric(batch_put_start_partial_successes_);
     serialize_metric(batch_put_start_items_);
     serialize_metric(batch_put_start_failed_items_);

@@ -66,6 +66,14 @@ bool ValidateSnapshot(SnapshotObjectStore& store, const std::string& root,
             !InspectArtifact(store, chunk.key, chunk.stored_size, chunk.crc32c))
             return false;
     }
+    if (manifest->weight_metadata) {
+        const auto& weights = *manifest->weight_metadata;
+        if (weights.key != ha::BuildBatchOpLogSnapshotWeightMetadataKey(
+                               root, descriptor.snapshot_id) ||
+            !InspectArtifact(store, weights.key, weights.stored_size,
+                             weights.crc32c))
+            return false;
+    }
     return true;
 }
 
