@@ -519,8 +519,8 @@ if(USE_ASCEND_DIRECT)
            COMMAND ascend_direct_transport_test)
 endif()
 
-# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
-if(ENABLE_MULTI_PROTOCOL)
+# This multi-protocol test directly uses CxlTransport and requires its backend.
+if(ENABLE_MULTI_PROTOCOL AND USE_CXL)
   add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
   target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest
                                                  gtest_main)
