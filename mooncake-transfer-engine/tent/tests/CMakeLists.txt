@@ -808,3 +808,8 @@ target_include_directories(tent_segment_desc_retry_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
+
+add_executable(tent_rdma_workload_test rdma_workload_test.cpp)
+target_link_libraries(tent_rdma_workload_test PRIVATE gtest gtest_main
+                                                      tent_interface)
+add_test(NAME tent_rdma_workload_test COMMAND tent_rdma_workload_test)

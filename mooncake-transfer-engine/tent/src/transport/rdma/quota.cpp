@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 
 namespace mooncake {
 namespace tent {
@@ -98,7 +99,7 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                                 uint64_t slice_bytes,
                                 const std::string& location,
                                 std::vector<int>& slice_dev_ids, int priority,
-                                uint64_t device_mask) {
+                                uint64_t device_mask, uint64_t trace_id) {
     slice_dev_ids.clear();
     slice_dev_ids.reserve(num_slices);
     auto entry = local_topology_->getMemEntry(location);
@@ -170,8 +171,21 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
         // to ensure all devices are sampled for EWMA updates
         thread_local uint64_t tl_call_count = 0;
         bool probe_mode = ((++tl_call_count % 100) == 0);
+        if (!probe_mode && sched_params_.batch_allocation_policy ==
+                               BatchAllocationPolicy::StaticCapacity) {
+            for (const auto& c : tl_candidates) {
+                const auto& capacities = sched_params_.batch_capacity_gbps;
+                if (static_cast<size_t>(c.dev_id) >= capacities.size() ||
+                    !std::isfinite(capacities[c.dev_id]) ||
+                    capacities[c.dev_id] <= 0) {
+                    return Status::InvalidArgument(
+                        "static_capacity requires positive batch_capacity_gbps "
+                        "for every candidate device ID");
+                }
+            }
+        }
         selectMultiPath(tl_candidates, num_slices, total_length, slice_bytes,
-                        slice_dev_ids, probe_mode);
+                        slice_dev_ids, probe_mode, trace_id);
     }
     return Status::OK();
 }
@@ -237,13 +251,18 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
             static_cast<double>(inflight + slice_bytes) / ewma_bw;
         double rank_penalty = sched_params_.numa_tier_weights[rank];
         double score = predicted_time * rank_penalty;
-        score +=
-            (SimpleRandom::Get().next(10) * sched_params_.score_jitter_range);
+        const double jitter =
+            SimpleRandom::Get().next(10) * sched_params_.score_jitter_range;
+        score += jitter;
         bool is_cross_numa = (rank > 0);
         Candidate c;
         c.dev_id = dev_id;
         c.score = score;
         c.is_cross_numa = is_cross_numa;
+        c.inflight_bytes = inflight;
+        c.bandwidth_bps = ewma_bw;
+        c.numa_penalty = rank_penalty;
+        c.jitter = jitter;
         candidates.push_back(c);
     };
 
@@ -312,7 +331,7 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
                                      uint32_t num_slices, uint64_t total_length,
                                      uint64_t slice_bytes,
                                      std::vector<int>& slice_dev_ids,
-                                     bool probe_mode) {
+                                     bool probe_mode, uint64_t trace_id) {
     if (candidates.empty()) return;
     const size_t first = slice_dev_ids.size();
     if (probe_mode) {
@@ -322,15 +341,53 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
             const Candidate& c = candidates[i % candidates.size()];
             slice_dev_ids.push_back(c.dev_id);
         }
+    } else if (sched_params_.batch_allocation_policy ==
+               BatchAllocationPolicy::VirtualLoad) {
+        std::vector<uint64_t> assigned_bytes(candidates.size(), 0);
+        uint64_t offset = 0;
+        for (uint32_t s = 0; s < num_slices; ++s) {
+            uint64_t length =
+                s + 1 == num_slices
+                    ? total_length - offset
+                    : std::min(slice_bytes, total_length - offset);
+            auto score = [&](size_t i) {
+                const auto& c = candidates[i];
+                return c.numa_penalty *
+                           (static_cast<double>(c.inflight_bytes) +
+                            assigned_bytes[i] + length) /
+                           c.bandwidth_bps +
+                       c.jitter;
+            };
+            size_t best = 0;
+            double best_score = score(0);
+            for (size_t i = 1; i < candidates.size(); ++i) {
+                double next_score = score(i);
+                if (std::abs(next_score - best_score) >
+                            sched_params_.score_jitter_range
+                        ? next_score < best_score
+                        : candidates[i].dev_id < candidates[best].dev_id) {
+                    best = i;
+                    best_score = next_score;
+                }
+            }
+            slice_dev_ids.push_back(candidates[best].dev_id);
+            assigned_bytes[best] += length;
+            offset += length;
+        }
     } else {
-        // Normal mode: weighted distribution based on inverse score
-        // Lower score → higher weight → more slices
+        // Keep the original integer apportionment and remainder rule for
+        // inverse scores and the fixed-capacity comparison baseline.
+        auto weight = [&](size_t i) {
+            if (sched_params_.batch_allocation_policy ==
+                BatchAllocationPolicy::StaticCapacity)
+                return sched_params_.batch_capacity_gbps[candidates[i].dev_id];
+            return 1.0 / (candidates[i].score + sched_params_.score_epsilon);
+        };
         double total_weight = 0.0;
         double max_weight = -1.0;
         int best_dev_idx = -1;
         for (size_t i = 0; i < candidates.size(); ++i) {
-            double w =
-                1.0 / (candidates[i].score + sched_params_.score_epsilon);
+            double w = weight(i);
             total_weight += w;
             if (w > max_weight) {
                 max_weight = w;
@@ -341,8 +398,7 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
             return;
         uint32_t remaining_slices = num_slices;
         for (size_t i = 0; i < candidates.size(); ++i) {
-            double w =
-                1.0 / (candidates[i].score + sched_params_.score_epsilon);
+            double w = weight(i);
             uint32_t assigned =
                 static_cast<uint32_t>((w / total_weight) * num_slices);
             if (assigned > 0) {
@@ -377,6 +433,42 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
         auto& dev = devices_[slice_dev_ids[i]];
         dev.addInflight(bytes);
         dev.total_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    if (sched_params_.batch_trace_interval) {
+        // Independent streams avoid aliasing the every-100th-call probe.
+        thread_local uint64_t normal_trace_calls = 0;
+        thread_local uint64_t probe_trace_calls = 0;
+        uint64_t sample =
+            probe_mode ? ++probe_trace_calls : ++normal_trace_calls;
+        if (sample % sched_params_.batch_trace_interval == 0) {
+            std::vector<uint64_t> assigned_bytes(candidates.size(), 0);
+            uint64_t traced_offset = 0;
+            for (size_t j = first; j < slice_dev_ids.size(); ++j) {
+                const uint64_t bytes =
+                    j + 1 == slice_dev_ids.size()
+                        ? total_length - traced_offset
+                        : std::min(slice_bytes, total_length - traced_offset);
+                traced_offset += bytes;
+                for (size_t i = 0; i < candidates.size(); ++i)
+                    if (candidates[i].dev_id == slice_dev_ids[j])
+                        assigned_bytes[i] += bytes;
+            }
+            std::ostringstream plan;
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                const auto& c = candidates[i];
+                plan << " " << local_topology_->getNicName(c.dev_id) << ":"
+                     << assigned_bytes[i] << "/" << c.inflight_bytes << "/"
+                     << c.bandwidth_bps;
+            }
+            LOG(INFO) << "RDMA_BATCH policy="
+                      << static_cast<int>(sched_params_.batch_allocation_policy)
+                      << " probe=" << probe_mode
+                      << " stream=" << (probe_mode ? "probe" : "normal")
+                      << " stream_call=" << sample << " trace_id=" << trace_id
+                      << " candidates=" << candidates.size()
+                      << " slices=" << num_slices << " bytes=" << total_length
+                      << " nic:assigned/inflight/bps=" << plan.str();
+        }
     }
 }
 

@@ -21,6 +21,12 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <thread>
+#include <iomanip>
+#include <limits>
+#include <glog/logging.h>
+#include "tent/transport/rdma/slice.h"
 #include <memory>
 #include <sstream>
 #include <utility>
@@ -153,6 +159,248 @@ std::unique_ptr<DeviceSelector> makeTwoNicSelector(
     EXPECT_TRUE(sel->setDeviceBandwidth(kDev0, 100.0).ok());
     EXPECT_TRUE(sel->setDeviceBandwidth(kDev1, 100.0).ok());
     return sel;
+}
+
+using BatchPolicy = DeviceSelector::BatchAllocationPolicy;
+
+DeviceSelector::SchedulingParams batchParams(BatchPolicy policy) {
+    DeviceSelector::SchedulingParams params;
+    params.batch_allocation_policy = policy;
+    params.enable_priority_filtering = false;
+    params.score_jitter_range = 0;
+    params.bandwidth_learning_rate = 1;
+    params.batch_capacity_gbps = {100, 100};
+    return params;
+}
+
+std::array<uint64_t, 2> inflight(DeviceSelector& sel) {
+    std::vector<NicLoadStats> stats;
+    EXPECT_TRUE(sel.getNicLoadStats(stats).ok());
+    std::array<uint64_t, 2> result{};
+    for (const auto& stat : stats) {
+        result[stat.device_name == "mlx5_0" ? 0 : 1] = stat.inflight_bytes;
+    }
+    return result;
+}
+
+TEST(DeviceSelectorBatchTest, ActualLengthsAndReleaseConserveBytes) {
+    for (auto policy : {BatchPolicy::InverseScore, BatchPolicy::VirtualLoad,
+                        BatchPolicy::StaticCapacity}) {
+        for (uint64_t total : {4 * kMiB + 7, 5 * kMiB + 7}) {
+            for (uint64_t mask : {1ULL, 3ULL}) {
+                std::thread([=] {
+                    auto sel = makeTwoNicSelector(batchParams(policy));
+                    const auto plan = planRdmaSlices(total, 2 * kMiB, 32);
+                    // Call 100 also checks the unchanged probe allocation path.
+                    for (int call = 1; call <= 100; ++call) {
+                        std::vector<int> ids;
+                        ASSERT_TRUE(sel->allocate(total, plan.count,
+                                                  plan.block_size, "cpu:0", ids,
+                                                  PRIO_HIGH, mask)
+                                        .ok());
+                        ASSERT_EQ(ids.size(), plan.count);
+                        std::array<uint64_t, 2> expected{};
+                        for (size_t i = 0; i < ids.size(); ++i) {
+                            ASSERT_GE(ids[i], 0);
+                            ASSERT_LT(ids[i], 2);
+                            if (mask == 1) {
+                                EXPECT_EQ(ids[i], 0);
+                            }
+                            expected[ids[i]] +=
+                                i + 1 == ids.size()
+                                    ? total - i * plan.block_size
+                                    : plan.block_size;
+                        }
+                        EXPECT_EQ(inflight(*sel), expected);
+                        EXPECT_EQ(expected[0] + expected[1], total);
+                        for (size_t i = 0; i < ids.size(); ++i) {
+                            uint64_t length = i + 1 == ids.size()
+                                                  ? total - i * plan.block_size
+                                                  : plan.block_size;
+                            // Completion samples and failed/unposted releases.
+                            ASSERT_TRUE(
+                                sel->release(ids[i], length,
+                                             call % 2 ? length / 12.5e9 : 0)
+                                    .ok());
+                        }
+                        EXPECT_EQ(inflight(*sel),
+                                  (std::array<uint64_t, 2>{0, 0}));
+                    }
+                }).join();
+            }
+        }
+    }
+}
+
+TEST(DeviceSelectorBatchTest, TailLengthChangesVirtualChoice) {
+    for (uint64_t total : {5 * kMiB, 6 * kMiB + 7}) {
+        std::thread([=] {
+            auto sel =
+                makeTwoNicSelector(batchParams(BatchPolicy::VirtualLoad));
+            ASSERT_TRUE(sel->setDeviceBandwidth(1, 200).ok());
+            int dev = -1;
+            ASSERT_TRUE(
+                sel->allocate(4 * kMiB, "cpu:0", dev, PRIO_HIGH, 2).ok());
+            const auto plan = planRdmaSlices(total, 2 * kMiB, 32);
+            ASSERT_EQ(plan.count, 3);
+            std::vector<int> ids;
+            ASSERT_TRUE(
+                sel->allocate(total, plan.count, plan.block_size, "cpu:0", ids)
+                    .ok());
+            // After A then B, loads are A=2, B=6 MiB. A 1 MiB tail
+            // prefers A (3 vs 3.5); a folded tail just over 2 MiB prefers B.
+            EXPECT_EQ(ids, (std::vector<int>{0, 1, total == 5 * kMiB ? 0 : 1}));
+            for (size_t i = 0; i < ids.size(); ++i)
+                ASSERT_TRUE(sel->release(ids[i],
+                                         i == 2 ? total - 4 * kMiB : 2 * kMiB,
+                                         0)
+                                .ok());
+            ASSERT_TRUE(sel->release(1, 4 * kMiB, 0).ok());
+            EXPECT_EQ(inflight(*sel), (std::array<uint64_t, 2>{0, 0}));
+        }).join();
+    }
+}
+
+TEST(DeviceSelectorBatchTest, StaticCapacityIgnoresOnlineBandwidth) {
+    std::thread([] {
+        auto params = batchParams(BatchPolicy::StaticCapacity);
+        params.batch_capacity_gbps = {100, 200};
+        auto sel = makeTwoNicSelector(params);
+        // Deliberately reverse the live rates. Fixed weights still favor B.
+        ASSERT_TRUE(sel->setDeviceBandwidth(0, 200).ok());
+        ASSERT_TRUE(sel->setDeviceBandwidth(1, 100).ok());
+        std::vector<int> ids;
+        ASSERT_TRUE(sel->allocate(64 * kMiB, 32, 2 * kMiB, "cpu:0", ids).ok());
+        EXPECT_EQ(std::count(ids.begin(), ids.end(), 0), 10);
+        EXPECT_EQ(std::count(ids.begin(), ids.end(), 1), 22);
+        for (int id : ids) ASSERT_TRUE(sel->release(id, 2 * kMiB, 0).ok());
+        EXPECT_EQ(inflight(*sel), (std::array<uint64_t, 2>{0, 0}));
+    }).join();
+}
+
+TEST(DeviceSelectorBatchTest, TraceSamplesNormalAndProbeIndependently) {
+    class Sink : public google::LogSink {
+       public:
+        size_t normal = 0, probe = 0;
+        void send(google::LogSeverity, const char*, const char*, int,
+                  const std::tm*, const char* message, size_t length) override {
+            std::string text(message, length);
+            if (text.find("RDMA_BATCH ") != 0) return;
+            if (text.find("stream=normal") != std::string::npos) ++normal;
+            if (text.find("stream=probe") != std::string::npos) ++probe;
+        }
+    };
+    for (uint64_t interval : {0, 100, 1000}) {
+        std::thread([=] {
+            auto params = batchParams(BatchPolicy::VirtualLoad);
+            params.batch_trace_interval = interval;
+            auto sel = makeTwoNicSelector(params);
+            Sink sink;
+            google::AddLogSink(&sink);
+            // 100,000 calls exercise 1,000 actual probes; no RDMA traffic.
+            for (int i = 0; i < 100000; ++i) {
+                std::vector<int> ids;
+                auto status =
+                    sel->allocate(4 * kMiB, 2, 2 * kMiB, "cpu:0", ids);
+                EXPECT_TRUE(status.ok());
+                for (int id : ids)
+                    EXPECT_TRUE(sel->release(id, 2 * kMiB, 0).ok());
+            }
+            google::RemoveLogSink(&sink);
+            EXPECT_EQ(sink.normal, interval ? 99000 / interval : 0);
+            EXPECT_EQ(sink.probe, interval ? 1000 / interval : 0);
+        }).join();
+    }
+}
+
+TEST(DeviceSelectorBatchTest, FixedInputScan) {
+    // Only the finite model oracle below is enumerated. All three allocation
+    // plans come from the real public allocate() path, with identical inputs.
+    for (auto capacity :
+         {std::array<double, 2>{100, 100}, std::array<double, 2>{200, 100},
+          std::array<double, 2>{100, 200}}) {
+        for (int loaded = 0; loaded < 2; ++loaded) {
+            for (uint64_t backlog_mib : {0, 2, 8, 16, 32, 64, 128}) {
+                std::array<uint64_t, 2> backlog{};
+                backlog[loaded] = backlog_mib * kMiB;
+                auto model_us = [&](int count_a) {
+                    double finish = 0;
+                    for (int rail = 0; rail < 2; ++rail) {
+                        int count = rail == 0 ? count_a : 32 - count_a;
+                        // An unused rail's historical work is not part of
+                        // this request's completion time.
+                        if (count == 0) continue;
+                        finish = std::max(finish,
+                                          (backlog[rail] + count * 2 * kMiB) /
+                                              (capacity[rail] * 1e3 / 8));
+                    }
+                    return finish;
+                };
+                double optimum = std::numeric_limits<double>::infinity();
+                for (int count = 0; count <= 32; ++count)
+                    optimum = std::min(optimum, model_us(count));
+                std::array<int, 3> counts{};
+                std::array<double, 3> times{};
+                for (int policy = 0; policy < 3; ++policy) {
+                    // Fresh thread: first aggregate call, never a probe.
+                    std::thread([&, policy] {
+                        auto params =
+                            batchParams(static_cast<BatchPolicy>(policy));
+                        params.batch_capacity_gbps = {capacity[0], capacity[1]};
+                        auto sel = makeTwoNicSelector(params);
+                        for (int rail = 0; rail < 2; ++rail)
+                            ASSERT_TRUE(
+                                sel->setDeviceBandwidth(rail, capacity[rail])
+                                    .ok());
+                        if (backlog_mib) {
+                            int chosen = -1;
+                            ASSERT_TRUE(sel->allocate(backlog[loaded], "cpu:0",
+                                                      chosen, PRIO_HIGH,
+                                                      1ULL << loaded)
+                                            .ok());
+                            ASSERT_EQ(chosen, loaded);
+                        }
+                        EXPECT_EQ(inflight(*sel), backlog);
+                        std::vector<int> ids;
+                        ASSERT_TRUE(
+                            sel->allocate(64 * kMiB, 32, 2 * kMiB, "cpu:0", ids)
+                                .ok());
+                        ASSERT_EQ(ids.size(), 32);
+                        counts[policy] = std::count(ids.begin(), ids.end(), 0);
+                        times[policy] = model_us(counts[policy]);
+                        auto expected = backlog;
+                        for (int id : ids) {
+                            ASSERT_GE(id, 0);
+                            ASSERT_LT(id, 2);
+                            expected[id] += 2 * kMiB;
+                        }
+                        EXPECT_EQ(inflight(*sel), expected);
+                        for (int id : ids)
+                            ASSERT_TRUE(sel->release(id, 2 * kMiB, 0).ok());
+                        EXPECT_EQ(inflight(*sel), backlog);
+                        if (backlog_mib) {
+                            ASSERT_TRUE(
+                                sel->release(loaded, backlog[loaded], 0).ok());
+                        }
+                        EXPECT_EQ(inflight(*sel),
+                                  (std::array<uint64_t, 2>{0, 0}));
+                    }).join();
+                }
+                std::cout << std::setprecision(12) << "BATCH_SCAN," << loaded
+                          << "," << backlog[0] / kMiB << ","
+                          << backlog[1] / kMiB << "," << capacity[0] << ","
+                          << capacity[1];
+                for (int policy = 0; policy < 3; ++policy)
+                    std::cout << "," << counts[policy] << ","
+                              << 32 - counts[policy] << "," << times[policy]
+                              << "," << times[policy] - optimum;
+                std::cout << "," << optimum << std::endl;
+                EXPECT_NEAR(times[1], optimum, 1e-8)
+                    << "loaded=" << loaded << " backlog_MiB=" << backlog_mib
+                    << " capacity=" << capacity[0] << ":" << capacity[1];
+            }
+        }
+    }
 }
 
 // Allocate `rounds` single-slice requests and return how many landed on each
