@@ -1539,12 +1539,13 @@ class MasterService {
 
     // Helper: allocate replicas, build the object's envelope, publish it on the
     // tenant's route, and return descriptor list.  Shared by PutStart and
-    // UpsertStart.
+    // UpsertStart. The tenant is created once this call is about to publish, so
+    // a request that fails before that leaves the registry as it was.
     auto AllocateAndInsertMetadata(
-        metadata::Tenant& tenant, const UUID& client_id, const std::string& key,
-        uint64_t value_length, const ReplicateConfig& config,
-        const std::string& writer_host_id, const std::string& group_id,
-        const TenantId& tenant_id,
+        const TenantId& tenant_id, const UUID& client_id,
+        const std::string& key, uint64_t value_length,
+        const ReplicateConfig& config, const std::string& writer_host_id,
+        const std::string& group_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
@@ -1552,12 +1553,36 @@ class MasterService {
         bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    // The quota account a tenant id is bound to. Reading it does not register a
+    // metadata tenant: the tenant factory binds this same account to the tenant
+    // it builds.
+    TenantQuotaHandle BoundTenantQuotaHandle(const TenantId& tenant_id);
+
     /**
      * @brief Helper to discard this tenant's expired processing replicas.
      */
     void DiscardExpiredProcessingReplicas(
         metadata::Tenant& tenant,
         const std::chrono::system_clock::time_point& now);
+    /**
+     * @brief Whether one object carries state the discard has work for: an
+     * in-flight write round, a replication task, an offload task or a promotion
+     * task. Read under the entry's own shared lock.
+     */
+    [[nodiscard]] bool HasInFlightState(
+        const std::shared_ptr<ObjectEntry>& entry) const;
+    /**
+     * @brief Settles the expired in-flight state of `objects[begin, end)`: the
+     * processing replicas of a write round past its release deadline, a
+     * replication task past its deadline, and expired offload and promotion
+     * tasks. Each acts on the publication the route holds when it runs, so a
+     * key republished in between is left alone. Objects with nothing in flight
+     * are skipped without a write lock.
+     */
+    void DiscardExpiredInFlightState(
+        metadata::Tenant& tenant, const TenantId& tenant_id,
+        const std::vector<std::shared_ptr<ObjectEntry>>& objects, size_t begin,
+        size_t end, const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
@@ -1947,6 +1972,29 @@ class MasterService {
     void ClearDynamicReplicationStateLocked(
         const TenantId& tenant_id, const std::shared_ptr<ObjectEntry>& entry,
         ObjectEntry::State& state);
+    // One expired pending proposal as a scan found it. The cleanup ends only
+    // the proposal this names: a proposal started after the scan, or the same
+    // one renewed, owns the key's state by then.
+    struct ExpiredDynamicReplicationPending {
+        std::string key;
+        std::shared_ptr<ObjectEntry> entry;
+        UUID proposal_id;
+        UUID lease_id;
+        UUID task_id;
+        uint64_t version_epoch{0};
+        int64_t expire_at_ms_epoch{0};
+    };
+    // Phase one of the sweep: the keys of `tenant` whose pending proposal had
+    // already expired at `now_ms`. Recording the proposal is what lets phase
+    // two tell it from a proposal that took its place.
+    [[nodiscard]] std::vector<ExpiredDynamicReplicationPending>
+    CollectExpiredDynamicReplicationPending(const metadata::Tenant& tenant,
+                                            int64_t now_ms) const;
+    // Phase two: ends the proposals `expired` names, and only those that are
+    // still the ones the scan saw and are still expired.
+    void CleanupExpiredDynamicReplicationPending(
+        const TenantId& tenant_id,
+        const std::vector<ExpiredDynamicReplicationPending>& expired);
     void CleanupExpiredDynamicReplicationState();
     // Whether a dynamic-replication task is still pending for the entry, with
     // the state of one whose lease already expired cleared. The caller holds

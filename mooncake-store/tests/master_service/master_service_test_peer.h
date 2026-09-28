@@ -447,6 +447,22 @@ class MasterServiceTestPeer {
         service_.ClearLocalDiskHandlesOwnedBy(owner);
     }
 
+    // The two phases of the expired-pending sweep, exposed separately so a test
+    // can let a new proposal take the key between them: the sweep must end the
+    // proposal it scanned and nothing else.
+    std::vector<MasterService::ExpiredDynamicReplicationPending>
+    CollectExpiredDynamicReplicationPending(const metadata::Tenant& tenant,
+                                            int64_t now_ms) const {
+        return service_.CollectExpiredDynamicReplicationPending(tenant, now_ms);
+    }
+
+    void CleanupExpiredDynamicReplicationPending(
+        const TenantId& tenant_id,
+        const std::vector<MasterService::ExpiredDynamicReplicationPending>&
+            expired) {
+        service_.CleanupExpiredDynamicReplicationPending(tenant_id, expired);
+    }
+
     void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
 
     void ClearInvalidHandles(

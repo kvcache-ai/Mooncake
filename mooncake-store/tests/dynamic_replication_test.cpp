@@ -1005,6 +1005,116 @@ TEST_F(DynamicReplicationTest, ExpiredDynamicPendingDoesNotBlockRegularCopy) {
                                  lease->lease_id));
 }
 
+// The sweep reads the pending proposals of a tenant and ends the expired ones.
+// A proposal published between that scan and the cleanup owns the key from then
+// on: ending the scanned proposal must not fail its task, drop its lease or
+// clear the pending state of the one that replaced it.
+TEST_F(DynamicReplicationTest,
+       ExpiredPendingSweepLeavesAProposalStartedAfterTheScan) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0x2c0000000);
+    auto target = PrepareSegment(service, "segment_1", 0x2d0000000);
+    const std::string key = "expired-sweep-key";
+    PutObject(service, source.client_id, key, source.segment_name);
+
+    auto stale = service.SubmitReplicaActionProposal(
+        BuildProposal(service, key, target.segment_name));
+    ASSERT_TRUE(stale.has_value());
+    ExpireDynamicPending(service, key);
+
+    const auto tenant =
+        MasterServiceTestPeer::Tenants(service).Lookup(TenantId::Default());
+    ASSERT_NE(nullptr, tenant);
+    auto peer = MasterServiceTestPeer(service);
+    const auto expired = peer.CollectExpiredDynamicReplicationPending(
+        *tenant, MasterServiceTestPeer::DynamicReplicationNowMs());
+    ASSERT_EQ(1u, expired.size());
+    EXPECT_EQ(stale->proposal_id, expired.front().proposal_id);
+    EXPECT_EQ(stale->task_id, expired.front().task_id);
+
+    // The key is taken over while the sweep still holds its record. The expired
+    // state goes first, which is what any path that ends a proposal does, and
+    // then a new proposal is accepted for the same key: the record no longer
+    // describes what the entry carries.
+    peer.ClearDynamicReplicationStateForKey(TenantId::Default(), *tenant, key);
+    auto fresh = service.SubmitReplicaActionProposal(
+        BuildProposal(service, key, target.segment_name));
+    ASSERT_TRUE(fresh.has_value());
+    ASSERT_NE(stale->proposal_id, fresh->proposal_id);
+    ASSERT_NE(stale->task_id, fresh->task_id);
+
+    peer.CleanupExpiredDynamicReplicationPending(TenantId::Default(), expired);
+
+    std::optional<UUID> pending_proposal;
+    const auto read_pending =
+        [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
+            const ObjectMetadata&, const ObjectEntry::State& state) -> bool {
+        if (!state.dynamic_replication_pending.has_value()) {
+            return false;
+        }
+        pending_proposal = state.dynamic_replication_pending->proposal_id;
+        return true;
+    };
+    const auto observed =
+        MasterServiceTestPeer(service).WithPublishedObjectForRead(
+            TenantId::Default(), key, read_pending);
+    ASSERT_TRUE(observed.has_value());
+    ASSERT_TRUE(*observed)
+        << "the sweep cleared the pending state of a proposal it never scanned";
+    ASSERT_TRUE(pending_proposal.has_value());
+    EXPECT_EQ(fresh->proposal_id, *pending_proposal);
+    EXPECT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                    service, TenantId::Default(), fresh->proposal_id)
+                    .has_value())
+        << "the sweep dropped the lease of a proposal it never scanned";
+
+    auto task_access =
+        MasterServiceTestPeer::TaskManager(service).get_read_access();
+    auto fresh_task = task_access.find_task_by_id(fresh->task_id);
+    ASSERT_TRUE(fresh_task.has_value());
+    EXPECT_EQ(TaskStatus::PENDING, fresh_task->status)
+        << "the sweep failed a task it never scanned";
+}
+
+// The same sweep, with nothing in between: the proposal it scanned is ended.
+TEST_F(DynamicReplicationTest, ExpiredPendingSweepEndsTheProposalItScanned) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0x2e0000000);
+    auto target = PrepareSegment(service, "segment_1", 0x2f0000000);
+    const std::string key = "expired-sweep-plain-key";
+    PutObject(service, source.client_id, key, source.segment_name);
+
+    auto lease = service.SubmitReplicaActionProposal(
+        BuildProposal(service, key, target.segment_name));
+    ASSERT_TRUE(lease.has_value());
+    ExpireDynamicPending(service, key);
+
+    const auto tenant =
+        MasterServiceTestPeer::Tenants(service).Lookup(TenantId::Default());
+    ASSERT_NE(nullptr, tenant);
+    auto peer = MasterServiceTestPeer(service);
+    const auto expired = peer.CollectExpiredDynamicReplicationPending(
+        *tenant, MasterServiceTestPeer::DynamicReplicationNowMs());
+    ASSERT_EQ(1u, expired.size());
+    peer.CleanupExpiredDynamicReplicationPending(TenantId::Default(), expired);
+
+    EXPECT_FALSE(HasDynamicState(service, key, lease->proposal_id));
+
+    auto task_access =
+        MasterServiceTestPeer::TaskManager(service).get_read_access();
+    auto expired_task = task_access.find_task_by_id(lease->task_id);
+    ASSERT_TRUE(expired_task.has_value());
+    EXPECT_EQ(TaskStatus::FAILED, expired_task->status);
+}
+
 TEST_F(DynamicReplicationTest, ExpiredLeaseRejectsCopyStart) {
     MasterServiceConfig config;
     config.dynamic_replication_mode = "enforce";

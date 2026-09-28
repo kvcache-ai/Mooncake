@@ -1320,6 +1320,44 @@ size_t RegisteredTenantCount(MasterService& service) {
 // A request that publishes nothing must not register a tenant: a client naming
 // a tenant id this service never stored into would otherwise grow the registry
 // with an empty tenant per request.
+// A PutStart that fails before it stores anything leaves the registry as it
+// was: the tenant is created when the object is about to be published, not when
+// a request arrives, so a rejected write cannot leave an empty tenant behind.
+TEST_F(MasterServiceTest, FailedPutStartLeavesNoTenantBehind) {
+    const TenantId filling("tenant_put_fills_pool");
+    const TenantId failing("tenant_put_never_publishes");
+    MasterService service(
+        MakeStrictTenantConfig({filling.value(), failing.value()}));
+    constexpr size_t kSegmentSize = 8 * 1024 * 1024;
+    constexpr size_t kObjectSize = 4 * 1024 * 1024;
+    const auto context = PrepareSimpleSegment(
+        service, "put_failure_segment", kDefaultSegmentBase, kSegmentSize);
+    const size_t tenants_before = RegisteredTenantCount(service);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    PutCompletedObject(service, context.client_id, "fill_a", filling, config,
+                       kObjectSize);
+    ASSERT_EQ(RegisteredTenantCount(service), tenants_before + 1);
+
+    // `failing` has a quota of its own and an empty route, and the request
+    // exceeds that quota: the write is refused before anything is published.
+    auto failed = service.PutStart(context.client_id, "no_room", failing,
+                                   kObjectSize + 1, config);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(ErrorCode::TENANT_QUOTA_EXCEEDED, failed.error());
+    EXPECT_EQ(RegisteredTenantCount(service), tenants_before + 1)
+        << "a PutStart that never publishes must not register its tenant";
+    EXPECT_EQ(MasterServiceTestPeer::Tenants(service).Lookup(failing), nullptr);
+    EXPECT_FALSE(service.GetReplicaList("no_room", failing).has_value());
+
+    // The same tenant is registered by a write that does publish.
+    PutCompletedObject(service, context.client_id, "stored", failing, config,
+                       kObjectSize);
+    EXPECT_EQ(RegisteredTenantCount(service), tenants_before + 2);
+    EXPECT_NE(MasterServiceTestPeer::Tenants(service).Lookup(failing), nullptr);
+}
+
 TEST_F(MasterServiceTest, MissDoesNotRegisterTenant) {
     const TenantId tenant("tenant_miss_scope");
     auto service = std::make_unique<MasterService>(
