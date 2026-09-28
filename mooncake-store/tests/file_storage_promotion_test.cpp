@@ -401,8 +401,7 @@ TEST_F(FileStoragePromotionTest, PrefetchKeysStopsBatchOnDramPressure) {
     bool dram_pressure = false;
     std::vector<std::string> attempted;
     auto res = file_storage->PrefetchKeys(
-        {"pk1", "pk2", "pk3", "pk4"}, {1024, 1024, 1024, 1024},
-        &dram_pressure,
+        {"pk1", "pk2", "pk3", "pk4"}, {1024, 1024, 1024, 1024}, &dram_pressure,
         [&attempted](const std::string& key, bool) {
             attempted.push_back(key);
         });
@@ -414,8 +413,7 @@ TEST_F(FileStoragePromotionTest, PrefetchKeysStopsBatchOnDramPressure) {
     EXPECT_EQ(fake->alloc_calls.load(), 1);
     EXPECT_EQ(attempted, std::vector<std::string>({"pk1"}));
     EXPECT_EQ(fake->notify_failure_calls.load(), 1);
-    EXPECT_EQ(fake->notify_failure_keys,
-              std::vector<std::string>({"pk1"}));
+    EXPECT_EQ(fake->notify_failure_keys, std::vector<std::string>({"pk1"}));
 }
 
 }  // namespace mooncake

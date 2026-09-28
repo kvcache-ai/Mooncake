@@ -98,9 +98,8 @@ void RegisterAndPromote(Client& client, FileStorage& file_storage,
             throttle->markInFlight(keys[i]);
         }
         bool dram_pressure = false;
-        auto prefetch_res =
-            file_storage.PrefetchKeys({keys[i]}, {sizes[i]}, &dram_pressure,
-                                      on_key_done);
+        auto prefetch_res = file_storage.PrefetchKeys(
+            {keys[i]}, {sizes[i]}, &dram_pressure, on_key_done);
         if (!prefetch_res) {
             LOG(WARNING) << "SSD prefetch: PrefetchKeys failed for key="
                          << keys[i] << ", error=" << prefetch_res.error();

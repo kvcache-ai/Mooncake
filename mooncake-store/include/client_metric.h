@@ -629,8 +629,8 @@ struct SsdMetric {
 
         ss << "SSD Prefetch: complete="
            << prefetch_complete_total.load(std::memory_order_relaxed)
-           << ", failed="
-           << prefetch_fail_total.load(std::memory_order_relaxed) << "\n";
+           << ", failed=" << prefetch_fail_total.load(std::memory_order_relaxed)
+           << "\n";
 
         ss << "\n" << "=== SSD Latency Summary (microseconds) ===" << "\n";
         ss << "Read: " << format_summary_percentiles(ssd_read_latency_summary)

@@ -313,9 +313,9 @@ TEST_F(PrefetchTaskMasterTest, PrefetchFailureDoesNotRecordCandidate) {
     // A from_prefetch failure must not re-record an on-hit candidate: with
     // promotion_on_hit off the retry sweeper never consumes it, so the
     // entry would leak and pin the tenant state permanently.
-    EXPECT_FALSE(CandidateFailuresForTesting(service.get(),
-                                             TenantId::Default(), "pkl")
-                     .has_value());
+    EXPECT_FALSE(
+        CandidateFailuresForTesting(service.get(), TenantId::Default(), "pkl")
+            .has_value());
 
     service->RemoveAll();
 }
@@ -338,20 +338,19 @@ TEST_F(PrefetchTaskMasterTest, RegisterPropagatesCandidateFailureCount) {
     // The candidate is consumed and its failure count moves onto the task —
     // hardcoding zero here would re-arm a persistently failing key on every
     // probe, defeating kMaxPromotionExecutionFailures.
-    EXPECT_EQ(TaskFailuresForTesting(service.get(), TenantId::Default(),
-                                     "pkp"),
+    EXPECT_EQ(TaskFailuresForTesting(service.get(), TenantId::Default(), "pkp"),
               std::optional<uint32_t>(2));
-    EXPECT_FALSE(CandidateFailuresForTesting(service.get(),
-                                             TenantId::Default(), "pkp")
-                     .has_value());
+    EXPECT_FALSE(
+        CandidateFailuresForTesting(service.get(), TenantId::Default(), "pkp")
+            .has_value());
 
     // A prefetch failure then ends the chain instead of re-recording.
     ASSERT_TRUE(
         service->NotifyPromotionFailure(holder, "pkp", TenantId::Default())
             .has_value());
-    EXPECT_FALSE(CandidateFailuresForTesting(service.get(),
-                                             TenantId::Default(), "pkp")
-                     .has_value());
+    EXPECT_FALSE(
+        CandidateFailuresForTesting(service.get(), TenantId::Default(), "pkp")
+            .has_value());
 
     service->RemoveAll();
 }
