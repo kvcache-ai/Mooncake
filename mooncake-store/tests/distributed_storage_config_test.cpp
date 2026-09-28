@@ -48,6 +48,9 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar legacy_root_dir{"MOONCAKE_DISTRIBUTED_ROOT_DIR"};
     ScopedEnvVar fs_adapter{"MOONCAKE_DFS_FS_ADAPTER"};
     ScopedEnvVar legacy_fs_adapter{"MOONCAKE_DISTRIBUTED_FS_TYPE"};
+    ScopedEnvVar kvcs_mode{"MOONCAKE_KVCS_MODE"};
+    ScopedEnvVar kvcs_parallel_query{"MOONCAKE_KVCS_ENABLE_PARALLEL_QUERY"};
+    ScopedEnvVar kvcs_query_timeout{"MOONCAKE_KVCS_QUERY_TIMEOUT_MS"};
     ScopedEnvVar health_check{"MOONCAKE_DISTRIBUTED_HEALTH_CHECK"};
     ScopedEnvVar shard_count{"MOONCAKE_DFS_SHARD_COUNT"};
     ScopedEnvVar shard_capacity{"MOONCAKE_DFS_SHARD_CAPACITY"};
@@ -75,6 +78,8 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(30));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(5));
+    EXPECT_FALSE(config.enable_parallel_query);
+    EXPECT_EQ(config.provider_query_timeout_ms, 50u);
 }
 
 DistributedStorageConfig ValidConfig() {
@@ -119,6 +124,8 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     env.eviction_low_watermark.Set("0.65");
     env.deferred_free_seconds.Set("12");
     env.eviction_check_interval.Set("3");
+    env.kvcs_parallel_query.Set("true");
+    env.kvcs_query_timeout.Set("75");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
 
@@ -134,6 +141,8 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
+    EXPECT_TRUE(config.enable_parallel_query);
+    EXPECT_EQ(config.provider_query_timeout_ms, 75u);
     EXPECT_TRUE(config.Validate());
     EXPECT_TRUE(config.ValidateForAllocator());
 
@@ -231,6 +240,22 @@ TEST_F(DistributedStorageConfigTest,
     EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.9);
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_TRUE(logs.empty());
+}
+
+TEST(DistributedStorageConfigValidationTest, AcceptsKvcsQueryHealthCheck) {
+    DistributedStorageConfig config;
+    config.fs_adapter_type = "kvcs-lowlevel";
+    config.enable_health_check = true;
+    EXPECT_TRUE(config.Validate());
+    config.fs_adapter_type = "kvcs-standard";
+    EXPECT_TRUE(config.Validate());
+}
+
+TEST(DistributedStorageConfigValidationTest, RejectsZeroProviderQueryTimeout) {
+    DistributedStorageConfig config;
+    config.fs_adapter_type = "kvcs-lowlevel";
+    config.provider_query_timeout_ms = 0;
+    EXPECT_FALSE(config.Validate());
 }
 
 TEST(DistributedStorageConfigValidationTest, RejectsInvalidBaseSettings) {

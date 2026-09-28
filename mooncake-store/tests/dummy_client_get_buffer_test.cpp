@@ -23,6 +23,8 @@
 #include "default_config.h"
 #include "dummy_client.h"
 #include "../src/config/client_object_checksum_config.h"
+#include "environ.h"
+#include "query_provider_test_adapter.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 
@@ -46,12 +48,15 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::remove_internal>(&rc);
     server.register_handler<&RealClient::removeAll_internal>(&rc);
     server.register_handler<&RealClient::isExist_internal>(&rc);
+    server.register_handler<&RealClient::batchIsExist_internal>(&rc);
     server.register_handler<&RealClient::getSize_internal>(&rc);
     server.register_handler<&RealClient::get_into_range_shm_helper>(&rc);
     server.register_handler<&RealClient::get_into_ranges_shm_helper>(&rc);
     server.register_handler<&RealClient::get_into_ranges_staged_shm_helper>(
         &rc);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
+    server.register_handler<
+        &RealClient::batch_get_into_multi_buffers_dummy_helper>(&rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
     server.register_handler<&RealClient::allocate_buffer_dummy>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
@@ -183,6 +188,18 @@ class DummyClientGetBufferTest : public ::testing::Test {
         ReplicateConfig config;
         config.replica_num = 1;
         ASSERT_EQ(real_client_->put(key, span, config), 0);
+    }
+
+    bool ReplaceDataWithoutClearingPending(const std::string &key,
+                                           const std::string &data) {
+        auto allocation =
+            real_client_->client_buffer_allocator_->allocate(data.size());
+        if (!allocation) return false;
+        std::memcpy(allocation->ptr(), data.data(), data.size());
+        std::vector<Slice> slices{{allocation->ptr(), data.size()}};
+        ReplicateConfig config;
+        config.replica_num = 1;
+        return real_client_->client_->Upsert(key, slices, config).has_value();
     }
 
     // Read via RealClient to populate hot cache, then wait for async fill.
@@ -385,6 +402,102 @@ TEST_F(DummyClientGetBufferTest, GetBuffer_AllocatorFallback) {
 
     std::string got(static_cast<const char *>(buf->ptr()), buf->size());
     EXPECT_EQ(got, data) << "Data mismatch on allocator fallback path";
+}
+
+TEST_F(DummyClientGetBufferTest,
+       BatchExistsResultCoversEveryUnchangedGetShapeAcrossRpcBoundary) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    auto provider_backend = MakeMissingQueryProviderBackend();
+    ASSERT_NE(provider_backend, nullptr);
+    real_client_->client_->SetDfsStorageBackend(provider_backend);
+
+    const std::string original = "0123456789abcdefghijklmnopqrstuv";
+    const std::string replacement(original.size(), 'R');
+    auto prime_pending_result = [&](const std::string &key) {
+        PutData(key, original);
+        if (dummy_client_->batchIsExist({key}) != std::vector<int>{1}) {
+            return false;
+        }
+        return ReplaceDataWithoutClearingPending(key, replacement);
+    };
+    auto expect_original = [&](const void *data, size_t size) {
+        ASSERT_NE(data, nullptr);
+        ASSERT_EQ(size, original.size());
+        EXPECT_EQ(std::string(static_cast<const char *>(data), size), original);
+    };
+
+    {
+        const std::string key = "implicit_cache_get_buffer";
+        ASSERT_TRUE(prime_pending_result(key));
+        auto result = dummy_client_->get_buffer(key);
+        ASSERT_NE(result, nullptr);
+        expect_original(result->ptr(), result->size());
+    }
+
+    {
+        const std::string key = "implicit_cache_batch_get_buffer";
+        ASSERT_TRUE(prime_pending_result(key));
+        auto results = dummy_client_->batch_get_buffer({key});
+        ASSERT_EQ(results.size(), 1u);
+        ASSERT_NE(results[0], nullptr);
+        expect_original(results[0]->ptr(), results[0]->size());
+    }
+
+    auto destination = dummy_client_->allocate_client_buffer(original.size());
+    ASSERT_TRUE(destination.has_value());
+    auto clear_destination = [&] {
+        std::memset(destination->ptr(), 0, destination->size());
+    };
+
+    {
+        const std::string key = "implicit_cache_get_into";
+        ASSERT_TRUE(prime_pending_result(key));
+        clear_destination();
+        ASSERT_EQ(dummy_client_->get_into(key, destination->ptr(),
+                                          destination->size()),
+                  static_cast<int64_t>(original.size()));
+        expect_original(destination->ptr(), destination->size());
+    }
+
+    {
+        const std::string key = "implicit_cache_batch_get_into";
+        ASSERT_TRUE(prime_pending_result(key));
+        clear_destination();
+        ASSERT_EQ(
+            dummy_client_->batch_get_into({key}, {destination->ptr()},
+                                          {destination->size()}),
+            (std::vector<int64_t>{static_cast<int64_t>(original.size())}));
+        expect_original(destination->ptr(), destination->size());
+    }
+
+    {
+        const std::string key = "implicit_cache_multi_buffer_get_into";
+        ASSERT_TRUE(prime_pending_result(key));
+        clear_destination();
+        constexpr size_t kFirstPart = 11;
+        auto *bytes = static_cast<char *>(destination->ptr());
+        ASSERT_EQ(dummy_client_->batch_get_into_multi_buffers(
+                      {key}, {{bytes, bytes + kFirstPart}},
+                      {{kFirstPart, original.size() - kFirstPart}}, false),
+                  (std::vector<int>{static_cast<int>(original.size())}));
+        expect_original(destination->ptr(), destination->size());
+    }
+
+    {
+        const std::string key = "implicit_cache_ranged_get_into";
+        ASSERT_TRUE(prime_pending_result(key));
+        clear_destination();
+        const auto results = dummy_client_->get_into_ranges(
+            {destination->ptr()}, {{key}}, {{{0, 13}}}, {{{0, 13}}},
+            {{{13, original.size() - 13}}});
+        ASSERT_EQ(results.size(), 1u);
+        ASSERT_EQ(results[0].size(), 1u);
+        EXPECT_EQ(results[0][0],
+                  (std::vector<int64_t>{
+                      13, static_cast<int64_t>(original.size() - 13)}));
+        expect_original(destination->ptr(), destination->size());
+    }
 }
 
 TEST_F(DummyClientGetBufferTest, GetIntoRejectsCorruptedObjectWithChecksum) {

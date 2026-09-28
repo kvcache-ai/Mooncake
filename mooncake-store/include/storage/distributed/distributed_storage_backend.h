@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,7 @@ struct DfsWriteRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    bool replace_existing = false;
 };
 
 struct DfsReadRequest {
@@ -62,6 +64,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
         return storage_mode_ == DistributedStorageMode::kObjectStorage;
     }
 
+    bool UsesKvcs() const {
+        return UsesObjectStorage() && distributed_config_.UsesKvcs();
+    }
+
     tl::expected<void, ErrorCode> Init() override;
 
     tl::expected<int64_t, ErrorCode> BatchOffload(
@@ -76,6 +82,21 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
+
+    bool SupportsProviderQuery() const;
+    bool CanQueryProviderInParallel() const;
+    std::chrono::milliseconds ProviderQueryTimeout() const;
+    bool IsProviderReplica(const Replica::Descriptor& replica) const;
+    ObjectStorageQueryResults BatchQueryProvider(
+        std::span<const std::string> logical_keys,
+        std::chrono::steady_clock::time_point deadline);
+    ObjectStorageIoResults BatchGetProviderWithQueryContexts(
+        std::span<const ObjectStorageGetRequest> requests,
+        std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>
+            contexts);
+    ObjectStorageIoResults BatchDeleteProvider(
+        std::span<const std::string> logical_keys);
+    void SerializeProviderMetrics(std::string& output) const;
 
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.

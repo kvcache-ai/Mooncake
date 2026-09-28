@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "client_service.h"
@@ -585,11 +586,15 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     if (query_result->IsLeaseExpired(now)) {
         return CachedQueryResultResponse(ErrorCode::OBJECT_NOT_FOUND);
     }
-    return CachedQueryResultResponse(GetReplicaListResponse(
-        std::vector<Replica::Descriptor>(query_result->replicas.begin(),
-                                         query_result->replicas.end()),
-        remaining_lease_ttl_ms(*query_result, now),
-        query_result->object_checksum));
+    return CachedQueryResultResponse(
+        GetReplicaListResponse(
+            std::vector<Replica::Descriptor>(query_result->replicas.begin(),
+                                             query_result->replicas.end()),
+            remaining_lease_ttl_ms(*query_result, now),
+            query_result->object_checksum),
+        std::vector<ProviderReadContext>(
+            query_result->provider_read_contexts.begin(),
+            query_result->provider_read_contexts.end()));
 }
 
 inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
@@ -598,12 +603,14 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     if (!cached_result.success) {
         return tl::make_unexpected(cached_result.error);
     }
-    return tl::expected<QueryResult, ErrorCode>(
-        tl::in_place,
+    return QueryResult(
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
-        cached_result.value.object_checksum);
+        cached_result.value.object_checksum,
+        std::vector<ProviderReadContext>(
+            cached_result.ProviderReadContexts().begin(),
+            cached_result.ProviderReadContexts().end()));
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(

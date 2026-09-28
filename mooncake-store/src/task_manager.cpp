@@ -152,7 +152,6 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
     }
 
     manager_->finished_task_history_.push_back(task_id);
-
     return ErrorCode::OK;
 }
 

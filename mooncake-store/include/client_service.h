@@ -49,13 +49,25 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    /** @brief Request-local provider metadata, keyed by replica ID. */
+    const std::vector<ProviderReadContext> provider_read_contexts;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
                 std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> object_checksum_param = std::nullopt)
+                std::optional<uint64_t> object_checksum_param = std::nullopt,
+                std::vector<ProviderReadContext>&& provider_contexts_param = {})
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          provider_read_contexts(std::move(provider_contexts_param)) {}
+
+    const ProviderReadContext* FindProviderReadContext(
+        ReplicaID replica_id) const {
+        for (const auto& context : provider_read_contexts) {
+            if (context.replica_id == replica_id) return &context;
+        }
+        return nullptr;
+    }
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -162,6 +174,7 @@ class Client {
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys,
         const std::string& tenant_id);
+    bool SupportsProviderQuery() const;
 
     tl::expected<void, ErrorCode> VerifyObjectChecksum(
         const std::string& object_key, const std::vector<Slice>& slices,
@@ -676,6 +689,12 @@ class Client {
         }
     }
 
+    void ObserveQueryResultCacheEvent(const std::string& event) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveQueryCacheEvent(event);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
@@ -884,9 +903,10 @@ class Client {
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
-    ErrorCode ReadDfsReplica(const std::string& key,
-                             const Replica::Descriptor& replica_descriptor,
-                             std::vector<Slice>& slices);
+    ErrorCode ReadDfsReplica(
+        const std::string& key, const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        const ProviderReadContext* provider_context = nullptr);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -951,7 +971,8 @@ class Client {
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
-    void SubmitDfsWrites(std::vector<PutOperation>& ops);
+    void SubmitDfsWrites(std::vector<PutOperation>& ops,
+                         bool replace_existing = false);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -962,7 +983,8 @@ class Client {
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
         const std::vector<const std::vector<Slice>*>& slice_lists,
-        const std::vector<DistributedFSDescriptor>& descriptors);
+        const std::vector<DistributedFSDescriptor>& descriptors,
+        bool replace_existing = false);
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
         std::vector<PutOperation>& ops, bool is_upsert);
@@ -970,7 +992,8 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
-    ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
+    ReplicateConfig PrepareReplicateConfig(
+        const ReplicateConfig& config) const;
 
     // Client identification
     const UUID client_id_;
@@ -1021,6 +1044,8 @@ class Client {
     // Pinned host memory pool for GPU D2H staging (must outlive
     // write_thread_pool_)
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    std::atomic<size_t> provider_query_inflight_{0};
+    ThreadPool provider_query_thread_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;

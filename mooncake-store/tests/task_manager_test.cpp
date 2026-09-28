@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 #include "task_manager.h"
-#include <thread>
 
 namespace {
 template <typename T, typename E>

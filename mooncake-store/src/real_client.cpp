@@ -34,6 +34,7 @@
 #include "batch_read_fanout.h"
 #include "common.h"
 #include "config.h"
+#include "config/distributed_storage_config.h"
 #include "config/rpc_protocol_config.h"
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
@@ -458,9 +459,14 @@ using mooncake::SelectBestReplica;
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
                                      bool include_object_checksum = true) {
+    std::vector<ProviderReadContext> provider_contexts;
+    if (const auto *context = qr.FindProviderReadContext(replica.id)) {
+        provider_contexts.push_back(*context);
+    }
     return QueryResult(
         {replica}, qr.lease_timeout,
-        include_object_checksum ? qr.object_checksum : std::nullopt);
+        include_object_checksum ? qr.object_checksum : std::nullopt,
+        std::move(provider_contexts));
 }
 
 // Shared object-byte range overflow check (same semantics as
@@ -1330,8 +1336,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
-    if (enable_ssd_offload) {
+    const auto distributed_config =
+        DistributedStorageConfig::FromEnvironment();
+    const bool enable_kvcs = distributed_config.UsesKvcs();
+    if (enable_ssd_offload || enable_kvcs) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
+        if (enable_kvcs) {
+            file_storage_config.storage_backend_type =
+                StorageBackendType::kDistributed;
+            file_storage_config.kvcs_tenant_id = client_->tenant_id();
+            LOG(INFO) << "Initializing KVCS distributed storage backend, mode="
+                      << distributed_config.fs_adapter_type;
+        }
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
         }
@@ -1585,6 +1601,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         return {};
     }
 
+    stop_pending_query_cleanup_thread();
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
@@ -2205,6 +2222,9 @@ int RealClient::start_http_server(int port) {
                                             "metrics not available");
                 return;
             }
+            if (file_storage_) {
+                file_storage_->SerializeProviderMetrics(*result);
+            }
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, std::move(*result));
         });
@@ -2554,6 +2574,7 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
+    invalidate_pending_query_result(key);
     return {};
 }
 
@@ -2567,7 +2588,9 @@ tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RemoveByRegex(str, force);
+    auto result = client_->RemoveByRegex(str, force);
+    if (result) clear_pending_query_results();
+    return result;
 }
 
 long RealClient::removeByRegex(const std::string &str, bool force) {
@@ -2579,7 +2602,9 @@ tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RemoveAll(force);
+    auto result = client_->RemoveAll(force);
+    if (result) clear_pending_query_results();
+    return result;
 }
 
 long RealClient::removeAll(bool force) {
@@ -2593,7 +2618,9 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    return client_->BatchRemove(keys, force);
+    auto results = client_->BatchRemove(keys, force);
+    invalidate_pending_query_results(keys, results);
+    return results;
 }
 
 std::vector<int> RealClient::batchRemove(const std::vector<std::string> &keys,
@@ -3469,8 +3496,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // Query the object info
-    auto query_result = client_->Query(key);
+    auto query_result = take_pending_query_result_or_query(key);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -3821,8 +3847,8 @@ RealClient::batch_get_buffer_internal(
         return final_results;
     }
 
-    // 1. Query metadata for all keys
-    auto query_results = client_->BatchQuery(keys);
+    // 1. Reuse a pending batch_exists snapshot once, then query only misses.
+    auto query_results = take_pending_query_results_or_query(keys);
 
     // 2. Prepare for batch get: filter valid keys and prepare buffers
     struct KeyOp {
@@ -4248,8 +4274,10 @@ RealClient::resolve_ranged_read_metadata(
     if (!allow_query_refresh) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return build_ranged_read_metadata_from_query_result(key,
-                                                        client_->Query(key));
+    return build_ranged_read_metadata_from_query_result(
+        key, query_result_cache == nullptr
+                 ? take_pending_query_result_or_query(key)
+                 : client_->Query(key));
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
@@ -4671,16 +4699,8 @@ RealClient::get_into_ranges_internal(
                         }
                         continue;
                     }
-                    // Planning cache entries may be close to expiry. Renew and
-                    // reselect the replica before copying into device memory.
-                    auto refresh_result = resolve_ranged_read_metadata(keys[j]);
-                    if (!refresh_result) {
-                        std::fill(range_results.begin(), range_results.end(),
-                                  tl::unexpected(refresh_result.error()));
-                        continue;
-                    }
                     std::optional<RangedReadMetadata> refreshed_metadata;
-                    refreshed_metadata.emplace(std::move(*refresh_result));
+                    refreshed_metadata.emplace(metadata);
                     auto lease_refresh_at =
                         [](const RangedReadMetadata &value) {
                             const auto now = std::chrono::steady_clock::now();
@@ -4800,8 +4820,13 @@ RealClient::get_into_ranges_internal(
         }
     };
 
-    // Planning may consume most of a short lease; renew before submission.
-    if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
+    // A freshly queried or implicitly cached lease is valid for the initial
+    // submit. Refresh before submission only when planning already exhausted
+    // it; long-running transfers continue to renew at half-life below.
+    if (allow_query_refresh && !scatter_leases.empty() &&
+        next_refresh_delay() == std::chrono::nanoseconds::zero()) {
+        refresh_leases();
+    }
     auto operation = client_->SubmitScatterNative(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =
@@ -4870,6 +4895,262 @@ std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
     return client_->BatchQuery(keys);
+}
+
+void RealClient::cache_pending_query_results(
+    const std::vector<std::string> &keys,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results) {
+    if (closed_.load(std::memory_order_acquire) || !client_ ||
+        keys.size() != query_results.size()) {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    const auto cache_deadline = now + std::chrono::seconds(30);
+    bool created = false;
+    bool capacity_rejected = false;
+
+    {
+        std::lock_guard<std::mutex> lock(pending_query_mutex_);
+        if (pending_query_stopping_ ||
+            closed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (pending_query_results_.size() + keys.size() >
+            kMaxPendingQueryResults) {
+            for (auto it = pending_query_results_.begin();
+                 it != pending_query_results_.end();) {
+                if (now < it->second.cleanup_deadline) {
+                    ++it;
+                    continue;
+                }
+                it = pending_query_results_.erase(it);
+            }
+        }
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const auto &result = query_results[i];
+            if (!result || result->IsLeaseExpired(now)) {
+                pending_query_results_.erase(keys[i]);
+                continue;
+            }
+            const bool has_complete_replica = std::any_of(
+                result->replicas.begin(), result->replicas.end(),
+                [](const auto &replica) {
+                    return replica.status == ReplicaStatus::COMPLETE;
+                });
+            if (!has_complete_replica) {
+                pending_query_results_.erase(keys[i]);
+                continue;
+            }
+            if (!pending_query_results_.contains(keys[i]) &&
+                pending_query_results_.size() >= kMaxPendingQueryResults) {
+                capacity_rejected = true;
+                continue;
+            }
+
+            pending_query_results_.erase(keys[i]);
+            pending_query_results_.emplace(
+                keys[i], PendingQueryResultEntry{
+                             .query_result = result.value(),
+                             .cleanup_deadline = std::min(
+                                 cache_deadline, result->lease_timeout)});
+            created = true;
+        }
+        if (created) ensure_pending_query_cleanup_thread_locked();
+    }
+
+    if (created) {
+        client_->ObserveQueryResultCacheEvent("created");
+    }
+    if (capacity_rejected) {
+        client_->ObserveQueryResultCacheEvent("capacity_rejected");
+    }
+}
+
+void RealClient::invalidate_pending_query_result(const std::string &key) {
+    std::lock_guard<std::mutex> lock(pending_query_mutex_);
+    pending_query_results_.erase(key);
+}
+
+void RealClient::invalidate_pending_query_results(
+    const std::vector<std::string> &keys,
+    const std::vector<tl::expected<void, ErrorCode>> &results) {
+    std::lock_guard<std::mutex> lock(pending_query_mutex_);
+    const size_t count = std::min(keys.size(), results.size());
+    for (size_t i = 0; i < count; ++i) {
+        if (results[i]) pending_query_results_.erase(keys[i]);
+    }
+}
+
+void RealClient::clear_pending_query_results() {
+    std::lock_guard<std::mutex> lock(pending_query_mutex_);
+    pending_query_results_.clear();
+}
+
+tl::expected<QueryResult, ErrorCode>
+RealClient::take_pending_query_result_or_query(const std::string &key) {
+    if (!client_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_->SupportsProviderQuery()) {
+        return client_->Query(key);
+    }
+
+    std::optional<QueryResult> cached;
+    auto now = std::chrono::steady_clock::now();
+    bool expired = false;
+    {
+        std::lock_guard<std::mutex> lock(pending_query_mutex_);
+        const auto it = pending_query_results_.find(key);
+        if (it != pending_query_results_.end() &&
+            now < it->second.cleanup_deadline &&
+            !it->second.query_result.IsLeaseExpired(now)) {
+            cached.emplace(it->second.query_result);
+            pending_query_results_.erase(it);
+        } else if (it != pending_query_results_.end()) {
+            pending_query_results_.erase(it);
+            expired = true;
+        }
+    }
+
+    if (cached) {
+        client_->ObserveQueryResultCacheEvent("hit");
+        return std::move(*cached);
+    }
+    if (expired) {
+        client_->ObserveQueryResultCacheEvent("expired");
+    }
+    client_->ObserveQueryResultCacheEvent("miss");
+    return client_->Query(key);
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>>
+RealClient::take_pending_query_results_or_query(
+    const std::vector<std::string> &keys) {
+    if (!client_ || keys.empty()) {
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (!client_->SupportsProviderQuery()) {
+        return client_->BatchQuery(keys);
+    }
+
+    std::vector<std::optional<tl::expected<QueryResult, ErrorCode>>> slots(
+        keys.size());
+    std::vector<std::string> missing_keys;
+    std::vector<size_t> missing_indexes;
+    std::unordered_set<std::string> consumed_keys;
+    auto now = std::chrono::steady_clock::now();
+    bool hit = false;
+    bool expired = false;
+
+    {
+        std::lock_guard<std::mutex> lock(pending_query_mutex_);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const auto it = pending_query_results_.find(keys[i]);
+            if (it != pending_query_results_.end() &&
+                now < it->second.cleanup_deadline &&
+                !it->second.query_result.IsLeaseExpired(now)) {
+                slots[i].emplace(it->second.query_result);
+                consumed_keys.insert(keys[i]);
+                hit = true;
+                continue;
+            }
+            if (it != pending_query_results_.end()) {
+                pending_query_results_.erase(it);
+                expired = true;
+            }
+            missing_keys.push_back(keys[i]);
+            missing_indexes.push_back(i);
+        }
+        for (const auto &key : consumed_keys) {
+            pending_query_results_.erase(key);
+        }
+    }
+
+    if (hit) {
+        client_->ObserveQueryResultCacheEvent("hit");
+    }
+    if (expired) {
+        client_->ObserveQueryResultCacheEvent("expired");
+    }
+    if (!missing_keys.empty()) {
+        client_->ObserveQueryResultCacheEvent("miss");
+        auto queried = client_->BatchQuery(missing_keys);
+        if (queried.size() != missing_keys.size()) {
+            for (const auto index : missing_indexes) {
+                slots[index].emplace(tl::unexpected(ErrorCode::RPC_FAIL));
+            }
+        } else {
+            for (size_t i = 0; i < missing_indexes.size(); ++i) {
+                slots[missing_indexes[i]].emplace(std::move(queried[i]));
+            }
+        }
+    }
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (auto &slot : slots) {
+        if (slot) {
+            results.emplace_back(std::move(*slot));
+        } else {
+            results.emplace_back(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        }
+    }
+    return results;
+}
+
+void RealClient::ensure_pending_query_cleanup_thread_locked() {
+    if (pending_query_stopping_ ||
+        closed_.load(std::memory_order_acquire) ||
+        pending_query_cleanup_thread_.joinable()) {
+        return;
+    }
+
+    pending_query_cleanup_thread_ =
+        std::jthread([this](const std::stop_token &stop_token) {
+            std::unique_lock<std::mutex> lock(pending_query_mutex_);
+            while (!stop_token.stop_requested()) {
+                pending_query_cleanup_cv_.wait_for(lock, stop_token,
+                                                   std::chrono::seconds(1),
+                                                   [] { return false; });
+                if (stop_token.stop_requested()) break;
+
+                const auto now = std::chrono::steady_clock::now();
+                bool expired = false;
+                for (auto it = pending_query_results_.begin();
+                     it != pending_query_results_.end();) {
+                    if (now < it->second.cleanup_deadline) {
+                        ++it;
+                        continue;
+                    }
+                    it = pending_query_results_.erase(it);
+                    expired = true;
+                }
+
+                lock.unlock();
+                if (expired && client_) {
+                    client_->ObserveQueryResultCacheEvent("expired");
+                }
+                lock.lock();
+            }
+        });
+}
+
+void RealClient::stop_pending_query_cleanup_thread() {
+    std::jthread cleanup_thread;
+    {
+        std::lock_guard<std::mutex> lock(pending_query_mutex_);
+        pending_query_stopping_ = true;
+        if (pending_query_cleanup_thread_.joinable()) {
+            pending_query_cleanup_thread_.request_stop();
+            cleanup_thread = std::move(pending_query_cleanup_thread_);
+        }
+        pending_query_cleanup_cv_.notify_all();
+    }
+    if (cleanup_thread.joinable()) cleanup_thread.join();
+    clear_pending_query_results();
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
@@ -5097,6 +5378,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
     if (!result) {
         return tl::unexpected(result.error());
     }
+    invalidate_pending_query_result(key);
     return {};
 }
 
@@ -5151,6 +5433,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
     if (!result) {
         return tl::unexpected(result.error());
     }
+    invalidate_pending_query_result(key);
     return {};
 }
 
@@ -5195,7 +5478,9 @@ RealClient::batch_upsert_from_internal(const std::vector<std::string> &keys,
             split_into_slices(buffers[i], sizes[i]));
     }
 
-    return client_->BatchUpsert(keys, ordered_batched_slices, config);
+    auto results = client_->BatchUpsert(keys, ordered_batched_slices, config);
+    invalidate_pending_query_results(keys, results);
+    return results;
 }
 
 std::vector<int> RealClient::batch_upsert_from(
@@ -5338,6 +5623,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
                    << toString(result.error());
         return tl::unexpected(result.error());
     }
+    invalidate_pending_query_result(key);
     return {};
 }
 
@@ -5434,6 +5720,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
     }
 
     auto results = client_->BatchUpsert(keys, ordered_batched_slices, config);
+    invalidate_pending_query_results(keys, results);
 
     // Check if any operations failed
     for (size_t i = 0; i < results.size(); ++i) {
@@ -5932,7 +6219,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         return {};
     }
 
-    const auto query_results = client_->BatchQuery(keys);
+    const auto query_results = take_pending_query_results_or_query(keys);
     return batch_get_into_internal(
         keys, buffers, sizes, query_results,
         [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
@@ -6347,8 +6634,41 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
         return std::vector<tl::expected<bool, ErrorCode>>();
     }
 
-    // Call client BatchIsExist and return the vector<expected> directly
-    return client_->BatchIsExist(keys);
+    if (!client_->SupportsProviderQuery()) {
+        return client_->BatchIsExist(keys);
+    }
+
+    auto query_results = client_->BatchQuery(keys);
+    if (query_results.size() != keys.size()) {
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+
+    std::vector<tl::expected<bool, ErrorCode>> results;
+    results.reserve(keys.size());
+    auto now = std::chrono::steady_clock::now();
+    for (const auto &query_result : query_results) {
+        if (!query_result) {
+            const auto error = query_result.error();
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                results.emplace_back(false);
+            } else {
+                results.emplace_back(tl::unexpected(error));
+            }
+            continue;
+        }
+        const bool has_complete_replica =
+            !query_result->IsLeaseExpired(now) &&
+            std::any_of(query_result->replicas.begin(),
+                        query_result->replicas.end(), [](const auto &replica) {
+                            return replica.status == ReplicaStatus::COMPLETE;
+                        });
+        results.emplace_back(has_complete_replica);
+    }
+
+    cache_pending_query_results(keys, query_results);
+    return results;
 }
 
 tl::expected<bool, ErrorCode> RealClient::probeKey_internal(
@@ -7526,9 +7846,11 @@ RealClient::batch_upsert_from_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const ReplicateConfig &config, bool stage_nonlocal) {
-    return BatchWriteFromMultiBuffers(client_, keys, all_buffers, all_sizes,
-                                      config, client_buffer_allocator_,
-                                      stage_nonlocal, &Client::BatchUpsert);
+    auto results = BatchWriteFromMultiBuffers(
+        client_, keys, all_buffers, all_sizes, config, client_buffer_allocator_,
+        stage_nonlocal, &Client::BatchUpsert);
+    invalidate_pending_query_results(keys, results);
+    return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -7580,17 +7902,35 @@ RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     bool prefer_alloc_in_same_node) {
-    // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
+    const auto query_results = take_pending_query_results_or_query(keys);
+    return batch_get_into_multi_buffers_internal(
+        keys, all_buffers, all_sizes, prefer_alloc_in_same_node, query_results);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_multi_buffers_internal(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    bool prefer_alloc_in_same_node,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size() ||
+        keys.size() != query_results.size()) {
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
                    << ", buffers=" << all_buffers.size()
-                   << ", sizes=" << all_sizes.size();
+                   << ", sizes=" << all_sizes.size()
+                   << ", query_results=" << query_results.size();
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -7601,8 +7941,6 @@ RealClient::batch_get_into_multi_buffers_internal(
     if (num_keys == 0) {
         return results;
     }
-    // Query metadata for all keys
-    const auto query_results = client_->BatchQuery(keys);
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;

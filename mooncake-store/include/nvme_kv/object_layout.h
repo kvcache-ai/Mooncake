@@ -4,9 +4,13 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include <ylt/util/tl/expected.hpp>
+
 #include "nvme_kv/key_codec.h"
+#include "types.h"
 
 namespace mooncake {
 
@@ -48,6 +52,19 @@ struct NvmeKvManifestChunkRecord {
     uint32_t payload_size;
     uint32_t payload_checksum;
 };
+
+struct NvmeKvWritePlan {
+    NvmeKvObjectIdentity identity;
+    NvmeKvPhysicalKey root_key{};
+    bool store_inline = false;
+    std::string root_blob;
+    std::vector<std::pair<NvmeKvPhysicalKey, std::string_view>> chunk_values;
+    std::vector<NvmeKvManifestChunkRecord> manifest_records;
+};
+
+tl::expected<NvmeKvWritePlan, ErrorCode> BuildNvmeKvWritePlan(
+    const NvmeKvObjectIdentity& identity, std::string_view payload,
+    uint32_t slot, uint32_t max_value_size);
 
 uint32_t ComputeNvmeKvPayloadChecksum(std::string_view payload);
 uint32_t ComputeNvmeKvHeaderChecksum(const NvmeKvObjectHeader& header);

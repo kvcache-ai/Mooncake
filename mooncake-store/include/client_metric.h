@@ -485,6 +485,35 @@ struct TransferOperationMetric {
     }
 };
 
+struct QueryMetric {
+    std::array<std::string, 1> phase_names = {"phase"};
+    std::array<std::string, 1> event_names = {"event"};
+
+    explicit QueryMetric(std::map<std::string, std::string> labels = {})
+        : latency_us("mooncake_query_latency",
+                     "Mooncake query latency by phase (us)", kLatencyBucket,
+                     labels, phase_names),
+          cache_events("mooncake_query_result_cache_events_total",
+                       "Query-result session cache events", labels,
+                       event_names) {}
+
+    ylt::metric::hybrid_histogram_1t latency_us;
+    ylt::metric::hybrid_counter_1t cache_events;
+
+    void ObserveLatency(const std::string& phase, uint64_t value_us) {
+        latency_us.observe(std::array<std::string, 1>{phase}, value_us);
+    }
+
+    void ObserveCacheEvent(const std::string& event) {
+        cache_events.inc(std::array<std::string, 1>{event});
+    }
+
+    void serialize(std::string& str) {
+        latency_us.serialize(str);
+        cache_events.serialize(str);
+    }
+};
+
 // SSD latency bucket: microseconds, tuned for SSD/network storage
 // Range: 50us (high-end NVMe) to 30s (3fs/nfs large object batch writes)
 inline const std::vector<double> kSsdLatencyBucket = {
@@ -877,6 +906,7 @@ struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
+    QueryMetric query_metric;
     SsdMetric ssd_metric;
     DfsMetric dfs_metric;
     AllocatorMetric allocator_metric;
@@ -907,6 +937,14 @@ struct ClientMetric {
                                   const std::string& op_name, uint64_t bytes,
                                   uint64_t latency_us) {
         transfer_operation_metric.Observe(kind, op_name, bytes, latency_us);
+    }
+
+    void ObserveQueryLatency(const std::string& phase, uint64_t latency_us) {
+        query_metric.ObserveLatency(phase, latency_us);
+    }
+
+    void ObserveQueryCacheEvent(const std::string& event) {
+        query_metric.ObserveCacheEvent(event);
     }
 
     void serialize(std::string& str);

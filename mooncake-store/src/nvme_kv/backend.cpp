@@ -20,6 +20,7 @@
 #include "config/executor_config.h"
 #include "config/io_concurrency_config.h"
 #include "nvme_kv/executor_util.h"
+#include "nvme_kv/key_conflict_policy.h"
 #include "nvme_kv/key_codec.h"
 #include "nvme_kv/key_conflict_policy.h"
 #include "nvme_kv/object_layout.h"
@@ -550,7 +551,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
     struct PreparedOffload {
         std::string payload_storage;
         std::string_view payload;
-        std::optional<NvmeKvKeyConflictPolicy::WritePlan> write_plan;
+        std::optional<NvmeKvWritePlan> write_plan;
         std::vector<PhysicalKey> written_chunk_keys;
         bool root_written = false;
         bool needs_fallback = false;
@@ -562,7 +563,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         auto &item = prepared[index];
         item.payload = BuildPayloadView(*plan.slices, plan.payload_size,
                                         item.payload_storage);
-        auto write_plan = NvmeKvKeyConflictPolicy::BuildWritePlan(
+        auto write_plan = BuildNvmeKvWritePlan(
             NvmeKvObjectIdentity{.logical_key = plan.key}, item.payload, 0,
             std::max(connector_->GetCapabilities().effective_max_value_size,
                      kMinMaxValueSize));
@@ -993,7 +994,7 @@ NvmeKvStorageBackend::OffloadOne(const std::string &key,
                  kMinMaxValueSize);
 
     for (uint32_t slot = 0; slot < kNvmeKvMaxPhysicalKeySlots; ++slot) {
-        auto write_plan_res = NvmeKvKeyConflictPolicy::BuildWritePlan(
+        auto write_plan_res = BuildNvmeKvWritePlan(
             NvmeKvObjectIdentity{.logical_key = key}, payload, slot,
             effective_max_value_size);
         if (!write_plan_res) {

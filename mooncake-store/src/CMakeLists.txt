@@ -13,6 +13,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     config/distributed_storage_config.cpp
     config/rpc_protocol_config.cpp
     config/store_cluster_identity_config.cpp
+    storage/distributed/object_storage_adapter.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp)
@@ -108,6 +109,11 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
+    storage/object_layout.cpp
+    storage/distributed/kvcs/kvcs_driver.cpp
+    storage/distributed/kvcs/kvcs_efc_topology.cpp
+    storage/distributed/kvcs/kvcs_capi_driver.cpp
+    storage/distributed/kvcs/kvcs_object_storage_adapter.cpp
     nvme_kv/backend.cpp
     nvme_kv/connector.cpp
     nvme_kv/config/connector_config.cpp
@@ -170,6 +176,27 @@ if(BUILD_UNIT_TESTS)
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
+
+# KVCS is optional so community builds without the vendor SDK continue to
+# work. The C API driver supplies an explicit NOT_SUPPORTED stub in that case.
+set(MOONCAKE_KVCS_SDK_FOUND OFF)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(KVCS QUIET IMPORTED_TARGET kvcs)
+endif()
+find_package(OpenSSL QUIET)
+if(TARGET PkgConfig::KVCS AND TARGET OpenSSL::Crypto)
+  set(MOONCAKE_KVCS_SDK_FOUND ON)
+  message(STATUS "KVCS SDK found: standard and low-level adapters enabled")
+else()
+  message(STATUS "KVCS SDK not found: adapters build with unsupported stubs")
+endif()
+set(MOONCAKE_KVCS_SDK_FOUND
+    ${MOONCAKE_KVCS_SDK_FOUND}
+    PARENT_SCOPE)
+set(MOONCAKE_KVCS_INCLUDE_DIRS
+    ${KVCS_INCLUDE_DIRS}
+    PARENT_SCOPE)
 
 # RISC-V toolchains may implement 16-byte atomic operations in libatomic rather
 # than emitting native instructions. Boost.Lockfree uses these operations in the
@@ -543,6 +570,12 @@ target_link_libraries(
           $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
+if(MOONCAKE_KVCS_SDK_FOUND)
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_HAVE_KVCS_SDK=1)
+  target_link_libraries(mooncake_store_client_objects
+                        PRIVATE PkgConfig::KVCS OpenSSL::Crypto)
+endif()
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
@@ -643,6 +676,9 @@ target_link_libraries(
          yalantinglibs::yalantinglibs
   PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash
           OpenSSL::Crypto $<$<PLATFORM_ID:Linux>:numa>)
+if(MOONCAKE_KVCS_SDK_FOUND)
+  target_link_libraries(mooncake_store PRIVATE PkgConfig::KVCS)
+endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()

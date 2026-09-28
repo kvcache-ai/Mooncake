@@ -353,6 +353,24 @@ add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
+add_store_test(object_layout_test object_layout_test.cpp)
+add_store_test(kvcs_efc_topology_test kvcs_efc_topology_test.cpp)
+add_store_test(kvcs_object_storage_adapter_test
+               kvcs_object_storage_adapter_test.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND MOONCAKE_KVCS_SDK_FOUND)
+  target_compile_definitions(kvcs_object_storage_adapter_test
+                             PRIVATE MOONCAKE_KVCS_TEST_SDK=1)
+  target_include_directories(kvcs_object_storage_adapter_test
+                             PRIVATE ${MOONCAKE_KVCS_INCLUDE_DIRS})
+  if(NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(kvcs_object_storage_adapter_test
+                               PRIVATE MOONCAKE_KVCS_TEST_WRAP=1)
+    target_link_options(kvcs_object_storage_adapter_test
+                        PRIVATE "-Wl,--wrap=kvcs_ll_batch_put"
+                                "-Wl,--wrap=kvcs_ll_batch_delete")
+  endif()
+endif()
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)

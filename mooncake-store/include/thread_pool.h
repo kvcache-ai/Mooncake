@@ -8,6 +8,10 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <future>
+#include <memory>
+#include <type_traits>
+#include <utility>
 namespace mooncake {
 /**
  * @class ThreadPool
@@ -34,6 +38,11 @@ class ThreadPool {
      */
     template <class F, class... Args>
     void enqueue(F&& f, Args&&... args);
+
+    /// Enqueues a task and returns a future for its result or exception.
+    template <class F>
+    auto submit(F&& function)
+        -> std::future<std::invoke_result_t<std::decay_t<F>&>>;
 
     /// Stops the thread pool (waits for current tasks to complete)
     void stop();
@@ -66,5 +75,16 @@ void ThreadPool::enqueue(F&& f, Args&&... args) {
         tasks.emplace([task] { (*task)(); });
     }
     condition.notify_one();  ///< Wake one waiting worker
+}
+
+template <class F>
+auto ThreadPool::submit(F&& function)
+    -> std::future<std::invoke_result_t<std::decay_t<F>&>> {
+    using Result = std::invoke_result_t<std::decay_t<F>&>;
+    auto task = std::make_shared<std::packaged_task<Result()>>(
+        std::forward<F>(function));
+    auto future = task->get_future();
+    enqueue([task] { (*task)(); });
+    return future;
 }
 }  // namespace mooncake

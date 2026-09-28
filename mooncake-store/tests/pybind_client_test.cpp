@@ -22,6 +22,7 @@
 #endif
 
 #include "config.h"
+#include "query_provider_test_adapter.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 
@@ -831,6 +832,76 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
     // Test isExist
     int exist_result = py_client_->isExist(key);
     EXPECT_EQ(exist_result, 1) << "Key should exist";
+}
+
+TEST_F(RealClientTest, BatchIsExistDoesNotReturnStaleValueAfterUpsert) {
+    StartMasterAndSetupClient();
+
+    auto provider_backend = MakeMissingQueryProviderBackend();
+    ASSERT_NE(provider_backend, nullptr);
+    py_client_->client_->SetDfsStorageBackend(provider_backend);
+
+    const std::string key = "batch_exists_then_upsert_key";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+
+    ASSERT_EQ(py_client_->batchIsExist({key}), (std::vector<int>{1}));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+
+    auto destination = py_client_->allocate_client_buffer(original.size());
+    ASSERT_TRUE(destination.has_value());
+    auto get = py_client_->batch_get_into(
+        {key}, {destination->ptr()}, {destination->size()});
+    ASSERT_EQ(get,
+              (std::vector<int64_t>{static_cast<int64_t>(replacement.size())}));
+    EXPECT_EQ(std::string(static_cast<char *>(destination->ptr()),
+                          destination->size()),
+              replacement);
+}
+
+TEST_F(RealClientTest, BatchIsExistSnapshotIsConsumedExactlyOnce) {
+    StartMasterAndSetupClient();
+
+    auto provider_backend = MakeMissingQueryProviderBackend();
+    ASSERT_NE(provider_backend, nullptr);
+    py_client_->client_->SetDfsStorageBackend(provider_backend);
+
+    const std::string key = "batch_exists_query_result_cache_key";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    ASSERT_EQ(py_client_->batchIsExist({key}), (std::vector<int>{1}));
+
+    auto allocation =
+        py_client_->client_buffer_allocator_->allocate(replacement.size());
+    ASSERT_TRUE(allocation.has_value());
+    std::memcpy(allocation->ptr(), replacement.data(), replacement.size());
+    std::vector<Slice> replacement_slices{
+        {allocation->ptr(), replacement.size()}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(py_client_->client_->Upsert(key, replacement_slices, config)
+                    .has_value());
+
+    auto destination = py_client_->allocate_client_buffer(original.size());
+    ASSERT_TRUE(destination.has_value());
+    auto first_get = py_client_->batch_get_into({key}, {destination->ptr()},
+                                                {destination->size()});
+    ASSERT_EQ(first_get,
+              (std::vector<int64_t>{static_cast<int64_t>(original.size())}));
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()),
+                          destination->size()),
+              original);
+
+    std::memset(destination->ptr(), 0, destination->size());
+    auto second_get = py_client_->batch_get_into({key}, {destination->ptr()},
+                                                 {destination->size()});
+    ASSERT_EQ(second_get,
+              (std::vector<int64_t>{static_cast<int64_t>(replacement.size())}));
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()),
+                          destination->size()),
+              replacement);
 }
 
 TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
