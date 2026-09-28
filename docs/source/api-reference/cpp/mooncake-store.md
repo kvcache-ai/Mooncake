@@ -28,6 +28,25 @@ tl::expected<void, ErrorCode> Get(const std::string& object_key,
 
 `Get` retrieves the value of `object_key` into the provided `slices`. The returned data is guaranteed to be complete and correct. Each slice must reference local DRAM/VRAM memory that has been pre-registered with `registerLocalMemory(addr, len)` (not the global segments that contribute to the distributed memory pool). The master returns the readable replica list and the client selects a complete replica. Depending on the selected replica, the data may be read from memory, NoF SSD, legacy shared-filesystem `DISK`, client-owned `LOCAL_DISK`, or the configured descriptor-based DFS backend.
 
+### CUDA Graph BatchGet completion
+
+CUDA builds expose `CudaTransferBarrier` and `StartBatchGetWithCudaBarrier` in
+`cuda_transfer_barrier.h`. Capture `barrier->enqueueWait(compute_stream)` before
+the graph operations that consume the destination buffers. Before each graph
+replay, call `StartBatchGetWithCudaBarrier(client, keys, slices, *barrier)` and
+then launch the graph. The call returns after starting a background Store
+`BatchGet`; the graph waits until that read finishes. After the graph completes,
+check `barrier->wait()` and discard the graph output unless it returns
+`ErrorCode::OK`.
+
+The client must be held by `std::shared_ptr<Client>`. Destination slices must
+remain registered and alive through the read and graph execution, and the
+barrier must remain alive until the graph finishes. Finish each replay before
+rearming the same barrier. The wrapper uses the ordinary `BatchGet` path for
+replica selection and read leases. It does **not** bind the transfer itself to
+the user CUDA stream or provide a Python `*_on_stream` API; its background host
+thread signals graph completion through a mapped host flag.
+
 ### Put
 
 ```C++

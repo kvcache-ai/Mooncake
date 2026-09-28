@@ -18,6 +18,9 @@
 #if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
 #endif
+#ifdef USE_CUDA
+#include "cuda_transfer_barrier.h"
+#endif
 
 namespace mooncake {
 
@@ -547,6 +550,55 @@ TEST_F(TransferTaskTest, TransferStrategyEnum) {
     oss << TransferStrategy::EMPTY;
     EXPECT_EQ(oss.str(), "EMPTY");
 }
+
+#ifdef USE_CUDA
+TEST_F(TransferTaskTest, CudaGraphWaitsForTransferFutureOnReplay) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0)
+        GTEST_SKIP() << "CUDA device unavailable";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    auto barrier = CudaTransferBarrier::Create();
+    ASSERT_NE(barrier, nullptr);
+    cudaStream_t stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+              cudaSuccess);
+    void* device_output = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_output, sizeof(int)), cudaSuccess);
+    cudaGraph_t graph;
+    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+              cudaSuccess);
+    ASSERT_TRUE(barrier->enqueueWait(stream));
+    ASSERT_EQ(cudaMemsetAsync(device_output, 0x2a, sizeof(int), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    cudaGraphExec_t executable;
+    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, 0), cudaSuccess);
+
+    for (ErrorCode expected :
+         {ErrorCode::OK, ErrorCode::OK, ErrorCode::TRANSFER_FAIL}) {
+        ASSERT_EQ(cudaMemset(device_output, 0, sizeof(int)), cudaSuccess);
+        auto state = std::make_shared<MemcpyOperationState>();
+        ASSERT_TRUE(barrier->start(TransferFuture(state)));
+        ASSERT_EQ(cudaGraphLaunch(executable, stream), cudaSuccess);
+        EXPECT_EQ(cudaStreamQuery(stream), cudaErrorNotReady);
+        EXPECT_FALSE(barrier->result().has_value());
+        state->set_completed(expected);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(barrier->wait(), expected);
+        int output = 0;
+        ASSERT_EQ(cudaMemcpy(&output, device_output, sizeof(output),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_EQ(output, 0x2a2a2a2a);
+    }
+
+    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    ASSERT_EQ(cudaFree(device_output), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+#endif
 
 }  // namespace mooncake
 
