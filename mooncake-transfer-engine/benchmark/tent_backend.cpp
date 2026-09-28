@@ -14,6 +14,7 @@
 
 #include "tent_backend.h"
 #include "utils.h"
+#include "split_output.h"
 #include "char_util.h"
 
 #include <atomic>
@@ -512,7 +513,44 @@ double TENTBenchRunner::runSingleTransfer(
                                 : intent_type;
         requests.emplace_back(entry);
     }
-    XferBenchTimer timer;
+    if (!splitOutputEnabled()) {
+        XferBenchTimer timer;
+        Status submitted;
+        if (XferBenchConfig::notifi) {
+            Notification notifi{"benchmark", std::to_string(target_addr)};
+            submitted = engine_->submitTransfer(batch_id, requests, notifi);
+        } else {
+            submitted = engine_->submitTransfer(batch_id, requests);
+        }
+        if (!submitted.ok()) {
+            LOG(ERROR) << "Failed to submit transfer: " << submitted.ToString();
+            noteTransferFailed();
+            return finish(-1.0);
+        }
+        while (g_tent_running.load()) {
+            TransferStatus overall_status;
+            auto polled = engine_->getTransferStatus(batch_id, overall_status);
+            if (!polled.ok()) {
+                LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
+                noteTransferFailed();
+                return finish(-1.0);
+            }
+            if (overall_status.s == TransferStatusEnum::COMPLETED) {
+                return finish(timer.lap_us());
+            }
+            if (overall_status.s == TransferStatusEnum::FAILED ||
+                overall_status.s == TransferStatusEnum::TIMEOUT ||
+                overall_status.s == TransferStatusEnum::CANCELED ||
+                overall_status.s == TransferStatusEnum::INVALID) {
+                LOG(ERROR) << "Failed transfer detected";
+                noteTransferFailed();
+                return finish(-1.0);
+            }
+        }
+        return finish(-1.0);
+    }
+
+    XferBenchTimer submit_timer;
     Status submitted;
     if (XferBenchConfig::notifi) {
         Notification notifi{"benchmark", std::to_string(target_addr)};
@@ -525,16 +563,22 @@ double TENTBenchRunner::runSingleTransfer(
         noteTransferFailed();
         return finish(-1.0);
     }
+    const uint64_t submit_us = submit_timer.lap_us();
+    XferBenchTimer wait_timer;
+    uint64_t polls = 0;
     while (g_tent_running.load()) {
         TransferStatus overall_status;
         auto polled = engine_->getTransferStatus(batch_id, overall_status);
+        polls++;
         if (!polled.ok()) {
             LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
             noteTransferFailed();
             return finish(-1.0);
         }
         if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            return finish(timer.lap_us());
+            const uint64_t wait_us = wait_timer.lap_us();
+            logSplitXfer({batch_size, submit_us, wait_us, polls});
+            return finish(static_cast<double>(submit_us + wait_us));
         }
         if (overall_status.s == TransferStatusEnum::FAILED ||
             overall_status.s == TransferStatusEnum::TIMEOUT ||

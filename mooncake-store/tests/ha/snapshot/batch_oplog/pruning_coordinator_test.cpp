@@ -1,3 +1,4 @@
+#include "ha_metric_manager.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.h"
 
 #include <gtest/gtest.h>
@@ -169,7 +170,7 @@ class RecordingObjectStore final : public SnapshotObjectStore {
 };
 
 std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
-                        int64_t lease_id = 101) {
+                        int64_t lease_id = 101, bool with_weights = false) {
     ha::BatchOpLogSnapshotManifest manifest;
     manifest.snapshot_id = ha::BuildBatchOpLogSnapshotId(batch, lease_id);
     manifest.last_included_batch_id = batch;
@@ -185,8 +186,19 @@ std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
                                       1, 1, Crc32cValue("o", 1)});
     store.objects[manifest.segments.key] = {'s'};
     store.objects[manifest.object_chunks[0].key] = {'o'};
+    if (with_weights) {
+        manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
+        manifest.weight_metadata = ha::BatchOpLogSnapshotObjectDescriptor{
+            ha::BuildBatchOpLogSnapshotWeightMetadataKey(root,
+                                                         manifest.snapshot_id),
+            1, Crc32cValue("w", 1)};
+        store.objects[manifest.weight_metadata->key] = {'w'};
+    }
     const auto bytes = ha::EncodeBatchOpLogSnapshotManifest(manifest);
     ha::BatchOpLogSnapshotDescriptor descriptor;
+    descriptor.schema_version = manifest.schema_version;
+    descriptor.snapshot_format = manifest.snapshot_format;
     descriptor.snapshot_id = manifest.snapshot_id;
     descriptor.last_included_batch_id = batch;
     descriptor.last_included_seq = manifest.last_included_seq;
@@ -206,6 +218,7 @@ std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
 class PruningTest : public ::testing::Test {
    protected:
     void SetUp() override {
+        HAMetricManager::instance().reset_snapshot_runtime(true);
         ASSERT_EQ(ErrorCode::OK, backend.Put(lock_key, "101"));
         latest = AddSnapshot(store, 20);
         fallback = AddSnapshot(store, 10);
@@ -230,11 +243,33 @@ class PruningTest : public ::testing::Test {
     std::string latest, fallback;
 };
 
+TEST_F(PruningTest, MissingWeightArtifactDoesNotAdvanceFloorOrDeleteLog) {
+    latest = AddSnapshot(store, 20, 101, true);
+    fallback = AddSnapshot(store, 10, 101, true);
+    backend.Put(latest_key, latest);
+    backend.Put(fallback_key, fallback);
+    for (const auto& id : {"20-101", "10-101"}) {
+        const auto key =
+            ha::BuildBatchOpLogSnapshotWeightMetadataKey("snapshots", id);
+        const auto bytes = store.objects.at(key);
+        store.objects.erase(key);
+        EXPECT_NE(ErrorCode::OK, Run());
+        EXPECT_FALSE(backend.values.contains(floor_key));
+        EXPECT_EQ(0u, backend.delete_count);
+        store.objects[key] = bytes;
+    }
+    EXPECT_EQ(ErrorCode::OK, Run());
+    EXPECT_EQ("10", backend.values.at(floor_key));
+    EXPECT_EQ(1u, backend.delete_count);
+}
+
 TEST_F(PruningTest, FirstSnapshotDoesNotPublishFloor) {
     backend.values.erase(fallback_key);
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_FALSE(backend.values.contains(floor_key));
     EXPECT_EQ(0u, backend.txn_count);
+    EXPECT_EQ(HAMetricManager::SnapshotSkipReason::NoFallback,
+              HAMetricManager::instance().get_snapshot_runtime().skip_reason);
     EXPECT_EQ(0u, backend.delete_count);
 }
 
@@ -354,11 +389,28 @@ TEST_F(PruningTest, FailedOrUnknownTxnDoesNotDelete) {
 }
 
 TEST_F(PruningTest, DeleteFailureKeepsFloorAndRetries) {
+    auto& metrics = HAMetricManager::instance();
+    const auto before = metrics.get_snapshot_runtime().floor_advances_total;
+    const auto errors =
+        metrics
+            .get_snapshot_operation(HAMetricManager::SnapshotOperation::Prune)
+            .errors;
     backend.delete_error = ErrorCode::ETCD_OPERATION_ERROR;
     EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, Run());
     EXPECT_EQ("10", backend.values[floor_key]);
+    EXPECT_EQ(10u, metrics.get_snapshot_runtime().compaction_floor);
+    EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
+    EXPECT_EQ(errors + 1, metrics
+                              .get_snapshot_operation(
+                                  HAMetricManager::SnapshotOperation::Prune)
+                              .errors);
     backend.delete_error = ErrorCode::OK;
     EXPECT_EQ(ErrorCode::OK, Run());
+    EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
+    EXPECT_EQ(errors + 1, metrics
+                              .get_snapshot_operation(
+                                  HAMetricManager::SnapshotOperation::Prune)
+                              .errors);
     EXPECT_EQ(2u, backend.delete_count);
     EXPECT_EQ("10", backend.values[floor_key]);
 }

@@ -37,6 +37,19 @@ namespace tent {
 class RdmaTransport;
 class DeviceSelector;
 
+// IBV_EVENT_DEVICE_SPEED_CHANGE: a port speed changed without a link flap
+// (a VF over LAG losing a PF, say). Newer rdma-core names it; the async
+// event ABI is append-only, so an older header means only that the
+// enumerator is missing, never that the kernel cannot raise the event.
+// Naming it here keeps the branch that handles it -- and its test --
+// compiled everywhere, so an old userspace on a new kernel still reacts.
+inline constexpr int kIbvEventDeviceSpeedChange = 20;  // after WQ_FATAL (19)
+#ifdef HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE
+// A build against a header that names it pins the value above.
+static_assert(kIbvEventDeviceSpeedChange == IBV_EVENT_DEVICE_SPEED_CHANGE,
+              "verbs async-event values are append-only; update the fallback");
+#endif
+
 class Workers {
     friend class RdmaTransportTestPeer;
 

@@ -50,6 +50,9 @@
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
 #endif
+#ifdef USE_HYLINK
+#include "transport/hylink_transport/hylink_transport.h"
+#endif
 #ifdef USE_MACA
 #include "transport/maca_transport/maca_transport.h"
 #endif
@@ -147,14 +150,8 @@ Status MultiTransport::submitTransfer(
     }
 
     std::vector<Transport*> transports;
-    transports.reserve(entries.size());
-    for (const auto& request : entries) {
-        Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
-        assert(transport);
-        transports.push_back(transport);
-    }
+    auto select_status = selectTransports(entries, transports);
+    if (!select_status.ok()) return select_status;
 
     auto& task_list = batch_desc.task_list;
     task_list.reserve(task_list.size() + entries.size());
@@ -496,6 +493,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new HipTransport();
     }
 #endif
+#ifdef USE_HYLINK
+    else if (std::string(proto) == "hylink") {
+        transport = new HylinkTransport();
+    }
+#endif
 #ifdef USE_MACA
     else if (std::string(proto) == "maca") {
         transport = new MacaTransport();
@@ -594,13 +596,57 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     return transport;
 }
 
+Status MultiTransport::selectTransports(
+    const std::vector<TransferRequest>& entries,
+    std::vector<Transport*>& transports) {
+    transports.clear();
+    transports.reserve(entries.size());
+    Transport* reused_transport = nullptr;
+    Transport::SegmentID reused_target = 0;
+    bool reuse_allowed = false;
+    const bool metacache = globalConfig().metacache;
+    for (const auto& request : entries) {
+        Transport* transport = nullptr;
+        // Reuse only address-independent routes within this submission. Mixed
+        // protocol segments must still resolve each address independently, and
+        // disabling the metadata cache must retain the explicit refresh
+        // behavior. This restores MultiTransport routing (protocol to
+        // Transport*), not RDMA's per-target SegmentDesc fetch inside
+        // submitTransferTask.
+        if (reuse_allowed && reused_transport && metacache &&
+            request.target_id == reused_target) {
+            transport = reused_transport;
+        } else {
+            auto status = selectTransport(request, transport, &reuse_allowed);
+            if (!status.ok()) return status;
+            assert(transport);
+            reused_transport = transport;
+            reused_target = request.target_id;
+        }
+        transports.push_back(transport);
+    }
+    return Status::OK();
+}
+
 Status MultiTransport::selectTransport(const TransferRequest& entry,
-                                       Transport*& transport) {
+                                       Transport*& transport,
+                                       bool* allows_reuse) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
+        if (allows_reuse) *allows_reuse = false;
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Offset-based routing is only compiled for mixed-protocol segments.
+    // A homogeneous batch can reuse this Transport*.
+    if (allows_reuse) {
+        *allows_reuse =
+            target_segment_desc->protocol.find(',') == std::string::npos;
+    }
+#else
+    if (allows_reuse) *allows_reuse = true;
+#endif
 
     auto proto = target_segment_desc->protocol;
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -616,6 +662,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             // hip is intra-node GPU-IPC only. On a cross-node request a
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.
+            if (p == "hylink") return std::getenv("MC_DISABLE_HYLINK") ? 0 : 5;
             if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
             if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
             if (p == "musa") return std::getenv("MC_DISABLE_MUSA") ? 0 : 4;

@@ -103,6 +103,13 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    // Open a file that must already exist. Implementations must not use
+    // O_CREAT: bucket descriptors can arrive after whole-bucket eviction.
+    virtual tl::expected<int, ErrorCode> OpenExistingFile(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     virtual tl::expected<void, ErrorCode> CloseFile(int /*fd*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }

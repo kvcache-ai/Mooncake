@@ -17,9 +17,12 @@
 #include "ha/snapshot/snapshot_maintenance_lease.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
+#include "ha_metric_manager.h"
 
 namespace mooncake {
 namespace {
+
+using Skip = HAMetricManager::SnapshotSkipReason;
 
 int64_t CurrentTimeMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -44,6 +47,7 @@ BatchOpLogSnapshotCoordinator::BatchOpLogSnapshotCoordinator(
       cluster_id_(std::move(cluster_id)),
       config_(std::move(config)),
       lease_factory_(std::move(lease_factory)) {
+    HAMetricManager::instance().reset_snapshot_runtime(true);
     if (!config_.clock) {
         config_.clock = [] { return Clock::now(); };
     }
@@ -176,6 +180,15 @@ void BatchOpLogSnapshotCoordinator::OnCaptureReleased() {
     } else if (capture_cursor_) {
         catch_up_target_ = *capture_cursor_;
     }
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.catch_up_target_batch =
+            catch_up_target_ ? catch_up_target_->batch_id : 0;
+        metrics.catch_up_target_sequence =
+            catch_up_target_ ? catch_up_target_->last_seq : 0;
+        if (prefix)
+            metrics.durable_batch =
+                std::max(metrics.durable_batch, prefix->batch_id);
+    });
     cv_.notify_all();
 }
 
@@ -198,7 +211,16 @@ std::optional<uint64_t> BatchOpLogSnapshotCoordinator::ReadLatestBatchId(
           ha::BuildBatchOpLogSnapshotFallbackKey(cluster_id_)}) {
         std::string value;
         const auto get_error = backend_.Get(key, value);
+        const bool latest =
+            key == ha::BuildBatchOpLogSnapshotLatestKey(cluster_id_);
         if (get_error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+            HAMetricManager::instance().update_snapshot_runtime(
+                [&](auto& metrics) {
+                    (latest ? metrics.latest_created_at_ms
+                            : metrics.fallback_created_at_ms) = std::nullopt;
+                    (latest ? metrics.latest_batch : metrics.fallback_batch) =
+                        0;
+                });
             continue;
         }
         if (get_error != ErrorCode::OK) {
@@ -206,6 +228,14 @@ std::optional<uint64_t> BatchOpLogSnapshotCoordinator::ReadLatestBatchId(
             return std::nullopt;
         }
         auto descriptor = ha::DecodeBatchOpLogSnapshotDescriptor(value);
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            (latest ? metrics.latest_created_at_ms
+                    : metrics.fallback_created_at_ms) =
+                descriptor ? std::optional<int64_t>(descriptor->created_at_ms)
+                           : std::nullopt;
+            (latest ? metrics.latest_batch : metrics.fallback_batch) =
+                descriptor ? descriptor->last_included_batch_id : 0;
+        });
         // Corrupt pointers are handled by the fenced publisher; they do not
         // qualify a newer local cursor on their own.
         if (descriptor) {
@@ -240,21 +270,33 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunOnce() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (attempt_in_flight_) {
+                HAMetricManager::instance().record_snapshot_skip(
+                    Skip::InFlight);
                 return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
             }
             if (stop_requested_) {
+                HAMetricManager::instance().record_snapshot_skip(Skip::Stopped);
                 return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
             }
             if (last_attempt_complete_ &&
                 Now() - *last_attempt_complete_ <
                     std::chrono::seconds(config_.snapshot_interval_seconds)) {
+                HAMetricManager::instance().record_snapshot_skip(
+                    Skip::Interval);
                 return ErrorCode::OK;
             }
             if (promotion_requested_) {
+                HAMetricManager::instance().record_snapshot_skip(
+                    Skip::Promotion);
                 return ErrorCode::OK;
             }
         }
-        return RunAttempt();
+        HAMetricManager::instance().record_snapshot_skip(Skip::None);
+        HAMetricManager::SnapshotOperationTimer timer(
+            HAMetricManager::SnapshotOperation::Schedule);
+        const auto error = RunAttempt();
+        timer.error = static_cast<int64_t>(error);
+        return error;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Batch snapshot coordinator failed: " << e.what();
         FinishAttempt(ErrorCode::INTERNAL_ERROR, false);
@@ -281,6 +323,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     }
     const auto local_prefix = standby_.GetLastAppliedBatchOpLogSnapshotPrefix();
     if (!local_prefix || local_prefix->batch_id <= *latest_batch_id) {
+        HAMetricManager::instance().record_snapshot_skip(Skip::NoNewBatch);
         FinishAttempt(ErrorCode::OK, false);
         return ErrorCode::OK;
     }
@@ -300,6 +343,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
             target = catch_up_target_;
         }
         if (target && !CatchUpComplete(*target)) {
+            HAMetricManager::instance().record_snapshot_skip(Skip::CatchUp);
             FinishAttempt(ErrorCode::OK, false);
             return ErrorCode::OK;
         }
@@ -307,6 +351,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
 
     auto lease = lease_factory_();
     if (!lease) {
+        HAMetricManager::instance().record_snapshot_skip(Skip::LeaseBusy);
         // A factory may return null to represent a busy maintenance lease.
         FinishAttempt(ErrorCode::OK, false);
         return ErrorCode::OK;
@@ -314,6 +359,8 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     const ErrorCode lease_error =
         lease->IsHeld() ? ErrorCode::OK : lease->Acquire();
     if (lease_error != ErrorCode::OK) {
+        if (lease_error == ErrorCode::ETCD_TRANSACTION_FAIL)
+            HAMetricManager::instance().record_snapshot_skip(Skip::LeaseBusy);
         // A busy maintenance lease is an ordinary skipped cycle.
         const ErrorCode result = lease_error == ErrorCode::ETCD_TRANSACTION_FAIL
                                      ? ErrorCode::OK
@@ -322,14 +369,33 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         return result;
     }
 
-    auto release_lease = [&] { (void)lease->Release(); };
+    // Observe and release on every exit, before making the attempt idle.
+    const auto observe_lease_loss =
+        [](SnapshotMaintenanceLease* held) noexcept {
+            try {
+                if (!held->IsHeld()) {
+                    HAMetricManager::instance().update_snapshot_runtime(
+                        [](auto& metrics) { ++metrics.lease_lost_total; });
+                }
+            } catch (...) {
+                LOG(WARNING)
+                    << "Failed to observe snapshot maintenance lease state";
+            }
+            (void)held->Release();
+        };
+    std::unique_ptr<SnapshotMaintenanceLease, decltype(observe_lease_loss)>
+        lease_observer(lease.get(), observe_lease_loss);
     bool cancel_before_capture = false;
+    bool promotion_before_capture = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        cancel_before_capture = stop_requested_ || promotion_requested_;
+        promotion_before_capture = promotion_requested_;
+        cancel_before_capture = stop_requested_ || promotion_before_capture;
     }
     if (cancel_before_capture) {
-        release_lease();
+        HAMetricManager::instance().record_snapshot_skip(
+            promotion_before_capture ? Skip::Promotion : Skip::Stopped);
+        lease_observer.reset();
         FinishAttempt(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
@@ -339,9 +405,11 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     const auto reread_local = standby_.GetLastAppliedBatchOpLogSnapshotPrefix();
     if (!reread_latest || !reread_local ||
         reread_local->batch_id <= *reread_latest) {
+        if (read_error == ErrorCode::OK)
+            HAMetricManager::instance().record_snapshot_skip(Skip::NoNewBatch);
         const ErrorCode result =
             read_error == ErrorCode::OK ? ErrorCode::OK : read_error;
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(result, true);
         return result;
     }
@@ -355,7 +423,9 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         }
     }
     if (!capture || capture->last_included_batch_id <= *reread_latest) {
-        release_lease();
+        HAMetricManager::instance().record_snapshot_skip(
+            capture ? Skip::NoNewBatch : Skip::CaptureUnavailable);
+        lease_observer.reset();
         FinishAttempt(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
@@ -366,9 +436,10 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         cancel_after_promotion = promotion_requested_;
     }
     if (cancel_after_promotion) {
+        HAMetricManager::instance().record_snapshot_skip(Skip::Promotion);
         standby_.CancelBatchOpLogSnapshotCapture();
         standby_.EndBatchOpLogSnapshotCapture(*capture);
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
@@ -395,7 +466,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         capture_active_ = false;
     }
     if (!descriptor) {
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(ErrorCode::INTERNAL_ERROR, true);
         return ErrorCode::INTERNAL_ERROR;
     }
@@ -406,20 +477,27 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         stop_before_publish = stop_requested_ && !promotion_requested_;
     }
     if (stop_before_publish) {
+        HAMetricManager::instance().record_snapshot_skip(Skip::Stopped);
         auto cleanup = object_store_.DeleteObjectsWithPrefix(artifact_prefix);
         if (!cleanup) {
             LOG(WARNING) << "Failed to clean snapshot candidate after stop: "
                          << cleanup.error();
         }
-        release_lease();
+        lease_observer.reset();
         FinishAttempt(ErrorCode::OK, true);
         return ErrorCode::OK;
     }
 
     BatchOpLogSnapshotPublisher publisher(backend_, cluster_id_);
     std::optional<std::string> expected_fallback;
-    ErrorCode publish_error =
-        publisher.Publish(*lease, *descriptor, &expected_fallback);
+    ErrorCode publish_error;
+    {
+        HAMetricManager::SnapshotOperationTimer timer(
+            HAMetricManager::SnapshotOperation::Publish);
+        publish_error =
+            publisher.Publish(*lease, *descriptor, &expected_fallback);
+        timer.error = static_cast<int64_t>(publish_error);
+    }
     if (publish_error != ErrorCode::OK) {
         auto cleanup = object_store_.DeleteObjectsWithPrefix(artifact_prefix);
         if (!cleanup) {
@@ -428,6 +506,20 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         }
     }
     if (publish_error == ErrorCode::OK) {
+        const auto latest = ha::DecodeBatchOpLogSnapshotDescriptor(*descriptor);
+        const auto fallback = ha::DecodeBatchOpLogSnapshotDescriptor(
+            expected_fallback.value_or(""));
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            metrics.latest_batch = latest ? latest->last_included_batch_id : 0;
+            metrics.fallback_batch =
+                fallback ? fallback->last_included_batch_id : 0;
+            metrics.latest_created_at_ms =
+                latest ? std::optional<int64_t>(latest->created_at_ms)
+                       : std::nullopt;
+            metrics.fallback_created_at_ms =
+                fallback ? std::optional<int64_t>(fallback->created_at_ms)
+                         : std::nullopt;
+        });
         BatchOpLogSnapshotGc gc(backend_, object_store_, cluster_id_,
                                 config_.snapshot_root);
         auto cancelled = [this] {
@@ -458,7 +550,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
             LOG(WARNING) << "Batch OpLog pruning threw unknown exception";
         }
     }
-    release_lease();
+    lease_observer.reset();
     FinishAttempt(publish_error, true);
     return publish_error;
 }

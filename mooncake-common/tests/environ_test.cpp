@@ -152,6 +152,22 @@ TEST_F(EnvironTest, StoreChecksumPopulatesFromEnv) {
     EXPECT_TRUE(e.GetStoreChecksumEnabled());
 }
 
+TEST_F(EnvironTest, RdmaDataDirectIsOptIn) {
+    class Source : public mooncake::EnvironSource {
+       public:
+        const char* value = nullptr;
+        const char* Get(const char* name) const override {
+            return std::string(name) == "MC_RDMA_DATA_DIRECT" ? value : nullptr;
+        }
+    } source;
+
+    EXPECT_FALSE(Environ(source).GetRdmaDataDirect());
+    source.value = "1";
+    EXPECT_TRUE(Environ(source).GetRdmaDataDirect());
+    source.value = "0";
+    EXPECT_FALSE(Environ(source).GetRdmaDataDirect());
+}
+
 // --- GetSizeT ---
 
 TEST_F(EnvironTest, GetSizeTValidValue) {

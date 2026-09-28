@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,11 @@ class AutoPortBinder {
 };
 
 tl::expected<std::string, int> httpGet(const std::string& url);
+
+// Sends an HTTP DELETE. Succeeds only on status 200; otherwise the error
+// describes the network failure or the HTTP status and response body.
+tl::expected<void, std::string> httpDelete(const std::string& url,
+                                           std::chrono::milliseconds timeout);
 
 tl::expected<std::string, std::string> GetInterfaceIPv4Address(
     const std::string& interface_name);

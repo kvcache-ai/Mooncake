@@ -470,6 +470,18 @@ Returns a transport instance by protocol name, mainly for advanced inspection or
 
 TransferEngine can send and receive lightweight notifications across segments to coordinate data movement.
 
+Notifications are sent only when requested through the APIs below. For classic TE:
+
+- `MC_RDMA_NOTIFY_ENABLED=1` (default) enables RDMA notifications for both `rdma` and
+  `rdma_twosided`; set it to `0` before initialization to use TCP.
+- Ordinary `rdma` supports up to 65528 combined bytes of `name` and `msg`. Unsupported
+  peers or larger messages fall back to TCP when `MC_RDMA_NOTIFY_OOB_FALLBACK=1`
+  (default); set it to `0` to return an error instead.
+- A successful ordinary RDMA send indicates local submission, without confirming
+  remote receipt. Connection setup or backpressure may block; applications must
+  ensure delivery before shutting down either engine.
+- Ordinary RDMA notifications use 32 MiB of registered host memory per endpoint.
+
 #### TransferEngine::submitTransferWithNotify
 
 ```cpp
