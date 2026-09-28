@@ -188,7 +188,9 @@ Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
             std::string("Invalid bootstrap response: ") + e.what() + LOC_MARK);
     }
     if (!response.reply_msg.empty()) {
-        return Status::RpcServiceError(response.reply_msg);
+        // A refusal is an answer: keep it off the RpcServiceError paths.
+        return Status::InternalError(
+            "Peer refused the bootstrap: " + response.reply_msg + LOC_MARK);
     }
     if (response.local_gid.empty()) {
         return Status::InvalidArgument(
