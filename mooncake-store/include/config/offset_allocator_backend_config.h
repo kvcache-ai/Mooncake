@@ -85,6 +85,12 @@ struct OffsetAllocatorBackendConfig {
     // of copying them into ClientBuffer. Falls back to the copy path when
     // registration fails. No effect unless dax_device_path is set.
     bool dax_zero_copy = false;
+
+    // NUMA node the zero-copy region is registered under, which is how the
+    // transfer engine picks the NICs that serve it. -1 reads the device's
+    // numa_node from sysfs (the closest CPU node; for a CXL expander this is
+    // not its CPU-less target_node, which has no local NIC).
+    int64_t dax_numa_node = -1;
 };
 
 }  // namespace mooncake

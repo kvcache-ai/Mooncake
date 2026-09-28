@@ -60,6 +60,11 @@ bool OffsetAllocatorBackendConfig::Validate() const {
                       "be a positive power of two";
         return false;
     }
+    if (dax_numa_node < -1) {
+        LOG(ERROR) << "OffsetAllocatorBackendConfig: dax_numa_node must be "
+                      ">= 0, or -1 for auto";
+        return false;
+    }
     return true;
 }
 
@@ -148,6 +153,8 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
                         cfg.dax_flush_cpu_cache);
     cfg.dax_zero_copy = Environ::ReadOr(
         Variables::MOONCAKE_OFFSET_DAX_ZERO_COPY, cfg.dax_zero_copy);
+    cfg.dax_numa_node = Environ::ReadOr(
+        Variables::MOONCAKE_OFFSET_DAX_NUMA_NODE, cfg.dax_numa_node);
 
     return cfg;
 }
