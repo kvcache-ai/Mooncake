@@ -239,6 +239,13 @@ TransferEnginePy::~TransferEnginePy() {
     large_buffer_list_.clear();
 }
 
+void TransferEnginePy::invalidateCachedSegment(
+    const char* target_hostname, Transport::SegmentHandle handle) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = handle_map_.find(target_hostname);
+    if (it != handle_map_.end() && it->second == handle) handle_map_.erase(it);
+}
+
 std::vector<std::string> buildDeviceFilter(const std::string& device_names) {
     std::stringstream ss(device_names);
     std::string item;
@@ -718,7 +725,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
     // remote RNIC, it will eventually fail. This allows selecting multiple
     // local RNIC in one transferSync call. Will be fixed in the next revision.
     const int max_retry =
-        engine_->numContexts() + 1;  // Iter all possible local contexts
+        engine_->isUsingTent() ? 1 : engine_->numContexts() + 1;
     auto start_ts = getCurrentTimeInNano();
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(1);
@@ -766,16 +773,29 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         TransferStatus status;
         while (!completed) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
-            LOG_ASSERT(s.ok());
+            if (!s.ok()) {
+                LOG(ERROR) << "Sync transfer status query failed for "
+                           << target_hostname << ": " << s.ToString();
+                engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
+                return -1;
+            }
             if (status.s == TransferStatusEnum::COMPLETED) {
                 engine_->freeBatchID(batch_id);
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
                 engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
+                completed = true;
+            } else if (status.s == TransferStatusEnum::CANCELED) {
+                LOG(INFO) << "Sync data transfer canceled";
+                engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
                 completed = true;
             }
             if (completed) break;
@@ -788,6 +808,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                           << (void*)buffer << " remote buffer "
                           << (void*)peer_buffer_address << " length " << length;
                 engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
                 return -1;
             }
         }
@@ -824,7 +845,8 @@ int TransferEnginePy::batchTransferSync(
         return -1;
     }
 
-    const int max_retry = engine_->numContexts() + 1;
+    const int max_retry =
+        engine_->isUsingTent() ? 1 : engine_->numContexts() + 1;
     auto start_ts = getCurrentTimeInNano();
     auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
     auto batch_size = buffers.size();
@@ -846,6 +868,7 @@ int TransferEnginePy::batchTransferSync(
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
+        for (auto& entry : entries) entry.advise_retry_cnt = retry;
         auto batch_id = engine_->allocateBatchID(batch_size);
         Status s =
             notify
@@ -882,7 +905,13 @@ int TransferEnginePy::batchTransferSync(
         TransferStatus status;
         while (!completed) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
-            LOG_ASSERT(s.ok());
+            if (!s.ok()) {
+                LOG(ERROR) << "Sync batch status query failed for "
+                           << target_hostname << ": " << s.ToString();
+                engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
+                return -1;
+            }
             if (status.s == TransferStatusEnum::COMPLETED) {
                 engine_->freeBatchID(batch_id);
                 return 0;
@@ -892,10 +921,17 @@ int TransferEnginePy::batchTransferSync(
                            << " requests, " << total_length
                            << " bytes) on retry " << retry << "/" << max_retry;
                 engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
                 engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
+                completed = true;
+            } else if (status.s == TransferStatusEnum::CANCELED) {
+                LOG(INFO) << "Sync batch data transfer canceled";
+                engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
                 completed = true;
             }
             if (completed) break;
@@ -909,6 +945,7 @@ int TransferEnginePy::batchTransferSync(
                 // still waiting tasks) the batch_id may fail and cause memory
                 // leak(a known issue).
                 engine_->freeBatchID(batch_id);
+                invalidateCachedSegment(target_hostname, handle);
                 return -1;
             }
         }
@@ -946,7 +983,8 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         return 0;
     }
 
-    const int max_retry = engine_->numContexts() + 1;
+    const int max_retry =
+        engine_->isUsingTent() ? 1 : engine_->numContexts() + 1;
     auto batch_size = buffers.size();
     std::vector<TransferRequest> entries;
     batch_id_t batch_id = 0;
@@ -967,6 +1005,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     }
 
     for (int retry = 0; retry < max_retry; ++retry) {
+        for (auto& entry : entries) entry.advise_retry_cnt = retry;
         batch_id = engine_->allocateBatchID(batch_size);
         auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
 
@@ -1012,7 +1051,10 @@ int TransferEnginePy::getBatchTransferStatus(
             auto batch_desc = reinterpret_cast<BatchDesc*>(entry.first);
             auto start_timestamp = batch_desc->start_timestamp;
             Status s = engine_->getBatchTransferStatus(entry.first, status);
-            LOG_ASSERT(s.ok());
+            if (!s.ok()) {
+                failed_or_timeout = true;
+                continue;
+            }
             if (status.s == TransferStatusEnum::COMPLETED) {
                 engine_->freeBatchID(entry.first);
                 LOG(INFO) << "Batch Transfer completed!";
@@ -1021,6 +1063,10 @@ int TransferEnginePy::getBatchTransferStatus(
                 failed_or_timeout = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
+                failed_or_timeout = true;
+            } else if (status.s == TransferStatusEnum::CANCELED) {
+                LOG(INFO) << "Sync data transfer canceled";
+                failed_or_timeout = true;
             }
             auto current_ts = getCurrentTimeInNano();
             if (current_ts - start_timestamp > entry.second) {
@@ -1087,14 +1133,19 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
     TransferStatus status;
     Status s = engine_->getTransferStatus(batch_id, 0, status);
-    LOG_ASSERT(s.ok());
+    if (!s.ok()) {
+        engine_->freeBatchID(batch_id);
+        return -1;
+    }
     if (status.s == TransferStatusEnum::COMPLETED) {
         engine_->freeBatchID(batch_id);
         return 1;
     } else if (status.s == TransferStatusEnum::FAILED) {
         engine_->freeBatchID(batch_id);
         return -1;
-    } else if (status.s == TransferStatusEnum::TIMEOUT) {
+    } else if (status.s == TransferStatusEnum::TIMEOUT ||
+               status.s == TransferStatusEnum::CANCELED) {
+        engine_->freeBatchID(batch_id);
         return -2;
     } else {
         return 0;

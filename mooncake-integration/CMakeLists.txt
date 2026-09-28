@@ -104,6 +104,11 @@ if(WITH_TE)
         LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
+    add_test(
+      NAME tent_python_sync_status_source_test
+      COMMAND
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_sync_status_source.py)
     set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
   endif()
 endif()
