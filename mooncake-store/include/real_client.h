@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -852,6 +853,22 @@ class RealClient : public PyClient {
         std::unordered_map<std::string, std::vector<Slice>> &objects,
         const OffloadReadRange *read_range = nullptr);
 
+    // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
+    // BatchGetLocal. Callers copy out of the restored arena (sequential
+    // BatchGetOffloadObject or session BatchTransferReadOffloadRanges) while
+    // the returned lease is alive; the destructor releases the owner buffer.
+    // allow_pinned: sequential memcpy may restore into the unregistered pinned
+    // arena. Session scatter is TE-only, so it must pass false and land in the
+    // owner's registered client buffer.
+    class OffloadRestoreLease;
+    tl::expected<std::unique_ptr<OffloadRestoreLease>, ErrorCode>
+    restore_offload_objects(
+        const std::string &target_rpc_service_addr,
+        const std::vector<std::string> &keys,
+        const std::vector<int64_t> &restore_sizes,
+        const std::unordered_map<std::string, std::vector<Slice>> &objects,
+        bool allow_pinned = true);
+
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
         const std::unordered_map<std::string, std::vector<Slice>> &objects)
@@ -1052,7 +1069,10 @@ class RealClient : public PyClient {
     // KV transfer sessions (process-local; not shared with DummyClient).
     // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
     // supported replica + lease); ranges only compare lease locally (no
-    // Master).
+    // Master). MEMORY uses BatchTransferReadRanges; DFS reads through
+    // request-scoped staging; LOCAL_DISK restores on the owner then
+    // BatchTransferReadOffloadRanges; DISK BatchGets into a temp buffer then
+    // scatters by src_offset.
     // Put sessions track writable + inflight so end/revoke can seal the
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
@@ -1066,6 +1086,9 @@ class RealClient : public PyClient {
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
+
+    void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
+                               const std::vector<std::string> &keys);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
@@ -1166,6 +1189,8 @@ class RealClient : public PyClient {
     struct SessionRangeReadPlan {
         std::vector<SessionRangeReadRequest> memory_requests;
         std::vector<SessionRangeReadRequest> dfs_requests;
+        std::vector<SessionRangeReadRequest> local_disk_requests;
+        std::vector<SessionRangeReadRequest> disk_requests;
     };
 
     struct DfsSessionStagingArena {
@@ -1205,6 +1230,14 @@ class RealClient : public PyClient {
         const std::vector<SessionRangeReadRequest> &requests) const;
 
     void execute_session_dfs_range_reads(
+        const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
+    void execute_session_local_disk_range_reads(
+        const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
+    void execute_session_disk_range_reads(
         const std::vector<SessionRangeReadRequest> &requests,
         std::vector<int> &results);
 
