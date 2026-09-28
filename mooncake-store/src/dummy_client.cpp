@@ -1312,8 +1312,8 @@ int DummyClient::isExist(const std::string& key) {
 std::vector<int> DummyClient::batchIsExist(
     const std::vector<std::string>& keys) {
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batchIsExist_internal_rpc, bool>(keys.size(),
-                                                                   keys);
+        invoke_batch_rpc<&RealClient::batchIsExist_internal_rpc, bool>(
+            keys.size(), keys);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -1360,7 +1360,8 @@ std::vector<int> DummyClient::batchProbeKey(
 }
 
 int64_t DummyClient::getSize(const std::string& key) {
-    return to_py_ret(invoke_rpc<&RealClient::getSize_internal_rpc, int64_t>(key));
+    return to_py_ret(
+        invoke_rpc<&RealClient::getSize_internal_rpc, int64_t>(key));
 }
 
 std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {

@@ -2391,8 +2391,9 @@ PYBIND11_MODULE(store, m) {
                 if (parent_span_id) ctx.parent_span_id = *parent_span_id;
                 set_current_request_context(std::move(ctx));
             },
-            py::arg("request_id") = py::none(), py::arg("trace_id") = py::none(),
-            py::arg("span_id") = py::none(), py::arg("parent_span_id") = py::none(),
+            py::arg("request_id") = py::none(),
+            py::arg("trace_id") = py::none(), py::arg("span_id") = py::none(),
+            py::arg("parent_span_id") = py::none(),
             "Set per-request context on the calling thread; consumed by "
             "subsequent store/master operations.")
         .def(
