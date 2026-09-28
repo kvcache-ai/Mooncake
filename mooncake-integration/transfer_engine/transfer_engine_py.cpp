@@ -17,6 +17,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -249,6 +250,32 @@ std::vector<std::string> buildDeviceFilter(const std::string& device_names) {
     return tokens;
 }
 
+#ifdef USE_EFA
+// EFA NICs are verbs devices too, but they only expose SRD, so the RDMA
+// transport cannot create RC QPs on them. Returns the requested devices (all
+// verbs devices when `requested` is empty) minus the EFA ones.
+std::vector<std::string> nonEfaVerbsDevices(
+    const std::vector<std::string>& requested) {
+    const std::filesystem::path sysfs = "/sys/class/infiniband";
+    std::vector<std::string> candidates = requested;
+    std::error_code ec;
+    if (candidates.empty()) {
+        for (const auto& entry :
+             std::filesystem::directory_iterator(sysfs, ec)) {
+            candidates.push_back(entry.path().filename().string());
+        }
+    }
+    std::vector<std::string> result;
+    for (const auto& name : candidates) {
+        auto driver =
+            std::filesystem::read_symlink(sysfs / name / "device/driver", ec);
+        if (!ec && driver.filename() == "efa") continue;
+        result.push_back(name);
+    }
+    return result;
+}
+#endif
+
 std::pair<std::string, std::string> parseConnectionString(
     const std::string& conn_string) {
     std::pair<std::string, std::string> result;
@@ -315,13 +342,28 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     // When using EFA protocol, we still need topology discovery but won't
     // auto-install RDMA
     bool use_efa = (proto == "efa");
+    // An explicit "rdma" request (e.g. an IB/RoCE cluster running the EFA
+    // wheel) installs the RDMA transport on the non-EFA devices. If there are
+    // none, keep the previous behavior and fall back to TCP.
+    bool use_rdma = false;
+    std::vector<std::string> rdma_devices;
+    if (proto == "rdma") {
+        rdma_devices = nonEfaVerbsDevices(device_filter);
+        use_rdma = !rdma_devices.empty();
+        if (!use_rdma) {
+            LOG(WARNING) << "protocol=rdma requested but no non-EFA RDMA "
+                            "device was found; falling back to TCP. On AWS "
+                            "EFA use protocol=efa instead.";
+        }
+    }
     // Disable auto_discover to prevent RDMA transport installation, we'll
     // install EFA manually
     engine_ = std::make_unique<TransferEngine>(false, device_filter);
-    // Manually discover topology for EFA to populate device list
-    if (use_efa) {
-        engine_->getLocalTopology()->discover(device_filter);
-        LOG(INFO) << "Topology discovery complete for EFA. Found "
+    // Manually discover topology for EFA/RDMA to populate device list
+    if (use_efa || use_rdma) {
+        engine_->getLocalTopology()->discover(use_efa ? device_filter
+                                                      : rdma_devices);
+        LOG(INFO) << "Topology discovery complete for " << proto << ". Found "
                   << engine_->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
@@ -362,6 +404,15 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
             return -1;
         }
         LOG(INFO) << "EFA transport installed successfully";
+    } else if (use_rdma) {
+        LOG(INFO)
+            << "Installing RDMA transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("rdma", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install RDMA transport";
+            return -1;
+        }
+        LOG(INFO) << "RDMA transport installed successfully";
     } else if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
