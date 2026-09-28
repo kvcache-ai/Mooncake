@@ -138,7 +138,11 @@ int UbSegment::RegUbSegment(const std::string &location, uint64_t va,
         }
         return 0;
     }
-    if (va == 0 || size == 0) return -1;
+    if (va == 0 || size == 0) {
+        LOG(ERROR) << "Invalid UB segment registration request: location="
+                   << location << ", va=" << va << ", size=" << size;
+        return -1;
+    }
 
     auto &resolved = symbols();
     if (!symbolsAvailable(resolved)) {
@@ -157,6 +161,9 @@ int UbSegment::RegUbSegment(const std::string &location, uint64_t va,
                                << ", requested=" << size;
                     return -1;
                 }
+                LOG(INFO) << "UB segment already registered for location "
+                          << location << ", va=" << va << ", size=" << size
+                          << " (idempotent no-op)";
                 return 0;
             }
         }
@@ -179,6 +186,10 @@ int UbSegment::RegUbSegment(const std::string &location, uint64_t va,
     }
 
     segments_[va].push_back({user_device_id, size});
+    LOG(INFO) << "Registered UB segment: location=" << location
+              << ", user_device_id=" << user_device_id
+              << ", logic_device_id=" << logic_device_id
+              << ", va=" << va << ", size=" << size;
     return 0;
 }
 
@@ -188,7 +199,11 @@ int UbSegment::UnRegUbSegment(const std::string &location, uint64_t va) {
 
     std::lock_guard<std::mutex> lock(mutex_);
     auto segment_it = segments_.find(va);
-    if (segment_it == segments_.end()) return 0;
+    if (segment_it == segments_.end()) {
+        LOG(INFO) << "No UB segment tracked for location " << location
+                  << ", va=" << va << " (nothing to unregister)";
+        return 0;
+    }
 
     auto &resolved = symbols();
     auto &entries = segment_it->second;
@@ -196,7 +211,12 @@ int UbSegment::UnRegUbSegment(const std::string &location, uint64_t va) {
         entries.begin(), entries.end(), [&](const SegmentInfo &entry) {
             return entry.user_device_id == user_device_id;
         });
-    if (entry_it == entries.end()) return 0;
+    if (entry_it == entries.end()) {
+        LOG(INFO) << "No UB segment tracked for location " << location
+                  << ", va=" << va << " on user device " << user_device_id
+                  << " (nothing to unregister)";
+        return 0;
+    }
 
     int first_error = 0;
     if (symbolsAvailable(resolved)) {
@@ -204,11 +224,24 @@ int UbSegment::UnRegUbSegment(const std::string &location, uint64_t va) {
         int ret = resolved.get_logic_device_id(user_device_id,
                                                 &logic_device_id);
         if (ret != 0) {
+            LOG(ERROR) << "aclrtGetLogicDevIdByUserDevId failed for user "
+                          "device "
+                       << user_device_id << ", va=" << va << ", ret=" << ret;
             first_error = ret;
         } else {
             ret = resolved.unregister_segment(
                 static_cast<uint32_t>(logic_device_id), va, entry_it->size);
-            if (ret != 0) first_error = ret;
+            if (ret != 0) {
+                LOG(ERROR) << "halMemUnRegUbSegment failed for user device "
+                           << user_device_id << ", va=" << va
+                           << ", size=" << entry_it->size << ", ret=" << ret;
+                first_error = ret;
+            } else {
+                LOG(INFO) << "Unregistered UB segment: location=" << location
+                          << ", user_device_id=" << user_device_id
+                          << ", logic_device_id=" << logic_device_id
+                          << ", va=" << va << ", size=" << entry_it->size;
+            }
         }
     } else {
         warnSymbolsUnavailable();

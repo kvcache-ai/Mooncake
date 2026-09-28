@@ -358,8 +358,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // NPU location. The context index is intentionally the index in
     // getHcaList(), which is also the index used by SegmentDesc devices.
     std::vector<size_t> target_indices;
-    if (explicit_location &&
-        resolved_name.rfind(UbSegment::kNpuPrefix, 0) == 0) {
+    const bool npu_location =
+        explicit_location && resolved_name.rfind(UbSegment::kNpuPrefix, 0) == 0;
+    if (npu_location) {
         const auto matrix = local_topology_->getMatrix();
         auto entry_it = matrix.find(resolved_name);
         if (entry_it != matrix.end() &&
@@ -384,6 +385,21 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     if (target_indices.empty()) {
         target_indices.resize(context_list_.size());
         std::iota(target_indices.begin(), target_indices.end(), 0);
+        if (npu_location) {
+            LOG(WARNING) << "Ascend RDMA: no HCA route found for location "
+                         << resolved_name << ", falling back to all "
+                         << context_list_.size() << " contexts";
+        }
+    } else {
+        std::string routed_contexts;
+        for (size_t i = 0; i < target_indices.size(); ++i) {
+            if (i) routed_contexts += ",";
+            routed_contexts += std::to_string(target_indices[i]);
+        }
+        LOG(INFO) << "Ascend RDMA: location " << resolved_name
+                  << " routes MR registration to HCA contexts ["
+                  << routed_contexts << "] (" << target_indices.size() << "/"
+                  << context_list_.size() << ")";
     }
 #else
     std::vector<size_t> target_indices(context_list_.size());
@@ -571,6 +587,11 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         int ub_ret = ub_segment_.RegUbSegment(
             resolved_name, reinterpret_cast<uint64_t>(chunk_addr), chunk_len);
         if (ub_ret != 0) {
+            LOG(ERROR) << "Failed to register UB segment (chunk " << ci << "/"
+                       << chunks.size() << ") at " << chunk_addr
+                       << " (location=" << resolved_name
+                       << ", length=" << chunk_len << ", ret=" << ub_ret
+                       << "), rolling back";
             rollbackChunks(ci);
             return ub_ret;
         }
@@ -778,7 +799,14 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             if (chunk_locations[i].empty()) continue;
             int ret = ub_segment_.UnRegUbSegment(chunk_locations[i],
                                                  chunk_addrs[i]);
-            if (ret && !first_err) first_err = ret;
+            if (ret) {
+                LOG(WARNING) << "Failed to unregister UB segment (chunk " << i
+                             << "/" << chunk_addrs.size() << ") at "
+                             << reinterpret_cast<void *>(chunk_addrs[i])
+                             << " (location=" << chunk_locations[i]
+                             << ", ret=" << ret << ")";
+                if (!first_err) first_err = ret;
+            }
         }
 #endif
 
@@ -842,7 +870,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     int ub_ret = ub_segment_.UnRegUbSegment(location, (uint64_t)addr);
     if (ub_ret != 0) {
         LOG(ERROR) << "Failed to unregister UB segment at " << addr
-                   << " (ret=" << ub_ret << ")";
+                   << " (location=" << location << ", ret=" << ub_ret << ")";
         if (!first_err) first_err = ub_ret;
     }
 #endif
