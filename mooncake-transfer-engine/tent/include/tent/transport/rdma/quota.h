@@ -201,11 +201,10 @@ class DeviceSelector {
     // actually carry, so release(), which returns a slice's real length,
     // balances. Charging every slice slice_bytes would leave the folded tail
     // released but never charged, and inflight_bytes is unsigned.
-    // trace_id identifies a source slot for diagnostics; never used to select.
     Status allocate(uint64_t total_length, uint32_t num_slices,
                     uint64_t slice_bytes, const std::string &location,
                     std::vector<int> &slice_dev_ids, int priority = PRIO_HIGH,
-                    uint64_t device_mask = ~0ULL, uint64_t trace_id = 0);
+                    uint64_t device_mask = ~0ULL);
 
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id);
@@ -296,21 +295,12 @@ class DeviceSelector {
     void fillDevicePriorities();
     int getDevicePriority(int dev_id) const;
 
-    enum class BatchAllocationPolicy {
-        InverseScore,
-        VirtualLoad,
-        StaticCapacity
-    };
+    enum class BatchAllocationPolicy { InverseScore, VirtualLoad };
 
     struct SchedulingParams {
         // Startup-only policy for normal aggregate allocation.
         BatchAllocationPolicy batch_allocation_policy =
             BatchAllocationPolicy::InverseScore;
-        // Zero disables sampled aggregate plans; no per-slice logging.
-        uint64_t batch_trace_interval = 0;
-        // Fixed calibration in Gbps by local device ID; never reads EWMA.
-        std::vector<double> batch_capacity_gbps;
-
         // NUMA tier penalties (rank 0 = local, should be smallest)
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};
@@ -443,7 +433,7 @@ class DeviceSelector {
     void selectMultiPath(const std::vector<Candidate> &candidates,
                          uint32_t num_slices, uint64_t total_length,
                          uint64_t slice_bytes, std::vector<int> &slice_dev_ids,
-                         bool probe_mode = false, uint64_t trace_id = 0);
+                         bool probe_mode = false);
 };
 
 }  // namespace tent

@@ -70,10 +70,6 @@ class RdmaTransportTestPeer {
     static void setBatchPolicy(RdmaTransport& transport,
                                const std::string& policy) {
         transport.conf_->set("transports/rdma/batch_allocation_policy", policy);
-        transport.conf_->set("transports/rdma/batch_trace_interval",
-                             uint64_t{100});
-        transport.conf_->set("transports/rdma/batch_capacity_gbps",
-                             std::vector<double>{100, 200});
     }
 
     static void bindMetadata(RdmaTransport& transport,
@@ -811,7 +807,6 @@ TEST(RdmaBatchPolicyTest, StartupConfigurationAndDefault) {
              {"", Policy::InverseScore},
              {"inverse_score", Policy::InverseScore},
              {"virtual_load", Policy::VirtualLoad},
-             {"static_capacity", Policy::StaticCapacity},
              {"unknown", Policy::InverseScore}}) {
         RdmaTransport transport;
         RdmaTransportTestPeer::bindTopology(transport,
@@ -822,10 +817,6 @@ TEST(RdmaBatchPolicyTest, StartupConfigurationAndDefault) {
         const auto& params =
             workers->getDeviceSelector()->getSchedulingParams();
         EXPECT_EQ(params.batch_allocation_policy, item.second);
-        EXPECT_EQ(params.batch_trace_interval, item.first.empty() ? 0 : 100);
-        EXPECT_EQ(params.batch_capacity_gbps,
-                  item.first.empty() ? std::vector<double>{}
-                                     : std::vector<double>({100, 200}));
     }
 }
 
