@@ -4417,7 +4417,7 @@ auto MasterService::GetReplicaList(const std::string& key,
     bool promotion_eligible = false;
     bool dynamic_replication_observed = false;
     MasterMetricManager::instance().inc_total_get_nums();
-    const auto outcome = WithObjectMetadataForRead(
+    auto outcome = WithObjectMetadataForRead(
         object_id,
         [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
             const ObjectMetadata& metadata, const ObjectEntry::State&)
@@ -4510,7 +4510,7 @@ auto MasterService::GetReplicaList(const std::string& key,
     if (dynamic_replication_observed) {
         MaybeQueueDynamicReplicaProposal(object_id);
     }
-    return *outcome;
+    return std::move(*outcome);
 }
 
 auto MasterService::GetReplicaListForAdmin(const std::string& key,
@@ -4520,7 +4520,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     const auto object_id = MakeObjectIdentity(key, tenant_id);
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto outcome = WithObjectMetadataForRead(
+    auto outcome = WithObjectMetadataForRead(
         object_id,
         [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
             const ObjectMetadata& metadata, const ObjectEntry::State&)
@@ -4548,7 +4548,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     if (!outcome->has_value()) {
         return tl::make_unexpected(outcome->error());
     }
-    return *outcome;
+    return std::move(*outcome);
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -4574,7 +4574,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         MasterMetricManager::instance().inc_total_get_nums();
 
         const ObjectIdentity object_id{normalized_tenant, key};
-        const auto outcome = WithObjectMetadataForRead(
+        auto outcome = WithObjectMetadataForRead(
             object_id,
             [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
                 const ObjectMetadata& metadata,
@@ -4683,7 +4683,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     for (size_t original_idx = 0; original_idx < keys.size(); ++original_idx) {
         const std::string& key = keys[original_idx];
         const ObjectIdentity object_id{normalized_tenant, key};
-        const auto outcome = WithObjectMetadataForRead(
+        auto outcome = WithObjectMetadataForRead(
             object_id,
             [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
                 const ObjectMetadata& metadata,
