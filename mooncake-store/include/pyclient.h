@@ -524,7 +524,8 @@ class PyClient {
     virtual int probeKey(const std::string &key) = 0;
 
     virtual std::vector<int> batchProbeKey(
-        const std::vector<std::string> &keys) = 0;
+        const std::vector<std::string> &keys,
+        const GrantLeasePolicy &policy = {}) = 0;
 
     virtual int64_t getSize(const std::string &key) = 0;
 

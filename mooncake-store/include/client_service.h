@@ -432,13 +432,14 @@ class Client {
         const std::vector<std::string>& keys);
 
     /**
-     * @brief Point-in-time existence check for multiple objects, granting no
-     *        read leases
+     * @brief Probe multiple objects, optionally leasing the last complete
+     *        candidate. LastHitOnly returns a selected-only mask.
      * @param keys Vector of keys to check
-     * @return Vector of existence results for each key
+     * @return Per-key existence results (None) or a selected-only mask
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        const GrantLeasePolicy& policy = {});
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments

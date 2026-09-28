@@ -3308,8 +3308,67 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
-    const std::vector<std::string>& keys, const TenantId& tenant_id) {
-    return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/false);
+    const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
+    const TenantId& tenant_id) {
+    if (keys.empty()) return {};
+    if (policy.lease_mode == ProbeLeaseMode::None) {
+        return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/false);
+    }
+    if (policy.lease_mode != ProbeLeaseMode::LastHitOnly ||
+        policy.candidate_size == 0 ||
+        keys.size() % policy.candidate_size != 0) {
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    std::vector<tl::expected<bool, ErrorCode>> results(keys.size(), false);
+    for (size_t end = keys.size(); end > 0; end -= policy.candidate_size) {
+        const size_t begin = end - policy.candidate_size;
+        std::map<size_t, std::vector<size_t>> indices_by_shard;
+        for (size_t i = begin; i < end; ++i) {
+            indices_by_shard[getShardIndex(normalized_tenant, keys[i])]
+                .push_back(i);
+        }
+
+        // Lock only this candidate's distinct shards, in ascending order.
+        // Keep eviction excluded until every member is checked and leased;
+        // do not reenter accessors that would acquire these locks again.
+        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        std::vector<std::unique_ptr<MetadataShardAccessorRO>> shards;
+        shards.reserve(indices_by_shard.size());
+        std::unordered_set<const ObjectMetadata*> objects;
+        bool complete = true;
+        for (const auto& [shard_idx, indices] : indices_by_shard) {
+            shards.push_back(
+                std::make_unique<MetadataShardAccessorRO>(this, shard_idx));
+            const auto& shard = *shards.back();
+            auto tenant_it = shard->tenants.find(normalized_tenant);
+            if (tenant_it == shard->tenants.end()) {
+                complete = false;
+                break;
+            }
+            for (const size_t i : indices) {
+                auto it = tenant_it->second.metadata.find(keys[i]);
+                if (it == tenant_it->second.metadata.end() ||
+                    !it->second.IsValid() || !HasReadableReplica(it->second)) {
+                    complete = false;
+                    break;
+                }
+                objects.insert(&it->second);
+            }
+            if (!complete) break;
+        }
+        if (!complete) continue;
+
+        for (const auto* object : objects) {
+            object->GrantReadLease(
+                std::chrono::milliseconds(default_kv_lease_ttl_));
+        }
+        std::fill(results.begin() + begin, results.begin() + end, true);
+        break;
+    }
+    return results;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(

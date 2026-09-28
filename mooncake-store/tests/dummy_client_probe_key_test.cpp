@@ -150,6 +150,25 @@ TEST_F(DummyClientProbeKeyTest, BatchProbeKeyOverRpcReportsExistence) {
     EXPECT_EQ(results[2], 1) << key_b << " should exist";
 }
 
+TEST_F(DummyClientProbeKeyTest, LastHitOnlyPolicySurvivesBothRpcBoundaries) {
+    ASSERT_TRUE(SetupStack());
+    for (const auto &key : {"a", "b", "c"}) PutData(key, "state");
+    const GrantLeasePolicy policy{ProbeLeaseMode::LastHitOnly, 2};
+    EXPECT_EQ(dummy_client_->batchProbeKey({"a", "b", "c", "missing"}, policy),
+              (std::vector<int>{1, 1, 0, 0}));
+    EXPECT_EQ(dummy_client_->batchProbeKey({"a", "missing", "b", "c"}, policy),
+              (std::vector<int>{0, 0, 1, 1}));
+    EXPECT_EQ(real_client_->batchProbeKey({"a", "b", "b", "c"}, policy),
+              (std::vector<int>{0, 0, 1, 1}));
+    EXPECT_EQ(dummy_client_->batchProbeKey({"a", "b", "c"}),
+              (std::vector<int>{1, 1, 1}));
+    EXPECT_TRUE(dummy_client_->batchProbeKey({}, policy).empty());
+    const auto invalid = dummy_client_->batchProbeKey(
+        {"a", "b"}, {ProbeLeaseMode::LastHitOnly, 0});
+    ASSERT_EQ(invalid.size(), 2u);
+    for (int value : invalid) EXPECT_LT(value, 0);
+}
+
 }  // namespace testing
 }  // namespace mooncake
 

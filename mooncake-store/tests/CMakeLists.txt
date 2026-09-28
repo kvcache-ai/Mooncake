@@ -75,6 +75,8 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_probe_policy_test
+               master_service_probe_policy_test.cpp)
 add_store_test(master_service_weight_management_test
                master_service_weight_management_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)

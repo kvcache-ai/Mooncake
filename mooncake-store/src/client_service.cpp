@@ -4034,8 +4034,8 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
-    const std::vector<std::string>& keys) {
-    auto response = master_client_.BatchProbeKey(keys);
+    const std::vector<std::string>& keys, const GrantLeasePolicy& policy) {
+    auto response = master_client_.BatchProbeKey(keys, policy);
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {

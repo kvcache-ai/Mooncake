@@ -1549,19 +1549,42 @@ else:
 ---
 
 #### batch_probe_key()
-Point-in-time existence check for multiple objects in a single batch
-operation, granting no read leases.
+Probe multiple objects, optionally selecting and leasing the last complete
+candidate. The default `"none"` policy remains a lease-free existence check.
 
 ```python
-def batch_probe_key(self, keys: List[str]) -> List[int]
+def batch_probe_key(
+    self, keys: List[str], policy: str = "none", candidate_size: int = 1
+) -> List[int]
 ```
 
 **Parameters:**
 - `keys` (List[str]): List of object identifiers to check
+- `policy` (str): `"none"` or `"LastHitOnly"`.
+- `candidate_size` (int): Number of consecutive keys forming each candidate.
+  Ignored for `"none"`. For a nonempty `"LastHitOnly"` request, it must be
+  positive and divide the number of keys exactly. Empty input returns `[]`.
 
 **Returns:**
-- `List[int]`: List of existence results (1=existed at probe time,
-0=not exists, -1=error)
+- `"none"`: per-key existence results (1=readable at probe time, 0=missing).
+- `"LastHitOnly"`: a selected-only mask of the same length and order as `keys`.
+  Every position in the last complete candidate is 1; all other positions are
+  0, **even if those objects exist**. An all-zero mask means no complete
+  candidate was found. Negative values indicate errors, not cache misses.
+
+Candidates are ordered by the caller. Every key in a candidate must have a
+readable replica before any member receives a lease. Earlier candidates may
+be missing or incomplete. The caller must include all required components,
+cache groups, and rank shards; Store does not infer prefix or model semantics.
+Duplicate key positions are allowed and must not alter the grouping.
+
+Selection, completeness validation, and lease acquisition are protected
+against normal eviction within the candidate. Selected objects receive the
+Master's default read-lease TTL; this does not change their soft-pin deadlines.
+The policy does not protect against lease expiry, forced removal, or replica
+loss. It does not explicitly renew unselected objects, but existing shared
+group leases (or a physical key repeated outside the selected candidate) may
+also protect unselected positions. No persistent group registration is added.
 
 **Example:**
 ```python
@@ -1570,6 +1593,24 @@ results = store.batch_probe_key(keys)
 candidates = [key for key, exists in zip(keys, results) if exists == 1]
 print("Probed candidates (unprotected from eviction):", candidates)
 ```
+
+For checkpoint selection, first use `batch_is_exist()` to protect the required
+KV data and determine its usable boundary. Pass only valid checkpoint
+candidates within that boundary, in increasing resume-position order:
+
+```python
+keys = ["checkpoint128.rank0", "checkpoint128.rank1",
+        "checkpoint256.rank0", "checkpoint256.rank1"]
+selected = store.batch_probe_key(keys, policy="LastHitOnly", candidate_size=2)
+# Both complete: [0, 0, 1, 1]. Last incomplete: [1, 1, 0, 0].
+# Load only the selected checkpoint, with the KV prefix it needs.
+```
+
+**Upgrade note:** the policy changes the `BatchProbeKey` Master RPC and the
+DummyClient-to-RealClient batch-probe RPC signatures. Upgrade the Master,
+client daemon, and clients together; mixed-version batch-probe calls are not
+supported. Default Python arguments preserve the old call syntax, not wire
+compatibility. `is_exist()`, `batch_is_exist()`, and `probe_key()` are unchanged.
 
 ---
 
