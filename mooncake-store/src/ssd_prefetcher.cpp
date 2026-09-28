@@ -356,32 +356,12 @@ std::optional<QueryResult> SsdPrefetcher::WaitIfPromotionInFlight(
         return requery_memory();
     }
 
-    // Another process may be promoting. One read-only re-query: only a
-    // PROCESSING MEMORY replica is evidence of an in-flight promotion worth
-    // waiting for; otherwise fall through to the SSD read at once.
-    auto qr = client->QueryReadOnly(key);
-    if (!qr) {
-        return std::nullopt;
-    }
-    const bool promotion_in_flight =
-        std::any_of(qr->replicas.begin(), qr->replicas.end(),
-                    [](const Replica::Descriptor& replica) {
-                        return replica.is_memory_replica() &&
-                               replica.status == ReplicaStatus::PROCESSING;
-                    });
-    if (!promotion_in_flight) {
-        return std::nullopt;
-    }
-
-    // Bounded poll: at most one re-query per 2ms slice, early exit as soon
-    // as the promoted replica is readable.
-    const int64_t deadline = PrefetchThrottle::NowMs() + budget_ms;
-    while (PrefetchThrottle::NowMs() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        if (auto refreshed = requery_memory()) {
-            return refreshed;
-        }
-    }
+    // The key is unknown to the local throttle: no live local promotion, so
+    // there is nothing to wait for. Promotions started by other processes
+    // are intentionally not waited on — client-visible replica queries
+    // filter out non-COMPLETE replicas (TryGetReadableReplicaDescriptor), so
+    // a PROCESSING MEMORY replica staged by another process can never be
+    // observed here. Fall through to the SSD read at once.
     return std::nullopt;
 }
 
