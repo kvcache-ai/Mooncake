@@ -61,6 +61,10 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct ClientObjectChecksumEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_STORE_CHECKSUM);
+};
+
 struct CxlSegmentEnvironmentVariables {
     // Keep the raw string so an unset value remains distinguishable from a
     // present but invalid value, which the legacy path resolves to zero.
