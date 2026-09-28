@@ -242,7 +242,8 @@ bool peerAnswered(coro_rpc::errc ec) {
 }  // namespace
 
 Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
-    std::string server_addr, int func_id, std::string request) {
+    std::string server_addr, int func_id, std::string request,
+    RpcCallOptions options) {
     if (tl_inside_rpc_handler) {
         co_return std::make_pair(
             Status::InvalidArgument(
@@ -257,11 +258,17 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     const bool from_pool = lease.client != nullptr;
 
     if (!lease.client) {
+        const std::chrono::milliseconds connect_timeout =
+            options.timeout.count() > 0
+                ? options.timeout
+                : coro_rpc_client::default_config.connect_timeout_duration;
         lease.client = std::make_unique<coro_rpc_client>(
             GetTransferEngineRpcClientIoContextPool().get_executor());
-        auto conn_result = co_await lease.client->connect(server_addr);
+        auto conn_result =
+            co_await lease.client->connect(server_addr, connect_timeout);
         if (conn_result.val() != 0) {
             lease.broken = true;
+            if (options.peer_unreachable) *options.peer_unreachable = true;
             auto msg = "Failed to connect RPC server. server: " + server_addr +
                        ", func_id: " + std::to_string(func_id) +
                        ", message: " + std::string{conn_result.message()};
@@ -272,10 +279,24 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
 
     lease->set_req_attachment(request);
 
-    auto call_result = co_await lease->call<&CoroRpcAgent::process>(func_id);
+    // Not inline in the co_await: GCC 11 miscompiles that in a ?: expression.
+    const std::chrono::milliseconds request_timeout =
+        options.timeout.count() > 0
+            ? options.timeout
+            : coro_rpc_client::default_config.request_timeout_duration;
+    auto call_result = co_await lease->call_for<&CoroRpcAgent::process>(
+        request_timeout, func_id);
 
     if (!call_result.has_value()) {
         lease.broken = true;
+        const bool answered = peerAnswered(call_result.error().code);
+        // A local error on an idle pooled connection only says it is stale;
+        // a timeout, or no answer on a connection made for this call, does not.
+        if (options.peer_unreachable && !answered &&
+            (call_result.error().code == coro_rpc::errc::timed_out ||
+             !from_pool)) {
+            *options.peer_unreachable = true;
+        }
         // An idle pooled connection only learns that its peer restarted when
         // it is next used, and every other connection pooled for that peer is
         // just as stale. Discarding only this one leaves the rest to fail the
@@ -288,7 +309,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         // answered -- a handler exception, an unknown function id, a rejected
         // argument -- the socket is fine, and so are the connections the other
         // callers of this address are holding.
-        if (from_pool && !peerAnswered(call_result.error().code)) {
+        if (from_pool && !answered) {
             pool->clearIfCurrent(generation);
         }
         auto msg = "Failed to call RPC function. server: " + server_addr +
@@ -308,9 +329,10 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
 
 Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
                           const std::string_view& request,
-                          std::string& response) {
+                          std::string& response,
+                          const RpcCallOptions& options) {
     auto [status, resp] = async_simple::coro::syncAwait(
-        callCoroutine(server_addr, func_id, std::string(request)));
+        callCoroutine(server_addr, func_id, std::string(request), options));
 
     if (status.ok()) {
         response = std::move(resp);

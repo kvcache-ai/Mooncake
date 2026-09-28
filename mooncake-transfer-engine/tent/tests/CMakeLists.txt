@@ -808,3 +808,13 @@ target_include_directories(tent_segment_desc_retry_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
+
+add_executable(tent_rpc_timeout_test rpc_timeout_test.cpp)
+target_link_libraries(tent_rpc_timeout_test PRIVATE gtest gtest_main
+                                                    tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_rpc_timeout_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_rpc_timeout_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rpc_timeout_test COMMAND tent_rpc_timeout_test)
