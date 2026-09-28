@@ -118,9 +118,20 @@ static bool initMemoryAllocator(const char* protocol) {
         return false;
 #endif
     } else {
-        allocateMemory = malloc;
+        // Ascend SVM (_devmm_mem_remote_map) requires a 64KB page-aligned
+        // src_va. Fallback protocols (rdma/tcp/ascend) use posix_memalign to
+        // guarantee 64KB alignment, otherwise aclrtHostRegister fails with
+        // EINVAL on a misaligned address.
+        allocateMemory = [](size_t s) -> void* {
+            void* p = nullptr;
+            if (posix_memalign(&p, 64 * 1024, s) != 0) {
+                return nullptr;
+            }
+            return p;
+        };
         freeMemory = free;
-        LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
+        LOG(WARNING) << "Using 64KB-aligned malloc/free for protocol: "
+                     << protocol;
     }
     g_protocol = protocol;
     return true;
@@ -248,13 +259,13 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
-        int ret =
-            engine_->init(conn_string, local_hostname,
-                          hostname_port.first.c_str(), hostname_port.second);
+        int ret = engine_->init(conn_string, local_hostname,
+                                hostname_port.first.c_str(),
+                                hostname_port.second, proto);
         if (ret) return -1;
     } else {
         // the last two params are unused
-        int ret = engine_->init(conn_string, local_hostname, "", 0);
+        int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
         if (ret) return -1;
     }
 
@@ -544,7 +555,13 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                     << ", CheckSegmentStatus not ok, ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
-                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                // Under MC_USE_TENT there is no classic metadata object
+                // (getMetadata() returns nullptr); TENT invalidates its own
+                // segment cache inside closeSegment(). Guard the classic-only
+                // cleanup so evicting a dead peer's handle cannot dereference
+                // a null metadata pointer. Refs #3995 (P0-stale-handle).
+                if (auto metadata = engine_->getMetadata())
+                    metadata->removeSegmentDesc(target_hostname);
                 handle_map_.erase(target_hostname);
             }
             return -1;
@@ -654,7 +671,13 @@ int TransferEnginePy::batchTransferSync(
                     << ", CheckSegmentStatus not ok, ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
-                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                // Under MC_USE_TENT there is no classic metadata object
+                // (getMetadata() returns nullptr); TENT invalidates its own
+                // segment cache inside closeSegment(). Guard the classic-only
+                // cleanup so evicting a dead peer's handle cannot dereference
+                // a null metadata pointer. Refs #3995 (P0-stale-handle).
+                if (auto metadata = engine_->getMetadata())
+                    metadata->removeSegmentDesc(target_hostname);
                 handle_map_.erase(target_hostname);
             }
             return -1;
@@ -1130,13 +1153,16 @@ int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string& segment_name) {
+    pybind11::gil_scoped_release release;
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
-    auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
-    if (!segment_desc || segment_desc->buffers.empty()) {
+    if (segment_id ==
+        static_cast<Transport::SegmentHandle>(ERR_INVALID_ARGUMENT))
         return 0;
-    }
-    return segment_desc->buffers[0].addr;
+    std::vector<SegmentBufferInfo> buffers;
+    if (engine_->getSegmentBuffers(segment_id, buffers) != 0 || buffers.empty())
+        return 0;
+    return buffers.front().addr;
 }
 
 std::string TransferEnginePy::getLocalTopology(const char* device_name) {
@@ -1147,13 +1173,12 @@ std::string TransferEnginePy::getLocalTopology(const char* device_name) {
         getenv("MC_USE_TENT") != nullptr || getenv("MC_USE_TEV1") != nullptr;
 #ifdef USE_TENT
     if (use_tent) {
-        // The classic shim (TransferEngine(true, filter)) silently drops the
-        // filter on the TENT path and builds its own Config in init(), so
-        // inject the whitelist via the per-instance Config that TENT's public
-        // constructor already accepts. Avoids touching the process-global
-        // MC_TE_FILTERS env var (racey under concurrent callers, leaked on
-        // throw). Note: if MC_TE_FILTERS is also set in env, loadFromEnv()
-        // inside TransferEngineImpl will override this — env takes priority.
+        // This helper only needs topology, so use the native TENT Config path
+        // directly instead of constructing the classic compatibility shim.
+        // Keep the filter per-instance and avoid the process-global
+        // MC_TE_FILTERS environment variable, which is unsafe for concurrent
+        // callers. Explicit Config values take precedence over environment
+        // defaults inside TransferEngineImpl.
         auto conf = std::make_shared<mooncake::tent::Config>();
         conf->set("metadata_type", "p2p");
         if (!device_name_safe.empty()) {
@@ -1198,6 +1223,15 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
     if (!engine_) return -1;
     pybind11::gil_scoped_release release;
+
+    if (engine_->isUsingTent()) {
+        auto handle = engine_->openSegment(peer_server_name);
+        if (handle == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
+            return -1;
+        auto liveness = engine_->probePeerAliveByID(handle);
+        return static_cast<int>(liveness);
+    }
+
     return engine_->getMetadata()->sendProbe(peer_server_name);
 }
 

@@ -95,6 +95,22 @@ fn has_library(search_dirs: &[PathBuf], candidates: &[&str]) -> bool {
     })
 }
 
+fn oss_adapter_enabled(build_dir: &std::path::Path) -> Option<bool> {
+    let cache_path = build_dir.join("CMakeCache.txt");
+    println!("cargo:rerun-if-changed={}", cache_path.display());
+    fs::read_to_string(cache_path)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("MOONCAKE_OSS_ADAPTER_ENABLED:INTERNAL=")
+                .and_then(|value| match value {
+                    "TRUE" => Some(true),
+                    "FALSE" => Some(false),
+                    _ => None,
+                })
+        })
+}
+
 fn emit_link_searches(search_dirs: &[PathBuf]) {
     for dir in search_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
@@ -237,7 +253,14 @@ fn main() {
             .display()
     );
 
+    // LocalSsdManager is built as a separate static library.
+    println!(
+        "cargo:rustc-link-search=native={}",
+        lib_path.join("local_ssd").display()
+    );
+
     println!("cargo:rustc-link-lib=mooncake_store");
+    println!("cargo:rustc-link-lib=mooncake_local_ssd");
 
     // Dependencies of mooncake_store that must be satisfied at link time.
     // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
@@ -274,6 +297,7 @@ fn main() {
         push_cmake_cache_library_dirs(&mut search_dirs, &build_dir);
         for dir in [
             build_dir.join("mooncake-store/src"),
+            build_dir.join("mooncake-store/src/local_ssd"),
             build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
             build_dir.join("mooncake-transfer-engine/src"),
             build_dir.join("mooncake-transfer-engine/src/common/base"),
@@ -288,6 +312,7 @@ fn main() {
     push_cmake_cache_library_dirs(&mut search_dirs, &default_build_dir);
     for dir in [
         default_build_dir.join("mooncake-store/src"),
+        default_build_dir.join("mooncake-store/src/local_ssd"),
         default_build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
         default_build_dir.join("mooncake-transfer-engine/src"),
         default_build_dir.join("mooncake-transfer-engine/src/common/base"),
@@ -348,6 +373,7 @@ fn main() {
 
     for library in [
         "mooncake_store",
+        "mooncake_local_ssd",
         "cachelib_memory_allocator",
         "transfer_engine",
         "base",
@@ -380,6 +406,17 @@ fn main() {
         if has_library(&search_dirs, candidates) {
             println!("cargo:rustc-link-lib={link_name}");
         }
+    }
+
+    // Static C++ dependencies do not propagate from CMake into Cargo. Honor
+    // CMake's actual OSS state; installed libraries without a build cache use
+    // the same library-discovery fallback as the other optional dependencies.
+    let oss_build_dir = env::var_os("MOONCAKE_BUILD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(build_dir);
+    if oss_adapter_enabled(&oss_build_dir).unwrap_or_else(|| has_library(&search_dirs, &["crypto"]))
+    {
+        println!("cargo:rustc-link-lib=crypto");
     }
 
     if has_gcov_runtime || has_library(&search_dirs, &["gcov"]) {

@@ -1,6 +1,6 @@
 // SSD prefetcher: best-effort SSD -> DRAM promotion triggered out-of-band by
 // exist probes (ExistOptions.prefetch_to_memory). See
-// docs/source/design/ssd-prefetch.md.
+// docs/source/design/store/ssd-prefetch.md.
 //
 // Lifetime: RealClient owns the SsdPrefetcher and outlives the components it
 // points at, but those components are shared_ptrs assigned during setup; to

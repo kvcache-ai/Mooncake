@@ -14,8 +14,10 @@
 #include <ylt/metric/counter.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
+#include "allocator_metric.h"
 #include "environ.h"
 #include "hybrid_metric.h"
+#include "master_heartbeat_metric.h"
 #include "common/byte_size.h"
 
 namespace mooncake {
@@ -893,12 +895,14 @@ struct ClientMetric {
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
     DfsMetric dfs_metric;
+    AllocatorMetric allocator_metric;
     // Prometheus "info" pattern: the value carries no meaning and is always 1,
     // the version strings ride along as static labels next to any caller
     // supplied labels so a scrape can attribute samples to a concrete build.
     // Shares the `mooncake_build_info` name with the master-side metric; the
     // two are told apart by the scrape target's job/instance labels.
     ylt::metric::gauge_t build_info;
+    MasterHeartbeatMetric master_heartbeat_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables

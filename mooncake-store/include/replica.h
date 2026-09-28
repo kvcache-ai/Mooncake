@@ -196,7 +196,7 @@ enum class ReplicaWriteMode {
  *
  * prefetch_to_memory requires the client to be configured with
  * enable_ssd_prefetch (and SSD offload for local promotion); otherwise it is
- * silently ignored. See docs/source/design/ssd-prefetch.md.
+ * silently ignored. See docs/source/design/store/ssd-prefetch.md.
  */
 struct ExistOptions {
     bool prefetch_to_memory = false;

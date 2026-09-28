@@ -35,6 +35,4 @@ int getFreeTcpPort();
 
 std::vector<int> getFreeTcpPorts(int count);
 
-std::string ResolveMooncakeHostId(const std::string& local_hostname);
-
 }  // namespace mooncake

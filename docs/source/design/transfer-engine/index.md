@@ -509,12 +509,13 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MUSA_COPY_API` (`musa` transport only) Select `auto` (default), `transfer_batch`, or `default`. On MUSA SDK 5.2 or newer, `auto` uses `muMemoryTransferBatchAsync` when every copy in a batch meets `MC_MUSA_TRANSFER_BATCH_MIN_BYTES`; `default` uses per-slice CUDA-compatible copies.
 - `MC_MUSA_TRANSFER_BATCH_MIN_BYTES` (`musa` transport only) Minimum copy size selected by `MC_MUSA_COPY_API=auto`. The default is 1048576 (1 MiB).
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed. Takes precedence over `MC_FORCE_SHM`.
-- `MC_FORCE_SHM` Opt in to POSIX SHM for same-host DRAM copies of buffers allocated with `allocateSharedMemory`. Default off. With `-DENABLE_MULTI_PROTOCOL=ON`, SHM is installed alongside RDMA/TCP (`rdma,shm` / `tcp,shm`). Without multi-protocol, SHM is the only transport (skip RDMA/TCP auto-install), like `MC_FORCE_TCP`. `MC_FORCE_TCP` is handled first in `init` and returns before SHM install. Alternative: `installTransport("shm")`, which logs a WARNING if it overwrites a non-empty rdma/tcp protocol. Objects are created `0600` (same UID). A peer `free`+`allocate` that reuses the same virtual address is remapped after the POSIX name disappears; a new address still needs a fresh `BufferDesc` (see `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`).
+- `MC_FORCE_SHM` Opt in to POSIX SHM (or hugetlbfs-backed SHM via `allocateSharedMemory(..., SharedMemoryOptions)`) for same-host DRAM copies of buffers allocated with `allocateSharedMemory`. Default off. With `-DENABLE_MULTI_PROTOCOL=ON`, SHM is installed alongside RDMA/TCP (`rdma,shm` / `tcp,shm`). Without multi-protocol, SHM is the only transport (skip RDMA/TCP auto-install), like `MC_FORCE_TCP`. `MC_FORCE_TCP` is handled first in `init` and returns before SHM install. Alternative: `installTransport("shm")`, which logs a WARNING if it overwrites a non-empty rdma/tcp protocol. Objects are created `0600` (same UID). `freeSharedMemory` unlinks the object; `SIGKILL` leftovers in `/dev/shm` or on the hugetlbfs mount are not reaped (hugetlbfs files continue to reserve hugepages — do not wipe all `mooncake_*` on start). A peer `free`+`allocate` that reuses the same virtual address is remapped after the name disappears; a new address still needs a fresh `BufferDesc` (see `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`).
 - `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
 - `MC_TE_FILTERS` Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
-- `WITH_NVIDIA_PEERMEM` When set to `1`, `ON`, or `TRUE`, Mooncake uses `ibv_reg_mr()` directly for GPU memory registration (requires the `nvidia-peermem` kernel module). By default (unset or `0`), Mooncake uses the DMA-BUF path which does not require `nvidia-peermem`.
+- `WITH_NVIDIA_PEERMEM` When unset or set to `1`, `ON`, or `TRUE`, Mooncake uses `ibv_reg_mr()` directly for GPU memory registration (requires the `nvidia-peermem` kernel module). Set to `0` to use the DMA-BUF path without `nvidia-peermem`. `MC_RDMA_DATA_DIRECT=1` takes precedence for the classic RDMA transport.
+- `MC_RDMA_DATA_DIRECT` Set to `1` to enable NVIDIA Data Direct for CUDA device memory in the classic RDMA transport (default: disabled). Overrides `WITH_NVIDIA_PEERMEM`. Requires a [supported platform](https://docs.nvidia.com/multi-node-nvlink-systems/grace-blackwell-cx8-gpudirect-rdma-guide/platform_software_and_configuration.html), compatible runtime `libmlx5`, and compatible NICs selected with `MC_TE_FILTERS` or custom topology. Unsupported configurations fail without fallback.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
 - `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
 - `MC_TCP_SLICE_SIZE` The segmentation granularity (in bytes) of TCP transport for splitting large transfers into socket read/write operations. Corresponds to `MC_SLICE_SIZE` for RDMA. Default value 65536 (64KB).
@@ -531,49 +532,6 @@ For the complete C++ API reference, see [Transfer Engine C++ API](../../api-refe
 
 ../../getting_started/supported-protocols
 :::
-
-## EFA Transport (AWS)
-
-:::{toctree}
-:maxdepth: 1
-
-efa_transport
-:::
-
-## Ascend Transport Component
-
-:::{toctree}
-:maxdepth: 1
-
-ascend_direct_transport
-ascend_transport
-heterogeneous_ascend
-:::
-
-## Sunrise Link Transport Component
-
-:::{toctree}
-:maxdepth: 1
-
-kunpeng_ub_transport
-sunrise_link_transport
-:::
-
-## FlagOS FlagCX Transport Component
-
-:::{toctree}
-:maxdepth: 1
-
-flagcx_transport
-:::
-
-## MPComm Transport Component
-
-::::{toctree}
-:maxdepth: 1
-
-mpcomm_transport
-::::
 
 ## Benchmark and Tuning Guide
 

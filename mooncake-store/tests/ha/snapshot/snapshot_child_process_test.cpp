@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 #include "master_snapshot_manager.h"
 #include "master_snapshot_repository.h"
 #include "master_metric_manager.h"
@@ -144,12 +145,13 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 #endif
 
-    // Helper wrappers for private methods (friend access)
+    // Helper wrappers for private methods (test peer)
     std::string CallFormatTimestamp(
         const std::chrono::system_clock::time_point& tp) {
         // FormatTimestamp is now in MasterSnapshotManager
-        if (service_->snapshot_manager_) {
-            return service_->snapshot_manager_->FormatTimestamp(tp);
+        if (MasterServiceTestPeer::SnapshotManager(*service_)) {
+            return MasterServiceTestPeer::SnapshotManager(*service_)
+                ->FormatTimestamp(tp);
         }
         // Fallback for tests without snapshot_manager_
         auto temp_manager = CreateTempSnapshotManager();
@@ -158,9 +160,9 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     void CallHandleChildExit(pid_t pid, int status,
                              const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            service_->snapshot_manager_->HandleChildExit(pid, status,
-                                                         snapshot_id);
+        if (MasterServiceTestPeer::SnapshotManager(*service_)) {
+            MasterServiceTestPeer::SnapshotManager(*service_)->HandleChildExit(
+                pid, status, snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
             temp_manager->HandleChildExit(pid, status, snapshot_id);
@@ -168,8 +170,9 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     void CallHandleChildTimeout(pid_t pid, const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            service_->snapshot_manager_->HandleChildTimeout(pid, snapshot_id);
+        if (MasterServiceTestPeer::SnapshotManager(*service_)) {
+            MasterServiceTestPeer::SnapshotManager(*service_)
+                ->HandleChildTimeout(pid, snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
             temp_manager->HandleChildTimeout(pid, snapshot_id);
@@ -178,9 +181,9 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     void CallCleanupOldSnapshot(int keep_count,
                                 const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            service_->snapshot_manager_->repository_->CleanupOldSnapshots(
-                keep_count, snapshot_id);
+        if (MasterServiceTestPeer::SnapshotManager(*service_)) {
+            MasterServiceTestPeer::SnapshotManager(*service_)
+                ->repository_->CleanupOldSnapshots(keep_count, snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
             temp_manager->repository_->CleanupOldSnapshots(keep_count,
@@ -191,9 +194,10 @@ class SnapshotChildProcessTest : public ::testing::Test {
     tl::expected<void, SerializationError> CallUploadSnapshotPayloadFile(
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            return service_->snapshot_manager_->repository_->UploadPayloadFile(
-                data, path, local_filename, snapshot_id);
+        if (MasterServiceTestPeer::SnapshotManager(*service_)) {
+            return MasterServiceTestPeer::SnapshotManager(*service_)
+                ->repository_->UploadPayloadFile(data, path, local_filename,
+                                                 snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
             return temp_manager->repository_->UploadPayloadFile(
@@ -202,17 +206,18 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     SnapshotObjectStore* GetSnapshotObjectStore() {
-        return service_->snapshot_object_store_.get();
+        return MasterServiceTestPeer::SnapshotObjectStore(*service_).get();
     }
 
     ha::SnapshotCatalogStore* GetSnapshotCatalogStore() {
-        return service_->snapshot_catalog_store_.get();
+        return MasterServiceTestPeer::SnapshotCatalogStore(*service_).get();
     }
 
     tl::expected<void, SerializationError> CallPersistState(
         const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            return service_->snapshot_manager_->PersistState(snapshot_id);
+        if (MasterServiceTestPeer::SnapshotManager(*service_)) {
+            return MasterServiceTestPeer::SnapshotManager(*service_)
+                ->PersistState(snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
             return temp_manager->PersistState(snapshot_id);
@@ -221,8 +226,9 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     tl::expected<void, SerializationError> CallPersistState(
         const ha::SnapshotDescriptor& descriptor) {
-        if (service_->snapshot_manager_) {
-            return service_->snapshot_manager_->PersistState(descriptor);
+        if (MasterServiceTestPeer::SnapshotManager(*service_)) {
+            return MasterServiceTestPeer::SnapshotManager(*service_)
+                ->PersistState(descriptor);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
             return temp_manager->PersistState(descriptor);
@@ -231,8 +237,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
-        size_t shard_idx = svc->getShardIndex(key);
-        auto& shard = svc->metadata_shards_[shard_idx];
+        size_t shard_idx = MasterServiceTestPeer(*svc).getShardIndex(key);
+        auto& shard = MasterServiceTestPeer::MetadataShards(*svc)[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
         auto tenant_it = shard.tenants.find(TenantId::Default());
         return tenant_it != shard.tenants.end() &&
@@ -241,13 +247,14 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     size_t SoftPinRegistrationCount(MasterService* svc) {
-        return svc->soft_pin_deadline_index_.RegistrationCountForTest();
+        return MasterServiceTestPeer(*svc).SoftPinRegistrationCount();
     }
 
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService* svc, const std::string& key) {
-        const size_t shard_idx = svc->getShardIndex(TenantId::Default(), key);
-        MasterService::MetadataShardAccessorRO shard(svc, shard_idx);
+        const size_t shard_idx =
+            MasterServiceTestPeer(*svc).getShardIndex(TenantId::Default(), key);
+        MasterServiceTestPeer::MetadataShardAccessorRO shard(svc, shard_idx);
         const auto tenant_it = shard->tenants.find(TenantId::Default());
         if (tenant_it == shard->tenants.end()) {
             return std::nullopt;
@@ -260,17 +267,19 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     uint32_t GetShardIndexForTest(const std::string& key) {
-        return static_cast<uint32_t>(service_->getShardIndex(key));
+        return static_cast<uint32_t>(
+            MasterServiceTestPeer(*service_).getShardIndex(key));
     }
 
     tl::expected<void, SerializationError> DeserializeMetadataForTest(
         const std::vector<uint8_t>& data) {
-        MasterService::MetadataSerializer serializer(service_.get());
+        MasterServiceTestPeer::MetadataSerializer serializer(service_.get());
         return serializer.Deserialize(data);
     }
 
     bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
-        auto& shard = service_->metadata_shards_[shard_idx];
+        auto& shard =
+            MasterServiceTestPeer::MetadataShards(*service_)[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
         for (const auto& [tenant_id, tenant_state] : shard.tenants) {
             auto it = tenant_state.metadata.find(key);
@@ -283,10 +292,11 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     std::string FindGroupIdOnDifferentShard(MasterService* svc,
                                             const std::string& key) {
-        const size_t key_shard = svc->getShardIndex(key);
+        const size_t key_shard = MasterServiceTestPeer(*svc).getShardIndex(key);
         for (int i = 0; i < 1024; ++i) {
             std::string group_id = key + "_group_" + std::to_string(i);
-            if (svc->getShardIndex(group_id) != key_shard) {
+            if (MasterServiceTestPeer(*svc).getShardIndex(group_id) !=
+                key_shard) {
                 return group_id;
             }
         }
@@ -310,20 +320,23 @@ class SnapshotChildProcessTest : public ::testing::Test {
             !service_config_.snapshot_backup_dir.empty();
 
         return std::make_unique<MasterSnapshotManager>(
-            service_.get(), options, service_->snapshot_mutex_,
-            service_->snapshot_object_store_.get(),
-            service_->snapshot_catalog_store_.get());
+            service_.get(), options,
+            MasterServiceTestPeer::SnapshotMutex(*service_),
+            MasterServiceTestPeer::SnapshotObjectStore(*service_).get(),
+            MasterServiceTestPeer::SnapshotCatalogStore(*service_).get());
     }
 
     void EnsureSnapshotStores() {
-        if (!service_->snapshot_object_store_) {
-            service_->snapshot_object_store_ = SnapshotObjectStore::Create(
-                SnapshotObjectStoreType::LOCAL_FILE);
+        if (!MasterServiceTestPeer::SnapshotObjectStore(*service_)) {
+            MasterServiceTestPeer::SnapshotObjectStore(*service_) =
+                SnapshotObjectStore::Create(
+                    SnapshotObjectStoreType::LOCAL_FILE);
         }
-        if (!service_->snapshot_catalog_store_ &&
-            service_->snapshot_object_store_) {
-            service_->snapshot_catalog_store_ =
-                service_->CreateSnapshotCatalogStore(service_config_);
+        if (!MasterServiceTestPeer::SnapshotCatalogStore(*service_) &&
+            MasterServiceTestPeer::SnapshotObjectStore(*service_)) {
+            MasterServiceTestPeer::SnapshotCatalogStore(*service_) =
+                MasterServiceTestPeer(*service_).CreateSnapshotCatalogStore(
+                    service_config_);
         }
     }
 
@@ -858,7 +871,9 @@ TEST_F(SnapshotChildProcessTest,
 
     const std::string snapshot_id = "20240601_120000_789";
     CreateBatchEtcdHASnapshotService(cluster_id, etcd_endpoints, kViewVersion);
-    ASSERT_EQ(ErrorCode::OK, service_->SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(ErrorCode::OK,
+              MasterServiceTestPeer(*service_).SetBatchOpLogBackendForTesting(
+                  backend));
     auto persist_result = CallPersistState(snapshot_id);
     ASSERT_TRUE(persist_result.has_value())
         << "PersistState failed: " << persist_result.error().message;

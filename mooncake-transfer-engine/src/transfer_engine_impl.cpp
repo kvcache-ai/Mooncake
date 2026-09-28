@@ -417,7 +417,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
-        } else if (kGpuP2PCompiled && (force_gpu_p2p || no_hca)) {
+        } else if (kGpuP2PCompiled &&
+                   (force_gpu_p2p || (no_hca && !force_hca))) {
+            // MC_FORCE_HCA suppresses automatic no-HCA fallback, but keeps
+            // explicitly requested GPU P2P transport precedence unchanged.
             Transport* t =
                 multi_transports_->installTransport(gpu_p2p_protocol, nullptr);
             if (!t) {
@@ -564,6 +567,11 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
 }
 
 void* TransferEngineImpl::allocateSharedMemory(size_t length) {
+    return allocateSharedMemory(length, SharedMemoryOptions{});
+}
+
+void* TransferEngineImpl::allocateSharedMemory(size_t length,
+                                               const SharedMemoryOptions& opt) {
     auto* shm =
         dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
     if (!shm) {
@@ -571,7 +579,7 @@ void* TransferEngineImpl::allocateSharedMemory(size_t length) {
                       "(set MC_FORCE_SHM=1 or installTransport(\"shm\"))";
         return nullptr;
     }
-    return shm->allocateSharedMemory(length);
+    return shm->allocateSharedMemory(length, opt);
 }
 
 int TransferEngineImpl::freeSharedMemory(void* addr) {

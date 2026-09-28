@@ -1216,6 +1216,43 @@ TEST_F(MasterMetricsTest, BuildInfoMetricIsSerialized) {
         << "build info value should be 1, got:" << value_part;
 }
 
+// Verify the five SSD offload lifecycle counters increment per client_id
+// label. MasterMetricManager is a process-wide singleton without reset APIs,
+// so the test uses unique client_id labels whose values are determined solely
+// by this test, independent of cumulative singleton state from other tests.
+TEST_F(MasterMetricsTest, OffloadCountersIncrementByClient) {
+    auto& mm = MasterMetricManager::instance();
+    const std::string cid_a = "offload-metric-test-a";
+    const std::string cid_b = "offload-metric-test-b";
+
+    mm.inc_offload_enqueued(cid_a, 10);
+    mm.inc_offload_enqueued(cid_b, 5);
+    mm.inc_offload_completed(cid_a, 7);
+    mm.inc_offload_failed(cid_a, 2);
+    mm.inc_offload_cancelled(cid_a, 1);
+    mm.inc_offload_enqueue_rejected(cid_b, 3);
+
+    const std::string out = mm.serialize_metrics();
+    EXPECT_NE(out.find("master_offload_enqueued_total{client_id=\"offload-"
+                       "metric-test-a\"} 10"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_enqueued_total{client_id=\"offload-"
+                       "metric-test-b\"} 5"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_completed_total{client_id=\"offload-"
+                       "metric-test-a\"} 7"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_failed_total{client_id=\"offload-metric-"
+                       "test-a\"} 2"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_cancelled_total{client_id=\"offload-"
+                       "metric-test-a\"} 1"),
+              std::string::npos);
+    EXPECT_NE(out.find("master_offload_enqueue_rejected_total{client_id="
+                       "\"offload-metric-test-b\"} 3"),
+              std::string::npos);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

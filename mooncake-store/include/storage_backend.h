@@ -234,7 +234,8 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
-    // DFS page-offset mode. Enabled automatically for kDistributed.
+    // DFS page-offset mode. Enabled for filesystem-mode distributed storage;
+    // object storage uses the regular offload control plane.
     bool enable_dfs = false;
     // Proactively evict local disk objects from the heartbeat thread once
     // backend usage crosses the high watermark.
@@ -984,10 +985,16 @@ class BucketStorageBackend : public StorageBackendInterface {
     // FinalizeEviction removes persisted metadata, waits for in-flight reads,
     // and then deletes the data files.
     struct PendingEviction {
-        std::vector<std::string> keys;  // All keys in evicted buckets
+        std::vector<std::string> keys;  // Keys the eviction removed from the
+                                        // index (matched set; skipped
+                                        // duplicates are never re-pointed)
         std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
             buckets;  // (bucket_id, metadata) for file deletion
         std::vector<std::string> write_keys;
+        // Duplicates bypassed instead of failing the batch: already
+        // persisted, or being persisted by a concurrent offload. The
+        // commit phase must skip these (idempotent Put semantics).
+        std::vector<std::string> skipped_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
     };

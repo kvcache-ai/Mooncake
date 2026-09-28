@@ -429,6 +429,7 @@ class TransferEngineImpl {
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
 
     void* allocateSharedMemory(size_t length);
+    void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
 
     int freeSharedMemory(void* addr);
 

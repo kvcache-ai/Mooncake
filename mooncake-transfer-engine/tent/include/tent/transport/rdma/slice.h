@@ -153,6 +153,14 @@ struct RdmaSlice {
     const std::string* target_machine_id = nullptr;
 
     std::weak_ptr<RdmaEndPoint> ep_weak_ptr;
+    // Posted work requests whose completion has not been polled and fully
+    // handled yet; every work request is signalled, so each accepted post
+    // owes one. The status cannot stand in for this -- a timeout or a
+    // teardown resolves a slice while its work request is live. Above zero,
+    // the completion queue can still hand this address back, or a handler
+    // can still be reading the slice, so the storage must outlive the
+    // batch: see RdmaTransport::freeSubBatch() and Workers::handleCompletion().
+    std::atomic<int> completions_owed{0};
     TransferStatusEnum word = TransferStatusEnum::INITIAL;
     int qp_index = 0;
     // Worker lane that enqueued this slice: the one whose inflight_slice_set

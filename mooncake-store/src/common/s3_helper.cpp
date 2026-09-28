@@ -31,13 +31,18 @@
 #include <aws/s3/model/UploadPartRequest.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include "crc32c.h"
-#include "environ.h"
 #include "fmt/format.h"
 #include "common/base64.h"
+#include "config/s3_client_config.h"
 
 namespace mooncake {
 
 namespace {
+
+const S3ClientConfig &GetS3ClientConfig() {
+    static const S3ClientConfig config = S3ClientConfig::FromEnvironment();
+    return config;
+}
 
 // Parse a checksum-mode string ("when_supported" | "when_required") into the
 // AWS SDK enum. Returns std::nullopt when the value is unset or invalid — the
@@ -76,10 +81,8 @@ void S3Helper::InitAPI() {
     Aws::InitAPI(options_);
     aws_initialized = true;
 
-    // Force Environ initialization so all MOONCAKE_AWS_* env vars are read
-    // once during startup, matching the previous "read once at InitAPI"
-    // behavior.
-    (void)Environ::Get();
+    // Cache all MOONCAKE_AWS_* settings once during startup.
+    (void)GetS3ClientConfig();
 }
 
 void S3Helper::ShutdownAPI() {
@@ -91,43 +94,43 @@ void S3Helper::ShutdownAPI() {
 
 S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
                    const std::string &region) {
-    const auto &env = Environ::Get();
+    const auto &env = GetS3ClientConfig();
     Aws::Client::ClientConfiguration config(true);
 
-    config.connectTimeoutMs = env.GetAwsConnectTimeoutMs();
-    config.requestTimeoutMs = env.GetAwsRequestTimeoutMs();
-    config.scheme = env.GetAwsUseHttps() ? Aws::Http::Scheme::HTTPS
-                                         : Aws::Http::Scheme::HTTP;
+    config.connectTimeoutMs = static_cast<long>(env.connect_timeout.count());
+    config.requestTimeoutMs = static_cast<long>(env.request_timeout.count());
+    config.scheme =
+        env.use_https ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
     if (auto request_checksum =
             ParseChecksumMode<Aws::Client::RequestChecksumCalculation>(
-                env.GetAwsRequestChecksumCalculation())) {
+                env.request_checksum_calculation)) {
         config.checksumConfig.requestChecksumCalculation = *request_checksum;
     }
     if (auto response_checksum =
             ParseChecksumMode<Aws::Client::ResponseChecksumValidation>(
-                env.GetAwsResponseChecksumValidation())) {
+                env.response_checksum_validation)) {
         config.checksumConfig.responseChecksumValidation = *response_checksum;
     }
 
     if (!region.empty()) {
         config.region = region;
     } else {
-        config.region = env.GetAwsRegion();
+        config.region = env.region;
     }
 
     if (!endpoint.empty()) {
         config.endpointOverride = endpoint;
     } else {
-        config.endpointOverride = env.GetAwsS3Endpoint();
+        config.endpointOverride = env.s3_endpoint;
     }
 
-    bucket_ = env.GetAwsBucketName();
+    bucket_ = env.bucket_name;
     if (!bucket.empty()) {
         bucket_ = bucket;
     }
 
-    Aws::Auth::AWSCredentials credentials(env.GetAwsAccessKeyId(),
-                                          env.GetAwsSecretAccessKey());
+    Aws::Auth::AWSCredentials credentials(env.access_key_id,
+                                          env.secret_access_key);
 
     // Concatenate log information into member variable connection_info_
     connection_info_ = fmt::format(
@@ -145,14 +148,14 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
         bucket_.empty() ? "unset" : bucket_, config.connectTimeoutMs,
         config.requestTimeoutMs,
         config.scheme == Aws::Http::Scheme::HTTPS ? "HTTPS" : "HTTP",
-        !env.GetAwsAccessKeyId().empty() ? "set" : "unset",
-        !env.GetAwsSecretAccessKey().empty() ? "set" : "unset",
-        env.GetAwsUseVirtualAddressing() ? "true" : "false");
+        !env.access_key_id.empty() ? "set" : "unset",
+        !env.secret_access_key.empty() ? "set" : "unset",
+        env.use_virtual_addressing ? "true" : "false");
 
     s3_client_ = Aws::S3::S3Client(
         credentials, config,
         Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-        env.GetAwsUseVirtualAddressing());
+        env.use_virtual_addressing);
 }
 
 S3Helper::~S3Helper() = default;
@@ -236,8 +239,11 @@ tl::expected<void, std::string> S3Helper::InspectObject(
 
     const std::string encoded = outcome.GetResult().GetChecksumCRC32C();
     const std::string decoded = base64::Decode(encoded);
-    if (!encoded.empty() && decoded.size() == sizeof(uint32_t) &&
-        base64::Encode(decoded) == encoded) {
+    if (!encoded.empty()) {
+        if (decoded.size() != sizeof(uint32_t) ||
+            base64::Encode(decoded) != encoded) {
+            return tl::make_unexpected("Invalid full-object CRC32C metadata");
+        }
         crc32c = (static_cast<uint32_t>(static_cast<unsigned char>(decoded[0]))
                   << 24) |
                  (static_cast<uint32_t>(static_cast<unsigned char>(decoded[1]))

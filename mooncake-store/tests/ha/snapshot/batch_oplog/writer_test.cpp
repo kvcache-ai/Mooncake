@@ -1,3 +1,4 @@
+#include "ha_metric_manager.h"
 #include "ha/snapshot/batch_oplog/writer.h"
 
 #include <glog/logging.h>
@@ -28,6 +29,10 @@ namespace {
 
 class FakeHaKvBackend final : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = values_.find(std::string(key));
@@ -240,6 +245,7 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
         standby_ = std::make_unique<HotStandbyService>(config);
         standby_->SetCatchUpBatchKvBackendForTesting(backend_);
         EXPECT_EQ(ErrorCode::OK, standby_->Start("", "", kClusterId));
+        HAMetricManager::instance().reset_snapshot_runtime(true);
         return standby_->BeginBatchOpLogSnapshotCapture();
     }
 
@@ -285,9 +291,22 @@ TEST_F(BatchOpLogSnapshotWriterTest, WritesAndVerifiesMultipleChunks) {
                       object.metadata.hard_pinned.value_or(false));
         }
     }
+    const auto metrics = HAMetricManager::instance().get_snapshot_runtime();
+    EXPECT_EQ(2u, metrics.chunk_count);
+    EXPECT_EQ(manifest->object_chunks[0].stored_size +
+                  manifest->object_chunks[1].stored_size,
+              metrics.chunk_bytes);
+    EXPECT_EQ(metrics.chunk_bytes + manifest->segments.stored_size +
+                  manifest_json.size() + descriptor_json->size(),
+              metrics.snapshot_bytes);
     EXPECT_EQ(5u, object_store.size());
     EXPECT_EQ(2u, object_store.string_upload_attempts);
     EXPECT_GT(object_store.download_attempts, 0u);
+    standby_
+        ->Stop();  // Join the apply loop before inspecting its pause sample.
+    EXPECT_GT(
+        HAMetricManager::instance().get_snapshot_runtime().capture_pause_us,
+        0u);
 }
 
 TEST_F(BatchOpLogSnapshotWriterTest, WritesEmptyClusterWithoutObjectChunks) {

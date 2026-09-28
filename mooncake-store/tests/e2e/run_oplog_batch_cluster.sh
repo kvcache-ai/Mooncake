@@ -10,7 +10,7 @@ die() {
 }
 
 usage() {
-  echo "Usage: $0 <up|status|collect|restart|down|smoke|restart-smoke|failpoint-smoke|failpoint-crash-smoke|remove-boundary-smoke|standby-read-smoke|promotion-catchup-smoke|ha-failover-smoke|allocator-recovery-smoke|allocator-recovery-matrix|non-ha-smoke> [options]" >&2
+  echo "Usage: $0 <up|status|collect|restart|down|smoke|restart-smoke|failpoint-smoke|failpoint-crash-smoke|remove-boundary-smoke|standby-read-smoke|promotion-catchup-smoke|ha-failover-smoke|allocator-recovery-smoke|allocator-recovery-matrix|non-ha-smoke|capacity-soak|capacity-nospace> [options]" >&2
 }
 
 parse_up_options() {
@@ -41,6 +41,8 @@ parse_up_options() {
   RECOVERY_REFILL_OBJECTS=120
   RECOVERY_PRESSURE_SEC=10
   RECOVERY_SEGMENT_BYTES=268435456
+  CAPACITY_SECONDS=3600
+  CAPACITY_MAX_BATCHES=2048
   ETCD_ENDPOINTS=""
   ETCD_BIN=${ETCD_BIN:-etcd}
   while (($#)); do
@@ -173,6 +175,16 @@ parse_up_options() {
         FAILPOINT_TIMEOUT_SEC=$2
         shift 2
         ;;
+      --capacity-seconds)
+        (($# >= 2)) || die "--capacity-seconds requires a value"
+        CAPACITY_SECONDS=$2
+        shift 2
+        ;;
+      --capacity-max-batches)
+        (($# >= 2)) || die "--capacity-max-batches requires a value"
+        CAPACITY_MAX_BATCHES=$2
+        shift 2
+        ;;
       --etcd-endpoints)
         (($# >= 2)) || die "--etcd-endpoints requires a value"
         ETCD_ENDPOINTS=$2
@@ -187,6 +199,8 @@ parse_up_options() {
     esac
   done
   [[ -d "$BUILD_DIR" ]] || die "build directory does not exist: $BUILD_DIR"
+  [[ "$CAPACITY_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "capacity-seconds must be positive"
+  [[ "$CAPACITY_MAX_BATCHES" =~ ^[1-9][0-9]*$ ]] || die "capacity-max-batches must be positive"
   [[ "$MASTER_COUNT" =~ ^[1-9][0-9]*$ ]] || die "masters must be positive"
   [[ "$CLIENT_COUNT" =~ ^[0-9]+$ ]] || die "clients must be non-negative"
   [[ "$BATCH_ENTRIES" =~ ^[1-9][0-9]*$ ]] ||
@@ -1885,7 +1899,7 @@ main() {
   local command=$1
   shift
   case "$command" in
-    up | smoke | restart-smoke | failpoint-smoke | failpoint-crash-smoke | remove-boundary-smoke | standby-read-smoke | promotion-catchup-smoke | ha-failover-smoke | allocator-recovery-smoke | allocator-recovery-matrix | non-ha-smoke)
+    up | smoke | restart-smoke | failpoint-smoke | failpoint-crash-smoke | remove-boundary-smoke | standby-read-smoke | promotion-catchup-smoke | ha-failover-smoke | allocator-recovery-smoke | allocator-recovery-matrix | non-ha-smoke | capacity-soak | capacity-nospace)
       parse_up_options "$@"
       if [[ "$command" == allocator-recovery-smoke ||
             "$command" == allocator-recovery-matrix ]] &&
@@ -1899,7 +1913,10 @@ main() {
       if [[ "$USE_ETCD_OBSERVER" != true && "$ENABLE_HA" == true ]]; then
         die "--no-etcd-observer is only supported by non-ha-smoke"
       fi
-      if [[ "$command" == up ]]; then
+      if [[ "$command" == capacity-soak || "$command" == capacity-nospace ]]; then
+        source "$SCRIPT_DIR/../ha/snapshot/batch_oplog/capacity.sh"
+        capacity_cluster "$command"
+      elif [[ "$command" == up ]]; then
         up_cluster
       elif [[ "$command" == smoke ]]; then
         smoke_cluster

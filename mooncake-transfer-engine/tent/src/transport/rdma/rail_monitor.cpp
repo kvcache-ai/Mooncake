@@ -99,9 +99,8 @@ bool RailMonitor::available(int local_nic, int remote_nic) {
     if (it == rail_states_.end()) return false;
     auto& st = it->second;
     if (!st.paused()) return true;
-    if (std::chrono::steady_clock::now() < st.resume_time) return false;
-    // Cooldown expired: clear all exponential-backoff memory so a fresh
-    // failure cycle starts from the initial cooldown_, not a doubled value.
+    auto now = std::chrono::steady_clock::now();
+    if (now < st.resume_time) return false;
     st.resume_time = {};
     st.error_count = 0;
     st.cooldown = std::chrono::seconds(0);
@@ -122,15 +121,45 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
         st.error_count++;
     }
     st.last_error = now;
-    if (st.cooldown.count() == 0) {
-        st.cooldown = cooldown_;
-    } else {
-        st.cooldown *= 2;
-        if (st.cooldown > kMaxCooldown) st.cooldown = kMaxCooldown;
-    }
+
+    const bool was_paused = st.paused();
+
     if (st.error_count >= error_threshold_) {
-        st.resume_time = now + st.cooldown;
-        updateBestMapping();
+        if (!was_paused) {
+            // Escalate the cooldown only when a *fresh* pause arms (the rail
+            // was healthy at this instant), never within an ongoing burst.
+            // Previously cooldown was doubled on every markFailed call, so a
+            // single outage -- N error WQEs landing in one 10s window -- pushed
+            // a 30s pause straight to the 300s cap before the outage even
+            // cleared, forcing a ~5min TCP fallback after the peer had already
+            // recovered. Now the cooldown is set once per pause cycle; errors
+            // arriving while already paused do not multiply it.
+            //
+            // cooldown == 0: the previous cycle ended with a proven-healthy
+            //   recovery (markRecovered reset it), so start from the initial
+            //   value. cooldown != 0: left by a cooldown-expiry recovery (time
+            //   elapsed, health not proven); escalate to back off harder.
+            if (st.cooldown.count() == 0) {
+                st.cooldown = cooldown_;
+            } else {
+                st.cooldown *= 2;
+                if (st.cooldown > kMaxCooldown) st.cooldown = kMaxCooldown;
+            }
+            LOG(INFO) << "Rail paused: local_nic=" << local_nic
+                      << " remote_nic=" << remote_nic
+                      << " (errors=" << st.error_count << " in "
+                      << error_window_.count()
+                      << "s, cooldown=" << st.cooldown.count() << "s)";
+            st.resume_time = now + st.cooldown;
+            updateBestMapping();
+        }
+        // Already paused: leave resume_time and cooldown untouched. Re-arming
+        // or escalating here would let a sustained outage extend the pause
+        // indefinitely -- the original defect. The pause runs its course and
+        // available() reopens on cooldown expiry.
+        // Open-phase probing and Half-Open (admit one trial on expiry, escalate
+        // on trial failure) are follow-ups: they need available() split into a
+        // non-mutating predicate plus an admit() with in-flight tracking.
     }
 }
 

@@ -839,11 +839,11 @@ class RdmaEndPointTestPeer {
         endpoint.qp_list_.clear();
     }
 
-    static int doSetupConnection(RdmaEndPoint &endpoint, int qp_index,
-                                 const ibv_gid &peer_gid, uint16_t peer_lid,
+    static int doSetupConnection(RdmaEndPoint& endpoint, int qp_index,
+                                 const ibv_gid& peer_gid, uint32_t peer_lid,
                                  uint32_t peer_qp_num, int local_gid_index,
-                                 std::string *reply_msg,
-                                 int &out_stage, int &out_sys_errno) {
+                                 std::string* reply_msg, int& out_stage,
+                                 int& out_sys_errno) {
         RdmaEndPoint::SetupConnectionFailureInfo failure_info = {};
         int rc = endpoint.doSetupConnection(qp_index, peer_gid, peer_lid,
                                             peer_qp_num, local_gid_index,

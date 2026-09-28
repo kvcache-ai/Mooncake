@@ -717,14 +717,18 @@ void Workers::asyncPostSend() {
             }
             auto status = generatePostPath(slice);
             if (!status.ok()) {
-                LOG(ERROR) << "Failed to generate post path for slice " << slice
-                           << ": " << status.ToString();
+                VLOG(1) << "Failed to generate post path for slice " << slice
+                        << ": " << status.ToString();
+                LOG_EVERY_N(ERROR, 10000)
+                    << "Failed to generate post path for slice " << slice
+                    << ": " << status.ToString();
                 releaseSliceQuota(slice, getCurrentTimeInNano());
+                // Count first: resolving the slice lets the batch be freed.
+                discountFromOwner(worker, slice);
                 updateSliceStatus(slice, slice->task->cancel_requested.load(
                                              std::memory_order_acquire)
                                              ? CANCELED
                                              : FAILED);
-                discountFromOwner(worker, slice);
             } else if (dropUnpostableSlice(worker, slice)) {
                 slice = slice->next;
                 continue;
@@ -760,11 +764,13 @@ void Workers::asyncPostSend() {
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
+                    VLOG(1)
+                        << "Slice " << slice << " failed: retry count exceeded";
+                    LOG_EVERY_N(WARNING, 100)
                         << "Slice " << slice << " failed: retry count exceeded";
                     disableEndpoint(slice);
-                    updateSliceStatus(slice, FAILED);
                     discountFromOwner(worker, slice);
+                    updateSliceStatus(slice, FAILED);
                 } else {
                     // The re-submit moves the count to the lane it lands on.
                     submitFromTick(worker, slice);
@@ -802,8 +808,8 @@ void Workers::asyncPostSend() {
             worker.inflight_slice_set.erase(slice);
             releaseSliceQuota(slice, post_ts);
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
-                updateSliceStatus(slice, CANCELED);
                 discountFromOwner(worker, slice);
+                updateSliceStatus(slice, CANCELED);
                 continue;
             }
             slice->retry_count++;
@@ -812,8 +818,8 @@ void Workers::asyncPostSend() {
                 LOG(WARNING)
                     << "Slice " << slice << " failed: retry count exceeded";
                 disableEndpoint(slice);
-                updateSliceStatus(slice, FAILED);
                 discountFromOwner(worker, slice);
+                updateSliceStatus(slice, FAILED);
             } else {
                 submitFromTick(worker, slice);
             }
@@ -950,6 +956,19 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                                const ibv_wc& wc, uint64_t poll_ts,
                                bool last_in_pass) {
     auto slice = (RdmaSlice*)wc.wr_id;
+    // The completion this post owed, paid back only once this handler is
+    // done with the slice. Paying it on entry is not enough: acknowledge()
+    // further down publishes the terminal status the caller is waiting for,
+    // so the batch can be freed, and the slice with it, while the lines
+    // after it still read the slice. Above zero, freeSubBatch() hands the
+    // slice to the orphan list instead of the slab and the reaper leaves it
+    // there.
+    struct CompletionPaid {
+        RdmaSlice* slice;
+        ~CompletionPaid() {
+            slice->completions_owed.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    } completion_paid{slice};
     // What the acknowledge callbacks below need, behind one reference so
     // the std::function stays in its small-buffer storage (no allocation
     // per completion).
@@ -1211,7 +1230,10 @@ int Workers::handleContextEvents(int dev_id,
 
 void Workers::applyContextEvent(int dev_id, RdmaContext& context,
                                 const ibv_async_event& event) {
-    switch (event.event_type) {
+    // Switched as an int, not as the enum: kIbvEventDeviceSpeedChange is not
+    // an enumerator on older headers, and the default below already covers
+    // every event this does not act on.
+    switch (static_cast<int>(event.event_type)) {
         case IBV_EVENT_QP_FATAL:
         case IBV_EVENT_WQ_FATAL: {
             auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
@@ -1268,15 +1290,14 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
             }
             break;
         }
-#ifdef HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE
-        case IBV_EVENT_DEVICE_SPEED_CHANGE:
-            // rdma-core >= 62: a port speed changed without a link flap
-            // (e.g. a VF over LAG losing a PF). Device-level, so the event
-            // names no port; each context opens exactly one, so re-query
-            // that one.
+        case kIbvEventDeviceSpeedChange:
+            // A port speed changed without a link flap (e.g. a VF over LAG
+            // losing a PF). Device-level, so the event names no port; each
+            // context opens exactly one, so re-query that one. See
+            // kIbvEventDeviceSpeedChange for why this is not behind an
+            // #ifdef on the header's enumerator.
             refreshLinkSpeed(dev_id, context);
             break;
-#endif
         default:
             break;
     }
@@ -1392,6 +1413,8 @@ void Workers::monitorThread() {
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
             reclaimEndpoints();
+            // An endpoint destroyed above settles its orphans right here.
+            transport_->reapOrphanSlices(/*on_tick=*/true);
             // Safety net for a recovery event that never reached us.
             resumePausedContexts();
             last_reclaim_time = current_time;
@@ -1562,9 +1585,13 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     if (gdr_excluded ||
         !rail.available(slice->source_dev_id, slice->target_dev_id)) {
-        LOG(INFO) << "Optimal device pair not available: source_dev_id "
-                  << slice->source_dev_id << ", target_dev_id "
-                  << slice->target_dev_id;
+        VLOG(1) << "Optimal device pair not available: source_dev_id "
+                << slice->source_dev_id << ", target_dev_id "
+                << slice->target_dev_id;
+        LOG_EVERY_N(WARNING, 10000)
+            << "Optimal device pair not available: source_dev_id "
+            << slice->source_dev_id << ", target_dev_id "
+            << slice->target_dev_id;
         return selectFallbackDevice(source, target, slice);
     }
 
@@ -1607,7 +1634,11 @@ bool Workers::gdrPairExcluded(const RouteHint& source, const RouteHint& target,
 
 Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
                                      RdmaSlice* slice) {
-    LOG_EVERY_N(INFO, 100) << "fallback device selection for slice " << slice;
+    // Mirrors selectOptimalDevice: a rare WARNING sample so a sustained
+    // fallback storm is visible without flooding; VLOG(1) for debugging.
+    VLOG(1) << "fallback device selection for slice " << slice;
+    LOG_EVERY_N(WARNING, 10000)
+        << "fallback device selection for slice " << slice;
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
 

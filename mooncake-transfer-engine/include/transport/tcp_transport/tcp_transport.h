@@ -169,6 +169,8 @@ class TcpTransport : public Transport {
     Status submitTransferTaskGroup(
         const std::vector<TransferTask *> &task_list) override;
 
+    bool supportsGroupedScatter() const override { return true; }
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 

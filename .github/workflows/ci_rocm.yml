@@ -18,6 +18,11 @@ on:
         required: false
         default: '["3.10", "3.12"]'
         type: string
+      version_override:
+        description: 'Optional wheel version override for nightly snapshots'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build-wheel-rocm:
@@ -134,6 +139,8 @@ jobs:
           -DPython3_EXECUTABLE="${PYTHON_BIN}"
 
     - name: Build project
+      env:
+        MAX_JOBS: "2"
       shell: bash
       run: |
         set -eo pipefail
@@ -142,7 +149,7 @@ jobs:
         # Retry to ride out transient Go module (proxy.golang.org) fetch errors
         # during the etcd-wrapper build; Go caches modules, so retries resume.
         n=0
-        until cmake --build . -j"$(nproc)"; do
+        until cmake --build . -j"${MAX_JOBS}"; do
           n=$((n+1))
           if [ "$n" -ge 3 ]; then echo "Build failed after $n attempts"; exit 1; fi
           echo "Build attempt $n failed; retrying in 15s..."; sleep 15
@@ -158,6 +165,17 @@ jobs:
       id: generate_tag
       shell: bash
       run: echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> "$GITHUB_OUTPUT"
+
+    - name: Apply wheel version override
+      if: ${{ inputs.version_override != '' }}
+      shell: bash
+      env:
+        VERSION_OVERRIDE: ${{ inputs.version_override }}
+      run: |
+        set -euo pipefail
+        sed -i "s/^version = .*/version = \"${VERSION_OVERRIDE}\"/" \
+          mooncake-wheel/pyproject.toml
+        grep '^version = ' mooncake-wheel/pyproject.toml
 
     - name: Build Python wheel
       shell: bash
