@@ -25,6 +25,8 @@
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "batch_read_fanout.h"
+#include "config/offload_parallel_worker_pool_config.h"
+#include "parallel_execute.h"
 #include "common.h"
 #include "config.h"
 #include "config/rpc_protocol_config.h"
@@ -809,6 +811,8 @@ RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
+    offload_parallel_pool_ = std::make_unique<ThreadPool>(static_cast<size_t>(
+        OffloadParallelWorkerPoolConfig::FromEnvironment().worker_count));
 }
 
 RealClient::~RealClient() {
@@ -3902,11 +3906,14 @@ RealClient::batch_get_buffer_internal(
 
         std::vector<tl::expected<int64_t, ErrorCode>> op_status(
             disk_ops.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-        for (auto &[endpoint, objects] : offload_objects) {
-            if (objects.empty()) continue;
-            auto read_result =
-                batch_get_into_offload_object_internal(endpoint, objects);
-            for (auto &[key, slices] : objects) {
+        for (auto &read : read_local_disk_endpoints(
+                 offload_objects, [this](const std::string &endpoint,
+                                         LocalDiskOffloadObjects &objects) {
+                     return batch_get_into_offload_object_internal(endpoint,
+                                                                   objects);
+                 })) {
+            const auto &read_result = read.status;
+            for (auto &[key, slices] : *read.objects) {
                 auto idx_it = disk_key_to_idx.find(key);
                 if (idx_it == disk_key_to_idx.end()) continue;
                 auto &op = disk_ops[idx_it->second];
@@ -6130,21 +6137,22 @@ RealClient::batch_get_into_internal(
     [[maybe_unused]] size_t offload_object_count = 0;
     [[maybe_unused]] auto start_read_store_time =
         std::chrono::steady_clock::now();
-    for (auto &offload_objects_it : offload_objects) {
-        offload_object_count += offload_objects_it.second.size();
-        auto batch_get_offload_result = local_disk_reader(
-            offload_objects_it.first, offload_objects_it.second);
+    for (auto &read :
+         read_local_disk_endpoints(offload_objects, local_disk_reader)) {
+        const auto &batch_get_offload_result = read.status;
+        offload_object_count += read.objects->size();
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
-                       << batch_get_offload_result.error();
-            for (const auto &offload_object_it : offload_objects_it.second) {
+                       << batch_get_offload_result.error()
+                       << ", endpoint=" << *read.endpoint;
+            for (const auto &offload_object_it : *read.objects) {
                 results[valid_local_disk_operations.at(offload_object_it.first)
                             .original_index] =
                     tl::make_unexpected(batch_get_offload_result.error());
             }
             continue;
         }
-        for (const auto &offload_object_it : offload_objects_it.second) {
+        for (const auto &offload_object_it : *read.objects) {
             const auto &op =
                 valid_local_disk_operations.at(offload_object_it.first);
             auto checksum_result = client_->VerifyObjectChecksum(
@@ -7507,10 +7515,14 @@ RealClient::batch_get_into_multi_buffers_internal(
                     .emplace(key, std::move(user_slices));
             }
 
-            for (auto &[endpoint, objects] : offload_objects) {
-                if (objects.empty()) continue;
-                auto read_result =
-                    batch_get_into_offload_object_internal(endpoint, objects);
+            for (auto &read : read_local_disk_endpoints(
+                     offload_objects, [this](const std::string &endpoint,
+                                             LocalDiskOffloadObjects &objects) {
+                         return batch_get_into_offload_object_internal(endpoint,
+                                                                       objects);
+                     })) {
+                const auto &read_result = read.status;
+                auto &objects = *read.objects;
                 // On success: results[original_index] was already pre-filled
                 // with total_size when valid_local_disk_ops was built; nothing
                 // to update. Only overwrite on failure.
@@ -8045,6 +8057,34 @@ bool RealClient::can_use_pinned_restore_arena(
         }
     }
     return has_data;
+}
+
+std::vector<RealClient::LocalDiskEndpointRead>
+RealClient::read_local_disk_endpoints(
+    LocalDiskOffloadObjectsByEndpoint &objects_by_endpoint,
+    const LocalDiskOffloadReader &reader) {
+    std::vector<LocalDiskEndpointRead> reads;
+    reads.reserve(objects_by_endpoint.size());
+    for (auto &[endpoint, objects] : objects_by_endpoint) {
+        if (objects.empty()) {
+            continue;
+        }
+        reads.push_back({&endpoint, &objects, {}});
+    }
+    if (reads.empty()) {
+        return reads;
+    }
+
+    const auto statuses = ParallelExecute(
+        reads,
+        [&reader](const LocalDiskEndpointRead &read) {
+            return reader(*read.endpoint, *read.objects);
+        },
+        *offload_parallel_pool_);
+    for (size_t i = 0; i < reads.size(); ++i) {
+        reads[i].status = statuses[i];
+    }
+    return reads;
 }
 
 tl::expected<void, ErrorCode>
