@@ -199,9 +199,11 @@ static uint64_t ipcPayloadOffset(const std::vector<unsigned char>& buffer) {
 // device; an in-range one is left alone, so every open that already worked
 // is unchanged.
 //
-// The layout is ROCclr's amd::MemObjMap::IpcMemHandle (LP64), which fills
-// hipIpcMemHandle_t exactly. Runtimes that predate the field keep reserved
-// (zero) bytes there, which are never out of range.
+// The layout is ROCclr's amd::MemObjMap::IpcMemHandle on LP64, which fills
+// hipIpcMemHandle_t exactly. It is private to the runtime, so the handle is
+// only touched on the releases it was checked against: owners_device_id
+// appeared in ROCm 7.1.0 and has this layout through 7.2.4. Any other runtime
+// gets the handle unchanged, as before this workaround.
 struct HipIpcMemHandleLayout {
     char ipc_handle[32];
     size_t psize;
@@ -210,16 +212,33 @@ struct HipIpcMemHandleLayout {
     int owners_device_id;
     char reserved[8];
 };
+static_assert(sizeof(void*) == 8, "the mirrored layout is the LP64 one");
 static_assert(sizeof(HipIpcMemHandleLayout) == sizeof(hipIpcMemHandle_t),
               "hipIpcMemHandle_t no longer matches ROCclr's IpcMemHandle");
+static_assert(offsetof(HipIpcMemHandleLayout, owners_device_id) == 52,
+              "owners_device_id moved in the mirrored IpcMemHandle");
+
+// Whether this runtime's IPC handles have the layout above.
+static bool ipcHandleLayoutVerified() {
+    static const bool verified = []() {
+        int version = 0;
+        if (!checkHip(hipRuntimeGetVersion(&version),
+                      "HipTransport: hipRuntimeGetVersion failed")) {
+            return false;
+        }
+        return version >= 70100000 && version < 70300000;
+    }();
+    return verified;
+}
 
 // Returns true if it changed the handle.
 static bool clampIpcHandleOwnerDevice(hipIpcMemHandle_t* handle,
                                       int device_count, int current_device) {
     HipIpcMemHandleLayout layout;
     memcpy(&layout, handle, sizeof(layout));
-    if (layout.owners_device_id >= 0 &&
-        layout.owners_device_id < device_count) {
+    if (!ipcHandleLayoutVerified() ||
+        (layout.owners_device_id >= 0 &&
+         layout.owners_device_id < device_count)) {
         return false;
     }
     layout.owners_device_id = current_device;
