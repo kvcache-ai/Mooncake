@@ -33,6 +33,7 @@
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "types.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 
@@ -324,8 +325,8 @@ class MasterServiceHATest : public ::testing::Test {
     inline static const TenantId kDefaultTenant = TenantId::Default();
 
     void SetUp() override {
-        ::setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", LegacyOpLogRootDir().c_str(),
-                 1);
+        mooncake::test::EnvironTestPeer::SetEnv(
+            "MOONCAKE_SNAPSHOT_LOCAL_PATH", LegacyOpLogRootDir().c_str(), 1);
     }
 
     void TearDown() override {
@@ -336,7 +337,8 @@ class MasterServiceHATest : public ::testing::Test {
         policy_files_.clear();
         std::error_code ec;
         std::filesystem::remove_all(LegacyOpLogRootDir(), ec);
-        ::unsetenv("MOONCAKE_SNAPSHOT_LOCAL_PATH");
+        mooncake::test::EnvironTestPeer::UnsetEnv(
+            "MOONCAKE_SNAPSHOT_LOCAL_PATH");
     }
 
     std::string LegacyOpLogRootDir() const {

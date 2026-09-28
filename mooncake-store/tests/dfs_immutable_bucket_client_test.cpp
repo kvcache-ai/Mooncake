@@ -16,6 +16,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "test_server_helpers.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 namespace {
@@ -96,9 +97,10 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         if (segment_) std::free(segment_);
         for (auto it = saved_env_.rbegin(); it != saved_env_.rend(); ++it) {
             if (it->second) {
-                ::setenv(it->first.c_str(), it->second->c_str(), 1);
+                mooncake::test::EnvironTestPeer::SetEnv(it->first.c_str(),
+                                                        it->second->c_str(), 1);
             } else {
-                ::unsetenv(it->first.c_str());
+                mooncake::test::EnvironTestPeer::UnsetEnv(it->first.c_str());
             }
         }
         std::error_code error;
@@ -115,7 +117,7 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         const char* old = ::getenv(name.c_str());
         saved_env_.emplace_back(
             name, old ? std::optional<std::string>(old) : std::nullopt);
-        ::setenv(name.c_str(), value.c_str(), 1);
+        mooncake::test::EnvironTestPeer::SetEnv(name.c_str(), value.c_str(), 1);
     }
 
     ReplicateConfig DfsConfig() const {

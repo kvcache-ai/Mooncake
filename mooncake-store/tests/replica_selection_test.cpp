@@ -16,6 +16,7 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include "environ_test_peer.h"
 
 namespace mooncake {
 namespace {
@@ -91,10 +92,13 @@ class ReplicaSelectionTest : public ::testing::Test {
         SetRemoteReplicaScorer(nullptr);
         if (original_env_.has_value()) {
             EXPECT_EQ(
-                setenv("MC_STORE_REPLICA_SCORING", original_env_->c_str(), 1),
+                mooncake::test::EnvironTestPeer::SetEnv(
+                    "MC_STORE_REPLICA_SCORING", original_env_->c_str(), 1),
                 0);
         } else {
-            EXPECT_EQ(unsetenv("MC_STORE_REPLICA_SCORING"), 0);
+            EXPECT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(
+                          "MC_STORE_REPLICA_SCORING"),
+                      0);
         }
     }
 
@@ -261,9 +265,9 @@ TEST_F(ReplicaSelectionTest, EnvironmentOptInUsesBuiltinScorer) {
 
 TEST_F(ReplicaSelectionTest, EnvironmentIsCachedButInjectedScorerRemainsLive) {
     const bool initially_enabled = RemoteReplicaScoringEnabled();
-    ASSERT_EQ(
-        setenv("MC_STORE_REPLICA_SCORING", initially_enabled ? "0" : "1", 1),
-        0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MC_STORE_REPLICA_SCORING", initially_enabled ? "0" : "1", 1),
+              0);
     EXPECT_EQ(RemoteReplicaScoringEnabled(), initially_enabled);
 
     SetRemoteReplicaScorer(BuiltinRemoteReplicaScore);

@@ -1,61 +1,50 @@
-#include "environ.h"
+#include "rpc_client_io_context.h"
 
 #include <gtest/gtest.h>
 
-#include <initializer_list>
-#include <string>
-#include <unordered_map>
-#include <utility>
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
-class MockEnvironSource : public EnvironSource {
-   public:
-    MockEnvironSource(
-        std::initializer_list<std::pair<const std::string, std::string>> values)
-        : values_(values) {}
+TEST(RpcClientIoThreadsTest, UsesComponentOverrides) {
+    const MapEnvironSource source{{"MC_RPC_CLIENT_IO_THREADS", "8"},
+                                  {"MC_STORE_RPC_CLIENT_IO_THREADS", "4"},
+                                  {"MC_TE_RPC_CLIENT_IO_THREADS", "6"}};
+    const auto config =
+        RpcClientIoThreadsConfig::FromEnvironment(Environ(source));
 
-    const char* Get(const char* name) const override {
-        const auto it = values_.find(name);
-        return it == values_.end() ? nullptr : it->second.c_str();
-    }
-
-    void Set(std::string name, std::string value) {
-        values_[std::move(name)] = std::move(value);
-    }
-
-   private:
-    std::unordered_map<std::string, std::string> values_;
-};
-
-TEST(RpcClientIoThreadsTest, UsesComponentOverridesAndFreezesValues) {
-    MockEnvironSource source{{"MC_RPC_CLIENT_IO_THREADS", "8"},
-                             {"MC_STORE_RPC_CLIENT_IO_THREADS", "4"},
-                             {"MC_TE_RPC_CLIENT_IO_THREADS", "6"}};
-    const Environ env(source);
-
-    EXPECT_EQ(env.GetRpcClientIoThreads(), 8U);
-    EXPECT_EQ(env.GetStoreRpcClientIoThreads(), 4U);
-    EXPECT_EQ(env.GetTransferEngineRpcClientIoThreads(), 6U);
-
-    source.Set("MC_RPC_CLIENT_IO_THREADS", "12");
-    source.Set("MC_STORE_RPC_CLIENT_IO_THREADS", "10");
-    source.Set("MC_TE_RPC_CLIENT_IO_THREADS", "11");
-    EXPECT_EQ(env.GetRpcClientIoThreads(), 8U);
-    EXPECT_EQ(env.GetStoreRpcClientIoThreads(), 4U);
-    EXPECT_EQ(env.GetTransferEngineRpcClientIoThreads(), 6U);
+    EXPECT_EQ(config.common, 8U);
+    EXPECT_EQ(config.store, 4U);
+    EXPECT_EQ(config.transfer_engine, 6U);
 }
 
 TEST(RpcClientIoThreadsTest, ComponentValuesUseCommonFallback) {
-    const MockEnvironSource source{{"MC_RPC_CLIENT_IO_THREADS", "8"},
-                                   {"MC_STORE_RPC_CLIENT_IO_THREADS", "0"},
-                                   {"MC_TE_RPC_CLIENT_IO_THREADS", "invalid"}};
-    const Environ env(source);
+    const MapEnvironSource source{{"MC_RPC_CLIENT_IO_THREADS", "8"},
+                                  {"MC_STORE_RPC_CLIENT_IO_THREADS", "0"},
+                                  {"MC_TE_RPC_CLIENT_IO_THREADS", "invalid"}};
+    const auto config =
+        RpcClientIoThreadsConfig::FromEnvironment(Environ(source));
 
-    EXPECT_EQ(env.GetRpcClientIoThreads(), 8U);
-    EXPECT_EQ(env.GetStoreRpcClientIoThreads(), 8U);
-    EXPECT_EQ(env.GetTransferEngineRpcClientIoThreads(), 8U);
+    EXPECT_EQ(config.common, 8U);
+    EXPECT_EQ(config.store, 8U);
+    EXPECT_EQ(config.transfer_engine, 8U);
+}
+
+TEST(RpcClientIoThreadsTest, DefaultsToBoundedHardwareConcurrency) {
+    const MapEnvironSource source;
+    const auto config =
+        RpcClientIoThreadsConfig::FromEnvironment(Environ(source));
+
+    EXPECT_GE(config.common, 1U);
+    EXPECT_LE(config.common, 16U);
+    EXPECT_EQ(config.store, config.common);
+    EXPECT_EQ(config.transfer_engine, config.common);
+}
+
+TEST(RpcClientIoThreadsTest, ProcessValuesAreResolvedOnce) {
+    const auto& first = RpcClientIoThreadsConfig::Process();
+    EXPECT_EQ(&first, &RpcClientIoThreadsConfig::Process());
 }
 
 }  // namespace

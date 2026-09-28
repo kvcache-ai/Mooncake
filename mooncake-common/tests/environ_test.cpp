@@ -13,284 +13,211 @@
 // limitations under the License.
 
 #include "environ.h"
-#include "environment_variable.h"
+#include "environ_test_peer.h"
 
 #include <gtest/gtest.h>
 
 #include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include <optional>
+#include <string>
+#include <vector>
 
-using mooncake::Environ;
+#include "environment_variable.h"
 
-class EnvironTest : public ::testing::Test {
-   protected:
-    void SetUp() override { clearTestEnvVars(); }
-    void TearDown() override { clearTestEnvVars(); }
+namespace mooncake {
+namespace {
 
-    void clearTestEnvVars() {
-        unsetenv("MC_TEST_INT");
-        unsetenv("MC_TEST_INT64");
-        unsetenv("MC_TEST_UINT32");
-        unsetenv("MC_TEST_UINT64");
-        unsetenv("MC_TEST_SIZET");
-        unsetenv("MC_TEST_DOUBLE");
-        unsetenv("MC_TEST_BOOL");
-        unsetenv("MC_TEST_STRING");
-    }
-};
+constexpr EnvironmentVariable<int> kInt{"MC_TEST_INT"};
+constexpr EnvironmentVariable<int64_t> kInt64{"MC_TEST_INT64"};
+constexpr EnvironmentVariable<uint32_t> kUInt32{"MC_TEST_UINT32"};
+constexpr EnvironmentVariable<size_t> kSizeT{"MC_TEST_SIZET"};
+constexpr EnvironmentVariable<double> kDouble{"MC_TEST_DOUBLE"};
+constexpr EnvironmentVariable<bool> kBool{"MC_TEST_BOOL"};
+constexpr EnvironmentVariable<std::string> kString{"MC_TEST_STRING"};
+constexpr EnvironmentVariable<std::vector<int>> kIntList{"MC_TEST_INT_LIST"};
+constexpr EnvironmentVariable<std::vector<std::string>> kStringList{
+    "MC_TEST_STRING_LIST"};
 
-// --- GetInt ---
+// --- Get ---
 
-TEST_F(EnvironTest, GetIntValidValue) {
+TEST(EnvironTest, GetReturnsRawValueOrNullopt) {
+    MapEnvironSource source{{"MC_TEST_STRING", " raw value "}};
+    const Environ env(source);
+
+    EXPECT_EQ(env.Get("MC_TEST_STRING"), " raw value ");
+    EXPECT_FALSE(env.Get("MC_TEST_MISSING").has_value());
+
+    source.Set("MC_TEST_STRING", "");
+    ASSERT_TRUE(env.Get("MC_TEST_STRING").has_value());
+    EXPECT_TRUE(env.Get("MC_TEST_STRING")->empty());
+
+    source.Unset("MC_TEST_STRING");
+    EXPECT_FALSE(env.Get("MC_TEST_STRING").has_value());
+}
+
+TEST(EnvironTest, ProcessReadsSnapshotUntilRefreshed) {
     setenv("MC_TEST_INT", "42", 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), 42);
+    setenv("MC_TEST_STRING", "a=b", 1);
+    mooncake::test::EnvironTestPeer::RefreshProcessEnvironment();
+    EXPECT_EQ(Environ::Process().GetTyped(kInt), 42);
+    EXPECT_EQ(Environ::Process().Get("MC_TEST_STRING"), "a=b");
+
+    setenv("MC_TEST_INT", "43", 1);
+    unsetenv("MC_TEST_STRING");
+    EXPECT_EQ(Environ::Process().GetTyped(kInt), 42);
+    EXPECT_EQ(Environ::Process().Get("MC_TEST_STRING"), "a=b");
+
+    mooncake::test::EnvironTestPeer::RefreshProcessEnvironment();
+    EXPECT_EQ(Environ::Process().GetTyped(kInt), 43);
+    EXPECT_FALSE(Environ::Process().Get("MC_TEST_STRING").has_value());
+
+    unsetenv("MC_TEST_INT");
+    mooncake::test::EnvironTestPeer::RefreshProcessEnvironment();
 }
 
-TEST_F(EnvironTest, GetIntNegativeValue) {
-    setenv("MC_TEST_INT", "-100", 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), -100);
+// --- GetTyped ---
+
+TEST(EnvironTest, GetTypedParsesValues) {
+    const MapEnvironSource source{{"MC_TEST_INT", " \t+42\r\n"},
+                                  {"MC_TEST_INT64", "123456789012"},
+                                  {"MC_TEST_SIZET", "1099511627776"},
+                                  {"MC_TEST_DOUBLE", " 0.75 "},
+                                  {"MC_TEST_BOOL", "off"},
+                                  {"MC_TEST_STRING", "hello world"}};
+    const Environ env(source);
+
+    EXPECT_EQ(env.GetTyped(kInt), 42);
+    EXPECT_EQ(env.GetTyped(kInt64), 123456789012LL);
+    EXPECT_EQ(env.GetTyped(kSizeT), 1099511627776ULL);
+    EXPECT_DOUBLE_EQ(env.GetTyped(kDouble).value(), 0.75);
+    EXPECT_EQ(env.GetTyped(kBool), false);
+    EXPECT_EQ(env.GetTyped(kString), "hello world");
 }
 
-TEST_F(EnvironTest, GetIntZero) {
-    setenv("MC_TEST_INT", "0", 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 99), 0);
+TEST(EnvironTest, GetTypedIntegerBounds) {
+    MapEnvironSource source{{"MC_TEST_INT", std::to_string(INT_MAX)}};
+    const Environ env(source);
+    EXPECT_EQ(env.GetTyped(kInt), INT_MAX);
+
+    source.Set("MC_TEST_INT", std::to_string(INT_MIN));
+    EXPECT_EQ(env.GetTyped(kInt), INT_MIN);
 }
 
-TEST_F(EnvironTest, GetIntMissing) {
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 77), 77);
-}
+TEST(EnvironTest, GetTypedReturnsNulloptForMissingOrInvalidValues) {
+    MapEnvironSource source;
+    const Environ env(source);
+    EXPECT_FALSE(env.GetTyped(kInt).has_value());
+    EXPECT_FALSE(env.GetTyped(kString).has_value());
 
-TEST_F(EnvironTest, GetIntEmpty) {
-    setenv("MC_TEST_INT", "", 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 55), 55);
-}
-
-TEST_F(EnvironTest, GetIntNonNumeric) {
-    setenv("MC_TEST_INT", "abc", 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 55), 55);
-}
-
-TEST_F(EnvironTest, GetIntTrailingGarbage) {
-    setenv("MC_TEST_INT", "123abc", 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 55), 55);
-}
-
-TEST_F(EnvironTest, GetIntOverflow) {
-    setenv("MC_TEST_INT", "99999999999999999999", 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 55), 55);
-}
-
-TEST_F(EnvironTest, GetIntMaxValue) {
-    setenv("MC_TEST_INT", std::to_string(INT_MAX).c_str(), 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), INT_MAX);
-}
-
-TEST_F(EnvironTest, GetIntMinValue) {
-    setenv("MC_TEST_INT", std::to_string(INT_MIN).c_str(), 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), INT_MIN);
-}
-
-TEST_F(EnvironTest, GetIntSupportsTrimmedLeadingPlus) {
-    setenv("MC_TEST_INT", " \t+42\r\n", 1);
-    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), 42);
-}
-
-// --- GetInt64 ---
-
-TEST_F(EnvironTest, GetInt64ValidValue) {
-    setenv("MC_TEST_INT64", "123456789012", 1);
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 0), 123456789012LL);
-}
-
-TEST_F(EnvironTest, GetInt64Missing) {
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 9999), 9999);
-}
-
-TEST_F(EnvironTest, GetInt64Empty) {
-    setenv("MC_TEST_INT64", "", 1);
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
-}
-
-TEST_F(EnvironTest, GetInt64NonNumeric) {
-    setenv("MC_TEST_INT64", "abc", 1);
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
-}
-
-TEST_F(EnvironTest, GetInt64Overflow) {
-    setenv("MC_TEST_INT64", "99999999999999999999999999", 1);
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
-}
-
-TEST_F(EnvironTest, UnsignedGettersUseRequestedDefaultForInvalidValues) {
-    setenv("MC_TEST_UINT32", "4294967296", 1);
-    setenv("MC_TEST_UINT64", "-1", 1);
-    EXPECT_EQ(Environ::GetUInt32("MC_TEST_UINT32", 17), 17U);
-    EXPECT_EQ(Environ::GetUInt64("MC_TEST_UINT64", 23), 23U);
-}
-
-// --- GetDouble ---
-
-TEST_F(EnvironTest, GetDoubleValidValue) {
-    setenv("MC_TEST_DOUBLE", " 0.75 ", 1);
-    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.75);
-}
-
-TEST_F(EnvironTest, GetDoubleMissingOrInvalidUsesRequestedDefault) {
-    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
-    setenv("MC_TEST_DOUBLE", "0.75garbage", 1);
-    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
-    setenv("MC_TEST_DOUBLE", "nan", 1);
-    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
-}
-
-TEST_F(EnvironTest, RdmaDataDirectIsOptIn) {
-    class Source : public mooncake::EnvironSource {
-       public:
-        const char* value = nullptr;
-        const char* Get(const char* name) const override {
-            return std::string(name) == "MC_RDMA_DATA_DIRECT" ? value : nullptr;
-        }
-    } source;
-
-    EXPECT_FALSE(Environ(source).GetRdmaDataDirect());
-    source.value = "1";
-    EXPECT_TRUE(Environ(source).GetRdmaDataDirect());
-    source.value = "0";
-    EXPECT_FALSE(Environ(source).GetRdmaDataDirect());
-}
-
-// --- GetSizeT ---
-
-TEST_F(EnvironTest, GetSizeTValidValue) {
-    setenv("MC_TEST_SIZET", "65536", 1);
-    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 0), 65536u);
-}
-
-TEST_F(EnvironTest, GetSizeTZero) {
-    setenv("MC_TEST_SIZET", "0", 1);
-    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 99), 0u);
-}
-
-TEST_F(EnvironTest, GetSizeTMissing) {
-    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 4096), 4096u);
-}
-
-TEST_F(EnvironTest, GetSizeTNonNumeric) {
-    setenv("MC_TEST_SIZET", "bogus", 1);
-    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 4096), 4096u);
-}
-
-TEST_F(EnvironTest, GetSizeTTrailingGarbage) {
-    setenv("MC_TEST_SIZET", "100MB", 1);
-    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 4096), 4096u);
-}
-
-TEST_F(EnvironTest, GetSizeTLargeValue) {
-    setenv("MC_TEST_SIZET", "1099511627776", 1);  // 1 TiB
-    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 0), 1099511627776ull);
-}
-
-TEST_F(EnvironTest, GetSizeTNegativeValue) {
-    setenv("MC_TEST_SIZET", "-1", 1);
-    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 4096), 4096u);
-}
-
-TEST_F(EnvironTest, GetSizeTNegativeWithLeadingSpace) {
-    setenv("MC_TEST_SIZET", " -1", 1);
-    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 4096), 4096u);
-}
-
-TEST_F(EnvironTest, GetSizeTOverflow) {
-    setenv("MC_TEST_SIZET", "99999999999999999999999999", 1);
-    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 4096), 4096u);
-}
-
-// --- GetBool ---
-
-TEST_F(EnvironTest, GetBoolTrue) {
-    for (const char* v : {"1", "true", "TRUE", "True", "on", "ON", "yes", "YES",
-                          "enable", "EnAbLe", " true "}) {
-        setenv("MC_TEST_BOOL", v, 1);
-        EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", false)) << "for: " << v;
+    for (const char* value : {"", "abc", "123abc", "99999999999999999999"}) {
+        source.Set("MC_TEST_INT", value);
+        EXPECT_FALSE(env.GetTyped(kInt).has_value()) << "for: " << value;
+    }
+    for (const char* value : {"-1", " -1", "100MB"}) {
+        source.Set("MC_TEST_SIZET", value);
+        EXPECT_FALSE(env.GetTyped(kSizeT).has_value()) << "for: " << value;
+    }
+    source.Set("MC_TEST_UINT32", "4294967296");
+    EXPECT_FALSE(env.GetTyped(kUInt32).has_value());
+    for (const char* value : {"", "0.75garbage", "nan"}) {
+        source.Set("MC_TEST_DOUBLE", value);
+        EXPECT_FALSE(env.GetTyped(kDouble).has_value()) << "for: " << value;
+    }
+    for (const char* value : {"", "whatever"}) {
+        source.Set("MC_TEST_BOOL", value);
+        EXPECT_FALSE(env.GetTyped(kBool).has_value()) << "for: " << value;
     }
 }
 
-TEST_F(EnvironTest, GetBoolFalse) {
-    for (const char* v :
+TEST(EnvironTest, GetTypedPreservesEmptyString) {
+    const MapEnvironSource source{{"MC_TEST_STRING", ""}};
+    const Environ env(source);
+
+    ASSERT_TRUE(env.GetTyped(kString).has_value());
+    EXPECT_TRUE(env.GetTyped(kString)->empty());
+}
+
+TEST(EnvironTest, GetTypedParsesBooleanSpellings) {
+    MapEnvironSource source;
+    const Environ env(source);
+    for (const char* value : {"1", "true", "TRUE", "True", "on", "ON", "yes",
+                              "YES", "enable", "EnAbLe", " true "}) {
+        source.Set("MC_TEST_BOOL", value);
+        EXPECT_EQ(env.GetTyped(kBool), true) << "for: " << value;
+    }
+    for (const char* value :
          {"0", "false", "FALSE", "off", "no", "disable", "DiSaBlE"}) {
-        setenv("MC_TEST_BOOL", v, 1);
-        EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false)) << "for: " << v;
+        source.Set("MC_TEST_BOOL", value);
+        EXPECT_EQ(env.GetTyped(kBool), false) << "for: " << value;
     }
 }
 
-TEST_F(EnvironTest, GetBoolInvalidUsesRequestedDefault) {
-    setenv("MC_TEST_BOOL", "whatever", 1);
-    EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", true));
-    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false));
+// --- GetTypedOr ---
+
+TEST(EnvironTest, GetTypedOrUsesDefaultForMissingValues) {
+    const MapEnvironSource source;
+    const Environ env(source);
+
+    EXPECT_EQ(env.GetTypedOr(kInt64, int64_t{17}), 17);
+    EXPECT_TRUE(env.GetTypedOr(kBool, true));
+    EXPECT_EQ(env.GetTypedOr(kString, std::string{"default"}), "default");
 }
 
-TEST_F(EnvironTest, GetBoolMissing) {
-    EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", true));
-    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false));
+TEST(EnvironTest, GetTypedOrReturnsParsedValue) {
+    const MapEnvironSource source{{"MC_TEST_INT", "0"}, {"MC_TEST_STRING", ""}};
+    const Environ env(source);
+
+    EXPECT_EQ(env.GetTypedOr(kInt, 99), 0);
+    EXPECT_EQ(env.GetTypedOr(kString, std::string{"default"}), "");
 }
 
-TEST_F(EnvironTest, GetBoolEmpty) {
-    setenv("MC_TEST_BOOL", "", 1);
-    EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", true));
-    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false));
-}
-
-// --- GetString ---
-
-TEST_F(EnvironTest, GetStringValidValue) {
-    setenv("MC_TEST_STRING", "hello", 1);
-    EXPECT_EQ(Environ::GetString("MC_TEST_STRING", "default"), "hello");
-}
-
-TEST_F(EnvironTest, GetStringMissing) {
-    EXPECT_EQ(Environ::GetString("MC_TEST_STRING", "default"), "default");
-}
-
-TEST_F(EnvironTest, GetStringEmpty) {
-    setenv("MC_TEST_STRING", "", 1);
-    EXPECT_EQ(Environ::GetString("MC_TEST_STRING", "default"), "");
-}
-
-TEST_F(EnvironTest, GetStringWithSpaces) {
-    setenv("MC_TEST_STRING", "hello world", 1);
-    EXPECT_EQ(Environ::GetString("MC_TEST_STRING", ""), "hello world");
-}
-
-TEST_F(EnvironTest, ReadsTypedEnvironmentVariableDefinitions) {
-    constexpr mooncake::EnvironmentVariable<int64_t> number{"MC_TEST_INT64"};
-    constexpr mooncake::EnvironmentVariable<bool> enabled{"MC_TEST_BOOL"};
-    constexpr mooncake::EnvironmentVariable<std::string> text{"MC_TEST_STRING"};
-
-    EXPECT_FALSE(Environ::Read(number).has_value());
-    EXPECT_EQ(Environ::ReadOr(number, int64_t{17}), 17);
-
-    setenv(number.name, "42", 1);
-    setenv(enabled.name, "off", 1);
-    setenv(text.name, "", 1);
-
-    EXPECT_EQ(Environ::Read(number), 42);
-    EXPECT_EQ(Environ::Read(enabled), false);
-    ASSERT_TRUE(Environ::Read(text).has_value());
-    EXPECT_TRUE(Environ::Read(text)->empty());
-}
-
-TEST_F(EnvironTest, TypedReadOrWarnsAndUsesDefaultForInvalidValues) {
-    constexpr mooncake::EnvironmentVariable<int64_t> number{"MC_TEST_INT64"};
-    setenv(number.name, "invalid", 1);
+TEST(EnvironTest, GetTypedOrWarnsAndUsesDefaultForInvalidValues) {
+    const MapEnvironSource source{{"MC_TEST_INT64", "invalid"}};
+    const Environ env(source);
 
     testing::internal::CaptureStderr();
-    EXPECT_EQ(Environ::ReadOr(number, int64_t{17}), 17);
+    EXPECT_EQ(env.GetTypedOr(kInt64, int64_t{17}), 17);
     const std::string logs = testing::internal::GetCapturedStderr();
 
     EXPECT_NE(logs.find("MC_TEST_INT64"), std::string::npos);
     EXPECT_NE(logs.find("using default 17"), std::string::npos);
 }
+
+// --- GetList ---
+
+TEST(EnvironTest, GetListSplitsAndParsesItems) {
+    const MapEnvironSource source{{"MC_TEST_INT_LIST", "1, 2 ,3"},
+                                  {"MC_TEST_STRING_LIST", "a; b ;c"}};
+    const Environ env(source);
+
+    EXPECT_EQ(env.GetList(kIntList), (std::vector<int>{1, 2, 3}));
+    EXPECT_EQ(env.GetList(kStringList, ';'),
+              (std::vector<std::string>{"a", "b", "c"}));
+}
+
+TEST(EnvironTest, GetListHandlesMissingEmptyAndInvalidValues) {
+    MapEnvironSource source;
+    const Environ env(source);
+    EXPECT_FALSE(env.GetList(kIntList).has_value());
+
+    source.Set("MC_TEST_INT_LIST", "");
+    ASSERT_TRUE(env.GetList(kIntList).has_value());
+    EXPECT_TRUE(env.GetList(kIntList)->empty());
+
+    for (const char* value : {"1,x,3", "1,,3", "1,"}) {
+        source.Set("MC_TEST_INT_LIST", value);
+        EXPECT_FALSE(env.GetList(kIntList).has_value()) << "for: " << value;
+    }
+
+    source.Set("MC_TEST_STRING_LIST", "a,,b");
+    EXPECT_EQ(env.GetList(kStringList),
+              (std::vector<std::string>{"a", "", "b"}));
+}
+
+}  // namespace
+}  // namespace mooncake
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);

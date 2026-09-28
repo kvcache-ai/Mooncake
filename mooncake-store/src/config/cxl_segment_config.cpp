@@ -6,11 +6,11 @@
 
 namespace mooncake {
 
-CxlSegmentConfig CxlSegmentConfig::FromEnvironment() {
+CxlSegmentConfig CxlSegmentConfig::FromEnvironment(const Environ& env) {
     CxlSegmentConfig config;
     using Variables = CxlSegmentEnvironmentVariables;
 
-    const auto raw_value = Environ::Read(Variables::MC_CXL_DEV_SIZE);
+    const auto raw_value = env.GetTyped(Variables::MC_CXL_DEV_SIZE);
     if (!raw_value.has_value()) {
         return config;
     }

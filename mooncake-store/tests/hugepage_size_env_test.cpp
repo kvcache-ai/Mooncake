@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include "environ_test_peer.h"
 
 namespace mooncake {
 namespace {
@@ -17,14 +18,17 @@ class ScopedEnvVar {
         if (const char* value = std::getenv(name)) {
             original_ = value;
         }
-        EXPECT_EQ(unsetenv(name), 0);
+        EXPECT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(name), 0);
     }
 
     ~ScopedEnvVar() {
         if (original_.has_value()) {
-            EXPECT_EQ(setenv(name_.c_str(), original_->c_str(), 1), 0);
+            EXPECT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                          name_.c_str(), original_->c_str(), 1),
+                      0);
         } else {
-            EXPECT_EQ(unsetenv(name_.c_str()), 0);
+            EXPECT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(name_.c_str()),
+                      0);
         }
     }
 
@@ -32,10 +36,14 @@ class ScopedEnvVar {
     ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
 
     void Set(const char* value) {
-        ASSERT_EQ(setenv(name_.c_str(), value, 1), 0);
+        ASSERT_EQ(
+            mooncake::test::EnvironTestPeer::SetEnv(name_.c_str(), value, 1),
+            0);
     }
 
-    void Unset() { ASSERT_EQ(unsetenv(name_.c_str()), 0); }
+    void Unset() {
+        ASSERT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(name_.c_str()), 0);
+    }
 
    private:
     std::string name_;

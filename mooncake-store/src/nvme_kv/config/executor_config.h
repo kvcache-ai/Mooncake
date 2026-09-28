@@ -5,6 +5,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct NvmeKvExecutorConfig {
     uint32_t transfer_alignment_bytes = 4096;
     uint32_t value_block_unit_bytes = 512;
@@ -13,12 +15,13 @@ struct NvmeKvExecutorConfig {
 
     // Field-specific readers preserve the existing late-read boundaries
     // without parsing unrelated executor settings on each call.
-    static uint32_t ReadTransferAlignmentBytesFromEnvironment();
-    static uint32_t ReadValueBlockUnitBytesFromEnvironment();
-    static uint32_t ReadProtocolMaxValueSizeFromEnvironment();
-    static std::size_t ReadPlanBatchSizeFromEnvironment();
+    static uint32_t ReadTransferAlignmentBytesFromEnvironment(
+        const Environ& env);
+    static uint32_t ReadValueBlockUnitBytesFromEnvironment(const Environ& env);
+    static uint32_t ReadProtocolMaxValueSizeFromEnvironment(const Environ& env);
+    static std::size_t ReadPlanBatchSizeFromEnvironment(const Environ& env);
 
-    static NvmeKvExecutorConfig FromEnvironment();
+    static NvmeKvExecutorConfig FromEnvironment(const Environ& env);
 };
 
 }  // namespace mooncake

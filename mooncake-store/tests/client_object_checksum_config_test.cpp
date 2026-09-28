@@ -1,31 +1,40 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
-#include <mutex>
 #include <optional>
 #include <string>
 
 #include "../src/config/client_object_checksum_config.h"
+#include "environ.h"
+#include "environ_test_peer.h"
 
 namespace mooncake {
 namespace {
 
-std::mutex environment_mutex;
+constexpr char kName[] = "MOONCAKE_STORE_CHECKSUM";
 
+ClientObjectChecksumConfig Load(const MapEnvironSource& source) {
+    return ClientObjectChecksumConfig::FromEnvironment(Environ(source));
+}
+
+// IsEnabledAtFirstUse() reads the process environment, so tests of it must
+// mutate the real environment and restore it afterwards.
 class ScopedChecksumEnvironment {
    public:
-    ScopedChecksumEnvironment() : environment_lock_(environment_mutex) {
+    ScopedChecksumEnvironment() {
         if (const char* value = std::getenv(kName)) {
             original_ = value;
         }
-        EXPECT_EQ(unsetenv(kName), 0);
+        EXPECT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(kName), 0);
     }
 
     ~ScopedChecksumEnvironment() {
         if (original_) {
-            EXPECT_EQ(setenv(kName, original_->c_str(), 1), 0);
+            EXPECT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                          kName, original_->c_str(), 1),
+                      0);
         } else {
-            EXPECT_EQ(unsetenv(kName), 0);
+            EXPECT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(kName), 0);
         }
     }
 
@@ -33,46 +42,46 @@ class ScopedChecksumEnvironment {
     ScopedChecksumEnvironment& operator=(const ScopedChecksumEnvironment&) =
         delete;
 
-    void Set(const char* value) { ASSERT_EQ(setenv(kName, value, 1), 0); }
+    void Set(const char* value) {
+        ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(kName, value, 1), 0);
+    }
 
    private:
-    static constexpr const char* kName = "MOONCAKE_STORE_CHECKSUM";
-    std::unique_lock<std::mutex> environment_lock_;
     std::optional<std::string> original_;
 };
 
 TEST(ClientObjectChecksumConfigTest, UnsetDisablesChecksum) {
-    ScopedChecksumEnvironment environment;
+    MapEnvironSource source;
 
-    EXPECT_FALSE(ClientObjectChecksumConfig::FromEnvironment().enabled);
+    EXPECT_FALSE(Load(source).enabled);
 }
 
 TEST(ClientObjectChecksumConfigTest, AcceptsCanonicalBooleanValues) {
-    ScopedChecksumEnvironment environment;
+    MapEnvironSource source;
 
     for (const char* value : {"1", "true", "TRUE", " yes ", "on", "enable"}) {
         SCOPED_TRACE(value);
-        environment.Set(value);
-        EXPECT_TRUE(ClientObjectChecksumConfig::FromEnvironment().enabled);
+        source.Set(kName, value);
+        EXPECT_TRUE(Load(source).enabled);
     }
 
     for (const char* value :
          {"0", "false", "FALSE", " no ", "off", "disable"}) {
         SCOPED_TRACE(value);
-        environment.Set(value);
-        EXPECT_FALSE(ClientObjectChecksumConfig::FromEnvironment().enabled);
+        source.Set(kName, value);
+        EXPECT_FALSE(Load(source).enabled);
     }
 }
 
 TEST(ClientObjectChecksumConfigTest, InvalidValuesWarnAndUseDefault) {
-    ScopedChecksumEnvironment environment;
+    MapEnvironSource source;
 
     for (const char* value : {"", "2", "enabled", "1suffix"}) {
         SCOPED_TRACE(value);
-        environment.Set(value);
+        source.Set(kName, value);
         ::testing::internal::CaptureStderr();
 
-        const auto config = ClientObjectChecksumConfig::FromEnvironment();
+        const auto config = Load(source);
         const std::string warning = ::testing::internal::GetCapturedStderr();
 
         EXPECT_FALSE(config.enabled);
@@ -94,13 +103,13 @@ TEST(ClientObjectChecksumConfigTest, FirstUseValueIsProcessWide) {
 }
 
 TEST(ClientObjectChecksumConfigTest, LoaderReadsCurrentEnvironment) {
-    ScopedChecksumEnvironment environment;
+    MapEnvironSource source;
 
-    environment.Set("1");
-    EXPECT_TRUE(ClientObjectChecksumConfig::FromEnvironment().enabled);
+    source.Set(kName, "1");
+    EXPECT_TRUE(Load(source).enabled);
 
-    environment.Set("0");
-    EXPECT_FALSE(ClientObjectChecksumConfig::FromEnvironment().enabled);
+    source.Set(kName, "0");
+    EXPECT_FALSE(Load(source).enabled);
 }
 
 }  // namespace

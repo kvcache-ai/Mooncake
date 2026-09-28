@@ -18,6 +18,7 @@
 
 #include "types.h"
 #include "pinned_buffer_pool.h"
+#include "environ_test_peer.h"
 #if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
 #endif
@@ -35,17 +36,18 @@ class ScopedEnvVar {
             old_value_ = old_value;
         }
         if (value) {
-            setenv(name_.c_str(), value, 1);
+            mooncake::test::EnvironTestPeer::SetEnv(name_.c_str(), value, 1);
         } else {
-            unsetenv(name_.c_str());
+            mooncake::test::EnvironTestPeer::UnsetEnv(name_.c_str());
         }
     }
 
     ~ScopedEnvVar() {
         if (had_old_value_) {
-            setenv(name_.c_str(), old_value_.c_str(), 1);
+            mooncake::test::EnvironTestPeer::SetEnv(name_.c_str(),
+                                                    old_value_.c_str(), 1);
         } else {
-            unsetenv(name_.c_str());
+            mooncake::test::EnvironTestPeer::UnsetEnv(name_.c_str());
         }
     }
 
@@ -61,11 +63,11 @@ class TransferTaskTest : public ::testing::Test {
         // Initialize glog for logging
         google::InitGoogleLogging("TransferTaskTest");
         FLAGS_logtostderr = 1;  // Output logs to stderr
-        unsetenv("MC_STORE_MEMCPY");
+        mooncake::test::EnvironTestPeer::UnsetEnv("MC_STORE_MEMCPY");
     }
 
     void TearDown() override {
-        unsetenv("MC_STORE_MEMCPY");
+        mooncake::test::EnvironTestPeer::UnsetEnv("MC_STORE_MEMCPY");
         // Cleanup glog
         google::ShutdownGoogleLogging();
     }
@@ -466,7 +468,7 @@ TEST_F(TransferTaskTest, IsSameProcessEndpoint) {
 }
 
 TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
-    setenv("MC_STORE_MEMCPY", "1", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_MEMCPY", "1", 1);
     TransferEngine engine(false);
     ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17933"), 0);
     const std::string endpoint = engine.getLocalIpAndPort();
@@ -497,7 +499,7 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
     }
     EXPECT_EQ(destination, source);
 
-    setenv("MC_STORE_MEMCPY", "0", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_MEMCPY", "0", 1);
     std::shared_ptr<StorageBackend> backend;
     TransferSubmitter submitter(engine, backend, endpoint);
     EXPECT_FALSE(submitter.submit_batch_get_offload_object(
@@ -513,7 +515,7 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectCopiesPinnedHostToGpu) {
         GTEST_SKIP() << "CUDA device is unavailable";
     }
 
-    setenv("MC_STORE_MEMCPY", "1", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_MEMCPY", "1", 1);
     constexpr size_t kSourceOffset = 128;
     constexpr size_t kSize = 4096;
     auto pinned_buffer =

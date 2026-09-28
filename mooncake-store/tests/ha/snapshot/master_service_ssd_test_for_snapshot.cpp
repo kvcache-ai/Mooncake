@@ -1,4 +1,5 @@
 #include "master_service_test_for_snapshot_base.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 
@@ -136,7 +137,8 @@ TEST_F(MasterServiceSSDSnapshotTest, RestorePreservesCacheTotalMetrics) {
 
     metrics.reset_cache_total_nums();
 
-    ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
+    mooncake::test::EnvironTestPeer::SetEnv(
+        "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
     auto restore_config = MasterServiceConfig::builder()
                               .set_enable_snapshot_restore(true)
                               .set_snapshot_object_store_type("local")
@@ -144,7 +146,8 @@ TEST_F(MasterServiceSSDSnapshotTest, RestorePreservesCacheTotalMetrics) {
                               .build();
     std::unique_ptr<MasterService> restored_service(
         new MasterService(restore_config));
-    ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+    mooncake::test::EnvironTestPeer::UnsetEnv(
+        "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
 
     stats = metrics.calculate_cache_stats();
     EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], 1);

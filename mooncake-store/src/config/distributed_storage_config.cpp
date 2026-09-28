@@ -13,6 +13,22 @@
 
 namespace mooncake {
 
+namespace {
+
+// Watermarks silently fall back for an empty value; other invalid values warn
+// through GetTypedOr.
+double ReadWatermark(const Environ& env,
+                     const EnvironmentVariable<double>& variable,
+                     double default_value) {
+    const auto raw = env.Get(variable.name);
+    if (!raw.has_value() || raw->empty()) {
+        return default_value;
+    }
+    return env.GetTypedOr(variable, default_value);
+}
+
+}  // namespace
+
 std::optional<DfsAllocatorType> ParseDfsAllocatorType(std::string_view name) {
     if (name == "shard") return DfsAllocatorType::SHARD;
     if (name == "bucket") return DfsAllocatorType::BUCKET;
@@ -124,55 +140,53 @@ bool DistributedStorageConfig::ValidateForAllocator() const {
     return true;
 }
 
-DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
+DistributedStorageConfig DistributedStorageConfig::FromEnvironment(
+    const Environ& env) {
     DistributedStorageConfig config;
     using Variables = DistributedStorageEnvironmentVariables;
 
     const auto legacy_root_dir =
-        Environ::ReadOr(Variables::MOONCAKE_DISTRIBUTED_ROOT_DIR, config.fsdir);
+        env.GetTypedOr(Variables::MOONCAKE_DISTRIBUTED_ROOT_DIR, config.fsdir);
     config.fsdir =
-        Environ::ReadOr(Variables::MOONCAKE_DFS_ROOT_DIR, legacy_root_dir);
+        env.GetTypedOr(Variables::MOONCAKE_DFS_ROOT_DIR, legacy_root_dir);
     if (!std::filesystem::path(config.fsdir).is_absolute()) {
         config.fsdir = std::filesystem::absolute(config.fsdir).string();
     }
 
-    const auto legacy_fs_adapter = Environ::ReadOr(
+    const auto legacy_fs_adapter = env.GetTypedOr(
         Variables::MOONCAKE_DISTRIBUTED_FS_TYPE, config.fs_adapter_type);
     config.fs_adapter_type =
-        Environ::ReadOr(Variables::MOONCAKE_DFS_FS_ADAPTER, legacy_fs_adapter);
-    config.allocator_type = Environ::ReadOr(Variables::MOONCAKE_DFS_ALLOCATOR,
-                                            config.allocator_type);
+        env.GetTypedOr(Variables::MOONCAKE_DFS_FS_ADAPTER, legacy_fs_adapter);
+    config.allocator_type = env.GetTypedOr(Variables::MOONCAKE_DFS_ALLOCATOR,
+                                           config.allocator_type);
     config.enable_health_check =
-        Environ::ReadOr(Variables::MOONCAKE_DISTRIBUTED_HEALTH_CHECK,
-                        config.enable_health_check);
-    config.shard_count = Environ::ReadOr(Variables::MOONCAKE_DFS_SHARD_COUNT,
-                                         config.shard_count);
-    config.shard_capacity = Environ::ReadOr(
+        env.GetTypedOr(Variables::MOONCAKE_DISTRIBUTED_HEALTH_CHECK,
+                       config.enable_health_check);
+    config.shard_count =
+        env.GetTypedOr(Variables::MOONCAKE_DFS_SHARD_COUNT, config.shard_count);
+    config.shard_capacity = env.GetTypedOr(
         Variables::MOONCAKE_DFS_SHARD_CAPACITY, config.shard_capacity);
-    config.bucket_capacity = Environ::ReadOr(
+    config.bucket_capacity = env.GetTypedOr(
         Variables::MOONCAKE_DFS_BUCKET_CAPACITY, config.bucket_capacity);
-    config.max_bucket_count = Environ::ReadOr(
+    config.max_bucket_count = env.GetTypedOr(
         Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT, config.max_bucket_count);
     config.alignment =
-        Environ::ReadOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
-    config.single_tenant = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_SINGLE_TENANT, config.single_tenant);
-    config.eviction_enabled = Environ::ReadOr(
+        env.GetTypedOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
+    config.single_tenant = env.GetTypedOr(Variables::MOONCAKE_DFS_SINGLE_TENANT,
+                                          config.single_tenant);
+    config.eviction_enabled = env.GetTypedOr(
         Variables::MOONCAKE_DFS_EVICTION_ENABLED, config.eviction_enabled);
 
-    // GetDouble silently falls back for an empty value; ReadOr<double> emits a
-    // warning. Keep the existing diagnostics while this refactor is
-    // behavior-preserving.
     config.eviction_high_watermark =
-        Environ::GetDouble(Variables::MOONCAKE_DFS_EVICTION_HIGH_WATERMARK.name,
-                           config.eviction_high_watermark);
+        ReadWatermark(env, Variables::MOONCAKE_DFS_EVICTION_HIGH_WATERMARK,
+                      config.eviction_high_watermark);
     config.eviction_low_watermark =
-        Environ::GetDouble(Variables::MOONCAKE_DFS_EVICTION_LOW_WATERMARK.name,
-                           config.eviction_low_watermark);
-    config.deferred_free_duration = std::chrono::seconds(Environ::ReadOr(
+        ReadWatermark(env, Variables::MOONCAKE_DFS_EVICTION_LOW_WATERMARK,
+                      config.eviction_low_watermark);
+    config.deferred_free_duration = std::chrono::seconds(env.GetTypedOr(
         Variables::MOONCAKE_DFS_DEFERRED_FREE_SECONDS,
         static_cast<int>(config.deferred_free_duration.count())));
-    config.eviction_check_interval = std::chrono::seconds(Environ::ReadOr(
+    config.eviction_check_interval = std::chrono::seconds(env.GetTypedOr(
         Variables::MOONCAKE_DFS_EVICTION_CHECK_INTERVAL,
         static_cast<int>(config.eviction_check_interval.count())));
     return config;

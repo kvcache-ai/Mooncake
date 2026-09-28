@@ -23,6 +23,7 @@
 #include "serialize/serializer.h"
 #include "types.h"
 #include "common/zstd_util.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 
@@ -74,16 +75,18 @@ class ScopedEnvVar {
             previous_value_ = previous;
         }
 
-        if (::setenv(name_.c_str(), value.c_str(), 1) != 0) {
+        if (mooncake::test::EnvironTestPeer::SetEnv(name_.c_str(),
+                                                    value.c_str(), 1) != 0) {
             throw std::runtime_error("failed to set environment variable");
         }
     }
 
     ~ScopedEnvVar() {
         if (had_previous_value_) {
-            ::setenv(name_.c_str(), previous_value_.c_str(), 1);
+            mooncake::test::EnvironTestPeer::SetEnv(name_.c_str(),
+                                                    previous_value_.c_str(), 1);
         } else {
-            ::unsetenv(name_.c_str());
+            mooncake::test::EnvironTestPeer::UnsetEnv(name_.c_str());
         }
     }
 

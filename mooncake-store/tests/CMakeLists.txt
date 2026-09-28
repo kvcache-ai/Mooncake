@@ -7,6 +7,7 @@ function(add_store_test name)
     ${name}
     PUBLIC mooncake_store
            master_service_test_peer
+           environ_test_peer
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
@@ -25,6 +26,7 @@ function(add_ha_test name)
     ${name}
     PUBLIC mooncake_store
            master_service_test_peer
+           environ_test_peer
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
@@ -399,6 +401,7 @@ if(STORE_USE_REDIS)
   target_link_libraries(
     redis_snapshot_catalog_store_test
     PUBLIC mooncake_store
+           environ_test_peer
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}

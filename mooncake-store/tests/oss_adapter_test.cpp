@@ -29,6 +29,7 @@
 #include "storage_backend.h"
 #include "oss_fault_test_helpers.h"
 #include "oss_live_test_helpers.h"
+#include "environ_test_peer.h"
 
 namespace mooncake {
 namespace {
@@ -38,9 +39,10 @@ class ScopedEnvironment {
     ~ScopedEnvironment() {
         for (const auto& [name, value] : original_values_) {
             if (value) {
-                setenv(name.c_str(), value->c_str(), 1);
+                mooncake::test::EnvironTestPeer::SetEnv(name.c_str(),
+                                                        value->c_str(), 1);
             } else {
-                unsetenv(name.c_str());
+                mooncake::test::EnvironTestPeer::UnsetEnv(name.c_str());
             }
         }
     }
@@ -51,7 +53,7 @@ class ScopedEnvironment {
             original_values_[name] =
                 original ? std::optional<std::string>(original) : std::nullopt;
         }
-        setenv(name.c_str(), value.c_str(), 1);
+        mooncake::test::EnvironTestPeer::SetEnv(name.c_str(), value.c_str(), 1);
     }
 
    private:

@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include "common/file_util.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 
@@ -165,7 +166,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
         tmp_dir_ = dir;
 
         // Set env for LocalFileSnapshotObjectStore
-        ::setenv(kEnvSnapshotLocalPath, tmp_dir().c_str(), 1);
+        mooncake::test::EnvironTestPeer::SetEnv(kEnvSnapshotLocalPath,
+                                                tmp_dir().c_str(), 1);
     }
 
     void TearDown() override {
@@ -173,7 +175,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         if (!tmp_dir().empty() && fs::exists(tmp_dir())) {
             fs::remove_all(tmp_dir());
         }
-        ::unsetenv(kEnvSnapshotLocalPath);
+        mooncake::test::EnvironTestPeer::UnsetEnv(kEnvSnapshotLocalPath);
         google::ShutdownGoogleLogging();
     }
 
@@ -1509,7 +1511,7 @@ TEST_F(SnapshotChildProcessTest,
 
 TEST_F(SnapshotChildProcessTest, EnableSnapshotWithoutEnvVar_Throws) {
     // Unset env var
-    ::unsetenv(kEnvSnapshotLocalPath);
+    mooncake::test::EnvironTestPeer::UnsetEnv(kEnvSnapshotLocalPath);
 
     auto config = MasterServiceConfigBuilder()
                       .set_enable_snapshot(true)
@@ -1527,7 +1529,7 @@ TEST_F(SnapshotChildProcessTest, EnableSnapshotWithoutEnvVar_Throws) {
 
 TEST_F(SnapshotChildProcessTest, DisableSnapshotWithoutEnvVar_NoThrow) {
     // Unset env var
-    ::unsetenv(kEnvSnapshotLocalPath);
+    mooncake::test::EnvironTestPeer::UnsetEnv(kEnvSnapshotLocalPath);
 
     auto config = MasterServiceConfigBuilder()
                       .set_enable_snapshot(false)

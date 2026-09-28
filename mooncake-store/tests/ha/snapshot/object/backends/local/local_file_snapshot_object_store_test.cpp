@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 
@@ -26,7 +27,9 @@ class LocalFileSnapshotObjectStoreTest : public ::testing::Test {
         if (const char* value = std::getenv("MOONCAKE_SNAPSHOT_LOCAL_PATH")) {
             original_path_ = value;
         }
-        ASSERT_EQ(unsetenv("MOONCAKE_SNAPSHOT_LOCAL_PATH"), 0);
+        ASSERT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(
+                      "MOONCAKE_SNAPSHOT_LOCAL_PATH"),
+                  0);
 
         // Create a unique temporary directory
         std::string tmpl = (fs::temp_directory_path() /
@@ -42,11 +45,14 @@ class LocalFileSnapshotObjectStoreTest : public ::testing::Test {
     void TearDown() override {
         backend_.reset();
         if (original_path_) {
-            EXPECT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH",
-                             original_path_->c_str(), 1),
-                      0);
+            EXPECT_EQ(
+                mooncake::test::EnvironTestPeer::SetEnv(
+                    "MOONCAKE_SNAPSHOT_LOCAL_PATH", original_path_->c_str(), 1),
+                0);
         } else {
-            EXPECT_EQ(unsetenv("MOONCAKE_SNAPSHOT_LOCAL_PATH"), 0);
+            EXPECT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(
+                          "MOONCAKE_SNAPSHOT_LOCAL_PATH"),
+                      0);
         }
         if (!tmp_dir().empty() && fs::exists(tmp_dir())) {
             fs::remove_all(tmp_dir());
@@ -142,7 +148,9 @@ TEST_F(LocalFileSnapshotObjectStoreTest, UploadBuffer_CreatesSubdirectories) {
 // ========== Error Handling ==========
 
 TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_EmptyPath_Throws) {
-    ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", tmp_dir().c_str(), 1), 0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MOONCAKE_SNAPSHOT_LOCAL_PATH", tmp_dir().c_str(), 1),
+              0);
     try {
         LocalFileSnapshotObjectStore store("");
         FAIL()
@@ -159,9 +167,13 @@ TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_EmptyPath_Throws) {
 TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_MissingOrEmptyEnv_Throws) {
     for (const char* value : {static_cast<const char*>(nullptr), ""}) {
         if (value) {
-            ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", value, 1), 0);
+            ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                          "MOONCAKE_SNAPSHOT_LOCAL_PATH", value, 1),
+                      0);
         } else {
-            ASSERT_EQ(unsetenv("MOONCAKE_SNAPSHOT_LOCAL_PATH"), 0);
+            ASSERT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(
+                          "MOONCAKE_SNAPSHOT_LOCAL_PATH"),
+                      0);
         }
         try {
             LocalFileSnapshotObjectStore store;
@@ -180,12 +192,15 @@ TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_MissingOrEmptyEnv_Throws) {
 TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_ReadsEnvForEachStore) {
     const auto first_path = fs::path(tmp_dir()) / "first" / "snapshots";
     ASSERT_FALSE(fs::exists(first_path));
-    ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", first_path.c_str(), 1), 0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MOONCAKE_SNAPSHOT_LOCAL_PATH", first_path.c_str(), 1),
+              0);
     LocalFileSnapshotObjectStore first;
     ASSERT_TRUE(fs::is_directory(first_path));
 
     const auto second_path = fs::path(tmp_dir()) / "second";
-    ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", second_path.c_str(), 1),
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MOONCAKE_SNAPSHOT_LOCAL_PATH", second_path.c_str(), 1),
               0);
     LocalFileSnapshotObjectStore second;
 
@@ -204,7 +219,9 @@ TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_ReadsEnvForEachStore) {
 TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_EnvRegularFile_Throws) {
     ASSERT_TRUE(backend_->UploadString("regular-file", "data"));
     const auto path = fs::path(tmp_dir()) / "regular-file";
-    ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", path.c_str(), 1), 0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MOONCAKE_SNAPSHOT_LOCAL_PATH", path.c_str(), 1),
+              0);
     EXPECT_THROW(LocalFileSnapshotObjectStore{}, std::runtime_error);
 }
 
@@ -214,7 +231,9 @@ TEST_F(LocalFileSnapshotObjectStoreTest, Constructor_ExplicitPathIgnoresEnv) {
     const std::string explicit_path =
         (fs::path(tmp_dir()) / "explicit").string();
     for (const auto& value : {std::string{}, env_path}) {
-        ASSERT_EQ(setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", value.c_str(), 1), 0);
+        ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                      "MOONCAKE_SNAPSHOT_LOCAL_PATH", value.c_str(), 1),
+                  0);
         LocalFileSnapshotObjectStore store(explicit_path);
         ASSERT_TRUE(store.UploadString("key", "explicit path"));
         EXPECT_TRUE(fs::is_regular_file(fs::path(explicit_path) / "key"));

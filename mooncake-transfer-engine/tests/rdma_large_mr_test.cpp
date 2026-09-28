@@ -44,10 +44,10 @@
 
 #if defined(USE_CUDA) || defined(USE_HIP)
 #include "cuda_alike.h"
-#include "environ.h"
 #endif
 #include "config.h"
 #include "transfer_engine.h"
+#include "transport/rdma_transport/rdma_environment_config.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
@@ -226,8 +226,8 @@ class RDMAGpuDmabufChunkTest : public ::testing::Test {
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 
 #if defined(USE_CUDA)
-        ASSERT_TRUE(Environ::Get().GetRdmaDataDirect() ||
-                    !Environ::Get().GetWithNvidiaPeermem())
+        ASSERT_TRUE(RdmaEnvironmentConfig::Process().data_direct ||
+                    !RdmaEnvironmentConfig::Process().with_nvidia_peermem)
             << "Launch with WITH_NVIDIA_PEERMEM=0 or MC_RDMA_DATA_DIRECT=1 "
                "so this test exercises DMA-BUF registration";
 #endif

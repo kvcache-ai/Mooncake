@@ -19,6 +19,7 @@
 #include "real_client.h"
 #include "test_server_helpers.h"
 #include "version.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 namespace {
@@ -66,9 +67,10 @@ class ScopedEnv {
 
     ~ScopedEnv() {
         if (old_value_) {
-            setenv(name_, old_value_->c_str(), 1);
+            mooncake::test::EnvironTestPeer::SetEnv(name_, old_value_->c_str(),
+                                                    1);
         } else {
-            unsetenv(name_);
+            mooncake::test::EnvironTestPeer::UnsetEnv(name_);
         }
     }
 
@@ -304,7 +306,7 @@ TEST_F(ClientMetricsTest, BandwidthSummaryRespectsEnvFlag) {
     ScopedEnv bandwidth_env(
         ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH
             .name);
-    setenv(
+    mooncake::test::EnvironTestPeer::SetEnv(
         ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH.name,
         "0", 1);
     auto metrics = ClientMetric::Create();
@@ -544,7 +546,7 @@ TEST_F(ClientMetricsTest, HeartbeatObservationsUseClientMetricLabels) {
 
 TEST_F(ClientMetricsTest, HttpHeartbeatMetricsRecoverAfterMasterRestart) {
     ScopedEnv timeout("MC_RPC_TIMEOUT_MS");
-    setenv("MC_RPC_TIMEOUT_MS", "200", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_RPC_TIMEOUT_MS", "200", 1);
     mooncake::testing::InProcMaster master;
     ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
                                  .set_http_metadata_port(0)
@@ -681,7 +683,7 @@ TEST_F(ClientMetricsTest, HttpMetricsConfigParserRejectsInvalidIntegers) {
 
 TEST_F(ClientMetricsTest, HttpMetricsEndpointReturns503WhenMetricsDisabled) {
     ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
-    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_CLIENT_METRIC", "0", 1);
 
     std::unordered_set<int> used_ports;
     int master_rpc_port = GetTestPort(used_ports);

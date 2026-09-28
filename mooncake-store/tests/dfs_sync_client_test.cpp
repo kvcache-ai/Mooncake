@@ -24,6 +24,7 @@
 #include "storage/distributed/posix_fs_adapter.h"
 #include "test_server_helpers.h"
 #include "common/client_buffer_allocation.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 
@@ -181,15 +182,16 @@ class DfsSyncClientTest : public ::testing::Test {
         saved_env_.push_back({key, old_value
                                        ? std::optional<std::string>(old_value)
                                        : std::nullopt});
-        ::setenv(key.c_str(), value.c_str(), 1);
+        mooncake::test::EnvironTestPeer::SetEnv(key.c_str(), value.c_str(), 1);
     }
 
     void RestoreEnv() {
         for (auto it = saved_env_.rbegin(); it != saved_env_.rend(); ++it) {
             if (it->second) {
-                ::setenv(it->first.c_str(), it->second->c_str(), 1);
+                mooncake::test::EnvironTestPeer::SetEnv(it->first.c_str(),
+                                                        it->second->c_str(), 1);
             } else {
-                ::unsetenv(it->first.c_str());
+                mooncake::test::EnvironTestPeer::UnsetEnv(it->first.c_str());
             }
         }
         saved_env_.clear();

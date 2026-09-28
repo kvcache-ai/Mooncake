@@ -1,51 +1,37 @@
 #include <gtest/gtest.h>
 
-#include <cstdlib>
 #include <limits>
-#include <optional>
 #include <string>
 
 #include "../src/config/client_numa_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
 class ClientNumaConfigTest : public ::testing::Test {
    protected:
-    void SetUp() override {
-        if (const char* value = std::getenv(kEnvironmentVariable)) {
-            original_ = value;
-        }
-        ASSERT_EQ(unsetenv(kEnvironmentVariable), 0);
+    ClientNumaConfig Load() const {
+        return ClientNumaConfig::FromEnvironment(Environ(source_));
     }
 
-    void TearDown() override {
-        if (original_.has_value()) {
-            EXPECT_EQ(setenv(kEnvironmentVariable, original_->c_str(), 1), 0);
-        } else {
-            EXPECT_EQ(unsetenv(kEnvironmentVariable), 0);
-        }
-    }
-
-    void Set(const char* value) {
-        ASSERT_EQ(setenv(kEnvironmentVariable, value, 1), 0);
-    }
+    void Set(const char* value) { source_.Set(kEnvironmentVariable, value); }
 
     static constexpr const char* kEnvironmentVariable =
         "MC_STORE_NUMA_SOCKET_ID";
 
    private:
-    std::optional<std::string> original_;
+    MapEnvironSource source_;
 };
 
 TEST_F(ClientNumaConfigTest, UnsetAndEmptyUseAutoDetectionWithoutWarning) {
     ::testing::internal::CaptureStderr();
-    EXPECT_FALSE(ClientNumaConfig::FromEnvironment().socket_id.has_value());
+    EXPECT_FALSE(Load().socket_id.has_value());
     EXPECT_TRUE(::testing::internal::GetCapturedStderr().empty());
 
     Set("");
     ::testing::internal::CaptureStderr();
-    EXPECT_FALSE(ClientNumaConfig::FromEnvironment().socket_id.has_value());
+    EXPECT_FALSE(Load().socket_id.has_value());
     EXPECT_TRUE(::testing::internal::GetCapturedStderr().empty());
 }
 
@@ -63,8 +49,7 @@ TEST_F(ClientNumaConfigTest, PreservesAcceptedDecimalSyntax) {
     for (const auto& entry : cases) {
         SCOPED_TRACE(entry.value);
         Set(entry.value);
-        EXPECT_EQ(ClientNumaConfig::FromEnvironment().socket_id,
-                  entry.expected);
+        EXPECT_EQ(Load().socket_id, entry.expected);
     }
 }
 
@@ -74,7 +59,7 @@ TEST_F(ClientNumaConfigTest, InvalidValuesWarnAndUseAutoDetection) {
         SCOPED_TRACE(value);
         Set(value);
         ::testing::internal::CaptureStderr();
-        EXPECT_FALSE(ClientNumaConfig::FromEnvironment().socket_id.has_value());
+        EXPECT_FALSE(Load().socket_id.has_value());
         const std::string logs = ::testing::internal::GetCapturedStderr();
         EXPECT_NE(logs.find(std::string("Invalid MC_STORE_NUMA_SOCKET_ID=") +
                             value + ", falling back to auto-detect"),
@@ -84,10 +69,10 @@ TEST_F(ClientNumaConfigTest, InvalidValuesWarnAndUseAutoDetection) {
 
 TEST_F(ClientNumaConfigTest, EachConfigReadsCurrentEnvironment) {
     Set("1");
-    const auto first = ClientNumaConfig::FromEnvironment();
+    const auto first = Load();
 
     Set("2");
-    const auto second = ClientNumaConfig::FromEnvironment();
+    const auto second = Load();
 
     EXPECT_EQ(first.socket_id, 1);
     EXPECT_EQ(second.socket_id, 2);

@@ -14,20 +14,24 @@
 #include "allocator.h"
 #include "client_metric.h"
 #include "common/network.h"
+#include "environ.h"
 #include "file_storage.h"
 #include "storage_backend.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
 #include "common/client_buffer_allocation.h"
 #include "utils/common.h"
+#include "environ_test_peer.h"
 
 namespace mooncake {
 
 void SetEnv(const std::string& key, const std::string& value) {
-    setenv(key.c_str(), value.c_str(), 1);
+    mooncake::test::EnvironTestPeer::SetEnv(key.c_str(), value.c_str(), 1);
 }
 
-void UnsetEnv(const std::string& key) { unsetenv(key.c_str()); }
+void UnsetEnv(const std::string& key) {
+    mooncake::test::EnvironTestPeer::UnsetEnv(key.c_str());
+}
 
 // Commit another offload after grouping but before this batch reaches the
 // backend. This deterministically exercises the duplicate race from #4097
@@ -73,6 +77,12 @@ class ConcurrentOffloadBackend : public BucketStorageBackend {
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
+    MapEnvironSource file_storage_source_;
+
+    FileStorageConfig LoadFileStorageConfig() const {
+        return FileStorageConfig::FromEnvironment(
+            Environ(file_storage_source_));
+    }
 
     void RunSkippedOffloadScenario(
         size_t duplicate_count, bool fail_write,
@@ -125,7 +135,7 @@ class FileStorageTest : public ::testing::Test {
             ASSERT_EQ(blocked.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
         }
 
-        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        FileStorageConfig config = LoadFileStorageConfig();
         config.storage_backend_type = backend_type;
         config.storage_filepath = data_path + "/skipped_ssd";
         config.local_buffer_size = 1024 * 1024;
@@ -199,26 +209,9 @@ class FileStorageTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
-        UnsetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR");
-        UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
-        UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
-        UnsetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES");
-        UnsetEnv("MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT");
-        UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
+        // FileStorage builds its backend from the process environment.
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
-        UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
-        UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
-        UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
-        UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS");
-        UnsetEnv("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS");
-        UnsetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION");
-        UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO");
-        UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO");
-        UnsetEnv("MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO");
-        UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
-        UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
-        UnsetEnv("MOONCAKE_USE_URING");
         UnsetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE");
         UnsetEnv("MOONCAKE_DFS_FS_ADAPTER");
         UnsetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR");
@@ -451,7 +444,7 @@ class FileStorageTest : public ::testing::Test {
                                               false)
                         .has_value());
 
-        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        FileStorageConfig config = LoadFileStorageConfig();
         config.storage_backend_type = backend_type;
         config.storage_filepath = data_path + "/heal_ssd" + suffix;
         config.local_buffer_size = 4 * 1024 * 1024;
@@ -572,7 +565,7 @@ class FileStorageTest : public ::testing::Test {
                                               false)
                         .has_value());
 
-        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        FileStorageConfig config = LoadFileStorageConfig();
         config.storage_backend_type = StorageBackendType::kFilePerKey;
         config.storage_filepath = data_path + "/heal_ssd_batch";
         config.local_buffer_size = 4 * 1024 * 1024;
@@ -695,7 +688,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     std::unordered_map<std::string, std::string> batch_data;
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
     FileStorage fileStorage1(file_storage_config, nullptr, "localhost:9003");
@@ -729,11 +722,11 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
 }
 
 TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
-    SetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-           "distributed_storage_backend");
+    file_storage_source_.Set("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                             "distributed_storage_backend");
     SetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR", data_path + "/distributed");
 
-    auto config = FileStorageConfig::FromEnvironment();
+    auto config = LoadFileStorageConfig();
     config.storage_filepath = data_path;
     config.local_buffer_size = 4 * 1024 * 1024;
     EXPECT_FALSE(config.enable_dfs);
@@ -760,7 +753,7 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
     std::vector<int64_t> sizes;
     std::unordered_map<std::string, std::string> batch_data;
 
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
@@ -803,7 +796,7 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
 }
 
 TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 64 * 1024;
     file_storage_config.use_uring = false;
@@ -833,7 +826,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
         offloading_objects.emplace("test" + std::to_string(i), 1);
     }
     std::vector<std::vector<std::string>> buckets_keys;
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.scanmeta_iterator_keys_limit = 969;
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
@@ -863,7 +856,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_deduplicates_carryover) {
     offloading_objects.emplace("duplicate", 1);
 
     std::vector<std::vector<std::string>> buckets_keys;
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
@@ -893,7 +886,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
         offloading_objects.emplace("test" + std::to_string(i), 1);
     }
     std::vector<std::vector<std::string>> buckets_keys;
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "10");
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
@@ -924,7 +917,7 @@ TEST_F(FileStorageTest,
         offloading_objects.emplace("test" + std::to_string(i), i);
     }
     std::vector<std::vector<std::string>> buckets_keys;
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "9");
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "496");
@@ -951,7 +944,7 @@ TEST_F(FileStorageTest,
         offloading_objects.emplace("test" + std::to_string(i), 1);
     }
     std::vector<std::vector<std::string>> buckets_keys;
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
@@ -987,7 +980,7 @@ TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
     ASSERT_TRUE(mount_result.has_value())
         << "MountLocalDiskSegment failed: " << toString(mount_result.error());
 
-    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    FileStorageConfig config = LoadFileStorageConfig();
     config.storage_backend_type = StorageBackendType::kFilePerKey;
     config.storage_filepath = data_path + "/heartbeat_watermark";
     config.local_buffer_size = 4 * 1024 * 1024;
@@ -1035,7 +1028,7 @@ TEST_F(FileStorageTest, HeartbeatAfterDrainDoesNotRemount) {
     ASSERT_TRUE(client.has_value());
     ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
 
-    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    FileStorageConfig config = LoadFileStorageConfig();
     config.storage_backend_type = StorageBackendType::kFilePerKey;
     config.storage_filepath = data_path + "/drain_hb";
     config.local_buffer_size = 4 * 1024 * 1024;
@@ -1074,7 +1067,7 @@ TEST_F(FileStorageTest, DrainSurvivesParkedHeartbeatTick) {
     ASSERT_TRUE(client.has_value());
     ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
 
-    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    FileStorageConfig config = LoadFileStorageConfig();
     config.storage_backend_type = StorageBackendType::kFilePerKey;
     config.storage_filepath = data_path + "/drain_race";
     config.local_buffer_size = 4 * 1024 * 1024;
@@ -1116,7 +1109,7 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
     ASSERT_TRUE(mount_result.has_value())
         << "MountLocalDiskSegment failed: " << toString(mount_result.error());
 
-    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    FileStorageConfig config = LoadFileStorageConfig();
     config.storage_backend_type = StorageBackendType::kFilePerKey;
     config.storage_filepath = data_path + "/tenant_notify";
     fs::create_directories(config.storage_filepath);
@@ -1188,7 +1181,7 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
     std::vector<int64_t> sizes;
     std::unordered_map<std::string, std::string> batch_data;
 
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_backend_type = StorageBackendType::kFilePerKey;
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
@@ -1230,7 +1223,7 @@ TEST_F(FileStorageTest, BatchLoadRecordsSsdMetrics) {
     std::vector<int64_t> sizes;
     std::unordered_map<std::string, std::string> batch_data;
 
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
 
     // Create FileStorage WITH SsdMetric
@@ -1280,7 +1273,7 @@ TEST_F(FileStorageTest, BatchLoadRecordsSsdMetrics) {
 }
 
 TEST_F(FileStorageTest, BatchLoadFailureDoesNotRecordSsdMetrics) {
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
 
     SsdMetric ssd_metric;
@@ -1320,7 +1313,7 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
     std::vector<int64_t> sizes;
     std::unordered_map<std::string, std::string> batch_data;
 
-    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    auto file_storage_config = LoadFileStorageConfig();
     file_storage_config.storage_filepath = data_path;
 
     // nullptr SsdMetric (default)

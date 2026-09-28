@@ -14,6 +14,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "environ_test_peer.h"
 
 namespace fs = std::filesystem;
 
@@ -27,14 +28,15 @@ class EnvVarGuard {
         if (const char *old_value = getenv(name)) {
             old_value_ = old_value;
         }
-        setenv(name, value, 1);
+        mooncake::test::EnvironTestPeer::SetEnv(name, value, 1);
     }
 
     ~EnvVarGuard() {
         if (old_value_.has_value()) {
-            setenv(name_.c_str(), old_value_->c_str(), 1);
+            mooncake::test::EnvironTestPeer::SetEnv(name_.c_str(),
+                                                    old_value_->c_str(), 1);
         } else {
-            unsetenv(name_.c_str());
+            mooncake::test::EnvironTestPeer::UnsetEnv(name_.c_str());
         }
     }
 

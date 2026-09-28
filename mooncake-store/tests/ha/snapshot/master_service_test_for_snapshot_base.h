@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "types.h"
+#include "environ_test_peer.h"
 
 // TODO metrics consistency
 namespace mooncake::test {
@@ -68,7 +69,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         tmp_dir_ = dir;
 
         // Set MOONCAKE_SNAPSHOT_LOCAL_PATH for LocalFileSnapshotObjectStore
-        ::setenv(kEnvSnapshotLocalPath, tmp_dir().c_str(), 1);
+        mooncake::test::EnvironTestPeer::SetEnv(kEnvSnapshotLocalPath,
+                                                tmp_dir().c_str(), 1);
     }
 
     // ==================== Structures ====================
@@ -828,7 +830,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // ========== Phase 3: Restart MasterService in Restore mode ==========
         // Inherit key configurations from original service (e.g., root_fs_dir
         // for SSD support)
-        ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
+        mooncake::test::EnvironTestPeer::SetEnv(
+            "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
         auto restore_config =
             MasterServiceConfig::builder()
                 .set_memory_allocator(BufferAllocatorType::OFFSET)
@@ -841,7 +844,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 .build();
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
-        ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+        mooncake::test::EnvironTestPeer::UnsetEnv(
+            "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
         // Freeze the restored instance before comparing snapshots. Its
         // eviction worker would otherwise mutate metadata between snapshots.
         MasterServiceTestPeer::EvictionRunning(*restored_service) = false;
@@ -928,7 +932,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         if (!tmp_dir().empty() && fs::exists(tmp_dir())) {
             fs::remove_all(tmp_dir());
         }
-        ::unsetenv(kEnvSnapshotLocalPath);
+        mooncake::test::EnvironTestPeer::UnsetEnv(kEnvSnapshotLocalPath);
         // Note: Do not call ShutdownGoogleLogging() here - glog only allows
         // single init/shutdown cycle
     }

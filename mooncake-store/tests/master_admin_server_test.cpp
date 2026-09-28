@@ -30,6 +30,7 @@
 #include "version.h"
 
 #include <ylt/reflection/user_reflect_macro.hpp>
+#include "environ_test_peer.h"
 
 namespace mooncake {
 namespace test {
@@ -61,9 +62,10 @@ class DfsAdminEnvironment {
     ~DfsAdminEnvironment() {
         for (const auto& [key, value] : saved_) {
             if (value) {
-                ::setenv(key.c_str(), value->c_str(), 1);
+                mooncake::test::EnvironTestPeer::SetEnv(key.c_str(),
+                                                        value->c_str(), 1);
             } else {
-                ::unsetenv(key.c_str());
+                mooncake::test::EnvironTestPeer::UnsetEnv(key.c_str());
             }
         }
         std::error_code ec;
@@ -75,7 +77,7 @@ class DfsAdminEnvironment {
         const char* previous = ::getenv(key.c_str());
         saved_.push_back({key, previous ? std::optional<std::string>(previous)
                                         : std::nullopt});
-        ::setenv(key.c_str(), value.c_str(), 1);
+        mooncake::test::EnvironTestPeer::SetEnv(key.c_str(), value.c_str(), 1);
     }
     std::filesystem::path root_;
     std::vector<std::pair<std::string, std::optional<std::string>>> saved_;

@@ -1,44 +1,30 @@
 #include <gtest/gtest.h>
 
-#include <cstdlib>
 #include <limits>
-#include <optional>
 #include <string>
 
 #include "../src/config/cxl_segment_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
 class CxlSegmentConfigTest : public ::testing::Test {
    protected:
-    void SetUp() override {
-        if (const char* value = std::getenv(kEnvironmentVariable)) {
-            original_ = value;
-        }
-        ASSERT_EQ(unsetenv(kEnvironmentVariable), 0);
+    CxlSegmentConfig Load() const {
+        return CxlSegmentConfig::FromEnvironment(Environ(source_));
     }
 
-    void TearDown() override {
-        if (original_.has_value()) {
-            EXPECT_EQ(setenv(kEnvironmentVariable, original_->c_str(), 1), 0);
-        } else {
-            EXPECT_EQ(unsetenv(kEnvironmentVariable), 0);
-        }
-    }
-
-    void Set(const char* value) {
-        ASSERT_EQ(setenv(kEnvironmentVariable, value, 1), 0);
-    }
+    void Set(const char* value) { source_.Set(kEnvironmentVariable, value); }
 
     static constexpr const char* kEnvironmentVariable = "MC_CXL_DEV_SIZE";
 
    private:
-    std::optional<std::string> original_;
+    MapEnvironSource source_;
 };
 
 TEST_F(CxlSegmentConfigTest, UnsetLeavesDeviceSizeAbsent) {
-    EXPECT_FALSE(CxlSegmentConfig::FromEnvironment().device_size.has_value());
+    EXPECT_FALSE(Load().device_size.has_value());
 }
 
 TEST_F(CxlSegmentConfigTest, PreservesAcceptedSizeSyntax) {
@@ -55,15 +41,13 @@ TEST_F(CxlSegmentConfigTest, PreservesAcceptedSizeSyntax) {
     for (const auto& entry : cases) {
         SCOPED_TRACE(entry.value);
         Set(entry.value);
-        EXPECT_EQ(CxlSegmentConfig::FromEnvironment().device_size,
-                  entry.expected);
+        EXPECT_EQ(Load().device_size, entry.expected);
     }
 
     const std::string maximum =
         std::to_string(std::numeric_limits<size_t>::max());
     Set(maximum.c_str());
-    EXPECT_EQ(CxlSegmentConfig::FromEnvironment().device_size,
-              std::numeric_limits<size_t>::max());
+    EXPECT_EQ(Load().device_size, std::numeric_limits<size_t>::max());
 }
 
 TEST_F(CxlSegmentConfigTest, PresentInvalidValuesResolveToZero) {
@@ -71,7 +55,7 @@ TEST_F(CxlSegmentConfigTest, PresentInvalidValuesResolveToZero) {
          {"", " ", "-1", "4096bytes", "18446744073709551616"}) {
         SCOPED_TRACE(value);
         Set(value);
-        const auto config = CxlSegmentConfig::FromEnvironment();
+        const auto config = Load();
         ASSERT_TRUE(config.device_size.has_value());
         EXPECT_EQ(*config.device_size, 0);
     }
@@ -79,10 +63,10 @@ TEST_F(CxlSegmentConfigTest, PresentInvalidValuesResolveToZero) {
 
 TEST_F(CxlSegmentConfigTest, EachConfigReadsCurrentEnvironment) {
     Set("4096");
-    const auto first = CxlSegmentConfig::FromEnvironment();
+    const auto first = Load();
 
     Set("8192");
-    const auto second = CxlSegmentConfig::FromEnvironment();
+    const auto second = Load();
 
     EXPECT_EQ(first.device_size, 4096);
     EXPECT_EQ(second.device_size, 8192);

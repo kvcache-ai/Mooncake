@@ -9,19 +9,21 @@
 #include <string>
 #include <vector>
 #include "storage/distributed/oss_adapter.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 class LiveOssParameter {
    public:
     LiveOssParameter(const char* key, const char* value) : key_(key) {
         if (const char* old = getenv(key)) old_ = old;
-        setenv(key, value, 1);
+        mooncake::test::EnvironTestPeer::SetEnv(key, value, 1);
     }
     ~LiveOssParameter() {
         if (old_)
-            setenv(key_.c_str(), old_->c_str(), 1);
+            mooncake::test::EnvironTestPeer::SetEnv(key_.c_str(), old_->c_str(),
+                                                    1);
         else
-            unsetenv(key_.c_str());
+            mooncake::test::EnvironTestPeer::UnsetEnv(key_.c_str());
     }
 
    private:

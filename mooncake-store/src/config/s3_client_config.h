@@ -5,6 +5,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct S3ClientConfig {
     std::string region;
     std::string s3_endpoint;
@@ -18,7 +20,7 @@ struct S3ClientConfig {
     std::chrono::milliseconds connect_timeout{10000};
     std::chrono::milliseconds request_timeout{30000};
 
-    static S3ClientConfig FromEnvironment();
+    static S3ClientConfig FromEnvironment(const Environ& env);
 };
 
 }  // namespace mooncake

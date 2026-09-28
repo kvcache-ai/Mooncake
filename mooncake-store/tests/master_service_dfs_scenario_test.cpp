@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "master_service/dsl/scenario.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 namespace {
@@ -20,14 +21,15 @@ class ScopedEnvVar {
         if (previous != nullptr) {
             previous_value_ = previous;
         }
-        ::setenv(name_.c_str(), value, 1);
+        mooncake::test::EnvironTestPeer::SetEnv(name_.c_str(), value, 1);
     }
 
     ~ScopedEnvVar() {
         if (previous_value_.has_value()) {
-            ::setenv(name_.c_str(), previous_value_->c_str(), 1);
+            mooncake::test::EnvironTestPeer::SetEnv(
+                name_.c_str(), previous_value_->c_str(), 1);
         } else {
-            ::unsetenv(name_.c_str());
+            mooncake::test::EnvironTestPeer::UnsetEnv(name_.c_str());
         }
     }
 

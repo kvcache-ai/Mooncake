@@ -5,9 +5,10 @@
 
 namespace mooncake {
 
-StoreClusterIdentityConfig StoreClusterIdentityConfig::FromEnvironment() {
+StoreClusterIdentityConfig StoreClusterIdentityConfig::FromEnvironment(
+    const Environ& env) {
     StoreClusterIdentityConfig config;
-    config.cluster_id = Environ::Read(
+    config.cluster_id = env.GetTyped(
         StoreClusterIdentityEnvironmentVariables::MC_STORE_CLUSTER_ID);
     return config;
 }

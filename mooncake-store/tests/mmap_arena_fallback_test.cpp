@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/client_buffer_allocation.h"
+#include "environ_test_peer.h"
 
 #if defined(__has_feature)
 #define MC_HAS_FEATURE(x) __has_feature(x)
@@ -54,20 +55,21 @@ class MmapArenaFallbackTest : public ::testing::Test {
     void SetUp() override {
         FLAGS_logtostderr = 1;
         FLAGS_minloglevel = google::WARNING;
-        setenv("MC_DISABLE_MMAP_ARENA", "1", 1);
+        mooncake::test::EnvironTestPeer::SetEnv("MC_DISABLE_MMAP_ARENA", "1",
+                                                1);
     }
 
     void TearDown() override {
-        unsetenv("MC_DISABLE_MMAP_ARENA");
-        unsetenv("MC_MMAP_ARENA_POOL_SIZE");
-        unsetenv("MC_STORE_HUGEPAGE_SIZE");
-        unsetenv("MC_STORE_USE_HUGEPAGE");
+        mooncake::test::EnvironTestPeer::UnsetEnv("MC_DISABLE_MMAP_ARENA");
+        mooncake::test::EnvironTestPeer::UnsetEnv("MC_MMAP_ARENA_POOL_SIZE");
+        mooncake::test::EnvironTestPeer::UnsetEnv("MC_STORE_HUGEPAGE_SIZE");
+        mooncake::test::EnvironTestPeer::UnsetEnv("MC_STORE_USE_HUGEPAGE");
     }
 };
 
 TEST_F(MmapArenaFallbackTest, PopulateHugetlbMappingUsesConfiguredPageStride) {
-    setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
-    setenv("MC_STORE_HUGEPAGE_SIZE", "2MB", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_USE_HUGEPAGE", "1", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_HUGEPAGE_SIZE", "2MB", 1);
 
     constexpr size_t kPageCount = 3;
     constexpr size_t kMapSize = kPageCount * SZ_2MB;
@@ -92,8 +94,8 @@ TEST_F(MmapArenaFallbackTest, PopulateNumaHugetlbMappingTouchesEveryRegion) {
     if (numa_available() < 0) {
         GTEST_SKIP() << "NUMA is unavailable";
     }
-    setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
-    setenv("MC_STORE_HUGEPAGE_SIZE", "2MB", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_USE_HUGEPAGE", "1", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_HUGEPAGE_SIZE", "2MB", 1);
 
     std::vector<int> numa_nodes;
     for (int node = 0; node <= numa_max_node() && numa_nodes.size() < 2;
@@ -125,12 +127,13 @@ TEST_F(MmapArenaFallbackTest, PopulateNumaHugetlbMappingTouchesEveryRegion) {
 }
 
 TEST_F(MmapArenaFallbackTest, ArenaInitFailureIsStickyForProcessLifetime) {
-    unsetenv("MC_DISABLE_MMAP_ARENA");
-    unsetenv("MC_STORE_USE_HUGEPAGE");
+    mooncake::test::EnvironTestPeer::UnsetEnv("MC_DISABLE_MMAP_ARENA");
+    mooncake::test::EnvironTestPeer::UnsetEnv("MC_STORE_USE_HUGEPAGE");
 
     // "infinite" parses to UINT64_MAX and deterministically trips the arena's
     // overflow guard before any mmap attempt.
-    setenv("MC_MMAP_ARENA_POOL_SIZE", "infinite", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_MMAP_ARENA_POOL_SIZE",
+                                            "infinite", 1);
     FLAGS_minloglevel = google::INFO;
     testing::internal::CaptureStderr();
     void* first_ptr = allocate_buffer_mmap_memory(64 * 1024, 64);
@@ -144,7 +147,8 @@ TEST_F(MmapArenaFallbackTest, ArenaInitFailureIsStickyForProcessLifetime) {
 
     // Fix the env and try again in the same process. std::call_once should
     // keep us on the fallback path without re-running initialization.
-    setenv("MC_MMAP_ARENA_POOL_SIZE", "2gb", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_MMAP_ARENA_POOL_SIZE", "2gb",
+                                            1);
     testing::internal::CaptureStderr();
     void* second_ptr = allocate_buffer_mmap_memory(64 * 1024, 64);
     ASSERT_NE(second_ptr, nullptr);
@@ -162,9 +166,10 @@ TEST_F(MmapArenaFallbackTest,
                         "test only proves itself on hugepage-free hosts";
     }
 
-    unsetenv("MC_DISABLE_MMAP_ARENA");
-    setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
-    setenv("MC_MMAP_ARENA_POOL_SIZE", "2mb", 1);
+    mooncake::test::EnvironTestPeer::UnsetEnv("MC_DISABLE_MMAP_ARENA");
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_USE_HUGEPAGE", "1", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_MMAP_ARENA_POOL_SIZE", "2mb",
+                                            1);
 
     FLAGS_minloglevel = google::INFO;
     testing::internal::CaptureStderr();
@@ -192,7 +197,7 @@ TEST_F(MmapArenaFallbackTest, HonorsPageAlignment) {
 }
 
 TEST_F(MmapArenaFallbackTest, NoHugepagesAllocFree) {
-    unsetenv("MC_STORE_USE_HUGEPAGE");
+    mooncake::test::EnvironTestPeer::UnsetEnv("MC_STORE_USE_HUGEPAGE");
 
     const size_t alloc_size = 65000;
     constexpr size_t alignment = 64;

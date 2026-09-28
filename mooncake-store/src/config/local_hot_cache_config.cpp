@@ -42,12 +42,12 @@ size_t ParseLegacyPositiveSizeOr(const std::optional<std::string>& raw_value,
 
 }  // namespace
 
-LocalHotCacheConfig LocalHotCacheConfig::FromEnvironment() {
+LocalHotCacheConfig LocalHotCacheConfig::FromEnvironment(const Environ& env) {
     LocalHotCacheConfig config;
     using Variables = LocalHotCacheEnvironmentVariables;
 
     const auto total_size =
-        Environ::Read(Variables::MC_STORE_LOCAL_HOT_CACHE_SIZE);
+        env.GetTyped(Variables::MC_STORE_LOCAL_HOT_CACHE_SIZE);
     config.total_size_bytes = ParseLegacyPositiveSizeOr(
         total_size, 0, Variables::MC_STORE_LOCAL_HOT_CACHE_SIZE.name,
         ", disable local hot cache");
@@ -56,17 +56,17 @@ LocalHotCacheConfig LocalHotCacheConfig::FromEnvironment() {
     }
 
     const auto block_size =
-        Environ::Read(Variables::MC_STORE_LOCAL_HOT_BLOCK_SIZE);
+        env.GetTyped(Variables::MC_STORE_LOCAL_HOT_BLOCK_SIZE);
     config.block_size_bytes =
         ParseLegacyPositiveSizeOr(block_size, config.block_size_bytes,
                                   Variables::MC_STORE_LOCAL_HOT_BLOCK_SIZE.name,
                                   ", using default block size");
 
-    config.use_shm = Environ::Read(Variables::MC_STORE_LOCAL_HOT_CACHE_USE_SHM)
+    config.use_shm = env.GetTyped(Variables::MC_STORE_LOCAL_HOT_CACHE_USE_SHM)
                          .value_or(std::string{}) == "1";
 
     const auto admission_threshold =
-        Environ::Read(Variables::MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD);
+        env.GetTyped(Variables::MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD);
     if (admission_threshold.has_value()) {
         const std::string error_message =
             "Invalid " +

@@ -34,6 +34,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include "environ_test_peer.h"
 
 namespace mooncake {
 namespace testing {
@@ -55,7 +56,8 @@ class RealClientHugepageRegisterTest : public ::testing::Test {
         google::InitGoogleLogging("RealClientHugepageRegisterTest");
         FLAGS_logtostderr = 1;
         // Must be set before the ShmHelper singleton is first instantiated.
-        setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
+        mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_USE_HUGEPAGE", "1",
+                                                1);
         if (const char* p = std::getenv("PROTOCOL")) {
             protocol_ = p;
         }
@@ -194,10 +196,14 @@ TEST_F(RealClientHugepageRegisterTest, HotCacheShmRegistersAlignedSegment) {
     const char* orig_size = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     const char* orig_block = std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
     const char* orig_shm = std::getenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
-    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "34865152",
-           1);  // 33MB, not 2MB-multiple
-    setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "3145728", 1);  // 3MB -> 11 blocks
-    setenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1", 1);
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_LOCAL_HOT_CACHE_SIZE",
+                                            "34865152",
+                                            1);  // 33MB, not 2MB-multiple
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_LOCAL_HOT_BLOCK_SIZE",
+                                            "3145728",
+                                            1);  // 3MB -> 11 blocks
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM",
+                                            "1", 1);
 
     auto client_opt = Client::Create(
         "localhost:17819", "P2PHANDSHAKE", protocol_,
@@ -208,19 +214,25 @@ TEST_F(RealClientHugepageRegisterTest, HotCacheShmRegistersAlignedSegment) {
 
     client_opt.reset();  // tear down before restoring the environment
     if (orig_size) {
-        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", orig_size, 1);
+        mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_LOCAL_HOT_CACHE_SIZE",
+                                                orig_size, 1);
     } else {
-        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+        mooncake::test::EnvironTestPeer::UnsetEnv(
+            "MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
     if (orig_block) {
-        setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", orig_block, 1);
+        mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_LOCAL_HOT_BLOCK_SIZE",
+                                                orig_block, 1);
     } else {
-        unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
+        mooncake::test::EnvironTestPeer::UnsetEnv(
+            "MC_STORE_LOCAL_HOT_BLOCK_SIZE");
     }
     if (orig_shm) {
-        setenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", orig_shm, 1);
+        mooncake::test::EnvironTestPeer::SetEnv(
+            "MC_STORE_LOCAL_HOT_CACHE_USE_SHM", orig_shm, 1);
     } else {
-        unsetenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
+        mooncake::test::EnvironTestPeer::UnsetEnv(
+            "MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
     }
 }
 

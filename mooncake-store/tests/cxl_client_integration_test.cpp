@@ -21,6 +21,7 @@
 #include "types.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
+#include "environ_test_peer.h"
 
 DEFINE_string(protocol, "cxl", "Transfer protocol: rdma|tcp|cxl");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -119,10 +120,13 @@ class ClientIntegrationTestCxl : public ::testing::Test {
         ASSERT_EQ(ftruncate(tmp_fd, FLAGS_cxl_device_size), 0);
 
         // Override flags from environment variables if present
-        setenv("MC_CXL_DEV_PATH", FLAGS_cxl_device_name.c_str(), 1);
-        setenv("MC_CXL_DEV_SIZE", std::to_string(FLAGS_cxl_device_size).c_str(),
-               1);
-        setenv("MC_MS_AUTO_DISC", std::to_string(FLAGS_auto_disc).c_str(), 0);
+        mooncake::test::EnvironTestPeer::SetEnv(
+            "MC_CXL_DEV_PATH", FLAGS_cxl_device_name.c_str(), 1);
+        mooncake::test::EnvironTestPeer::SetEnv(
+            "MC_CXL_DEV_SIZE", std::to_string(FLAGS_cxl_device_size).c_str(),
+            1);
+        mooncake::test::EnvironTestPeer::SetEnv(
+            "MC_MS_AUTO_DISC", std::to_string(FLAGS_auto_disc).c_str(), 0);
 
         if (getenv("DEFAULT_KV_LEASE_TTL")) {
             default_kv_lease_ttl_ = std::stoul(getenv("DEFAULT_KV_LEASE_TTL"));

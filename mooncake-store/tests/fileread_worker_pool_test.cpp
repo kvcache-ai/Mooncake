@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include "environ_test_peer.h"
 
 namespace mooncake {
 
@@ -25,14 +26,20 @@ class ScopedFilereadWorkersEnv {
         if (const char* old = std::getenv("MC_FILEREAD_WORKERS")) {
             original_ = old;
         }
-        EXPECT_EQ(setenv("MC_FILEREAD_WORKERS", value, 1), 0);
+        EXPECT_EQ(mooncake::test::EnvironTestPeer::SetEnv("MC_FILEREAD_WORKERS",
+                                                          value, 1),
+                  0);
     }
 
     ~ScopedFilereadWorkersEnv() {
         if (original_) {
-            EXPECT_EQ(setenv("MC_FILEREAD_WORKERS", original_->c_str(), 1), 0);
+            EXPECT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                          "MC_FILEREAD_WORKERS", original_->c_str(), 1),
+                      0);
         } else {
-            EXPECT_EQ(unsetenv("MC_FILEREAD_WORKERS"), 0);
+            EXPECT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(
+                          "MC_FILEREAD_WORKERS"),
+                      0);
         }
     }
 
@@ -50,7 +57,9 @@ TEST(FilereadWorkerPoolTest, AcceptsTypedTrailingWhitespaceAndCaches) {
         FilereadWorkerPool pool(backend);
         EXPECT_EQ(FilereadWorkerPoolTestPeer::WorkerCount(pool), 2u);
     }
-    ASSERT_EQ(setenv("MC_FILEREAD_WORKERS", "3", 1), 0);
+    ASSERT_EQ(
+        mooncake::test::EnvironTestPeer::SetEnv("MC_FILEREAD_WORKERS", "3", 1),
+        0);
     {
         FilereadWorkerPool pool(backend);
         EXPECT_EQ(FilereadWorkerPoolTestPeer::WorkerCount(pool), 2u);

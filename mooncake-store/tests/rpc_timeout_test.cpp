@@ -34,10 +34,12 @@
 #include <optional>
 #include <string>
 
+#include "environ.h"
 #include "master_client.h"
 #include "pyclient.h"
 #include "test_server_helpers.h"
 #include "types.h"
+#include "environ_test_peer.h"
 
 namespace mooncake {
 namespace {
@@ -52,16 +54,19 @@ class RpcTimeoutEnvTest : public ::testing::Test {
         }
         // These integration tests use TCP regardless of the ambient protocol.
         for (const char* name : names_) {
-            ASSERT_EQ(unsetenv(name), 0);
+            ASSERT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(name), 0);
         }
     }
 
     void TearDown() override {
         for (int i = 0; i < 3; ++i) {
             if (original_[i].has_value()) {
-                EXPECT_EQ(setenv(names_[i], original_[i]->c_str(), 1), 0);
+                EXPECT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                              names_[i], original_[i]->c_str(), 1),
+                          0);
             } else {
-                EXPECT_EQ(unsetenv(names_[i]), 0);
+                EXPECT_EQ(mooncake::test::EnvironTestPeer::UnsetEnv(names_[i]),
+                          0);
             }
         }
     }
@@ -130,8 +135,9 @@ TEST_F(RpcTimeoutEnvTest, RpcTimesOutAgainstUnresponsiveMaster) {
     constexpr int kTimeoutMs = 500;
 
     // The constructor reads MC_RPC_TIMEOUT_MS, so it must be set beforehand.
-    ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS", std::to_string(kTimeoutMs).c_str(),
-                       /*overwrite=*/1),
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MC_RPC_TIMEOUT_MS", std::to_string(kTimeoutMs).c_str(),
+                  /*overwrite=*/1),
               0);
 
     BlackHoleServer server;
@@ -163,8 +169,12 @@ TEST_F(RpcTimeoutEnvTest, RpcTimesOutAgainstUnresponsiveMaster) {
 // when the race lost, and must run clean with the guard.
 TEST_F(RpcTimeoutEnvTest, TeardownDrainsInFlightTimeoutRequests) {
     // Long request timeout so teardown lands squarely inside the call window.
-    ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS", "3000", /*overwrite=*/1), 0);
-    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "100", /*overwrite=*/1), 0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv("MC_RPC_TIMEOUT_MS",
+                                                      "3000", /*overwrite=*/1),
+              0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MC_RPC_CONNECT_TIMEOUT_MS", "100", /*overwrite=*/1),
+              0);
 
     BlackHoleServer server;
 
@@ -221,7 +231,9 @@ TEST(RpcTimeoutTest, HaControlPolicyPreservesForegroundRetryPolicy) {
     const auto port = ntohs(addr.sin_port);
     ASSERT_GT(port, 0);
 
-    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "100", 1), 0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MC_RPC_CONNECT_TIMEOUT_MS", "100", 1),
+              0);
 
     MasterClient client(generate_uuid());
 
@@ -251,7 +263,7 @@ TEST(RpcTimeoutTest, HaControlPolicyPreservesForegroundRetryPolicy) {
             std::chrono::steady_clock::now() - foreground_start)
             .count();
 
-    ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+    mooncake::test::EnvironTestPeer::UnsetEnv("MC_RPC_CONNECT_TIMEOUT_MS");
     EXPECT_EQ(::close(probe_fd), 0);
 
     EXPECT_EQ(initial_rc, ErrorCode::RPC_FAIL);
@@ -285,7 +297,9 @@ TEST(RpcTimeoutTest, FailedCandidateProbeDoesNotRetargetHeartbeat) {
     const std::string candidate_address =
         "127.0.0.1:" + std::to_string(ntohs(addr.sin_port));
 
-    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "100", 1), 0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MC_RPC_CONNECT_TIMEOUT_MS", "100", 1),
+              0);
     MasterClient client(generate_uuid());
     ASSERT_EQ(ErrorCode::OK, client.Connect(confirmed_leader.master_address()));
     client.EnableHaConnectionPolicy();
@@ -293,7 +307,7 @@ TEST(RpcTimeoutTest, FailedCandidateProbeDoesNotRetargetHeartbeat) {
     EXPECT_EQ(ErrorCode::RPC_FAIL, client.Connect(candidate_address));
     auto heartbeat = client.Ping();
 
-    ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+    mooncake::test::EnvironTestPeer::UnsetEnv("MC_RPC_CONNECT_TIMEOUT_MS");
     EXPECT_EQ(::close(probe_fd), 0);
     ASSERT_TRUE(heartbeat.has_value());
 }
@@ -313,8 +327,8 @@ TEST_F(RpcTimeoutEnvTest, TimeoutEnvOverridesAreOptIn) {
             std::chrono::seconds(30)};
     };
 
-    ::unsetenv("MC_RPC_TIMEOUT_MS");
-    ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+    mooncake::test::EnvironTestPeer::UnsetEnv("MC_RPC_TIMEOUT_MS");
+    mooncake::test::EnvironTestPeer::UnsetEnv("MC_RPC_CONNECT_TIMEOUT_MS");
 
     auto non_ha_config = detail::MakeMasterRpcClientPoolConfig();
     EXPECT_EQ(non_ha_config.connect_retry_count, 3u);
@@ -329,20 +343,25 @@ TEST_F(RpcTimeoutEnvTest, TimeoutEnvOverridesAreOptIn) {
     EXPECT_EQ(ha_config.client_config.connect_timeout_duration,
               std::chrono::seconds(1));
 
+    // Read the process environment, as MakeMasterRpcClientPoolConfig() does,
+    // so the helper and the master pool observe the same values.
     StubClientConfig defaults;
-    detail::ApplyRpcTimeoutOverrides(defaults,
-                                     RpcTimeoutConfig::FromEnvironment());
+    detail::ApplyRpcTimeoutOverrides(
+        defaults, RpcTimeoutConfig::FromEnvironment(Environ::Process()));
     EXPECT_EQ(defaults.request_timeout_duration, std::chrono::seconds(30));
     EXPECT_EQ(defaults.connect_timeout_duration, std::chrono::seconds(30));
     const auto original_master_config = detail::MakeMasterRpcClientPoolConfig();
 
-    ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS", "1500", /*overwrite=*/1), 0);
-    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "1500", /*overwrite=*/1),
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv("MC_RPC_TIMEOUT_MS",
+                                                      "1500", /*overwrite=*/1),
+              0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MC_RPC_CONNECT_TIMEOUT_MS", "1500", /*overwrite=*/1),
               0);
 
     StubClientConfig overridden;
-    detail::ApplyRpcTimeoutOverrides(overridden,
-                                     RpcTimeoutConfig::FromEnvironment());
+    detail::ApplyRpcTimeoutOverrides(
+        overridden, RpcTimeoutConfig::FromEnvironment(Environ::Process()));
     EXPECT_EQ(overridden.request_timeout_duration,
               std::chrono::milliseconds(1500));
     EXPECT_EQ(overridden.connect_timeout_duration,
@@ -368,17 +387,23 @@ TEST_F(RpcTimeoutEnvTest, OverridesPreserveCallerPolicyAndUseResolvedValues) {
         std::chrono::milliseconds request_timeout_duration{7000};
         std::chrono::milliseconds connect_timeout_duration{1000};
     };
+    const MapEnvironSource unset_environment;
     StubClientConfig defaults;
-    detail::ApplyRpcTimeoutOverrides(defaults,
-                                     RpcTimeoutConfig::FromEnvironment());
+    detail::ApplyRpcTimeoutOverrides(
+        defaults,
+        RpcTimeoutConfig::FromEnvironment(Environ(unset_environment)));
     EXPECT_EQ(defaults.request_timeout_duration,
               std::chrono::milliseconds(7000));
     EXPECT_EQ(defaults.connect_timeout_duration,
               std::chrono::milliseconds(1000));
 
     // The helper must apply this snapshot, not re-read the environment.
-    ASSERT_EQ(setenv("MC_RPC_TIMEOUT_MS", "9999", 1), 0);
-    ASSERT_EQ(setenv("MC_RPC_CONNECT_TIMEOUT_MS", "9999", 1), 0);
+    ASSERT_EQ(
+        mooncake::test::EnvironTestPeer::SetEnv("MC_RPC_TIMEOUT_MS", "9999", 1),
+        0);
+    ASSERT_EQ(mooncake::test::EnvironTestPeer::SetEnv(
+                  "MC_RPC_CONNECT_TIMEOUT_MS", "9999", 1),
+              0);
     for (const int timeout_ms : {0, -1, 1500}) {
         SCOPED_TRACE(timeout_ms);
         RpcTimeoutConfig config;
@@ -403,7 +428,9 @@ TEST_F(RpcTimeoutEnvTest, OverridesPreserveCallerPolicyAndUseResolvedValues) {
 
 TEST_F(RpcTimeoutEnvTest, RpcTimesOutAgainstUnresponsiveOffloadPeer) {
     constexpr int kTimeoutMs = 500;
-    ASSERT_EQ(setenv("MC_RPC_TIMEOUT_MS", "500", 1), 0);
+    ASSERT_EQ(
+        mooncake::test::EnvironTestPeer::SetEnv("MC_RPC_TIMEOUT_MS", "500", 1),
+        0);
     BlackHoleServer server;
     ClientRequester requester;
 

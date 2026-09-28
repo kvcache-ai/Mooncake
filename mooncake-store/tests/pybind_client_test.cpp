@@ -24,6 +24,7 @@
 #include "config.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
+#include "environ_test_peer.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -48,14 +49,15 @@ class ScopedEnvVar {
    public:
     ScopedEnvVar(const char* name, const char* value) : name_(name) {
         if (const char* previous = getenv(name)) previous_ = previous;
-        setenv(name, value, 1);
+        mooncake::test::EnvironTestPeer::SetEnv(name, value, 1);
     }
 
     ~ScopedEnvVar() {
         if (previous_) {
-            setenv(name_.c_str(), previous_->c_str(), 1);
+            mooncake::test::EnvironTestPeer::SetEnv(name_.c_str(),
+                                                    previous_->c_str(), 1);
         } else {
-            unsetenv(name_.c_str());
+            mooncake::test::EnvironTestPeer::UnsetEnv(name_.c_str());
         }
     }
 

@@ -4,7 +4,7 @@ add_library(rdma_transport OBJECT ${RDMA_SOURCES})
 target_link_libraries(
   rdma_transport
   PUBLIC gflags::gflags glog::glog
-  PRIVATE JsonCpp::JsonCpp pthread)
+  PRIVATE JsonCpp::JsonCpp mooncake_common pthread)
 
 if(USE_CUDA)
   target_compile_definitions(rdma_transport PRIVATE _GNU_SOURCE)

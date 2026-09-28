@@ -305,6 +305,21 @@ struct S3ClientEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_AWS_REQUEST_TIMEOUT_MS);
 };
 
+struct RpcClientIoEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(int, MC_RPC_CLIENT_IO_THREADS);
+    MC_DEFINE_ENV_VAR(int, MC_STORE_RPC_CLIENT_IO_THREADS);
+    MC_DEFINE_ENV_VAR(int, MC_TE_RPC_CLIENT_IO_THREADS);
+};
+
+struct RdmaTransportEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, WITH_NVIDIA_PEERMEM);
+    MC_DEFINE_ENV_VAR(bool, MC_RDMA_DATA_DIRECT);
+};
+
+struct EfaTransportEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(int, MC_EFA_CQ_THREADS);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake

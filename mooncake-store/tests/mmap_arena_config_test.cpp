@@ -1,76 +1,49 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
-#include <optional>
 #include <string>
 
 #include "../src/config/mmap_arena_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
-class ScopedEnvVar {
-   public:
-    explicit ScopedEnvVar(const char* name) : name_(name) {
-        if (const char* value = std::getenv(name)) {
-            original_ = value;
-        }
-        unsetenv(name);
-    }
-
-    ~ScopedEnvVar() {
-        if (original_.has_value()) {
-            setenv(name_.c_str(), original_->c_str(), 1);
-        } else {
-            unsetenv(name_.c_str());
-        }
-    }
-
-    ScopedEnvVar(const ScopedEnvVar&) = delete;
-    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
-    void Set(const char* value) { setenv(name_.c_str(), value, 1); }
-    void Unset() { unsetenv(name_.c_str()); }
-
-   private:
-    std::string name_;
-    std::optional<std::string> original_;
-};
-
-struct MmapArenaEnvironment {
-    ScopedEnvVar pool_size{"MC_MMAP_ARENA_POOL_SIZE"};
-    ScopedEnvVar disable{"MC_DISABLE_MMAP_ARENA"};
-    ScopedEnvVar use_hugepage{"MC_STORE_USE_HUGEPAGE"};
-    ScopedEnvVar hugepage_size{"MC_STORE_HUGEPAGE_SIZE"};
-};
-
 class MmapArenaConfigTest : public ::testing::Test {
    protected:
     static constexpr uint64_t kFlagPoolSize = 8ULL * 1024 * 1024 * 1024;
+    static constexpr const char* kPoolSize = "MC_MMAP_ARENA_POOL_SIZE";
+    static constexpr const char* kDisable = "MC_DISABLE_MMAP_ARENA";
+    static constexpr const char* kUseHugepage = "MC_STORE_USE_HUGEPAGE";
+    static constexpr const char* kHugepageSize = "MC_STORE_HUGEPAGE_SIZE";
 
-    MmapArenaEnvironment env;
+    MmapArenaConfig Load(bool enabled_by_flag) const {
+        return MmapArenaConfig::FromEnvironment(Environ(source_),
+                                                enabled_by_flag, kFlagPoolSize);
+    }
+
+    MapEnvironSource source_;
 };
 
 TEST_F(MmapArenaConfigTest, UnsetAndEmptyEnvironmentPreserveFlagInputs) {
-    auto config = MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
+    auto config = Load(false);
     EXPECT_FALSE(config.enabled);
     EXPECT_EQ(config.pool_size, kFlagPoolSize);
     EXPECT_FALSE(config.hugepages_explicitly_requested);
 
-    env.pool_size.Set("");
-    env.disable.Set("");
-    config = MmapArenaConfig::FromEnvironment(true, kFlagPoolSize);
+    source_.Set(kPoolSize, "");
+    source_.Set(kDisable, "");
+    config = Load(true);
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.pool_size, kFlagPoolSize);
     EXPECT_FALSE(config.hugepages_explicitly_requested);
 }
 
 TEST_F(MmapArenaConfigTest, PoolSizeEnvironmentOptsInAndOverridesFlag) {
-    env.pool_size.Set(" 1.5 MB ");
+    source_.Set(kPoolSize, " 1.5 MB ");
 
-    const auto config = MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
+    const auto config = Load(false);
 
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.pool_size, 1572864);
@@ -78,9 +51,9 @@ TEST_F(MmapArenaConfigTest, PoolSizeEnvironmentOptsInAndOverridesFlag) {
 }
 
 TEST_F(MmapArenaConfigTest, PreservesAcceptedInfinitePoolSize) {
-    env.pool_size.Set("infinite");
+    source_.Set(kPoolSize, "infinite");
 
-    const auto config = MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
+    const auto config = Load(false);
 
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.pool_size, std::numeric_limits<uint64_t>::max());
@@ -88,11 +61,10 @@ TEST_F(MmapArenaConfigTest, PreservesAcceptedInfinitePoolSize) {
 
 TEST_F(MmapArenaConfigTest, InvalidAndZeroPoolSizesOptInWithFlagFallback) {
     for (const char* value : {"0", "-1", "invalid", "   ", "1e999"}) {
-        env.pool_size.Set(value);
+        source_.Set(kPoolSize, value);
         ::testing::internal::CaptureStderr();
 
-        const auto config =
-            MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
+        const auto config = Load(false);
         const std::string logs = ::testing::internal::GetCapturedStderr();
 
         EXPECT_TRUE(config.enabled) << value;
@@ -104,30 +76,26 @@ TEST_F(MmapArenaConfigTest, InvalidAndZeroPoolSizesOptInWithFlagFallback) {
 }
 
 TEST_F(MmapArenaConfigTest, DisableEnvironmentUsesCanonicalBooleanTokens) {
-    env.pool_size.Set("2mb");
+    source_.Set(kPoolSize, "2mb");
     for (const char* value : {"1", " TRUE ", "yes", "on", "enable"}) {
-        env.disable.Set(value);
-        EXPECT_FALSE(
-            MmapArenaConfig::FromEnvironment(false, kFlagPoolSize).enabled)
-            << value;
+        source_.Set(kDisable, value);
+        EXPECT_FALSE(Load(false).enabled) << value;
     }
 
     for (const char* value : {"0", " false ", "no", "off", "disable"}) {
-        env.disable.Set(value);
-        EXPECT_TRUE(
-            MmapArenaConfig::FromEnvironment(false, kFlagPoolSize).enabled)
-            << value;
+        source_.Set(kDisable, value);
+        EXPECT_TRUE(Load(false).enabled) << value;
     }
 
-    env.disable.Set("true");
-    EXPECT_FALSE(MmapArenaConfig::FromEnvironment(true, kFlagPoolSize).enabled);
+    source_.Set(kDisable, "true");
+    EXPECT_FALSE(Load(true).enabled);
 }
 
 TEST_F(MmapArenaConfigTest, InvalidDisableValueWarnsAndFallsBackToFalse) {
-    env.disable.Set("maybe");
+    source_.Set(kDisable, "maybe");
     ::testing::internal::CaptureStderr();
 
-    const auto config = MmapArenaConfig::FromEnvironment(true, kFlagPoolSize);
+    const auto config = Load(true);
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_TRUE(config.enabled);
@@ -136,13 +104,13 @@ TEST_F(MmapArenaConfigTest, InvalidDisableValueWarnsAndFallsBackToFalse) {
 }
 
 TEST_F(MmapArenaConfigTest, DisabledPathSkipsHugepageAndPoolValidation) {
-    env.pool_size.Set("invalid");
-    env.disable.Set("true");
-    env.use_hugepage.Set("1");
-    env.hugepage_size.Set("invalid");
+    source_.Set(kPoolSize, "invalid");
+    source_.Set(kDisable, "true");
+    source_.Set(kUseHugepage, "1");
+    source_.Set(kHugepageSize, "invalid");
     ::testing::internal::CaptureStderr();
 
-    const auto config = MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
+    const auto config = Load(false);
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_FALSE(config.enabled);
@@ -151,13 +119,13 @@ TEST_F(MmapArenaConfigTest, DisabledPathSkipsHugepageAndPoolValidation) {
 }
 
 TEST_F(MmapArenaConfigTest, PreservesValidationDiagnosticOrder) {
-    env.pool_size.Set("invalid");
-    env.disable.Set("maybe");
-    env.use_hugepage.Set("1");
-    env.hugepage_size.Set("invalid");
+    source_.Set(kPoolSize, "invalid");
+    source_.Set(kDisable, "maybe");
+    source_.Set(kUseHugepage, "1");
+    source_.Set(kHugepageSize, "invalid");
     ::testing::internal::CaptureStderr();
 
-    const auto config = MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
+    const auto config = Load(false);
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_TRUE(config.enabled);
@@ -173,22 +141,22 @@ TEST_F(MmapArenaConfigTest, PreservesValidationDiagnosticOrder) {
 }
 
 TEST_F(MmapArenaConfigTest, AnyPresentHugepageFlagIsAnExplicitRequest) {
-    env.use_hugepage.Set("0");
+    source_.Set(kUseHugepage, "0");
 
-    const auto config = MmapArenaConfig::FromEnvironment(true, kFlagPoolSize);
+    const auto config = Load(true);
 
     EXPECT_TRUE(config.enabled);
     EXPECT_TRUE(config.hugepages_explicitly_requested);
 }
 
 TEST_F(MmapArenaConfigTest, EachConstructionReadsCurrentEnvironment) {
-    env.pool_size.Set("2mb");
-    auto config = MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
+    source_.Set(kPoolSize, "2mb");
+    auto config = Load(false);
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.pool_size, 2ULL * 1024 * 1024);
 
-    env.pool_size.Unset();
-    config = MmapArenaConfig::FromEnvironment(false, kFlagPoolSize);
+    source_.Unset(kPoolSize);
+    config = Load(false);
     EXPECT_FALSE(config.enabled);
     EXPECT_EQ(config.pool_size, kFlagPoolSize);
 }

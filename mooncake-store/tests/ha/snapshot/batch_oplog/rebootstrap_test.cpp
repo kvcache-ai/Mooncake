@@ -19,6 +19,7 @@
 #include "ha/snapshot/batch_oplog/codec.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
+#include "environ_test_peer.h"
 
 namespace mooncake::test {
 namespace {
@@ -109,7 +110,9 @@ class RebootstrapTest : public ::testing::Test {
     void TearDown() override {
         ReleaseSwap();
         service_->Stop();
-        if (armed_) unsetenv("MOONCAKE_TEST_FAILPOINT_DIR");
+        if (armed_)
+            mooncake::test::EnvironTestPeer::UnsetEnv(
+                "MOONCAKE_TEST_FAILPOINT_DIR");
         std::filesystem::remove_all(root_);
     }
     void Prefix(uint64_t id) {
@@ -210,7 +213,8 @@ class RebootstrapTest : public ::testing::Test {
         EXPECT_EQ("new", handoff->segments[0].segment_name);
     }
     void ArmSwap() {
-        setenv("MOONCAKE_TEST_FAILPOINT_DIR", root_.c_str(), 1);
+        mooncake::test::EnvironTestPeer::SetEnv("MOONCAKE_TEST_FAILPOINT_DIR",
+                                                root_.c_str(), 1);
         armed_ = true;
         std::ofstream(root_ + "/standby_rebootstrap_before_swap.arm");
     }

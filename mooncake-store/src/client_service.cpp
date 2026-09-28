@@ -51,6 +51,7 @@
 #include "crc_checksum.h"
 #include "config/client_numa_config.h"
 #include "storage/distributed/distributed_storage_backend.h"
+#include "environ.h"
 
 namespace mooncake {
 
@@ -446,8 +447,9 @@ Client::Client(const std::string& local_hostname,
                      metrics_ ? &metrics_->master_client_metric : nullptr,
                      tenant_id),
       local_hostname_(local_hostname),
-      host_id_(
-          ClientHostIdentityConfig::FromEnvironment(local_hostname).host_id),
+      host_id_(ClientHostIdentityConfig::FromEnvironment(Environ::Process(),
+                                                         local_hostname)
+                   .host_id),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       object_checksum_enabled_(
@@ -831,7 +833,7 @@ ErrorCode Client::InitTransferEngine(
     bool auto_discover = false;
     if (!use_tent) {
         auto config = ClientAutoDiscoveryConfig::FromEnvironment(
-            protocol, device_names.has_value());
+            Environ::Process(), protocol, device_names.has_value());
         auto_discover = config.enabled;
         transfer_engine_->setAutoDiscover(
             {.enabled = auto_discover, .protocol = protocol});
@@ -843,7 +845,7 @@ ErrorCode Client::InitTransferEngine(
                 << protocol;
         }
 
-        config.LoadFiltersFromEnvironment();
+        config.LoadFiltersFromEnvironment(Environ::Process());
         if (auto_discover) {
             transfer_engine_->setWhitelistFilters(std::move(config.filters));
         }
@@ -1030,8 +1032,8 @@ void Client::InitTransferSubmitter() {
     // used separately where needed.
 #ifdef USE_NOF
     const int numa_socket_id =
-        ClientNumaConfig::FromEnvironment().socket_id.value_or(
-            GetCurrentNumaSocketId());
+        ClientNumaConfig::FromEnvironment(Environ::Process())
+            .socket_id.value_or(GetCurrentNumaSocketId());
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);
@@ -5477,7 +5479,8 @@ ErrorCode Client::InitLocalHotCache() {
         return ErrorCode::OK;
     }
 
-    const auto config = LocalHotCacheConfig::FromEnvironment();
+    const auto config =
+        LocalHotCacheConfig::FromEnvironment(Environ::Process());
     if (config.total_size_bytes == 0) {
         return ErrorCode::OK;
     }

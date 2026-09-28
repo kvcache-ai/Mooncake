@@ -16,6 +16,7 @@
 #include "types.h"
 #include "common/client_buffer_allocation.h"
 #include "common/network.h"
+#include "environ_test_peer.h"
 
 namespace mooncake {
 namespace testing {
@@ -34,9 +35,10 @@ class EnvGuard {
 
     ~EnvGuard() {
         if (old_value_.has_value()) {
-            setenv(key_, old_value_->c_str(), 1);
+            mooncake::test::EnvironTestPeer::SetEnv(key_, old_value_->c_str(),
+                                                    1);
         } else {
-            unsetenv(key_);
+            mooncake::test::EnvironTestPeer::UnsetEnv(key_);
         }
     }
 
@@ -166,7 +168,7 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
     void SetUp() override {
         memcpy_guard_ = std::make_unique<EnvGuard>("MC_STORE_MEMCPY");
         vlog_guard_ = std::make_unique<VLogGuard>(1);
-        unsetenv("MC_STORE_MEMCPY");
+        mooncake::test::EnvironTestPeer::UnsetEnv("MC_STORE_MEMCPY");
 
         InProcMasterConfig config;
         config.http_metadata_port = getFreeTcpPort();
@@ -435,7 +437,8 @@ class HotCacheRedirectStrategyTest
 
 TEST_P(HotCacheRedirectStrategyTest, CacheHitUsesLocalMemcpy) {
     EnvGuard cache_size_guard("MC_STORE_LOCAL_HOT_CACHE_SIZE");
-    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB
+    mooncake::test::EnvironTestPeer::SetEnv("MC_STORE_LOCAL_HOT_CACHE_SIZE",
+                                            "33554432", 1);  // 32MB
 
     const HandshakeMode mode = GetParam();
     const bool is_p2p = mode == HandshakeMode::P2P;

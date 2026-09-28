@@ -5,7 +5,7 @@ add_library(efa_transport OBJECT ${EFA_SOURCES})
 target_link_libraries(
   efa_transport
   PUBLIC glog::glog gflags::gflags
-  PRIVATE fabric)
+  PRIVATE fabric mooncake_common)
 
 target_include_directories(
   efa_transport
