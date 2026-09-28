@@ -818,3 +818,13 @@ endif()
 target_include_directories(tent_rpc_timeout_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rpc_timeout_test COMMAND tent_rpc_timeout_test)
+
+add_executable(tent_peer_health_test peer_health_test.cpp)
+target_link_libraries(tent_peer_health_test PRIVATE gtest gtest_main
+                                                    tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_peer_health_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_peer_health_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_peer_health_test COMMAND tent_peer_health_test)
