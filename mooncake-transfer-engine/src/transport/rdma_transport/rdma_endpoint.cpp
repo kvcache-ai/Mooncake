@@ -437,18 +437,12 @@ int RdmaEndPoint::postNotificationReceive(size_t slot) {
 }
 
 void RdmaEndPoint::rollbackNotificationConstruction() {
-    rollbackNotificationConstruction(
-        NotificationCleanupOps{ibv_destroy_qp, ibv_dereg_mr});
-}
-
-void RdmaEndPoint::rollbackNotificationConstruction(
-    const NotificationCleanupOps &ops) {
     // constructNotification() holds notify_.mutex and has not registered the
     // QP with the context yet. Best-effort cleanup keeps a failed optional
     // channel from retaining verbs resources until endpoint destruction.
     auto &s = notify_;
     if (s.qp) {
-        const int ret = ops.destroy_qp(s.qp);
+        const int ret = ibv_destroy_qp(s.qp);
         if (ret == 0) {
             s.qp = nullptr;
         } else {
@@ -457,7 +451,7 @@ void RdmaEndPoint::rollbackNotificationConstruction(
         }
     }
     if (s.send_mr) {
-        const int ret = ops.dereg_mr(s.send_mr);
+        const int ret = ibv_dereg_mr(s.send_mr);
         if (ret == 0) {
             s.send_mr = nullptr;
         } else {
@@ -467,7 +461,7 @@ void RdmaEndPoint::rollbackNotificationConstruction(
         }
     }
     if (s.recv_mr) {
-        const int ret = ops.dereg_mr(s.recv_mr);
+        const int ret = ibv_dereg_mr(s.recv_mr);
         if (ret == 0) {
             s.recv_mr = nullptr;
         } else {

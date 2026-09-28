@@ -154,13 +154,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
         char *slot, const TransferMetadata::NotifyDesc &notify);
     static bool decodeNotification(const char *slot, size_t bytes,
                                    TransferMetadata::NotifyDesc &notify);
-    struct NotificationCleanupOps {
-        int (*destroy_qp)(ibv_qp *) = nullptr;
-        int (*dereg_mr)(ibv_mr *) = nullptr;
-    };
     int constructNotification();
     void rollbackNotificationConstruction();
-    void rollbackNotificationConstruction(const NotificationCleanupOps &ops);
     int connectNotification(const ibv_gid &gid, uint32_t lid, uint32_t peer_qp,
                             int local_gid_index);
     uint32_t notificationQpNum() const;

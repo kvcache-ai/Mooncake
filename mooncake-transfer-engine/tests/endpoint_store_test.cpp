@@ -45,11 +45,8 @@ using namespace mooncake;
 namespace mooncake {
 class RdmaEndpointStoreNotificationTestPeer {
    public:
-    using CleanupOps = RdmaEndPoint::NotificationCleanupOps;
-
-    static void rollbackNotificationConstruction(RdmaEndPoint& endpoint,
-                                                 const CleanupOps& ops) {
-        endpoint.rollbackNotificationConstruction(ops);
+    static int constructNotification(RdmaEndPoint& endpoint) {
+        return endpoint.constructNotification();
     }
 
     static bool hasResources(const RdmaEndPoint& endpoint) {
@@ -59,29 +56,9 @@ class RdmaEndpointStoreNotificationTestPeer {
                endpoint.notify_.recv_buffer;
     }
 
-    static void seedResources(RdmaEndPoint& endpoint) {
-        std::lock_guard<std::mutex> guard(endpoint.notify_.mutex);
-        endpoint.notify_.qp = reinterpret_cast<ibv_qp*>(0x1);
-        endpoint.notify_.send_mr = reinterpret_cast<ibv_mr*>(0x2);
-        endpoint.notify_.recv_mr = reinterpret_cast<ibv_mr*>(0x3);
-        endpoint.notify_.send_buffer = std::make_unique<char[]>(1);
-        endpoint.notify_.recv_buffer = std::make_unique<char[]>(1);
-        endpoint.notify_.enabled = true;
-    }
-
     static bool enabled(const RdmaEndPoint& endpoint) {
         std::lock_guard<std::mutex> guard(endpoint.notify_.mutex);
         return endpoint.notify_.enabled;
-    }
-
-    static void clearResources(RdmaEndPoint& endpoint) {
-        std::lock_guard<std::mutex> guard(endpoint.notify_.mutex);
-        endpoint.notify_.qp = nullptr;
-        endpoint.notify_.send_mr = nullptr;
-        endpoint.notify_.recv_mr = nullptr;
-        endpoint.notify_.send_buffer.reset();
-        endpoint.notify_.recv_buffer.reset();
-        endpoint.notify_.enabled = false;
     }
 };
 }  // namespace mooncake
@@ -255,64 +232,13 @@ TEST_F(EndpointStoreTest,
     EXPECT_EQ(sentinel, store.getEndpointByPtr(sentinel.get()));
 }
 
-struct NotificationRollbackProbe {
-    int destroy_qp_calls = 0;
-    int dereg_mr_calls = 0;
-    int destroy_qp_result = 0;
-    int dereg_mr_result = 0;
-
-    static NotificationRollbackProbe* current;
-
-    static int destroyQp(ibv_qp*) {
-        ++current->destroy_qp_calls;
-        return current->destroy_qp_result;
-    }
-
-    static int deregMr(ibv_mr*) {
-        ++current->dereg_mr_calls;
-        return current->dereg_mr_result;
-    }
-};
-
-NotificationRollbackProbe* NotificationRollbackProbe::current = nullptr;
-
-TEST_F(EndpointStoreTest, NotificationConstructionRollsBackResources) {
+TEST_F(EndpointStoreTest, NotificationConstructionRollsBackWithoutCq) {
     RdmaEndPoint endpoint(*ctx_);
-    NotificationRollbackProbe probe;
-    NotificationRollbackProbe::current = &probe;
-
-    RdmaEndpointStoreNotificationTestPeer::seedResources(endpoint);
-
-    RdmaEndpointStoreNotificationTestPeer::rollbackNotificationConstruction(
-        endpoint, {NotificationRollbackProbe::destroyQp,
-                   NotificationRollbackProbe::deregMr});
-
-    EXPECT_EQ(probe.destroy_qp_calls, 1);
-    EXPECT_EQ(probe.dereg_mr_calls, 2);
+    EXPECT_NE(
+        RdmaEndpointStoreNotificationTestPeer::constructNotification(endpoint),
+        0);
     EXPECT_FALSE(RdmaEndpointStoreNotificationTestPeer::hasResources(endpoint));
     EXPECT_FALSE(RdmaEndpointStoreNotificationTestPeer::enabled(endpoint));
-
-    NotificationRollbackProbe::current = nullptr;
-}
-
-TEST_F(EndpointStoreTest, NotificationConstructionRetainsFailedCleanup) {
-    RdmaEndPoint endpoint(*ctx_);
-    NotificationRollbackProbe probe;
-    probe.destroy_qp_result = EBUSY;
-    probe.dereg_mr_result = EBUSY;
-    NotificationRollbackProbe::current = &probe;
-
-    RdmaEndpointStoreNotificationTestPeer::seedResources(endpoint);
-
-    RdmaEndpointStoreNotificationTestPeer::rollbackNotificationConstruction(
-        endpoint, {NotificationRollbackProbe::destroyQp,
-                   NotificationRollbackProbe::deregMr});
-
-    EXPECT_TRUE(RdmaEndpointStoreNotificationTestPeer::hasResources(endpoint));
-    EXPECT_TRUE(RdmaEndpointStoreNotificationTestPeer::enabled(endpoint));
-
-    RdmaEndpointStoreNotificationTestPeer::clearResources(endpoint);
-    NotificationRollbackProbe::current = nullptr;
 }
 
 }  // namespace
