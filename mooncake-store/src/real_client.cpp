@@ -46,6 +46,7 @@
 #include "common/network.h"
 #include "common/result.h"
 #include "rpc_types.h"
+#include "request_context.h"
 #include "file_storage.h"
 #include "device/accelerator_registry.h"
 #include "default_config.h"
@@ -8500,6 +8501,113 @@ RealClient::batch_get_into_offload_object_internal(
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
     return {};
+}
+
+
+namespace {
+RequestContext LoadRequestContextAttachment(const std::string &attachment) {
+    RequestContext request_context;
+    if (!attachment.empty()) {
+        request_context = deserialize_request_context(attachment);
+        VLOG(2) << "hop-A bridge request_id=" << request_context.request_id
+                << " trace_id=" << request_context.trace_id;
+    }
+    return request_context;
+}
+}  // namespace
+
+void RealClient::put_dummy_helper_rpc(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const std::string &key, std::span<const char> value,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::optional<CurrentCtxScope> ctx_guard;
+    ctx_guard.emplace(LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment()));
+    ctx.response_msg(put_dummy_helper(key, value, config, client_id));
+}
+
+void RealClient::put_batch_dummy_helper_rpc(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::optional<CurrentCtxScope> ctx_guard;
+    ctx_guard.emplace(LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment()));
+    ctx.response_msg(put_batch_dummy_helper(keys, values, config, client_id));
+}
+
+void RealClient::put_parts_dummy_helper_rpc(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const std::string &key, std::vector<std::span<const char>> values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::optional<CurrentCtxScope> ctx_guard;
+    ctx_guard.emplace(LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment()));
+    ctx.response_msg(put_parts_dummy_helper(key, values, config, client_id));
+}
+
+void RealClient::batch_get_into_dummy_helper_rpc(
+    coro_rpc::context<std::vector<tl::expected<int64_t, ErrorCode>>> ctx,
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &sizes, int32_t device_id,
+    const UUID &client_id) {
+    std::optional<CurrentCtxScope> ctx_guard;
+    ctx_guard.emplace(LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment()));
+    ctx.response_msg(async_simple::coro::syncAwait(
+        batch_get_into_dummy_helper(keys, dummy_buffers, sizes, device_id,
+                                    client_id)));
+}
+
+void RealClient::batch_put_from_dummy_helper_rpc(
+    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config,
+    int32_t device_id, const UUID &client_id) {
+    std::optional<CurrentCtxScope> ctx_guard;
+    ctx_guard.emplace(LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment()));
+    ctx.response_msg(batch_put_from_dummy_helper(
+        keys, dummy_buffers, sizes, config, device_id, client_id));
+}
+
+void RealClient::remove_internal_rpc(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const std::string &key, bool force) {
+    std::optional<CurrentCtxScope> ctx_guard;
+    ctx_guard.emplace(LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment()));
+    ctx.response_msg(remove_internal(key, force));
+}
+
+void RealClient::isExist_internal_rpc(
+    coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+    const std::string &key) {
+    std::optional<CurrentCtxScope> ctx_guard;
+    ctx_guard.emplace(LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment()));
+    ctx.response_msg(isExist_internal(key));
+}
+
+void RealClient::batchIsExist_internal_rpc(
+    coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+    const std::vector<std::string> &keys) {
+    std::optional<CurrentCtxScope> ctx_guard;
+    ctx_guard.emplace(LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment()));
+    ctx.response_msg(batchIsExist_internal(keys));
+}
+
+void RealClient::getSize_internal_rpc(
+    coro_rpc::context<tl::expected<int64_t, ErrorCode>> ctx,
+    const std::string &key) {
+    std::optional<CurrentCtxScope> ctx_guard;
+    ctx_guard.emplace(LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment()));
+    ctx.response_msg(getSize_internal(key));
 }
 
 ClientRequester::ClientRequester() {
