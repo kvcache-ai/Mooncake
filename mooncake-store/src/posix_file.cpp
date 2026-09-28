@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <fcntl.h>
 #include <string>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -7,6 +8,16 @@
 #include "file_interface.h"
 
 namespace mooncake {
+bool StorageFile::drop_page_cache() {
+    int ret = posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+    if (ret != 0) {
+        LOG(WARNING) << "posix_fadvise(DONTNEED) failed for: " << filename_
+                     << ", error: " << strerror(ret);
+        return false;
+    }
+    return true;
+}
+
 PosixFile::PosixFile(const std::string &filename, int fd)
     : StorageFile(filename, fd) {
     if (fd < 0) {
