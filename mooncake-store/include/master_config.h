@@ -7,6 +7,7 @@
 #include <glog/logging.h>
 
 #include "config/metrics_bootstrap_config.h"
+#include "config/nof_heartbeat_bootstrap_config.h"
 #include "config_helper.h"
 #include "types.h"
 
@@ -112,9 +113,7 @@ struct MasterConfig {
     double nof_eviction_high_watermark_ratio;
     int64_t client_active_ttl_sec;
     int64_t client_suspicion_ttl_sec;
-    int64_t nof_heartbeat_interval_sec;
-    uint32_t nof_heartbeat_probe_timeout_ms;
-    uint32_t nof_heartbeat_failures_threshold;
+    NofHeartbeatBootstrapConfig nof_heartbeat;
 
     bool enable_ha;
     bool enable_offload;
@@ -369,10 +368,11 @@ class MasterServiceSupervisorConfig {
             config.nof_eviction_high_watermark_ratio;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
-        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
-        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_interval_sec = config.nof_heartbeat.interval.count();
+        nof_heartbeat_probe_timeout_ms =
+            static_cast<uint32_t>(config.nof_heartbeat.probe_timeout.count());
         nof_heartbeat_failures_threshold =
-            config.nof_heartbeat_failures_threshold;
+            config.nof_heartbeat.failures_threshold;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
@@ -671,10 +671,11 @@ class WrappedMasterServiceConfig {
         view_version = view_version_param;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
-        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
-        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_interval_sec = config.nof_heartbeat.interval.count();
+        nof_heartbeat_probe_timeout_ms =
+            static_cast<uint32_t>(config.nof_heartbeat.probe_timeout.count());
         nof_heartbeat_failures_threshold =
-            config.nof_heartbeat_failures_threshold;
+            config.nof_heartbeat.failures_threshold;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
