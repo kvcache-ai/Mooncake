@@ -82,6 +82,7 @@ struct MetadataStoragePlugin;
 
 namespace test {
 class MasterServiceTestPeer;
+class SnapshotChildProcessTest;
 }  // namespace test
 
 // std::unordered_map/set never shrink their bucket array on erase, so a
@@ -124,6 +125,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 
 class MasterService {
     friend class test::MasterServiceTestPeer;
+    friend class test::SnapshotChildProcessTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ClientOffboardingWorker;
@@ -1070,15 +1072,29 @@ class MasterService {
 
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
-        mutable SharedMutex mutex;
-        std::unordered_map<TenantId, TenantState, TenantIdHash> tenants
-            GUARDED_BY(mutex);
+        std::unordered_map<TenantId, TenantState, TenantIdHash> tenants;
         // Count of objects that have at least one completed LOCAL_DISK replica.
         // Used to compute eviction_base = metadata.size() - disk_object_count,
         // excluding disk-only objects from the eviction denominator.
-        long disk_object_count GUARDED_BY(mutex) = 0;
+        long disk_object_count = 0;
     };
-    std::array<MetadataShard, kNumShards> metadata_shards_;
+    class MetadataShardAccessorRW;
+    class MetadataShardAccessorRO;
+    struct MetadataShardHolder {
+        using VisitFunc = std::function<void(MetadataShard&)>;
+        void ForEach(const VisitFunc &visit_func) {
+            for (size_t i = 0; i < kNumShards; ++i) {
+                SharedMutexLocker lock(&mutexs_[i]);
+                visit_func(metadata_shards_[i]);
+            }
+        }
+       private:
+        std::array<MetadataShard, kNumShards> metadata_shards_;
+        mutable std::array<SharedMutex, kNumShards> mutexs_;
+        friend class MetadataShardAccessorRW;
+        friend class MetadataShardAccessorRO;
+        friend class test::MasterServiceTestPeer;
+    } meta_data_shard_holder_;
 
     // Group domain: all groups in one shard. Routing stays hash(tenant, key);
     // group state is just member keys + one shared lease, consulted at eviction
@@ -1092,11 +1108,19 @@ class MasterService {
 
     // Small and low-frequency (put/register + eviction), so one lock is enough.
     struct GroupDomain {
-        mutable SharedMutex mutex;
         // key: tenant_id.MakeScopedKey(group_id)
-        std::unordered_map<std::string, GroupState> groups GUARDED_BY(mutex);
+        std::unordered_map<std::string, GroupState> groups;
     };
-    GroupDomain group_domain_;
+    class GroupDomainAccessorRW;
+    class GroupDomainAccessorRO;
+    struct GroupDomainHolder {
+       private:
+        friend class GroupDomainAccessorRW;
+        friend class GroupDomainAccessorRO;
+        GroupDomain group_domain_;
+        mutable SharedMutex mutex;
+    };
+    GroupDomainHolder group_domain_holder_;
 
     class SoftPinDeadlineIndex {
         friend class test::MasterServiceTestPeer;
@@ -1177,8 +1201,8 @@ class MasterService {
        public:
         MetadataShardAccessorRW(MasterService* master_service,
                                 size_t shard_index)
-            : shard_(master_service->metadata_shards_[shard_index]),
-              lock_(&shard_.mutex) {}
+            : shard_(master_service->meta_data_shard_holder_.metadata_shards_[shard_index]),
+              lock_(&master_service->meta_data_shard_holder_.mutexs_[shard_index]) {}
 
         MetadataShard* operator->() { return &shard_; }
 
@@ -1226,8 +1250,8 @@ class MasterService {
        public:
         MetadataShardAccessorRO(const MasterService* master_service,
                                 size_t shard_index)
-            : shard_(master_service->metadata_shards_[shard_index]),
-              lock_(&shard_.mutex, shared_lock) {}
+            : shard_(master_service->meta_data_shard_holder_.metadata_shards_[shard_index]),
+              lock_(&master_service->meta_data_shard_holder_.mutexs_[shard_index], shared_lock) {}
 
         const MetadataShard* operator->() const { return &shard_; }
 
@@ -1242,7 +1266,8 @@ class MasterService {
     class GroupDomainAccessorRW {
        public:
         explicit GroupDomainAccessorRW(MasterService* master_service)
-            : shard_(master_service->group_domain_), lock_(&shard_.mutex) {}
+            : shard_(master_service->group_domain_holder_.group_domain_)
+            , lock_(&master_service->group_domain_holder_.mutex) {}
 
         GroupDomain* operator->() { return &shard_; }
 
@@ -1261,8 +1286,8 @@ class MasterService {
     class GroupDomainAccessorRO {
        public:
         explicit GroupDomainAccessorRO(const MasterService* master_service)
-            : shard_(master_service->group_domain_),
-              lock_(&shard_.mutex, shared_lock) {}
+            : shard_(master_service->group_domain_holder_.group_domain_),
+              lock_(&master_service->group_domain_holder_.mutex, shared_lock) {}
 
         const GroupDomain* operator->() const { return &shard_; }
 

@@ -161,10 +161,16 @@ class MasterServiceTestPeer {
     }
 
     static auto& MetadataShards(MasterService& service) {
-        return service.metadata_shards_;
+        return service.meta_data_shard_holder_.metadata_shards_;
     }
     static const auto& MetadataShards(const MasterService& service) {
-        return service.metadata_shards_;
+        return service.meta_data_shard_holder_.metadata_shards_;
+    }
+    static auto& MetadataShardMutexs(MasterService& service) {
+        return service.meta_data_shard_holder_.mutexs_;
+    }
+    static const auto& MetadataShardMutexs(const MasterService& service) {
+        return service.meta_data_shard_holder_.mutexs_;
     }
 
     static auto& NeedMemEviction(MasterService& service) {

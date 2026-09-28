@@ -1822,13 +1822,13 @@ void MasterService::AccountCacheTotalRemoval(ObjectMetadata& metadata) {
 
 void MasterService::RebuildCacheTotalAccounting() {
     MasterMetricManager::instance().reset_cache_total_nums();
-    for (auto& shard : metadata_shards_) {
+    meta_data_shard_holder_.ForEach([](MetadataShard& shard) {
         for (auto& tenant_entry : shard.tenants) {
             for (auto& metadata_entry : tenant_entry.second.metadata) {
                 SyncCacheTotalAccounting(metadata_entry.second);
             }
         }
-    }
+    });
 }
 
 std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
@@ -7913,16 +7913,15 @@ void MasterService::RunDfsEviction() {
             if (indexes_by_shard[shard_idx].empty()) continue;
 
             std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
+            MetadataShardAccessorRW accessor(this, shard_idx);
 
             // Validate and remove candidates under the same shard lock. Once a
             // candidate has been seen in this cycle, it is excluded above;
             // encountering it again means the LRU scan has wrapped.
             for (const size_t i : indexes_by_shard[shard_idx]) {
                 const auto& candidate = candidates[i];
-                auto tenant_it =
-                    metadata_shards_[shard_idx].tenants.find(tenant_id);
-                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
+                auto tenant_it = accessor->tenants.find(tenant_id);
+                if (tenant_it == accessor->tenants.end()) {
                     accepted[i] = true;
                     continue;
                 }
@@ -7975,11 +7974,10 @@ void MasterService::RunDfsEviction() {
                 }
             }
 
-            auto tenant_it =
-                metadata_shards_[shard_idx].tenants.find(tenant_id);
-            if (tenant_it != metadata_shards_[shard_idx].tenants.end() &&
+            auto tenant_it = accessor->tenants.find(tenant_id);
+            if (tenant_it != accessor->tenants.end() &&
                 tenant_it->second.Empty()) {
-                metadata_shards_[shard_idx].tenants.erase(tenant_it);
+                accessor->tenants.erase(tenant_it);
             }
         }
 
@@ -10666,7 +10664,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         client_ids.insert(client_id);
     }
 
-    for (const auto& shard : metadata_shards_) {
+    meta_data_shard_holder_.ForEach([&](MetadataShard& shard) {
         for (const auto& [tenant_id, tenant_state] : shard.tenants) {
             (void)tenant_id;
             for (const auto& [key, metadata] : tenant_state.metadata) {
@@ -10681,7 +10679,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
                 }
             }
         }
-    }
+    });
 
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>
@@ -10699,7 +10697,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         for (const auto& [client_id, record] : records) {
             segment_access.BindClientLiveness(client_id, record);
         }
-        for (auto& shard : metadata_shards_) {
+        meta_data_shard_holder_.ForEach([&](MetadataShard& shard) {
             for (auto& [tenant_id, tenant_state] : shard.tenants) {
                 (void)tenant_id;
                 for (auto& [key, metadata] : tenant_state.metadata) {
@@ -10726,7 +10724,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
                         });
                 }
             }
-        }
+        });
     }
     if (missing_memory_registration) {
         return tl::make_unexpected(SerializationError(
@@ -10767,7 +10765,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
             std::getenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
         if (!skip_cleanup) {
             auto cleanup_now = now;
-            for (auto& shard : metadata_shards_) {
+            meta_data_shard_holder_.ForEach([&](MetadataShard& shard) {
                 for (auto tenant_it = shard.tenants.begin();
                      tenant_it != shard.tenants.end();) {
                     auto& tenant_state = tenant_it->second;
@@ -10789,7 +10787,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                         ++tenant_it;
                     }
                 }
-            }
+            });
         }
 
         // Rebuild allocated memory metrics
@@ -10800,7 +10798,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 segment_name);
         }
 
-        for (auto& shard : metadata_shards_) {
+        meta_data_shard_holder_.ForEach([&](MetadataShard& shard) {
             for (auto& [tenant_id, tenant_state] : shard.tenants) {
                 for (auto it = tenant_state.metadata.begin();
                      it != tenant_state.metadata.end();) {
@@ -10825,7 +10823,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                     ++it;
                 }
             }
-        }
+        });
 
         LOG(INFO) << "[Restore] Total allocated size after restore: "
                   << segment_manager_.GetMemoryUsage().used_bytes;
@@ -12062,10 +12060,9 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                replica.get_refcnt() == 0;
     };
 
-    size_t start_idx = randomIndex(metadata_shards_.size());
-    for (size_t i = 0; i < metadata_shards_.size(); i++) {
-        MetadataShardAccessorRW shard(
-            this, (start_idx + i) % metadata_shards_.size());
+    size_t start_idx = randomIndex(kNumShards);
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
         DiscardExpiredProcessingReplicas(shard, now);
         for (const auto& [tenant_id, tenant_state] : shard->tenants) {
             object_count += tenant_state.metadata.size();
@@ -12616,22 +12613,23 @@ MasterService::MetadataSerializer::Serialize() {
     // metadata but didn't clean up the tenant map; using metadata_count
     // (not tenants.empty()) ensures the count matches the skip logic below.
     size_t valid_shards = 0;
-    for (size_t i = 0; i < kNumShards; ++i) {
+    service_->meta_data_shard_holder_.ForEach([&](MetadataShard& shard) {
         size_t metadata_count = 0;
-        for (const auto& [tid, ts] : service_->metadata_shards_[i].tenants) {
+        for (const auto& [tid, ts] : shard.tenants) {
             metadata_count += ts.metadata.size();
         }
         if (metadata_count > 0) {
             valid_shards++;
         }
-    }
+    });
 
     // Create shards map
     packer.pack_map(valid_shards);
 
     // Iterate through all shards, serialize each shard independently
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
-        const auto& shard = service_->metadata_shards_[shard_idx];
+        MetadataShardAccessorRO accessor(service_, shard_idx);
+        const auto& shard = accessor.get();
 
         // Skip shards with no actual metadata entries.
         // A shard may have empty tenants left after eviction erased all
@@ -12785,7 +12783,8 @@ MasterService::MetadataSerializer::Deserialize(
         // that placed grouped objects on hash(group_id) shards are therefore
         // migrated automatically and need not be regenerated. See
         // docs/source/design/store/mooncake-store.md.
-        auto& shard = service_->metadata_shards_[shard_idx];
+        MetadataShardAccessorRW accessor(service_, shard_idx);
+        auto& shard = accessor.get();
         auto result = DeserializeShard(shard_obj, shard);
         if (!result) {
             return tl::make_unexpected(SerializationError(
@@ -12829,9 +12828,9 @@ MasterService::MetadataSerializer::Deserialize(
 
 void MasterService::MetadataSerializer::Reset() {
     service_->soft_pin_deadline_index_.Clear();
-    for (auto& shard : service_->metadata_shards_) {
+    service_->meta_data_shard_holder_.ForEach([](MetadataShard& shard){
         shard.tenants.clear();
-    }
+    });
     {
         GroupDomainAccessorRW group_domain(service_);
         group_domain->groups.clear();

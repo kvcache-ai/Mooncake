@@ -238,10 +238,9 @@ class SnapshotChildProcessTest : public ::testing::Test {
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
         size_t shard_idx = MasterServiceTestPeer(*svc).getShardIndex(key);
-        auto& shard = MasterServiceTestPeer::MetadataShards(*svc)[shard_idx];
-        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        auto tenant_it = shard.tenants.find(TenantId::Default());
-        return tenant_it != shard.tenants.end() &&
+        MasterService::MetadataShardAccessorRO accessor(svc, shard_idx);
+        auto tenant_it = accessor->tenants.find(TenantId::Default());
+        return tenant_it != accessor->tenants.end() &&
                tenant_it->second.metadata.find(key) !=
                    tenant_it->second.metadata.end();
     }
@@ -278,10 +277,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
-        auto& shard =
-            MasterServiceTestPeer::MetadataShards(*service_)[shard_idx];
-        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
+        MasterService::MetadataShardAccessorRO accessor(service_.get(), shard_idx);
+        for (const auto& [tenant_id, tenant_state] : accessor->tenants) {
             auto it = tenant_state.metadata.find(key);
             if (it != tenant_state.metadata.end()) {
                 return it->second.IsGrouped();

@@ -897,7 +897,7 @@ class MasterServiceHATest : public ::testing::Test {
         const size_t shard_idx =
             MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
         return std::unique_lock<SharedMutex>(
-            MasterServiceTestPeer::MetadataShards(service)[shard_idx].mutex);
+            MasterServiceTestPeer::MetadataShardMutexs(service)[shard_idx]);
     }
 
     template <typename CreateTask>
@@ -917,10 +917,9 @@ class MasterServiceHATest : public ::testing::Test {
             MasterServiceTestPeer::SegmentManager(service).getSegmentAccess());
         auto task = std::async(std::launch::async, std::move(create_task));
         auto& metadata_mutex =
-            MasterServiceTestPeer::MetadataShards(
+            MasterServiceTestPeer::MetadataShardMutexs(
                 service)[MasterServiceTestPeer(service).getShardIndex(tenant_id,
-                                                                      key)]
-                .mutex;
+                                                                      key)];
         const auto wait_for_metadata = [&](bool available, auto timeout) {
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             while (std::chrono::steady_clock::now() < deadline) {
