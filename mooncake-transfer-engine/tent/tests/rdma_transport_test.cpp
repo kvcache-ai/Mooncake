@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
+#include <sys/eventfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -273,6 +274,26 @@ class RdmaContextTestPeer {
 
     static void unbindDevice(RdmaContext& context) {
         context.native_context_ = nullptr;
+    }
+
+    // Everything construct() does before it calls enable(), so a test can
+    // install stand-in verbs in between and then drive enable() itself.
+    static void prepareForEnable(RdmaContext& context,
+                                 const std::string& device_name,
+                                 std::shared_ptr<RdmaParams> params) {
+        context.device_name_ = device_name;
+        context.params_ = params;
+        context.endpoint_store_ = std::make_shared<SIEVEEndpointStore>(
+            context, params->endpoint.endpoint_store_cap);
+        context.status_ = RdmaContext::DEVICE_DISABLED;
+    }
+
+    // What enable() built and disable() has to give back.
+    static size_t compChannelCount(const RdmaContext& context) {
+        return context.comp_channel_.size();
+    }
+    static size_t cqCount(const RdmaContext& context) {
+        return context.cq_list_.size();
     }
 };
 
@@ -957,6 +978,8 @@ struct FakePortVerbs {
     uint16_t lid = 0;
     int gid_table_len = 8;
     int query_port_rc = 0;
+    int query_port_calls = 0;
+    int query_port_fail_from = -1;  // fail that call onwards; -1 = never
     ibv_gid gid{};
     int expected_gid_index = 3;
     int query_gid_rc = 0;
@@ -968,8 +991,12 @@ struct FakePortVerbs {
 FakePortVerbs fake_port;
 
 int fakeQueryPort(ibv_context* context, uint8_t, ibv_port_attr* attr) {
+    const int call = fake_port.query_port_calls++;
     if (context != &fake_port.native) return EINVAL;
     if (fake_port.query_port_rc) return fake_port.query_port_rc;
+    if (fake_port.query_port_fail_from >= 0 &&
+        call >= fake_port.query_port_fail_from)
+        return EIO;
     *attr = {};
     attr->state = fake_port.state;
     attr->active_speed = fake_port.active_speed;
@@ -1093,71 +1120,538 @@ TEST_F(RdmaContextFakeVerbsTest, RefreshFailsCleanlyWhenQueryPortFails) {
     EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);  // cached values kept
 }
 
-// The whole runtime chain: a port event reaches Workers::applyContextEvent,
+// ---- enable() over a whole stand-in RNIC ---------------------------------
+
+// Every verb enable() walks, with counters for what is currently held and a
+// switch to fail one step, so a test can cut enable() short anywhere and
+// assert that whatever it had already acquired was given back. The fds are
+// real: enable() puts the async fd and every completion-channel fd into an
+// epoll set.
+struct FakeRnic {
+    static constexpr int kChannels = 2;
+    static constexpr int kCqs = 8;
+    static constexpr const char* kName = "mc-fake-rnic-0";
+
+    ibv_device device{};
+    ibv_device* device_list[1] = {nullptr};
+    ibv_context native{};
+    ibv_pd pd{};
+    ibv_comp_channel channel[kChannels]{};
+    ibv_cq cq[kCqs]{};
+
+    // What the device reports.
+    int phys_port_cnt = 1;
+    ibv_port_state port_state = IBV_PORT_ACTIVE;
+    uint64_t effective_speed_100mbps = 0;
+
+    // Where to fail; false / -1 means "never".
+    bool fail_open_device = false;
+    bool fail_query_device = false;
+    bool no_valid_gid = false;  // every GID entry unreadable
+    bool fail_alloc_pd = false;
+    int fail_comp_channel_at = -1;  // index of the create call that fails
+    int fail_create_cq_at = -1;     // data CQs first, notification CQ last
+    int fail_query_port_from = -1;  // that call onwards
+
+    // Attempts, so a test can say how far enable() got.
+    int list_calls = 0;
+    int free_list_calls = 0;
+    int open_attempts = 0;
+    int alloc_pd_attempts = 0;
+    int channel_attempts = 0;
+    int cq_attempts = 0;
+    int query_port_calls = 0;
+    int query_speed_calls = 0;
+
+    // Held right now: every one must be back to zero once enable() has
+    // failed or disable() has run.
+    int devices_open = 0;
+    int pds_open = 0;
+    int channels_open = 0;
+    int cqs_open = 0;
+};
+FakeRnic fake_rnic;
+
+ibv_device** fakeGetDeviceList(int* num_devices) {
+    ++fake_rnic.list_calls;
+    fake_rnic.device_list[0] = &fake_rnic.device;
+    *num_devices = 1;
+    return fake_rnic.device_list;
+}
+
+void fakeFreeDeviceList(ibv_device**) { ++fake_rnic.free_list_calls; }
+
+const char* fakeGetDeviceName(ibv_device*) { return FakeRnic::kName; }
+
+ibv_context* fakeOpenDevice(ibv_device* device) {
+    ++fake_rnic.open_attempts;
+    if (fake_rnic.fail_open_device || device != &fake_rnic.device)
+        return nullptr;
+    ++fake_rnic.devices_open;
+    return &fake_rnic.native;
+}
+
+int fakeCloseDevice(ibv_context* context) {
+    if (context != &fake_rnic.native) return EINVAL;
+    --fake_rnic.devices_open;
+    return 0;
+}
+
+int fakeQueryDevice(ibv_context* context, ibv_device_attr* attr) {
+    if (fake_rnic.fail_query_device || context != &fake_rnic.native)
+        return EINVAL;
+    *attr = {};
+    attr->phys_port_cnt = fake_rnic.phys_port_cnt;
+    attr->max_cqe = 4096;
+    attr->max_cq = 64;
+    attr->max_sge = 8;
+    attr->max_qp_wr = 1024;
+    return 0;
+}
+
+int fakeRnicQueryPort(ibv_context* context, uint8_t, ibv_port_attr* attr) {
+    const int call = fake_rnic.query_port_calls++;
+    if (context != &fake_rnic.native) return EINVAL;
+    if (fake_rnic.fail_query_port_from >= 0 &&
+        call >= fake_rnic.fail_query_port_from)
+        return EIO;
+    *attr = {};
+    attr->state = fake_rnic.port_state;
+    attr->active_speed = 128;  // NDR
+    attr->active_width = 2;    // 4x -> 400 Gbps encoded
+    attr->active_mtu = IBV_MTU_1024;
+    attr->lid = 7;
+    attr->gid_tbl_len = 4;
+    return 0;
+}
+
+// One usable entry, index 0: IB type, non-zero, and with no netdev behind it
+// (the stand-in has no sysfs), which is what auto-select settles on.
+int fakeQueryGidEx(ibv_context* context, uint32_t, uint32_t gid_index,
+                   ibv_gid_entry* entry, uint32_t, size_t) {
+    if (fake_rnic.no_valid_gid || context != &fake_rnic.native ||
+        gid_index != 0)
+        return EINVAL;
+    *entry = {};
+    entry->gid_type = IBV_GID_TYPE_IB;
+    entry->gid.raw[15] = 1;
+    return 0;
+}
+
+int fakeRnicQueryGid(ibv_context* context, uint8_t, int index, ibv_gid* gid) {
+    if (fake_rnic.no_valid_gid || context != &fake_rnic.native || index != 0)
+        return EINVAL;
+    *gid = {};
+    gid->raw[15] = 1;
+    return 0;
+}
+
+ibv_pd* fakeAllocPd(ibv_context* context) {
+    ++fake_rnic.alloc_pd_attempts;
+    if (fake_rnic.fail_alloc_pd || context != &fake_rnic.native) return nullptr;
+    ++fake_rnic.pds_open;
+    return &fake_rnic.pd;
+}
+
+int fakeDeallocPd(ibv_pd* pd) {
+    if (pd != &fake_rnic.pd) return EINVAL;
+    --fake_rnic.pds_open;
+    return 0;
+}
+
+ibv_comp_channel* fakeCreateCompChannel(ibv_context* context) {
+    const int index = fake_rnic.channel_attempts++;
+    if (context != &fake_rnic.native || index >= FakeRnic::kChannels) {
+        return nullptr;
+    }
+    if (index == fake_rnic.fail_comp_channel_at) return nullptr;
+    ++fake_rnic.channels_open;
+    return &fake_rnic.channel[index];
+}
+
+int fakeDestroyCompChannel(ibv_comp_channel*) {
+    --fake_rnic.channels_open;
+    return 0;
+}
+
+ibv_cq* fakeCreateCq(ibv_context* context, int, void*, ibv_comp_channel*, int) {
+    const int index = fake_rnic.cq_attempts++;
+    if (context != &fake_rnic.native || index >= FakeRnic::kCqs) return nullptr;
+    if (index == fake_rnic.fail_create_cq_at) return nullptr;
+    ++fake_rnic.cqs_open;
+    return &fake_rnic.cq[index];
+}
+
+int fakeDestroyCq(ibv_cq*) {
+    --fake_rnic.cqs_open;
+    return 0;
+}
+
+int fakeRnicQueryPortSpeed(ibv_context* context, uint32_t, uint64_t* speed) {
+    ++fake_rnic.query_speed_calls;
+    if (context != &fake_rnic.native) return EINVAL;
+    *speed = fake_rnic.effective_speed_100mbps;
+    return 0;
+}
+
+// A context one call short of enable(), with the whole verbs table replaced.
+// The #3325 fix -- release everything already acquired when a later step
+// fails -- has no other way to be exercised without an RNIC.
+class RdmaContextEnableTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        fake_rnic = FakeRnic{};
+        async_fd_ = eventfd(0, 0);
+        ASSERT_GE(async_fd_, 0);
+        fake_rnic.native.async_fd = async_fd_;
+        fake_rnic.native.num_comp_vectors = 4;
+        for (int i = 0; i < FakeRnic::kChannels; ++i) {
+            channel_fd_[i] = eventfd(0, 0);
+            ASSERT_GE(channel_fd_[i], 0);
+            fake_rnic.channel[i].fd = channel_fd_[i];
+        }
+
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(topology
+                        ->parse(R"({"nics":[
+                            {"name":"mc-fake-rnic-0","type":0,"numa_node":0}]})")
+                        .ok());
+        RdmaTransportTestPeer::bindTopology(transport_, topology);
+
+        context_ = std::make_unique<RdmaContext>(transport_);
+        auto& verbs = RdmaContextTestPeer::verbs(*context_);
+        verbs.ibv_get_device_list = fakeGetDeviceList;
+        verbs.ibv_free_device_list = fakeFreeDeviceList;
+        verbs.ibv_get_device_name = fakeGetDeviceName;
+        verbs.ibv_open_device = fakeOpenDevice;
+        verbs.ibv_close_device = fakeCloseDevice;
+        verbs.ibv_query_device = fakeQueryDevice;
+        verbs.ibv_query_port_default = fakeRnicQueryPort;
+        verbs.ibv_query_gid = fakeRnicQueryGid;
+        verbs.ibv_query_gid_ex = fakeQueryGidEx;
+        verbs.ibv_query_port_speed = fakeRnicQueryPortSpeed;
+        verbs.ibv_alloc_pd = fakeAllocPd;
+        verbs.ibv_dealloc_pd = fakeDeallocPd;
+        verbs.ibv_create_comp_channel = fakeCreateCompChannel;
+        verbs.ibv_destroy_comp_channel = fakeDestroyCompChannel;
+        verbs.ibv_create_cq = fakeCreateCq;
+        verbs.ibv_destroy_cq = fakeDestroyCq;
+
+        params_ = std::make_shared<RdmaParams>();
+        params_->device.num_cq_list = 2;
+        params_->device.num_comp_channels = 1;
+        RdmaContextTestPeer::prepareForEnable(*context_, FakeRnic::kName,
+                                              params_);
+    }
+
+    void TearDown() override {
+        context_.reset();  // ~RdmaContext -> disable()
+        close(async_fd_);
+        for (int fd : channel_fd_)
+            if (fd >= 0) close(fd);
+    }
+
+    // The postcondition the #3325 fix is about, from both sides: the device
+    // holds nothing, and the context points at nothing.
+    void expectNothingHeld() {
+        EXPECT_EQ(fake_rnic.devices_open, 0);
+        EXPECT_EQ(fake_rnic.pds_open, 0);
+        EXPECT_EQ(fake_rnic.channels_open, 0);
+        EXPECT_EQ(fake_rnic.cqs_open, 0);
+        EXPECT_EQ(fake_rnic.free_list_calls, fake_rnic.list_calls);
+        EXPECT_EQ(context_->nativeContext(), nullptr);
+        EXPECT_EQ(context_->nativePD(), nullptr);
+        EXPECT_EQ(context_->eventFd(), -1);
+        EXPECT_EQ(RdmaContextTestPeer::compChannelCount(*context_), 0u);
+        EXPECT_EQ(RdmaContextTestPeer::cqCount(*context_), 0u);
+        EXPECT_EQ(context_->notifyCq(), nullptr);
+        EXPECT_EQ(context_->status(), RdmaContext::DEVICE_DISABLED);
+    }
+
+    RdmaTransport transport_;
+    std::unique_ptr<RdmaContext> context_;
+    std::shared_ptr<RdmaParams> params_;
+    int async_fd_ = -1;
+    int channel_fd_[FakeRnic::kChannels] = {-1, -1};
+};
+
+TEST_F(RdmaContextEnableTest, EnableBuildsEverythingAndDisableGivesItBack) {
+    ASSERT_EQ(context_->enable(), 0);
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_ENABLED);
+    EXPECT_EQ(fake_rnic.devices_open, 1);
+    EXPECT_EQ(fake_rnic.pds_open, 1);
+    EXPECT_EQ(fake_rnic.channels_open, 1);
+    EXPECT_EQ(fake_rnic.cqs_open, 3);  // two data CQs plus the notification CQ
+    EXPECT_EQ(RdmaContextTestPeer::cqCount(*context_), 2u);
+    EXPECT_NE(context_->notifyCq(), nullptr);
+    EXPECT_GE(context_->eventFd(), 0);
+
+    ASSERT_EQ(context_->disable(), 0);
+    expectNothingHeld();
+}
+
+// Nothing is opened when the name does not match, and the device list is
+// still freed.
+TEST_F(RdmaContextEnableTest, UnknownDeviceNameOpensNothing) {
+    RdmaContextTestPeer::prepareForEnable(*context_, "mc-not-here", params_);
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 0);
+}
+
+// A port outside the device's range is rejected after the device is open:
+// the scoped handle openDevice holds must close it on the way out.
+TEST_F(RdmaContextEnableTest, PortOutOfRangeClosesTheDeviceItOpened) {
+    params_->device.port = 2;  // the stand-in reports one physical port
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 1);
+}
+
+// The device list is freed whether or not the open that follows it works.
+TEST_F(RdmaContextEnableTest, OpenDeviceFailureStillFreesTheDeviceList) {
+    fake_rnic.fail_open_device = true;
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 1);
+    EXPECT_EQ(fake_rnic.alloc_pd_attempts, 0);
+}
+
+// Two more exits with the device already open, one before the port check and
+// one after it: the scoped handle has to close the device on both.
+TEST_F(RdmaContextEnableTest, QueryDeviceFailureClosesTheDevice) {
+    fake_rnic.fail_query_device = true;
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 1);
+    EXPECT_EQ(fake_rnic.query_port_calls, 0);
+}
+
+TEST_F(RdmaContextEnableTest, NoUsableGidClosesTheDevice) {
+    fake_rnic.no_valid_gid =
+        true;  // auto-select scans the table and finds nothing
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.open_attempts, 1);
+    EXPECT_EQ(fake_rnic.alloc_pd_attempts, 0);
+}
+
+TEST_F(RdmaContextEnableTest, AllocPdFailureClosesTheDevice) {
+    fake_rnic.fail_alloc_pd = true;
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.alloc_pd_attempts, 1);
+}
+
+TEST_F(RdmaContextEnableTest, CompChannelFailureReleasesThePdAndTheDevice) {
+    params_->device.num_comp_channels = 2;
+    fake_rnic.fail_comp_channel_at = 1;  // the second one
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.channel_attempts, 2);
+}
+
+TEST_F(RdmaContextEnableTest, DataCqFailureReleasesTheChannelAndThePd) {
+    fake_rnic.fail_create_cq_at = 1;  // the second data CQ
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.cq_attempts, 2);
+}
+
+TEST_F(RdmaContextEnableTest, NotifyCqFailureReleasesTheDataCqs) {
+    fake_rnic.fail_create_cq_at = 2;  // after the two data CQs
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.cq_attempts, 3);
+}
+
+// The last step of enable() re-reads the port to decide ENABLED vs PAUSED.
+// Everything is built by then, so this is the failure point that releases
+// the most.
+TEST_F(RdmaContextEnableTest, FinalPortQueryFailureReleasesEverything) {
+    fake_rnic.fail_query_port_from = 1;  // openDevice's read is call 0
+    EXPECT_EQ(context_->enable(), -1);
+    expectNothingHeld();
+    EXPECT_EQ(fake_rnic.query_port_calls, 2);
+}
+
+// A port that is not ACTIVE at open is not a failure: everything is built and
+// the context waits in DEVICE_PAUSED for a PORT_ACTIVE event.
+TEST_F(RdmaContextEnableTest, PortThatIsNotActiveEnablesPaused) {
+    fake_rnic.port_state = IBV_PORT_DOWN;
+    ASSERT_EQ(context_->enable(), 0);
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_PAUSED);
+    EXPECT_EQ(fake_rnic.pds_open, 1);
+    EXPECT_EQ(fake_rnic.cqs_open, 3);
+    EXPECT_NE(context_->notifyCq(), nullptr);
+}
+
+// openDevice() seeds the link speed, so a context is never selected on the
+// encoded rate when the effective one is available -- the first transfer
+// does not have to wait for a monitor tick.
+TEST_F(RdmaContextEnableTest, OpenDeviceSeedsTheEffectiveSpeed) {
+    fake_rnic.effective_speed_100mbps = 2000;  // LAG down to one 200G member
+    ASSERT_EQ(context_->enable(), 0);
+    EXPECT_EQ(fake_rnic.query_speed_calls, 1);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+}
+
+TEST_F(RdmaContextEnableTest, OpenDeviceFallsBackToTheEncodedRate) {
+    fake_rnic.effective_speed_100mbps = 0;  // the verb has nothing to say
+    ASSERT_EQ(context_->enable(), 0);
+    EXPECT_EQ(fake_rnic.query_speed_calls, 1);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);  // NDR 4x encoded
+}
+
+// The whole runtime chain: an async event reaches Workers::applyContextEvent,
 // the context re-reads its (fake) port, and the selector is re-seeded only
 // when the speed actually changed -- with the device marked available again
 // on the new rate, not the old one.
-TEST(RdmaContextEventChainTest, PortActiveReseedsOnlyWhenTheSpeedChanged) {
-    auto topology = std::make_shared<Topology>();
-    ASSERT_TRUE(topology
-                    ->parse(R"({"nics":[
+class RdmaContextLinkSpeedEventTest : public ::testing::Test {
+   protected:
+    static constexpr int kDev = 1;
+
+    void SetUp() override {
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(topology
+                        ->parse(R"({"nics":[
                         {"name":"mc-tcp-0","type":1,"numa_node":0},
                         {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
-                    .ok());
-    RdmaTransport transport;
-    RdmaTransportTestPeer::bindTopology(transport, topology);
-    ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport), 0u);
-    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
-    auto* selector = workers->getDeviceSelector();
-    constexpr int kDev = 1;
-    auto& context = *RdmaTransportTestPeer::contextSet(transport)[kDev];
+                        .ok());
+        RdmaTransportTestPeer::bindTopology(transport_, topology);
+        ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport_), 0u);
+        workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
+        selector_ = workers_->getDeviceSelector();
+        context_ = RdmaTransportTestPeer::contextSet(transport_)[kDev].get();
 
-    fake_port = FakePortVerbs{};
-    fake_port.active_speed = 128;
-    fake_port.active_width = 2;  // 400G
-    fake_port.lid = 1;
-    fake_port.gid.raw[15] = 1;
-    auto& verbs = RdmaContextTestPeer::verbs(context);
-    verbs.ibv_query_port_default = fakeQueryPort;
-    verbs.ibv_query_gid = fakeQueryGid;
-    verbs.ibv_query_port_speed = fakeQueryPortSpeed;
-    auto params = std::make_shared<RdmaParams>();
-    params->device.gid_index = fake_port.expected_gid_index;
-    RdmaContextTestPeer::bindDevice(context, &fake_port.native, params);
-    RdmaContextTestPeer::seedAddress(context, "mc-absent-rnic-1", fake_port.lid,
-                                     fake_port.expected_gid_index,
-                                     fake_port.gid,
-                                     RdmaContext::DEVICE_ENABLED);
-    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
-    RdmaTransportTestPeer::bindMetadata(transport, metadata);
-    ASSERT_TRUE(transport.setupLocalSegment().ok());
+        fake_port = FakePortVerbs{};
+        fake_port.active_speed = 128;
+        fake_port.active_width = 2;  // 400G
+        fake_port.lid = 1;
+        fake_port.gid.raw[15] = 1;
+        auto& verbs = RdmaContextTestPeer::verbs(*context_);
+        verbs.ibv_query_port_default = fakeQueryPort;
+        verbs.ibv_query_gid = fakeQueryGid;
+        verbs.ibv_query_port_speed = fakeQueryPortSpeed;
+        params_ = std::make_shared<RdmaParams>();
+        params_->device.gid_index = fake_port.expected_gid_index;
+        RdmaContextTestPeer::bindDevice(*context_, &fake_port.native, params_);
+        RdmaContextTestPeer::seedAddress(
+            *context_, "mc-absent-rnic-1", fake_port.lid,
+            fake_port.expected_gid_index, fake_port.gid,
+            RdmaContext::DEVICE_ENABLED);
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata_);
+        ASSERT_TRUE(transport_.setupLocalSegment().ok());
 
-    // Pretend init seeded it at 400G and it learned ~45 GB/s since.
-    ASSERT_EQ(context.refreshPortAttributes(), 0);
-    ASSERT_TRUE(
-        selector->setDeviceBandwidth(kDev, context.linkSpeedGbps()).ok());
-    ASSERT_TRUE(selector->setDeviceAvailable(kDev, true).ok());
-    for (int i = 0; i < 64; ++i)
-        ASSERT_TRUE(selector->release(kDev, 1 << 20, (1 << 20) / 45e9).ok());
-    ASSERT_NEAR(selector->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+        // Pretend init seeded it at 400G and it learned ~45 GB/s since.
+        ASSERT_EQ(context_->refreshPortAttributes(), 0);
+        ASSERT_TRUE(
+            selector_->setDeviceBandwidth(kDev, context_->linkSpeedGbps())
+                .ok());
+        ASSERT_TRUE(selector_->setDeviceAvailable(kDev, true).ok());
+        for (int i = 0; i < 64; ++i)
+            ASSERT_TRUE(
+                selector_->release(kDev, 1 << 20, (1 << 20) / 45e9).ok());
+        ASSERT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    }
 
-    ibv_async_event event{};
-    event.event_type = IBV_EVENT_PORT_ACTIVE;
-    event.element.port_num = context.portNum();
+    void TearDown() override { RdmaContextTestPeer::unbindDevice(*context_); }
 
+    ibv_async_event portActive() const {
+        ibv_async_event event{};
+        event.event_type = IBV_EVENT_PORT_ACTIVE;
+        event.element.port_num = context_->portNum();
+        return event;
+    }
+
+    // Device-scoped, so it names no port.
+    static ibv_async_event speedChange() {
+        ibv_async_event event{};
+        event.event_type =
+            static_cast<ibv_event_type>(kIbvEventDeviceSpeedChange);
+        return event;
+    }
+
+    void fire(const ibv_async_event& event) {
+        RdmaTransportTestPeer::applyContextEvent(*workers_, kDev, *context_,
+                                                 event);
+    }
+
+    RdmaTransport transport_;
+    std::unique_ptr<Workers> workers_;
+    DeviceSelector* selector_ = nullptr;
+    RdmaContext* context_ = nullptr;
+    std::shared_ptr<RdmaParams> params_;
+    std::shared_ptr<ControlService> metadata_;
+};
+
+TEST_F(RdmaContextLinkSpeedEventTest,
+       PortActiveReseedsOnlyWhenTheSpeedChanged) {
     // Same speed after the flap: keep what was learned.
-    RdmaTransportTestPeer::applyContextEvent(*workers, kDev, context, event);
-    EXPECT_NEAR(selector->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
-    EXPECT_TRUE(selector->isDeviceAvailable(kDev));
+    fire(portActive());
+    EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
 
     // LAG lost a PF: the effective speed halves, the seed and clamp follow.
     fake_port.speed_100mbps = 2000;
-    RdmaTransportTestPeer::applyContextEvent(*workers, kDev, context, event);
-    EXPECT_DOUBLE_EQ(context.linkSpeedGbps(), 200.0);
-    EXPECT_DOUBLE_EQ(selector->getAggregateEwmaBandwidth(), 25e9);
-    EXPECT_TRUE(selector->isDeviceAvailable(kDev));
+    fire(portActive());
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+    EXPECT_DOUBLE_EQ(selector_->getAggregateEwmaBandwidth(), 25e9);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+}
 
-    RdmaContextTestPeer::unbindDevice(context);
+// The re-read that decides whether to re-seed is the last step of bringing a
+// port back up, after the address refresh has already succeeded. Losing it
+// must not cost the device its recovery: no re-seed, but selectable again on
+// what is still known about the link.
+TEST_F(RdmaContextLinkSpeedEventTest, PortActiveRecoversWhenTheReReadFails) {
+    fake_port.speed_100mbps = 2000;  // a change the failed read cannot see
+    fake_port.query_port_calls = 0;
+    fake_port.query_port_fail_from = 1;  // the address refresh is call 0
+
+    fire(portActive());
+    EXPECT_EQ(fake_port.query_port_calls, 2);
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);  // last known kept
+    EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_ENABLED);
+}
+
+// A speed change with no link flap: re-query and re-seed, but leave
+// availability and the endpoints alone -- the port never went down.
+TEST_F(RdmaContextLinkSpeedEventTest,
+       SpeedChangeReseedsWithoutTouchingTheLink) {
+    fake_port.speed_100mbps = 2000;  // LAG down to one 200G member
+    fire(speedChange());
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 200.0);
+    EXPECT_DOUBLE_EQ(selector_->getAggregateEwmaBandwidth(), 25e9);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_ENABLED);
+}
+
+// The same event when nothing actually changed -- a spurious or duplicated
+// notification -- must not throw away what the EWMA has learned.
+TEST_F(RdmaContextLinkSpeedEventTest, SpeedChangeAtTheSameSpeedKeepsTheEwma) {
+    fake_port.query_port_calls = 0;
+    fire(speedChange());
+    EXPECT_EQ(fake_port.query_port_calls, 1);  // it did re-read
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);
+    EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+}
+
+// A failed re-query keeps the last known speed, so there is nothing to
+// re-seed from and the learned estimate stands.
+TEST_F(RdmaContextLinkSpeedEventTest,
+       SpeedChangeWithAFailedReReadChangesNothing) {
+    fake_port.query_port_rc = EIO;
+    fake_port.query_port_calls = 0;
+    fire(speedChange());
+    EXPECT_EQ(fake_port.query_port_calls, 1);  // it tried
+    EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);
+    EXPECT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
 }
 
 // The complete address-refresh chain: a GID_CHANGE event re-queries both

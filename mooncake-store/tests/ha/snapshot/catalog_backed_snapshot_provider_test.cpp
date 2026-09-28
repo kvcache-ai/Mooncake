@@ -10,10 +10,13 @@
 #include <string>
 #include <vector>
 
+#include <msgpack.hpp>
+
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 #include "ha/snapshot/snapshot_test_utils.h"
+#include "weight_metadata_store.h"
 
 namespace mooncake::test {
 
@@ -23,6 +26,29 @@ DEFINE_string(redis_endpoint, "",
 namespace {
 
 namespace fs = std::filesystem;
+
+std::vector<uint8_t> AddWeightMetadataStore(
+    const std::vector<uint8_t>& metadata,
+    const WeightMetadataSnapshot& weight_metadata) {
+    auto root = msgpack::unpack(reinterpret_cast<const char*>(metadata.data()),
+                                metadata.size());
+    const auto& object = root.get();
+    EXPECT_EQ(msgpack::type::MAP, object.type);
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    packer.pack_map(object.via.map.size + 1);
+    for (uint32_t i = 0; i < object.via.map.size; ++i) {
+        packer.pack(object.via.map.ptr[i].key);
+        packer.pack(object.via.map.ptr[i].val);
+    }
+    packer.pack("weight_metadata");
+    const auto encoded = struct_pack::serialize(weight_metadata);
+    packer.pack_bin(encoded.size());
+    packer.pack_bin_body(encoded.data(), encoded.size());
+    return std::vector<uint8_t>(
+        reinterpret_cast<const uint8_t*>(buffer.data()),
+        reinterpret_cast<const uint8_t*>(buffer.data()) + buffer.size());
+}
 
 class CatalogBackedSnapshotProviderTest
     : public ::testing::TestWithParam<CatalogBackendParam> {
@@ -161,6 +187,57 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
               kDefaultTestDiskFilePath);
     EXPECT_EQ(replica.get_disk_descriptor().object_size,
               kDefaultTestObjectSize);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadsWeightMetadataStoreFromMetadata) {
+    WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    WeightMetadataSnapshot weight_metadata{
+        .metadata = {WeightRevisionMetadata{
+            .identity = identity,
+            .manifest =
+                WeightManifestReference{
+                    .manifest_key =
+                        "weights/production/llama-70b/step-100/7/manifest",
+                    .manifest_sha256 = std::string(64, 'a'),
+                    .payload_group_id = MakeWeightPayloadGroupId(identity),
+                    .payload_keys_sha256 = std::string(64, 'b'),
+                    .payload_count = 1,
+                    .logical_bytes = 1024,
+                },
+            .availability = WeightAvailabilityState::READY,
+            .residency = WeightResidencyState::HOT,
+            .operation = WeightOperationState::NONE,
+            .metadata_generation = 2,
+            .created_at_ms = 100,
+            .updated_at_ms = 101,
+        }},
+        .leases = {},
+        .operations = {},
+        .next_lease_id = 1,
+        .next_operation_id = 1,
+    };
+    auto metadata = AddWeightMetadataStore(
+        BuildMetadataPayload(UUID{1, 2}, kDefaultTestObjectKey,
+                             kDefaultTestDiskFilePath, kDefaultTestObjectSize),
+        weight_metadata);
+    auto published = mooncake::test::PublishSnapshotPayloadBytes(
+        *object_store_, *catalog_store_, descriptor_, std::move(metadata));
+    ASSERT_TRUE(published.has_value()) << published.error();
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    EXPECT_EQ(weight_metadata, snapshot->value().weight_metadata);
 }
 
 // The master snapshot writer evolved its per-object metadata layout over time

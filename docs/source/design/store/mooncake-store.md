@@ -840,6 +840,7 @@ When the space needs to be released, this interface is used to remove the previo
 :maxdepth: 1
 
 ssd-offload
+immutable-dfs-bucket-allocator
 ssd-free-ratio-first-allocation
 nvme-kv-backend
 oss-backend

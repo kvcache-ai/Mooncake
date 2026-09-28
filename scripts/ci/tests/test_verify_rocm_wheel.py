@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location(
-    "verify_rocm_wheel", ROOT / "scripts/tone_tests/python/verify_rocm_wheel.py"
+    "verify_rocm_wheel", ROOT / "scripts/e2e/python/verify_rocm_wheel.py"
 )
 VERIFY = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

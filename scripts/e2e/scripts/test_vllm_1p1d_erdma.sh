@@ -100,7 +100,7 @@ run_proxy()
         ready_pattern="All prefiller instances are ready."
     else
         echo "Using NIXL Proxy (vLLM < 0.16.0)"
-        proxy_script="python3 -u /test_run/python/toy_proxy_server.py --host 0.0.0.0 --port 8000 --prefiller-host $REMOTE_IP --prefiller-port 8010 --decoder-host $LOCAL_IP --decoder-port 8020"
+        proxy_script="python3 -u /test_run/e2e/python/toy_proxy_server.py --host 0.0.0.0 --port 8000 --prefiller-host $REMOTE_IP --prefiller-port 8010 --decoder-host $LOCAL_IP --decoder-port 8020"
         ready_pattern="Application startup complete."
         use_health_check=1
     fi
@@ -181,7 +181,7 @@ run_single_model()
         status=1
     else
         # Remote start server
-        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
+        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$E2E_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
             echo "ERROR: Failed to start remote server for model $model_name"
             status=1
         else

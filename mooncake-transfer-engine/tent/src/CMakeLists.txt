@@ -36,6 +36,12 @@ else()
   message(STATUS "ROCm/HIP: Disabled")
 endif()
 
+# TENT hylink on Hygon DTK, built on the HIP runtime (requires USE_HIP).
+if(USE_HYLINK)
+  message(STATUS "TENT hylink (DTK): Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_HYLINK)
+endif()
+
 # GDS
 find_library(CUFILE_LIB cufile HINTS ${CUDAToolkit_LIBRARY_DIR})
 find_path(CUFILE_INCLUDE cufile.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
@@ -163,6 +169,7 @@ foreach(
   tent_xport_tpu
   tent_xport_xpu
   tent_xport_mpcomm
+  tent_xport_hylink
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})
