@@ -129,7 +129,7 @@ python3 mooncake-store/benchmarks/run_master_rpc_trace.py \
   --replayer build/mooncake-store/benchmarks/master_rpc_trace_bench \
   --output-dir /outside/repo/results/run-001 \
   --master-cpus 0-3 --replay-cpus 4-7 \
-  --rpc-threads 4 --workers 16
+  --rpc-threads 4
 ```
 
 Choose CPU sets using `lscpu -e=CPU,CORE,SOCKET,NODE`; keep physical cores and
@@ -140,7 +140,8 @@ to 2 and enables master metrics. The master retains its default KV read lease
 TTL.
 
 For manual master management, invoke the C++ binary with `--trace`,
-`--master_server`, `--workers`, `--output` and `--samples`.
+`--master_server`, `--output` and `--samples`.
+It creates one worker per distinct `client_id`; worker count is not configurable.
 The replayer loads the trace once before issuing RPCs and checks that its header
 uses a supported format. There is no separate validation pass; the producer is
 responsible for satisfying the trace contract below.
@@ -178,13 +179,14 @@ operation implicitly depends on its registration, and each unmount depends on
 its corresponding mount. Other ordering must be recorded in `depends_on`:
 for example, a put that requires newly mounted capacity should depend on that
 mount, and an unmount that must follow particular reads should depend on them.
-Unrelated calls remain concurrent; unmount does not drain all pending requests.
+Different clients can execute concurrently. Calls within a client execute in
+file order, including lifecycle calls; unmount does not drain other clients.
 The replayer sends only recorded lifecycle calls, including unmounts. A trace
 may end with segments still mounted; the launcher then stops its dedicated
 master. Nonempty remount recovery is unsupported.
 
 Ping is supported after client registration. Like other events,
-it uses the shared worker pool, original timestamps and completion dependencies.
+it uses its client's worker, original timestamps and completion dependencies.
 For example, a workload heartbeat can be recorded as:
 
 ```json
@@ -203,8 +205,11 @@ The two fields are mutually exclusive. Remove respects leases (`force=false`).
 
 `depends_on` lists earlier event IDs. Dependencies wait for completion; they do
 not imply success. Producers must preserve write/read/remove ordering for shared
-keys, including reads that must precede a later mutation. Unrelated ready calls
-remain concurrent. Unknown fields are ignored. Event fields and lifecycle
+keys, including reads that must precede a later mutation. Producers must also
+preserve serial call-flow dependencies, including completion of a blocking put
+before the next batch in that flow. Different clients can execute concurrently;
+all flows sharing a client are serialized in file order by its single worker.
+Unknown fields are ignored. Event fields and lifecycle
 consistency are not prevalidated; JSON decoding or dependency lookup can still
 fail while loading a malformed trace.
 
@@ -217,10 +222,11 @@ modeled. Do not silently discard these semantics in a producer.
 
 ### Arrival control and results
 
-Timestamps are replayed unchanged, relative to the replay start. `--workers`
-caps concurrent API calls, independent of logical client count. Overdue events
-stay queued; planned arrival times do not move to conceal overload. Dispatch lag
-includes worker and dependency waits.
+Timestamps are replayed unchanged, relative to the replay start. Each client has
+one worker and at most one API call in flight. A slow call delays later calls
+from that client, even if their timestamps differ. Overdue events stay queued;
+planned arrival times do not move to conceal overload. Dispatch lag includes
+waiting for earlier calls from the same client, dependencies and scheduling.
 A fixed trace does not model serving feedback caused by a slow or failed master.
 
 The launcher saves all outputs under `--output-dir`. `result.json` keeps the
@@ -324,6 +330,6 @@ per-operation results when comparing business RPC throughput with older runs
 that generated heartbeats outside the trace.
 
 High replay lag with low master utilization indicates a load-generator limit.
-Vary workers or the input workload and check offered versus achieved rates
+Vary the input workload or client count and check offered versus achieved rates
 before attributing a throughput ceiling to master locks. This benchmark reports
 whole-master load; lock attribution additionally requires profiling.

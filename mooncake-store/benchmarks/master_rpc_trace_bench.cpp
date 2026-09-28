@@ -9,7 +9,6 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -19,9 +18,7 @@
 #include <latch>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <queue>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -35,8 +32,6 @@ DEFINE_string(trace, "", "Master RPC JSONL trace to replay");
 DEFINE_string(master_server, "127.0.0.1:50051",
               "Dedicated benchmark master address");
 DEFINE_string(tenant, "default", "Tenant used for all trace clients");
-DEFINE_uint32(workers, 8,
-              "Maximum concurrent trace calls (not simulated clients)");
 DEFINE_string(output, "master_trace_result.json",
               "Summary output, written after replay");
 DEFINE_string(samples, "master_trace_samples.jsonl",
@@ -83,7 +78,7 @@ struct TraceSample {
 };
 
 // The second argument is the completed BatchPutStart result for End/Revoke.
-// Calls for the same logical client may execute concurrently.
+// One worker owns each logical client and executes its calls in file order.
 using TraceExecutor =
     std::function<RpcOutcome(const TraceEvent&, const RpcOutcome* put_start)>;
 
@@ -243,25 +238,16 @@ RpcTrace LoadTrace(const std::string& path) {
     return ReadTrace(input);
 }
 
-// One dispatcher times dependency-ready events and wakes only the workers
-// needed to execute them. Slow dependent calls do not block unrelated events.
-std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
+// Each client has a private event sequence. Completion flags synchronize
+// cross-client dependencies without a shared dispatch queue or scheduling lock.
+std::vector<TraceSample> ReplayTrace(const RpcTrace& trace,
                                      const TraceExecutor& execute) {
-    Require(workers > 0, "workers must be positive");
     Require(!trace.events.empty(), "trace must contain events");
     using Clock = std::chrono::steady_clock;
     using Micros = std::chrono::microseconds;
     std::vector<TraceSample> samples(trace.events.size());
-    std::vector<size_t> pending(trace.events.size());
-    std::vector<std::vector<size_t>> children(trace.events.size());
-    std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>>
-        ready;
-    std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>>
-        runnable;
-    std::mutex mutex;
-    std::condition_variable work_available, schedule_changed;
-    size_t remaining = trace.events.size();
-    size_t waiting_workers = 0;
+    std::vector<std::atomic<uint32_t>> completed(trace.events.size());
+    std::map<std::string, std::vector<size_t>> clients;
     auto origin = Clock::now();
     const auto max_delay =
         std::chrono::duration_cast<Micros>(Clock::time_point::max() - origin)
@@ -272,38 +258,28 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
             "timestamp exceeds steady-clock range");
         samples[i].scheduled_us =
             static_cast<int64_t>(trace.events[i].timestamp_us);
-        pending[i] = trace.events[i].dependencies.size();
-        if (pending[i] == 0) ready.push(i);
+        clients[trace.events[i].client_id].push_back(i);
         for (auto dependency : trace.events[i].dependencies) {
             Require(dependency < i, "invalid dependency index");
-            children[dependency].push_back(i);
         }
     }
     const auto elapsed = [&] {
         return std::chrono::duration_cast<Micros>(Clock::now() - origin)
             .count();
     };
-    const auto worker_count = std::min(workers, trace.events.size());
-    std::latch initialized(worker_count), start(1);
+    std::latch initialized(clients.size()), start(1);
     bool startup_cancelled = false;
-    auto run = [&] {
+    auto run = [&](const std::vector<size_t>& events) {
         initialized.count_down();
         start.wait();
         if (startup_cancelled) return;
-        while (true) {
-            size_t index;
-            {
-                std::unique_lock lock(mutex);
-                ++waiting_workers;
-                work_available.wait(
-                    lock, [&] { return remaining == 0 || !runnable.empty(); });
-                --waiting_workers;
-                if (remaining == 0) return;
-                index = runnable.top();
-                runnable.pop();
-            }
+        for (auto index : events) {
             const auto& event = trace.events[index];
             auto& sample = samples[index];
+            std::this_thread::sleep_until(origin + Micros(sample.scheduled_us));
+            for (auto dependency : event.dependencies) {
+                completed[dependency].wait(0, std::memory_order_acquire);
+            }
             sample.start_us = elapsed();
             try {
                 sample.outcome = execute(
@@ -320,23 +296,15 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
                 sample.outcome.error = error.what();
             }
             sample.finish_us = elapsed();
-            bool changed = false;
-            {
-                std::lock_guard lock(mutex);
-                for (auto child : children[index]) {
-                    if (--pending[child] == 0) {
-                        ready.push(child);
-                        changed = true;
-                    }
-                }
-                if (--remaining == 0) changed = true;
-            }
-            if (changed) schedule_changed.notify_one();
+            // Publish both timing and outcome before dependent clients proceed.
+            completed[index].store(1, std::memory_order_release);
+            completed[index].notify_all();
         }
     };
     std::vector<std::jthread> threads;
     try {
-        for (size_t i = 0; i < worker_count; ++i) threads.emplace_back(run);
+        for (const auto& [client, events] : clients)
+            threads.emplace_back(run, std::cref(events));
     } catch (...) {
         startup_cancelled = true;
         start.count_down();
@@ -349,33 +317,6 @@ std::vector<TraceSample> ReplayTrace(const RpcTrace& trace, size_t workers,
             std::chrono::duration_cast<Micros>(origin.time_since_epoch())
                 .count();
     start.count_down();
-    {
-        std::unique_lock lock(mutex);
-        while (remaining != 0) {
-            if (ready.empty()) {
-                schedule_changed.wait(lock);
-                continue;
-            }
-            const auto due = origin + Micros(samples[ready.top()].scheduled_us);
-            if (Clock::now() < due) {
-                schedule_changed.wait_until(lock, due);
-                continue;
-            }
-            const auto now = Clock::now();
-            size_t added = 0;
-            while (!ready.empty() &&
-                   origin + Micros(samples[ready.top()].scheduled_us) <= now) {
-                runnable.push(ready.top());
-                ready.pop();
-                ++added;
-            }
-            const auto wake = std::min(added, waiting_workers);
-            lock.unlock();
-            for (size_t i = 0; i < wake; ++i) work_available.notify_one();
-            lock.lock();
-        }
-    }
-    work_available.notify_all();
     for (auto& thread : threads) thread.join();
     return samples;
 }
@@ -486,8 +427,7 @@ class Session {
 
     mooncake::MasterClient client;
     std::map<std::string, mooncake::Segment> segments;
-    std::mutex lifecycle_mutex;
-    std::atomic<bool> registered{false};
+    bool registered = false;
     const std::string host_id =
         "trace_" + mooncake::UuidToString(mooncake::generate_uuid());
 };
@@ -528,8 +468,7 @@ class MasterReplay {
             prepared.push_back(std::move(call));
         }
         return ReplayTrace(
-            trace, FLAGS_workers,
-            [&](const TraceEvent& event, const RpcOutcome* start) {
+            trace, [&](const TraceEvent& event, const RpcOutcome* start) {
                 const auto index = &event - trace.events.data();
                 return Execute(event, prepared[index], start);
             });
@@ -568,12 +507,11 @@ class MasterReplay {
         auto& client = *call.client;
         if (event.op == "ReMountSegment" || event.op == "MountSegment" ||
             event.op == "UnmountSegment") {
-            std::lock_guard lock(session.lifecycle_mutex);
             tl::expected<void, mooncake::ErrorCode> response;
             if (event.op == "ReMountSegment") {
                 response = client.ReMountSegment({});
-                if (response) session.registered.store(true);
-            } else if (!session.registered.load()) {
+                if (response) session.registered = true;
+            } else if (!session.registered) {
                 throw std::runtime_error("client registration failed");
             } else if (event.op == "MountSegment") {
                 mooncake::Segment segment;
@@ -600,7 +538,7 @@ class MasterReplay {
             if (!response) result.error = toString(response.error());
             return result;
         }
-        if (!session.registered.load())
+        if (!session.registered)
             throw std::runtime_error("client registration failed");
         if (event.op == "Ping") {
             result.rpc_sent = true;
@@ -670,9 +608,8 @@ int main(int argc, char** argv) {
     google::InitGoogleLogging(argv[0]);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     try {
-        if (FLAGS_trace.empty() || FLAGS_workers == 0) {
-            throw std::invalid_argument(
-                "trace and positive workers are required");
+        if (FLAGS_trace.empty()) {
+            throw std::invalid_argument("trace is required");
         }
         const auto trace = LoadTrace(FLAGS_trace);
         MasterReplay runner;
@@ -681,7 +618,8 @@ int main(int argc, char** argv) {
         auto result = SummarizeTrace(trace, samples);
         result["master_server"] = FLAGS_master_server;
         result["tenant"] = FLAGS_tenant;
-        result["workers"] = FLAGS_workers;
+        result["workers"] = Json::UInt64(runner.client_count());
+        result["replay_policy"] = "one_worker_per_client";
         result["logical_clients"] = Json::UInt64(runner.client_count());
         result["has_errors"] = HasErrors(samples);
         WriteSamples(FLAGS_samples, trace, samples);

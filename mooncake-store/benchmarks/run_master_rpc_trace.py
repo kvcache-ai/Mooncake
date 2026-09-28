@@ -210,7 +210,6 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--master-cpus", required=True)
     parser.add_argument("--replay-cpus", required=True)
-    parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--rpc-threads", type=int, default=4)
     parser.add_argument("--sample-interval", type=float, default=0.2)
     parser.add_argument("--timeout", type=float, default=600)
@@ -219,13 +218,9 @@ def main():
         parser.error("process sampling and CPU affinity require Linux")
     if cpu_set(args.master_cpus) & cpu_set(args.replay_cpus):
         parser.error("master and replay CPU sets must be disjoint")
-    if (
-        args.workers < 1
-        or args.rpc_threads < 1
-        or any(
-            not math.isfinite(value) or value <= 0
-            for value in (args.sample_interval, args.timeout)
-        )
+    if args.rpc_threads < 1 or any(
+        not math.isfinite(value) or value <= 0
+        for value in (args.sample_interval, args.timeout)
     ):
         parser.error("counts, intervals and timeout must be positive")
     trace, master_bin, replay_bin = (
@@ -258,7 +253,6 @@ def main():
         str(replay_bin),
         f"--trace={trace}",
         f"--master_server=127.0.0.1:{rpc_port}",
-        f"--workers={args.workers}",
         f"--output={directory / 'replay.json'}",
         f"--samples={directory / 'samples.jsonl'}",
         "--logtostderr=1",
