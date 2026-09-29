@@ -4813,7 +4813,7 @@ Client::BatchTransferReadOffloadRanges(
         }
         return results;
     }
-    const auto status = operation.wait();
+    const auto status = operation->wait();
     if (!status.ok()) {
         LOG(ERROR) << "Batch offload range read scatter operation failed: "
                    << status.ToString();
