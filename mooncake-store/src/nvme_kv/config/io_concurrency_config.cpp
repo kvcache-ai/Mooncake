@@ -7,7 +7,7 @@
 #include <string>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "config/client_environment_variables.h"
 #include "u32_parser.h"
 
 namespace mooncake {
@@ -46,13 +46,13 @@ NvmeKvIoConcurrencyConfig NvmeKvIoConcurrencyConfig::FromEnvironment(
     NvmeKvIoConcurrencyConfig config;
     config.max_io_concurrency = ReadPositiveOr(
         env,
-        NvmeKvIoConcurrencyEnvironmentVariables::
+        ClientEnvironmentVariables::NvmeKv::IoConcurrency::
             MOONCAKE_NVME_KV_MAX_IO_CONCURRENCY,
         kDefaultMaxIoConcurrency, std::numeric_limits<uint32_t>::max());
 
-    const auto configured_io =
-        ReadOptionalPositive(env, NvmeKvIoConcurrencyEnvironmentVariables::
-                                      MOONCAKE_NVME_KV_IO_CONCURRENCY);
+    const auto configured_io = ReadOptionalPositive(
+        env, ClientEnvironmentVariables::NvmeKv::IoConcurrency::
+                 MOONCAKE_NVME_KV_IO_CONCURRENCY);
     config.io_concurrency =
         configured_io.has_value()
             ? std::min(*configured_io, config.max_io_concurrency)
@@ -64,13 +64,13 @@ NvmeKvIoConcurrencyConfig NvmeKvIoConcurrencyConfig::FromEnvironment(
         config.io_concurrency > 1 ? config.io_concurrency - 1 : 1;
     config.batch_submit_concurrency = ReadPositiveOr(
         env,
-        NvmeKvIoConcurrencyEnvironmentVariables::
+        ClientEnvironmentVariables::NvmeKv::IoConcurrency::
             MOONCAKE_NVME_KV_BATCH_SUBMIT_CONCURRENCY,
         std::min(kDefaultBatchSubmitConcurrency, max_submit_concurrency),
         max_submit_concurrency);
     config.root_submit_concurrency = ReadPositiveOr(
         env,
-        NvmeKvIoConcurrencyEnvironmentVariables::
+        ClientEnvironmentVariables::NvmeKv::IoConcurrency::
             MOONCAKE_NVME_KV_ROOT_SUBMIT_CONCURRENCY,
         std::min(kDefaultRootSubmitConcurrency, max_submit_concurrency),
         max_submit_concurrency);
@@ -81,7 +81,7 @@ NvmeKvIoConcurrencyConfig NvmeKvIoConcurrencyConfig::FromEnvironment(
             : 1;
     config.prepare_concurrency = ReadPositiveOr(
         env,
-        NvmeKvIoConcurrencyEnvironmentVariables::
+        ClientEnvironmentVariables::NvmeKv::IoConcurrency::
             MOONCAKE_NVME_KV_PREPARE_CONCURRENCY,
         std::min(kDefaultPrepareConcurrency, max_prepare_concurrency),
         max_prepare_concurrency);

@@ -6,12 +6,13 @@
 #include <string>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
 bool NoFDebugConfig::ReadEnabledFromEnvironment(const Environ& env) {
-    const auto raw = env.GetTyped(NoFDebugEnvironmentVariables::MC_NOF_DEBUG);
+    const auto raw =
+        env.GetTyped(ClientEnvironmentVariables::NoF::Debug::MC_NOF_DEBUG);
     if (!raw) return false;
 
     std::string normalized = *raw;
@@ -24,8 +25,8 @@ bool NoFDebugConfig::ReadEnabledFromEnvironment(const Environ& env) {
 
 std::chrono::milliseconds NoFDebugConfig::ReadIntervalMsFromEnvironment(
     const Environ& env) {
-    const auto raw =
-        env.GetTyped(NoFDebugEnvironmentVariables::MC_NOF_DEBUG_INTERVAL_MS);
+    const auto raw = env.GetTyped(
+        ClientEnvironmentVariables::NoF::Debug::MC_NOF_DEBUG_INTERVAL_MS);
     if (!raw) return std::chrono::milliseconds{1000};
 
     char* end = nullptr;

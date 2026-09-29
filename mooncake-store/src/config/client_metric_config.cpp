@@ -5,14 +5,14 @@
 
 #include "bool_parser.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 #include "integer_parser.h"
 
 namespace mooncake {
 
 ClientMetricConfig ClientMetricConfig::FromEnvironment(const Environ& env) {
     ClientMetricConfig config;
-    using Variables = ClientMetricEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Metric;
 
     const auto enabled = env.GetTyped(Variables::MC_STORE_CLIENT_METRIC);
     if (enabled.has_value()) {

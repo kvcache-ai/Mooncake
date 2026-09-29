@@ -10,7 +10,7 @@
 
 #include "bool_parser.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
@@ -46,7 +46,7 @@ bool ParseStrictBoolOr(const std::string& raw_value, bool default_value) {
 
 FileStorageConfig FileStorageConfig::FromEnvironment(const Environ& env) {
     FileStorageConfig config;
-    using Variables = FileStorageEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Offload::FileStorage;
 
     const auto storage_backend_descriptor =
         env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR,

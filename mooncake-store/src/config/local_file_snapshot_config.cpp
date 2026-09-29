@@ -3,14 +3,14 @@
 #include <stdexcept>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "master_environment_variables.h"
 
 namespace mooncake {
 
 LocalFileSnapshotConfig LocalFileSnapshotConfig::FromEnvironment(
     const Environ& env) {
     const auto value = env.GetTyped(
-        LocalFileSnapshotEnvironmentVariables::MOONCAKE_SNAPSHOT_LOCAL_PATH);
+        MasterEnvironmentVariables::Snapshot::MOONCAKE_SNAPSHOT_LOCAL_PATH);
     if (!value || value->empty()) {
         throw std::runtime_error(
             "MOONCAKE_SNAPSHOT_LOCAL_PATH environment variable is not set. "

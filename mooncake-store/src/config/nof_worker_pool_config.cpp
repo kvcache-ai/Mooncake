@@ -3,15 +3,15 @@
 #include <glog/logging.h>
 
 #include "environ.h"
+#include "client_environment_variables.h"
 #include "environment_value_parser.h"
-#include "environment_variables.h"
 
 namespace mooncake {
 
 NoFWorkerPoolConfig NoFWorkerPoolConfig::FromEnvironment(const Environ& env) {
     NoFWorkerPoolConfig config;
-    const auto raw =
-        env.GetTyped(NoFWorkerPoolEnvironmentVariables::MC_NOF_WORKERS);
+    const auto raw = env.GetTyped(
+        ClientEnvironmentVariables::NoF::WorkerPool::MC_NOF_WORKERS);
     if (!raw || raw->empty()) {
         return config;
     }

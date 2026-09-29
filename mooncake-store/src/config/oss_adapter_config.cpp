@@ -5,7 +5,7 @@
 #include <glog/logging.h>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 namespace {
@@ -21,7 +21,7 @@ std::string ReadPrimaryOrAlias(const Environ& env,
 
 tl::expected<OssAdapterConfig, ErrorCode> OssAdapterConfig::FromEnvironment(
     const Environ& env) {
-    using Variables = OssAdapterEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Offload::Oss;
     OssAdapterConfig config;
 
     config.endpoint = ReadPrimaryOrAlias(env, Variables::MOONCAKE_OSS_ENDPOINT,

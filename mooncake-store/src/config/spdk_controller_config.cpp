@@ -7,7 +7,7 @@ namespace mooncake {
 
 SpdkControllerConfig SpdkControllerConfig::FromEnvironment(const Environ& env) {
     SpdkControllerConfig config;
-    using Variables = SpdkControllerEnvironmentVariables;
+    using Variables = CommonEnvironmentVariables::SpdkController;
     config.num_io_queues = env.GetTyped(Variables::MC_NVME_NUM_IO_QUEUES);
     config.io_queue_size = env.GetTyped(Variables::MC_NVME_IO_QUEUE_SIZE);
     config.io_queue_requests =

@@ -7,13 +7,13 @@
 #include <glog/logging.h>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
 ClientNumaConfig ClientNumaConfig::FromEnvironment(const Environ& env) {
     ClientNumaConfig config;
-    using Variables = ClientNumaEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Numa;
 
     const auto raw_value = env.GetTyped(Variables::MC_STORE_NUMA_SOCKET_ID);
     if (!raw_value.has_value() || raw_value->empty()) {

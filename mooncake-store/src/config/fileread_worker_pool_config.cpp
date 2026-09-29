@@ -3,8 +3,8 @@
 #include <glog/logging.h>
 
 #include "environ.h"
+#include "client_environment_variables.h"
 #include "environment_value_parser.h"
-#include "environment_variables.h"
 
 namespace mooncake {
 
@@ -12,7 +12,7 @@ FilereadWorkerPoolConfig FilereadWorkerPoolConfig::FromEnvironment(
     const Environ& env) {
     FilereadWorkerPoolConfig config;
     const auto raw = env.GetTyped(
-        FilereadWorkerPoolEnvironmentVariables::MC_FILEREAD_WORKERS);
+        ClientEnvironmentVariables::FilereadWorkerPool::MC_FILEREAD_WORKERS);
     if (!raw || raw->empty()) {
         return config;
     }

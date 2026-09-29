@@ -15,7 +15,7 @@
 
 #include "client_metric.h"
 #include "common/network.h"
-#include "environment_variables.h"
+#include "../src/config/client_environment_variables.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 #include "version.h"
@@ -302,11 +302,11 @@ TEST_F(ClientMetricsTest, ZeroSumHybridHistogramPreservesExistingMetrics) {
 
 TEST_F(ClientMetricsTest, BandwidthSummaryRespectsEnvFlag) {
     ScopedEnv bandwidth_env(
-        ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH
+        ClientEnvironmentVariables::Metric::MC_STORE_CLIENT_METRIC_BANDWIDTH
             .name);
-    setenv(
-        ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH.name,
-        "0", 1);
+    setenv(ClientEnvironmentVariables::Metric::MC_STORE_CLIENT_METRIC_BANDWIDTH
+               .name,
+           "0", 1);
     auto metrics = ClientMetric::Create();
     ASSERT_NE(metrics, nullptr);
 

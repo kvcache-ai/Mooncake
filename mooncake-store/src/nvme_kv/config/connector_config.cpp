@@ -6,7 +6,7 @@
 #include <string>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "config/client_environment_variables.h"
 #include "u32_parser.h"
 
 namespace mooncake {
@@ -24,8 +24,8 @@ uint32_t ReadNvmeKvU32Or(const Environ& env,
 
 tl::expected<NvmeKvTransport, ErrorCode> ReadTransport(const Environ& env) {
     const auto transport =
-        env.GetTyped(
-               NvmeKvConnectorEnvironmentVariables::MOONCAKE_NVME_KV_TRANSPORT)
+        env.GetTyped(ClientEnvironmentVariables::NvmeKv::Connector::
+                         MOONCAKE_NVME_KV_TRANSPORT)
             .value_or("");
     if (transport.empty() || transport == "auto") {
         return NvmeKvTransport::kAuto;
@@ -57,23 +57,27 @@ const char* NvmeKvTransportName(NvmeKvTransport transport) {
 tl::expected<NvmeKvConnectorConfig, ErrorCode>
 NvmeKvConnectorConfig::FromEnvironment(const Environ& env) {
     NvmeKvConnectorConfig config;
-    config.device_path = env.GetTyped(NvmeKvConnectorEnvironmentVariables::
-                                          MOONCAKE_NVME_KV_DEVICE_PATH)
-                             .value_or("");
+    config.device_path =
+        env.GetTyped(ClientEnvironmentVariables::NvmeKv::Connector::
+                         MOONCAKE_NVME_KV_DEVICE_PATH)
+            .value_or("");
     if (config.device_path.empty()) {
         LOG(ERROR) << "MOONCAKE_NVME_KV_DEVICE_PATH must not be empty";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     config.nsid = ReadNvmeKvU32Or(
-        env, NvmeKvConnectorEnvironmentVariables::MOONCAKE_NVME_KV_NSID,
+        env,
+        ClientEnvironmentVariables::NvmeKv::Connector::MOONCAKE_NVME_KV_NSID,
         config.nsid);
-    config.queue_depth = ReadNvmeKvU32Or(
-        env, NvmeKvConnectorEnvironmentVariables::MOONCAKE_NVME_KV_QUEUE_DEPTH,
-        config.queue_depth);
+    config.queue_depth =
+        ReadNvmeKvU32Or(env,
+                        ClientEnvironmentVariables::NvmeKv::Connector::
+                            MOONCAKE_NVME_KV_QUEUE_DEPTH,
+                        config.queue_depth);
     config.runtime_transfer_limit =
         ReadNvmeKvU32Or(env,
-                        NvmeKvConnectorEnvironmentVariables::
+                        ClientEnvironmentVariables::NvmeKv::Connector::
                             MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT,
                         config.runtime_transfer_limit);
     auto transport = ReadTransport(env);

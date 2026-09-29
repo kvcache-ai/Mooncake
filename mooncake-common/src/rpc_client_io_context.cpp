@@ -23,7 +23,7 @@ uint32_t ResolveRpcClientIoThreads(const Environ& env,
 
 RpcClientIoThreadsConfig RpcClientIoThreadsConfig::FromEnvironment(
     const Environ& env) {
-    using Variables = RpcClientIoEnvironmentVariables;
+    using Variables = CommonEnvironmentVariables::Rpc;
     const uint32_t hardware_threads =
         static_cast<uint32_t>(std::thread::hardware_concurrency());
     const uint32_t default_threads = std::min(

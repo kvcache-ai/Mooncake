@@ -5,7 +5,7 @@
 #include "ascii_string.h"
 #include "common.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 namespace {
@@ -31,7 +31,7 @@ std::string NormalizeHostId(std::string_view value) {
 ClientHostIdentityConfig ClientHostIdentityConfig::FromEnvironment(
     const Environ& env, const std::string& local_hostname) {
     const std::string configured_host_id(TrimAsciiWhitespace(
-        env.GetTyped(ClientHostIdentityEnvironmentVariables::MOONCAKE_HOST_ID)
+        env.GetTyped(ClientEnvironmentVariables::HostIdentity::MOONCAKE_HOST_ID)
             .value_or("")));
     return {.host_id = NormalizeHostId(configured_host_id.empty()
                                            ? local_hostname

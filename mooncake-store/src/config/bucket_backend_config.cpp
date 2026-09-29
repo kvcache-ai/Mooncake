@@ -5,7 +5,7 @@
 #include <string>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
@@ -23,7 +23,7 @@ bool BucketBackendConfig::Validate() const {
 
 BucketBackendConfig BucketBackendConfig::FromEnvironment(const Environ& env) {
     BucketBackendConfig config;
-    using Variables = BucketBackendEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Offload::Bucket;
 
     config.bucket_keys_limit =
         env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT,

@@ -6,7 +6,7 @@
 
 #include "common/byte_size.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 namespace {
@@ -18,7 +18,7 @@ constexpr size_t kSize1Gb = 1024ULL * 1024 * 1024;
 }  // namespace
 
 bool HugepageConfig::IsEnabledFromEnvironment(const Environ& env) {
-    using Variables = HugepageEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Hugepage;
     return env.GetTyped(Variables::MC_STORE_USE_HUGEPAGE).has_value();
 }
 
@@ -31,7 +31,7 @@ HugepageConfig HugepageConfig::FromEnvironment(const Environ& env) {
     config.enabled = true;
     config.page_size = kSize2Mb;
 
-    using Variables = HugepageEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Hugepage;
     const auto raw_size = env.GetTyped(Variables::MC_STORE_HUGEPAGE_SIZE);
     if (!raw_size.has_value()) {
         return config;

@@ -7,14 +7,14 @@
 
 #include "ascii_string.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
 ClientAutoDiscoveryConfig ClientAutoDiscoveryConfig::FromEnvironment(
     const Environ& env, std::string_view protocol,
     bool device_names_configured) {
-    using Variables = ClientAutoDiscoveryEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::AutoDiscovery;
     ClientAutoDiscoveryConfig config;
 
     const auto raw_auto_discover = env.GetTyped(Variables::MC_MS_AUTO_DISC);
@@ -58,7 +58,7 @@ ClientAutoDiscoveryConfig ClientAutoDiscoveryConfig::FromEnvironment(
 }
 
 void ClientAutoDiscoveryConfig::LoadFiltersFromEnvironment(const Environ& env) {
-    using Variables = ClientAutoDiscoveryEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::AutoDiscovery;
 
     const auto raw_filters = env.GetTyped(Variables::MC_MS_FILTERS);
     if (enabled) {

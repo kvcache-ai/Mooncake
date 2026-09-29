@@ -1,14 +1,15 @@
 #include "master_metadata_config.h"
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "master_environment_variables.h"
 
 namespace mooncake {
 
 MasterMetadataConfig MasterMetadataConfig::FromEnvironment(const Environ& env) {
     MasterMetadataConfig config;
     config.cluster_id =
-        env.GetTyped(MasterMetadataEnvironmentVariables::MC_METADATA_CLUSTER_ID)
+        env.GetTyped(
+               MasterEnvironmentVariables::Metadata::MC_METADATA_CLUSTER_ID)
             .value_or("");
     return config;
 }

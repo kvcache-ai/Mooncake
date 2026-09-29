@@ -4,7 +4,7 @@
 
 #include "ascii_string.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 #include "integer_parser.h"
 
 namespace mooncake {
@@ -12,7 +12,7 @@ namespace mooncake {
 RegisteredPinnedMemoryConfig RegisteredPinnedMemoryConfig::FromEnvironment(
     const Environ& env) {
     RegisteredPinnedMemoryConfig config;
-    using Variables = RegisteredPinnedMemoryEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::PinnedMemory;
 
     const auto raw_value =
         env.GetTyped(Variables::MC_STORE_PIN_MEMORY_MAX_BYTES);

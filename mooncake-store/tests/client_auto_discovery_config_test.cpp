@@ -6,14 +6,14 @@
 
 #include "../src/config/client_auto_discovery_config.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "../src/config/client_environment_variables.h"
 
 namespace mooncake {
 namespace {
 
 class ClientAutoDiscoveryConfigTest : public ::testing::Test {
    protected:
-    using Variables = ClientAutoDiscoveryEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::AutoDiscovery;
 
     ClientAutoDiscoveryConfig Load(std::string_view protocol,
                                    bool device_names_configured) const {
