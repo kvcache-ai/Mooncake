@@ -199,6 +199,12 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
 
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            // Bypass inject: snapshot the calling (Python) thread's per-request
+            // RequestContext once at entry, then carry it on hop A via
+            // send_request_with_attachment. The hop A server handler reads it
+            // back (when it is a V3 context handler) and bridges it to hop B;
+            // non-reading handlers ignore it. Empty attachment == plain
+            // send_request (gray).
             std::string ctx_attachment = current_request_context_attachment();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
@@ -244,6 +250,9 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
+            // Bypass inject (see invoke_rpc): snapshot the per-request
+            // RequestContext on the calling thread once at entry and carry it
+            // on hop A via send_request_with_attachment.
             std::string ctx_attachment = current_request_context_attachment();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,

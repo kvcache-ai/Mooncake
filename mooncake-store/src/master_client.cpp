@@ -335,7 +335,8 @@ struct RpcNameTraits<&WrappedMasterService::MarkTaskToComplete> {
     static constexpr const char* value = "MarkTaskToComplete";
 };
 
-// Keep context-handler metrics under the ordinary RPC label.
+// hop B: per-request _with_context handler metric labels aggregate
+// under the base method name so dashboards don't split the rpc.
 template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey_with_context> {
     static constexpr const char* value = "ExistKey";
