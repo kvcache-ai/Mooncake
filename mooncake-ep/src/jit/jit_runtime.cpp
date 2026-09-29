@@ -9,6 +9,7 @@
 #include <jit/jit_runtime.hpp>
 
 #include <jit/jit_cache.hpp>
+#include <jit/jit_config.h>
 #include <jit/jit_utils.hpp>
 #include <jit/nvcc_compiler.hpp>
 
@@ -28,21 +29,6 @@
 #include <unordered_map>
 #include <vector>
 #include <unistd.h>
-
-#ifndef MOONCAKE_EP_JIT_SOURCE_DIR
-#define MOONCAKE_EP_JIT_SOURCE_DIR "/usr/include/mooncake_ep"
-#endif
-
-// Left empty by default: fingerprinting an unrelated system include root on
-// every process would be expensive and meaningless. Builds that need extra
-// headers (e.g. NCCL device headers) point this at the right tree.
-#ifndef MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR
-#define MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR ""
-#endif
-
-#ifndef MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR
-#define MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR ""
-#endif
 
 namespace mooncake {
 namespace jit {
