@@ -639,6 +639,18 @@ endif()
 if(MOONCAKE_ENABLE_OTEL_TRACING)
   target_compile_definitions(mooncake_store_master_objects
                              PRIVATE MOONCAKE_ENABLE_OTEL_TRACING)
+  target_link_libraries(
+    mooncake_store_master_objects
+    PRIVATE opentelemetry-cpp::trace
+            opentelemetry-cpp::resources
+            opentelemetry-cpp::otlp_recordable
+            opentelemetry-cpp::otlp_http_exporter
+            opentelemetry-cpp::otlp_http_client
+            opentelemetry-cpp::otlp_grpc_exporter)
+  if(TARGET opentelemetry-cpp::otlp_grpc_client)
+    target_link_libraries(mooncake_store_master_objects
+                          PRIVATE opentelemetry-cpp::otlp_grpc_client)
+  endif()
 endif()
 if(STORE_USE_REDIS)
   target_link_libraries(mooncake_store_master_objects PRIVATE Mooncake::hiredis)
@@ -680,6 +692,18 @@ endif()
 if(MOONCAKE_ENABLE_OTEL_TRACING)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_ENABLE_OTEL_TRACING)
+  target_link_libraries(
+    mooncake_store_client_objects
+    PRIVATE opentelemetry-cpp::trace
+            opentelemetry-cpp::resources
+            opentelemetry-cpp::otlp_recordable
+            opentelemetry-cpp::otlp_http_exporter
+            opentelemetry-cpp::otlp_http_client
+            opentelemetry-cpp::otlp_grpc_exporter)
+  if(TARGET opentelemetry-cpp::otlp_grpc_client)
+    target_link_libraries(mooncake_store_client_objects
+                          PRIVATE opentelemetry-cpp::otlp_grpc_client)
+  endif()
 endif()
 if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_URING)
@@ -770,8 +794,8 @@ if(MOONCAKE_ENABLE_OTEL_TRACING)
             opentelemetry-cpp::otlp_http_client
             opentelemetry-cpp::otlp_grpc_exporter)
   if(TARGET opentelemetry-cpp::otlp_grpc_client)
-    target_link_libraries(
-      mooncake_store_master PRIVATE opentelemetry-cpp::otlp_grpc_client)
+    target_link_libraries(mooncake_store_master
+                          PRIVATE opentelemetry-cpp::otlp_grpc_client)
   endif()
 endif()
 
