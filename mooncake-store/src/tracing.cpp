@@ -138,8 +138,8 @@ std::string SpanIdHex(const trace_api::SpanId& id) {
 // un-exported "remote" parent and inherits the request-derived trace id, which
 // PopulateRequestContext then propagates to the next hop.
 //
-// Caller fallback (plan_trace.md §2.9): HiCache backup ops have no request_id
-// at all, only caller_id/caller_role. Without a request_id the synthesized
+// Caller fallback: HiCache backup ops have no request_id at all, only
+// caller_id/caller_role. Without a request_id the synthesized
 // parent would be empty and hop-a would again become a random root. We fall
 // back to a caller-keyed virtual parent so same caller/role => same trace id
 // and the otherwise rootless backup traffic stays correlatable.
@@ -259,9 +259,9 @@ class ScopedSpanImpl {
                                    parent_ctx->request_id.size()));
         }
         // Caller attribution (disambiguate which dummy-client / thread issued
-        // the RPC; see plan_trace.md §2.8). Recorded only when the caller
-        // actually supplied them -- absent (compatible field unset) on older /
-        // non-sglang callers, so those spans are unchanged.
+        // the RPC). Recorded only when the caller actually supplied them --
+        // absent (compatible field unset) on older / non-sglang callers, so
+        // those spans are unchanged.
         if (parent_ctx != nullptr) {
             if (auto v = caller_id_of(*parent_ctx); !v.empty()) {
                 span_->SetAttribute("caller.id",

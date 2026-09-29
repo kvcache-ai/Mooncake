@@ -1,7 +1,7 @@
 // Unit tests for request_context.h trace-id / span-id derivation, including the
 // caller-based ("virtual prefetch/backup root") derivation added for HiCache
-// backup ops that carry caller_id/caller_role but no request_id (plan_trace.md
-// "virtual root"). These are header-only, no OpenTelemetry dependency, so they
+// backup ops that carry caller_id/caller_role but no request_id. These are
+// header-only, no OpenTelemetry dependency, so they
 // run in the default (tracing-OFF) build.
 
 #include <gtest/gtest.h>
@@ -68,8 +68,8 @@ TEST(RequestContextEnsureTraceId, BackupSelfSeedsFromCaller) {
 }
 
 TEST(RequestContextEnsureTraceId, RequestIdTakesPrecedenceOverCaller) {
-    // Prefetch path keeps the existing (plan_trace.md §2.7) request-id-derived
-    // trace id; EnsureTraceIdFromCaller must not override it with a caller id.
+    // Prefetch path keeps the existing request-id-derived trace id;
+    // EnsureTraceIdFromCaller must not override it with a caller id.
     RequestContext ctx;
     ctx.request_id = "abcd1234-abcd-1234-abcd-1234abcd1234";  // UUID -> 32 hex
     ctx.caller_id = "sglang-tp0";
@@ -99,7 +99,7 @@ TEST(RequestContextDeserialize, PrefetchAttachmentStillUsesRequestId) {
     raw.request_id = "abcd1234-abcd-1234-abcd-1234abcd1234";
     std::string att = struct_pack::serialize<std::string>(raw);
     auto got = deserialize_request_context(att);
-    // UUID request_id used verbatim as the trace id (plan_trace.md §2.7).
+    // UUID request_id used verbatim as the trace id.
     EXPECT_EQ(got.trace_id, "abcd1234abcd1234abcd1234abcd1234");
 }
 
