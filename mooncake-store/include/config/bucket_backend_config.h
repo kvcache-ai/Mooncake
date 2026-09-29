@@ -5,6 +5,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 enum class BucketEvictionPolicy {
     NONE,  // No eviction (default)
     FIFO,  // Evict oldest bucket first (by creation order)
@@ -64,7 +66,7 @@ struct BucketBackendConfig {
 
     bool Validate() const;
 
-    static BucketBackendConfig FromEnvironment();
+    static BucketBackendConfig FromEnvironment(const Environ& env);
 };
 
 }  // namespace mooncake

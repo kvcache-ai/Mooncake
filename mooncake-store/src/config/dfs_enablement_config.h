@@ -2,10 +2,12 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct DfsEnablementConfig {
     bool enabled = false;
 
-    static DfsEnablementConfig FromEnvironment();
+    static DfsEnablementConfig FromEnvironment(const Environ& env);
 };
 
 }  // namespace mooncake

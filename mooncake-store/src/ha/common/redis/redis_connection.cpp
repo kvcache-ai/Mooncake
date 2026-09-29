@@ -5,6 +5,7 @@
 #include <exception>
 
 #include "config/redis_connection_config.h"
+#include "environ.h"
 
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
@@ -74,7 +75,8 @@ tl::expected<int, ErrorCode> ParsePositiveInt(std::string_view text,
 }
 
 tl::expected<int, ErrorCode> ResolveRedisDbIndex() {
-    const auto config = RedisConnectionConfig::FromEnvironment();
+    const auto config =
+        RedisConnectionConfig::FromEnvironment(Environ::Process());
     if (!config.has_value()) {
         return tl::make_unexpected(config.error());
     }
@@ -174,7 +176,8 @@ tl::expected<RedisContextPtr, ErrorCode> ConnectRedis(
         return tl::make_unexpected(endpoint.error());
     }
 
-    const auto config = RedisConnectionConfig::FromEnvironment();
+    const auto config =
+        RedisConnectionConfig::FromEnvironment(Environ::Process());
     if (!config.has_value()) {
         return tl::make_unexpected(config.error());
     }

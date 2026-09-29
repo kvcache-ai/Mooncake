@@ -8,6 +8,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct OssAdapterConfig {
     std::string endpoint;
     std::string bucket;
@@ -21,7 +23,8 @@ struct OssAdapterConfig {
     int receive_buffer_size = 1024 * 1024;
     int upload_buffer_size = 1024 * 1024;
 
-    static tl::expected<OssAdapterConfig, ErrorCode> FromEnvironment();
+    static tl::expected<OssAdapterConfig, ErrorCode> FromEnvironment(
+        const Environ& env);
 };
 
 }  // namespace mooncake

@@ -34,6 +34,7 @@
 #include <optional>
 #include <string>
 
+#include "environ.h"
 #include "master_client.h"
 #include "pyclient.h"
 #include "test_server_helpers.h"
@@ -329,9 +330,11 @@ TEST_F(RpcTimeoutEnvTest, TimeoutEnvOverridesAreOptIn) {
     EXPECT_EQ(ha_config.client_config.connect_timeout_duration,
               std::chrono::seconds(1));
 
+    // Read the process environment, as MakeMasterRpcClientPoolConfig() does,
+    // so the helper and the master pool observe the same values.
     StubClientConfig defaults;
-    detail::ApplyRpcTimeoutOverrides(defaults,
-                                     RpcTimeoutConfig::FromEnvironment());
+    detail::ApplyRpcTimeoutOverrides(
+        defaults, RpcTimeoutConfig::FromEnvironment(Environ::Process()));
     EXPECT_EQ(defaults.request_timeout_duration, std::chrono::seconds(30));
     EXPECT_EQ(defaults.connect_timeout_duration, std::chrono::seconds(30));
     const auto original_master_config = detail::MakeMasterRpcClientPoolConfig();
@@ -341,8 +344,8 @@ TEST_F(RpcTimeoutEnvTest, TimeoutEnvOverridesAreOptIn) {
               0);
 
     StubClientConfig overridden;
-    detail::ApplyRpcTimeoutOverrides(overridden,
-                                     RpcTimeoutConfig::FromEnvironment());
+    detail::ApplyRpcTimeoutOverrides(
+        overridden, RpcTimeoutConfig::FromEnvironment(Environ::Process()));
     EXPECT_EQ(overridden.request_timeout_duration,
               std::chrono::milliseconds(1500));
     EXPECT_EQ(overridden.connect_timeout_duration,
@@ -368,9 +371,11 @@ TEST_F(RpcTimeoutEnvTest, OverridesPreserveCallerPolicyAndUseResolvedValues) {
         std::chrono::milliseconds request_timeout_duration{7000};
         std::chrono::milliseconds connect_timeout_duration{1000};
     };
+    const MapEnvironSource unset_environment;
     StubClientConfig defaults;
-    detail::ApplyRpcTimeoutOverrides(defaults,
-                                     RpcTimeoutConfig::FromEnvironment());
+    detail::ApplyRpcTimeoutOverrides(
+        defaults,
+        RpcTimeoutConfig::FromEnvironment(Environ(unset_environment)));
     EXPECT_EQ(defaults.request_timeout_duration,
               std::chrono::milliseconds(7000));
     EXPECT_EQ(defaults.connect_timeout_duration,

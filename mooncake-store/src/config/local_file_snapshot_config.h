@@ -4,10 +4,12 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct LocalFileSnapshotConfig {
     std::string base_path;
 
-    static LocalFileSnapshotConfig FromEnvironment();
+    static LocalFileSnapshotConfig FromEnvironment(const Environ& env);
 };
 
 }  // namespace mooncake

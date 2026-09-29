@@ -29,9 +29,9 @@ std::string NormalizeHostId(std::string_view value) {
 }  // namespace
 
 ClientHostIdentityConfig ClientHostIdentityConfig::FromEnvironment(
-    const std::string& local_hostname) {
+    const Environ& env, const std::string& local_hostname) {
     const std::string configured_host_id(TrimAsciiWhitespace(
-        Environ::Read(ClientHostIdentityEnvironmentVariables::MOONCAKE_HOST_ID)
+        env.GetTyped(ClientHostIdentityEnvironmentVariables::MOONCAKE_HOST_ID)
             .value_or("")));
     return {.host_id = NormalizeHostId(configured_host_id.empty()
                                            ? local_hostname

@@ -20,8 +20,8 @@ constexpr std::size_t kDefaultBatchSubmitConcurrency = 6;
 constexpr std::size_t kDefaultRootSubmitConcurrency = 1;
 
 std::optional<std::size_t> ReadOptionalPositive(
-    const EnvironmentVariable<std::string>& variable) {
-    const auto value = Environ::Read(variable);
+    const Environ& env, const EnvironmentVariable<std::string>& variable) {
+    const auto value = env.GetTyped(variable);
     if (!value.has_value()) {
         return std::nullopt;
     }
@@ -32,25 +32,27 @@ std::optional<std::size_t> ReadOptionalPositive(
     return static_cast<std::size_t>(*parsed);
 }
 
-std::size_t ReadPositiveOr(const EnvironmentVariable<std::string>& variable,
+std::size_t ReadPositiveOr(const Environ& env,
+                           const EnvironmentVariable<std::string>& variable,
                            std::size_t fallback, std::size_t maximum) {
-    const auto parsed = ReadOptionalPositive(variable);
+    const auto parsed = ReadOptionalPositive(env, variable);
     return parsed.has_value() ? std::min(*parsed, maximum) : fallback;
 }
 
 }  // namespace
 
 NvmeKvIoConcurrencyConfig NvmeKvIoConcurrencyConfig::FromEnvironment(
-    std::size_t device_queue_depth) {
+    const Environ& env, std::size_t device_queue_depth) {
     NvmeKvIoConcurrencyConfig config;
     config.max_io_concurrency = ReadPositiveOr(
+        env,
         NvmeKvIoConcurrencyEnvironmentVariables::
             MOONCAKE_NVME_KV_MAX_IO_CONCURRENCY,
         kDefaultMaxIoConcurrency, std::numeric_limits<uint32_t>::max());
 
     const auto configured_io =
-        ReadOptionalPositive(NvmeKvIoConcurrencyEnvironmentVariables::
-                                 MOONCAKE_NVME_KV_IO_CONCURRENCY);
+        ReadOptionalPositive(env, NvmeKvIoConcurrencyEnvironmentVariables::
+                                      MOONCAKE_NVME_KV_IO_CONCURRENCY);
     config.io_concurrency =
         configured_io.has_value()
             ? std::min(*configured_io, config.max_io_concurrency)
@@ -61,11 +63,13 @@ NvmeKvIoConcurrencyConfig NvmeKvIoConcurrencyConfig::FromEnvironment(
     const std::size_t max_submit_concurrency =
         config.io_concurrency > 1 ? config.io_concurrency - 1 : 1;
     config.batch_submit_concurrency = ReadPositiveOr(
+        env,
         NvmeKvIoConcurrencyEnvironmentVariables::
             MOONCAKE_NVME_KV_BATCH_SUBMIT_CONCURRENCY,
         std::min(kDefaultBatchSubmitConcurrency, max_submit_concurrency),
         max_submit_concurrency);
     config.root_submit_concurrency = ReadPositiveOr(
+        env,
         NvmeKvIoConcurrencyEnvironmentVariables::
             MOONCAKE_NVME_KV_ROOT_SUBMIT_CONCURRENCY,
         std::min(kDefaultRootSubmitConcurrency, max_submit_concurrency),
@@ -76,6 +80,7 @@ NvmeKvIoConcurrencyConfig NvmeKvIoConcurrencyConfig::FromEnvironment(
             ? config.io_concurrency - config.batch_submit_concurrency
             : 1;
     config.prepare_concurrency = ReadPositiveOr(
+        env,
         NvmeKvIoConcurrencyEnvironmentVariables::
             MOONCAKE_NVME_KV_PREPARE_CONCURRENCY,
         std::min(kDefaultPrepareConcurrency, max_prepare_concurrency),

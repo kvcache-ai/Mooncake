@@ -5,9 +5,10 @@
 
 namespace mooncake {
 
-ShmSpdkRegistrationConfig ShmSpdkRegistrationConfig::FromEnvironment() {
+ShmSpdkRegistrationConfig ShmSpdkRegistrationConfig::FromEnvironment(
+    const Environ& env) {
     return {
-        Environ::Read(
+        env.GetTyped(
             ShmSpdkRegistrationEnvironmentVariables::MC_STORE_REGISTER_SPDK) ==
         "1"};
 }

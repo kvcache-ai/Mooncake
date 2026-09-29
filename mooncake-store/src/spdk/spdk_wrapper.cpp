@@ -13,13 +13,15 @@
 #include <thread>
 #include "config/spdk_controller_config.h"
 #include "spdk/spdk_wrapper.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
 void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
     opts->keep_alive_timeout_ms = 0;
-    const auto config = SpdkControllerConfig::FromEnvironment();
+    const auto config =
+        SpdkControllerConfig::FromEnvironment(Environ::Process());
     if (config.num_io_queues.has_value()) {
         opts->num_io_queues = *config.num_io_queues;
     }

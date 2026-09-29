@@ -3,10 +3,12 @@
 #include "../src/config/registered_pinned_memory_config.h"
 
 #include <array>
-#include <cstdlib>
-#include <optional>
+#include <cstdint>
+#include <string>
 
 #include <gtest/gtest.h>
+
+#include "environ.h"
 
 namespace mooncake {
 namespace {
@@ -14,64 +16,45 @@ namespace {
 using Manager = RegisteredPinnedMemoryManager;
 using UnregisterResult = Manager::UnregisterResult;
 
-class ScopedEnvVar {
-   public:
-    explicit ScopedEnvVar(const char* name) : name_(name) {
-        if (const char* value = std::getenv(name)) {
-            original_ = value;
-        }
-        unsetenv(name_.c_str());
-    }
-
-    ~ScopedEnvVar() {
-        if (original_.has_value()) {
-            setenv(name_.c_str(), original_->c_str(), 1);
-        } else {
-            unsetenv(name_.c_str());
-        }
-    }
-
-    ScopedEnvVar(const ScopedEnvVar&) = delete;
-    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
-    void Set(const char* value) { setenv(name_.c_str(), value, 1); }
-
-   private:
-    std::string name_;
-    std::optional<std::string> original_;
-};
-
 class RegisteredPinnedMemoryConfigTest : public ::testing::Test {
    protected:
-    ScopedEnvVar max_bytes{"MC_STORE_PIN_MEMORY_MAX_BYTES"};
+    uint64_t LoadMaxBytes() const {
+        return RegisteredPinnedMemoryConfig::FromEnvironment(Environ(source_))
+            .max_bytes;
+    }
+
+    void SetMaxBytes(const char* value) {
+        source_.Set("MC_STORE_PIN_MEMORY_MAX_BYTES", value);
+    }
+
+    MapEnvironSource source_;
 };
 
 TEST_F(RegisteredPinnedMemoryConfigTest, UnsetAndEmptyDisableWithoutWarning) {
     ::testing::internal::CaptureStderr();
-    EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 0);
+    EXPECT_EQ(LoadMaxBytes(), 0);
     EXPECT_TRUE(::testing::internal::GetCapturedStderr().empty());
 
-    max_bytes.Set("");
+    SetMaxBytes("");
     ::testing::internal::CaptureStderr();
-    EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 0);
+    EXPECT_EQ(LoadMaxBytes(), 0);
     EXPECT_TRUE(::testing::internal::GetCapturedStderr().empty());
 }
 
 TEST_F(RegisteredPinnedMemoryConfigTest, ReadsZeroAndPositiveByteLimits) {
-    max_bytes.Set("0");
-    EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 0);
+    SetMaxBytes("0");
+    EXPECT_EQ(LoadMaxBytes(), 0);
 
-    max_bytes.Set(" 4096\t");
-    EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 4096);
+    SetMaxBytes(" 4096\t");
+    EXPECT_EQ(LoadMaxBytes(), 4096);
 }
 
 TEST_F(RegisteredPinnedMemoryConfigTest, InvalidValuesWarnAndDisable) {
     for (const char* value :
          {"-1", "+1", "1suffix", "   ", "18446744073709551616"}) {
-        max_bytes.Set(value);
+        SetMaxBytes(value);
         ::testing::internal::CaptureStderr();
-        EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 0)
-            << value;
+        EXPECT_EQ(LoadMaxBytes(), 0) << value;
         const std::string logs = ::testing::internal::GetCapturedStderr();
         EXPECT_NE(logs.find("MC_STORE_PIN_MEMORY_MAX_BYTES"), std::string::npos)
             << value;
