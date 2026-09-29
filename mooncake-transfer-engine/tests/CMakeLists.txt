@@ -239,7 +239,7 @@ if(USE_CUDA AND NOT USE_HIP)
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(dmabuf_export_test PUBLIC CUDA::cudart)
   set_tests_properties(dmabuf_export_test PROPERTIES ENVIRONMENT
-                       "WITH_NVIDIA_PEERMEM=0")
+                                                     "WITH_NVIDIA_PEERMEM=0")
 endif()
 
 if(USE_MNNVL)
