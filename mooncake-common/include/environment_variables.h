@@ -103,6 +103,8 @@ struct StoreShmEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_USE_SHM_SEGMENT);
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_SHM_ALLOW_TMPFS);
     MC_DEFINE_ENV_VAR(std::string, MC_HUGETLBFS_PATH);
+};
+
 struct ShmSpdkRegistrationEnvironmentVariables {
     // The registration opt-in is enabled only by the exact string "1".
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REGISTER_SPDK);
