@@ -766,6 +766,7 @@ if(USE_FLAGCX)
       PROPERTIES IMPORTED_LOCATION "${FLAGCX_LIBRARY}"
                  INTERFACE_INCLUDE_DIRECTORIES "${FLAGCX_INCLUDE_DIR}")
   endif()
+  include_directories(${FLAGCX_INCLUDE_DIR})
   add_compile_definitions(USE_FLAGCX)
   message(
     STATUS
