@@ -6,6 +6,7 @@ import base64
 import hashlib
 import importlib
 import importlib.metadata as metadata
+import os
 from pathlib import Path
 
 
@@ -56,20 +57,34 @@ def verify_multi_protocol_support(engine_module: object, engine_path: Path) -> N
     )
 
 
+def find_extension_record(records: dict[str, object], module_stem: str) -> str:
+    matches = [
+        name
+        for name in records
+        if name.startswith(f"mooncake/{module_stem}") and name.endswith(".so")
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected one installed {module_stem} extension, found {matches}"
+        )
+    return matches[0]
+
+
 def main() -> None:
     distribution = metadata.distribution("mooncake-transfer-engine-rocm")
+    os.environ["MOONCAKE_STORE_BACKEND"] = "cpp"
     package = importlib.import_module("mooncake")
     package_dir = Path(package.__file__).resolve().parent
     records = {str(item): item for item in distribution.files or ()}
-    expected_files = {
-        "mooncake/engine.so": "mooncake.engine",
-        "mooncake/store.so": "mooncake.store",
-        "mooncake/mooncake_master": None,
-    }
+    expected_files = [
+        (find_extension_record(records, "engine."), "mooncake.engine"),
+        (find_extension_record(records, "_store."), "mooncake._store"),
+        ("mooncake/mooncake_master", None),
+    ]
 
     print("Mooncake package:", package.__file__)
     print("Mooncake ROCm distribution:", distribution.version)
-    for relative_path, module_name in expected_files.items():
+    for relative_path, module_name in expected_files:
         record = records.get(relative_path)
         if record is None or record.hash is None:
             raise RuntimeError(f"Missing hashed wheel record: {relative_path}")
@@ -96,6 +111,14 @@ def main() -> None:
                 verify_multi_protocol_support(module, installed_path)
 
         print(relative_path, installed_path, f"{record.hash.mode}={digest}")
+
+    store = importlib.import_module("mooncake.store")
+    private_store = importlib.import_module("mooncake._store")
+    if store._BACKEND != "cpp" or store.MooncakeDistributedStore is not private_store.MooncakeDistributedStore:
+        raise RuntimeError("the installed C++ Store facade did not select its private extension")
+
+    if any(str(item).endswith("mooncake_store_rs.pth") for item in distribution.files or ()):
+        raise RuntimeError("the wheel still installs the legacy Store-RS startup hook")
 
 
 if __name__ == "__main__":

@@ -1,13 +1,22 @@
 # Python Guide
 
-Store-RS Python bindings are implemented by the PyO3 crate `crates/mooncake-store-py` and the source modules under `python/mooncake_store_rs`.
+The root `mooncake-transfer-engine` wheel owns the `mooncake` Python package and its Store facade. Store-RS bindings are implemented by `crates/mooncake-store-py` and the modules under `python/mooncake/store/rs`.
 
-The Python API reuses the Rust runtime, control plane, allocator, reclaim logic, tracing, and metrics. The Python modules currently run from a source checkout and are not published as a separate distribution.
+With `MOONCAKE_STORE_BACKEND` unset, the facade selects the C++ Store. Set the
+variable to exactly `cpp` or `rs` before importing `mooncake.store`. An empty or
+unknown value raises `ValueError`; a selected backend missing from the installed
+root wheel raises an import error without switching to the other backend.
 
-Use the Store-RS source import path:
+Both implementations use the same public import path:
 
 ```python
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+```
+
+The Store-RS-specific structured-object helper remains under its implementation namespace:
+
+```python
+from mooncake.store.rs.structured_object_store import MooncakeBundleTransfer
 ```
 
 ## What the Python Layer Provides
@@ -134,24 +143,30 @@ Design boundary:
 - it does not change route ownership, replica ownership, or placement policy
 - values larger than the configured block size bypass the cache
 
-## Build From a Checkout
+## Build and install the root wheel
+
+The default root wheel builds the C++ Store and does not require a Rust toolchain:
 
 ```bash
-export MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs
-export MOONCAKE_ROOT_DIR=/path/to/Mooncake
-export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
-cmake -S "${MOONCAKE_ROOT_DIR}" -B "${MOONCAKE_BUILD_DIR}" \
-  -DWITH_TE=ON -DUSE_TENT=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
-  -DWITH_STORE_RS=ON
-cmake --build "${MOONCAKE_BUILD_DIR}" --target build_store_rs
-export MOONCAKE_PYTHON_TARGET_DIR="${MOONCAKE_BUILD_DIR}/mooncake-store-rs"
-export PYTHONPATH="${MOONCAKE_STORE_RS_DIR}/python"
+python3 -m pip wheel . --no-deps --wheel-dir dist/cpp
 ```
 
-The CMake target uses the selected CMake build tree for Transfer Engine and TENT,
-and places the PyO3 extension under `mooncake-store-rs` in that build tree. Set
-`MOONCAKE_PYTHON_TARGET_DIR` and `PYTHONPATH` before importing the source module.
-This checkout path is used by the Python compatibility e2e scripts.
+Enable Store-RS in a root wheel with the optional CMake component, then install
+that wheel into the test virtualenv:
+
+```bash
+SKBUILD_CMAKE_ARGS="-DWITH_STORE_RS=ON" \
+  python3 -m pip wheel . --no-deps --wheel-dir dist/rs
+python3 -m venv .venv-store-rs
+.venv-store-rs/bin/python -m pip install --no-deps dist/rs/mooncake_transfer_engine-*.whl
+MOONCAKE_STORE_BACKEND=rs .venv-store-rs/bin/python -c \
+  "from mooncake.store import MooncakeDistributedStore; print(MooncakeDistributedStore)"
+```
+
+The wheel installs the private `mooncake._store_rs` extension and its CMake
+native dependencies in the `python` install component. Python imports use the
+installed package and its RPATH; they do not scan Cargo target directories or
+source checkouts.
 
 ## Standalone Client Binary
 
@@ -162,8 +177,8 @@ cargo build --release -p mooncake-store-py --bin mooncake-store-client --bin moo
 ```
 
 The executables are written to `target/release/` unless `CARGO_TARGET_DIR` is
-set. CMake builds the native extension and standalone Rust executables from the
-same workspace; it does not install a separate Python distribution.
+set. A root wheel built with `WITH_STORE_RS=ON` also installs the native
+commands next to the Python package and exposes them as console scripts.
 
 Start a storage client:
 
@@ -338,7 +353,7 @@ Notes:
 
 ## Structured Object Store Helper
 
-`mooncake_store_rs.structured_object_store` provides a higher-level helper for one logical object that contains multiple named members.
+`mooncake.store.rs.structured_object_store` provides a higher-level helper for one logical object that contains multiple named members.
 It is designed for cases such as rollout / batch transfer where callers want to keep their own object semantics locally while using Mooncake for fast payload movement.
 
 The helper separates two concepts:
@@ -349,7 +364,7 @@ The helper separates two concepts:
 ### Main types
 
 ```python
-from mooncake_store_rs.structured_object_store import (
+from mooncake.store.rs.structured_object_store import (
     MooncakeBundleTransfer,
     StructuredMemberSlice,
     StructuredObjectPayload,
@@ -366,8 +381,8 @@ Use `put_structured_object()` to write one structured object. The default read p
 
 ```python
 import numpy as np
-from mooncake_store_rs.store import MooncakeDistributedStore
-from mooncake_store_rs.structured_object_store import MooncakeBundleTransfer, StructuredObjectPayload
+from mooncake.store import MooncakeDistributedStore
+from mooncake.store.rs.structured_object_store import MooncakeBundleTransfer, StructuredObjectPayload
 
 store = MooncakeDistributedStore()
 transfer = MooncakeBundleTransfer(store, key_prefix="demo/structured")
@@ -444,7 +459,7 @@ Use the bundle path when the object is just a manifest plus named payloads, and 
 ## Basic Real-Mode Example
 
 ```python
-from mooncake_store_rs.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup(
@@ -473,7 +488,7 @@ When `domain` and `object_set` are omitted from `setup(...)`, the Python wrapper
 ## Routed Writes
 
 ```python
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 store.setup(
@@ -521,6 +536,8 @@ For path-specific manual checks, keep using the paired helper scripts below.
 Run the dedicated local hot-cache e2e:
 
 ```bash
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_PYTHON_BIN=/path/to/venv/bin/python \
 ./scripts/e2e/run-local-hot-cache-e2e.sh
 ```
 
@@ -537,12 +554,12 @@ Useful inputs:
 
 ## Real-Mode Validation Script
 
-Use `scripts/clients/real_client_rw.py` for black-box real-mode validation against the current store-rs compatibility stack.
+Use `python/tests/store/rs/clients/real_client_rw.py` for black-box real-mode validation against the current store-rs compatibility stack.
 
 Storage node:
 
 ```bash
-python3 ./scripts/clients/real_client_rw.py \
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/real_client_rw.py \
   --local_host 10.0.0.11:17111 \
   --metadata_url redis://10.0.0.10:6379/0 \
   --storage-bytes $((128 * 1024 * 1024)) \
@@ -553,7 +570,7 @@ python3 ./scripts/clients/real_client_rw.py \
 RW-only writer:
 
 ```bash
-python3 ./scripts/clients/real_client_rw.py \
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/real_client_rw.py \
   --local_host 10.0.0.21:17121 \
   --metadata_url redis://10.0.0.10:6379/0 \
   --storage-bytes 0 \
@@ -565,7 +582,7 @@ python3 ./scripts/clients/real_client_rw.py \
 RW-only reader:
 
 ```bash
-python3 ./scripts/clients/real_client_rw.py \
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/real_client_rw.py \
   --local_host 10.0.0.22:17122 \
   --metadata_url redis://10.0.0.10:6379/0 \
   --storage-bytes 0 \
@@ -586,12 +603,12 @@ Current script behavior:
 
 ## Dummy-Mode Validation Script
 
-Use `scripts/clients/dummy_client_rw.py` for black-box dummy-mode validation against a standalone compatibility daemon.
+Use `python/tests/store/rs/clients/dummy_client_rw.py` for black-box dummy-mode validation against a standalone compatibility daemon.
 
 Single-item mode:
 
 ```bash
-python3 ./scripts/clients/dummy_client_rw.py \
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/dummy_client_rw.py \
   --daemon_addr 127.0.0.1:16590 \
   --key_prefix dummy-smoke
 ```
@@ -599,7 +616,7 @@ python3 ./scripts/clients/dummy_client_rw.py \
 Shared-memory batch mode:
 
 ```bash
-python3 ./scripts/clients/dummy_client_rw.py \
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/dummy_client_rw.py \
   --daemon_addr 127.0.0.1:16590 \
   --key_prefix dummy-batch \
   --batch_size 8
@@ -608,7 +625,7 @@ python3 ./scripts/clients/dummy_client_rw.py \
 Shared-memory multi-buffer mode:
 
 ```bash
-python3 ./scripts/clients/dummy_client_rw.py \
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/dummy_client_rw.py \
   --daemon_addr 127.0.0.1:16590 \
   --key_prefix dummy-multi \
   --batch_size 4 \
@@ -640,7 +657,7 @@ Start the standalone compatibility server first:
 Then connect from Python:
 
 ```python
-from mooncake_store_rs.store import MooncakeDistributedStore, MooncakeHostMemAllocator
+from mooncake.store import MooncakeDistributedStore, MooncakeHostMemAllocator
 
 store = MooncakeDistributedStore()
 store.setup_dummy(
@@ -676,7 +693,7 @@ Hugepage options:
 Example:
 
 ```python
-from mooncake_store_rs.store import MooncakeHostMemAllocator
+from mooncake.store import MooncakeHostMemAllocator
 
 allocator = MooncakeHostMemAllocator(use_hugepage=True, hugepage_size="2MB")
 ptr = allocator.alloc(2 * 1024 * 1024)
@@ -711,7 +728,7 @@ Import paths:
 ```python
 from mooncake import BufferPool
 # or
-from mooncake_store_rs.store import BufferPool
+from mooncake.store import BufferPool
 # or
 from mooncake.buffer_pool import BufferPool
 ```
@@ -719,7 +736,7 @@ from mooncake.buffer_pool import BufferPool
 Basic usage:
 
 ```python
-from mooncake_store_rs.store import BufferPool, MooncakeDistributedStore
+from mooncake.store import BufferPool, MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup(
@@ -940,7 +957,7 @@ Validation entry points are now grouped by purpose:
 
 - `scripts/run-all-tests.sh` — unified discovery + execution entrypoint for shell-based regressions
 - `scripts/build/` — native dependency and coverage helpers
-- `scripts/clients/` — black-box real/dummy read-write validators
+- `python/tests/store/rs/clients/` — black-box real/dummy read-write validators
 - `scripts/e2e/` — generic compatibility and stress runners
 - `scripts/lib/` — shared shell bootstrap helpers used by script entrypoints
 - `scripts/tests/client/` — standalone client CLI regressions
@@ -967,18 +984,23 @@ Typical scoped runs:
 Run the Python compatibility validation:
 
 ```bash
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_PYTHON_BIN=/path/to/venv/bin/python \
 ./scripts/e2e/run-python-compat-e2e.sh
 ```
 
 Run the black-box real-mode reader / writer validator:
 
 ```bash
-python3 ./scripts/clients/real_client_rw.py --help
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" \
+  ./python/tests/store/rs/clients/real_client_rw.py --help
 ```
 
 Run the hot-upgrade startup validation:
 
 ```bash
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_PYTHON_BIN=/path/to/venv/bin/python \
 ./scripts/tests/client/test-python-client-hot-upgrade-args.sh
 ```
 

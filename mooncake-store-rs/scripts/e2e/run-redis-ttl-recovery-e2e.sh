@@ -42,9 +42,9 @@ Environment:
   MC_STORE_RS_TTL_RECOVERY_HOLD_SECONDS  Idle lifetime for storage clients
                                          (default: 600)
   MC_STORE_RS_KEEP_TEMP                  Keep temp dir on failure when set to 1
+  MOONCAKE_PYTHON_BIN                    Interpreter from a virtualenv with
+                                         the root wheel installed
   MOONCAKE_STORE_RS_DIR              Absolute Store-RS source directory
-  MOONCAKE_ROOT_DIR                  Absolute Mooncake source directory
-  MOONCAKE_BUILD_DIR                 Absolute Mooncake CMake build directory
 EOF
 }
 
@@ -95,15 +95,6 @@ import time
 
 print(int(time.time() * 1000))
 PY
-}
-
-ensure_runtime_ready() {
-  echo "==> building Python extension and standalone client from source"
-  (
-    cd "${REPO_ROOT}"
-    cargo build --release -p mooncake-store-py --lib --bin mooncake-store-client
-  )
-  PYTHON_BIN="python3"
 }
 
 wait_for_redis_up() {
@@ -212,7 +203,7 @@ run_real_client() {
   local -a args=(
     "${PYTHON_BIN}"
     -u
-    "${REPO_ROOT}/scripts/clients/real_client_rw.py"
+    "${REPO_ROOT}/python/tests/store/rs/clients/real_client_rw.py"
     --local_host "${local_host}"
     --metadata_url "${REDIS_URL}"
     --storage-bytes "${storage_bytes}"
@@ -252,7 +243,7 @@ start_storage_client() {
 
   MC_STORE_RS_EXPIRES_AT_MS="${expires_at_ms}" \
     PYTHONUNBUFFERED=1 \
-    "${PYTHON_BIN}" -u "${REPO_ROOT}/scripts/clients/real_client_rw.py" \
+    "${PYTHON_BIN}" -u "${REPO_ROOT}/python/tests/store/rs/clients/real_client_rw.py" \
       --local_host "${local_host}" \
       --metadata_url "${REDIS_URL}" \
       --storage-bytes "${STORAGE_BYTES}" \
@@ -338,15 +329,12 @@ cleanup() {
 trap cleanup EXIT
 
 mc_scripts_require_command git
-mc_scripts_require_command cargo
 mc_scripts_require_command python3
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
 
-mc_scripts_setup_upstream_runtime_env repo-python
+mc_scripts_setup_root_store_rs_python
 export PYTHONDONTWRITEBYTECODE=1
-
-ensure_runtime_ready
 
 TEMP_DIR=$(mktemp -d)
 PIDS=()

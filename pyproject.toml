@@ -93,6 +93,9 @@ transfer_engine_bench = "mooncake.cli_bench:main"
 mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
 mc_store_rest_server = "mooncake.mooncake_store_service:sync_main"
 transfer_engine_topology_dump = "mooncake.transfer_engine_topology_dump:main"
+mooncake-store-client = "mooncake._launcher:store_rs_client"
+mooncake-store-admin = "mooncake._launcher:store_rs_admin"
+mooncake-store-bench = "mooncake._launcher:store_rs_bench"
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
@@ -113,3 +116,4 @@ WITH_EP = false
 WITH_P2P_STORE = false
 WITH_STORE_GO = false
 WITH_STORE_RUST = false
+WITH_STORE_RS = false

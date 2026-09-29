@@ -9,16 +9,10 @@ import sys
 import time
 import traceback
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any
 
 
-REPO_ROOT = Path(os.environ["MOONCAKE_STORE_RS_DIR"]).expanduser()
-PYTHON_ROOT = REPO_ROOT / "python"
-if str(PYTHON_ROOT) not in sys.path:
-    sys.path.insert(0, str(PYTHON_ROOT))
-
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 
 LEASE_MS = 30_000

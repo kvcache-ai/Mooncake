@@ -5,11 +5,8 @@ import gc
 
 import pytest
 
-from mooncake_store_rs.buffer_pool import BufferPool
-
-pytestmark = pytest.mark.skipif(
-    BufferPool is None, reason="native BufferPool is unavailable"
-)
+pytest.importorskip("mooncake._store_rs")
+from mooncake.store.rs.buffer_pool import BufferPool
 
 
 class _LocalLease:

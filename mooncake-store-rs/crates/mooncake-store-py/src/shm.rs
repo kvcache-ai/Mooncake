@@ -7,6 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
+#[cfg(any(feature = "python", test))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
@@ -24,6 +25,7 @@ pub struct DummyClientId {
 }
 
 impl DummyClientId {
+    #[cfg(any(feature = "python", test))]
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let counter = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -51,6 +53,7 @@ pub struct ShmRegisterRequest {
 }
 
 impl ShmRegisterRequest {
+    #[cfg(any(feature = "python", test))]
     pub fn new(client_id: DummyClientId, region_id: u64, size: usize) -> Self {
         Self {
             magic: SHM_REGISTER_MAGIC,
@@ -73,6 +76,7 @@ pub struct HotCacheFdRequest {
 }
 
 impl HotCacheFdRequest {
+    #[cfg(feature = "python")]
     pub fn new(client_id: DummyClientId) -> Self {
         Self {
             magic: HOT_CACHE_FD_MAGIC,
@@ -93,6 +97,7 @@ pub struct HotCacheFdResponse {
 
 #[derive(Debug)]
 struct SharedRegion {
+    #[cfg(any(feature = "python", test))]
     region_id: u64,
     base: usize,
     requested_len: usize,
@@ -102,13 +107,16 @@ struct SharedRegion {
 
 #[derive(Debug)]
 pub struct SharedRegionRegistration {
+    #[cfg(any(feature = "python", test))]
     pub region_id: u64,
+    #[cfg(any(feature = "python", test))]
     pub requested_len: usize,
     pub registered_len: usize,
     pub fd: OwnedFd,
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(any(feature = "python", test))]
 pub struct ResolvedSharedRegion {
     pub region_id: u64,
     pub base: usize,
@@ -172,6 +180,7 @@ impl Drop for OwnedMappedRegion {
 
 static SHARED_REGISTRY: LazyLock<Mutex<BTreeMap<usize, SharedRegion>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+#[cfg(any(feature = "python", test))]
 static NEXT_REGION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn allocate_shared_region(size: usize) -> Result<usize> {
@@ -195,6 +204,7 @@ pub fn allocate_shared_region_with_options(
     let mapping = mmap_shared(fd.as_raw_fd(), mapped_len)?;
     let base = mapping as usize;
     let region = SharedRegion {
+        #[cfg(any(feature = "python", test))]
         region_id: NEXT_REGION_ID.fetch_add(1, Ordering::Relaxed),
         base,
         requested_len: size,
@@ -231,13 +241,16 @@ pub fn shared_region_for_registration(ptr: usize, size: usize) -> Result<SharedR
         )));
     }
     Ok(SharedRegionRegistration {
+        #[cfg(any(feature = "python", test))]
         region_id: region.region_id,
+        #[cfg(any(feature = "python", test))]
         requested_len: region.requested_len,
         registered_len: region.mapped_len,
         fd: dup_fd(region.fd.as_raw_fd())?,
     })
 }
 
+#[cfg(any(feature = "python", test))]
 pub fn resolve_shared_region(ptr: usize, size: usize) -> Result<ResolvedSharedRegion> {
     let end = ptr
         .checked_add(size)
@@ -312,6 +325,7 @@ pub fn hot_cache_ipc_socket_path(server_addr: &str, worker_scope: &str) -> PathB
     scoped_ipc_socket_path("mc-dh", server_addr, worker_scope)
 }
 
+#[cfg(any(feature = "python", test))]
 pub fn send_shm_register_request(
     socket_path: &Path,
     request: &ShmRegisterRequest,
@@ -395,6 +409,7 @@ pub fn send_hot_cache_fd_response(stream: &UnixStream, fd: &OwnedFd, size: usize
     send_fd(stream.as_raw_fd(), fd.as_raw_fd(), as_bytes(&response))
 }
 
+#[cfg(feature = "python")]
 pub fn request_hot_cache_region(
     socket_path: &Path,
     client_id: DummyClientId,

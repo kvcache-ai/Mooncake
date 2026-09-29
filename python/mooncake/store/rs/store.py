@@ -3,95 +3,28 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import Future
-import ctypes
 import gc
-import importlib.machinery
-import importlib.util
+import importlib
 import json
-import mmap
 import os
-import pathlib
 import queue
-import sys
 import threading
 from dataclasses import dataclass, field
 import warnings
 
-from ._runtime import (
-    explicit_path,
-    package_dir,
-    preload_native_libraries,
-    source_tree_root,
-)
+try:
+    _native = importlib.import_module("mooncake._store_rs")
+except ModuleNotFoundError as exc:
+    if exc.name != "mooncake._store_rs":
+        raise
+    raise ImportError(
+        "MOONCAKE_STORE_BACKEND='rs' requires a Mooncake wheel built with "
+        "WITH_STORE_RS=ON"
+    ) from exc
 
-_logger = logging.getLogger("mooncake_store_rs.store")
-
-
-def _load_native():
-    root = package_dir()
-    preload_native_libraries(root)
-    try:
-        from . import _store_rs as native  # type: ignore
-
-        return native
-    except Exception:
-        target_roots: list[pathlib.Path] = []
-        for env_key in ("MOONCAKE_PYTHON_TARGET_DIR", "CARGO_TARGET_DIR"):
-            configured_target = explicit_path(env_key)
-            if configured_target is not None:
-                target_roots.append(configured_target)
-        store_rs_root = source_tree_root()
-        if store_rs_root is not None:
-            target_roots.append(store_rs_root / "target")
-        suffixes = list(importlib.machinery.EXTENSION_SUFFIXES) + [".so"]
-        patterns = []
-        for suffix in suffixes:
-            patterns.extend([f"_store_rs{suffix}", f"lib_store_rs{suffix}"])
-
-        candidates: list[pathlib.Path] = []
-        seen: set[pathlib.Path] = set()
-        for target_root in target_roots:
-            for profile in ("debug", "release"):
-                for profile_dir in (
-                    target_root / profile,
-                    target_root / profile / "deps",
-                ):
-                    for pattern in patterns:
-                        for candidate in profile_dir.glob(pattern):
-                            resolved = candidate.resolve()
-                            if resolved in seen or not resolved.exists():
-                                continue
-                            seen.add(resolved)
-                            candidates.append(resolved)
-
-        candidates.sort(
-            key=lambda candidate: (
-                candidate.stat().st_mtime_ns,
-                1 if f"{pathlib.Path('target') / 'debug'}" in str(candidate) else 0,
-            ),
-            reverse=True,
-        )
-
-        for candidate in candidates:
-            spec = importlib.util.spec_from_file_location(
-                "mooncake_store_rs._store_rs", candidate
-            )
-            if spec is None or spec.loader is None:
-                continue
-            module = importlib.util.module_from_spec(spec)
-            sys.modules["mooncake_store_rs._store_rs"] = module
-            spec.loader.exec_module(module)
-            return module
-
-        raise ImportError(
-            "cannot find native mooncake store module; run `cargo build -p mooncake-store-py` first"
-        )
-
-
-_native = _load_native()
-
-# Re-export the native buffer pool type through the Store-RS source API.
-BufferPool = getattr(_native, "BufferPool", None)
+_logger = logging.getLogger("mooncake.store.rs.store")
+BufferPool = _native.BufferPool
+RegisteredBufferPool = BufferPool
 
 _CACHE_STATUS = "status"
 _CACHE_STATUS_LIST = "status_list"
@@ -225,51 +158,16 @@ class MooncakeHostMemAllocator:
     ) -> None:
         self._use_hugepage = use_hugepage
         self._hugepage_size = _normalize_hugepage_size(hugepage_size)
-        native_allocator = getattr(_native, "MooncakeHostMemAllocator", None)
-        self._native_allocator = (
-            native_allocator(
-                use_hugepage=self._use_hugepage,
-                hugepage_size=self._hugepage_size,
-            )
-            if native_allocator
-            else None
+        self._native_allocator = _native.MooncakeHostMemAllocator(
+            use_hugepage=self._use_hugepage,
+            hugepage_size=self._hugepage_size,
         )
-        self._allocations: dict[int, mmap.mmap] = {}
 
     def alloc(self, size: int) -> int:
-        if self._native_allocator is not None:
-            return int(self._native_allocator.alloc(int(size)))
-        if self._use_hugepage or self._hugepage_size is not None:
-            raise RuntimeError(
-                "hugepage allocation requires the native mooncake store extension"
-            )
-        requested = int(size)
-        if requested <= 0:
-            raise ValueError("allocation size must be positive")
-        region = mmap.mmap(-1, requested)
-        pointer = ctypes.addressof(ctypes.c_char.from_buffer(region))
-        self._allocations[pointer] = region
-        return pointer
+        return int(self._native_allocator.alloc(int(size)))
 
     def free(self, ptr: int) -> int:
-        if self._native_allocator is not None:
-            return int(self._native_allocator.free(int(ptr)))
-        pointer = int(ptr)
-        region = self._allocations.pop(pointer, None)
-        if region is None:
-            return -1
-        region.close()
-        return 0
-
-    def close(self) -> None:
-        if self._native_allocator is not None:
-            return
-        pointers = list(self._allocations)
-        for pointer in pointers:
-            self.free(pointer)
-
-    def __del__(self) -> None:
-        self.close()
+        return int(self._native_allocator.free(int(ptr)))
 
 
 class _NativeStoreWorker:
@@ -1785,25 +1683,22 @@ def _items_use_bytes_payloads(items: Sequence[tuple]) -> bool:
     return isinstance(sample, (bytes, bytearray, memoryview))
 
 
-# Parallelism types from native module (optional in builds that omit them)
-try:
-    ParallelAxis = _native.ParallelAxis
-    TensorParallelism = _native.TensorParallelism
-    ReadTarget = _native.ReadTarget
-    AXIS_DP = _native.AXIS_DP()
-    AXIS_TP = _native.AXIS_TP()
-    AXIS_EP = _native.AXIS_EP()
-    AXIS_PP = _native.AXIS_PP()
-    READ_MODE_AS_STORED = _native.READ_MODE_AS_STORED()
-    READ_MODE_SHARD = _native.READ_MODE_SHARD()
-    READ_MODE_FULL = _native.READ_MODE_FULL()
-except AttributeError:
-    pass
+ParallelAxis = _native.ParallelAxis
+TensorParallelism = _native.TensorParallelism
+ReadTarget = _native.ReadTarget
+AXIS_DP = _native.AXIS_DP()
+AXIS_TP = _native.AXIS_TP()
+AXIS_EP = _native.AXIS_EP()
+AXIS_PP = _native.AXIS_PP()
+READ_MODE_AS_STORED = _native.READ_MODE_AS_STORED()
+READ_MODE_SHARD = _native.READ_MODE_SHARD()
+READ_MODE_FULL = _native.READ_MODE_FULL()
 
 __all__ = [
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
     "BufferPool",
+    "RegisteredBufferPool",
     "ReplicateConfig",
     "init_tracing",
     "metrics_text",

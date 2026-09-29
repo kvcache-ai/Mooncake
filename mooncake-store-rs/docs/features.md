@@ -494,7 +494,7 @@ What this means in practice:
 - the same metrics and tracing capabilities are available
 - the same replication controls are exposed through `ReplicateConfig`
 - the same standalone compatibility server can serve dummy clients
-- the Python compatibility modules are exercised from the source checkout
+- the root wheel exposes a Python Store facade with explicit C++ and Store-RS backends
 
 ### Dummy and real compatibility paths
 
@@ -513,5 +513,5 @@ The standard read/write entry point is:
 
 Manual path-specific validators stay available as:
 
-- `scripts/clients/real_client_rw.py`
-- `scripts/clients/dummy_client_rw.py`
+- `python/tests/store/rs/clients/real_client_rw.py`
+- `python/tests/store/rs/clients/dummy_client_rw.py`

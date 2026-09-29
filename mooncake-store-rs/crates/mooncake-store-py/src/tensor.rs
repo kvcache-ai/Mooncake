@@ -8,7 +8,7 @@ use mooncake_tensor::{TensorDtype, TensorMetadata};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::{pointer_from_usize, PyMooncakeDistributedStore};
+use super::{pointer_from_usize, PyMooncakeDistributedStore};
 
 // ─── Conversion helpers ──────────────────────────────────────────────────────
 

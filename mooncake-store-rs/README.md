@@ -290,6 +290,7 @@ For the runtime view, read `docs/architecture.md`.
 export MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs
 export MOONCAKE_ROOT_DIR=/path/to/Mooncake
 export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
+export MOONCAKE_PYTHON_BIN=/path/to/root-wheel-venv/bin/python
 cmake -S "${MOONCAKE_ROOT_DIR}" -B "${MOONCAKE_BUILD_DIR}" \
   -DWITH_TE=ON -DUSE_TENT=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
   -DWITH_STORE_RS=ON
@@ -328,6 +329,9 @@ This script:
 - verifies that the successor promotes itself and can still read the original payload
 
 Python hot-upgrade argument and wrapper compatibility validation:
+
+Use `MOONCAKE_PYTHON_BIN` for a virtualenv with the installed root wheel built
+with `WITH_STORE_RS=ON`. The Python e2e scripts select Store-RS from that wheel.
 
 ```bash
 ./scripts/tests/client/test-python-client-hot-upgrade-args.sh
@@ -516,14 +520,14 @@ For direct operator-driven validation, the paired helper scripts remain
 available:
 
 ```bash
-python3 ./scripts/clients/real_client_rw.py --help
-python3 ./scripts/clients/dummy_client_rw.py --help
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/real_client_rw.py --help
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/dummy_client_rw.py --help
 ```
 
 Run the real-mode black-box read/write validator:
 
 ```bash
-python3 ./scripts/clients/real_client_rw.py \
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/real_client_rw.py \
   --local_host 127.0.0.1:17111 \
   --metadata_url redis://127.0.0.1:6380/0 \
   --storage-bytes $((128 * 1024 * 1024)) \
@@ -534,7 +538,7 @@ python3 ./scripts/clients/real_client_rw.py \
 Use the same script to validate routed rw-only clients:
 
 ```bash
-python3 ./scripts/clients/real_client_rw.py \
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/real_client_rw.py \
   --local_host 127.0.0.1:17121 \
   --metadata_url redis://127.0.0.1:6380/0 \
   --storage-bytes 0 \
@@ -546,7 +550,7 @@ python3 ./scripts/clients/real_client_rw.py \
 Run the dummy-mode black-box read/write validator against a standalone daemon:
 
 ```bash
-python3 ./scripts/clients/dummy_client_rw.py \
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" ./python/tests/store/rs/clients/dummy_client_rw.py \
   --daemon_addr 127.0.0.1:16590 \
   --key_prefix smoke \
   --batch_size 4
@@ -762,33 +766,30 @@ For a fuller Rust guide, including lifecycle and buffer-oriented APIs, read `doc
 
 ## Python Usage
 
-Build Store-RS and its Python extension from the repository checkout:
+Build the root wheel with the C++ Store backend by default:
 
 ```bash
-export MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs
-export MOONCAKE_ROOT_DIR=/path/to/Mooncake
-export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
-cmake -S "${MOONCAKE_ROOT_DIR}" -B "${MOONCAKE_BUILD_DIR}" \
-  -DWITH_TE=ON -DUSE_TENT=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
-  -DWITH_STORE_RS=ON
-cmake --build "${MOONCAKE_BUILD_DIR}" --target build_store_rs
-export MOONCAKE_PYTHON_TARGET_DIR="${MOONCAKE_BUILD_DIR}/mooncake-store-rs"
-export PYTHONPATH="${MOONCAKE_STORE_RS_DIR}/python"
+python3 -m pip wheel . --no-deps --wheel-dir dist/cpp
 ```
 
-Build the standalone Rust commands from the same workspace:
+To include Store-RS in a root wheel, enable its optional CMake component:
 
 ```bash
-cd "${MOONCAKE_STORE_RS_DIR}"
-cargo build --release -p mooncake-store-py --bin mooncake-store-client --bin mooncake-store-admin --bin mooncake-store-bench
-export PATH="${MOONCAKE_STORE_RS_DIR}/target/release:${PATH}"
+SKBUILD_CMAKE_ARGS="-DWITH_STORE_RS=ON" \
+  python3 -m pip wheel . --no-deps --wheel-dir dist/rs
+python3 -m venv .venv-store-rs
+.venv-store-rs/bin/python -m pip install --no-deps dist/rs/mooncake_transfer_engine-*.whl
+MOONCAKE_STORE_BACKEND=rs .venv-store-rs/bin/python -c \
+  "from mooncake.store import MooncakeDistributedStore; print(MooncakeDistributedStore)"
 ```
 
-The Python compatibility modules currently run from this source checkout. The
-workspace does not publish a separate Python distribution.
+The root wheel owns the `mooncake` package. With `MOONCAKE_STORE_BACKEND` unset,
+`mooncake.store` selects the C++ Store; set it to `rs` to select Store-RS. The
+value must be exactly `cpp` or `rs` and is read when `mooncake.store` is first
+imported.
 
 ```python
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 store.setup(
@@ -814,7 +815,7 @@ store.put("replicated", b"payload", config=config)
 Use the host allocator when the application wants stable registered buffers:
 
 ```python
-from mooncake_store_rs.store import MooncakeHostMemAllocator
+from mooncake.store import MooncakeHostMemAllocator
 
 allocator = MooncakeHostMemAllocator(use_hugepage=True, hugepage_size="2MB")
 ptr = allocator.alloc(2 * 1024 * 1024)
@@ -912,7 +913,7 @@ crates/
   mooncake-transport/       Safe Rust wrapper around Mooncake TE/TENT
   mooncake-transport-sys/   Native FFI and upstream Mooncake build integration
 python/
-  mooncake_store_rs/        Store-RS Python compatibility source
+  mooncake/store/rs/        Store-RS Python implementation behind the facade
 scripts/
   format.sh                 Unified Rust/Python formatter plus Rust clippy gate
   run-all-tests.sh            Unified scripts regression runner for CI and local use

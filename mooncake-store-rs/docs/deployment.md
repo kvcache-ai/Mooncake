@@ -14,7 +14,7 @@ Runtime-local CLI, Python, and environment route/resource knobs remain available
 
 ## Requirements
 
-- Rust toolchain
+- Rust toolchain when building the optional Store-RS wheel component
 - `cmake` and a C++ toolchain
 - `redis-server` and `redis-cli`
 - Git submodule support for native dependencies
@@ -72,19 +72,23 @@ Supported script inputs:
 | `MOONCAKE_STORE_RS_DIR` | required absolute path | Store-RS source location |
 | `MOONCAKE_ROOT_DIR` | required absolute path | Mooncake source location |
 | `MOONCAKE_BUILD_DIR` | required absolute path | Mooncake CMake build output |
+| `MOONCAKE_PYTHON_BIN` | required for Python e2e | virtualenv interpreter with the root wheel built using `WITH_STORE_RS=ON` |
 
 ### Python compatibility e2e
 
-Run the Python compatibility validation:
+Run the Python compatibility validation with a root wheel installed in a
+virtualenv. Set `MOONCAKE_PYTHON_BIN` to that environment's interpreter; the
+script selects `MOONCAKE_STORE_BACKEND=rs` and imports the installed package.
 
 ```bash
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_PYTHON_BIN=/path/to/venv/bin/python \
 ./scripts/e2e/run-python-compat-e2e.sh
 ```
 
 What the script does:
 
-- builds `mooncake-store-py`
-- exports `PYTHONPATH="$PWD/python"`
+- requires a root wheel built with `WITH_STORE_RS=ON`
 - creates two Python clients
 - validates single-object, batch, zero-copy, multi-buffer, route, and metrics paths
 
@@ -93,12 +97,16 @@ What the script does:
 Run the daemon-local hot-cache validation:
 
 ```bash
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_PYTHON_BIN=/path/to/venv/bin/python \
 ./scripts/e2e/run-local-hot-cache-e2e.sh
 ```
 
+The script selects Store-RS from the installed root wheel.
+
 What the script does:
 
-- builds the Python extension and standalone `mooncake-store-client` binary from the source checkout
+- runs the installed Store-RS Python extension and standalone client command
 - Phase A validates that a real-mode reader reuses daemon-local cached bytes after the origin key is removed remotely
 - Phase B validates that two dummy clients attached to one standalone daemon reuse a shm-backed hot-cache hit
 - starts a temporary Redis instance automatically and tears it down after the run
@@ -112,13 +120,15 @@ Important inputs:
 | `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_SCRATCH_BYTES` | `16 MiB` | scratch bytes per local client |
 | `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_CACHE_BYTES` | `1 MiB` | hot-cache capacity under test |
 | `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_BLOCK_BYTES` | `8192` | hot-cache block size under test |
+| `MOONCAKE_PYTHON_BIN` | required | virtualenv interpreter with a root wheel built with `WITH_STORE_RS=ON` |
 
 ### Real-mode read/write validation
 
 Run the real-mode black-box validator:
 
 ```bash
-python3 ./scripts/clients/real_client_rw.py --help
+MOONCAKE_STORE_BACKEND=rs "$MOONCAKE_PYTHON_BIN" \
+  ./python/tests/store/rs/clients/real_client_rw.py --help
 ```
 
 What the script does:

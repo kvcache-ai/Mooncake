@@ -670,6 +670,7 @@ if(USE_SUNRISE)
 endif()
 
 if(BUILD_SHARED_LIBS)
+  set_target_properties(mooncake_store PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
 

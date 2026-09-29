@@ -99,27 +99,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mc_scripts_require_command cargo
 mc_scripts_require_command python3
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
 
-mc_scripts_setup_upstream_runtime_env python
+mc_scripts_setup_root_store_rs_python
 export PYTHONDONTWRITEBYTECODE=1
 
 mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
-# This test uses inline Python (mooncake.store) which requires the native
-# _store_rs module built by `cargo build -p mooncake-store-py`.  We cannot
-# skip the build even when a prebuilt CLI binary is available.
-echo "==> building standalone mooncake-store-client binary"
-cargo build -p mooncake-store-py
-
-BIN="${REPO_ROOT}/target/debug/mooncake-store-client"
+BIN="${PYTHON_BIN%/*}/mooncake-store-client"
 if [[ ! -x "${BIN}" ]]; then
-  echo "expected binary was not produced at ${BIN}" >&2
+  echo "installed root wheel did not provide ${BIN}" >&2
   exit 1
 fi
 
@@ -182,7 +175,7 @@ TEST_VALUE="${TEST_VALUE}" \
 python3 - <<'PY'
 import os
 
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(
@@ -234,7 +227,7 @@ python3 - <<'PY'
 import os
 import time
 
-from mooncake_store_rs.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 assert store.setup(

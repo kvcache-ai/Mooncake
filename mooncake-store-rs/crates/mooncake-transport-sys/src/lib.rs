@@ -2,7 +2,6 @@
 
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone)]
@@ -120,20 +119,16 @@ fn library_search_dirs() -> Vec<PathBuf> {
 fn add_base_search_dirs(base_dir: &Path, dirs: &mut Vec<PathBuf>) {
     push_unique_dir(dirs, base_dir);
     push_unique_dir(dirs, &base_dir.join("lib"));
-    if let Some(parent) = base_dir.parent() {
-        if base_dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
-            push_unique_dir(dirs, parent);
-            push_unique_dir(dirs, &parent.join("lib"));
-        }
-        add_transport_build_out_dirs(parent, dirs);
-    }
-    add_transport_build_out_dirs(base_dir, dirs);
 }
 
 fn add_upstream_search_dirs(build_dir: &Path, dirs: &mut Vec<PathBuf>) {
     // upstream relocated libasio.so from mooncake-asio/ to mooncake-common/
     push_unique_dir(dirs, &build_dir.join("mooncake-common"));
     push_unique_dir(dirs, &build_dir.join("mooncake-asio"));
+    push_unique_dir(
+        dirs,
+        &build_dir.join("mooncake-store-rs").join("native-shims"),
+    );
     push_unique_dir(
         dirs,
         &build_dir.join("mooncake-transfer-engine").join("src"),
@@ -145,23 +140,6 @@ fn add_upstream_search_dirs(build_dir: &Path, dirs: &mut Vec<PathBuf>) {
             .join("tent")
             .join("src"),
     );
-}
-
-fn add_transport_build_out_dirs(profile_dir: &Path, dirs: &mut Vec<PathBuf>) {
-    let build_dir = profile_dir.join("build");
-    let Ok(entries) = fs::read_dir(build_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("mooncake-transport-sys-") {
-            continue;
-        }
-        push_unique_dir(dirs, &path.join("out"));
-    }
 }
 
 fn push_library_candidate(candidates: &mut Vec<PathBuf>, path: &Path, file_name: &str) {
@@ -926,7 +904,7 @@ pub mod tent {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_base_search_dirs, search_library_in_dir};
+    use super::{add_base_search_dirs, add_upstream_search_dirs, search_library_in_dir};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -995,38 +973,21 @@ mod tests {
     }
 
     #[test]
-    fn add_base_search_dirs_discovers_transport_build_out_from_deps() {
+    fn add_upstream_search_dirs_includes_cmake_shims_from_explicit_build_dir() {
         let temp_dir = TempDir::new();
-        let deps_dir = temp_dir.path().join("target").join("debug").join("deps");
-        let build_out_dir = temp_dir
+        let shim_dir = temp_dir
             .path()
-            .join("target")
-            .join("debug")
-            .join("build")
-            .join("mooncake-transport-sys-abc123")
-            .join("out");
-        fs::create_dir_all(&deps_dir).expect("deps dir should create");
-        fs::create_dir_all(&build_out_dir).expect("build out dir should create");
+            .join("mooncake-store-rs")
+            .join("native-shims");
+        fs::create_dir_all(&shim_dir).expect("CMake shim directory should create");
 
         let mut dirs = Vec::new();
-        add_base_search_dirs(&deps_dir, &mut dirs);
+        add_upstream_search_dirs(temp_dir.path(), &mut dirs);
 
         assert!(dirs.contains(
-            &deps_dir
+            &shim_dir
                 .canonicalize()
-                .expect("deps dir should canonicalize")
-        ));
-        assert!(dirs.contains(
-            &deps_dir
-                .parent()
-                .expect("deps dir should have parent")
-                .canonicalize()
-                .expect("profile dir should canonicalize")
-        ));
-        assert!(dirs.contains(
-            &build_out_dir
-                .canonicalize()
-                .expect("build out dir should canonicalize")
+                .expect("CMake shim directory should resolve")
         ));
     }
 }

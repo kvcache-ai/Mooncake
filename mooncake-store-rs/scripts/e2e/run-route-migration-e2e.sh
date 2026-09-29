@@ -93,20 +93,8 @@ Environment:
   MC_STORE_RS_ROUTE_MIGRATION_ROUTE_TOPK
                                    Embedded WRH top-k width passed to
                                    standalone clients (default: 2)
-  CARGO_TARGET_DIR                 Cargo target dir override. Defaults to a
-                                   fresh temp dir under the e2e temp root so
-                                   host and container builds do not fight over
-                                   permissions or stale artifacts.
-  MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR
-                                   Optional prebuilt bin dir. When set, the
-                                   e2e reuses existing standalone binaries and
-                                   skips `cargo build`.
-  MC_STORE_RS_ROUTE_MIGRATION_CLIENT_BIN
-                                   Optional explicit client binary path.
-  MC_STORE_RS_ROUTE_MIGRATION_ADMIN_BIN
-                                   Optional explicit admin binary path.
-  MC_STORE_RS_ROUTE_MIGRATION_ADMIN_CLI_BIN
-                                   Optional explicit admin CLI binary path.
+  MOONCAKE_PYTHON_BIN              Interpreter from a virtualenv with the root
+                                   wheel installed
   MOONCAKE_STORE_RS_DIR          Absolute Store-RS source directory
   MOONCAKE_ROOT_DIR              Absolute Mooncake source directory
   MOONCAKE_BUILD_DIR             Absolute Mooncake CMake build directory
@@ -230,17 +218,6 @@ raise SystemExit(f"admin health check failed for {base_url}: {last_error!r}")
 PY
 }
 
-prepend_transport_shim_loader_env() {
-  local profile_dir=$1
-  local shim_dir
-
-  for shim_dir in "${profile_dir}"/build/mooncake-transport-sys-*/out; do
-    if [[ -d "${shim_dir}" ]]; then
-      mc_scripts_prepend_env_path LD_LIBRARY_PATH "${shim_dir}"
-    fi
-  done
-}
-
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-$(allocate_port)}"
 SOURCE_TRANSPORT_PORT="$(allocate_port)"
 TARGET_TRANSPORT_PORT="$(allocate_port)"
@@ -307,43 +284,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mc_scripts_require_command cargo
 mc_scripts_require_command python3
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
+mc_scripts_setup_root_store_rs_python
 
 export PYTHONDONTWRITEBYTECODE=1
 export MC_STORE_RS_REDIS_URL="${REDIS_URL}"
 export MC_STORE_RS_REDIS_PORT="${REDIS_PORT}"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMP_DIR}/cargo-target}"
-
-CLIENT_BIN_OVERRIDE=${MC_STORE_RS_ROUTE_MIGRATION_CLIENT_BIN:-}
-ADMIN_BIN_OVERRIDE=${MC_STORE_RS_ROUTE_MIGRATION_ADMIN_BIN:-}
-ADMIN_CLI_BIN_OVERRIDE=${MC_STORE_RS_ROUTE_MIGRATION_ADMIN_CLI_BIN:-}
-if [[ -n "${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR:-}" ]]; then
-  CLIENT_BIN_OVERRIDE=${CLIENT_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-client}
-  ADMIN_BIN_OVERRIDE=${ADMIN_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-admin}
-  ADMIN_CLI_BIN_OVERRIDE=${ADMIN_CLI_BIN_OVERRIDE:-${MC_STORE_RS_ROUTE_MIGRATION_BIN_DIR}/mooncake-store-admin}
-fi
 
 mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
-if [[ -n "${CLIENT_BIN_OVERRIDE}" || -n "${ADMIN_BIN_OVERRIDE}" ]]; then
-  echo "==> reusing prebuilt standalone binaries"
-else
-  echo "==> building standalone mooncake-store-client/admin binaries"
-  cargo build -p mooncake-store-py
-fi
-
-mc_scripts_setup_upstream_runtime_env python
-
-TARGET_DIR="${CARGO_TARGET_DIR}"
-BIN="${CLIENT_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-client}"
-ADMIN_BIN="${ADMIN_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-admin}"
-ADMIN_CLI_BIN="${ADMIN_CLI_BIN_OVERRIDE:-${ADMIN_BIN}}"
-BIN_DIR="$(dirname "${BIN}")"
+BIN="${PYTHON_BIN%/*}/mooncake-store-client"
+ADMIN_BIN="${PYTHON_BIN%/*}/mooncake-store-admin"
+ADMIN_CLI_BIN="${ADMIN_BIN}"
 
 if [[ ! -x "${BIN}" ]]; then
   echo "expected client binary was not produced at ${BIN}" >&2
@@ -357,8 +313,6 @@ if [[ "${SUBMITTER}" == "cli" && ! -x "${ADMIN_CLI_BIN}" ]]; then
   echo "expected admin CLI binary was not produced at ${ADMIN_CLI_BIN}" >&2
   exit 1
 fi
-
-prepend_transport_shim_loader_env "${BIN_DIR}"
 
 CLIENT_BASE_ARGS=(
   --local-hostname 127.0.0.1
@@ -497,7 +451,7 @@ import sys
 import time
 import urllib.request
 
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 admin_url = sys.argv[1]
 redis_url = sys.argv[2]

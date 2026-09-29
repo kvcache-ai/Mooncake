@@ -14,8 +14,8 @@ use mooncake_tensor::{
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::tensor::{parse_dtype_str, TensorReadResult};
-use crate::{pointer_from_usize, PyMooncakeDistributedStore};
+use super::tensor::{parse_dtype_str, TensorReadResult};
+use super::{pointer_from_usize, PyMooncakeDistributedStore};
 
 // ─── Python-exposed parallelism types ──────────────────────────────────────
 

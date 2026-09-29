@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-try:
-    from .store import BufferPool
-except (ImportError, AttributeError):
-    BufferPool = None  # type: ignore[assignment]
+from .store import BufferPool
 
 __all__ = ["BufferPool"]

@@ -11,7 +11,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/e2e/run-local-hot-cache-e2e.sh [all|real|dummy]
 
-Validate the local hot-cache v2 behavior against the Python source runtime:
+Validate the local hot-cache v2 behavior against an installed root wheel:
 
   real   - rw-only real client keeps a locally cached value after the origin key
            is deleted remotely.
@@ -34,9 +34,9 @@ Environment:
                                               (default: 8192)
   MC_STORE_RS_KEEP_TEMP                       Keep temp dir on failure when set
                                               to 1
+  MOONCAKE_PYTHON_BIN                         Interpreter from a virtualenv
+                                              with the root wheel installed
   MOONCAKE_STORE_RS_DIR                    Absolute Store-RS source directory
-  MOONCAKE_ROOT_DIR                        Absolute Mooncake source directory
-  MOONCAKE_BUILD_DIR                       Absolute Mooncake CMake build directory
 USAGE
 }
 
@@ -79,15 +79,6 @@ import time
 
 print(int(time.time() * 1000))
 PY
-}
-
-ensure_runtime_ready() {
-  echo "==> building Python extension and standalone client from source"
-  (
-    cd "${REPO_ROOT}"
-    cargo build --release -p mooncake-store-py --lib --bin mooncake-store-client
-  )
-  PYTHON_BIN="python3"
 }
 
 wait_for_redis_up() {
@@ -211,13 +202,13 @@ cleanup() {
   exit "${exit_code}"
 }
 
-mc_scripts_require_command cargo
 mc_scripts_require_command python3
 mc_scripts_require_command redis-server
 mc_scripts_require_command redis-cli
 
-mc_scripts_setup_upstream_runtime_env repo-python
+mc_scripts_setup_root_store_rs_python
 export PYTHONDONTWRITEBYTECODE=1
+cd "${REPO_ROOT}"
 
 if [[ -z "${REDIS_PORT}" ]]; then
   REDIS_PORT=$(allocate_port)
@@ -240,7 +231,6 @@ export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_BLOCK_BYTES="${HOT_BLOCK_BYTES}"
 trap cleanup EXIT
 
 start_redis "${REDIS_DIR}"
-ensure_runtime_ready
 
 export MC_STORE_LOCAL_HOT_CACHE_SIZE="${HOT_CACHE_BYTES}"
 export MC_STORE_LOCAL_HOT_BLOCK_SIZE="${HOT_BLOCK_BYTES}"
@@ -254,9 +244,9 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
 import os
 import time
 
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
-from scripts.clients.real_client_rw import apply_replication_config, setup_store
+from python.tests.store.rs.clients.real_client_rw import apply_replication_config, setup_store
 
 
 REDIS_URL = os.environ["MC_STORE_RS_LOCAL_HOT_CACHE_E2E_REDIS_URL"]
@@ -352,7 +342,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
   export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_DAEMON_HOST="127.0.0.1:$(allocate_port)"
   export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_DUMMY_ADDR="127.0.0.1:$(allocate_port)"
   export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_DUMMY_WRITER_HOST="127.0.0.1:$(allocate_port)"
-  DAEMON_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/release/mooncake-store-client"
+  DAEMON_BIN="${PYTHON_BIN%/*}/mooncake-store-client"
   env \
     MC_STORE_LOCAL_HOT_CACHE_SIZE="${HOT_CACHE_BYTES}" \
     MC_STORE_LOCAL_HOT_BLOCK_SIZE="${HOT_BLOCK_BYTES}" \
@@ -383,10 +373,10 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
 import os
 import time
 
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
-from scripts.clients.dummy_client_rw import wait_for_dummy_ready
-from scripts.clients.real_client_rw import apply_replication_config, setup_store
+from python.tests.store.rs.clients.dummy_client_rw import wait_for_dummy_ready
+from python.tests.store.rs.clients.real_client_rw import apply_replication_config, setup_store
 
 
 REDIS_URL = os.environ["MC_STORE_RS_LOCAL_HOT_CACHE_E2E_REDIS_URL"]

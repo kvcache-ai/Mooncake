@@ -31,7 +31,7 @@ fi
 mc_scripts_require_command cargo
 mc_scripts_require_command python3
 
-mc_scripts_setup_upstream_runtime_env python
+mc_scripts_setup_upstream_runtime_env none
 export PYTHONDONTWRITEBYTECODE=1
 
 cd "${REPO_ROOT}"

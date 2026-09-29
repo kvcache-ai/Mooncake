@@ -15,8 +15,8 @@ binding and the pure-Python wrapper compatibility path.
 
 Environment:
   MOONCAKE_STORE_RS_DIR       Absolute Store-RS source directory
-  MOONCAKE_ROOT_DIR            Absolute Mooncake source directory
-  MOONCAKE_BUILD_DIR           Absolute Mooncake CMake build directory
+  MOONCAKE_PYTHON_BIN          Interpreter from a virtualenv with the root
+                               wheel installed
 EOF
 }
 
@@ -25,39 +25,26 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-mc_scripts_require_command cargo
-mc_scripts_require_command python3
-mc_scripts_setup_upstream_runtime_env none
+mc_scripts_setup_root_store_rs_python
 
 cd "${REPO_ROOT}"
 
-echo "==> testing Python native setup hot-upgrade parsers"
-cargo test -p mooncake-store-py python_setup_parsers
-
-echo "==> testing Python wrapper forwarding compatibility"
-REPO_ROOT="${REPO_ROOT}" python3 - <<'PY'
-import importlib.util
+echo "==> testing installed-wheel Python wrapper forwarding compatibility"
+"${PYTHON_BIN}" - <<'PY'
+import importlib
 import os
-import pathlib
 import sys
 import threading
 import types
 
-repo_root = pathlib.Path(os.environ["REPO_ROOT"])
-package_dir = repo_root / "python" / "mooncake_store_rs"
-
-pkg = types.ModuleType("mooncake_store_rs")
-pkg.__path__ = [str(package_dir)]
-sys.modules["mooncake_store_rs"] = pkg
-
-runtime = types.ModuleType("mooncake_store_rs._runtime")
-runtime.package_dir = lambda: package_dir
-runtime.preload_native_libraries = lambda root: None
-sys.modules["mooncake_store_rs._runtime"] = runtime
-
-native = types.ModuleType("mooncake_store_rs._store_rs")
+native = types.ModuleType("mooncake._store_rs")
 native.MooncakeDistributedStore = lambda: object()
 native.MooncakeHostMemAllocator = lambda *args, **kwargs: None
+native.BufferPool = type("BufferPool", (), {})
+native.ReplicateConfig = type("ReplicateConfig", (), {})
+native.ParallelAxis = type("ParallelAxis", (), {})
+native.TensorParallelism = type("TensorParallelism", (), {})
+native.ReadTarget = type("ReadTarget", (), {})
 trace_state = {"filters": []}
 def init_tracing(trace_filter=None):
     trace_state["filters"].append(trace_filter)
@@ -72,13 +59,14 @@ def start_metrics_server(bind_addr="127.0.0.1:0"):
 native.start_metrics_server = start_metrics_server
 native.stop_metrics_server = lambda: None
 native.metrics_server_address = lambda: metrics_state["address"]
-sys.modules["mooncake_store_rs._store_rs"] = native
+for name, value in {
+    "AXIS_DP": 1, "AXIS_TP": 2, "AXIS_EP": 3, "AXIS_PP": 4,
+    "READ_MODE_AS_STORED": 1, "READ_MODE_SHARD": 2, "READ_MODE_FULL": 3,
+}.items():
+    setattr(native, name, lambda value=value: value)
+sys.modules["mooncake._store_rs"] = native
 
-spec = importlib.util.spec_from_file_location("mooncake_store_rs.store", package_dir / "store.py")
-module = importlib.util.module_from_spec(spec)
-sys.modules["mooncake_store_rs.store"] = module
-assert spec.loader is not None
-spec.loader.exec_module(module)
+module = importlib.import_module("mooncake.store.rs.store")
 
 class FakeWorker:
     def __init__(self):

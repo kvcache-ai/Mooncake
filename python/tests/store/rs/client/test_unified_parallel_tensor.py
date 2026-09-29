@@ -8,7 +8,7 @@ multi-axis layouts.
 Requires a running mooncake-store-client daemon (dummy mode) and torch.
 
 Example:
-    python3 scripts/tests/client/test_unified_parallel_tensor.py \
+    python3 python/tests/store/rs/client/test_unified_parallel_tensor.py \
       --daemon_addr 127.0.0.1:16590
 """
 
@@ -21,7 +21,7 @@ import struct
 
 import torch
 
-from mooncake_store_rs.store import (
+from mooncake.store import (
     MooncakeDistributedStore,
     MooncakeHostMemAllocator,
     ParallelAxis,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import ctypes
+import importlib
 import io
 import json
 import sys
@@ -10,17 +11,12 @@ from collections.abc import MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 
 from mooncake._partial_read import MatrixReadPlan, plan_matrix_read
-
-try:
-    import mooncake.store as _mooncake_store
-except Exception:  # pragma: no cover - depends on built extension
-    _mooncake_store = None  # type: ignore[assignment]
+from mooncake.store import ReplicateConfig
 
 import msgpack as _msgpack
 
@@ -6369,23 +6365,29 @@ def _object_array_from_decoded_values(values: list[Any]) -> np.ndarray:
 
 
 
+def _cpp_tensor_codec_module():
+    try:
+        return importlib.import_module("mooncake._store")
+    except ModuleNotFoundError as exc:
+        if exc.name != "mooncake._store":
+            raise
+        return None
+
+
 def _has_tensor_codec_helpers() -> bool:
-    return (
-        _mooncake_store is not None
-        and callable(getattr(_mooncake_store, "_serialize_tensor", None))
-        and callable(getattr(_mooncake_store, "_deserialize_tensor", None))
+    module = _cpp_tensor_codec_module()
+    return module is not None and all(
+        callable(getattr(module, name, None))
+        for name in ("_serialize_tensor", "_deserialize_tensor")
     )
 
 
 def _tensor_metadata_size() -> int:
-    helper = (
-        None
-        if _mooncake_store is None
-        else getattr(_mooncake_store, "_tensor_metadata_size", None)
-    )
-    if callable(helper):
-        return int(helper())
-    return 0
+    module = _cpp_tensor_codec_module()
+    if module is None:
+        return 0
+    helper = getattr(module, "_tensor_metadata_size", None)
+    return int(helper()) if callable(helper) else 0
 
 
 def _torch_save_payload_bytes(value: Any) -> bytes:
@@ -6527,10 +6529,11 @@ def _deserialize_tensor_payload(payload: bytes) -> Any:
 
 
 def _tensor_codec_helper(name: str) -> Any:
-    helper = None if _mooncake_store is None else getattr(_mooncake_store, name, None)
+    module = _cpp_tensor_codec_module()
+    helper = None if module is None else getattr(module, name, None)
     if not callable(helper):
         raise RuntimeError(
-            "mooncake.store tensor serialization helpers are required for structured tensor fields"
+            "the C++ Store tensor codec is required for this structured tensor operation"
         )
     return helper
 
@@ -6668,11 +6671,12 @@ def _config_with_group_id(config: Any, group_id: str) -> Any:
         raise ValueError(
             "config.group_ids conflicts with the DataProto storage group"
         )
-    grouped_config = (
-        getattr(_mooncake_store, "ReplicateConfig", SimpleNamespace)()
-        if config is None
-        else _copy_write_config(config)
-    )
+    grouped_config = ReplicateConfig() if config is None else _copy_write_config(config)
+    if not hasattr(grouped_config, "group_ids"):
+        raise NotImplementedError(
+            "structured DataProto groups require ReplicateConfig.group_ids; "
+            "select the C++ Store backend"
+        )
     grouped_config.group_ids = [group_id]
     return grouped_config
 

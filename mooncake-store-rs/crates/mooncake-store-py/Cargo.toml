@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
+[features]
+default = ["python"]
+python = ["dep:pyo3"]
+python-extension = ["python", "pyo3/extension-module"]
+
 [lib]
 name = "_store_rs"
 crate-type = ["cdylib", "rlib"]
@@ -18,7 +23,7 @@ mooncake-store-core = { path = "../mooncake-store-core" }
 mooncake-tensor = { path = "../mooncake-tensor" }
 mooncake-transport = { path = "../mooncake-transport" }
 parking_lot.workspace = true
-pyo3.workspace = true
+pyo3 = { workspace = true, optional = true }
 prost = "0.13"
 serde.workspace = true
 serde_json.workspace = true

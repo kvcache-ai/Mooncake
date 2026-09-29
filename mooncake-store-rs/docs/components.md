@@ -157,12 +157,12 @@ What it contains:
 - metadata URL parsing for Redis and etcd
 - shm registration helpers and dummy compatibility RPC client
 
-### `python/mooncake_store_rs`
+### `python/mooncake/store/rs`
 
 Purpose:
 
-- source compatibility layer around the native extension
-- find and load the built shared library from the repository checkout
+- Store-RS implementation selected by the root `mooncake.store` facade
+- load the private `_store_rs` extension installed in the root wheel
 
 It also provides Python-friendly wrappers for batch and buffer-oriented methods.
 

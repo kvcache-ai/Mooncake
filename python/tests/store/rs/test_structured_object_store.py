@@ -8,7 +8,7 @@ import time
 import numpy as np
 import pytest
 
-from mooncake_store_rs.structured_object_store import (
+from mooncake.store.rs.structured_object_store import (
     BundleTransferPolicy,
     MooncakeBundleTransfer,
     RemoteBundleRef,

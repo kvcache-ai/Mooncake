@@ -103,6 +103,37 @@ mc_scripts_setup_upstream_runtime_env() {
   esac
 }
 
+mc_scripts_setup_root_store_rs_python() {
+  local python_bin=${MOONCAKE_PYTHON_BIN:?MOONCAKE_PYTHON_BIN must point to the installed-wheel virtualenv interpreter}
+  [[ "${python_bin}" == /* && -x "${python_bin}" ]] || {
+    echo "MOONCAKE_PYTHON_BIN must be an absolute executable: ${python_bin}" >&2
+    exit 1
+  }
+
+  unset PYTHONPATH
+  export MOONCAKE_STORE_BACKEND=rs
+  export PYTHONNOUSERSITE=1
+  PYTHON_BIN="${python_bin}"
+  export PYTHON_BIN
+  PATH="$(dirname "${python_bin}"):${PATH}"
+  export PATH
+
+  "${PYTHON_BIN}" - <<'PY'
+from pathlib import Path
+import sys
+
+import mooncake
+import mooncake.store
+
+package = Path(mooncake.__file__).resolve()
+prefix = Path(sys.prefix).resolve()
+if sys.prefix == sys.base_prefix or not package.is_relative_to(prefix):
+    raise RuntimeError("MOONCAKE_PYTHON_BIN must use the installed root wheel virtualenv")
+if mooncake.store._BACKEND != "rs":
+    raise RuntimeError("MOONCAKE_STORE_BACKEND=rs was not selected")
+PY
+}
+
 mc_scripts_start_local_redis_if_needed() {
   local redis_port=$1
   local started_var=${2:-}

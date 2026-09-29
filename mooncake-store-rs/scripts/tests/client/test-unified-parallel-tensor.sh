@@ -41,25 +41,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mc_scripts_require_command cargo
 mc_scripts_require_command python3
 
-mc_scripts_setup_upstream_runtime_env python
+mc_scripts_setup_root_store_rs_python
 export PYTHONDONTWRITEBYTECODE=1
 
 cd "${REPO_ROOT}"
 
-if [[ -n "${MC_STORE_RS_CLIENT_RW_BIN:-}" ]]; then
-  echo "==> reusing prebuilt standalone mooncake-store-client binary"
-  BIN="${MC_STORE_RS_CLIENT_RW_BIN}"
-else
-  echo "==> building mooncake-store-py"
-  cargo build -p mooncake-store-py
-  BIN="${REPO_ROOT}/target/debug/mooncake-store-client"
-fi
+BIN="${PYTHON_BIN%/*}/mooncake-store-client"
 
 if [[ ! -x "${BIN}" ]]; then
-  echo "expected binary was not produced at ${BIN}" >&2
+  echo "installed root wheel did not provide ${BIN}" >&2
   exit 1
 fi
 
@@ -115,7 +107,7 @@ PIDS+=($!)
 wait_for_healthz "127.0.0.1:${METRICS_PORT}"
 
 echo "==> running unified parallel tensor E2E tests"
-python3 ./scripts/tests/client/test_unified_parallel_tensor.py \
+"${PYTHON_BIN}" ./python/tests/store/rs/client/test_unified_parallel_tensor.py \
   --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
   --tenant default \
   --keyspace "${KEYSPACE}"

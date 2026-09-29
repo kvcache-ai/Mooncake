@@ -160,7 +160,7 @@ Important points:
 Python real-mode example:
 
 ```python
-from mooncake_store_rs.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup({
@@ -184,7 +184,7 @@ Use real mode when Python should participate directly in the same distributed ru
 Python dummy-mode example:
 
 ```python
-from mooncake_store_rs.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup_dummy(

@@ -19,8 +19,8 @@ Usage: scripts/tests/client/test-client-rw-cli.sh [all|real|dummy]
 Build and execute the standalone mooncake-store-client binary, then verify both
 repository-standard read/write validators:
 
-- `scripts/clients/dummy_client_rw.py` against the daemon dummy API
-- `scripts/clients/real_client_rw.py` against the real routed store runtime
+- `python/tests/store/rs/clients/dummy_client_rw.py` against the daemon dummy API
+- `python/tests/store/rs/clients/real_client_rw.py` against the real routed store runtime
 
 Environment:
   MC_STORE_RS_REDIS_PORT      Redis port for the temporary metadata backend
@@ -113,29 +113,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mc_scripts_require_command cargo
 mc_scripts_require_command python3
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
 
-mc_scripts_setup_upstream_runtime_env python
+mc_scripts_setup_root_store_rs_python
 export PYTHONDONTWRITEBYTECODE=1
 
 mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
-if [[ -n "${MC_STORE_RS_CLIENT_RW_BIN:-}" ]]; then
-  echo "==> reusing prebuilt standalone mooncake-store-client binary"
-  BIN="${MC_STORE_RS_CLIENT_RW_BIN}"
-else
-  echo "==> building standalone mooncake-store-client binary"
-  cargo build -p mooncake-store-py
-  BIN="${REPO_ROOT}/target/debug/mooncake-store-client"
-fi
+BIN="${PYTHON_BIN%/*}/mooncake-store-client"
 
 if [[ ! -x "${BIN}" ]]; then
-  echo "expected binary was not produced at ${BIN}" >&2
+  echo "installed root wheel did not provide ${BIN}" >&2
   exit 1
 fi
 
@@ -203,7 +195,7 @@ sleep 1
 
 if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
   echo "==> validating dummy single-item path"
-  python3 ./scripts/clients/dummy_client_rw.py \
+  "${PYTHON_BIN}" ./python/tests/store/rs/clients/dummy_client_rw.py \
     --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
     --tenant default \
     --keyspace "${KEYSPACE}" \
@@ -215,7 +207,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
     --delete
 
   echo "==> validating dummy shm batch path"
-  python3 ./scripts/clients/dummy_client_rw.py \
+  "${PYTHON_BIN}" ./python/tests/store/rs/clients/dummy_client_rw.py \
     --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
     --tenant default \
     --keyspace "${KEYSPACE}" \
@@ -228,7 +220,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
     --delete
 
   echo "==> validating dummy multi-buffer shm path"
-  python3 ./scripts/clients/dummy_client_rw.py \
+  "${PYTHON_BIN}" ./python/tests/store/rs/clients/dummy_client_rw.py \
     --daemon_addr "127.0.0.1:${DUMMY_RPC_PORT}" \
     --tenant default \
     --keyspace "${KEYSPACE}" \
@@ -243,7 +235,7 @@ fi
 
 if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
   echo "==> validating real routed single-item path"
-  python3 ./scripts/clients/real_client_rw.py \
+  "${PYTHON_BIN}" ./python/tests/store/rs/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
     --storage-bytes 0 \
@@ -261,7 +253,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
     --replica_num 2 \
     --key_prefix "real-single-${RUN_ID}"
 
-  python3 ./scripts/clients/real_client_rw.py \
+  "${PYTHON_BIN}" ./python/tests/store/rs/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
     --storage-bytes 0 \
@@ -280,7 +272,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
     --key_prefix "real-single-${RUN_ID}"
 
   echo "==> validating real routed batch path"
-  python3 ./scripts/clients/real_client_rw.py \
+  "${PYTHON_BIN}" ./python/tests/store/rs/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
     --storage-bytes 0 \
@@ -298,7 +290,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
     --replica_num 2 \
     --key_prefix "real-batch-${RUN_ID}"
 
-  python3 ./scripts/clients/real_client_rw.py \
+  "${PYTHON_BIN}" ./python/tests/store/rs/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
     --storage-bytes 0 \

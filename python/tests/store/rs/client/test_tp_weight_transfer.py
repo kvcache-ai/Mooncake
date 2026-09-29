@@ -11,7 +11,7 @@ Scenarios:
 Requires a running mooncake-store-client daemon (dummy mode).
 
 Example:
-    python3 scripts/tests/client/test_tp_weight_transfer.py \
+    python3 python/tests/store/rs/client/test_tp_weight_transfer.py \
       --daemon_addr 127.0.0.1:16590
 """
 
@@ -21,7 +21,7 @@ import argparse
 import ctypes
 import sys
 
-from mooncake_store_rs.store import MooncakeDistributedStore, MooncakeHostMemAllocator
+from mooncake.store import MooncakeDistributedStore, MooncakeHostMemAllocator
 
 
 def parse_args() -> argparse.Namespace:

@@ -71,7 +71,8 @@ mc_scripts_require_command python3
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
 
-mc_scripts_setup_upstream_runtime_env python
+mc_scripts_setup_upstream_runtime_env none
+mc_scripts_setup_root_store_rs_python
 export PYTHONDONTWRITEBYTECODE=1
 
 REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
@@ -200,9 +201,9 @@ wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-client started stable
 wait_for_log "${TEMP_DIR}/client-b-v1.log" "mooncake-store-client started stable_id=client-b epoch=1"
 echo "  [OK] Both V1 clients started"
 
-REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" python3 - <<'PY'
+REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" "${PYTHON_BIN}" - <<'PY'
 import os
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(
@@ -257,9 +258,9 @@ wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-client promoted stabl
 wait_for_exit "${CLIENT_A_V1_PID}" "client-a-v1" 30
 echo "  [OK] client-a V1 exited, V2 promoted"
 
-REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" python3 - <<'PY'
+REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" "${PYTHON_BIN}" - <<'PY'
 import os, time
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(
@@ -337,9 +338,9 @@ echo "  [OK] client-a V2 exited, V1 rollback instance promoted (epoch=3)"
 echo ""
 echo "=== PHASE 4: Verify all data intact after rollback ==="
 
-REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" python3 - <<'PY'
+REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" "${PYTHON_BIN}" - <<'PY'
 import os, time
-from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(

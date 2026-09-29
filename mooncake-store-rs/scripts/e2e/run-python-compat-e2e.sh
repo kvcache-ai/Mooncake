@@ -2,29 +2,27 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR=${MOONCAKE_STORE_RS_DIR:-}
+ROOT_DIR=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to the Store-RS checkout containing this script}
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../lib/common.sh"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
-mc_scripts_require_command cargo
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
-mc_scripts_setup_upstream_runtime_env python
+mc_scripts_setup_root_store_rs_python
 mc_scripts_start_local_redis_if_needed "${REDIS_PORT}"
 export PYTHONDONTWRITEBYTECODE=1
 export MC_STORE_RS_REDIS_URL="${MC_STORE_RS_REDIS_URL:-redis://127.0.0.1:${REDIS_PORT}/0}"
 
 cd "${ROOT_DIR}"
-cargo build -p mooncake-store-py
 
-python3 - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 import ctypes
 import os
 import subprocess
 import time
 import urllib.request
 
-from mooncake_store_rs.store import (
+from mooncake.store import (
     MooncakeDistributedStore,
     ReplicateConfig,
     metrics_server_address,
