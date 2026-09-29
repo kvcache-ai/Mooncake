@@ -2273,80 +2273,141 @@ TEST_F(MasterServiceTenantQuotaTest,
         << "a tenant under its own watermark must not pay for a noisy one";
 }
 
-// A group sweep tears down a member it invalidated under that member's own
-// lock, so by the time the sweep has settled a group there is no invalidated
-// member left routed for a later pass to drop. A replica that lands on such a
-// member at that point therefore either belongs to a live publication or is
-// refused, and never ends up on an entry the sweep takes down afterwards.
+// A group eviction tears an invalidated member down inside that member's own
+// callback, so the entry is already gone when an offload completion for that
+// key lands while the sweep is settling the group, and the replica the master
+// accepts for it belongs to a live publication instead of going down with an
+// entry a later pass was going to erase. The trigger is the real tenant
+// watermark pass over the tenant's one group, and the completions are the RPC a
+// store worker sends when an offload finishes, issued from their own thread
+// while the sweep holds the snapshot lock.
 TEST_F(MasterServiceTenantQuotaTest,
        GroupEvictionSettlesAnInvalidatedMemberBeforeAReplicaCanLand) {
     const TenantId tenant("tenant-a");
-    MasterService service(MakeTenantWatermarkConfig(
-        {{tenant, 1000}}, /*watermark=*/0.9, /*eviction_ratio=*/0.05));
-    UUID client_id = MountSegment(service, /*size=*/4096);
+    const std::string group_id = "evict-group";
+    const std::string member_key_a = "grouped-a";
+    const std::string member_key_b = "grouped-b";
+    const uint64_t object_size = 240;
 
-    // Two groups of two members, so the pass has to evict a group and the
-    // members it invalidates are the ones this test watches.
-    const auto put_grouped = [&](const std::string& key,
-                                 const std::string& group) {
-        auto config = MemoryConfig();
-        config.group_ids = std::vector<std::string>{group};
+    // The tenant's whole population is one group of two members, so the only
+    // bytes the pass can free are that group's and either member can be the
+    // pass's trigger. The pair sits over the tenant's watermark.
+    MasterServiceConfig config = MakeTenantWatermarkConfig(
+        {{tenant, 500}}, /*watermark=*/0.9, /*eviction_ratio=*/0.05);
+    // The HA deployment this reproduces runs the OpLog on the client write and
+    // offload paths, so the completion that races the eviction carries an OpLog
+    // record of its own.
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    MasterService service(config);
+    // Nothing else may move this state: the periodic worker runs the same
+    // watermark pass this test drives by hand, and the replica cleanup worker
+    // would sweep the disk replica the completion registers.
+    QuiesceRecreateBackgroundWorkers(service);
+    MasterServiceTestPeer::InstallOpLogWriterForTesting(
+        service, std::make_unique<HoldingOpLogWriter>());
+    const UUID client_id = MountSegment(service, /*size=*/4096);
+
+    const auto put_grouped = [&](const std::string& key) {
+        ReplicateConfig put_config = MemoryConfig();
+        put_config.group_ids = std::vector<std::string>{group_id};
         ASSERT_TRUE(
-            service.PutStart(client_id, key, tenant, 240, config).has_value());
+            service.PutStart(client_id, key, tenant, object_size, put_config)
+                .has_value());
         ASSERT_TRUE(service.PutEnd(client_id, key, tenant, ReplicaType::MEMORY)
                         .has_value());
     };
-    put_grouped("grouped-a1", "evict-group-1");
-    put_grouped("grouped-b1", "evict-group-1");
-    put_grouped("grouped-a2", "evict-group-2");
-    put_grouped("grouped-b2", "evict-group-2");
-    ASSERT_GT(Snapshot(service, tenant).charged_bytes, 900u);
+    put_grouped(member_key_a);
+    put_grouped(member_key_b);
+    ASSERT_GT(Snapshot(service, tenant).charged_bytes, 450u);
 
-    // The sweep's last step: the second member was invalidated by its eviction,
-    // and this is where a subsequent pass used to erase it. Land the disk
-    // replica an offload completion would register for it here.
-    bool member_routed_at_settled = false;
-    bool add_succeeded = false;
-    size_t hook_runs = 0;
-    MasterServiceTestPeer(service).SetGroupEvictionSettledHookForTesting([&] {
-        if (hook_runs++ > 0) {
-            return;
-        }
-        auto routed = service.ExistKey("grouped-b1", tenant);
-        ASSERT_TRUE(routed.has_value()) << toString(routed.error());
-        member_routed_at_settled = routed.value();
-
+    MasterServiceTestPeer peer(service);
+    const auto route_of = [&](const std::string& key) {
+        return MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+    };
+    ASSERT_NE(route_of(member_key_a), nullptr);
+    ASSERT_NE(route_of(member_key_b), nullptr);
+    const auto has_disk_replica = [&](const std::string& key) {
+        return peer
+            .WithStoredObjectForRead(
+                tenant, key,
+                [](const std::shared_ptr<ObjectEntry>&,
+                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                    return metadata.CountReplicas(
+                               &Replica::fn_is_local_disk_replica) > 0;
+                })
+            .value_or(false);
+    };
+    const auto register_disk_replica = [&](const std::string& key) {
         StorageObjectMetadata metadata;
-        metadata.data_size = 240;
+        metadata.data_size = static_cast<int64_t>(object_size);
         metadata.transport_endpoint = "disk-endpoint";
         std::vector<OffloadTaskItem> tasks{OffloadTaskItem{
-            .tenant_id = tenant.value(), .key = "grouped-b1", .size = 240}};
-        add_succeeded =
-            service.NotifyOffloadSuccess(client_id, tasks, {metadata})
-                .has_value();
+            .tenant_id = tenant.value(), .key = key, .size = object_size}};
+        return service.NotifyOffloadSuccess(client_id, tasks, {metadata})
+            .has_value();
+    };
+
+    // Both completions run on their own thread and the hook waits for them: the
+    // pass holds the snapshot lock for its whole run and each completion takes
+    // that lock again. Both waits are bounded, so a stalled completion fails
+    // the assertions below rather than hanging the suite. Both keys are
+    // registered, because which member the pass took as its trigger is the
+    // pass's own choice: the group eviction invalidated both of them.
+    std::promise<void> group_settled;
+    std::promise<void> registrations_done;
+    auto group_settled_future = group_settled.get_future();
+    auto registrations_done_future = registrations_done.get_future();
+    bool accepted_a = false;
+    bool accepted_b = false;
+    bool registrations_completed = false;
+    size_t settled_runs = 0;
+    std::thread registrar([&] {
+        group_settled_future.wait();
+        accepted_a = register_disk_replica(member_key_a);
+        accepted_b = register_disk_replica(member_key_b);
+        registrations_done.set_value();
+    });
+    peer.SetGroupEvictionSettledHookForTesting([&] {
+        ++settled_runs;
+        if (settled_runs > 1) {
+            return;
+        }
+        // Every member's callback has returned and the member the sweep
+        // invalidated is being torn down here: this is the point an offload
+        // completion of the group lands on.
+        group_settled.set_value();
+        registrations_completed =
+            registrations_done_future.wait_for(std::chrono::seconds(30)) ==
+            std::future_status::ready;
     });
 
     RunTenantEvictionPass(service);
+    if (settled_runs == 0) {
+        // No group was settled, so nothing released the registrar: do it here
+        // and let the assertions report what the pass did.
+        group_settled.set_value();
+    }
+    registrar.join();
 
-    ASSERT_GT(hook_runs, 0u) << "the sweep never settled a group";
-    EXPECT_FALSE(member_routed_at_settled)
-        << "an invalidated member must be torn down by the sweep itself, not "
-           "left routed for a later pass";
-
-    auto replicas = service.GetReplicaList("grouped-b1", tenant);
-    if (add_succeeded) {
-        ASSERT_TRUE(replicas.has_value())
-            << "a disk replica the master accepted must not be dropped with "
-               "the "
-               "entry it was added to";
-        EXPECT_TRUE(std::any_of(replicas->replicas.begin(),
-                                replicas->replicas.end(),
-                                [](const Replica::Descriptor& replica) {
-                                    return replica.is_local_disk_replica();
-                                }));
-    } else {
-        EXPECT_FALSE(replicas.has_value())
-            << "a refused replica must not leave a publication behind";
+    ASSERT_GT(settled_runs, 0u) << "the sweep never settled a group";
+    ASSERT_TRUE(registrations_completed)
+        << "the offload completions did not finish while the sweep was holding "
+           "the group";
+    EXPECT_TRUE(accepted_a);
+    EXPECT_TRUE(accepted_b);
+    // The replica the completion registered for a member the sweep invalidated
+    // belongs to the publication that key routes now: with the teardown inside
+    // the member's own callback the entry is already gone when the completion
+    // lands, and a pass that erased it afterwards would take the replica with
+    // it.
+    for (const std::string& key : {member_key_a, member_key_b}) {
+        EXPECT_NE(route_of(key), nullptr)
+            << "the replica the master accepted for " << key
+            << " went down with the entry the sweep had decided to erase";
+        EXPECT_TRUE(has_disk_replica(key))
+            << "no disk replica on the publication of " << key;
     }
 }
 

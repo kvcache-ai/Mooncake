@@ -519,32 +519,6 @@ class MasterServiceTest : public ::testing::Test {
         return tenant_handle->GroupMembers(group_id);
     }
 
-    void ClearGroupStateForTest(MasterService& service) {
-        // Drops every grouped entry's membership from its tenant's group
-        // index, leaving the group table empty for a rebuild.
-        MasterServiceTestPeer::Tenants(service).Visit(
-            [&](const TenantId&,
-                const std::shared_ptr<metadata::Tenant>& handle) {
-                for (const auto& entry : handle->SnapshotObjects()) {
-                    if (entry->group_id().empty()) {
-                        continue;
-                    }
-                    handle->UnregisterGroupMember(entry);
-                }
-            });
-    }
-
-    void RebuildGroupStateForTest(MasterService& service) {
-        // Snapshot deserialization wires membership as it routes each object,
-        // so this pass is the test's own: it drives the per-tenant rebuild
-        // directly.
-        MasterServiceTestPeer::Tenants(service).Visit(
-            [](const TenantId&,
-               const std::shared_ptr<metadata::Tenant>& handle) {
-                handle->RebuildGroupState();
-            });
-    }
-
     // The shared group lease, read from a member's own lease: every grouped
     // object points at its group's single shared Lease.
     std::shared_ptr<Lease> GetGroupLeaseForTest(

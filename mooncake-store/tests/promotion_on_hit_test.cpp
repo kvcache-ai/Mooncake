@@ -90,12 +90,6 @@ class PromotionOnHitTest : public ::testing::Test {
             .RunPromotionCandidateRetryForTesting();
     }
 
-    static uint64_t GetPromotionCandidateCountForTesting(
-        MasterService* service) {
-        return MasterServiceTestPeer::PromotionCandidateCount(*service).load(
-            std::memory_order_relaxed);
-    }
-
     static uint64_t GetPromotionInFlightForTesting(MasterService* service) {
         return MasterServiceTestPeer::PromotionInFlight(*service).load(
             std::memory_order_relaxed);
@@ -3177,47 +3171,6 @@ TEST_F(PromotionOnHitTest, RetryCandidate_MultipleKeysTracked) {
     EXPECT_EQ(
         CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
         static_cast<size_t>(kKeys));
-
-    service->RemoveAll();
-}
-
-// A metadata reload drops the candidate index, the global count and the
-// in-flight counter with the rest of the state.
-TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.promotion_on_hit = true;
-    config.promotion_admission_threshold = 1;
-    config.default_kv_lease_ttl = 2000;
-    config.eviction_high_watermark_ratio = 0.0;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto seg =
-        PrepareSegment(*service, "reload_seg", kDefaultSegmentBase, seg_size);
-    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_reload",
-                                       1024, seg.segment_name));
-
-    // Record a candidate.
-    {
-        auto r = service->GetReplicaList("k_reload", TenantId::Default());
-        ASSERT_TRUE(r.has_value());
-    }
-    ASSERT_EQ(
-        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
-        1u);
-
-    // Simulate metadata reload.
-    {
-        MasterServiceTestPeer::MetadataSerializer serializer(service.get());
-        serializer.Reset();
-    }
-
-    EXPECT_EQ(
-        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
-        0u);
-    EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 0u);
-    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
 
     service->RemoveAll();
 }

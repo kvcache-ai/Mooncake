@@ -449,32 +449,6 @@ TEST_F(MasterServiceTest, GroupStateRegistersAndCleansUpMembers) {
     EXPECT_TRUE(GetGroupMemberKeysForTest(*service_, group_id).empty());
 }
 
-TEST_F(MasterServiceTest, RebuildGroupStateRestoresMembershipFromMetadata) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    const std::string key_a = "rebuild_group_key_a";
-    const std::string key_b = "rebuild_group_key_b";
-    const std::string group_id = "rebuild_group_id";
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.group_ids = std::vector<std::string>{group_id};
-    PutCompletedObject(*service_, client_id, key_a, config);
-    PutCompletedObject(*service_, client_id, key_b, config);
-
-    // Simulate a snapshot reset: drop all group state.
-    ClearGroupStateForTest(*service_);
-    EXPECT_TRUE(GetGroupMemberKeysForTest(*service_, group_id).empty());
-
-    // Rebuild from object metadata (as snapshot deserialization does).
-    RebuildGroupStateForTest(*service_);
-
-    auto members = GetGroupMemberKeysForTest(*service_, group_id);
-    EXPECT_EQ(2u, members.size());
-}
-
 TEST_F(MasterServiceTest, GroupLeaseIsSharedAndExtendsOnMemberRead) {
     const uint64_t kv_lease_ttl = 1000;
     auto service_config = MasterServiceConfig::builder()

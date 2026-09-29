@@ -26,6 +26,8 @@
 
 #include <unistd.h>
 
+#include "common/zstd_util.h"
+#include "serialize/serializer.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
@@ -1429,98 +1431,256 @@ TEST_F(MasterServiceTest, SnapshotDecodeReplacesPublishedMetadata) {
     EXPECT_EQ(RegisteredTenantCount(service), 0u);
 }
 
-// Decoding a snapshot wires what the payload carries: the group membership of
-// every member, one shared lease per group, a same-named group in another
-// tenant kept apart, and no replica-action state inherited from before the
-// decode.
+namespace {
+
+// One object of a metadata payload: the tenant and key it routes, the group it
+// belongs to, and the lease deadline the payload records for it.
+struct SnapshotPayloadObject {
+    std::string tenant_id;
+    std::string key;
+    std::string group_id;
+    uint64_t lease_deadline_ms;
+    uint64_t replica_id;
+    uint64_t object_size{1024};
+};
+
+// A metadata payload shaped the way MetadataSerializer::Serialize writes one:
+// one compressed shard per list of objects, each object routed by the tenant id
+// in its own item, with an empty discarded-replicas list and a replica id base.
+// Building it by hand pins the deadline every item carries, which is what the
+// decode takes each group's shared lease from.
+std::vector<uint8_t> BuildSnapshotMetadataPayload(
+    const std::vector<std::vector<SnapshotPayloadObject>>& shards,
+    const UUID& client_id) {
+    constexpr uint64_t kPutStartTimeMs = 1700000000000ULL;
+    constexpr uint64_t kReplicaNextId = 1000000ULL;
+
+    msgpack::sbuffer root_buffer;
+    MsgpackPacker root_packer(&root_buffer);
+    root_packer.pack_map(3);
+
+    root_packer.pack(std::string("shards"));
+    root_packer.pack_map(shards.size());
+    for (size_t shard_index = 0; shard_index < shards.size(); ++shard_index) {
+        msgpack::sbuffer shard_buffer;
+        MsgpackPacker shard_packer(&shard_buffer);
+        shard_packer.pack_map(1);
+        shard_packer.pack(std::string("metadata"));
+        shard_packer.pack_array(shards[shard_index].size());
+        for (const auto& object : shards[shard_index]) {
+            shard_packer.pack_array(3);
+            shard_packer.pack(object.tenant_id);
+            shard_packer.pack(object.key);
+            // The layout SerializeMetadata writes: the seven leading fields,
+            // the replica count, the data type, one replica per count, then
+            // hard_pinned and group_id.
+            shard_packer.pack_array(11);
+            shard_packer.pack(UuidToString(client_id));
+            shard_packer.pack(kPutStartTimeMs);
+            shard_packer.pack(object.object_size);
+            shard_packer.pack(object.lease_deadline_ms);
+            shard_packer.pack(false);
+            shard_packer.pack(uint64_t{0});
+            shard_packer.pack(uint32_t{1});
+            shard_packer.pack(static_cast<uint8_t>(ObjectDataType::TENSOR));
+            // One DISK replica, as Serializer<Replica> packs one.
+            shard_packer.pack_array(4);
+            shard_packer.pack(object.replica_id);
+            shard_packer.pack(static_cast<int16_t>(ReplicaStatus::COMPLETE));
+            shard_packer.pack(static_cast<int8_t>(ReplicaType::DISK));
+            shard_packer.pack_array(2);
+            shard_packer.pack(std::string("/tmp/mooncake_decode_replica.data"));
+            shard_packer.pack(object.object_size);
+            shard_packer.pack(false);
+            shard_packer.pack(object.group_id);
+        }
+        const auto compressed =
+            zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
+                          shard_buffer.size(), 3);
+        root_packer.pack(std::to_string(shard_index));
+        root_packer.pack_bin(compressed.size());
+        root_packer.pack_bin_body(
+            reinterpret_cast<const char*>(compressed.data()),
+            compressed.size());
+    }
+
+    root_packer.pack(std::string("discarded_replicas"));
+    root_packer.pack_array(0);
+    root_packer.pack(std::string("replica_next_id"));
+    root_packer.pack(kReplicaNextId);
+
+    const auto* data = reinterpret_cast<const uint8_t*>(root_buffer.data());
+    return std::vector<uint8_t>(data, data + root_buffer.size());
+}
+
+}  // namespace
+
+// Decoding a snapshot wires what the payload carries: each object's group
+// membership, one shared group lease per tenant raised to the latest deadline
+// among that group's members, a same-named group in another tenant kept apart,
+// and no replica-action state inherited from before the decode. A payload whose
+// deadlines the test pins shows which of them the group ends on.
 TEST_F(MasterServiceTest, SnapshotDecodeWiresGroupsAndDropsActionState) {
     const TenantId tenant_a("tenant_decode_groups_a");
     const TenantId tenant_b("tenant_decode_groups_b");
     const std::string group_id = "decode-shared-group";
-    const std::string key_a = "decode_group_a1";
-    const std::string key_a2 = "decode_group_a2";
-    const std::string key_b = "decode_group_b1";
+    const std::string staged_key = "decode_staged_key";
+    const std::string restored_key_a1 = "restored_group_a1";
+    const std::string restored_key_a2 = "restored_group_a2";
+    const std::string restored_key_b = "restored_group_b1";
+    const uint64_t base_deadline_ms = 4200000000000ULL;
+    // The member decoded first carries the latest deadline of its group, so a
+    // group lease that ends on the last member the decode saw, or that a later
+    // member of the same group lowers, fails the assertions below.
+    const uint64_t group_a_latest_deadline_ms = base_deadline_ms + 60000;
+    const uint64_t group_a_earlier_deadline_ms = base_deadline_ms;
+    const uint64_t group_b_deadline_ms = base_deadline_ms + 30000;
 
-    MasterService service(
-        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
+    MasterServiceConfig config =
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()});
+    // Promotion on hit with the pool held over its watermark: offload is what
+    // gives promotion its LOCAL_DISK replicas, and the watermark gate is what
+    // records the candidate this test stages, which the decode has to clear
+    // along with the lease beside it.
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.eviction_high_watermark_ratio = 0.0;
+    MasterService service(config);
+    // Pool eviction is held over its watermark, so the periodic worker would
+    // evict what this test stages and its retry loop would unindex the staged
+    // candidate; the replica cleanup worker moves replicas. The serializer runs
+    // against the state those would move.
+    MasterServiceTestPeer::EvictionRunning(service) = false;
+    if (MasterServiceTestPeer::EvictionThread(service).joinable()) {
+        MasterServiceTestPeer::EvictionThread(service).join();
+    }
+    MasterServiceTestPeer::ReplicaCleanupWorker(service).Stop();
+    MasterServiceTestPeer peer(service);
     const auto context = PrepareSimpleSegment(service);
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.group_ids = std::vector<std::string>{group_id};
-    PutCompletedObject(service, context.client_id, key_a, tenant_a, config);
-    PutCompletedObject(service, context.client_id, key_a2, tenant_a, config);
-    PutCompletedObject(service, context.client_id, key_b, tenant_b, config);
 
-    ASSERT_EQ(
-        GetGroupMemberKeysForTest(service, group_id, tenant_a.value()).size(),
-        2u);
-    ASSERT_EQ(
-        GetGroupMemberKeysForTest(service, group_id, tenant_b.value()).size(),
-        1u);
-    const auto lease_before =
-        GetGroupLeaseForTest(service, group_id, tenant_a.value());
-    ASSERT_NE(lease_before, nullptr);
+    // One publication of this service, so the decode below can be shown to
+    // replace what the routes held.
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    PutCompletedObject(service, context.client_id, staged_key, tenant_a,
+                       put_config);
 
-    // Replica-action state the decode must not inherit.
-    const auto publication = MasterServiceTestPeer::FindObject(
-        service, MasterServiceTestPeer::ObjectIdentity{tenant_a, key_a});
-    ASSERT_NE(publication, nullptr);
+    const auto route_of = [&](const TenantId& tenant, const std::string& key) {
+        return MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+    };
+    // The lease a member holds: an entry's metadata borrows the lease of the
+    // group it belongs to, so two members of one group report one lease and two
+    // groups report their own.
+    const auto lease_of = [&](const TenantId& tenant, const std::string& key) {
+        auto lease = peer.WithStoredObjectForRead(
+            tenant, key,
+            [](const std::shared_ptr<ObjectEntry>&,
+               const ObjectMetadata& metadata,
+               const ObjectEntry::State&) { return metadata.lease_; });
+        return lease.has_value() ? *lease : nullptr;
+    };
+    const auto deadline_ms_of = [](const std::shared_ptr<Lease>& lease) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                lease->ExpiresAt().time_since_epoch())
+                .count());
+    };
+
+    // Replica-action state staged on the staged publication: a promotion
+    // candidate the retry loop would keep retrying, and a dynamic-replication
+    // lease a client could still act on. A decode has to drop both.
+    const MasterServiceTestPeer::ObjectIdentity staged{tenant_a, staged_key};
+    const auto staged_entry =
+        MasterServiceTestPeer::FindObject(service, staged);
+    ASSERT_NE(staged_entry, nullptr);
+    ASSERT_EQ(peer.TryPushPromotionQueue(staged, /*record_candidate=*/true),
+              MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected);
     const UUID proposal_id = generate_uuid();
     ReplicaActionLease lease;
     lease.proposal_id = proposal_id;
     lease.lease_id = proposal_id;
     lease.tenant_id = tenant_a.value();
-    lease.key = key_a;
+    lease.key = staged_key;
     lease.expire_at_ms_epoch =
         MasterServiceTestPeer::DynamicReplicationNowMs() + 3600000;
-    MasterServiceTestPeer(service).PutDynamicReplicationLeaseForTesting(
-        tenant_a, publication, proposal_id, lease);
+    peer.PutDynamicReplicationLeaseForTesting(tenant_a, staged_entry,
+                                              proposal_id, lease);
+    ASSERT_EQ(peer.CountCandidatesForTesting(tenant_a), 1u);
+    ASSERT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                    service, tenant_a, proposal_id)
+                    .has_value());
 
-    std::vector<uint8_t> payload;
+    // A payload whose deadlines are pinned: the member that comes first carries
+    // the latest deadline of its group. Its objects carry keys the service does
+    // not hold, so the decode replaces the staged publication with them, and
+    // they are DISK-backed, so a round trip through the loader is metadata
+    // alone rather than a second claim on a segment allocation.
+    const auto payload = BuildSnapshotMetadataPayload(
+        {{{tenant_a.value(), restored_key_a1, group_id,
+           group_a_latest_deadline_ms, 7001},
+          {tenant_a.value(), restored_key_a2, group_id,
+           group_a_earlier_deadline_ms, 7002}},
+         {{tenant_b.value(), restored_key_b, group_id, group_b_deadline_ms,
+           7003}}},
+        context.client_id);
+    {
+        MasterServiceTestPeer::MetadataSerializer serializer(&service);
+        ASSERT_TRUE(serializer.Deserialize(payload).has_value());
+    }
+
+    // The staged publication is gone, and so are the records that named it.
+    EXPECT_EQ(route_of(tenant_a, staged_key), nullptr);
+    EXPECT_EQ(peer.CountCandidatesForTesting(tenant_a), 0u);
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant_a, proposal_id)
+                     .has_value());
+
+    // Membership is wired per tenant from the payload, and every member of one
+    // group borrows that group's single lease, which ends at the latest
+    // deadline among its members. A group with the same id in another tenant is
+    // another group, with a lease of its own and the deadline its own payload
+    // carries.
+    auto decoded_members_a =
+        GetGroupMemberKeysForTest(service, group_id, tenant_a.value());
+    std::sort(decoded_members_a.begin(), decoded_members_a.end());
+    EXPECT_EQ(decoded_members_a,
+              (std::vector<std::string>{restored_key_a1, restored_key_a2}));
+    EXPECT_EQ(GetGroupMemberKeysForTest(service, group_id, tenant_b.value()),
+              (std::vector<std::string>{restored_key_b}));
+    const auto decoded_lease_a1 = lease_of(tenant_a, restored_key_a1);
+    const auto decoded_lease_a2 = lease_of(tenant_a, restored_key_a2);
+    ASSERT_NE(decoded_lease_a1, nullptr);
+    ASSERT_NE(decoded_lease_a2, nullptr);
+    EXPECT_EQ(decoded_lease_a1.get(), decoded_lease_a2.get())
+        << "the members of one group share one lease";
+    EXPECT_EQ(deadline_ms_of(decoded_lease_a1), group_a_latest_deadline_ms)
+        << "the group lease ends at the latest deadline among its members";
+    const auto decoded_lease_b = lease_of(tenant_b, restored_key_b);
+    ASSERT_NE(decoded_lease_b, nullptr);
+    EXPECT_NE(decoded_lease_b.get(), decoded_lease_a1.get())
+        << "the same group id in another tenant is another group";
+    EXPECT_EQ(deadline_ms_of(decoded_lease_b), group_b_deadline_ms)
+        << "another tenant's group keeps the deadline its own payload carries";
+
+    // What the loader itself writes carries the same wiring: the group of each
+    // member and the deadline of the group lease, so decoding that payload back
+    // re-wires the membership and the shared lease from the payload alone.
     {
         MasterServiceTestPeer::MetadataSerializer serializer(&service);
         auto encoded = serializer.Serialize();
         ASSERT_TRUE(encoded.has_value());
-        payload = std::move(*encoded);
+        ASSERT_TRUE(serializer.Deserialize(*encoded).has_value());
     }
-
-    MasterServiceTestPeer::MetadataSerializer reader(&service);
-    ASSERT_TRUE(reader.Deserialize(payload).has_value());
-
-    // Membership is rewired per tenant from the payload, and a group with the
-    // same id in another tenant stays that tenant's own.
-    EXPECT_EQ(
-        GetGroupMemberKeysForTest(service, group_id, tenant_a.value()).size(),
-        2u);
-    EXPECT_EQ(
-        GetGroupMemberKeysForTest(service, group_id, tenant_b.value()).size(),
-        1u);
-    // Every member of one group shares the lease the decode wired, and a group
-    // of another tenant is another group with its own lease. The payload keeps
-    // the deadline in milliseconds, so a decoded lease carries that value and
-    // the live one was taken within a millisecond of it.
-    const auto lease_after =
-        GetGroupLeaseForTest(service, group_id, tenant_a.value());
-    ASSERT_NE(lease_after, nullptr);
-    const auto lease_b =
-        GetGroupLeaseForTest(service, group_id, tenant_b.value());
-    ASSERT_NE(lease_b, nullptr);
-    EXPECT_NE(lease_after.get(), lease_b.get())
-        << "the same group id in another tenant is another group";
-    const auto milliseconds_between = [](const std::shared_ptr<Lease>& left,
-                                         const std::shared_ptr<Lease>& right) {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                   left->ExpiresAt() - right->ExpiresAt())
-            .count();
-    };
-    EXPECT_LT(std::abs(milliseconds_between(lease_after, lease_before)), 2)
-        << "the shared lease must keep the deadline the payload carries";
-    EXPECT_LT(std::abs(milliseconds_between(lease_b, lease_before)), 2);
-
-    // The lease staged before the decode is the state's, not the payload's.
-    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
-                     service, tenant_a, proposal_id)
-                     .has_value());
+    const auto round_trip_lease_a1 = lease_of(tenant_a, restored_key_a1);
+    const auto round_trip_lease_a2 = lease_of(tenant_a, restored_key_a2);
+    ASSERT_NE(round_trip_lease_a1, nullptr);
+    ASSERT_NE(round_trip_lease_a2, nullptr);
+    EXPECT_EQ(round_trip_lease_a1.get(), round_trip_lease_a2.get())
+        << "the members of one group share one lease";
+    EXPECT_EQ(deadline_ms_of(round_trip_lease_a1), group_a_latest_deadline_ms)
+        << "the loader records the group lease's own deadline";
 }
 
 TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
