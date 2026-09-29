@@ -12,9 +12,16 @@ if(USE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
 
+  set(MOONCAKE_EP_JIT_SOURCES
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_runtime.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_cache.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_utils.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/nvcc_compiler.cpp")
+
   # Keep CUDA fatbins in a separate library.  The Python host extension can
   # then pass through auditwheel while this library is injected afterwards.
-  add_library(mooncake_ep_device SHARED ${MOONCAKE_EP_DEVICE_SOURCES})
+  add_library(mooncake_ep_device SHARED ${MOONCAKE_EP_DEVICE_SOURCES}
+                                        ${MOONCAKE_EP_JIT_SOURCES})
   set_target_properties(mooncake_ep_device PROPERTIES
                         POSITION_INDEPENDENT_CODE ON)
   if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
@@ -33,7 +40,8 @@ if(USE_CUDA)
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-g0>
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-  target_link_libraries(mooncake_ep_device PRIVATE CUDA::cudart)
+  target_link_libraries(mooncake_ep_device PRIVATE CUDA::cudart
+                                                   CUDA::cuda_driver)
   if(USE_NCCL_DEVICE)
     target_link_libraries(mooncake_ep_device PRIVATE NCCL::nccl)
   endif()
