@@ -71,6 +71,25 @@ set_target_properties(
              "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
 
 if(BUILD_UNIT_TESTS)
+  if(WITH_METRICS AND USE_TCP)
+    add_executable(
+      tebench_metrics_integration_test
+      tests/metrics_integration_test.cpp te_backend.cpp utils.cpp
+      split_output.cpp)
+    # Use the same backend dependencies as tebench, including device runtimes.
+    target_link_libraries(
+      tebench_metrics_integration_test
+      PRIVATE $<TARGET_PROPERTY:tebench,LINK_LIBRARIES> gtest gtest_main)
+    target_include_directories(
+      tebench_metrics_integration_test
+      PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+    add_test(NAME tebench_metrics_integration_test
+             COMMAND tebench_metrics_integration_test)
+    set_tests_properties(tebench_metrics_integration_test
+                         PROPERTIES TIMEOUT 60 LABELS integration)
+  endif()
+
   add_executable(
     tebench_qos_metrics_test tests/qos_metrics_test.cpp qos_metrics_adapter.cpp
                              workload_config.cpp utils.cpp)
