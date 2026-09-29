@@ -3388,6 +3388,73 @@ TEST_F(PromotionOnHitTest, RetryCandidate_SliceResumesThroughTheIndex) {
     service->RemoveAll();
 }
 
+// The record holds the candidate index the retry sweep walks; dropping its last
+// candidate drops the record with it.
+TEST_F(PromotionOnHitTest, ReplicaActionStateIsReclaimedWithItsLastCandidate) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+    QuiesceEvictionWorker(*service);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "state_seg", kDefaultSegmentBase, seg_size);
+    const TenantId tenant = TenantId::Default();
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_state", 512,
+                                       seg.segment_name));
+    ASSERT_TRUE(service->GetReplicaList("k_state", tenant).has_value());
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), tenant), 1u);
+    ASSERT_TRUE(MasterServiceTestPeer::HasReplicaActionState(*service, tenant));
+
+    // The retry sweep drops a candidate whose key stopped qualifying, and the
+    // record goes with the last one it drops.
+    AgeCandidatesPastTtlForTesting(service.get());
+    for (size_t round = 0; round < 4; ++round) {
+        RunPromotionCandidateRetryForTesting(service.get());
+    }
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), tenant), 0u);
+    EXPECT_FALSE(
+        MasterServiceTestPeer::HasReplicaActionState(*service, tenant));
+
+    service->RemoveAll();
+}
+
+// An object teardown drops the leases and the candidate of the key it unwinds,
+// so the tenant's record goes with them.
+TEST_F(PromotionOnHitTest, ReplicaActionStateIsReclaimedOnObjectTeardown) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+    QuiesceEvictionWorker(*service);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "teardown_seg", kDefaultSegmentBase, seg_size);
+    const TenantId tenant = TenantId::Default();
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_teardown",
+                                       512, seg.segment_name));
+    ASSERT_TRUE(service->GetReplicaList("k_teardown", tenant).has_value());
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), tenant), 1u);
+    ASSERT_TRUE(MasterServiceTestPeer::HasReplicaActionState(*service, tenant));
+
+    ASSERT_TRUE(MasterServiceTestPeer(*service).EraseObjectForTesting(
+        tenant, "k_teardown"));
+
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), tenant), 0u);
+    EXPECT_FALSE(
+        MasterServiceTestPeer::HasReplicaActionState(*service, tenant));
+
+    service->RemoveAll();
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

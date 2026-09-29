@@ -2273,4 +2273,51 @@ TEST_F(MasterServiceTenantQuotaTest,
         << "a tenant under its own watermark must not pay for a noisy one";
 }
 
+// A tenant's record is its own: unwinding one tenant's objects leaves another
+// tenant's record and leases alone.
+TEST_F(MasterServiceTenantQuotaTest, ReplicaActionStateIsReclaimedPerTenant) {
+    const TenantId tenant_a("tenant-state-a");
+    const TenantId tenant_b("tenant-state-b");
+    MasterService service(
+        MakeConfig({{tenant_a, 1024 * 1024}, {tenant_b, 1024 * 1024}}));
+    UUID client_id = MountSegment(service, /*size=*/8192);
+
+    PutComplete(service, client_id, "state-key-a", tenant_a, 512);
+    PutComplete(service, client_id, "state-key-b", tenant_b, 512);
+
+    MasterServiceTestPeer peer(service);
+    const auto stage_lease = [&](const TenantId& tenant,
+                                 const std::string& key) {
+        auto entry = MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        EXPECT_NE(entry, nullptr);
+        const UUID proposal_id = generate_uuid();
+        peer.PutDynamicReplicationLeaseForTesting(
+            tenant, entry, proposal_id,
+            MakeReplicaActionLease(tenant, key, proposal_id));
+        return proposal_id;
+    };
+    const UUID proposal_a = stage_lease(tenant_a, "state-key-a");
+    const UUID proposal_b = stage_lease(tenant_b, "state-key-b");
+    ASSERT_TRUE(
+        MasterServiceTestPeer::HasReplicaActionState(service, tenant_a));
+    ASSERT_TRUE(
+        MasterServiceTestPeer::HasReplicaActionState(service, tenant_b));
+
+    // The teardown of one tenant's key retracts that tenant's lease, and its
+    // record goes with it; the other tenant keeps both.
+    ASSERT_TRUE(peer.EraseObjectForTesting(tenant_a, "state-key-a"));
+    EXPECT_FALSE(
+        MasterServiceTestPeer::HasReplicaActionState(service, tenant_a));
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant_a, proposal_a)
+                     .has_value());
+
+    EXPECT_TRUE(MasterServiceTestPeer::HasReplicaActionState(service, tenant_b))
+        << "the other tenant's record is not this teardown's to drop";
+    EXPECT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                    service, tenant_b, proposal_b)
+                    .has_value());
+}
+
 }  // namespace mooncake::test

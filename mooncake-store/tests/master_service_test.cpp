@@ -1253,6 +1253,7 @@ TEST_F(MasterServiceTest, SnapshotReloadDropsReplicaActionState) {
     ASSERT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
                     service, tenant, proposal_id)
                     .has_value());
+    ASSERT_TRUE(MasterServiceTestPeer::HasReplicaActionState(service, tenant));
     EXPECT_NE(MasterServiceTestPeer::PromotionCandidateCount(service).load(
                   std::memory_order_relaxed),
               0u);
@@ -1281,6 +1282,8 @@ TEST_F(MasterServiceTest, SnapshotReloadDropsReplicaActionState) {
     EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
                      service, tenant, proposal_id)
                      .has_value());
+    EXPECT_FALSE(MasterServiceTestPeer::HasReplicaActionState(service, tenant))
+        << "the record held both halves, so the reset drops it with them";
 
     // The same tenant and key published again inherit nothing.
     PutCompletedObject(service, segment.client_id, key, tenant, put_config,

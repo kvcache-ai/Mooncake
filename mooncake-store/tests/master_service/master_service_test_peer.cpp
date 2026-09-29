@@ -116,7 +116,7 @@ size_t MasterServiceTestPeer::RunPromotionCandidateRetryForTesting() {
 void MasterServiceTestPeer::SeedPromotionTaskForTesting(
     const TenantId& tenant_id, const std::string& key, const UUID& holder_id,
     ReplicaID alloc_id, uint64_t object_size) {
-    auto tenant_handle = service_.GetOrCreateTenantHandle(tenant_id);
+    auto tenant_handle = service_.tenants_.GetOrCreateTenant(tenant_id);
     auto entry = tenant_handle->Get(key);
     if (entry == nullptr) {
         // The route is what keeps the entry reachable by the completion path,

@@ -1269,4 +1269,75 @@ TEST_F(DynamicReplicationTest, TargetSelectionPrefersDifferentHost) {
     EXPECT_EQ(lease->target_segment, other_host_target.name);
 }
 
+// One record per tenant holds the leases a client may act on and the candidate
+// index the retry sweep walks; it goes once it holds neither.
+TEST_F(DynamicReplicationTest, ReplicaActionStateIsReclaimedWithItsLastLease) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_heat_window_seconds = 10;
+    config.dynamic_replication_admission_qps_threshold = 0.2;
+    config.dynamic_replication_max_memory_replicas = 2;
+    config.default_kv_lease_ttl = 2000;
+    MasterService service(config);
+
+    const TenantId tenant = TenantId::Default();
+    auto segment = PrepareSegment(service, "segment_reclaim", 0x1a00000000);
+    PutObject(service, segment.client_id, "reclaim_key_a",
+              segment.segment_name);
+    PutObject(service, segment.client_id, "reclaim_key_b",
+              segment.segment_name);
+
+    const auto stage_lease = [&](const std::string& key,
+                                 std::chrono::seconds ttl) {
+        auto entry = MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        EXPECT_NE(entry, nullptr);
+        const UUID proposal_id = generate_uuid();
+        ReplicaActionLease lease;
+        lease.proposal_id = proposal_id;
+        lease.lease_id = proposal_id;
+        lease.tenant_id = tenant.value();
+        lease.key = key;
+        lease.expire_at_ms_epoch =
+            MasterServiceTestPeer::DynamicReplicationNowMs() +
+            std::chrono::duration_cast<std::chrono::milliseconds>(ttl).count();
+        MasterServiceTestPeer(service).PutDynamicReplicationLeaseForTesting(
+            tenant, entry, proposal_id, lease);
+        return lease;
+    };
+    const auto deadline_of = [](const ReplicaActionLease& lease) {
+        return std::chrono::system_clock::time_point{
+            std::chrono::milliseconds(lease.expire_at_ms_epoch + 1000)};
+    };
+
+    // Two leases expiring apart, so the first sweep retracts one of them and
+    // the record still has a lease to report.
+    const auto first = stage_lease("reclaim_key_a", std::chrono::seconds(60));
+    const auto second = stage_lease("reclaim_key_b", std::chrono::hours(1));
+    ASSERT_TRUE(MasterServiceTestPeer::HasReplicaActionState(service, tenant));
+
+    MasterServiceTestPeer::EraseExpiredDynamicReplicationLeases(
+        service, tenant, deadline_of(first));
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant, first.proposal_id)
+                     .has_value());
+    EXPECT_TRUE(MasterServiceTestPeer::HasReplicaActionState(service, tenant))
+        << "the second lease is still one a client may act on";
+
+    MasterServiceTestPeer::EraseExpiredDynamicReplicationLeases(
+        service, tenant, deadline_of(second));
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant, second.proposal_id)
+                     .has_value());
+    EXPECT_FALSE(MasterServiceTestPeer::HasReplicaActionState(service, tenant))
+        << "the record holds neither a lease nor a candidate";
+
+    // A later lease starts a fresh record.
+    const auto third = stage_lease("reclaim_key_a", std::chrono::seconds(60));
+    EXPECT_TRUE(MasterServiceTestPeer::HasReplicaActionState(service, tenant));
+    EXPECT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                    service, tenant, third.proposal_id)
+                    .has_value());
+}
+
 }  // namespace mooncake::test

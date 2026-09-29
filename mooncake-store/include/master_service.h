@@ -1088,10 +1088,12 @@ class MasterService {
     // take this same lock, so tenants serialize against each other here. The
     // object route, the group table and the quota account are per-tenant and do
     // not. The table is touched on the action paths below, never on a read of
-    // the object route, so giving each tenant its own lock here is a change of
-    // granularity rather than of correctness. `DynamicReplicationLeaseTable`
-    // keeps its own internal lock, so a per-tenant split does not need to widen
-    // this one.
+    // the object route, so giving each tenant its own lock is a change of
+    // granularity rather than of correctness; a per-tenant split has to be
+    // measured on the p50, p99 and p999 of these action paths, the wait on this
+    // lock and their throughput, with promotion and dynamic replication on and
+    // off. `DynamicReplicationLeaseTable` keeps its own internal lock, so the
+    // split does not have to widen this one.
     mutable std::mutex replica_action_mutex_;
     std::unordered_map<TenantId, TenantReplicaActionState, TenantIdHash>
         replica_action_state_ GUARDED_BY(replica_action_mutex_);
@@ -1105,12 +1107,15 @@ class MasterService {
     // leave a client acting on a key that is gone.
     void EraseReplicaActionLeasesForObject(const TenantId& tenant_id,
                                            std::string_view key);
+    // Drops a tenant's record once it holds neither a lease nor a candidate.
+    // The caller holds replica_action_mutex_ and keeps no reference to it.
+    void EraseReplicaActionStateIfEmptyLocked(const TenantId& tenant_id);
     // Drops every tenant's records for a reload that replaces all state: the
-    // leases and the candidate index are keyed by keys whose entries are gone,
-    // so keeping them would leave clients acting on objects that no longer
-    // exist and a candidate index that no publication owns. The promotion
-    // bookkeeping that shadows the table is part of the same step, so a reset
-    // path cannot retire one without the other.
+    // leases and the candidate index name keys whose entries are gone, so
+    // keeping them would leave clients acting on objects that no longer exist
+    // and a candidate index no publication owns. Callers reach this after
+    // removing every tenant, so nothing is left to walk, and the promotion
+    // bookkeeping that shadows the records is reset here.
     void ResetReplicaActionStateForReload();
     [[nodiscard]] std::optional<ReplicaActionLease> FindDynamicReplicationLease(
         const TenantId& tenant_id, const UUID& proposal_id);
@@ -1284,33 +1289,16 @@ class MasterService {
     // The registry is the authority on which tenant instance is current, so the
     // tenant is resolved for the key being read. A batch uses this form per key
     // and passes the key as a view it keeps alive for the call only, instead of
-    // building an owning identity per key.
+    // building an owning identity per key. An absent tenant, an unrouted key or
+    // a publication the route no longer holds reads as an empty result.
     template <typename Fn>
     [[nodiscard]] auto WithObjectMetadataForRead(const TenantId& tenant_id,
                                                  std::string_view user_key,
                                                  Fn&& fn) const {
-        return WithPublishedObjectForRead(tenants_.Lookup(tenant_id), user_key,
-                                          std::forward<Fn>(fn));
-    }
-
-    // The same read through an identity the caller already holds.
-    template <typename Fn>
-    [[nodiscard]] auto WithObjectMetadataForRead(
-        const ObjectIdentity& object_id, Fn&& fn) const {
-        return WithObjectMetadataForRead(
-            object_id.tenant_id, object_id.user_key, std::forward<Fn>(fn));
-    }
-
-    // The read form once the tenant is in hand. `user_key` must stay alive for
-    // the call: the access holds it only long enough to resolve and re-check
-    // the entry it publishes.
-    template <typename Fn>
-    [[nodiscard]] auto WithPublishedObjectForRead(
-        const std::shared_ptr<metadata::Tenant>& tenant,
-        std::string_view user_key, Fn&& fn) const {
         using Result = std::invoke_result_t<
             Fn, const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
             const ObjectMetadata&, const ObjectEntry::State&>;
+        const auto tenant = tenants_.Lookup(tenant_id);
         if (tenant == nullptr) {
             return PublishedResult<Result>{};
         }
@@ -1332,6 +1320,14 @@ class MasterService {
                         std::forward<Fn>(fn)(*tenant, entry, metadata, state)};
                 }
             });
+    }
+
+    // The same read through an identity the caller already holds.
+    template <typename Fn>
+    [[nodiscard]] auto WithObjectMetadataForRead(
+        const ObjectIdentity& object_id, Fn&& fn) const {
+        return WithObjectMetadataForRead(
+            object_id.tenant_id, object_id.user_key, std::forward<Fn>(fn));
     }
 
     // Drops the object's invalid memory replicas under the entry's own lock, at
@@ -1423,10 +1419,8 @@ class MasterService {
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
-    // Resolves the tenant, creating it through the registry's factory on first
-    // use; the factory is what binds its quota account.
-    std::shared_ptr<metadata::Tenant> GetOrCreateTenantHandle(
-        const TenantId& tenant_id);
+    // The quota account a tenant is bound to, or null when quotas are off. The
+    // registry's factory binds it when it builds the tenant.
     TenantQuotaHandle GetBoundTenantQuotaHandle(
         const metadata::Tenant& tenant) const;
     tl::expected<void, ErrorCode> ChargeTenantQuota(TenantQuotaHandle account,

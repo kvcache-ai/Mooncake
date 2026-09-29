@@ -212,6 +212,21 @@ class MasterServiceTestPeer {
         return service.FindDynamicReplicationLease(tenant_id, proposal_id);
     }
 
+    // Drops the leases whose deadline passed, as the sweep paths do.
+    static void EraseExpiredDynamicReplicationLeases(
+        MasterService& service, const TenantId& tenant_id,
+        const std::chrono::system_clock::time_point& now) {
+        service.EraseExpiredDynamicReplicationLeases(tenant_id, now);
+    }
+
+    // True while the service keeps a lease or a candidate index for the tenant;
+    // the record goes once it holds neither.
+    static bool HasReplicaActionState(MasterService& service,
+                                      const TenantId& tenant_id) {
+        std::lock_guard<std::mutex> lock(service.replica_action_mutex_);
+        return service.replica_action_state_.contains(tenant_id);
+    }
+
     // The keys whose published object carries a promotion candidate, for one
     // tenant. The candidate itself lives in the entry's own state, so each key
     // is resolved again before it is read.
@@ -566,7 +581,7 @@ class MasterServiceTestPeer {
     // a tenant always has one to charge against. The id is taken as given.
     std::shared_ptr<metadata::Tenant> GetOrCreateTenantHandle(
         const TenantId& tenant_id) {
-        return service_.GetOrCreateTenantHandle(tenant_id);
+        return service_.tenants_.GetOrCreateTenant(tenant_id);
     }
 
     bool IsReplicaReadable(const Replica& replica) const {

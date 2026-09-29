@@ -1563,15 +1563,27 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     tenant_quota_table_.RecomputeEffectiveQuotas(capacity);
 }
 
-std::shared_ptr<metadata::Tenant> MasterService::GetOrCreateTenantHandle(
-    const TenantId& tenant_id) {
-    return tenants_.GetOrCreateTenant(tenant_id);
-}
-
 // --- Per-tenant replica-action records --------------------------------------
 //
 // Replica-action leases and the promotion-candidate key index, both
 // re-validated against the entry their tenant's own route publishes.
+
+void MasterService::EraseReplicaActionStateIfEmptyLocked(
+    const TenantId& tenant_id) {
+    const auto it = replica_action_state_.find(tenant_id);
+    if (it == replica_action_state_.end()) {
+        return;
+    }
+    // The record goes only when both halves are gone: a lease a client may act
+    // on, or a candidate the retry sweep still has to visit, keeps it.
+    if (!it->second.leases.Empty() ||
+        !it->second.promotion_candidate_keys.empty()) {
+        return;
+    }
+    // An erase leaves the other entries of the map valid, and nothing outside
+    // the mutex refers to this one.
+    replica_action_state_.erase(it);
+}
 
 void MasterService::EraseReplicaActionLeasesForObject(const TenantId& tenant_id,
                                                       std::string_view key) {
@@ -1581,15 +1593,21 @@ void MasterService::EraseReplicaActionLeasesForObject(const TenantId& tenant_id,
         return;
     }
     it->second.leases.EraseForObject(key);
+    EraseReplicaActionStateIfEmptyLocked(tenant_id);
 }
 
 void MasterService::ResetReplicaActionStateForReload() {
-    // The per-entry pass first: it unindexes candidates through the same mutex
-    // the table clear below takes. Both halves of the reset live here, so a
-    // reload path cannot retire one without the other.
-    ReconcilePromotionBookkeeping();
-    std::lock_guard<std::mutex> lock(replica_action_mutex_);
-    replica_action_state_.clear();
+    // Callers reach this after removing every tenant, so a reconcile would walk
+    // nothing: the records go by id and the promotion bookkeeping that shadows
+    // them is zeroed here. The restore path reconciles once its payload is in
+    // place.
+    {
+        std::lock_guard<std::mutex> lock(replica_action_mutex_);
+        replica_action_state_.clear();
+    }
+    promotion_candidate_count_.store(0, std::memory_order_relaxed);
+    promotion_retry_cursor_.store(0, std::memory_order_relaxed);
+    promotion_in_flight_.store(0, std::memory_order_relaxed);
 }
 
 std::optional<ReplicaActionLease> MasterService::FindDynamicReplicationLease(
@@ -1619,7 +1637,9 @@ bool MasterService::RemoveDynamicReplicationLease(const TenantId& tenant_id,
     if (it == replica_action_state_.end()) {
         return false;
     }
-    return it->second.leases.Remove(proposal_id);
+    const bool removed = it->second.leases.Remove(proposal_id);
+    EraseReplicaActionStateIfEmptyLocked(tenant_id);
+    return removed;
 }
 
 void MasterService::EraseExpiredDynamicReplicationLeases(
@@ -1631,6 +1651,7 @@ void MasterService::EraseExpiredDynamicReplicationLeases(
         return;
     }
     it->second.leases.EraseExpired(now);
+    EraseReplicaActionStateIfEmptyLocked(tenant_id);
 }
 
 void MasterService::IndexPromotionCandidate(const TenantId& tenant_id,
@@ -1647,6 +1668,7 @@ void MasterService::UnindexPromotionCandidate(const TenantId& tenant_id,
         return;
     }
     it->second.promotion_candidate_keys.erase(key);
+    EraseReplicaActionStateIfEmptyLocked(tenant_id);
 }
 
 std::vector<std::string> MasterService::PromotionCandidateKeys(
@@ -3939,7 +3961,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         const auto now = std::chrono::system_clock::now();
         for (auto& object : prepared_objects) {
             const auto& standby_meta = object.entry->metadata;
-            const auto tenant = GetOrCreateTenantHandle(object.tenant_id);
+            const auto tenant = tenants_.GetOrCreateTenant(object.tenant_id);
             auto entry =
                 std::make_shared<ObjectEntry>(std::make_unique<ObjectMetadata>(
                     standby_meta.client_id, now, standby_meta.size,
@@ -5082,7 +5104,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
     // The tenant is created here, once this call is about to publish into it:
     // a request that fails above leaves the registry as it was.
-    const auto tenant = GetOrCreateTenantHandle(tenant_id);
+    const auto tenant = tenants_.GetOrCreateTenant(tenant_id);
     auto insert_result = InsertMetadata(
         *tenant, client_id, key, value_length, config, group_id, tenant_id, now,
         soft_pin_request, std::move(allocation_result.value()),
@@ -5667,7 +5689,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             SyncCacheTotalAccounting(metadata);
             SyncKvObjectState(key, metadata, object_id.tenant_id);
         });
-    const auto tenant = GetOrCreateTenantHandle(object_id.tenant_id);
+    const auto tenant = tenants_.GetOrCreateTenant(object_id.tenant_id);
     if (!tenant->InsertObject(entry)) {
         // A concurrent publish took the key: its own registration stands and
         // this replica was registered nowhere, so the accounting added here is
@@ -13850,7 +13872,7 @@ MasterService::MetadataSerializer::DeserializeTenant(
         }
 
         auto metadata_ptr = std::move(metadata_result.value());
-        const auto tenant = service_->GetOrCreateTenantHandle(tenant_id);
+        const auto tenant = service_->tenants_.GetOrCreateTenant(tenant_id);
         auto entry =
             std::make_shared<ObjectEntry>(std::make_unique<ObjectMetadata>(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
