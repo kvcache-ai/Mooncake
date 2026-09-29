@@ -487,9 +487,15 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // which is capped at max_mr_size and would silently disable pre-touch for a
     // >=4GiB buffer). Compute once above the loop to avoid repeated
     // hardware_concurrency() OS queries per chunk.
-    const bool do_pre_touch = context_list_.size() > 0 &&
-                              std::thread::hardware_concurrency() >= 4 &&
-                              length >= (size_t)4 * 1024 * 1024 * 1024;
+    //
+    // Pre-touch faults host pages in before the real registration. It gains
+    // nothing for device memory registered through DMA-BUF, where each
+    // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
+    // block, so skip it there.
+    const bool do_pre_touch =
+        dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
+        context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
+        length >= (size_t)4 * 1024 * 1024 * 1024;
 
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void *chunk_addr = chunks[ci].first;
