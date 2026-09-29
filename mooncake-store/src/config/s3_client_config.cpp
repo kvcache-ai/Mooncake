@@ -32,10 +32,10 @@ S3ClientConfig S3ClientConfig::FromEnvironment() {
     config.response_checksum_validation = Environ::ReadOr(
         S3ClientEnvironmentVariables::MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION,
         config.response_checksum_validation);
-    config.connect_timeout = std::chrono::milliseconds(Environ::ReadOr(
+    config.connect_timeout = std::chrono::milliseconds(Environ::ReadOr<int64_t>(
         S3ClientEnvironmentVariables::MOONCAKE_AWS_CONNECT_TIMEOUT_MS,
         config.connect_timeout.count()));
-    config.request_timeout = std::chrono::milliseconds(Environ::ReadOr(
+    config.request_timeout = std::chrono::milliseconds(Environ::ReadOr<int64_t>(
         S3ClientEnvironmentVariables::MOONCAKE_AWS_REQUEST_TIMEOUT_MS,
         config.request_timeout.count()));
     return config;

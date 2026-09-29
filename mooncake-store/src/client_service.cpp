@@ -2253,43 +2253,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     return BatchUpsert(keys, batched_slices, config, {});
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
-    const std::vector<ObjectKey>& keys,
-    std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
-        client_cfg.preferred_segment = local_hostname_;
-    }
-    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    ComputeBatchObjectChecksums(ops);
-    if (client_cfg.prefer_alloc_in_same_node) {
-        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(*err));
-        }
-        StartBatchUpsert(ops, client_cfg);
-        StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, true);
-    }
-
-    StartBatchUpsert(ops, client_cfg);
-    StageWriteBuffersForRemoteReplicas(ops, stager);
-    auto t0 = std::chrono::steady_clock::now();
-    SubmitTransfers(ops);
-    WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - t0)
-                  .count();
-    if (metrics_) {
-        metrics_->transfer_metric.batch_put_latency_us.observe(us);
-    }
-
-    FinalizeBatchUpsert(ops);
-    return CollectResults(ops);
-}
-
 // TODO: `client.cpp` is too long, consider split it into multiple files
 enum class PutOperationState {
     PENDING,
@@ -2406,6 +2369,43 @@ class PutOperation {
         return state == PutOperationState::SUCCESS && result.has_value();
     }
 };
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager) {
+    ReplicateConfig client_cfg = AttachHostId(config);
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    ComputeBatchObjectChecksums(ops);
+    if (client_cfg.prefer_alloc_in_same_node) {
+        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(*err));
+        }
+        StartBatchUpsert(ops, client_cfg);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
+        return BatchWriteWhenPreferSameNode(ops, true);
+    }
+
+    StartBatchUpsert(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
+    auto t0 = std::chrono::steady_clock::now();
+    SubmitTransfers(ops);
+    WaitForTransfers(ops);
+    SubmitDfsWrites(ops);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_latency_us.observe(us);
+    }
+
+    FinalizeBatchUpsert(ops);
+    return CollectResults(ops);
+}
 
 std::vector<PutOperation> Client::CreatePutOperations(
     const std::vector<ObjectKey>& keys,

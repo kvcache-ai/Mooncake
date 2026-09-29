@@ -63,6 +63,7 @@
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
 #endif
+#include "gflags/gflags.h"
 
 DEFINE_bool(enable_http_server, false,
             "Enable embedded HTTP server for health check and metrics.");

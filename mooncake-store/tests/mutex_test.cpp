@@ -8,6 +8,7 @@
 #include <chrono>
 #include <stdexcept>
 
+#pragma clang diagnostic ignored "-Wthread-safety-analysis"
 namespace mooncake::test {
 
 class SharedMutexTest : public ::testing::Test {

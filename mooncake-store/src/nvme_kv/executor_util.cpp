@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <sstream>
 
 #include "config/u32_parser.h"
 
