@@ -229,8 +229,16 @@ struct DistributedFSDescriptor {
     uint64_t object_size = 0;
     uint64_t aligned_size = 0;
     int shard_idx = 0;
+    // Added after the original DFS descriptor was deployed. Keep this field
+    // compatible so old peers can ignore it and new peers can decode old
+    // descriptors without changing the surrounding RPC contracts.
+    struct_pack::compatible<UUID, 1> allocation_id{};
+
+    [[nodiscard]] UUID GetAllocationId() const {
+        return allocation_id.value_or(UUID{});
+    }
     YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
-             aligned_size, shard_idx);
+             aligned_size, shard_idx, allocation_id);
 };
 
 struct DfsReplicaData {

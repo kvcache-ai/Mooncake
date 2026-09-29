@@ -771,8 +771,9 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
                     ErrorCode::DESERIALIZE_FAIL,
                     "serialize_msgpack Replica missing DfsReplicaData"));
             }
-            // Format: [file_path, offset, object_size, aligned_size, shard_idx]
-            packer.pack_array(5);
+            // Format: [file_path, offset, object_size, aligned_size, shard_idx,
+            //          allocation_id]
+            packer.pack_array(6);
             packer.pack(dfs_data->descriptor.file_path);
             packer.pack(static_cast<uint64_t>(dfs_data->descriptor.offset));
             packer.pack(
@@ -780,6 +781,7 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             packer.pack(
                 static_cast<uint64_t>(dfs_data->descriptor.aligned_size));
             packer.pack(static_cast<int32_t>(dfs_data->descriptor.shard_idx));
+            packer.pack(UuidToString(dfs_data->descriptor.GetAllocationId()));
             break;
         }
         default:
@@ -885,11 +887,11 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
         case static_cast<int8_t>(ReplicaType::DFS): {
             const auto &payload = array_items[3];
             if (payload.type != msgpack::type::ARRAY ||
-                payload.via.array.size != 5) {
+                payload.via.array.size != 6) {
                 return tl::unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                        "deserialize_msgpack Replica DFS "
-                                       "payload is not valid array[5]"));
+                                       "payload is not valid array[6]"));
             }
             auto *payload_items = payload.via.array.ptr;
             DistributedFSDescriptor descriptor;
@@ -898,6 +900,15 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             descriptor.object_size = payload_items[2].as<uint64_t>();
             descriptor.aligned_size = payload_items[3].as<uint64_t>();
             descriptor.shard_idx = payload_items[4].as<int32_t>();
+            UUID allocation_id;
+            if (!StringToUuid(payload_items[5].as<std::string>(),
+                              allocation_id)) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "deserialize_msgpack Replica DFS allocation_id is "
+                    "invalid"));
+            }
+            descriptor.allocation_id = allocation_id;
 
             replica = std::make_shared<Replica>(std::move(descriptor), status);
             break;
