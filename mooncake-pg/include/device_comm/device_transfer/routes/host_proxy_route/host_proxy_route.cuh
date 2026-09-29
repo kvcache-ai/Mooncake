@@ -17,9 +17,9 @@ class HostProxyTransferTicket {
    public:
     __device__ __forceinline__ HostProxyTransferTicket() = default;
 
-    __device__ __forceinline__ HostProxyTransferTicket(
-        HostProxyCommandSlot::RequestHandle handle, uint64_t start_ticks,
-        uint64_t timeout_ticks)
+    __device__ __forceinline__
+    HostProxyTransferTicket(HostProxyCommandSlot::RequestHandle handle,
+                            uint64_t start_ticks, uint64_t timeout_ticks)
         : handle_(handle),
           start_ticks_(start_ticks),
           timeout_ticks_(timeout_ticks) {}
