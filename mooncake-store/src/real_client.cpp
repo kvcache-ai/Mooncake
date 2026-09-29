@@ -10172,6 +10172,16 @@ void SetSpanError(ScopedSpan &span,
 }
 }  // namespace
 
+// Every V3 hop A entry below bridges the incoming out-of-band RequestContext
+// to hop B with the same three invariants:
+//   1. Bridge the request context in this (coro_rpc server) thread's
+//      g_current_ctx so the synchronous master RPC re-attaches the same id.
+//   2. OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+//      context, then refresh the request context so the downstream hop-B
+//      (master) attachment carries this span as the parent.
+//   3. Always install a scope (even for an empty attachment / disabled
+//      tracing) so the hop B inject reads THIS request's id, not residue left
+//      on this io thread.
 void RealClient::put_dummy_helper_rpc(
     coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
     const std::string &key, std::span<const char> value,
@@ -10181,6 +10191,8 @@ void RealClient::put_dummy_helper_rpc(
     ScopedSpan span("mooncake-real-client", "rc.put", &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: put_dummy_helper -> put_internal -> client_->Put ->
+    // master_client_.PutStart.
     auto result = put_dummy_helper(key, value, config, client_id);
     SetSpanError(span, result);
     ctx.response_msg(std::move(result));
@@ -10196,6 +10208,8 @@ void RealClient::put_batch_dummy_helper_rpc(
     ScopedSpan span("mooncake-real-client", "rc.put_batch", &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: put_batch_dummy_helper -> put_batch_internal ->
+    // client_->BatchPut -> master_client_.BatchPutStart.
     auto result = put_batch_dummy_helper(keys, values, config, client_id);
     SetSpanError(span, result);
     ctx.response_msg(std::move(result));
@@ -10210,6 +10224,8 @@ void RealClient::put_parts_dummy_helper_rpc(
     ScopedSpan span("mooncake-real-client", "rc.put_parts", &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: put_parts_dummy_helper -> put_parts_internal ->
+    // client_->Put -> master_client_.PutStart.
     auto result = put_parts_dummy_helper(key, values, config, client_id);
     SetSpanError(span, result);
     ctx.response_msg(std::move(result));
@@ -10226,6 +10242,8 @@ void RealClient::batch_get_into_dummy_helper_rpc(
     ScopedSpan span("mooncake-real-client", "rc.batch_get", &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: batch_get_into_dummy_helper -> client_->Query ->
+    // master_client_.GetReplicaList.
     auto result = async_simple::coro::syncAwait(batch_get_into_dummy_helper(
         keys, dummy_buffers, sizes, device_id, client_id));
     SetSpanError(span, result);
@@ -10244,6 +10262,8 @@ void RealClient::batch_put_from_dummy_helper_rpc(
                     &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: batch_put_from_dummy_helper -> client_->BatchPutFrom ->
+    // master_client_.BatchPutStart.
     auto result = batch_put_from_dummy_helper(keys, dummy_buffers, sizes,
                                               config, device_id, client_id);
     SetSpanError(span, result);
@@ -10258,6 +10278,8 @@ void RealClient::remove_internal_rpc(
     ScopedSpan span("mooncake-real-client", "rc.remove", &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: remove_internal -> client_->Remove ->
+    // master_client_.Remove.
     auto result = remove_internal(key, force);
     SetSpanError(span, result);
     ctx.response_msg(std::move(result));
@@ -10271,6 +10293,8 @@ void RealClient::isExist_internal_rpc(
     ScopedSpan span("mooncake-real-client", "rc.is_exist", &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: isExist_internal -> client_->IsExist ->
+    // master_client_.ExistKey.
     auto result = isExist_internal(key);
     SetSpanError(span, result);
     ctx.response_msg(std::move(result));
@@ -10285,6 +10309,8 @@ void RealClient::batchIsExist_internal_rpc(
                     &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: batchIsExist_internal -> client_->BatchIsExist ->
+    // master_client_.BatchExistKey.
     auto result = batchIsExist_internal(keys);
     SetSpanError(span, result);
     ctx.response_msg(std::move(result));
@@ -10298,6 +10324,8 @@ void RealClient::getSize_internal_rpc(
     ScopedSpan span("mooncake-real-client", "rc.get_size", &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: getSize_internal -> client_->Query ->
+    // master_client_.GetReplicaList.
     auto result = getSize_internal(key);
     SetSpanError(span, result);
     ctx.response_msg(std::move(result));

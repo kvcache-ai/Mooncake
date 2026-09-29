@@ -584,19 +584,23 @@ class RealClient : public PyClient {
         const std::string &key, std::vector<std::span<const char>> values,
         const ReplicateConfig &config, const UUID &client_id);
 
-    // V3 context handlers bridge hop A's out-of-band attachment into the
-    // thread-local context used by the subsequent hop B master RPC.
+    // Hop A (dummy -> real server) V3 context handlers bridge hop A's
+    // out-of-band attachment into the thread-local context used by the
+    // subsequent hop B master RPC.
     void put_dummy_helper_rpc(
         coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config, const UUID &client_id);
 
+    // See put_dummy_helper_rpc: V3 hop A entry bridging the request context
+    // to hop B via CurrentCtxScope (master RPC: BatchPutStart).
     void put_batch_dummy_helper_rpc(
         coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
         const std::vector<std::string> &keys,
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config, const UUID &client_id);
 
+    // See put_dummy_helper_rpc: V3 hop A entry (master RPC: PutStart).
     void put_parts_dummy_helper_rpc(
         coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
         const std::string &key, std::vector<std::span<const char>> values,
@@ -608,6 +612,11 @@ class RealClient : public PyClient {
                                 const std::vector<size_t> &sizes,
                                 int32_t device_id, const UUID &client_id);
 
+    // Hop A (dummy -> real server) entry. The value-returning
+    // batch_get_into_dummy_helper stays the shared body (also used
+    // in-process by the real path); this wrapper installs a CurrentCtxScope
+    // before syncAwait so the hop B master RPC re-attaches the request
+    // context.
     void batch_get_into_dummy_helper_rpc(
         coro_rpc::context<std::vector<tl::expected<int64_t, ErrorCode>>> ctx,
         const std::vector<std::string> &keys,
@@ -621,6 +630,9 @@ class RealClient : public PyClient {
         const std::vector<size_t> &sizes, const ReplicateConfig &config,
         int32_t device_id, const UUID &client_id);
 
+    // Hop A (dummy -> real server) entry for the value-returning
+    // batch_put_from_dummy_helper body; bridges the request context to hop
+    // B through the synchronous master RPC.
     void batch_put_from_dummy_helper_rpc(
         coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
         const std::vector<std::string> &keys,
@@ -907,6 +919,11 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> remove_internal(const std::string &key,
                                                   bool force = false);
 
+    // V3 hop A entry (dummy path only). remove_internal stays the
+    // value-returning body used in-process by the real path; this wrapper
+    // reads the attachment, installs a CurrentCtxScope for the hop B bridge
+    // (master RPC: Remove), delegates to the body, and replies via
+    // ctx.response_msg.
     void remove_internal_rpc(
         coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
         const std::string &key, bool force);
@@ -938,10 +955,20 @@ class RealClient : public PyClient {
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
         const std::vector<std::string> &keys);
 
+    // V3 hop A entry (dummy path only). isExist_internal stays the
+    // value-returning body used in-process by the real path; this wrapper
+    // reads the attachment, installs a CurrentCtxScope for the hop B bridge
+    // (master RPC: ExistKey), delegates to the body, and replies via
+    // ctx.response_msg.
     void isExist_internal_rpc(
         coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
         const std::string &key);
 
+    // V3 hop A entry (dummy path only). batchIsExist_internal stays the
+    // value-returning body used in-process by the real path; this wrapper
+    // reads the attachment, installs a CurrentCtxScope for the hop B bridge
+    // (master RPC: BatchExistKey), delegates to the body, and replies via
+    // ctx.response_msg.
     void batchIsExist_internal_rpc(
         coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
         const std::vector<std::string> &keys);
@@ -969,6 +996,12 @@ class RealClient : public PyClient {
     DiskReadHealResult heal_disk_replica_for_read(
         const std::string &key, const Replica::Descriptor &local_disk_replica,
         const std::optional<std::string> &resolved_tenant_id = std::nullopt);
+
+    // V3 hop A entry (dummy path only). getSize_internal stays the
+    // value-returning body used in-process by the real path; this wrapper
+    // reads the attachment, installs a CurrentCtxScope for the hop B bridge
+    // (master RPC: GetReplicaList via Query), delegates to the body, and
+    // replies via ctx.response_msg.
     void getSize_internal_rpc(
         coro_rpc::context<tl::expected<int64_t, ErrorCode>> ctx,
         const std::string &key);

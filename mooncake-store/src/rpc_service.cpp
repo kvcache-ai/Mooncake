@@ -2153,6 +2153,10 @@ void SetSpanError(ScopedSpan& span,
 }
 }  // namespace
 
+// hop B extract: per-request "_with_context" V3 handlers. Each reads the
+// out-of-band attachment, reinstalls it as this io thread's current request
+// context (so downstream Logging/metrics keep the id), and delegates to the
+// existing value-returning handler. Empty attachment == no per-request id.
 void WrappedMasterService::ExistKey_with_context(
     coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
     const std::string& key, const std::string& tenant_id) {
@@ -2437,8 +2441,8 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::QueryWeightOperation,
         &WrappedMasterService::DeleteWeightRevision>(
         server, wrapped_master_service, worker_pool);
-    // Per-request V3 handlers. Empty attachments continue to use the ordinary
-    // value-returning handlers above, so older masters stay compatible.
+
+    // --- register the per-request _with_context V3 handlers ---
     server.register_handler<
         &mooncake::WrappedMasterService::ExistKey_with_context>(
         &wrapped_master_service);

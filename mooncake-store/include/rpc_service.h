@@ -182,9 +182,12 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchUpdateSoftPin(
         const std::vector<std::string>& keys, uint64_t ttl_ms,
         const std::string& tenant_id = "default");
-    // Per-request V3 handlers. Keep the value-returning handlers above for
-    // old clients and no-attachment requests; these receive the context via
-    // coro_rpc's out-of-band attachment and delegate to the same bodies.
+
+    // --- Per-request "_with_context" V3 handlers (hop B extract). ---
+    // Keep the value-returning handlers above for backward compat
+    // (old clients / no-attachment path route to the plain methods);
+    // these carry the per-request RequestContext via coro_rpc's
+    // out-of-band attachment and reuse the same per-handler logic.
     void ExistKey_with_context(
         coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
         const std::string& key, const std::string& tenant_id);
