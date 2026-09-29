@@ -3534,7 +3534,6 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
         });
 }
 
-
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
 RealClient::acquire_hot_cache(const std::string &key) {
     if (!client_ || !client_->IsHotCacheEnabled()) {

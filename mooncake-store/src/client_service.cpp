@@ -489,7 +489,8 @@ bool Client::DrainInflightOperations(std::chrono::seconds timeout) {
 
 Client::~Client() {
     // Never free TransferEngine / master pool under an in-flight Get/Put.
-    // On timeout keep waiting rather than destroying under flight (#3909 review).
+    // On timeout keep waiting rather than destroying under flight (#3909
+    // review).
     if (!DrainInflightOperations()) {
         LOG(ERROR) << "Client dtor: drain timed out; waiting until idle";
         while (!DrainInflightOperations()) {
