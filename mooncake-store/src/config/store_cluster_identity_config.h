@@ -5,10 +5,12 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct StoreClusterIdentityConfig {
     std::optional<std::string> cluster_id;
 
-    static StoreClusterIdentityConfig FromEnvironment();
+    static StoreClusterIdentityConfig FromEnvironment(const Environ& env);
 };
 
 }  // namespace mooncake

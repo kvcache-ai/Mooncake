@@ -44,13 +44,13 @@ bool ParseStrictBoolOr(const std::string& raw_value, bool default_value) {
 
 }  // namespace
 
-FileStorageConfig FileStorageConfig::FromEnvironment() {
+FileStorageConfig FileStorageConfig::FromEnvironment(const Environ& env) {
     FileStorageConfig config;
     using Variables = FileStorageEnvironmentVariables;
 
     const auto storage_backend_descriptor =
-        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR,
-                        std::string{"bucket_storage_backend"});
+        env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR,
+                       std::string{"bucket_storage_backend"});
 
     if (storage_backend_descriptor == "bucket_storage_backend") {
         config.storage_backend_type = StorageBackendType::kBucket;
@@ -67,54 +67,54 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         LOG(ERROR) << "Unknown storage backend.";
     }
 
-    config.storage_filepath = Environ::ReadOr(
+    config.storage_filepath = env.GetTypedOr(
         Variables::MOONCAKE_OFFLOAD_FILE_STORAGE_PATH, config.storage_filepath);
 
     config.local_buffer_size =
-        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES,
-                        config.local_buffer_size);
+        env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES,
+                       config.local_buffer_size);
 
     config.pinned_restore_arena_size =
-        Environ::ReadOr(Variables::MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES,
-                        config.pinned_restore_arena_size);
+        env.GetTypedOr(Variables::MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES,
+                       config.pinned_restore_arena_size);
 
     const auto legacy_scanmeta_iterator_keys_limit =
-        Environ::ReadOr(Variables::MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT,
-                        config.scanmeta_iterator_keys_limit);
-    config.scanmeta_iterator_keys_limit = Environ::ReadOr(
-        Variables::MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT,
-        legacy_scanmeta_iterator_keys_limit);
+        env.GetTypedOr(Variables::MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT,
+                       config.scanmeta_iterator_keys_limit);
+    config.scanmeta_iterator_keys_limit =
+        env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT,
+                       legacy_scanmeta_iterator_keys_limit);
 
-    config.total_keys_limit = Environ::ReadOr(
+    config.total_keys_limit = env.GetTypedOr(
         Variables::MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT, config.total_keys_limit);
 
     config.total_size_limit =
-        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES,
-                        config.total_size_limit);
+        env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES,
+                       config.total_size_limit);
 
     config.heartbeat_interval_seconds =
-        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS,
-                        config.heartbeat_interval_seconds);
-    config.client_buffer_gc_interval_seconds = Environ::ReadOr(
+        env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS,
+                       config.heartbeat_interval_seconds);
+    config.client_buffer_gc_interval_seconds = env.GetTypedOr(
         Variables::MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS,
         config.client_buffer_gc_interval_seconds);
 
     config.client_buffer_gc_ttl_ms =
-        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS,
-                        config.client_buffer_gc_ttl_ms);
+        env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS,
+                       config.client_buffer_gc_ttl_ms);
 
-    const auto enable_disk_watermark_eviction = Environ::ReadOr(
+    const auto enable_disk_watermark_eviction = env.GetTypedOr(
         Variables::MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION,
         std::string{config.enable_disk_watermark_eviction ? "true" : "false"});
     config.enable_disk_watermark_eviction = ParseStrictBoolOr(
         enable_disk_watermark_eviction, config.enable_disk_watermark_eviction);
 
-    const auto high_watermark_ratio = Environ::ReadOr(
+    const auto high_watermark_ratio = env.GetTypedOr(
         Variables::MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO,
         std::string{});
     const auto high_watermark_ratio_or_alias =
         high_watermark_ratio.empty()
-            ? Environ::ReadOr(
+            ? env.GetTypedOr(
                   Variables::MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO,
                   std::string{})
             : high_watermark_ratio;
@@ -122,12 +122,12 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         ParseDiskEvictionRatioOr(high_watermark_ratio_or_alias,
                                  config.disk_eviction_high_watermark_ratio);
 
-    const auto low_watermark_ratio = Environ::ReadOr(
+    const auto low_watermark_ratio = env.GetTypedOr(
         Variables::MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO,
         std::string{});
     const auto low_watermark_ratio_or_alias =
         low_watermark_ratio.empty()
-            ? Environ::ReadOr(
+            ? env.GetTypedOr(
                   Variables::MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO,
                   std::string{})
             : low_watermark_ratio;
@@ -135,9 +135,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         low_watermark_ratio_or_alias, config.disk_eviction_low_watermark_ratio);
 
     const auto legacy_use_uring =
-        Environ::ReadOr(Variables::MOONCAKE_USE_URING, std::string{"false"});
-    const auto use_uring = Environ::ReadOr(
-        Variables::MOONCAKE_OFFLOAD_USE_URING, legacy_use_uring);
+        env.GetTypedOr(Variables::MOONCAKE_USE_URING, std::string{"false"});
+    const auto use_uring =
+        env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_USE_URING, legacy_use_uring);
     config.use_uring = ParseStrictBoolOr(use_uring, false);
 
     return config;

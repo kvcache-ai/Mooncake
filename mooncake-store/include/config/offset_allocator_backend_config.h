@@ -5,6 +5,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 enum class OffsetEvictionPolicy {
     NONE,  // No eviction
     FIFO,  // Evict oldest key first (by insertion order)
@@ -46,7 +48,7 @@ struct OffsetAllocatorBackendConfig {
 
     bool Validate() const;
 
-    static OffsetAllocatorBackendConfig FromEnvironment();
+    static OffsetAllocatorBackendConfig FromEnvironment(const Environ& env);
 
     // ---- Persistence settings ----
     OffsetPersistMode persist_mode = OffsetPersistMode::kDisabled;

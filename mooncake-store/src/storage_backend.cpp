@@ -29,6 +29,7 @@
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "crc32c.h"
+#include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -5567,7 +5568,8 @@ tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
-            auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
+            auto bucket_backend_config =
+                BucketBackendConfig::FromEnvironment(Environ::Process());
             if (!bucket_backend_config.Validate()) {
                 throw std::invalid_argument(
                     "Invalid StorageBackend configuration");
@@ -5577,7 +5579,7 @@ CreateStorageBackend(const FileStorageConfig& config) {
         }
         case StorageBackendType::kFilePerKey: {
             auto file_per_key_backend_config =
-                FilePerKeyConfig::FromEnvironment();
+                FilePerKeyConfig::FromEnvironment(Environ::Process());
             if (!file_per_key_backend_config.Validate()) {
                 throw std::invalid_argument(
                     "Invalid StorageBackend configuration");
@@ -5587,7 +5589,8 @@ CreateStorageBackend(const FileStorageConfig& config) {
         }
         case StorageBackendType::kOffsetAllocator: {
             auto offset_backend_config =
-                OffsetAllocatorBackendConfig::FromEnvironment();
+                OffsetAllocatorBackendConfig::FromEnvironment(
+                    Environ::Process());
             if (!offset_backend_config.Validate()) {
                 throw std::invalid_argument(
                     "Invalid OffsetAllocatorBackendConfig");
@@ -5600,7 +5603,7 @@ CreateStorageBackend(const FileStorageConfig& config) {
 
         case StorageBackendType::kDistributed: {
             auto distributed_config =
-                DistributedStorageConfig::FromEnvironment();
+                DistributedStorageConfig::FromEnvironment(Environ::Process());
             if (!distributed_config.Validate()) {
                 throw std::invalid_argument(
                     "Invalid DistributedStorage configuration");

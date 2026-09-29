@@ -24,6 +24,9 @@
 #include "types.h"
 
 namespace mooncake {
+
+class Environ;
+
 struct FileRecord {
     std::string path;
     uint64_t size;
@@ -256,7 +259,7 @@ struct FileStorageConfig {
      *
      * @return FileStorageConfig with values from env or defaults
      */
-    static FileStorageConfig FromEnvironment();
+    static FileStorageConfig FromEnvironment(const Environ& env);
 };
 
 class StorageBackendInterface {

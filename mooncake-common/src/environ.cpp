@@ -1,7 +1,6 @@
 #include "environ.h"
 
 #include <cstdlib>
-#include <iostream>
 
 namespace mooncake {
 
@@ -31,20 +30,6 @@ void MapEnvironSource::Unset(std::string_view name) {
     if (it != values_.end()) {
         values_.erase(it);
     }
-}
-
-double Environ::GetDouble(const char* name, double default_value) {
-    const auto value = Process().Get(name);
-    if (!value.has_value() || value->empty()) {
-        return default_value;
-    }
-    const auto parsed = TryParseEnvironmentValue<double>(*value);
-    if (parsed.has_value()) {
-        return *parsed;
-    }
-    std::cerr << "[Mooncake] Warning: invalid value '" << *value << "' for env "
-              << name << ", using default " << default_value << std::endl;
-    return default_value;
 }
 
 const Environ& Environ::Process() {

@@ -23,6 +23,7 @@
 #include "nvme_kv/key_codec.h"
 #include "nvme_kv/key_conflict_policy.h"
 #include "nvme_kv/object_layout.h"
+#include "environ.h"
 
 namespace mooncake {
 
@@ -92,7 +93,8 @@ std::string_view BuildPayloadView(const std::vector<Slice> &slices,
 }
 
 size_t ReadPlanBatchSize() {
-    return NvmeKvExecutorConfig::ReadPlanBatchSizeFromEnvironment();
+    return NvmeKvExecutorConfig::ReadPlanBatchSizeFromEnvironment(
+        Environ::Process());
 }
 
 std::optional<std::vector<size_t>> ValidateChunkRecords(
@@ -191,7 +193,7 @@ NvmeKvStorageBackend::NvmeKvStorageBackend(
 
 void NvmeKvStorageBackend::InitIoWorkers() {
     const auto config = NvmeKvIoConcurrencyConfig::FromEnvironment(
-        connector_->GetCapabilities().queue_depth);
+        Environ::Process(), connector_->GetCapabilities().queue_depth);
     const size_t max_io_concurrency = config.max_io_concurrency;
     io_parallelism_ = config.io_concurrency;
     batch_submit_concurrency_ = config.batch_submit_concurrency;
