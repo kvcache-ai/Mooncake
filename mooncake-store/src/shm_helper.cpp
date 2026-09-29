@@ -14,6 +14,7 @@
 #include "config.h"
 #include "config/hugepage_config.h"
 #include "config/shm_spdk_registration_config.h"
+#include "environ.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -80,7 +81,8 @@ ShmHelper::ShmHelper() {
     // `= default` and the env is only initialized lazily via InitializeEnv().
     SpdkWrapper::GetInstance();
 #endif
-    use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
+    use_hugepage_ =
+        HugepageConfig::IsEnabledFromEnvironment(Environ::Process());
     // Read once at construction (ShmHelper is a singleton). Opt-in only: with
     // MC_STORE_REGISTER_SPDK=1, ShmHelper mappings are registered with SPDK so
     // NoF zero-copy transfers can DMA to/from them; otherwise the previous
@@ -96,7 +98,7 @@ ShmHelper::ShmHelper() {
         // sufficient, so force hugepages here; if not enough are configured the
         // allocation below fails with a clear error instead of silently losing
         // NoF zero-copy. This is an override on top of
-        // HugepageConfig::IsEnabledFromEnvironment() above.
+        // HugepageConfig::IsEnabledFromEnvironment above.
         use_hugepage_ = true;
 #endif
         LOG(INFO) << "MC_STORE_REGISTER_SPDK=1: shared memory will be "
@@ -105,7 +107,8 @@ ShmHelper::ShmHelper() {
 }
 
 bool ShmHelper::is_register_spdk_enabled() {
-    return ShmSpdkRegistrationConfig::FromEnvironment().enabled;
+    return ShmSpdkRegistrationConfig::FromEnvironment(Environ::Process())
+        .enabled;
 }
 
 ShmHelper::~ShmHelper() { cleanup(); }

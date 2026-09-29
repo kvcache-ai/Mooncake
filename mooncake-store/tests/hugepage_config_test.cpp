@@ -2,45 +2,13 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-#include <optional>
 #include <string>
 
 #include "../src/config/hugepage_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
-
-class ScopedEnvVar {
-   public:
-    explicit ScopedEnvVar(const char* name) : name_(name) {
-        if (const char* value = std::getenv(name)) {
-            original_ = value;
-        }
-        EXPECT_EQ(unsetenv(name), 0);
-    }
-
-    ~ScopedEnvVar() {
-        if (original_.has_value()) {
-            EXPECT_EQ(setenv(name_.c_str(), original_->c_str(), 1), 0);
-        } else {
-            EXPECT_EQ(unsetenv(name_.c_str()), 0);
-        }
-    }
-
-    ScopedEnvVar(const ScopedEnvVar&) = delete;
-    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
-    void Set(const char* value) {
-        ASSERT_EQ(setenv(name_.c_str(), value, 1), 0);
-    }
-
-    void Unset() { ASSERT_EQ(unsetenv(name_.c_str()), 0); }
-
-   private:
-    std::string name_;
-    std::optional<std::string> original_;
-};
 
 class HugepageConfigTest : public ::testing::Test {
    protected:
@@ -49,15 +17,22 @@ class HugepageConfigTest : public ::testing::Test {
         FLAGS_minloglevel = google::WARNING;
     }
 
-    ScopedEnvVar use_hugepage{"MC_STORE_USE_HUGEPAGE"};
-    ScopedEnvVar hugepage_size{"MC_STORE_HUGEPAGE_SIZE"};
+    bool IsEnabled() const {
+        return HugepageConfig::IsEnabledFromEnvironment(Environ(source_));
+    }
+
+    HugepageConfig Load() const {
+        return HugepageConfig::FromEnvironment(Environ(source_));
+    }
+
+    MapEnvironSource source_;
 };
 
 TEST_F(HugepageConfigTest, UnsetDisablesHugepagesAndSkipsSizeValidation) {
-    hugepage_size.Set("invalid");
+    source_.Set("MC_STORE_HUGEPAGE_SIZE", "invalid");
     ::testing::internal::CaptureStderr();
 
-    const HugepageConfig config = HugepageConfig::FromEnvironment();
+    const HugepageConfig config = Load();
 
     EXPECT_FALSE(config.enabled);
     EXPECT_EQ(config.page_size, 0);
@@ -68,20 +43,20 @@ TEST_F(HugepageConfigTest, UnsetDisablesHugepagesAndSkipsSizeValidation) {
 TEST_F(HugepageConfigTest, AnyPresentEnableValueRequestsHugepages) {
     for (const char* value : {"", "0"}) {
         SCOPED_TRACE(value);
-        use_hugepage.Set(value);
+        source_.Set("MC_STORE_USE_HUGEPAGE", value);
 
-        EXPECT_TRUE(HugepageConfig::IsEnabledFromEnvironment());
-        const HugepageConfig config = HugepageConfig::FromEnvironment();
+        EXPECT_TRUE(IsEnabled());
+        const HugepageConfig config = Load();
         EXPECT_TRUE(config.enabled);
         EXPECT_EQ(config.page_size, 2ULL * 1024 * 1024);
     }
 }
 
 TEST_F(HugepageConfigTest, UnsetSizeDefaultsTo2Mb) {
-    use_hugepage.Set("1");
-    hugepage_size.Unset();
+    source_.Set("MC_STORE_USE_HUGEPAGE", "1");
+    source_.Unset("MC_STORE_HUGEPAGE_SIZE");
 
-    const HugepageConfig config = HugepageConfig::FromEnvironment();
+    const HugepageConfig config = Load();
 
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.page_size, 2ULL * 1024 * 1024);
@@ -99,12 +74,12 @@ TEST_F(HugepageConfigTest, AcceptsLegacyByteSizeSyntaxForSupportedSizes) {
         {"2048K", 2ULL * 1024 * 1024},
     };
 
-    use_hugepage.Set("1");
+    source_.Set("MC_STORE_USE_HUGEPAGE", "1");
     for (const auto& entry : cases) {
         SCOPED_TRACE(entry.value);
-        hugepage_size.Set(entry.value);
+        source_.Set("MC_STORE_HUGEPAGE_SIZE", entry.value);
 
-        const HugepageConfig config = HugepageConfig::FromEnvironment();
+        const HugepageConfig config = Load();
 
         EXPECT_TRUE(config.enabled);
         EXPECT_EQ(config.page_size, entry.expected);
@@ -112,14 +87,14 @@ TEST_F(HugepageConfigTest, AcceptsLegacyByteSizeSyntaxForSupportedSizes) {
 }
 
 TEST_F(HugepageConfigTest, InvalidSizesWarnAndFallBackTo2Mb) {
-    use_hugepage.Set("1");
+    source_.Set("MC_STORE_USE_HUGEPAGE", "1");
     for (const char* value :
          {"", " ", "2MiB", "2MBjunk", "1e999", "infinite", "256MB", "1.5GB"}) {
         SCOPED_TRACE(value);
-        hugepage_size.Set(value);
+        source_.Set("MC_STORE_HUGEPAGE_SIZE", value);
         ::testing::internal::CaptureStderr();
 
-        const HugepageConfig config = HugepageConfig::FromEnvironment();
+        const HugepageConfig config = Load();
         const std::string logs = ::testing::internal::GetCapturedStderr();
 
         EXPECT_TRUE(config.enabled);
@@ -132,17 +107,16 @@ TEST_F(HugepageConfigTest, InvalidSizesWarnAndFallBackTo2Mb) {
 }
 
 TEST_F(HugepageConfigTest, EachCallReadsCurrentEnvironment) {
-    use_hugepage.Set("1");
-    hugepage_size.Set("2MB");
-    EXPECT_EQ(HugepageConfig::FromEnvironment().page_size, 2ULL * 1024 * 1024);
+    source_.Set("MC_STORE_USE_HUGEPAGE", "1");
+    source_.Set("MC_STORE_HUGEPAGE_SIZE", "2MB");
+    EXPECT_EQ(Load().page_size, 2ULL * 1024 * 1024);
 
-    hugepage_size.Set("1GB");
-    EXPECT_EQ(HugepageConfig::FromEnvironment().page_size,
-              1024ULL * 1024 * 1024);
+    source_.Set("MC_STORE_HUGEPAGE_SIZE", "1GB");
+    EXPECT_EQ(Load().page_size, 1024ULL * 1024 * 1024);
 
-    use_hugepage.Unset();
-    EXPECT_FALSE(HugepageConfig::IsEnabledFromEnvironment());
-    EXPECT_EQ(HugepageConfig::FromEnvironment().page_size, 0);
+    source_.Unset("MC_STORE_USE_HUGEPAGE");
+    EXPECT_FALSE(IsEnabled());
+    EXPECT_EQ(Load().page_size, 0);
 }
 
 }  // namespace

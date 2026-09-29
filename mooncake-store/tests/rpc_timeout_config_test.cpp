@@ -2,46 +2,27 @@
 
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
-#include <optional>
-#include <string>
 
 #include "config/rpc_timeout_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
 class RpcTimeoutConfigTest : public ::testing::Test {
    protected:
-    void SetUp() override {
-        for (int i = 0; i < 2; ++i) {
-            if (const char* value = std::getenv(names_[i])) {
-                original_[i] = value;
-            }
-        }
-        for (const char* name : names_) {
-            ASSERT_EQ(unsetenv(name), 0);
-        }
-    }
-
-    void TearDown() override {
-        for (int i = 0; i < 2; ++i) {
-            if (original_[i].has_value()) {
-                EXPECT_EQ(setenv(names_[i], original_[i]->c_str(), 1), 0);
-            } else {
-                EXPECT_EQ(unsetenv(names_[i]), 0);
-            }
-        }
+    RpcTimeoutConfig Load() const {
+        return RpcTimeoutConfig::FromEnvironment(Environ(source_));
     }
 
     static constexpr const char* names_[] = {"MC_RPC_TIMEOUT_MS",
                                              "MC_RPC_CONNECT_TIMEOUT_MS"};
-    std::optional<std::string> original_[2];
+    MapEnvironSource source_;
 };
 
 TEST_F(RpcTimeoutConfigTest, UnsetVariablesLeaveOverridesAbsent) {
-    const auto config = RpcTimeoutConfig::FromEnvironment();
+    const auto config = Load();
     EXPECT_FALSE(config.request_timeout.has_value());
     EXPECT_FALSE(config.connect_timeout.has_value());
 }
@@ -68,8 +49,8 @@ TEST_F(RpcTimeoutConfigTest, PreservesLegacyConversionForEachVariable) {
         SCOPED_TRACE(names_[i]);
         for (const auto& entry : cases) {
             SCOPED_TRACE(entry.value);
-            ASSERT_EQ(setenv(names_[i], entry.value, 1), 0);
-            const auto config = RpcTimeoutConfig::FromEnvironment();
+            source_.Set(names_[i], entry.value);
+            const auto config = Load();
             const auto& selected =
                 i == 0 ? config.request_timeout : config.connect_timeout;
             const auto& other =
@@ -78,24 +59,24 @@ TEST_F(RpcTimeoutConfigTest, PreservesLegacyConversionForEachVariable) {
             EXPECT_EQ(*selected, std::chrono::milliseconds(entry.expected));
             EXPECT_FALSE(other.has_value());
         }
-        ASSERT_EQ(unsetenv(names_[i]), 0);
+        source_.Unset(names_[i]);
     }
 }
 
 TEST_F(RpcTimeoutConfigTest, EachConstructionReadsCurrentEnvironment) {
-    ASSERT_EQ(setenv("MC_RPC_TIMEOUT_MS", "1500", 1), 0);
-    ASSERT_EQ(setenv("MC_RPC_CONNECT_TIMEOUT_MS", "1000", 1), 0);
-    const auto original = RpcTimeoutConfig::FromEnvironment();
+    source_.Set("MC_RPC_TIMEOUT_MS", "1500");
+    source_.Set("MC_RPC_CONNECT_TIMEOUT_MS", "1000");
+    const auto original = Load();
 
-    ASSERT_EQ(setenv("MC_RPC_TIMEOUT_MS", "0", 1), 0);
-    ASSERT_EQ(setenv("MC_RPC_CONNECT_TIMEOUT_MS", "-1", 1), 0);
-    const auto changed = RpcTimeoutConfig::FromEnvironment();
+    source_.Set("MC_RPC_TIMEOUT_MS", "0");
+    source_.Set("MC_RPC_CONNECT_TIMEOUT_MS", "-1");
+    const auto changed = Load();
     EXPECT_EQ(changed.request_timeout, std::chrono::milliseconds(0));
     EXPECT_EQ(changed.connect_timeout, std::chrono::milliseconds(-1));
 
-    ASSERT_EQ(unsetenv("MC_RPC_TIMEOUT_MS"), 0);
-    ASSERT_EQ(unsetenv("MC_RPC_CONNECT_TIMEOUT_MS"), 0);
-    const auto cleared = RpcTimeoutConfig::FromEnvironment();
+    source_.Unset("MC_RPC_TIMEOUT_MS");
+    source_.Unset("MC_RPC_CONNECT_TIMEOUT_MS");
+    const auto cleared = Load();
     EXPECT_FALSE(cleared.request_timeout.has_value());
     EXPECT_FALSE(cleared.connect_timeout.has_value());
     EXPECT_EQ(original.request_timeout, std::chrono::milliseconds(1500));

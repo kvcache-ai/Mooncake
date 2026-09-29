@@ -24,6 +24,7 @@
 #include "master_metric_manager.h"
 #include "store_rpc_client_io_context.h"
 #include "task_manager.h"
+#include "environ.h"
 
 namespace mooncake {
 
@@ -79,12 +80,13 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
         config.client_config.connect_timeout_duration = std::chrono::seconds{1};
     }
 
-    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
+    if (RpcProtocolConfig::FromEnvironment(Environ::Process()).use_rdma) {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
-    ApplyRpcTimeoutOverrides(config.client_config,
-                             RpcTimeoutConfig::FromEnvironment());
+    ApplyRpcTimeoutOverrides(
+        config.client_config,
+        RpcTimeoutConfig::FromEnvironment(Environ::Process()));
     return config;
 }
 

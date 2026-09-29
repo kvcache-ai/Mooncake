@@ -875,7 +875,8 @@ void ResourceTracker::startSignalThread() {
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
-    use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
+    use_hugepage_ =
+        HugepageConfig::IsEnabledFromEnvironment(Environ::Process());
 }
 
 RealClient::~RealClient() {
@@ -1021,7 +1022,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         client_ = *client_opt;
     } else {
         // Auto port binding with retry on metadata registration failure
-        const auto auto_port_config = ClientAutoPortConfig::FromEnvironment();
+        const auto auto_port_config =
+            ClientAutoPortConfig::FromEnvironment(Environ::Process());
         bool success = false;
 
         for (int retry = 0; retry < auto_port_config.max_retries; ++retry) {
@@ -1109,7 +1111,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // registration limit split it into balanced chunks; other transports use
     // one segment.
     if (protocol == "cxl") {
-        const auto cxl_config = CxlSegmentConfig::FromEnvironment();
+        const auto cxl_config =
+            CxlSegmentConfig::FromEnvironment(Environ::Process());
         if (!cxl_config.device_size.has_value()) {
             LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1335,7 +1338,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
     if (enable_ssd_offload) {
-        auto file_storage_config = FileStorageConfig::FromEnvironment();
+        auto file_storage_config =
+            FileStorageConfig::FromEnvironment(Environ::Process());
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
         }
@@ -8510,7 +8514,7 @@ RealClient::batch_get_into_offload_object_internal(
 ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
 #ifdef YLT_ENABLE_IBV
-    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
+    if (RpcProtocolConfig::FromEnvironment(Environ::Process()).use_rdma) {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
@@ -8532,8 +8536,9 @@ ClientRequester::ClientRequester() {
     // peer which is gone blocks for connect_retry_count * 30s plus the waits
     // between retries -- 91s with the defaults above -- and no configuration
     // can shorten it. Defaults are unchanged when the variables are unset.
-    detail::ApplyRpcTimeoutOverrides(pool_conf.client_config,
-                                     RpcTimeoutConfig::FromEnvironment());
+    detail::ApplyRpcTimeoutOverrides(
+        pool_conf.client_config,
+        RpcTimeoutConfig::FromEnvironment(Environ::Process()));
 
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(

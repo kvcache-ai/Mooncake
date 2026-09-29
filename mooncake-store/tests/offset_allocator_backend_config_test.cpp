@@ -3,61 +3,22 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
-#include <cstdlib>
-#include <optional>
 #include <string>
+
+#include "environ.h"
 
 namespace mooncake::test {
 namespace {
 
-class ScopedEnvVar {
-   public:
-    explicit ScopedEnvVar(const char* name) : name_(name) {
-        if (const char* value = std::getenv(name)) {
-            original_ = value;
-        }
-        unsetenv(name);
-    }
-
-    ~ScopedEnvVar() {
-        if (original_.has_value()) {
-            setenv(name_.c_str(), original_->c_str(), 1);
-        } else {
-            unsetenv(name_.c_str());
-        }
-    }
-
-    ScopedEnvVar(const ScopedEnvVar&) = delete;
-    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
-    void Set(const char* value) { setenv(name_.c_str(), value, 1); }
-
-   private:
-    std::string name_;
-    std::optional<std::string> original_;
-};
-
-struct OffsetAllocatorEnvironment {
-    ScopedEnvVar policy{"MOONCAKE_OFFSET_EVICTION_POLICY"};
-    ScopedEnvVar high_ratio{"MOONCAKE_OFFSET_HIGH_RATIO"};
-    ScopedEnvVar low_ratio{"MOONCAKE_OFFSET_LOW_RATIO"};
-    ScopedEnvVar max_nodes{"MOONCAKE_OFFSET_MAX_CAPACITY_NODES"};
-    ScopedEnvVar max_evict{"MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD"};
-    ScopedEnvVar persist_mode{"MOONCAKE_OFFSET_PERSIST_MODE"};
-    ScopedEnvVar persist_interval{"MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS"};
-    ScopedEnvVar record_crc{"MOONCAKE_OFFSET_RECORD_CRC"};
-
-    void SetAll(const char* value) {
-        policy.Set(value);
-        high_ratio.Set(value);
-        low_ratio.Set(value);
-        max_nodes.Set(value);
-        max_evict.Set(value);
-        persist_mode.Set(value);
-        persist_interval.Set(value);
-        record_crc.Set(value);
-    }
-};
+constexpr const char* kPolicy = "MOONCAKE_OFFSET_EVICTION_POLICY";
+constexpr const char* kHighRatio = "MOONCAKE_OFFSET_HIGH_RATIO";
+constexpr const char* kLowRatio = "MOONCAKE_OFFSET_LOW_RATIO";
+constexpr const char* kMaxNodes = "MOONCAKE_OFFSET_MAX_CAPACITY_NODES";
+constexpr const char* kMaxEvict = "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD";
+constexpr const char* kPersistMode = "MOONCAKE_OFFSET_PERSIST_MODE";
+constexpr const char* kPersistInterval =
+    "MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS";
+constexpr const char* kRecordCrc = "MOONCAKE_OFFSET_RECORD_CRC";
 
 void ExpectDefaultOffsetAllocatorConfig(
     const OffsetAllocatorBackendConfig& config) {
@@ -80,25 +41,37 @@ void ExpectDefaultOffsetAllocatorConfig(
 
 class OffsetAllocatorEnvironmentTest : public ::testing::Test {
    protected:
-    OffsetAllocatorEnvironment env;
+    OffsetAllocatorBackendConfig Load() const {
+        return OffsetAllocatorBackendConfig::FromEnvironment(Environ(source_));
+    }
+
+    void SetAll(const char* value) {
+        for (const char* name :
+             {kPolicy, kHighRatio, kLowRatio, kMaxNodes, kMaxEvict,
+              kPersistMode, kPersistInterval, kRecordCrc}) {
+            source_.Set(name, value);
+        }
+    }
+
+    MapEnvironSource source_;
 };
 
 TEST_F(OffsetAllocatorEnvironmentTest, KeepsDefaultsWhenVariablesAreUnset) {
-    const auto config = OffsetAllocatorBackendConfig::FromEnvironment();
+    const auto config = Load();
     ExpectDefaultOffsetAllocatorConfig(config);
 }
 
 TEST_F(OffsetAllocatorEnvironmentTest, ReadsValidValues) {
-    env.policy.Set("FIFO");
-    env.high_ratio.Set("0.75");
-    env.low_ratio.Set("0.50");
-    env.max_nodes.Set("123");
-    env.max_evict.Set("17");
-    env.persist_mode.Set("RELAXED");
-    env.persist_interval.Set("10");
-    env.record_crc.Set("false");
+    source_.Set(kPolicy, "FIFO");
+    source_.Set(kHighRatio, "0.75");
+    source_.Set(kLowRatio, "0.50");
+    source_.Set(kMaxNodes, "123");
+    source_.Set(kMaxEvict, "17");
+    source_.Set(kPersistMode, "RELAXED");
+    source_.Set(kPersistInterval, "10");
+    source_.Set(kRecordCrc, "false");
 
-    const auto config = OffsetAllocatorBackendConfig::FromEnvironment();
+    const auto config = Load();
     EXPECT_EQ(config.eviction_policy, OffsetEvictionPolicy::FIFO);
     EXPECT_DOUBLE_EQ(config.high_ratio, 0.75);
     EXPECT_DOUBLE_EQ(config.low_ratio, 0.50);
@@ -112,54 +85,54 @@ TEST_F(OffsetAllocatorEnvironmentTest, ReadsValidValues) {
 }
 
 TEST_F(OffsetAllocatorEnvironmentTest, PreservesLegacyRatioParsing) {
-    env.high_ratio.Set("0.75suffix");
+    source_.Set(kHighRatio, "0.75suffix");
 
-    const auto suffixed = OffsetAllocatorBackendConfig::FromEnvironment();
+    const auto suffixed = Load();
     EXPECT_DOUBLE_EQ(suffixed.high_ratio, 0.75);
     EXPECT_DOUBLE_EQ(suffixed.keys_high_ratio, 0.75);
 
-    env.high_ratio.Set("nan");
-    const auto nan = OffsetAllocatorBackendConfig::FromEnvironment();
+    source_.Set(kHighRatio, "nan");
+    const auto nan = Load();
     EXPECT_TRUE(std::isnan(nan.high_ratio));
     EXPECT_TRUE(std::isnan(nan.keys_high_ratio));
 }
 
 TEST_F(OffsetAllocatorEnvironmentTest, KeepsDefaultsForInvalidValues) {
-    env.policy.Set("unknown");
-    env.high_ratio.Set("not-a-ratio");
-    env.low_ratio.Set("not-a-ratio");
-    env.max_nodes.Set("not-an-integer");
-    env.max_evict.Set("-1");
-    env.persist_mode.Set("unknown");
-    env.persist_interval.Set("not-an-integer");
-    env.record_crc.Set("unknown");
+    source_.Set(kPolicy, "unknown");
+    source_.Set(kHighRatio, "not-a-ratio");
+    source_.Set(kLowRatio, "not-a-ratio");
+    source_.Set(kMaxNodes, "not-an-integer");
+    source_.Set(kMaxEvict, "-1");
+    source_.Set(kPersistMode, "unknown");
+    source_.Set(kPersistInterval, "not-an-integer");
+    source_.Set(kRecordCrc, "unknown");
 
-    const auto config = OffsetAllocatorBackendConfig::FromEnvironment();
+    const auto config = Load();
     ExpectDefaultOffsetAllocatorConfig(config);
 }
 
 TEST_F(OffsetAllocatorEnvironmentTest,
        KeepsDefaultRatioForWhitespacePrefixedInvalidValue) {
-    env.high_ratio.Set(" invalid");
+    source_.Set(kHighRatio, " invalid");
 
-    const auto config = OffsetAllocatorBackendConfig::FromEnvironment();
+    const auto config = Load();
     EXPECT_DOUBLE_EQ(config.high_ratio, 0.90);
     EXPECT_DOUBLE_EQ(config.keys_high_ratio, 0.90);
 }
 
 TEST_F(OffsetAllocatorEnvironmentTest, KeepsDefaultsForEmptyValues) {
-    env.SetAll("");
+    SetAll("");
 
-    const auto config = OffsetAllocatorBackendConfig::FromEnvironment();
+    const auto config = Load();
     ExpectDefaultOffsetAllocatorConfig(config);
 }
 
 TEST_F(OffsetAllocatorEnvironmentTest,
        PreservesDiagnosticsForUnparsableAndEmptyValues) {
     for (const char* value : {"invalid", ""}) {
-        env.SetAll(value);
+        SetAll(value);
         testing::internal::CaptureStderr();
-        const auto config = OffsetAllocatorBackendConfig::FromEnvironment();
+        const auto config = Load();
         const std::string logs = testing::internal::GetCapturedStderr();
 
         ExpectDefaultOffsetAllocatorConfig(config);
@@ -180,9 +153,9 @@ TEST_F(OffsetAllocatorEnvironmentTest,
 
 TEST_F(OffsetAllocatorEnvironmentTest,
        PreservesWarningForNonPositiveEvictionCap) {
-    env.max_evict.Set("-1");
+    source_.Set(kMaxEvict, "-1");
     testing::internal::CaptureStderr();
-    const auto config = OffsetAllocatorBackendConfig::FromEnvironment();
+    const auto config = Load();
     const std::string logs = testing::internal::GetCapturedStderr();
 
     ExpectDefaultOffsetAllocatorConfig(config);

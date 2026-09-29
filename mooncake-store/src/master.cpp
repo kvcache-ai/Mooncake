@@ -31,6 +31,7 @@
 
 #include "master_config.h"
 #include "version.h"
+#include "environ.h"
 
 using namespace coro_rpc;
 using namespace async_simple;
@@ -1636,7 +1637,8 @@ int main(int argc, char* argv[]) {
     }
 
     const auto rpc_protocol_config =
-        mooncake::RpcProtocolConfig::FromEnvironment();
+        mooncake::RpcProtocolConfig::FromEnvironment(
+            mooncake::Environ::Process());
 #ifdef YLT_ENABLE_IBV
     const std::string protocol = rpc_protocol_config.use_rdma ? "rdma" : "tcp";
 #else

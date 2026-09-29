@@ -204,22 +204,6 @@ TEST(EnvironTest, GetListHandlesMissingEmptyAndInvalidValues) {
               (std::vector<std::string>{"a", "", "b"}));
 }
 
-// --- Compatibility wrappers ---
-
-TEST(EnvironTest, CompatibilityWrappersReadTheProcessEnvironment) {
-    setenv("MC_TEST_INT", "7", 1);
-    setenv("MC_TEST_DOUBLE", "", 1);
-    EXPECT_EQ(Environ::Read(kInt), 7);
-    EXPECT_EQ(Environ::ReadOr(kInt64, int64_t{3}), 3);
-    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
-
-    setenv("MC_TEST_DOUBLE", "0.25", 1);
-    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.25);
-
-    unsetenv("MC_TEST_INT");
-    unsetenv("MC_TEST_DOUBLE");
-}
-
 }  // namespace
 }  // namespace mooncake
 

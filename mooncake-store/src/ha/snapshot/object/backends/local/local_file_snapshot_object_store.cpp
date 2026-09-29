@@ -8,12 +8,14 @@
 #include <glog/logging.h>
 
 #include "config/local_file_snapshot_config.h"
+#include "environ.h"
 
 namespace mooncake {
 
 LocalFileSnapshotObjectStore::LocalFileSnapshotObjectStore()
     : LocalFileSnapshotObjectStore(
-          LocalFileSnapshotConfig::FromEnvironment().base_path) {}
+          LocalFileSnapshotConfig::FromEnvironment(Environ::Process())
+              .base_path) {}
 
 LocalFileSnapshotObjectStore::LocalFileSnapshotObjectStore(
     const std::string& base_path) {
