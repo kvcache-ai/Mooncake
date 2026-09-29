@@ -1559,10 +1559,11 @@ class MasterService {
         bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
-    // The quota account a tenant id is bound to. Reading it does not register a
-    // metadata tenant: the tenant factory binds this same account to the tenant
-    // it builds.
-    TenantQuotaHandle BoundTenantQuotaHandle(const TenantId& tenant_id);
+    // The quota account a tenant id is bound to, created when it has none yet.
+    // Getting one does not register a metadata tenant: the tenant factory binds
+    // this same account to the tenant it builds.
+    TenantQuotaHandle GetOrCreateQuotaHandleForTenantId(
+        const TenantId& tenant_id);
 
     /**
      * @brief Helper to discard one tenant's expired processing replicas. The

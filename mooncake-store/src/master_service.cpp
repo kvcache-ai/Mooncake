@@ -5061,7 +5061,7 @@ auto MasterService::AllocateAndInsertMetadata(
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
-    auto* quota_account = BoundTenantQuotaHandle(tenant_id);
+    auto* quota_account = GetOrCreateQuotaHandleForTenantId(tenant_id);
     const uint64_t pending_quota_charge =
         RequestedMemoryQuotaCharge(value_length, config);
     auto quota_result = ChargeTenantQuota(quota_account, pending_quota_charge);
@@ -5089,7 +5089,7 @@ auto MasterService::AllocateAndInsertMetadata(
     return insert_result;
 }
 
-TenantQuotaHandle MasterService::BoundTenantQuotaHandle(
+TenantQuotaHandle MasterService::GetOrCreateQuotaHandleForTenantId(
     const TenantId& tenant_id) {
     if (!enable_multi_tenants_) {
         return nullptr;
@@ -5197,7 +5197,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             // registry. The account a charge goes against is the quota table's,
             // which the tenant factory binds to the tenant it builds.
             auto admission_result = ChargeTenantQuota(
-                BoundTenantQuotaHandle(object_id.tenant_id), 0);
+                GetOrCreateQuotaHandleForTenantId(object_id.tenant_id), 0);
             if (!admission_result) {
                 return tl::make_unexpected(admission_result.error());
             }
@@ -6337,7 +6337,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // a tenant behind, and Case A below creates the one it publishes
             // into.
             auto admission_result = ChargeTenantQuota(
-                BoundTenantQuotaHandle(object_id.tenant_id), 0);
+                GetOrCreateQuotaHandleForTenantId(object_id.tenant_id), 0);
             if (!admission_result) {
                 return tl::make_unexpected(admission_result.error());
             }
