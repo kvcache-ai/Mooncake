@@ -329,6 +329,8 @@ WeightMetadataSnapshot MakeWeightMetadataSnapshot() {
             .fenced_metadata_generation = 4,
             .started_at_ms = 150,
             .updated_at_ms = 200,
+            .processed_members = 0,
+            .total_members = 2,
             .cursor = {},
             .message = {},
         }},
@@ -855,7 +857,10 @@ TEST_F(HotStandbyServiceTest, AppliesNewerWeightMetadataOpLogAfterSnapshot) {
     ready.residency = WeightResidencyState::HOT;
     ready.metadata_generation = 2;
     ready.updated_at_ms = 200;
-    const auto encoded = struct_pack::serialize(ready);
+    const auto encoded = struct_pack::serialize(WeightMetadataUpsertOp{
+        .metadata = ready,
+        .operation = std::nullopt,
+    });
     auto batch = MakeCaptureBatch(1, 2, OpType::WEIGHT_METADATA_UPSERT,
                                   MakeWeightRevisionMetadataKey(ready.identity),
                                   std::string(encoded.begin(), encoded.end()));

@@ -211,6 +211,10 @@ class MetadataStore {
     virtual bool RemoveWeightLease(uint64_t lease_id,
                                    const WeightRevisionIdentity& identity,
                                    uint64_t fenced_metadata_generation) = 0;
+    virtual bool PutWeightOperation(
+        const WeightResidencyOperation& operation) = 0;
+    virtual std::optional<WeightResidencyOperation> GetWeightOperation(
+        uint64_t operation_id) const = 0;
 };
 
 }  // namespace mooncake

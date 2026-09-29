@@ -96,6 +96,15 @@ WeightRevisionMetadata MakeWeightMetadata(uint64_t metadata_generation) {
     };
 }
 
+std::string SerializeWeightUpsert(
+    const WeightRevisionMetadata& metadata,
+    std::optional<WeightResidencyOperation> operation = std::nullopt) {
+    return SerializePayload(WeightMetadataUpsertOp{
+        .metadata = metadata,
+        .operation = std::move(operation),
+    });
+}
+
 class OpLogApplierTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -119,7 +128,7 @@ TEST_F(OpLogApplierTest, AppliesWeightMetadataAndRejectsStaleGeneration) {
     const auto key = MakeWeightRevisionMetadataKey(generation_one.identity);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(
         MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, key,
-                  SerializePayload(generation_one))));
+                  SerializeWeightUpsert(generation_one))));
     ASSERT_EQ(generation_one,
               mock_metadata_store_->GetWeightMetadata(generation_one.identity));
 
@@ -128,13 +137,13 @@ TEST_F(OpLogApplierTest, AppliesWeightMetadataAndRejectsStaleGeneration) {
     generation_two.updated_at_ms = 102;
     EXPECT_TRUE(applier_->ApplyOpLogEntry(
         MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key,
-                  SerializePayload(generation_two))));
+                  SerializeWeightUpsert(generation_two))));
     ASSERT_EQ(generation_two,
               mock_metadata_store_->GetWeightMetadata(generation_one.identity));
 
     EXPECT_FALSE(applier_->ApplyOpLogEntry(
         MakeEntry(3, OpType::WEIGHT_METADATA_UPSERT, key,
-                  SerializePayload(generation_one))));
+                  SerializeWeightUpsert(generation_one))));
     EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
     EXPECT_EQ(generation_two,
               mock_metadata_store_->GetWeightMetadata(generation_one.identity));
@@ -151,10 +160,11 @@ TEST_F(OpLogApplierTest, AppliesImportingToReadyTransition) {
     ready.created_at_ms = importing.created_at_ms;
     const auto key = MakeWeightRevisionMetadataKey(importing.identity);
 
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(importing))));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
-        1, OpType::WEIGHT_METADATA_UPSERT, key, SerializePayload(importing))));
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
-        2, OpType::WEIGHT_METADATA_UPSERT, key, SerializePayload(ready))));
+        2, OpType::WEIGHT_METADATA_UPSERT, key, SerializeWeightUpsert(ready))));
     EXPECT_EQ(ready,
               mock_metadata_store_->GetWeightMetadata(importing.identity));
 }
@@ -163,7 +173,7 @@ TEST_F(OpLogApplierTest, WeightMetadataDuplicateReplayIsIdempotent) {
     auto metadata = MakeWeightMetadata(1);
     auto entry = MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT,
                            MakeWeightRevisionMetadataKey(metadata.identity),
-                           SerializePayload(metadata));
+                           SerializeWeightUpsert(metadata));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
@@ -171,30 +181,70 @@ TEST_F(OpLogApplierTest, WeightMetadataDuplicateReplayIsIdempotent) {
               mock_metadata_store_->GetWeightMetadata(metadata.identity));
 }
 
-TEST_F(OpLogApplierTest, RejectsUnsupportedResidencyOperationPayload) {
-    for (auto operation :
-         {WeightOperationState::EVICTING, WeightOperationState::REHYDRATING,
-          WeightOperationState::REPAIRING}) {
-        SCOPED_TRACE(static_cast<int>(operation));
-        StandbyMetadataStore standby;
-        OpLogApplier applier(&standby, cluster_id_);
-        const auto ready = MakeWeightMetadata(1);
-        const auto key = MakeWeightRevisionMetadataKey(ready.identity);
-        ASSERT_TRUE(applier.ApplyOpLogEntry(MakeEntry(
-            1, OpType::WEIGHT_METADATA_UPSERT, key, SerializePayload(ready))));
+TEST_F(OpLogApplierTest, ReplaysWeightOperationStartAndCompletion) {
+    auto ready = MakeWeightMetadata(1);
+    const auto key = MakeWeightRevisionMetadataKey(ready.identity);
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        1, OpType::WEIGHT_METADATA_UPSERT, key, SerializeWeightUpsert(ready))));
 
-        auto operating = MakeWeightMetadata(2);
-        operating.operation = operation;
-        operating.operation_id = 1;
-        ASSERT_TRUE(ValidateWeightRevisionMetadata(operating).ok());
-        EXPECT_FALSE(applier.ApplyOpLogEntry(
-            MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key,
-                      SerializePayload(operating))));
-        EXPECT_EQ(2u, applier.GetExpectedSequenceId());
-        EXPECT_EQ(ready, standby.GetWeightMetadata(ready.identity));
-        EXPECT_TRUE(
-            ValidateWeightMetadataSnapshot(standby.SnapshotWeightMetadata()));
-    }
+    auto evicting = ready;
+    evicting.metadata_generation = 2;
+    evicting.operation = WeightOperationState::EVICTING;
+    evicting.operation_id = 9;
+    evicting.updated_at_ms = 200;
+    WeightResidencyOperation operation{
+        .operation_id = 9,
+        .identity = ready.identity,
+        .operation = WeightOperationState::EVICTING,
+        .target_residency = WeightResidencyState::COLD,
+        .fenced_metadata_generation = 2,
+        .started_at_ms = 200,
+        .updated_at_ms = 200,
+        .processed_members = 0,
+        .total_members = 2,
+        .cursor = {},
+        .message = {},
+    };
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(evicting, operation))));
+    EXPECT_EQ(operation, mock_metadata_store_->GetWeightOperation(9));
+
+    auto cold = evicting;
+    cold.metadata_generation = 3;
+    cold.operation = WeightOperationState::NONE;
+    cold.operation_id = 0;
+    cold.residency = WeightResidencyState::COLD;
+    cold.updated_at_ms = 300;
+    operation.updated_at_ms = 300;
+    operation.message = "completed";
+    auto completion = MakeEntry(3, OpType::WEIGHT_METADATA_UPSERT, key,
+                                SerializeWeightUpsert(cold, operation));
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(completion));
+    EXPECT_EQ(cold, mock_metadata_store_->GetWeightMetadata(ready.identity));
+    EXPECT_EQ(operation, mock_metadata_store_->GetWeightOperation(9));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(completion));
+}
+
+TEST_F(OpLogApplierTest, RejectsWeightOperationWithoutRecord) {
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id_);
+    const auto ready = MakeWeightMetadata(1);
+    const auto key = MakeWeightRevisionMetadataKey(ready.identity);
+    ASSERT_TRUE(applier.ApplyOpLogEntry(MakeEntry(
+        1, OpType::WEIGHT_METADATA_UPSERT, key, SerializeWeightUpsert(ready))));
+
+    auto operating = MakeWeightMetadata(2);
+    operating.operation = WeightOperationState::EVICTING;
+    operating.operation_id = 1;
+    ASSERT_TRUE(ValidateWeightRevisionMetadata(operating).ok());
+    EXPECT_FALSE(applier.ApplyOpLogEntry(
+        MakeEntry(2, OpType::WEIGHT_METADATA_UPSERT, key,
+                  SerializeWeightUpsert(operating))));
+    EXPECT_EQ(2u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(ready, standby.GetWeightMetadata(ready.identity));
+    EXPECT_TRUE(
+        ValidateWeightMetadataSnapshot(standby.SnapshotWeightMetadata()));
 }
 
 TEST_F(OpLogApplierTest, AppliesWeightLeaseAndDeleteTombstones) {
@@ -202,7 +252,7 @@ TEST_F(OpLogApplierTest, AppliesWeightLeaseAndDeleteTombstones) {
     const auto metadata_key = MakeWeightRevisionMetadataKey(metadata.identity);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(
         MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, metadata_key,
-                  SerializePayload(metadata))));
+                  SerializeWeightUpsert(metadata))));
 
     WeightRevisionLease lease{
         .lease_id = 42,
@@ -238,7 +288,7 @@ TEST_F(OpLogApplierTest, AppliesWeightLeaseAndDeleteTombstones) {
 
     EXPECT_FALSE(applier_->ApplyOpLogEntry(
         MakeEntry(5, OpType::WEIGHT_METADATA_UPSERT, metadata_key,
-                  SerializePayload(metadata))));
+                  SerializeWeightUpsert(metadata))));
     EXPECT_EQ(5u, applier_->GetExpectedSequenceId());
 }
 
@@ -251,7 +301,7 @@ TEST_F(OpLogApplierTest, RejectsMalformedWeightPayloadAndMismatchedKey) {
 
     EXPECT_FALSE(applier_->ApplyOpLogEntry(
         MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT, "weight-revision:wrong",
-                  SerializePayload(metadata))));
+                  SerializeWeightUpsert(metadata))));
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
 }
 

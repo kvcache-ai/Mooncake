@@ -275,6 +275,44 @@ class WrappedMasterService {
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
 
+    WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<ListWeightRevisionsResponse>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request,
+                        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation>
+    StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> ReconcileWeightRevision(
+        const ReconcileWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
+
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.
     tl::expected<void, ErrorCode> RestoreFromStandby(

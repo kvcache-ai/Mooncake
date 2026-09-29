@@ -484,6 +484,31 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<bool, ErrorCode> PollRemoveAll();
 
+    WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request);
+    WeightRpcResult<ListWeightRevisionsResponse> ListWeightRevisions(
+        const ListWeightRevisionsRequest& request);
+    WeightRpcResult<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightRpcResult<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightResidencyOperation> StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request);
+    WeightRpcResult<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> ReconcileWeightRevision(
+        const ReconcileWeightRevisionRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request);
+
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 

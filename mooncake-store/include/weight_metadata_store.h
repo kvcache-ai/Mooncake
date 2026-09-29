@@ -83,7 +83,9 @@ class WeightMetadataStore {
         const RenewWeightRevisionLeaseRequest& request, uint64_t now_ms) const;
     Result<WeightLeaseMutation> PrepareReleaseLease(
         const ReleaseWeightRevisionLeaseRequest& request) const;
-    std::vector<WeightLeaseMutation> PrepareExpireLeases(uint64_t now_ms) const;
+    std::vector<WeightLeaseMutation> PrepareExpireLeases(
+        uint64_t now_ms, const std::optional<WeightRevisionIdentity>& identity =
+                             std::nullopt) const;
     Result<WeightRevisionLease> Publish(const WeightLeaseMutation& mutation);
     bool HasActiveLease(const WeightRevisionIdentity& identity,
                         uint64_t metadata_generation, uint64_t now_ms) const;
@@ -95,7 +97,9 @@ class WeightMetadataStore {
         uint64_t now_ms) const;
     Result<WeightOperationMutation> PrepareUpdateOperationProgress(
         uint64_t operation_id, uint64_t processed_members,
-        uint64_t total_members, std::string cursor, uint64_t now_ms) const;
+        uint64_t total_members, std::string cursor,
+        WeightAvailabilityState observed_availability,
+        WeightResidencyState observed_residency, uint64_t now_ms) const;
     Result<WeightResidencyOperation> Publish(
         const WeightOperationMutation& mutation);
     Result<WeightResidencyOperation> QueryOperation(

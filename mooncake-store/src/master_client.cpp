@@ -349,6 +349,27 @@ struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
 
+#define DEFINE_WEIGHT_RPC_NAME(method)                    \
+    template <>                                           \
+    struct RpcNameTraits<&WrappedMasterService::method> { \
+        static constexpr const char* value = #method;     \
+    }
+
+DEFINE_WEIGHT_RPC_NAME(BeginWeightImport);
+DEFINE_WEIGHT_RPC_NAME(CommitWeightImport);
+DEFINE_WEIGHT_RPC_NAME(AbortWeightImport);
+DEFINE_WEIGHT_RPC_NAME(GetWeightRevision);
+DEFINE_WEIGHT_RPC_NAME(ListWeightRevisions);
+DEFINE_WEIGHT_RPC_NAME(AcquireWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(RenewWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(ReleaseWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(StartWeightResidencyOperation);
+DEFINE_WEIGHT_RPC_NAME(QueryWeightOperation);
+DEFINE_WEIGHT_RPC_NAME(ReconcileWeightRevision);
+DEFINE_WEIGHT_RPC_NAME(DeleteWeightRevision);
+
+#undef DEFINE_WEIGHT_RPC_NAME
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
     const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
@@ -480,6 +501,50 @@ void MasterClient::EnableHaConnectionPolicy() {
         ha_control_client_accessor_.GetOrCreateClientPool(client_addr_param_);
     }
     ha_connection_policy_enabled_.store(true, std::memory_order_release);
+}
+
+#define DEFINE_WEIGHT_CLIENT_METHOD(method, request_type, result_type)       \
+    WeightRpcResult<result_type> MasterClient::method(                       \
+        const request_type& request) {                                       \
+        return invoke_rpc<&WrappedMasterService::method,                     \
+                          tl::expected<result_type, WeightManagementError>>( \
+            request, tenant_id_.value());                                    \
+    }
+
+DEFINE_WEIGHT_CLIENT_METHOD(BeginWeightImport, BeginWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(CommitWeightImport, CommitWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(AbortWeightImport, AbortWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(GetWeightRevision, GetWeightRevisionRequest,
+                            WeightRevisionView)
+DEFINE_WEIGHT_CLIENT_METHOD(ListWeightRevisions, ListWeightRevisionsRequest,
+                            ListWeightRevisionsResponse)
+DEFINE_WEIGHT_CLIENT_METHOD(AcquireWeightRevisionLease,
+                            AcquireWeightRevisionLeaseRequest,
+                            WeightRevisionLease)
+DEFINE_WEIGHT_CLIENT_METHOD(RenewWeightRevisionLease,
+                            RenewWeightRevisionLeaseRequest,
+                            WeightRevisionLease)
+DEFINE_WEIGHT_CLIENT_METHOD(StartWeightResidencyOperation,
+                            StartWeightResidencyOperationRequest,
+                            WeightResidencyOperation)
+DEFINE_WEIGHT_CLIENT_METHOD(QueryWeightOperation, QueryWeightOperationRequest,
+                            WeightResidencyOperation)
+DEFINE_WEIGHT_CLIENT_METHOD(ReconcileWeightRevision,
+                            ReconcileWeightRevisionRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(DeleteWeightRevision, DeleteWeightRevisionRequest,
+                            WeightRevisionMetadata)
+
+#undef DEFINE_WEIGHT_CLIENT_METHOD
+
+WeightRpcResult<void> MasterClient::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request) {
+    return invoke_rpc<&WrappedMasterService::ReleaseWeightRevisionLease,
+                      tl::expected<void, WeightManagementError>>(
+        request, tenant_id_.value());
 }
 
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
