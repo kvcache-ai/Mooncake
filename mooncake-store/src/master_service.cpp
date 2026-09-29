@@ -4532,6 +4532,15 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 const auto& metadata = metadata_it->second;
                 auto replica_list = GetReadableReplicaDescriptors(metadata);
 
+                if (dfs_allocator_) {
+                    for (const auto& replica : replica_list) {
+                        if (replica.is_dfs_replica()) {
+                            const auto& desc = replica.get_dfs_descriptor();
+                            dfs_allocator_->UpdateAccess(key, desc);
+                        }
+                    }
+                }
+
                 if (replica_list.empty()) {
                     if (metadata.AllReplicas([](const Replica& replica) {
                             return replica.status() == ReplicaStatus::REMOVED;
