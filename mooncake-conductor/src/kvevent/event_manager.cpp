@@ -1,5 +1,9 @@
 #include "conductor/kvevent/event_manager.h"
 
+#include "conductor/client/types.h"
+#include "conductor/kvevent/conductor_service.h"
+#include "conductor/kvevent/rpc_service.h"
+
 #include <glog/logging.h>
 #include <msgpack.hpp>
 #include <csignal>
@@ -27,29 +31,6 @@ using coro_http::status_type;
 constexpr const char* kApplicationMsgpack = "application/msgpack";
 
 using MsgpackPacker = msgpack::packer<msgpack::sbuffer>;
-
-prefixindex::ContextKey ContextFromService(
-    const common::ServiceConfig& service) {
-    return {.tenant_id = service.tenant_id,
-            .model_name = service.model_name,
-            .lora_name = service.lora_name,
-            .block_size = service.block_size};
-}
-
-prefixindex::HashProfile ProfileFromService(
-    const common::ServiceConfig& service) {
-    return service.hash_profile;
-}
-
-prefixindex::EngineRegistration RegistrationFromService(
-    const common::ServiceConfig& service) {
-    return {.context = ContextFromService(service),
-            .profile = ProfileFromService(service),
-            .instance_id = service.instance_id,
-            .dp_rank = service.dp_rank,
-            .effective_block_size = service.block_size,
-            .cache_group = service.cache_group};
-}
 
 bool MsgpackInt64(const msgpack::object& value, int64_t* out) {
     if (value.type == msgpack::type::POSITIVE_INTEGER) {
@@ -115,6 +96,21 @@ void HttpValidationError(coro_http_response& resp, const char* reason,
         packer.pack(static_cast<uint64_t>(*index));
     }
     HttpMsgpack(resp, status_type::bad_request, body);
+}
+
+// Maps a service-layer error code to the HTTP status the endpoint contracts
+// have always used for the corresponding failure.
+status_type ErrorToHttpStatus(ErrorCode code) {
+    switch (code) {
+        case ErrorCode::INVALID_PARAMS:
+            return status_type::bad_request;
+        case ErrorCode::SERVICE_NOT_FOUND:
+            return status_type::not_found;
+        case ErrorCode::CONDUCTOR_UNAVAILABLE:
+            return status_type::service_unavailable;
+        default:
+            return status_type::internal_server_error;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -344,47 +340,6 @@ bool ParseHashProfileConfig(const msgpack::object_map& body,
     }
     return true;
 }
-
-std::string ValidateServiceConfig(const common::ServiceConfig& service) {
-    if (service.endpoint.empty()) {
-        return "endpoint is required";
-    }
-    if (service.model_name.empty()) {
-        return "modelname is required";
-    }
-    if (service.tenant_id.empty()) {
-        return "tenant_id must not be empty after normalization";
-    }
-    if (service.block_size <= 0) {
-        return "block_size must be greater than zero";
-    }
-    if (service.dp_rank < 0) {
-        return "dp_rank must be non-negative";
-    }
-    if (service.cache_group.has_value() && *service.cache_group != 0) {
-        return "only cache group zero is supported";
-    }
-    if (service.publisher_kind == common::PublisherKind::kVllm ||
-        service.publisher_kind == common::PublisherKind::kSglang) {
-        if (service.instance_id.empty()) {
-            return "instance_id is required for vLLM/SGLang";
-        }
-        return prefixindex::PrefixCacheTable::ValidateRegistration(
-                   RegistrationFromService(service))
-            .error;
-    }
-    if (service.publisher_kind == common::PublisherKind::kMooncake) {
-        return prefixindex::ValidateHashProfile(ProfileFromService(service));
-    }
-    return "unsupported publisher kind";
-}
-
-struct QueryRequest {
-    prefixindex::ContextKey context;
-    std::vector<int32_t> token_ids;
-    std::optional<std::string> cache_salt;
-    std::optional<std::string> instance_filter;
-};
 
 // Decodes one little-endian int32 from a msgpack bin token_ids element.
 int32_t DecodeLeInt32(const char* p) {
@@ -763,8 +718,11 @@ std::string MakeServiceKey(const std::string& instance_id,
 }
 
 EventManager::EventManager(std::vector<common::ServiceConfig> services,
-                           int http_server_port)
-    : services_(std::move(services)), http_server_port_(http_server_port) {}
+                           int http_server_port, int rpc_server_port)
+    : services_(std::move(services)),
+      http_server_port_(http_server_port),
+      rpc_server_port_(rpc_server_port),
+      service_(std::make_unique<ConductorService>(*this)) {}
 
 EventManager::~EventManager() { Stop(); }
 
@@ -827,6 +785,11 @@ void EventManager::Stop() {
     if (http_server_) {
         LOG(INFO) << "Shutting down HTTP server";
         http_server_->stop();
+    }
+    if (rpc_server_) {
+        LOG(INFO) << "Shutting down RPC server";
+        rpc_server_->stop();
+        rpc_server_.reset();
     }
 
     // Stop all ZMQ clients. Collect them under the lock but Stop()
@@ -1072,17 +1035,20 @@ void EventManager::RegisterHttpHandlers() {
                 return;
             }
 
-            const auto results =
-                indexer_.Query(query.context, query.token_ids, query.cache_salt,
-                               query.instance_filter);
+            auto result = GetService().Query(query);
+            if (!result) {
+                HttpError(resp, ErrorToHttpStatus(result.error()),
+                          std::string(ErrorCodeName(result.error())));
+                return;
+            }
             msgpack::sbuffer body;
             MsgpackPacker packer(&body);
             packer.pack_map(1);
             packer.pack("instances");
-            packer.pack_map(static_cast<uint32_t>(results.size()));
-            for (const auto& [instance_id, result] : results) {
+            packer.pack_map(static_cast<uint32_t>(result->instances.size()));
+            for (const auto& [instance_id, hit] : result->instances) {
                 packer.pack(instance_id);
-                PackCacheHitResult(packer, result);
+                PackCacheHitResult(packer, hit);
             }
             HttpMsgpack(resp, status_type::ok, body);
         });
@@ -1105,24 +1071,22 @@ void EventManager::RegisterHttpHandlers() {
                 return;
             }
 
-            {
-                std::unique_lock lock(mu_);
-                auto [is_new, err] = SubscribeToService(svc);
-                if (!err.empty()) {
-                    lock.unlock();
-                    LOG(ERROR) << "Dynamic register failed instance_id="
-                               << svc.instance_id << " err=" << err;
-                    if (err.starts_with("failed to start ZMQ client")) {
-                        HttpError(resp, status_type::internal_server_error,
-                                  "Failed to subscribe: " + err);
-                    } else {
-                        HttpValidationError(resp, "invalid_registration", err);
-                    }
-                    return;
+            // ConductorService::Register takes mu_ exclusively inside; the
+            // handler must not add a lock around the call.
+            auto result = GetService().Register(svc);
+            if (!result) {
+                LOG(ERROR) << "Dynamic register failed instance_id="
+                           << svc.instance_id
+                           << " err=" << ErrorCodeName(result.error());
+                if (result.error() == ErrorCode::INVALID_PARAMS) {
+                    HttpValidationError(
+                        resp, "invalid_registration",
+                        std::string(ErrorCodeName(result.error())));
+                } else {
+                    HttpError(resp, ErrorToHttpStatus(result.error()),
+                              std::string(ErrorCodeName(result.error())));
                 }
-                if (is_new) {
-                    services_.push_back(svc);
-                }
+                return;
             }
 
             msgpack::sbuffer response_body;
@@ -1184,17 +1148,19 @@ void EventManager::RegisterHttpHandlers() {
             const std::string target_key =
                 MakeServiceKey(instance_id, target_tenant, dp_rank);
 
-            const auto [removed_service, error] =
-                UnsubscribeFromService(instance_id, target_tenant, dp_rank);
-            if (!removed_service) {
-                HttpError(
-                    resp, status_type::not_found,
-                    error.empty() ? "service not found: " + target_key : error);
-                return;
-            }
-            if (!error.empty()) {
-                HttpError(resp, status_type::internal_server_error,
-                          "Failed to unregister prefix context: " + error);
+            // ConductorService::Unregister runs UnsubscribeFromService, which
+            // must be called without mu_ held (see the deadlock note in
+            // EventManager::UnsubscribeFromService); no lock is added here.
+            auto result =
+                GetService().Unregister(instance_id, target_tenant, dp_rank);
+            if (!result) {
+                if (result.error() == ErrorCode::SERVICE_NOT_FOUND) {
+                    HttpError(resp, status_type::not_found,
+                              "service not found: " + target_key);
+                } else {
+                    HttpError(resp, ErrorToHttpStatus(result.error()),
+                              std::string(ErrorCodeName(result.error())));
+                }
                 return;
             }
 
@@ -1216,7 +1182,7 @@ void EventManager::RegisterHttpHandlers() {
     // ---- /global_view ---------------------------------------------------
     server->set_http_handler<GET>(
         "/global_view", [this](coro_http_request&, coro_http_response& resp) {
-            const auto global_view = indexer_.GetGlobalView();
+            const auto global_view = GetService().GetGlobalView();
 
             msgpack::sbuffer body;
             MsgpackPacker packer(&body);
@@ -1264,19 +1230,19 @@ void EventManager::RegisterHttpHandlers() {
         "/services", [this](coro_http_request&, coro_http_response& resp) {
             VLOG(1) << "receive req method=GET path=/services";
 
+            // ListServices takes the shared lock internally and returns a
+            // snapshot in active_configs_ (std::map) key order, so the packed
+            // sequence matches the previous locked iteration byte for byte.
+            const auto services = GetService().ListServices();
             msgpack::sbuffer body;
             MsgpackPacker packer(&body);
             packer.pack_map(2);
             packer.pack("count");
-            {
-                std::shared_lock lock(mu_);
-                packer.pack(static_cast<uint64_t>(active_configs_.size()));
-                packer.pack("services");
-                packer.pack_array(
-                    static_cast<uint32_t>(active_configs_.size()));
-                for (const auto& [key, svc] : active_configs_) {
-                    PackServiceConfig(packer, svc);
-                }
+            packer.pack(static_cast<uint64_t>(services.size()));
+            packer.pack("services");
+            packer.pack_array(static_cast<uint32_t>(services.size()));
+            for (const auto& svc : services) {
+                PackServiceConfig(packer, svc);
             }
             HttpMsgpack(resp, status_type::ok, body);
         });
@@ -1305,6 +1271,30 @@ bool EventManager::StartHTTPServer() {
         }
     }
     return true;
+}
+
+bool EventManager::StartRPCServer() {
+    if (rpc_server_port_ == 0) {
+        return true;  // RPC channel disabled.
+    }
+    rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+        /*thread_num=*/4, static_cast<unsigned short>(rpc_server_port_));
+    RegisterConductorRpcService(*rpc_server_, *service_);
+    auto future = rpc_server_->async_start();
+    if (future.hasResult()) {
+        const auto ec = std::move(future).get();
+        if (ec) {
+            LOG(ERROR) << "RPC server failed err=" << ec.message();
+            rpc_server_.reset();
+            return false;
+        }
+    }
+    LOG(INFO) << "RPC server listening port=" << rpc_server_->port();
+    return true;
+}
+
+uint16_t EventManager::RpcPort() const {
+    return rpc_server_ ? rpc_server_->port() : 0;
 }
 
 }  // namespace mooncake::conductor::kvevent
