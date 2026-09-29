@@ -48,7 +48,6 @@
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
-#include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
@@ -58,16 +57,6 @@
 #include "metadata_store.h"
 
 namespace mooncake {
-
-// Forward declaration for MasterSnapshotManager
-class MasterSnapshotManager;
-class MasterSnapshotRepository;
-
-namespace ha {
-class SnapshotCatalogStore;
-class MasterSnapshotCodec;
-struct MasterSnapshotPayloads;
-}  // namespace ha
 
 class EtcdOpLogStore;
 class ShardAllocator;
@@ -110,15 +99,15 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * Lock order: To avoid deadlocks, the following lock order should be followed:
  * 1. client_mutex_
  * 2. tenant_quota_policy_mutex_
- * 3. snapshot_mutex_
+ * 3. master_state_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
  * 5. tenant_quota_recompute_mutex_
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
  * Strict tenant admission and policy mutation paths that need both
- * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
- * policy mutex first, then snapshot_mutex_.
+ * tenant_quota_policy_mutex_ and master_state_mutex_ must acquire the tenant
+ * policy mutex first, then master_state_mutex_.
  * tenant_quota_recompute_mutex_ serializes the capacity snapshot and the
  * corresponding quota-table update. The segment mutex is released before
  * entering ShardedTenantQuotaTable, so these two locks are never nested.
@@ -127,11 +116,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 class MasterService {
     friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
-    friend class MasterSnapshotManager;    // Allow access to internal state for
-                                           // snapshot
     friend class ClientOffboardingWorker;
-    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
-                                           // members
 
    public:
     using NoFProbeFn =
@@ -736,7 +721,7 @@ class MasterService {
      *
      * The replica sweep targets exactly this owner (see
      * ClearLocalDiskHandlesOwnedBy), and the deregistration runs under the
-     * exclusive snapshot_mutex_ so no registration admitted against the old
+     * exclusive master_state_mutex_ so no registration admitted against the old
      * one can land after the sweep: NotifyOffloadSuccess checks the
      * registration and writes the replica inside one shared-lock section,
      * which therefore falls entirely before the deregistration (registered,
@@ -958,9 +943,6 @@ class MasterService {
         std::optional<ReplicaID> expected_max_replica_id,
         const WeightMetadataSnapshot* legacy_weight_metadata);
 
-    std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
-        const MasterServiceConfig& config);
-
     // Shared lookup path for ExistKey/ProbeKey (and their batch variants).
     // When grant_lease is false, the check acquires no read lease and is a
     // point-in-time existence probe only.
@@ -969,21 +951,6 @@ class MasterService {
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyImpl(
         const std::vector<std::string>& keys, const TenantId& tenant_id,
         bool grant_lease);
-
-    // Restore master state
-    void RestoreState();
-    void ResetStateAfterFailedRestoreAttempt();
-    tl::expected<void, SerializationError>
-    RebuildClientLivenessAfterSnapshotRestore();
-
-    /**
-     * @brief Apply decoded snapshot state to running master service
-     * @param payloads Decoded snapshot payloads
-     * @param now Current time for cleanup logic
-     * @return void on success, SerializationError on failure
-     */
-    tl::expected<void, SerializationError> ApplySnapshotState(
-        const std::chrono::system_clock::time_point& now);
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -1024,7 +991,7 @@ class MasterService {
     std::string GetClientHostId(const UUID& client_id) const;
 
     void ClearInvalidHandles();
-    // Caller owns snapshot_mutex_ (shared) while metadata is swept.
+    // Caller owns master_state_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
@@ -1044,12 +1011,6 @@ class MasterService {
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
-    bool ShouldSkipSnapshotForClientOffboarding() const {
-        return client_offboarding_worker_.HasPending();
-    }
-
-    std::string FormatTimestamp(
-        const std::chrono::system_clock::time_point& tp);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
@@ -1490,7 +1451,7 @@ class MasterService {
     // Momentarily takes the LocalSsdManager registry lock, so callers must not
     // hold it; call before taking a metadata shard lock. Callers that need the
     // answer to stay true across a later metadata write must hold
-    // snapshot_mutex_ (shared) across both -- UnmountLocalDiskSegment
+    // master_state_mutex_ (shared) across both -- UnmountLocalDiskSegment
     // deregisters the client under the exclusive lock, so the check and the
     // write cannot straddle a deregistration.
     bool HasMountedLocalDiskSegment(const UUID& client_id);
@@ -1674,9 +1635,6 @@ class MasterService {
     // milliseconds, and admission still has its own synchronous fallback in
     // between.
     static constexpr uint64_t kTenantEvictionCheckIntervalMs = 1000;
-
-    // Snapshot manager handles snapshot lifecycle orchestration
-    std::unique_ptr<MasterSnapshotManager> snapshot_manager_;
 
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
@@ -1891,48 +1849,6 @@ class MasterService {
         ObjectMetadataIterator it_;
         ProcessingIterator processing_it_;
         ReplicationTaskIterator replication_task_it_;
-    };
-
-    class MetadataSerializer {
-       public:
-        MetadataSerializer(MasterService* service) : service_(service) {}
-
-        // Serialize metadata of all shards
-        tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
-            const WeightMetadataSnapshot* frozen_weight_metadata = nullptr);
-
-        tl::expected<void, SerializationError> Deserialize(
-            const std::vector<uint8_t>& data);
-
-        void Reset();
-
-       private:
-        MasterService* service_;
-
-        // Serialize a single ObjectMetadata
-        tl::expected<void, SerializationError> SerializeMetadata(
-            const ObjectMetadata& metadata, MsgpackPacker& packer) const;
-
-        // Deserialize a single ObjectMetadata
-        [[nodiscard]] tl::expected<std::unique_ptr<ObjectMetadata>,
-                                   SerializationError>
-        DeserializeMetadata(const msgpack::object& obj) const;
-
-        // Serialize a single MetadataShard
-        tl::expected<void, SerializationError> SerializeShard(
-            const MetadataShard& shard, MsgpackPacker& packer) const;
-
-        // Deserialize a single MetadataShard
-        tl::expected<void, SerializationError> DeserializeShard(
-            const msgpack::object& obj, MetadataShard& shard);
-
-        // Serialize discarded replicas
-        tl::expected<void, SerializationError> SerializeDiscardedReplicas(
-            MsgpackPacker& packer) const;
-
-        // Deserialize discarded replicas
-        tl::expected<void, SerializationError> DeserializeDiscardedReplicas(
-            const msgpack::object& obj);
     };
 
     friend class MetadataAccessor;
@@ -2252,11 +2168,7 @@ class MasterService {
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
-    std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
-    std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
-    std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
-    std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
-    mutable std::shared_mutex snapshot_mutex_;
+    mutable std::shared_mutex master_state_mutex_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
@@ -2289,7 +2201,6 @@ class MasterService {
         }
 
        private:
-        friend class MetadataSerializer;
         std::vector<Replica> replicas_;
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;

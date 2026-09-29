@@ -29,8 +29,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_service.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
-    master_snapshot_manager.cpp
-    master_snapshot_repository.cpp
     master_metric_manager.cpp
     segment/region_driver.cpp
     placement/index.cpp
@@ -63,7 +61,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
     ha/standby_metadata_store.cpp
-    ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/batch_oplog/codec.cpp
     ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.cpp
@@ -73,13 +70,10 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.cpp
     ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.cpp
     ha/snapshot/snapshot_maintenance_lease.cpp
-    ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/local_ssd_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
-    ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
-    ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
     task_manager.cpp
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp

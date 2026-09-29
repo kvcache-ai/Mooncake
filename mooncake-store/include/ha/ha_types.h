@@ -16,7 +16,6 @@ namespace ha {
 using ClusterNamespace = std::string;
 using OwnerToken = std::string;
 using OpLogSequenceId = uint64_t;
-using SnapshotId = std::string;
 
 enum class HABackendType {
     UNKNOWN = 0,
@@ -193,15 +192,6 @@ struct OpLogPollResult {
     std::vector<OpLogRecord> records;
     OpLogSequenceId next_seq = 0;
     bool timed_out = false;
-};
-
-struct SnapshotDescriptor {
-    SnapshotId snapshot_id;
-    OpLogSequenceId last_included_seq = 0;
-    ViewVersionId producer_view_version = 0;
-    std::string manifest_key;
-    std::string object_prefix;
-    int64_t created_at_ms = 0;
 };
 
 }  // namespace ha

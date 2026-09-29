@@ -137,10 +137,6 @@ add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
 add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
-add_store_test(master_service_ssd_test_for_snapshot
-               ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
-add_store_test(master_service_promotion_test_for_snapshot
-               ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
 endif()
@@ -265,10 +261,6 @@ set_tests_properties(dfs_read_checksum_test
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
 endif()
-add_store_test(
-  embedded_snapshot_catalog_store_test
-  ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp
-)
 add_store_test(zstd_util_test zstd_util_test.cpp)
 add_store_test(local_file_snapshot_config_test
                local_file_snapshot_config_test.cpp)
@@ -277,10 +269,6 @@ add_store_test(
   local_file_snapshot_object_store_test
   ha/snapshot/object/backends/local/local_file_snapshot_object_store_test.cpp)
 add_store_test(file_util_test file_util_test.cpp)
-add_store_test(snapshot_child_process_test
-               ha/snapshot/snapshot_child_process_test.cpp)
-add_store_test(master_snapshot_codec_test
-               ha/snapshot/master_snapshot_codec_test.cpp)
 add_ha_test(batch_oplog_snapshot_types_test
             ha/snapshot/batch_oplog/metadata_test.cpp)
 add_ha_test(batch_oplog_snapshot_codec_test
@@ -300,8 +288,6 @@ add_ha_test(batch_oplog_snapshot_promotion_test
             ha/snapshot/batch_oplog/promotion_test.cpp)
 add_ha_test(batch_oplog_snapshot_rebootstrap_test
             ha/snapshot/batch_oplog/rebootstrap_test.cpp)
-add_store_test(master_service_test_for_snapshot
-               ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_connector_config_test nvme_kv/connector_config_test.cpp)
 add_store_test(ha_cluster_namespace_config_test
@@ -361,25 +347,6 @@ if(STORE_USE_REDIS)
     PRIVATE ha/leadership/backends/redis/high_availability_redis_test.cpp)
   target_link_libraries(high_availability_test PRIVATE Mooncake::hiredis)
 
-  add_executable(
-    redis_snapshot_catalog_store_test
-    ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store_test.cpp)
-  target_include_directories(redis_snapshot_catalog_store_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(
-    redis_snapshot_catalog_store_test
-    PUBLIC mooncake_store
-           transfer_engine
-           cachelib_memory_allocator
-           ${ETCD_WRAPPER_LIB}
-           glog::glog
-           gflags::gflags
-           ibverbs
-           gtest
-           pthread
-    PRIVATE Mooncake::hiredis)
-  add_test(NAME redis_snapshot_catalog_store_test
-           COMMAND redis_snapshot_catalog_store_test)
 endif()
 if(STORE_USE_K8S_LEASE)
   target_sources(
@@ -434,8 +401,6 @@ add_ha_test(ha_metric_manager_test ha/standby/ha_metric_manager_test.cpp)
 add_ha_test(hot_standby_service_test ha/standby/hot_standby_service_test.cpp)
 add_ha_test(standby_metadata_store_test
             ha/standby/standby_metadata_store_test.cpp)
-add_ha_test(hot_standby_snapshot_bootstrap_test
-            ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
 add_ha_test(oplog_types_test ha/oplog/oplog_types_test.cpp)
 add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
@@ -459,14 +424,6 @@ target_link_libraries(oplog_test_failpoint_test PRIVATE glog::glog gtest
                                                         gtest_main pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
-add_ha_test(catalog_backed_snapshot_provider_test
-            ha/snapshot/catalog_backed_snapshot_provider_test.cpp)
-if(STORE_USE_REDIS)
-  foreach(target catalog_backed_snapshot_provider_test
-                 hot_standby_snapshot_bootstrap_test)
-    target_link_libraries(${target} PRIVATE Mooncake::hiredis)
-  endforeach()
-endif()
 
 foreach(
   target

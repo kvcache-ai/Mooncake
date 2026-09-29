@@ -18,7 +18,6 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/capture.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
-#include "ha/snapshot/snapshot_provider.h"
 #include "ha/standby_metadata_store.h"
 #include "standby_state_machine.h"
 #include "types.h"
@@ -47,9 +46,7 @@ struct HotStandbyConfig {
     // snapshot baseline before switching to steady-state replication.
     bool enable_snapshot_bootstrap{false};
 
-    // OpLog following phase (optional): when disabled, Start() stops after the
-    // snapshot bootstrap phase and keeps the standby in a snapshot-only steady
-    // state.
+    // When disabled, the standby starts empty without metadata replication.
     bool enable_oplog_following{true};
 
     int oplog_poll_interval_ms{1000};
@@ -195,9 +192,6 @@ class HotStandbyService {
         SnapshotLifecycleCallback callback);
     void SetBatchOpLogSnapshotStopCallback(SnapshotLifecycleCallback callback);
 
-    // Inject a snapshot provider (from external snapshot implementation).
-    void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
-
     // Inject the new batch-OpLog bootstrap path. It owns no running state;
     // Start() gives it temporary stores and installs them only on success.
     void SetBatchOpLogSnapshotProvider(
@@ -270,8 +264,6 @@ class HotStandbyService {
     HotStandbyConfig config_;
 
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
-    std::unique_ptr<SnapshotProvider> snapshot_provider_{
-        std::make_unique<NoopSnapshotProvider>()};
     std::shared_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
 
     // OpLog replication components

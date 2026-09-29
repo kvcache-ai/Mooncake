@@ -153,11 +153,6 @@ class MasterMetricManager {
     void inc_client_offboarding_alert();
     void observe_client_offboarding_duration_ms(int64_t duration_ms);
 
-    // Snapshot Metrics
-    void set_snapshot_duration_ms(int64_t size);
-    void inc_snapshot_success();
-    void inc_snapshot_fail();
-
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
@@ -773,10 +768,6 @@ class MasterMetricManager {
     ylt::metric::dynamic_counter_1t offload_cancelled_total_;
     ylt::metric::dynamic_counter_1t offload_enqueue_rejected_total_;
 
-    // Snapshot Metrics
-    ylt::metric::histogram_t snapshot_duration_ms_;
-    ylt::metric::counter_t snapshot_success_;
-    ylt::metric::counter_t snapshot_fail_;
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;
     ylt::metric::counter_t copy_start_failures_;

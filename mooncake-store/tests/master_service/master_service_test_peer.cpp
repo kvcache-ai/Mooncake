@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cassert>
 
-#include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -116,7 +115,7 @@ size_t MasterServiceTestPeer::RunPromotionCandidateRetryForTesting() {
 size_t MasterServiceTestPeer::CountCandidatesForTesting(
     const TenantId& tenant_id) {
     size_t count = 0;
-    std::shared_lock<std::shared_mutex> lock(service_.snapshot_mutex_);
+    std::shared_lock<std::shared_mutex> lock(service_.master_state_mutex_);
     for (size_t i = 0; i < MasterService::kNumShards; i++) {
         MetadataShardAccessorRO shard(&service_, i);
         auto it = shard->tenants.find(tenant_id);
@@ -151,12 +150,6 @@ size_t MasterServiceTestPeer::SoftPinRegistrationCount() const {
     const auto& index = service_.soft_pin_deadline_index_;
     std::lock_guard lock(index.mutex_);
     return index.registrations_.size();
-}
-
-std::unique_ptr<ha::SnapshotCatalogStore>
-MasterServiceTestPeer::CreateSnapshotCatalogStore(
-    const MasterServiceConfig& config) {
-    return service_.CreateSnapshotCatalogStore(config);
 }
 
 }  // namespace mooncake::test
