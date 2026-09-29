@@ -40,7 +40,6 @@
 
 #include "config.h"
 #include "cuda_alike.h"
-#include "environ.h"
 #include "hip_device_guard.h"
 #if defined(USE_HIP_DMABUF)
 #include <sys/utsname.h>
@@ -510,7 +509,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
     (void)length;
-    const bool data_direct = Environ::Get().GetRdmaDataDirect();
+    const bool data_direct = globalConfig().rdma_data_direct;
     if (data_direct) {
 #ifdef USE_CUDA
         if (!dataDirectRegMr()) return ERR_CONTEXT;
@@ -533,7 +532,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         out.method = DmabufExport::Method::kHostReg;
 #if defined(USE_CUDA) || defined(USE_SUPA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
-               Environ::Get().GetWithNvidiaPeermem() && !data_direct) {
+               globalConfig().with_nvidia_peermem && !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
         out.method = DmabufExport::Method::kHostReg;
@@ -771,7 +770,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // reference, so all NICs share one dma_buf object (and one BAR1
         // window).
 #ifdef USE_CUDA
-        if (Environ::Get().GetRdmaDataDirect()) {
+        if (globalConfig().rdma_data_direct) {
             auto reg_mr = dataDirectRegMr();
             if (!reg_mr) return ERR_CONTEXT;
             mrMeta.mr = reg_mr(pd_, exp.offset, length, (uintptr_t)addr, exp.fd,
@@ -793,7 +792,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
                     << length << " dmabuf_offset " << exp.offset << " on "
                     << device_name_ << " MC_RDMA_DATA_DIRECT="
-                    << Environ::Get().GetRdmaDataDirect();
+                    << globalConfig().rdma_data_direct;
         return ERR_CONTEXT;
     }
     return 0;
@@ -1525,7 +1524,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // not just GPUs listing it as preferred.  Runtime selection falls
         // back to avail_hca when a preferred NIC is disabled, so we must
         // validate both lists.
-        if (!Environ::Get().GetWithNvidiaPeermem()) {
+        if (!globalConfig().with_nvidia_peermem) {
             std::vector<int> mapped_gpu_devices;
             if (engine_.local_topology_) {
                 const auto topology_matrix =
@@ -1602,7 +1601,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                     }
                 }
             }
-        }  // !Environ::Get().GetWithNvidiaPeermem()
+        }  // !globalConfig().with_nvidia_peermem
 #endif
 
         ibv_port_attr port_attr;
