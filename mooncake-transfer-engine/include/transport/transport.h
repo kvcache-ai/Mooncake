@@ -142,7 +142,7 @@ class Transport {
         }
         std::string source_location;
         SliceStatus status;
-        TransferTask *task;
+        std::atomic<TransferTask *> task;
         // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
         // are 32-bit. Use a scoped alias so the width is defined in one place.
 #if defined(USE_EFA) || defined(USE_CXI)
@@ -228,22 +228,23 @@ class Transport {
 
         void markSuccess() {
             status = Slice::SUCCESS;
-            __atomic_fetch_add(&task->transferred_bytes, length,
-                               __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
+            TransferTask *t = task.load(std::memory_order_acquire);
+            __atomic_fetch_add(&t->transferred_bytes, length, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&t->success_slice_count, 1, __ATOMIC_ACQ_REL);
             // Second CQ RMW: handshake word. success_slice_count stays for
             // getTransferStatus; packing both into one word is a follow-up.
-            const uint64_t state = __atomic_add_fetch(&task->completion_state,
-                                                      1, __ATOMIC_ACQ_REL);
-            finishIfComplete(task, state, false);
+            const uint64_t state = __atomic_add_fetch(&t->completion_state, 1,
+                                                      __ATOMIC_ACQ_REL);
+            finishIfComplete(t, state, false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
-            const uint64_t state = __atomic_add_fetch(&task->completion_state,
-                                                      1, __ATOMIC_ACQ_REL);
-            finishIfComplete(task, state, true);
+            TransferTask *t = task.load(std::memory_order_acquire);
+            __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
+            const uint64_t state = __atomic_add_fetch(&t->completion_state, 1,
+                                                      __ATOMIC_ACQ_REL);
+            finishIfComplete(t, state, true);
         }
 
         static void unsealTaskSubmission(TransferTask *task) {
