@@ -53,7 +53,6 @@ JitKernelVariant make_variant(const void* identity) {
     variant.runtime_key = 1;
     variant.num_blocks = 1;
     variant.block_dim = 32;
-    // The engine defaults to sm_90; mooncake-ep also builds for sm_80.
     variant.min_sm = 80;
     return variant;
 }
