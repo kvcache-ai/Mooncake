@@ -115,23 +115,30 @@ Redis authentication can come from URL-embedded credentials or from `MC_REDIS_US
 
 ## Check Without Native Build
 
-`mooncake-transport-sys` builds the upstream Mooncake TE/TENT native libraries by default.
-Developer machines that only need Rust type analysis can skip that native CMake step:
+`mooncake-transport-sys` compiles native shims against TE/TENT artifacts from an existing
+Mooncake CMake build tree. `MOONCAKE_ROOT_DIR` and `MOONCAKE_BUILD_DIR` come from the enclosing
+CMake build or must be set to absolute paths for direct Cargo builds. The build script never
+configures another Mooncake build.
+
+The enclosing CMake target builds the required native targets before Rust:
+
+```bash
+cmake -S /path/to/Mooncake -B /path/to/Mooncake-build \
+  -DWITH_STORE_RS=ON -DWITH_TE=ON -DUSE_TENT=ON \
+  -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
+cmake --build /path/to/Mooncake-build --target build_store_rs
+```
+
+Developer machines that only need Rust type analysis can skip native shim compilation:
 
 ```bash
 MOONCAKE_SKIP_NATIVE_BUILD=1 cargo check
 ```
 
 This is intended for IDE analysis and for build environments that provide native artifacts through
-`MOONCAKE_UPSTREAM_BUILD_DIR` and the explicit shim library path variables. Runtime builds that need
-fresh TE/TENT artifacts should leave `MOONCAKE_SKIP_NATIVE_BUILD` unset.
-The native build defaults to the enclosing Mooncake repository and its
-`build-rust` directory. Its CMake configuration owns the pinned FetchContent
-dependencies, including header-only yalantinglibs. On a fresh checkout CMake
-populates `_deps` before the Rust shims compile against those headers; a reused
-build tree with missing headers is configured again. Native builds share this
-dependency source with the wheel helpers and require no separate yalantinglibs
-installation.
+`MOONCAKE_BUILD_DIR` and the explicit shim library path variables. Runtime builds require
+an existing CMake build tree with the TE, TENT, and yalantinglibs artifacts; the enclosing CMake
+targets establish that dependency before Cargo compiles the shims.
 
 ## Enable Routed Writes
 

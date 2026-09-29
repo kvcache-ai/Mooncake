@@ -33,29 +33,21 @@ _NATIVE_LIBRARY_ENV_VARS = {
     "libmooncake_tent_shim.so": "MOONCAKE_TENT_SHIM_LIB_PATH",
 }
 
-# Build directories an upstream Mooncake checkout may have been configured into,
-# and the artefact locations within each.
-_UPSTREAM_BUILD_DIRS = ("build", "build-rust", "build-wheel-compat")
-_UPSTREAM_LIB_SUBDIRS = (
+# Artefact locations within the CMake build directory.
+_BUILD_LIB_SUBDIRS = (
     # upstream relocated libasio.so from mooncake-asio/ to mooncake-common/
     ("mooncake-common",),
     ("mooncake-asio",),
     ("mooncake-transfer-engine", "src"),
     ("mooncake-transfer-engine", "tent", "src"),
 )
-_UPSTREAM_BIN_SUBDIRS = (
-    ("mooncake-store", "src"),
-    ("mooncake-transfer-engine", "example"),
-)
+
+
+_BUILD_BIN_SUBDIRS = (("mooncake-transfer-engine", "example"),)
 
 
 def package_dir() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent
-
-
-def repo_root(package_root: pathlib.Path | None = None) -> pathlib.Path:
-    root = package_root if package_root is not None else package_dir()
-    return root.parent.parent
 
 
 def resolve_first(candidates: list[pathlib.Path]) -> pathlib.Path | None:
@@ -65,6 +57,16 @@ def resolve_first(candidates: list[pathlib.Path]) -> pathlib.Path | None:
     return None
 
 
+def explicit_path(name: str) -> pathlib.Path | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    path = pathlib.Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{name} must be an absolute path: {path}")
+    return path
+
+
 def safe_resolve(path: pathlib.Path) -> pathlib.Path | None:
     try:
         return path.expanduser().resolve()
@@ -72,55 +74,19 @@ def safe_resolve(path: pathlib.Path) -> pathlib.Path | None:
         return None
 
 
-def source_tree_root(package_root: pathlib.Path | None = None) -> pathlib.Path | None:
-    """The checkout this package was imported from, or None when installed.
-
-    `repo_root` answers unconditionally, which for a wheel install points at
-    whatever happens to sit two levels above ``site-packages``. Build-tree
-    lookups must not follow it there, so they ask this instead.
-    """
-    candidate = repo_root(package_root)
-    if (candidate / "Cargo.toml").is_file() and (candidate / "crates").is_dir():
-        return candidate
-    return None
-
-
-def upstream_roots(package_root: pathlib.Path | None = None) -> list[pathlib.Path]:
-    """Checkouts of upstream Mooncake that may hold built artefacts.
-
-    Both supported layouts are probed without configuration: a standalone
-    checkout vendors upstream at ``third_party/Mooncake``, while inside the
-    Mooncake monorepo the upstream tree *is* an ancestor directory. A candidate
-    only counts if it actually looks like Mooncake, which keeps walking upwards
-    from finding false positives.
-    """
-    candidates: list[pathlib.Path] = []
-
-    configured = os.environ.get("MOONCAKE_UPSTREAM_DIR")
-    if configured:
-        candidates.append(pathlib.Path(configured).expanduser())
-
-    source_root = source_tree_root(package_root)
-    if source_root is not None:
-        candidates.append(source_root / "third_party" / "Mooncake")
-        candidates.extend(list(source_root.parents)[:3])
-
-    return [
-        candidate
-        for candidate in candidates
-        if (candidate / "mooncake-transfer-engine").is_dir()
-    ]
+def source_tree_root() -> pathlib.Path | None:
+    """Store-RS checkout explicitly configured for development resources."""
+    return explicit_path("MOONCAKE_STORE_RS_DIR")
 
 
 def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]:
     root = package_root if package_root is not None else package_dir()
     candidates: list[pathlib.Path] = []
 
-    configured_build = os.environ.get("MOONCAKE_UPSTREAM_BUILD_DIR")
-    if configured_build:
-        build_root = pathlib.Path(configured_build).expanduser()
+    build_root = explicit_path("MOONCAKE_BUILD_DIR")
+    if build_root is not None:
         candidates.extend(
-            build_root.joinpath(*parts) for parts in _UPSTREAM_LIB_SUBDIRS
+            build_root.joinpath(*parts) for parts in _BUILD_LIB_SUBDIRS
         )
 
     candidates.extend(
@@ -133,13 +99,6 @@ def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]
             root.parent / "mooncake.libs",
         ]
     )
-
-    for upstream in upstream_roots(root):
-        for build_dir in _UPSTREAM_BUILD_DIRS:
-            candidates.extend(
-                (upstream / build_dir).joinpath(*parts)
-                for parts in _UPSTREAM_LIB_SUBDIRS
-            )
 
     resolved: list[pathlib.Path] = []
     seen: set[pathlib.Path] = set()
@@ -213,17 +172,16 @@ def binary_path(
     root = package_root if package_root is not None else package_dir()
     candidates = [root / binary_name]
 
-    source_root = source_tree_root(root)
+    source_root = source_tree_root()
     if source_root is not None:
         candidates.append(source_root / "dist" / "bin" / binary_name)
         candidates.append(source_root / "target" / "release" / binary_name)
 
-    for upstream in upstream_roots(root):
-        for build_dir in _UPSTREAM_BUILD_DIRS:
-            candidates.extend(
-                (upstream / build_dir).joinpath(*parts) / binary_name
-                for parts in _UPSTREAM_BIN_SUBDIRS
-            )
+    build_root = explicit_path("MOONCAKE_BUILD_DIR")
+    if build_root is not None:
+        candidates.extend(
+            build_root.joinpath(*parts) / binary_name for parts in _BUILD_BIN_SUBDIRS
+        )
 
     resolved = resolve_first(candidates)
     if resolved is None:

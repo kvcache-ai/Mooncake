@@ -8,12 +8,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
-# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
-# where the git toplevel is the enclosing repository rather than this tree.
-[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store-rs"
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
 # shellcheck disable=SC1091
-source "${REPO_ROOT}/scripts/lib/common.sh"
+source "${SCRIPT_DIR}/lib/common.sh"
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOG_DIR_DEFAULT="${REPO_ROOT}/target/regression-logs/scripts-ci-${STAMP}"
 
@@ -138,6 +135,12 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
+[[ "${REPO_ROOT}" == /* && -d "${REPO_ROOT}" ]] || {
+  echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${REPO_ROOT}" >&2
+  exit 1
+}
 
 contains_tag() {
   local needle=$1

@@ -62,10 +62,6 @@ pub struct TransferBatchHints {
     pub max_inflight_bytes: Option<u64>,
 }
 
-pub fn default_upstream_build_dir() -> &'static str {
-    mooncake_transport_sys::DEFAULT_UPSTREAM_BUILD_DIR
-}
-
 pub fn rdma_device_max_registration_size() -> Option<usize> {
     usize::try_from(unsafe { mooncake_transport_sys::tent::mooncake_tent_probe_rdma_max_mr_size() })
         .ok()
@@ -87,9 +83,8 @@ pub(crate) fn clamp_registration_size(
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_registration_size, default_upstream_build_dir, rdma_device_max_registration_size,
-        Opcode, TransferBatchHints, TransferPacingMode, TransferProgress, TransferRequest,
-        TransferStatus, TransportEngineKind,
+        clamp_registration_size, rdma_device_max_registration_size, Opcode, TransferBatchHints,
+        TransferPacingMode, TransferProgress, TransferRequest, TransferStatus, TransportEngineKind,
     };
 
     #[test]
@@ -133,7 +128,6 @@ mod tests {
             TransportEngineKind::ClassicTe,
             TransportEngineKind::ClassicTe
         );
-        assert!(!default_upstream_build_dir().is_empty());
     }
 
     #[test]

@@ -5,10 +5,6 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_UPSTREAM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../");
-pub const DEFAULT_UPSTREAM_BUILD_DIR: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../build-rust");
-
 const WHEEL_LIB_DIRS: [&str; 2] = ["mooncake.libs", "mooncake_store_rs.libs"];
 
 #[derive(Copy, Clone)]
@@ -111,17 +107,14 @@ fn library_search_dirs() -> Vec<PathBuf> {
             add_base_search_dirs(executable_dir, &mut dirs);
         }
     }
-    add_upstream_search_dirs(Path::new(DEFAULT_UPSTREAM_BUILD_DIR), &mut dirs);
-    add_upstream_search_dirs(
-        &Path::new(DEFAULT_UPSTREAM_DIR).join("build-wheel-compat"),
-        &mut dirs,
-    );
-    if let Some(build_dir) = env::var_os("MOONCAKE_UPSTREAM_BUILD_DIR").map(PathBuf::from) {
+    if let Some(build_dir) = env::var_os("MOONCAKE_BUILD_DIR").filter(|path| !path.is_empty()) {
+        let build_dir = PathBuf::from(build_dir);
+        assert!(
+            build_dir.is_absolute(),
+            "MOONCAKE_BUILD_DIR must be an absolute path: {}",
+            build_dir.display()
+        );
         add_upstream_search_dirs(&build_dir, &mut dirs);
-    }
-    if let Some(upstream_dir) = env::var_os("MOONCAKE_UPSTREAM_DIR").map(PathBuf::from) {
-        add_upstream_search_dirs(&upstream_dir.join("build-rust"), &mut dirs);
-        add_upstream_search_dirs(&upstream_dir.join("build-wheel-compat"), &mut dirs);
     }
     dirs
 }

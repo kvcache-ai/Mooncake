@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+ROOT_DIR=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
+[[ "${ROOT_DIR}" == /* && -d "${ROOT_DIR}" ]] || {
+  echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${ROOT_DIR}" >&2
+  exit 1
+}
 BINARY="${NOF_BINARY:-${ROOT_DIR}/target/debug/nof_multi_client}"
 LOG_DIR="${NOF_LOG_DIR:-${ROOT_DIR}/target/nof-multi-client}"
 RUN_TAG="${NOF_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"

@@ -2,12 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
-# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
-# where the git toplevel is the enclosing repository rather than this tree.
-[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store-rs"
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
 # shellcheck disable=SC1091
-source "${REPO_ROOT}/scripts/lib/common.sh"
+source "${SCRIPT_DIR}/../../lib/common.sh"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 MODE="${1:-all}"
 TRANSPORT_BACKEND="${MC_STORE_RS_TRANSPORT_BACKEND:-classic-te}"
@@ -34,8 +31,9 @@ Environment:
   MC_STORE_RS_ROUTE_CONTROL   Route control mode (`embedded-wrh` by default)
   MC_STORE_RS_ROUTE_TOPK      Embedded WRH top-k authority count (default: 2)
   MC_STORE_RS_TEST_PROTOCOL   Transport protocol (`tcp` by default)
-  MOONCAKE_UPSTREAM_DIR       Mooncake upstream submodule path
-  MOONCAKE_UPSTREAM_BUILD_DIR Explicit upstream build directory override
+  MOONCAKE_STORE_RS_DIR       Absolute Store-RS source directory
+  MOONCAKE_ROOT_DIR            Absolute Mooncake source directory
+  MOONCAKE_BUILD_DIR           Absolute Mooncake CMake build directory
   MC_STORE_RS_CLIENT_RW_BIN   Optional explicit standalone client binary path.
 EOF
 }
@@ -120,8 +118,7 @@ mc_scripts_require_command python3
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
 
-UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
-mc_scripts_setup_upstream_runtime_env "${REPO_ROOT}" python "${UPSTREAM_BUILD_DIR}"
+mc_scripts_setup_upstream_runtime_env python
 export PYTHONDONTWRITEBYTECODE=1
 
 mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED

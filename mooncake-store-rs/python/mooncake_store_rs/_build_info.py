@@ -5,7 +5,7 @@ import pathlib
 import subprocess
 from types import MappingProxyType
 
-from ._runtime import package_dir, repo_root
+from ._runtime import package_dir, source_tree_root
 
 _BUILD_INFO_FILE = "build-info.json"
 _UNKNOWN = "unknown"
@@ -43,8 +43,8 @@ def _read_packaged_build_info() -> dict[str, str] | None:
 
 
 def _git_output(*args: str) -> str | None:
-    repository = repo_root()
-    if not (repository / ".git").exists():
+    repository = source_tree_root()
+    if repository is None:
         return None
     try:
         completed = subprocess.run(

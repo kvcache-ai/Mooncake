@@ -1,11 +1,60 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
-# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
-# where the git toplevel is the enclosing repository rather than this tree.
-[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store-rs"
+usage() {
+  cat <<'EOF'
+Usage: scripts/build/build-wheel.sh [maturin build args...]
+
+Required path environment:
+  MOONCAKE_STORE_RS_DIR       mooncake-store-rs package root
+  MOONCAKE_ROOT_DIR       Mooncake source root
+  MOONCAKE_BUILD_DIR CMake build directory for Mooncake native targets
+
+Environment:
+  PYTHON                     Python interpreter used to create the build venv
+  WHEEL_VENV                 Virtualenv directory for build tools
+  DIST_DIR                   Output directory for wheel and binary artifacts
+  PYBIND11_PREBUILT_DIR      Prebuilt pybind11 directory (if set, use instead of submodule)
+  MOONCAKE_REUSE_NATIVE_ARTIFACTS
+                             Reuse native assets already present in the CMake build directory
+  BUILD_JOBS                 Parallel jobs for CMake builds
+
+Example:
+  MOONCAKE_STORE_RS_DIR=/path/to/mooncake-store-rs \
+  MOONCAKE_ROOT_DIR=/path/to/Mooncake \
+  MOONCAKE_BUILD_DIR=/path/to/Mooncake-build \
+  ./scripts/build/build-wheel.sh --interpreter python3.11
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit path}
+UPSTREAM_DIR=${MOONCAKE_ROOT_DIR:?MOONCAKE_ROOT_DIR must be set to an explicit path}
+UPSTREAM_BUILD_DIR=${MOONCAKE_BUILD_DIR:?MOONCAKE_BUILD_DIR must be set to an explicit path}
+for path in "${REPO_ROOT}" "${UPSTREAM_DIR}" "${UPSTREAM_BUILD_DIR}"; do
+  if [[ "${path}" != /* ]]; then
+    echo "all MOONCAKE_*_DIR paths must be absolute: ${path}" >&2
+    exit 1
+  fi
+done
+for directory in "${REPO_ROOT}" "${UPSTREAM_DIR}"; do
+  if [[ ! -d "${directory}" ]]; then
+    echo "required source directory does not exist: ${directory}" >&2
+    exit 1
+  fi
+done
+if [[ ! -d "${REPO_ROOT}/crates/mooncake-store-py" ]]; then
+  echo "MOONCAKE_STORE_RS_DIR must point to the mooncake-store-rs package root: ${REPO_ROOT}" >&2
+  exit 1
+fi
+if [[ ! -d "${UPSTREAM_DIR}/mooncake-transfer-engine" || ! -d "${UPSTREAM_DIR}/mooncake-common" ]]; then
+  echo "MOONCAKE_ROOT_DIR must point to the Mooncake source root: ${UPSTREAM_DIR}" >&2
+  exit 1
+fi
 
 # ── Timing helpers (only print when CI=true or TIMING=1) ──
 _WHEEL_TIMING=${TIMING:-${CI:-0}}
@@ -24,48 +73,10 @@ VENV_DIR=${WHEEL_VENV:-"${REPO_ROOT}/.venv-wheel"}
 DIST_DIR=${DIST_DIR:-"${REPO_ROOT}/dist"}
 WHEEL_DIR="${DIST_DIR}/wheels"
 BIN_DIR="${DIST_DIR}/bin"
-UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR:-"${REPO_ROOT}/third_party/Mooncake"}
-# Inside the Mooncake monorepo the upstream tree is the enclosing repository
-# rather than a submodule. Both arms are guarded on a transfer-engine
-# directory, so an uninitialised submodule keeps the submodule path and
-# fails with that name rather than silently pointing somewhere unrelated.
-if [ ! -d "${UPSTREAM_DIR}/mooncake-transfer-engine" ] \
-  && [ -d "${REPO_ROOT}/../mooncake-transfer-engine" ]; then
-  UPSTREAM_DIR=$(cd "${REPO_ROOT}/.." && pwd)
-fi
-UPSTREAM_BUILD_DIR=${MOONCAKE_UPSTREAM_BUILD_DIR:-"${UPSTREAM_DIR}/build-wheel-compat"}
 BUILD_JOBS=${BUILD_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 8)}
 BUILD_GIT_BRANCH=${MC_BUILD_GIT_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}
 BUILD_GIT_COMMIT=${MC_BUILD_GIT_COMMIT:-$(git -C "${REPO_ROOT}" rev-parse HEAD)}
 BUILD_TIME=${MC_BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
-
-usage() {
-  cat <<'EOF'
-Usage: scripts/build/build-wheel.sh [maturin build args...]
-
-Environment:
-  PYTHON                     Python interpreter used to create the build venv
-  WHEEL_VENV                 Virtualenv directory for build tools
-  DIST_DIR                   Output directory for wheel and binary artifacts
-  MOONCAKE_UPSTREAM_DIR      Mooncake upstream source tree
-  MOONCAKE_UPSTREAM_BUILD_DIR  Upstream build directory used for engine/CLI assets
-  PYBIND11_PREBUILT_DIR      Prebuilt pybind11 directory (if set, use instead of submodule)
-  MOONCAKE_REUSE_NATIVE_ARTIFACTS
-                             Reuse existing native assets in MOONCAKE_UPSTREAM_BUILD_DIR
-                             instead of configuring/building upstream CMake targets
-  BUILD_JOBS                 Parallel jobs for CMake builds
-
-Examples:
-  ./scripts/build/build-wheel.sh
-  ./scripts/build/build-wheel.sh --interpreter python3.11
-  DIST_DIR=artifacts ./scripts/build/build-wheel.sh --compatibility manylinux_2_28
-EOF
-}
-
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
-  exit 0
-fi
 
 MATURIN_ARGS=("$@")
 HAS_COMPATIBILITY=0
@@ -404,7 +415,7 @@ if is_truthy "${MOONCAKE_REUSE_NATIVE_ARTIFACTS:-0}"; then
 else
   # 如果设置了 SKIP_SUBMODULE_UPDATE，跳过 submodule 更新（CI 环境中 checkout 已处理）
   if [[ -z "${SKIP_SUBMODULE_UPDATE:-}" ]]; then
-    git -C "${REPO_ROOT}" submodule update --init --recursive
+    git -C "${UPSTREAM_DIR}" submodule update --init --recursive
   fi
   ensure_pybind11
   _timer_elapsed $_WHEEL_GLOBAL_START "setup (venv + deps + pybind11)"
@@ -463,8 +474,9 @@ else
   _timer_elapsed $_CMAKE_BUILD_START "cmake build (static engine + C++ libs)"
 fi
 
-export MOONCAKE_UPSTREAM_DIR="${UPSTREAM_DIR}"
-export MOONCAKE_UPSTREAM_BUILD_DIR="${UPSTREAM_BUILD_DIR}"
+export MOONCAKE_ROOT_DIR="${UPSTREAM_DIR}"
+export MOONCAKE_BUILD_DIR="${UPSTREAM_BUILD_DIR}"
+export MOONCAKE_STORE_RS_DIR="${REPO_ROOT}"
 
 _CARGO_BUILD_START=$(_timer_start)
 cargo build \
@@ -535,8 +547,7 @@ store_bench_path = pathlib.Path(sys.argv[7])
 build_git_branch = sys.argv[8]
 build_git_commit = sys.argv[9]
 build_time = sys.argv[10]
-# Passed in rather than derived: upstream is a submodule in a standalone
-# checkout but the enclosing repository inside the Mooncake monorepo.
+# Use the explicitly selected Mooncake source root for its packaged Python assets.
 upstream_dir = pathlib.Path(sys.argv[11])
 upstream_py_dir = upstream_dir / "mooncake-wheel" / "mooncake"
 transport_shim_out_dirs = sorted(transport_build_dir.glob("mooncake-transport-sys-*/out"))

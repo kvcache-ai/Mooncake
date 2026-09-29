@@ -2,18 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
-# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
-# where the git toplevel is the enclosing repository rather than this tree.
-[ -f "${ROOT_DIR}/Cargo.toml" ] || ROOT_DIR="${ROOT_DIR}/mooncake-store-rs"
+ROOT_DIR=${MOONCAKE_STORE_RS_DIR:-}
 # shellcheck disable=SC1091
-source "${ROOT_DIR}/scripts/lib/common.sh"
+source "${SCRIPT_DIR}/../lib/common.sh"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 mc_scripts_require_command cargo
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
-UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${ROOT_DIR}")
-mc_scripts_setup_upstream_runtime_env "${ROOT_DIR}" python "${UPSTREAM_BUILD_DIR}"
+mc_scripts_setup_upstream_runtime_env python
 mc_scripts_start_local_redis_if_needed "${REDIS_PORT}"
 export PYTHONDONTWRITEBYTECODE=1
 export MC_STORE_RS_REDIS_URL="${MC_STORE_RS_REDIS_URL:-redis://127.0.0.1:${REDIS_PORT}/0}"

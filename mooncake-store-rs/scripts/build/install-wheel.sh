@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
-# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
-# where the git toplevel is the enclosing repository rather than this tree.
-[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store-rs"
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
 
 default_python() {
   if [[ -n "${PYTHON:-}" ]]; then
@@ -16,7 +12,7 @@ default_python() {
     printf '%s\n' "${VIRTUAL_ENV}/bin/python"
     return 0
   fi
-  if [[ -x "${REPO_ROOT}/.venv-wheel/bin/python" ]]; then
+  if [[ -n "${REPO_ROOT}" && -x "${REPO_ROOT}/.venv-wheel/bin/python" ]]; then
     printf '%s\n' "${REPO_ROOT}/.venv-wheel/bin/python"
     return 0
   fi
@@ -24,8 +20,16 @@ default_python() {
 }
 
 PYTHON_BIN=$(default_python)
-WHEEL_DIR=${WHEEL_DIR:-"${REPO_ROOT}/dist/wheels"}
 WHEEL_PATH=${1:-}
+if [[ -z "${WHEEL_PATH}" && -z "${WHEEL_DIR:-}" ]]; then
+  REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?set MOONCAKE_STORE_RS_DIR, WHEEL_DIR, or pass an explicit wheel path}
+  [[ "${REPO_ROOT}" == /* && -d "${REPO_ROOT}" ]] || {
+    echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${REPO_ROOT}" >&2
+    exit 1
+  }
+  WHEEL_DIR="${REPO_ROOT}/dist/wheels"
+fi
+WHEEL_DIR=${WHEEL_DIR:-$(dirname "${WHEEL_PATH}")}
 
 if [[ -z "${WHEEL_PATH}" ]]; then
   WHEEL_PATH=$(ls -1t "${WHEEL_DIR}"/mooncake_store_rs-*.whl 2>/dev/null | head -n 1 || true)

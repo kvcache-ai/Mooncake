@@ -36,60 +36,15 @@ mc_scripts_require_command() {
   exit 1
 }
 
-mc_scripts_list_upstream_dirs() {
-  local repo_root=$1
-  local primary_worktree
-
-  if [[ -n "${MOONCAKE_UPSTREAM_DIR:-}" ]]; then
-    printf '%s\n' "${MOONCAKE_UPSTREAM_DIR}"
-  fi
-  printf '%s\n' "${repo_root}/third_party/Mooncake"
-
-  # Inside the Mooncake monorepo the upstream tree is the enclosing repository
-  # rather than a submodule; identify it by its transfer-engine module so this
-  # does not latch onto an unrelated parent directory.
-  if [[ -d "${repo_root}/../mooncake-transfer-engine" ]]; then
-    (cd "${repo_root}/.." && pwd)
-  fi
-
-  if primary_worktree=$(git -C "${repo_root}" worktree list --porcelain 2>/dev/null | awk '/^worktree / { print substr($0, 10); exit }'); then
-    if [[ -n "${primary_worktree}" && "${primary_worktree}" != "${repo_root}" ]]; then
-      printf '%s\n' "${primary_worktree}/third_party/Mooncake"
-    fi
-  fi
-}
-
 mc_scripts_resolve_upstream_build_dir() {
-  local repo_root=$1
-  local candidates=()
-  local candidate
-  local upstream_dir
-
-  if [[ -n "${MOONCAKE_UPSTREAM_BUILD_DIR:-}" ]]; then
-    candidates+=("${MOONCAKE_UPSTREAM_BUILD_DIR}")
+  local build_dir=${MOONCAKE_BUILD_DIR:?MOONCAKE_BUILD_DIR must be set to an explicit CMake build directory}
+  [[ "${build_dir}" == /* ]] || { echo "MOONCAKE_BUILD_DIR must be an absolute path: ${build_dir}" >&2; exit 1; }
+  if [[ ! -f "${build_dir}/mooncake-transfer-engine/src/libtransfer_engine.so" ]] \
+    || [[ ! -f "${build_dir}/mooncake-transfer-engine/tent/src/libtent_shared.so" ]]; then
+    echo "MOONCAKE_BUILD_DIR must contain the built Transfer Engine and TENT libraries: ${build_dir}" >&2
+    exit 1
   fi
-
-  while IFS= read -r upstream_dir; do
-    [[ -z "${upstream_dir}" ]] && continue
-    candidates+=(
-      "${upstream_dir}/build-rust"
-      "${upstream_dir}/build-wheel-compat"
-    )
-  done < <(mc_scripts_list_upstream_dirs "${repo_root}")
-
-  for candidate in "${candidates[@]}"; do
-    if [[ -f "${candidate}/mooncake-transfer-engine/src/libtransfer_engine.so" ]] \
-      && [[ -f "${candidate}/mooncake-transfer-engine/tent/src/libtent_shared.so" ]]; then
-      printf '%s\n' "${candidate}"
-      return 0
-    fi
-  done
-
-  echo "unable to find Mooncake runtime libraries under any known Mooncake upstream tree" >&2
-  echo "checked candidates:" >&2
-  printf '  %s\n' "${candidates[@]}" >&2
-  echo "set MOONCAKE_UPSTREAM_BUILD_DIR to a built upstream directory" >&2
-  exit 1
+  printf '%s\n' "${build_dir}"
 }
 
 mc_scripts_prepend_env_path() {
@@ -118,18 +73,15 @@ mc_scripts_prepend_env_path() {
 }
 
 mc_scripts_setup_upstream_runtime_env() {
-  local repo_root=$1
-  local pythonpath_mode=${2:-none}
-  local build_dir=${3:-}
-  local upstream_dir
-
-  if [[ -z "${build_dir}" ]]; then
-    build_dir=$(mc_scripts_resolve_upstream_build_dir "${repo_root}")
-  fi
-  upstream_dir=$(cd -- "${build_dir}/.." && pwd)
-
-  export MOONCAKE_UPSTREAM_DIR="${upstream_dir}"
-  export MOONCAKE_UPSTREAM_BUILD_DIR="${build_dir}"
+  local pythonpath_mode=${1:-none}
+  local source_root=${MOONCAKE_ROOT_DIR:?MOONCAKE_ROOT_DIR must be set to an explicit Mooncake source directory}
+  local store_rs_root=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
+  local build_dir
+  [[ "${source_root}" == /* ]] || { echo "MOONCAKE_ROOT_DIR must be an absolute path: ${source_root}" >&2; exit 1; }
+  [[ "${store_rs_root}" == /* ]] || { echo "MOONCAKE_STORE_RS_DIR must be an absolute path: ${store_rs_root}" >&2; exit 1; }
+  [[ -d "${source_root}" ]] || { echo "MOONCAKE_ROOT_DIR must be a directory: ${source_root}" >&2; exit 1; }
+  [[ -d "${store_rs_root}" ]] || { echo "MOONCAKE_STORE_RS_DIR must be a directory: ${store_rs_root}" >&2; exit 1; }
+  build_dir=$(mc_scripts_resolve_upstream_build_dir)
   mc_scripts_prepend_env_path \
     LD_LIBRARY_PATH \
     "${build_dir}/mooncake-transfer-engine/src" \
@@ -139,10 +91,10 @@ mc_scripts_setup_upstream_runtime_env() {
     none)
       ;;
     python)
-      mc_scripts_prepend_env_path PYTHONPATH "${repo_root}/python"
+      mc_scripts_prepend_env_path PYTHONPATH "${store_rs_root}/python"
       ;;
     repo-python)
-      mc_scripts_prepend_env_path PYTHONPATH "${repo_root}" "${repo_root}/python"
+      mc_scripts_prepend_env_path PYTHONPATH "${store_rs_root}" "${store_rs_root}/python"
       ;;
     *)
       echo "unsupported python path mode: ${pythonpath_mode}" >&2

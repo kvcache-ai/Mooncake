@@ -17,18 +17,24 @@ Runtime-local CLI, Python, and environment route/resource knobs remain available
 - Rust toolchain
 - `cmake` and a C++ toolchain
 - `redis-server` and `redis-cli`
-- Git submodule support
+- Git submodule support for native dependencies used by wheel builds
 - Python 3, if you want to run the Python compatibility layer
 
 ## Prepare the Repository
 
-Fetch the upstream Mooncake submodule before building the transport layer:
+Set the Store-RS source, Mooncake source, and CMake build paths explicitly. Each
+path must be absolute. Build Transfer Engine and TENT into the selected CMake
+build directory before running local scripts:
 
 ```bash
-git submodule update --init --recursive
+export MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs
+export MOONCAKE_ROOT_DIR=/path/to/Mooncake
+export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
+cmake -S "${MOONCAKE_ROOT_DIR}" -B "${MOONCAKE_BUILD_DIR}" \
+  -DWITH_TE=ON -DUSE_TENT=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON
+cmake --build "${MOONCAKE_BUILD_DIR}" --target transfer_engine tent_shared
 ```
-
-The repository expects the upstream sources at `third_party/Mooncake`.
 
 ## Large-Memory Classic RDMA Bring-Up
 
@@ -51,9 +57,9 @@ Run the full Rust end-to-end suite and the built-in batch benchmark:
 
 What the script does:
 
-- checks that `third_party/Mooncake` exists
+- requires the three explicit absolute path variables from the prepare step
 - starts a local Redis instance on port `6380` when needed
-- sets `LD_LIBRARY_PATH` for the upstream TE/TENT artifacts
+- sets `LD_LIBRARY_PATH` from `MOONCAKE_BUILD_DIR`
 - runs `cargo run --release -p mooncake-store-e2e`
 
 Supported script inputs:
@@ -63,8 +69,9 @@ Supported script inputs:
 | `MC_STORE_RS_REDIS_PORT` | `6380` | local Redis port |
 | `MC_STORE_RS_BENCH_ITERS` | `64` | batch benchmark loop count passed into the local Rust e2e |
 | `MC_STORE_RS_VALUE_SIZE` | `4096` | payload size used by e2e |
-| `MOONCAKE_UPSTREAM_DIR` | `third_party/Mooncake` | upstream source location |
-| `MOONCAKE_UPSTREAM_BUILD_DIR` | `third_party/Mooncake/build-rust` | upstream build output location |
+| `MOONCAKE_STORE_RS_DIR` | required absolute path | Store-RS source location |
+| `MOONCAKE_ROOT_DIR` | required absolute path | Mooncake source location |
+| `MOONCAKE_BUILD_DIR` | required absolute path | Mooncake CMake build output |
 
 ### Python compatibility e2e
 

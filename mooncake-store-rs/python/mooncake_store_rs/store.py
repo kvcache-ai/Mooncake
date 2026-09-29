@@ -17,14 +17,18 @@ import threading
 from dataclasses import dataclass, field
 import warnings
 
-from ._runtime import package_dir, preload_native_libraries
+from ._runtime import (
+    explicit_path,
+    package_dir,
+    preload_native_libraries,
+    source_tree_root,
+)
 
 _logger = logging.getLogger("mooncake_store_rs.store")
 
 
 def _load_native():
     root = package_dir()
-    repo_root = root.parent.parent
     preload_native_libraries(root)
     try:
         from . import _store_rs as native  # type: ignore
@@ -33,10 +37,12 @@ def _load_native():
     except Exception:
         target_roots: list[pathlib.Path] = []
         for env_key in ("MOONCAKE_PYTHON_TARGET_DIR", "CARGO_TARGET_DIR"):
-            env_value = os.environ.get(env_key)
-            if env_value:
-                target_roots.append(pathlib.Path(env_value).expanduser())
-        target_roots.append(repo_root / "target")
+            configured_target = explicit_path(env_key)
+            if configured_target is not None:
+                target_roots.append(configured_target)
+        store_rs_root = source_tree_root()
+        if store_rs_root is not None:
+            target_roots.append(store_rs_root / "target")
         suffixes = list(importlib.machinery.EXTENSION_SUFFIXES) + [".so"]
         patterns = []
         for suffix in suffixes:

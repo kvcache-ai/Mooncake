@@ -732,8 +732,9 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |
 | `MC_STORE_USE_HUGEPAGE` | local memory, standalone client, and Python shm allocator | enable hugepage-backed allocation; standalone client treats `0`, `false`, `no`, or `off` as an explicit disable |
 | `MC_STORE_HUGEPAGE_SIZE` | local memory and Python shm allocator | hugepage size; `2MB` or `1GB` |
-| `MOONCAKE_UPSTREAM_DIR` | local scripts | upstream Mooncake source tree |
-| `MOONCAKE_UPSTREAM_BUILD_DIR` | local scripts | upstream Mooncake build output tree |
+| `MOONCAKE_STORE_RS_DIR` | local scripts and Python source runtime | explicit Store-RS source tree |
+| `MOONCAKE_ROOT_DIR` | local scripts and native shim builds | explicit Mooncake source tree |
+| `MOONCAKE_BUILD_DIR` | local scripts and native runtime loading | explicit Mooncake CMake build output tree |
 
 `mooncake-store-bench` reuses `MC_STORE_RS_TRACE_FILTER` for level control, but
 it has its own trace-file surface. Use `MC_BENCH_TRACE_FILE` for bench logs and

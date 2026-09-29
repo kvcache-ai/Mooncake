@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+ROOT_DIR=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
+[[ "${ROOT_DIR}" == /* && -d "${ROOT_DIR}" ]] || {
+  echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${ROOT_DIR}" >&2
+  exit 1
+}
 
 source "${HOME}/.cargo/env" 2>/dev/null || true
 for command in cargo pkg-config ldd sha256sum; do

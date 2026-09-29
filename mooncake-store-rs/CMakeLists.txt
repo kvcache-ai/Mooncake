@@ -10,37 +10,40 @@
 if(NOT TARGET transfer_engine)
   message(FATAL_ERROR "WITH_STORE_RS=ON requires WITH_TE=ON")
 endif()
+if(NOT TARGET tent_shared)
+  message(FATAL_ERROR "WITH_STORE_RS=ON requires USE_TENT=ON")
+endif()
 
 find_program(CARGO_EXECUTABLE cargo)
 if(NOT CARGO_EXECUTABLE)
   message(FATAL_ERROR "WITH_STORE_RS=ON requires cargo on PATH")
 endif()
 
-# store-rs links the transfer engine through its own shims, so the upstream
-# artefacts have to exist before cargo runs. Passing MOONCAKE_UPSTREAM_BUILD_DIR
-# points build.rs at *this* build tree; without it, build.rs would configure and
-# run a second CMake build of the enclosing repository on its own.
+# store-rs compiles its native shims against the TE and TENT artifacts from
+# this CMake build tree.
 add_custom_target(build_store_rs ALL
   COMMAND
     ${CMAKE_COMMAND} -E env
     CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
-    MOONCAKE_UPSTREAM_DIR=${PROJECT_SOURCE_DIR}
-    MOONCAKE_UPSTREAM_BUILD_DIR=${PROJECT_BINARY_DIR}
+    MOONCAKE_ROOT_DIR=${PROJECT_SOURCE_DIR}
+    MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}
+    MOONCAKE_STORE_RS_DIR=${CMAKE_CURRENT_SOURCE_DIR}
     ${CARGO_EXECUTABLE} build --release
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMENT "Building mooncake-store-rs (Rust workspace)"
   VERBATIM)
-add_dependencies(build_store_rs transfer_engine)
+add_dependencies(build_store_rs transfer_engine tent_shared)
 
 # Tests are compiled but not run here; running them needs Redis or etcd.
 add_custom_target(build_store_rs_tests
   COMMAND
     ${CMAKE_COMMAND} -E env
     CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
-    MOONCAKE_UPSTREAM_DIR=${PROJECT_SOURCE_DIR}
-    MOONCAKE_UPSTREAM_BUILD_DIR=${PROJECT_BINARY_DIR}
+    MOONCAKE_ROOT_DIR=${PROJECT_SOURCE_DIR}
+    MOONCAKE_BUILD_DIR=${PROJECT_BINARY_DIR}
+    MOONCAKE_STORE_RS_DIR=${CMAKE_CURRENT_SOURCE_DIR}
     ${CARGO_EXECUTABLE} test --lib --no-run --release
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMENT "Building mooncake-store-rs tests"
   VERBATIM)
-add_dependencies(build_store_rs_tests transfer_engine)
+add_dependencies(build_store_rs_tests transfer_engine tent_shared)

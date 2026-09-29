@@ -2,12 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
-# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
-# where the git toplevel is the enclosing repository rather than this tree.
-[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store-rs"
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
 # shellcheck disable=SC1091
-source "${REPO_ROOT}/scripts/lib/common.sh"
+source "${SCRIPT_DIR}/../lib/common.sh"
 
 MODE="${1:-move}"
 
@@ -110,8 +107,9 @@ Environment:
                                    Optional explicit admin binary path.
   MC_STORE_RS_ROUTE_MIGRATION_ADMIN_CLI_BIN
                                    Optional explicit admin CLI binary path.
-  MOONCAKE_UPSTREAM_DIR            Mooncake upstream checkout override
-  MOONCAKE_UPSTREAM_BUILD_DIR      Built upstream directory override
+  MOONCAKE_STORE_RS_DIR          Absolute Store-RS source directory
+  MOONCAKE_ROOT_DIR              Absolute Mooncake source directory
+  MOONCAKE_BUILD_DIR             Absolute Mooncake CMake build directory
 EOF
 }
 
@@ -129,6 +127,12 @@ if [[ "${MODE}" != "move" && "${MODE}" != "copy" && "${MODE}" != "copy-multi" ]]
   usage >&2
   exit 1
 fi
+
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
+[[ "${REPO_ROOT}" == /* && -d "${REPO_ROOT}" ]] || {
+  echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${REPO_ROOT}" >&2
+  exit 1
+}
 
 SUBMITTER="${MC_STORE_RS_ROUTE_MIGRATION_SUBMITTER:-http}"
 if [[ "${SUBMITTER}" != "http" && "${SUBMITTER}" != "cli" ]]; then
@@ -224,25 +228,6 @@ while time.time() < deadline:
 
 raise SystemExit(f"admin health check failed for {base_url}: {last_error!r}")
 PY
-}
-
-setup_runtime_loader_env() {
-  local build_dir=$1
-
-  export MOONCAKE_UPSTREAM_BUILD_DIR="${build_dir}"
-  if [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/third_party/Mooncake" ]]; then
-    export MOONCAKE_UPSTREAM_DIR="${REPO_ROOT}/third_party/Mooncake"
-  elif [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/../mooncake-transfer-engine" ]]; then
-    # monorepo layout: upstream is the enclosing repository
-    MOONCAKE_UPSTREAM_DIR=$(cd "${REPO_ROOT}/.." && pwd)
-    export MOONCAKE_UPSTREAM_DIR
-  fi
-
-  mc_scripts_prepend_env_path \
-    LD_LIBRARY_PATH \
-    "${build_dir}/mooncake-transfer-engine/src" \
-    "${build_dir}/mooncake-transfer-engine/tent/src"
-  mc_scripts_prepend_env_path PYTHONPATH "${REPO_ROOT}/python"
 }
 
 prepend_transport_shim_loader_env() {
@@ -349,18 +334,10 @@ if [[ -n "${CLIENT_BIN_OVERRIDE}" || -n "${ADMIN_BIN_OVERRIDE}" ]]; then
   echo "==> reusing prebuilt standalone binaries"
 else
   echo "==> building standalone mooncake-store-client/admin binaries"
-  if [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/third_party/Mooncake" ]]; then
-    export MOONCAKE_UPSTREAM_DIR="${REPO_ROOT}/third_party/Mooncake"
-  elif [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/../mooncake-transfer-engine" ]]; then
-    # monorepo layout: upstream is the enclosing repository
-    MOONCAKE_UPSTREAM_DIR=$(cd "${REPO_ROOT}/.." && pwd)
-    export MOONCAKE_UPSTREAM_DIR
-  fi
   cargo build -p mooncake-store-py
 fi
 
-UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
-setup_runtime_loader_env "${UPSTREAM_BUILD_DIR}"
+mc_scripts_setup_upstream_runtime_env python
 
 TARGET_DIR="${CARGO_TARGET_DIR}"
 BIN="${CLIENT_BIN_OVERRIDE:-${TARGET_DIR}/debug/mooncake-store-client}"

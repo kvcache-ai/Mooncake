@@ -2,20 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
-[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store-rs"
-
-COVERAGE_DIR=${COVERAGE_DIR:-"${REPO_ROOT}/target/coverage"}
-if [[ -n "${MOONCAKE_UPSTREAM_DIR:-}" ]]; then
-  UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR}
-elif [[ -d "${REPO_ROOT}/third_party/Mooncake/mooncake-transfer-engine" ]]; then
-  UPSTREAM_DIR="${REPO_ROOT}/third_party/Mooncake"
-else
-  UPSTREAM_DIR=$(cd -- "${REPO_ROOT}/.." && pwd)
-fi
-SUMMARY_FILE="${COVERAGE_DIR}/summary.txt"
-JSON_FILE="${COVERAGE_DIR}/workspace.json"
-HTML_DIR="${COVERAGE_DIR}/html"
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
+source "${SCRIPT_DIR}/../lib/common.sh"
 
 usage() {
   cat <<'EOF'
@@ -34,8 +22,9 @@ Notes:
 
 Environment:
   COVERAGE_DIR                Output directory for coverage artifacts
-  MOONCAKE_UPSTREAM_DIR       Mooncake upstream source tree
-  MOONCAKE_UPSTREAM_BUILD_DIR Explicit upstream build directory override
+  MOONCAKE_ROOT_DIR       Mooncake upstream source tree
+  MOONCAKE_BUILD_DIR Explicit Mooncake CMake build directory
+  MOONCAKE_STORE_RS_DIR Explicit Store-RS source directory
 EOF
 }
 
@@ -43,6 +32,16 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
 fi
+
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
+[[ "${REPO_ROOT}" == /* && -d "${REPO_ROOT}" ]] || {
+  echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${REPO_ROOT}" >&2
+  exit 1
+}
+COVERAGE_DIR=${COVERAGE_DIR:-"${REPO_ROOT}/target/coverage"}
+SUMMARY_FILE="${COVERAGE_DIR}/summary.txt"
+JSON_FILE="${COVERAGE_DIR}/workspace.json"
+HTML_DIR="${COVERAGE_DIR}/html"
 
 require_command() {
   local cmd=$1
@@ -52,39 +51,13 @@ require_command() {
   fi
 }
 
-resolve_upstream_build_dir() {
-  local candidates=()
-  local candidate
-
-  if [[ -n "${MOONCAKE_UPSTREAM_BUILD_DIR:-}" ]]; then
-    candidates+=("${MOONCAKE_UPSTREAM_BUILD_DIR}")
-  fi
-  candidates+=(
-    "${UPSTREAM_DIR}/build-rust"
-    "${UPSTREAM_DIR}/build-wheel-compat"
-  )
-
-  for candidate in "${candidates[@]}"; do
-    if [[ -f "${candidate}/mooncake-transfer-engine/src/libtransfer_engine.so" ]] \
-      && [[ -f "${candidate}/mooncake-transfer-engine/tent/src/libtent_shared.so" ]]; then
-      printf '%s\n' "${candidate}"
-      return 0
-    fi
-  done
-
-  echo "unable to find Mooncake runtime libraries under ${UPSTREAM_DIR}" >&2
-  echo "set MOONCAKE_UPSTREAM_BUILD_DIR to a built upstream directory" >&2
-  return 1
-}
-
 require_command cargo
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo "cargo llvm-cov is not installed; run: cargo install cargo-llvm-cov" >&2
   exit 1
 fi
 
-UPSTREAM_BUILD_DIR=$(resolve_upstream_build_dir)
-export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src:${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:${LD_LIBRARY_PATH:-}"
+mc_scripts_setup_upstream_runtime_env none
 
 mkdir -p "${COVERAGE_DIR}"
 rm -f "${SUMMARY_FILE}" "${JSON_FILE}"

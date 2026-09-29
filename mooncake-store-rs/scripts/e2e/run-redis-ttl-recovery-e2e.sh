@@ -2,12 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
-# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
-# where the git toplevel is the enclosing repository rather than this tree.
-[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store-rs"
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
 # shellcheck disable=SC1091
-source "${REPO_ROOT}/scripts/lib/common.sh"
+source "${SCRIPT_DIR}/../lib/common.sh"
 MODE="${1:-all}"
 
 usage() {
@@ -47,8 +44,9 @@ Environment:
   MC_STORE_RS_TTL_RECOVERY_HOLD_SECONDS  Idle lifetime for storage clients
                                          (default: 600)
   MC_STORE_RS_KEEP_TEMP                  Keep temp dir on failure when set to 1
-  MOONCAKE_UPSTREAM_DIR                  Mooncake upstream checkout override
-  MOONCAKE_UPSTREAM_BUILD_DIR            Built upstream directory override
+  MOONCAKE_STORE_RS_DIR              Absolute Store-RS source directory
+  MOONCAKE_ROOT_DIR                  Absolute Mooncake source directory
+  MOONCAKE_BUILD_DIR                 Absolute Mooncake CMake build directory
 EOF
 }
 
@@ -62,6 +60,12 @@ if [[ "${MODE}" != "all" && "${MODE}" != "persisted" && "${MODE}" != "fresh" ]];
   usage >&2
   exit 1
 fi
+
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
+[[ "${REPO_ROOT}" == /* && -d "${REPO_ROOT}" ]] || {
+  echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${REPO_ROOT}" >&2
+  exit 1
+}
 
 PROTOCOL="${MC_STORE_RS_TTL_RECOVERY_PROTOCOL:-tcp}"
 TRANSPORT_BACKEND="${MC_STORE_RS_TTL_RECOVERY_TRANSPORT_BACKEND:-classic-te}"
@@ -377,8 +381,7 @@ mc_scripts_require_command python3
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
 
-UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
-mc_scripts_setup_upstream_runtime_env "${REPO_ROOT}" repo-python "${UPSTREAM_BUILD_DIR}"
+mc_scripts_setup_upstream_runtime_env repo-python
 export PYTHONDONTWRITEBYTECODE=1
 
 ensure_runtime_ready
@@ -408,7 +411,7 @@ echo "==> replica num:         ${REPLICA_NUM}"
 echo "==> lease ttl ms:        ${LEASE_MS}"
 echo "==> redis down seconds:  ${DOWN_SECONDS}"
 echo "==> python:              ${PYTHON_BIN}"
-echo "==> upstream build dir:  ${UPSTREAM_BUILD_DIR}"
+echo "==> upstream build dir:  ${MOONCAKE_BUILD_DIR}"
 echo "==> redis url:           ${REDIS_URL}"
 echo "==> keyspace:            ${KEYSPACE}"
 

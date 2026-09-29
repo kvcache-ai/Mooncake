@@ -214,21 +214,29 @@ Design boundary:
 ## Build From a Checkout
 
 ```bash
-git submodule update --init --recursive
+export MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs
+export MOONCAKE_ROOT_DIR=/path/to/Mooncake
+export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
+cd "${MOONCAKE_STORE_RS_DIR}"
 cargo build -p mooncake-store-py
-export PYTHONPATH="$PWD/python"
+export PYTHONPATH="${MOONCAKE_STORE_RS_DIR}/python"
 ```
 
 The package loads the native extension from the local `target` directory and
-preloads Mooncake TE/TENT shared libraries from the enclosing repository's
-`build-rust` directory. `MOONCAKE_UPSTREAM_DIR` and
-`MOONCAKE_UPSTREAM_BUILD_DIR` select an explicit source and build tree.
+preloads Mooncake TE/TENT shared libraries from the CMake build tree. Set the
+three variables to absolute paths before a direct Cargo build; the build path
+identifies an existing tree with TE, TENT, and yalantinglibs artifacts. CMake
+sets the same paths when it builds Store-RS as a target.
 
 ## Build a Wheel
 
-Use the repository packaging script:
+Use the repository packaging script with explicit package, source, and CMake
+build paths:
 
 ```bash
+export MOONCAKE_STORE_RS_DIR=/path/to/mooncake-store-rs
+export MOONCAKE_ROOT_DIR=/path/to/Mooncake
+export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
 ./scripts/build/build-wheel.sh
 ```
 
@@ -244,9 +252,9 @@ By default the script:
 Repository packaging rule:
 
 - `scripts/build/build-wheel.sh` is the single owner of wheel asset injection and `auditwheel repair`
-- the enclosing Mooncake CMake configuration fetches its pinned header-only
-  yalantinglibs dependency into the build tree; the Rust native shims use those
-  same fetched headers, including on a fresh checkout
+- the wheel helper configures the explicitly selected Mooncake source and build
+  trees, and the Rust native shims use the CMake-fetched header-only yalantinglibs
+  from that build tree
 - wheel and native-library build helpers share that CMake dependency source;
   yalantinglibs requires no separate installation or prebuilt prefix
 
@@ -257,13 +265,15 @@ Common variants:
 DIST_DIR=artifacts ./scripts/build/build-wheel.sh
 ```
 
-Build environments that already provide native artifacts can skip the upstream CMake
-portion and reuse `MOONCAKE_UPSTREAM_BUILD_DIR` directly:
+Build environments that already provide native artifacts can skip the wheel
+helper's CMake portion and reuse the explicitly selected build tree directly:
 
 ```bash
 MOONCAKE_REUSE_NATIVE_ARTIFACTS=1 \
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
-MOONCAKE_UPSTREAM_BUILD_DIR="$PWD/build" \
+MOONCAKE_STORE_RS_DIR=/path/to/mooncake-store-rs \
+MOONCAKE_ROOT_DIR=/path/to/Mooncake \
+MOONCAKE_BUILD_DIR="$PWD/build" \
 MOONCAKE_CLASSIC_SHIM_LIB_PATH="$PWD/dist/lib/libmooncake_classic_shim.so" \
 MOONCAKE_TENT_SHIM_LIB_PATH="$PWD/dist/lib/libmooncake_tent_shim.so" \
 ./scripts/build/build-wheel.sh --interpreter python3.10
@@ -274,9 +284,15 @@ instead. It reuses `scripts/build/build-wheel.sh` inside the container and
 produces the same `dist/wheels/` and `dist/bin/` outputs:
 
 ```bash
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_ROOT_DIR=/path/to/Mooncake \
 ./scripts/build/build-wheel-ubuntu-docker.sh
-PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
-PYTHON_VERSION=3.12 ./scripts/build/build-wheel-ubuntu-docker.sh
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_ROOT_DIR=/path/to/Mooncake PYTHON_VERSION=3.11 \
+./scripts/build/build-wheel-ubuntu-docker.sh
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_ROOT_DIR=/path/to/Mooncake PYTHON_VERSION=3.12 \
+./scripts/build/build-wheel-ubuntu-docker.sh
 ```
 
 Docker wheel notes:

@@ -11,8 +11,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .compile_protos(&["proto/dummy_store.proto"], &["proto"])?;
     println!("cargo:rerun-if-changed=proto/dummy_store.proto");
-    println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_DIR");
-    println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_ROOT_DIR");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=PYTHON");
     println!("cargo:rerun-if-env-changed=PYO3_PYTHON");
     link_python_embed();

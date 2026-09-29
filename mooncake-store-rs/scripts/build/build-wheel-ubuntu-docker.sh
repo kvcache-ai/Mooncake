@@ -8,35 +8,10 @@ set -euo pipefail
 # scripts/build/build-wheel.sh as the single packaging implementation.
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-GIT_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
-REPO_ROOT=${GIT_ROOT}
-REPO_PATH_IN_MOUNT=
-if [[ ! -f "${REPO_ROOT}/Cargo.toml" ]]; then
-  REPO_PATH_IN_MOUNT=mooncake-store-rs
-  REPO_ROOT="${GIT_ROOT}/${REPO_PATH_IN_MOUNT}"
-fi
-MOUNT_ROOT=${GIT_ROOT}
-
 UBUNTU_VERSION=${UBUNTU_VERSION:-22.04}
 PYTHON_VERSION=${PYTHON_VERSION:-system}
 DOCKER_IMAGE=${DOCKER_IMAGE:-}
 PYTHON_TAG=
-MOUNT_POINT_IN_CONTAINER=${MOUNT_POINT_IN_CONTAINER:-/work}
-WORKDIR_IN_CONTAINER=${WORKDIR_IN_CONTAINER:-${MOUNT_POINT_IN_CONTAINER}}
-if [[ -n "${REPO_PATH_IN_MOUNT}" && "${WORKDIR_IN_CONTAINER}" == "${MOUNT_POINT_IN_CONTAINER}" ]]; then
-  WORKDIR_IN_CONTAINER="${MOUNT_POINT_IN_CONTAINER}/${REPO_PATH_IN_MOUNT}"
-fi
-CACHE_DIR=${MOONCAKE_DOCKER_CACHE_DIR:-"${REPO_ROOT}/target/docker-wheel-cache"}
-CACHE_DIR_IN_CONTAINER=${CACHE_DIR_IN_CONTAINER:-/cache}
-REBUILD_IMAGE=${REBUILD_IMAGE:-0}
-PULL_IMAGE=${PULL_IMAGE:-1}
-CN_MIRROR=${CN_MIRROR:-1}
-CN_RUSTUP_DIST_SERVER=${CN_RUSTUP_DIST_SERVER:-https://mirrors.ustc.edu.cn/rust-static}
-CN_RUSTUP_UPDATE_ROOT=${CN_RUSTUP_UPDATE_ROOT:-https://mirrors.ustc.edu.cn/rust-static/rustup}
-CN_PIP_INDEX_URL=${CN_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
-CN_PIP_TRUSTED_HOST=${CN_PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
-CN_CRATES_REGISTRY=${CN_CRATES_REGISTRY:-sparse+https://mirrors.ustc.edu.cn/crates.io-index/}
 
 usage() {
   cat <<'EOF'
@@ -50,6 +25,8 @@ same artifacts as scripts/build/build-wheel.sh:
   dist/bin/mooncake-store-admin
 
 Environment:
+  MOONCAKE_STORE_RS_DIR       mooncake-store-rs package root (required)
+  MOONCAKE_ROOT_DIR       Mooncake source root that contains the package (required)
   UBUNTU_VERSION              Ubuntu base image tag (default: 22.04)
   PYTHON_VERSION              Python runtime in the builder image: system, 3.10, 3.11, 3.12
   DOCKER_IMAGE                Builder image name (default: mooncake-store-wheel:ubuntu-${UBUNTU_VERSION}-py<version>)
@@ -72,8 +49,9 @@ Forwarded build environment:
   BUILD_JOBS
   DIST_DIR
   WHEEL_VENV
-  MOONCAKE_UPSTREAM_DIR
-  MOONCAKE_UPSTREAM_BUILD_DIR
+  MOONCAKE_ROOT_DIR
+  MOONCAKE_BUILD_DIR
+  MOONCAKE_STORE_RS_DIR
   PYTHON
   HTTP_PROXY, HTTPS_PROXY, NO_PROXY and lowercase variants
   PIP_INDEX_URL, PIP_EXTRA_INDEX_URL, PIP_TRUSTED_HOST
@@ -81,16 +59,17 @@ Forwarded build environment:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL, CARGO_NET_GIT_FETCH_WITH_CLI
 
 Path rule:
-  DIST_DIR, WHEEL_VENV, MOONCAKE_UPSTREAM_DIR, and
-  MOONCAKE_UPSTREAM_BUILD_DIR must be relative paths or absolute paths inside
-  this repository. External host paths are intentionally not mounted.
+  MOONCAKE_STORE_RS_DIR and MOONCAKE_ROOT_DIR must be absolute paths inside
+  this repository, and the package root must be inside the source root. The
+  wrapper supplies MOONCAKE_BUILD_DIR under its mounted build cache.
+  External source paths are intentionally not mounted.
 
 Examples:
+  MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+  MOONCAKE_ROOT_DIR=/path/to/Mooncake ./scripts/build/build-wheel-ubuntu-docker.sh
+  MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+  MOONCAKE_ROOT_DIR=/path/to/Mooncake PYTHON_VERSION=3.11 \
   ./scripts/build/build-wheel-ubuntu-docker.sh
-  PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
-  BUILD_JOBS=16 ./scripts/build/build-wheel-ubuntu-docker.sh
-  UBUNTU_VERSION=24.04 REBUILD_IMAGE=1 ./scripts/build/build-wheel-ubuntu-docker.sh
-  DOCKER_NETWORK=host ./scripts/build/build-wheel-ubuntu-docker.sh --compatibility linux
 EOF
 }
 
@@ -98,6 +77,48 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
 fi
+
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit path}
+UPSTREAM_DIR=${MOONCAKE_ROOT_DIR:?MOONCAKE_ROOT_DIR must be set to an explicit path}
+for path in "${REPO_ROOT}" "${UPSTREAM_DIR}"; do
+  if [[ "${path}" != /* ]]; then
+    echo "MOONCAKE_STORE_RS_DIR and MOONCAKE_ROOT_DIR must be absolute paths: ${path}" >&2
+    exit 1
+  fi
+done
+REPO_ROOT=$(cd -- "${REPO_ROOT}" && pwd)
+UPSTREAM_DIR=$(cd -- "${UPSTREAM_DIR}" && pwd)
+export MOONCAKE_STORE_RS_DIR="${REPO_ROOT}"
+export MOONCAKE_ROOT_DIR="${UPSTREAM_DIR}"
+MOUNT_ROOT=${UPSTREAM_DIR}
+if [[ "${REPO_ROOT}" == "${MOUNT_ROOT}" ]]; then
+  REPO_PATH_IN_MOUNT=
+elif [[ "${REPO_ROOT}" == "${MOUNT_ROOT}/"* ]]; then
+  REPO_PATH_IN_MOUNT=${REPO_ROOT#"${MOUNT_ROOT}/"}
+else
+  echo "MOONCAKE_STORE_RS_DIR must be inside MOONCAKE_ROOT_DIR" >&2
+  exit 1
+fi
+if [[ ! -d "${REPO_ROOT}/crates/mooncake-store-py" ]]; then
+  echo "MOONCAKE_STORE_RS_DIR must point to the mooncake-store-rs package root: ${REPO_ROOT}" >&2
+  exit 1
+fi
+
+MOUNT_POINT_IN_CONTAINER=${MOUNT_POINT_IN_CONTAINER:-/work}
+WORKDIR_IN_CONTAINER=${WORKDIR_IN_CONTAINER:-${MOUNT_POINT_IN_CONTAINER}}
+if [[ -n "${REPO_PATH_IN_MOUNT}" && "${WORKDIR_IN_CONTAINER}" == "${MOUNT_POINT_IN_CONTAINER}" ]]; then
+  WORKDIR_IN_CONTAINER="${MOUNT_POINT_IN_CONTAINER}/${REPO_PATH_IN_MOUNT}"
+fi
+CACHE_DIR=${MOONCAKE_DOCKER_CACHE_DIR:-"${REPO_ROOT}/target/docker-wheel-cache"}
+CACHE_DIR_IN_CONTAINER=${CACHE_DIR_IN_CONTAINER:-/cache}
+REBUILD_IMAGE=${REBUILD_IMAGE:-0}
+PULL_IMAGE=${PULL_IMAGE:-1}
+CN_MIRROR=${CN_MIRROR:-1}
+CN_RUSTUP_DIST_SERVER=${CN_RUSTUP_DIST_SERVER:-https://mirrors.ustc.edu.cn/rust-static}
+CN_RUSTUP_UPDATE_ROOT=${CN_RUSTUP_UPDATE_ROOT:-https://mirrors.ustc.edu.cn/rust-static/rustup}
+CN_PIP_INDEX_URL=${CN_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+CN_PIP_TRUSTED_HOST=${CN_PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+CN_CRATES_REGISTRY=${CN_CRATES_REGISTRY:-sparse+https://mirrors.ustc.edu.cn/crates.io-index/}
 
 require_command() {
   local command_name=$1
@@ -415,7 +436,7 @@ declare -a DOCKER_RUN_ARGS=(
   -e "CARGO_HOME=${CACHE_DIR_IN_CONTAINER}/cargo"
   -e "RUSTUP_HOME=/usr/local/rustup"
   -e "WHEEL_VENV=${CACHE_DIR_IN_CONTAINER}/venv"
-  -e "MOONCAKE_UPSTREAM_BUILD_DIR=${DEFAULT_UPSTREAM_BUILD_DIR}"
+  -e "MOONCAKE_BUILD_DIR=${DEFAULT_UPSTREAM_BUILD_DIR}"
   -e "PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   -e "CONTAINER_MOUNT_ROOT=${MOUNT_POINT_IN_CONTAINER}"
   -e "CONTAINER_WORKDIR=${WORKDIR_IN_CONTAINER}"
@@ -452,8 +473,9 @@ append_env_if_set CARGO_NET_GIT_FETCH_WITH_CLI
 
 append_repo_path_env_if_set DIST_DIR
 append_repo_path_env_if_set WHEEL_VENV
-append_repo_path_env_if_set MOONCAKE_UPSTREAM_DIR
-append_repo_path_env_if_set MOONCAKE_UPSTREAM_BUILD_DIR
+append_repo_path_env_if_set MOONCAKE_STORE_RS_DIR
+append_repo_path_env_if_set MOONCAKE_ROOT_DIR
+append_repo_path_env_if_set MOONCAKE_BUILD_DIR
 
 cat <<EOF
 ubuntu: ${UBUNTU_VERSION}

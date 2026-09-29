@@ -13,23 +13,13 @@ set -euo pipefail
 # overhead (maturin, auditwheel, cargo build --release, etc.).
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
-# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
-# where the git toplevel is the enclosing repository rather than this tree.
-[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store-rs"
-
 PYTHON_BIN=${PYTHON:-python3}
-UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR:-"${REPO_ROOT}/third_party/Mooncake"}
-# Inside the Mooncake monorepo the upstream tree is the enclosing repository
-# rather than a submodule. Both arms are guarded on a transfer-engine
-# directory, so an uninitialised submodule keeps the submodule path and
-# fails with that name rather than silently pointing somewhere unrelated.
-if [ ! -d "${UPSTREAM_DIR}/mooncake-transfer-engine" ] \
-  && [ -d "${REPO_ROOT}/../mooncake-transfer-engine" ]; then
-  UPSTREAM_DIR=$(cd "${REPO_ROOT}/.." && pwd)
-fi
-UPSTREAM_BUILD_DIR=${MOONCAKE_UPSTREAM_BUILD_DIR:-"${UPSTREAM_DIR}/build-wheel-compat"}
+UPSTREAM_DIR=${MOONCAKE_ROOT_DIR:?MOONCAKE_ROOT_DIR must be set to an explicit Mooncake source directory}
+UPSTREAM_BUILD_DIR=${MOONCAKE_BUILD_DIR:?MOONCAKE_BUILD_DIR must be set to an explicit CMake build directory}
+for path in "${UPSTREAM_DIR}" "${UPSTREAM_BUILD_DIR}"; do
+  [[ "${path}" == /* ]] || { echo "MOONCAKE_*_DIR paths must be absolute: ${path}" >&2; exit 1; }
+done
+[[ -d "${UPSTREAM_DIR}" ]] || { echo "MOONCAKE_ROOT_DIR must be a directory: ${UPSTREAM_DIR}" >&2; exit 1; }
 BUILD_JOBS=${BUILD_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 8)}
 BUILD_WHEEL_NATIVE_ASSETS=${BUILD_WHEEL_NATIVE_ASSETS:-0}
 
@@ -67,7 +57,7 @@ ensure_pybind11() {
 }
 
 if [[ -z "${SKIP_SUBMODULE_UPDATE:-}" ]]; then
-  git -C "${REPO_ROOT}" submodule update --init --recursive
+  git -C "${UPSTREAM_DIR}" submodule update --init --recursive
 fi
 ensure_pybind11
 
@@ -79,7 +69,7 @@ if is_truthy "${BUILD_WHEEL_NATIVE_ASSETS}"; then
 fi
 
 # Create a minimal venv just for cmake's Python3_EXECUTABLE requirement
-VENV_DIR="${REPO_ROOT}/.venv-upstream-libs"
+VENV_DIR="${UPSTREAM_DIR}/.venv-upstream-libs"
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
   "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 fi

@@ -11,8 +11,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(&["proto/control_plane.proto"], &["proto"])?;
 
     println!("cargo:rerun-if-changed=proto/control_plane.proto");
-    println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_DIR");
-    println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_ROOT_DIR");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KVCS_CAPI");
     println!("cargo:rerun-if-env-changed=KVCS_SDK_ROOT");

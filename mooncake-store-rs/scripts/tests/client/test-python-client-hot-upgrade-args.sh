@@ -2,12 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
-# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
-# where the git toplevel is the enclosing repository rather than this tree.
-[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store-rs"
+REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
 # shellcheck disable=SC1091
-source "${REPO_ROOT}/scripts/lib/common.sh"
+source "${SCRIPT_DIR}/../../lib/common.sh"
 
 usage() {
   cat <<'EOF'
@@ -17,8 +14,9 @@ Verify Python hot-upgrade startup argument handling for both the native PyO3
 binding and the pure-Python wrapper compatibility path.
 
 Environment:
-  MOONCAKE_UPSTREAM_DIR       Mooncake upstream submodule path
-  MOONCAKE_UPSTREAM_BUILD_DIR Explicit upstream build directory override
+  MOONCAKE_STORE_RS_DIR       Absolute Store-RS source directory
+  MOONCAKE_ROOT_DIR            Absolute Mooncake source directory
+  MOONCAKE_BUILD_DIR           Absolute Mooncake CMake build directory
 EOF
 }
 
@@ -29,8 +27,7 @@ fi
 
 mc_scripts_require_command cargo
 mc_scripts_require_command python3
-UPSTREAM_BUILD_DIR=$(mc_scripts_resolve_upstream_build_dir "${REPO_ROOT}")
-mc_scripts_setup_upstream_runtime_env "${REPO_ROOT}" none "${UPSTREAM_BUILD_DIR}"
+mc_scripts_setup_upstream_runtime_env none
 
 cd "${REPO_ROOT}"
 

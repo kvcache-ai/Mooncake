@@ -289,10 +289,16 @@ For the runtime view, read `docs/architecture.md`.
 - Git submodule support
 - Python 3, if you want the Python layer
 
-### Fetch the upstream Mooncake submodule
+### Set explicit source and build paths
 
 ```bash
-git submodule update --init --recursive
+export MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs
+export MOONCAKE_ROOT_DIR=/path/to/Mooncake
+export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
+cmake -S "${MOONCAKE_ROOT_DIR}" -B "${MOONCAKE_BUILD_DIR}" \
+  -DWITH_TE=ON -DUSE_TENT=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON
+cmake --build "${MOONCAKE_BUILD_DIR}" --target transfer_engine tent_shared
 ```
 
 ### Run the local Rust e2e and benchmark
@@ -301,10 +307,10 @@ git submodule update --init --recursive
 ./scripts/e2e/run-local-e2e.sh
 ```
 
-This script will:
+The script requires the three absolute paths above. It will:
 
 - auto-start a local Redis instance on port `6380` when needed
-- build Mooncake TE/TENT from `third_party/Mooncake` when native artifacts are missing
+- use the TE/TENT libraries from `MOONCAKE_BUILD_DIR`
 - run the Rust end-to-end suite
 - print batch put/get benchmark results
 
@@ -554,6 +560,9 @@ python3 ./scripts/clients/dummy_client_rw.py \
 To package the Python module and the standalone client command together:
 
 ```bash
+export MOONCAKE_STORE_RS_DIR=/path/to/mooncake-store-rs
+export MOONCAKE_ROOT_DIR=/path/to/Mooncake
+export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
 ./scripts/build/build-wheel.sh
 python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
@@ -567,7 +576,9 @@ python -c "import mooncake_store_rs as m; print(m.__build_info__)"
 If the host OS is missing build dependencies, use the Ubuntu Docker wrapper:
 
 ```bash
-PYTHON=python3.11 ./scripts/build/build-wheel.sh
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_ROOT_DIR=/path/to/Mooncake \
+PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
 ```
 
 The Docker wrapper produces the same `dist/wheels/` and `dist/bin/` outputs and
@@ -801,7 +812,12 @@ For a fuller Rust guide, including lifecycle and buffer-oriented APIs, read `doc
 
 Build the native module and expose the Python package from the repository checkout:
 
+First build TE/TENT with CMake; the explicit source and build paths below identify those existing
+artifacts for the Rust shim build.
+
 ```bash
+export MOONCAKE_ROOT_DIR=/path/to/Mooncake
+export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
 cargo build -p mooncake-store-py
 export PYTHONPATH="$PWD/python"
 ```
@@ -809,12 +825,17 @@ export PYTHONPATH="$PWD/python"
 Build a distributable wheel and package the standalone client binary:
 
 ```bash
+export MOONCAKE_STORE_RS_DIR=/path/to/mooncake-store-rs
+export MOONCAKE_ROOT_DIR=/path/to/Mooncake
+export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
 ./scripts/build/build-wheel.sh
 ```
 
 Or build in Ubuntu Docker with an explicit Python runtime:
 
 ```bash
+MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
+MOONCAKE_ROOT_DIR=/path/to/Mooncake \
 PYTHON_VERSION=3.12 ./scripts/build/build-wheel-ubuntu-docker.sh
 ```
 
