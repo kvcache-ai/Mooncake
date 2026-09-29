@@ -831,11 +831,11 @@ TEST_F(RDMAEndpointReestablishTest,
 namespace mooncake {
 class RdmaEndPointTestPeer {
    public:
-    static void addDummyQp(RdmaEndPoint &endpoint, ibv_qp *qp) {
+    static void addDummyQp(RdmaEndPoint& endpoint, ibv_qp* qp) {
         endpoint.qp_list_.push_back(qp);
     }
 
-    static void clearDummyQp(RdmaEndPoint &endpoint) {
+    static void clearDummyQp(RdmaEndPoint& endpoint) {
         endpoint.qp_list_.clear();
     }
 
@@ -854,10 +854,11 @@ class RdmaEndPointTestPeer {
     }
 
     static int getResetStageValue() {
-        return static_cast<int>(RdmaEndPoint::SetupConnectionFailureStage::kReset);
+        return static_cast<int>(
+            RdmaEndPoint::SetupConnectionFailureStage::kReset);
     }
 };
-}
+}  // namespace mooncake
 
 extern std::atomic<int> g_inject_modify_qp_error;
 
@@ -893,7 +894,9 @@ TEST(RDMAEndpointSetupErrorTest, VerifyVerbsErrorCorrectlyCaptured) {
     EXPECT_EQ(rc, ERR_ENDPOINT);
     EXPECT_EQ(stage, mooncake::RdmaEndPointTestPeer::getResetStageValue());
     EXPECT_EQ(sys_errno, EINVAL);
-    EXPECT_TRUE(reply_msg.find("EINVAL") != std::string::npos || reply_msg.find("Invalid argument") != std::string::npos || reply_msg.find("22") != std::string::npos);
+    EXPECT_TRUE(reply_msg.find("EINVAL") != std::string::npos ||
+                reply_msg.find("Invalid argument") != std::string::npos ||
+                reply_msg.find("22") != std::string::npos);
 }
 
 }  // namespace

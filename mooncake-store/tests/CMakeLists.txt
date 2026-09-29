@@ -236,6 +236,7 @@ add_store_test(hugepage_config_test hugepage_config_test.cpp)
 add_store_test(shm_spdk_registration_config_test
                shm_spdk_registration_config_test.cpp)
 add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
+add_store_test(store_shm_alloc_test store_shm_alloc_test.cpp)
 add_store_test(random_test random_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)

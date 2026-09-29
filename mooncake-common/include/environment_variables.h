@@ -97,6 +97,14 @@ struct HugepageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_HUGEPAGE_SIZE);
 };
 
+struct StoreShmEnvironmentVariables {
+    // Keep these as strings so enablement matches envFlagEnabled / MC_FORCE_SHM
+    // (unset, empty, 0/false/no/off are off; anything else is on).
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_USE_SHM_SEGMENT);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_SHM_ALLOW_TMPFS);
+    MC_DEFINE_ENV_VAR(std::string, MC_HUGETLBFS_PATH);
+};
+
 struct ShmSpdkRegistrationEnvironmentVariables {
     // The registration opt-in is enabled only by the exact string "1".
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REGISTER_SPDK);
