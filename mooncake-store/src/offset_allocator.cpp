@@ -831,6 +831,7 @@ OffsetAllocatorSnapshot OffsetAllocator::CaptureSnapshot() const {
     // The snapshot owns its layout: it can outlive this allocator and must
     // never observe later mutations, so the bin/node state is copied here.
     // The copy constructor is private; OffsetAllocator is a friend.
+    MutexLocker lock(&m_mutex);
     std::unique_ptr<__Allocator> layout(new __Allocator(*m_allocator));
     return {m_base,           m_multiplier_bits, m_capacity,
             m_allocated_size, m_allocated_num,   std::move(layout)};
@@ -845,6 +846,7 @@ OffsetAllocator::Restore(OffsetAllocatorSnapshot snapshot) {
     auto allocator = std::shared_ptr<OffsetAllocator>(new OffsetAllocator(
         snapshot.base, snapshot.capacity, snapshot.multiplier_bits,
         std::move(snapshot.layout)));
+    MutexLocker lock(&allocator->m_mutex);
     allocator->m_allocated_size = snapshot.allocated_size;
     allocator->m_allocated_num = snapshot.allocated_num;
     return allocator;

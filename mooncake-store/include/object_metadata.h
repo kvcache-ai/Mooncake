@@ -109,8 +109,10 @@ struct ObjectMetadata {
     mutable SpinLock lock;
     // Authoritative lease: ungrouped objects own one; grouped objects share
     // the group's. Never null after construction.
-    mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
-        std::make_shared<Lease>();
+
+    // lease_ is only assigned as member variable of TenantState::metadata, 
+    // which can be guarded by MetadataShardAccessorRO or MetadataShardAccessorRW
+    mutable std::shared_ptr<Lease> lease_ = std::make_shared<Lease>();
     mutable std::optional<std::chrono::system_clock::time_point>
         soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
                                             // deadline

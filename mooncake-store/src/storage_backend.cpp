@@ -2667,6 +2667,7 @@ void BucketStorageBackend::RollbackCommittedBucket(
 std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
 BucketStorageBackend::SelectEvictionCandidate() {
     // Must be called with mutex_ held (exclusive).
+    SharedMutexLocker lock(&mutex_);
     switch (bucket_backend_config_.eviction_policy) {
         case BucketEvictionPolicy::FIFO:
             // buckets_ is ordered by bucket_id (monotonically increasing),
@@ -2714,6 +2715,7 @@ BucketStorageBackend::SelectEvictionCandidate() {
 int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
     namespace fs = std::filesystem;
     auto now = std::chrono::steady_clock::now();
+    SharedMutexLocker lock(&mutex_);
     if (cached_disk_bytes_ >= 0 &&
         now - cached_disk_bytes_at_ <
             std::chrono::milliseconds(
@@ -2960,6 +2962,7 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
     PendingEviction&& pending) {
     ReleasePreparedWriteLocked(pending);
 
+    SharedMutexLocker lock(&mutex_);
     CHECK_GE(pending_eviction_size_, pending.evicted_size);
     pending_eviction_size_ -= pending.evicted_size;
     for (const auto& key : pending.keys) {
@@ -3022,6 +3025,7 @@ void BucketStorageBackend::ReleasePreparedWrite(
 
 void BucketStorageBackend::ReleasePreparedWriteLocked(
     const PendingEviction& pending) {
+    SharedMutexLocker lock(&mutex_);
     CHECK_GE(pending_write_size_, pending.write_size);
     pending_write_size_ -= pending.write_size;
     for (const auto& key : pending.write_keys) {

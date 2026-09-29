@@ -374,6 +374,7 @@ Serializer<offset_allocator::OffsetAllocator>::serialize(
     packer.pack(allocator.m_multiplier_bits);
     packer.pack(allocator.m_capacity);
 
+    MutexLocker lock(&allocator.m_mutex);
     packer.pack(allocator.m_allocated_size);
     packer.pack(allocator.m_allocated_num);
 

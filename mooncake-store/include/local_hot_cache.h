@@ -252,7 +252,7 @@ class LocalHotCache {
     std::shared_ptr<ShmHelper::ShmSegment> shm_segment_;
     bool use_shm_ = false;
 
-    mutable std::shared_mutex lru_mutex_;
+    mutable SharedMutex lru_mutex_;
     std::list<HotMemBlock*> lru_queue_ GUARDED_BY(lru_mutex_);  // prefilled LRU
     // key -> iterator of lru_queue_
     std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>

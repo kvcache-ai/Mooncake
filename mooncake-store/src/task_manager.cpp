@@ -7,6 +7,7 @@ namespace mooncake {
 
 std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
     const UUID& task_id) const {
+    SharedMutexLocker lock(&manager_->mutex_);
     auto it = manager_->all_tasks_.find(task_id);
     if (it != manager_->all_tasks_.end()) {
         return it->second;
@@ -15,19 +16,23 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
 }
 
 ScopedTaskReadAccess::task_iterator ScopedTaskReadAccess::begin() const {
+    SharedMutexLocker lock(&manager_->mutex_, shared_lock);
     return manager_->all_tasks_.cbegin();
 }
 
 ScopedTaskReadAccess::task_iterator ScopedTaskReadAccess::end() const {
+    SharedMutexLocker lock(&manager_->mutex_, shared_lock);
     return manager_->all_tasks_.cend();
 }
 
 size_t ScopedTaskReadAccess::size() const {
+    SharedMutexLocker lock(&manager_->mutex_, shared_lock);
     return manager_->all_tasks_.size();
 }
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
     const UUID& client_id, TaskType type, const std::string& payload) {
+    SharedMutexLocker lock(&manager_->mutex_);
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"
@@ -59,6 +64,7 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
                                                    size_t batch_size) {
     std::vector<Task> result;
 
+    SharedMutexLocker lock(&manager_->mutex_);
     auto pit = manager_->pending_tasks_.find(client_id);
     if (pit == manager_->pending_tasks_.end()) {
         return result;
@@ -120,6 +126,7 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    SharedMutexLocker lock(&manager_->mutex_);
     auto it = manager_->all_tasks_.find(task_id);
     if (it == manager_->all_tasks_.end()) {
         LOG(ERROR) << "Task " << task_id << " not found for update";
@@ -157,6 +164,7 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
 }
 
 void ScopedTaskWriteAccess::prune_finished_tasks() {
+    SharedMutexLocker lock(&manager_->mutex_);
     while (manager_->finished_task_history_.size() >
            manager_->max_total_finished_tasks_) {
         UUID oldest_task_id = manager_->finished_task_history_.front();
@@ -168,6 +176,7 @@ void ScopedTaskWriteAccess::prune_finished_tasks() {
 void ScopedTaskWriteAccess::prune_expired_tasks() {
     const auto now = std::chrono::system_clock::now();
     // Pending timeout: based on created_at
+    SharedMutexLocker lock(&manager_->mutex_);
     if (manager_->pending_task_timeout_sec_ > 0) {
         const auto pending_timeout_duration =
             std::chrono::seconds(manager_->pending_task_timeout_sec_);
@@ -259,6 +268,7 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
 
 void ScopedTaskWriteAccess::restore_task(Task&& task) {
     const UUID task_id = task.id;
+    SharedMutexLocker lock(&manager_->mutex_);
     manager_->all_tasks_[task_id] = std::move(task);
     Task& stored_task = manager_->all_tasks_[task_id];
 
@@ -286,6 +296,7 @@ void ScopedTaskWriteAccess::restore_task(Task&& task) {
 
 ErrorCode ScopedTaskWriteAccess::fail_task_if_pending(
     const UUID& task_id, const std::string& message) {
+    SharedMutexLocker lock(&manager_->mutex_);
     auto it = manager_->all_tasks_.find(task_id);
     if (it == manager_->all_tasks_.end()) {
         return ErrorCode::TASK_NOT_FOUND;
@@ -305,6 +316,7 @@ ErrorCode ScopedTaskWriteAccess::fail_task_if_pending(
 }
 
 void ScopedTaskWriteAccess::clear_all() {
+    SharedMutexLocker lock(&manager_->mutex_);
     manager_->all_tasks_.clear();
     manager_->pending_tasks_.clear();
     manager_->processing_tasks_.clear();

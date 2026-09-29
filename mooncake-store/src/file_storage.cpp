@@ -694,8 +694,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         if (draining_.load()) {
             return {};
         }
-        auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
-            return client_->OffloadObjectHeartbeat(enable_offloading_,
+        auto fetch_offload_tasks = [&, enable_offloading = enable_offloading_]() -> tl::expected<void, ErrorCode> {
+            return client_->OffloadObjectHeartbeat(enable_offloading,
                                                    offloading_objects);
         };
         auto heartbeat_result = fetch_offload_tasks();

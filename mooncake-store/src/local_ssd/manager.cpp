@@ -286,11 +286,13 @@ bool LocalSsdManager::CancelOffloadsIfAllPending(
 
     const std::string index = tenant_id.MakeScopedKey(key);
     for (const auto& client : clients) {
+        MutexLocker lock(&client.record->mailbox.mutex_);
         if (!client.record->mailbox.pending_offloads_.contains(index)) {
             return false;
         }
     }
     for (auto& client : clients) {
+        MutexLocker lock(&client.record->mailbox.mutex_);
         client.record->mailbox.pending_offloads_.erase(index);
     }
     return true;
@@ -378,7 +380,9 @@ void LocalSsdManager::RestorePersistedState(LocalSsdPersistedState state) {
     for (auto& [client_id, persisted] : state) {
         auto record =
             std::make_shared<ClientRecord>(persisted.enable_offloading);
+        MutexLocker record_lock(&record->stats_mutex);
         record->total_capacity_bytes = persisted.total_capacity_bytes;
+        MutexLocker mailbox_lock(&record->mailbox.mutex_);
         record->mailbox.pending_offloads_.insert(
             std::make_move_iterator(persisted.pending_offloads.begin()),
             std::make_move_iterator(persisted.pending_offloads.end()));

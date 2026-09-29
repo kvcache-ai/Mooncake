@@ -75,13 +75,13 @@ LocalHotCache::~LocalHotCache() {
 }
 
 bool LocalHotCache::PutHotKey(HotMemBlock* block) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
     return putHotKeyLocked(block);
 }
 
 bool LocalHotCache::PutHotKey(HotMemBlock* block,
                               const HotCachePutToken& token) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
     // Validate the token and publish under the same lock so a concurrent
     // Remove/Bump cannot slip in between the check and the publish.
     if (block && !block->key_.empty() &&
@@ -98,6 +98,7 @@ bool LocalHotCache::putHotKeyLocked(HotMemBlock* block) {
 
     if (!block) return false;
 
+    SharedMutexLocker lock(&lru_mutex_);
     // Handle return-to-lru tail case (empty key or cancelled task)
     if (block->key_.empty()) {
         block->ref_count = 0;
@@ -126,12 +127,12 @@ bool LocalHotCache::putHotKeyLocked(HotMemBlock* block) {
 }
 
 bool LocalHotCache::HasHotKey(const std::string& key) const {
-    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lk(&lru_mutex_, shared_lock);
     return key_to_lru_it_.find(key) != key_to_lru_it_.end();
 }
 
 HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
-    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lk(&lru_mutex_, shared_lock);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return nullptr;
@@ -152,7 +153,7 @@ HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
 }
 
 void LocalHotCache::ReleaseHotKey(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it != key_to_lru_it_.end()) {
         HotMemBlock* block = *(it->second);
@@ -189,6 +190,7 @@ bool LocalHotCache::hasActiveBlockForKeyLocked(const std::string& key) const {
 }
 
 bool LocalHotCache::removeHotKeyLocked(const std::string& key) {
+    SharedMutexLocker lock(&lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return false;
@@ -208,7 +210,7 @@ bool LocalHotCache::removeHotKeyLocked(const std::string& key) {
 }
 
 bool LocalHotCache::RemoveHotKey(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
 
     key_generation_[key]++;
     drainDeferredTouches();
@@ -225,7 +227,7 @@ size_t LocalHotCache::RemoveHotKeys(const std::vector<std::string>& keys) {
         return 0;
     }
 
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
     drainDeferredTouches();
 
     size_t removed = 0;
@@ -250,7 +252,7 @@ size_t LocalHotCache::RemoveHotKeysByRegex(const std::string& regex_pattern) {
 
     std::vector<std::string> matching_keys;
     {
-        std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+        SharedMutexLocker lk(&lru_mutex_, shared_lock);
         matching_keys.reserve(key_to_lru_it_.size());
         for (const auto& [key, _] : key_to_lru_it_) {
             if (std::regex_search(key, pattern)) {
@@ -263,7 +265,7 @@ size_t LocalHotCache::RemoveHotKeysByRegex(const std::string& regex_pattern) {
         return 0;
     }
 
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
     drainDeferredTouches();
 
     size_t removed = 0;
@@ -277,7 +279,7 @@ size_t LocalHotCache::RemoveHotKeysByRegex(const std::string& regex_pattern) {
 }
 
 size_t LocalHotCache::RemoveAllHotKeys() {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
     cache_epoch_.fetch_add(1, std::memory_order_relaxed);
 
     std::vector<std::string> keys;
@@ -297,7 +299,7 @@ size_t LocalHotCache::RemoveAllHotKeys() {
 }
 
 void LocalHotCache::BumpKeyGeneration(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
     key_generation_[key]++;
 }
 
@@ -306,7 +308,7 @@ void LocalHotCache::BumpKeyGenerations(const std::vector<std::string>& keys) {
         return;
     }
 
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
     for (const auto& key : keys) {
         key_generation_[key]++;
     }
@@ -317,7 +319,7 @@ void LocalHotCache::BumpCacheEpoch() {
 }
 
 void LocalHotCache::Clear() {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
     cache_epoch_.fetch_add(1, std::memory_order_relaxed);
 
     std::vector<std::string> keys;
@@ -333,7 +335,7 @@ void LocalHotCache::Clear() {
 }
 
 HotCachePutToken LocalHotCache::AcquirePutToken(const std::string& key) {
-    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lk(&lru_mutex_, shared_lock);
     HotCachePutToken token;
     token.cache_epoch = cache_epoch_.load(std::memory_order_relaxed);
     auto it = key_generation_.find(key);
@@ -346,6 +348,7 @@ bool LocalHotCache::isPutTokenValidLocked(const std::string& key,
     if (token.cache_epoch != cache_epoch_.load(std::memory_order_relaxed)) {
         return false;
     }
+    SharedMutexLocker lk(&lru_mutex_, shared_lock);
     auto it = key_generation_.find(key);
     const uint64_t current_gen = (it != key_generation_.end()) ? it->second : 0;
     return token.key_generation == current_gen;
@@ -353,12 +356,12 @@ bool LocalHotCache::isPutTokenValidLocked(const std::string& key,
 
 bool LocalHotCache::IsPutTokenValid(const std::string& key,
                                     const HotCachePutToken& token) const {
-    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lk(&lru_mutex_, shared_lock);
     return isPutTokenValidLocked(key, token);
 }
 
 bool LocalHotCache::TouchHotKey(const std::string& key) {
-    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lk(&lru_mutex_, shared_lock);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return false;
@@ -371,7 +374,7 @@ bool LocalHotCache::TouchHotKey(const std::string& key) {
 }
 
 HotMemBlock* LocalHotCache::GetFreeBlock() {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lock(&lru_mutex_);
 
     // Drain deferred LRU touches before scanning for victims
     drainDeferredTouches();
@@ -419,6 +422,7 @@ HotMemBlock* LocalHotCache::GetFreeBlock() {
 void LocalHotCache::drainDeferredTouches() {
     // Caller must hold exclusive lock on lru_mutex_.
     // Iterate the LRU list and splice any block with accessed=true to front.
+    SharedMutexLocker lk(&lru_mutex_);
     for (auto it = lru_queue_.begin(); it != lru_queue_.end();) {
         HotMemBlock* blk = *it;
         if (blk && blk->accessed.exchange(false, std::memory_order_relaxed)) {
@@ -442,7 +446,7 @@ void LocalHotCache::drainDeferredTouches() {
 }
 
 size_t LocalHotCache::GetCacheSize() const {
-    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    SharedMutexLocker lk(&lru_mutex_, shared_lock);
     return lru_queue_.size();
 }
 

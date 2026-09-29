@@ -70,14 +70,14 @@ class ObjectEntry {
     // never the reverse for any pair. Both references last only for the call.
     template <typename Fn>
     decltype(auto) WithExclusiveAccess(Fn&& fn) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
+        SharedMutexLocker lock(&mutex_);
         return std::forward<Fn>(fn)(*metadata_, state_);
     }
 
     // The same for readers: `fn` sees both halves but may not mutate them.
     template <typename Fn>
     decltype(auto) WithSharedAccess(Fn&& fn) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        SharedMutexLocker lock(&mutex_, shared_lock);
         return std::forward<Fn>(fn)(std::as_const(*metadata_),
                                     std::as_const(state_));
     }
@@ -91,7 +91,7 @@ class ObjectEntry {
     // carries no other state.
     std::atomic<uint64_t> generation_{0};
     // Mutable so a const entry can still be read under the shared lock.
-    mutable std::shared_mutex mutex_;
+    mutable SharedMutex mutex_;
     State state_ GUARDED_BY(mutex_);
 };
 

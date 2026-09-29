@@ -1109,7 +1109,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Maintained lazily — reads update last_access_ns_ atomically without
     // touching this index; SelectEvictionCandidate() repairs stale entries.
     std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
-    int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
+    int64_t GUARDED_BY(iterator_mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 
     mutable Mutex offloading_mutex_;
