@@ -1,14 +1,14 @@
 #include "cxl_segment_config.h"
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 #include "integer_parser.h"
 
 namespace mooncake {
 
 CxlSegmentConfig CxlSegmentConfig::FromEnvironment(const Environ& env) {
     CxlSegmentConfig config;
-    using Variables = CxlSegmentEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::CxlSegment;
 
     const auto raw_value = env.GetTyped(Variables::MC_CXL_DEV_SIZE);
     if (!raw_value.has_value()) {

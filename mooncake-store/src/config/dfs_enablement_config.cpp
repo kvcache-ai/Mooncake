@@ -1,13 +1,13 @@
 #include "dfs_enablement_config.h"
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "master_environment_variables.h"
 
 namespace mooncake {
 
 DfsEnablementConfig DfsEnablementConfig::FromEnvironment(const Environ& env) {
     DfsEnablementConfig config;
-    using Variables = DfsEnablementEnvironmentVariables;
+    using Variables = MasterEnvironmentVariables::DfsEnablement;
 
     // Read the legacy alias first to preserve the old primary-over-alias
     // precedence and diagnostics, including an eager alias read.

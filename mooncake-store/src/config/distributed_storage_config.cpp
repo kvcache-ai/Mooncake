@@ -143,7 +143,7 @@ bool DistributedStorageConfig::ValidateForAllocator() const {
 DistributedStorageConfig DistributedStorageConfig::FromEnvironment(
     const Environ& env) {
     DistributedStorageConfig config;
-    using Variables = DistributedStorageEnvironmentVariables;
+    using Variables = CommonEnvironmentVariables::DistributedStorage;
 
     const auto legacy_root_dir =
         env.GetTypedOr(Variables::MOONCAKE_DISTRIBUTED_ROOT_DIR, config.fsdir);

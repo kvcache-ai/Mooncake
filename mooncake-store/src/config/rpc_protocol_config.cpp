@@ -6,7 +6,7 @@
 namespace mooncake {
 
 RpcProtocolConfig RpcProtocolConfig::FromEnvironment(const Environ& env) {
-    using Variables = RpcProtocolEnvironmentVariables;
+    using Variables = CommonEnvironmentVariables::Rpc;
     const auto value = env.GetTyped(Variables::MC_RPC_PROTOCOL);
     return RpcProtocolConfig{.use_rdma = value && *value == "rdma"};
 }

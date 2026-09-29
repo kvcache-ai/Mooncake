@@ -8,7 +8,7 @@
 #include "bool_parser.h"
 #include "common/byte_size.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 #include "hugepage_config.h"
 
 namespace mooncake {
@@ -18,7 +18,7 @@ MmapArenaConfig MmapArenaConfig::FromEnvironment(const Environ& env,
                                                  uint64_t flag_pool_size) {
     MmapArenaConfig config{.enabled = enabled_by_flag,
                            .pool_size = flag_pool_size};
-    using Variables = MmapArenaEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::MmapArena;
 
     const std::string env_pool_size =
         env.GetTypedOr(Variables::MC_MMAP_ARENA_POOL_SIZE, std::string{});

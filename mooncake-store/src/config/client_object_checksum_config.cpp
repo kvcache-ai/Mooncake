@@ -1,7 +1,7 @@
 #include "client_object_checksum_config.h"
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
@@ -13,7 +13,7 @@ bool ClientObjectChecksumConfig::IsEnabledAtFirstUse() {
 ClientObjectChecksumConfig ClientObjectChecksumConfig::FromEnvironment(
     const Environ& env) {
     return {env.GetTypedOr(
-        ClientObjectChecksumEnvironmentVariables::MOONCAKE_STORE_CHECKSUM,
+        ClientEnvironmentVariables::ObjectChecksum::MOONCAKE_STORE_CHECKSUM,
         false)};
 }
 

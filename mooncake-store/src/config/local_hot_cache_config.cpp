@@ -7,7 +7,7 @@
 #include <string>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 namespace {
@@ -44,7 +44,7 @@ size_t ParseLegacyPositiveSizeOr(const std::optional<std::string>& raw_value,
 
 LocalHotCacheConfig LocalHotCacheConfig::FromEnvironment(const Environ& env) {
     LocalHotCacheConfig config;
-    using Variables = LocalHotCacheEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::LocalHotCache;
 
     const auto total_size =
         env.GetTyped(Variables::MC_STORE_LOCAL_HOT_CACHE_SIZE);

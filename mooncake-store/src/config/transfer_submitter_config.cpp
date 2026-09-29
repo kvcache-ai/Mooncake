@@ -7,15 +7,15 @@
 
 #include "bool_parser.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
 TransferSubmitterConfig TransferSubmitterConfig::FromEnvironment(
     const Environ& env) {
     TransferSubmitterConfig config;
-    auto value =
-        env.GetTyped(TransferSubmitterEnvironmentVariables::MC_STORE_MEMCPY);
+    auto value = env.GetTyped(
+        ClientEnvironmentVariables::TransferSubmitter::MC_STORE_MEMCPY);
     if (!value.has_value()) {
         return config;
     }

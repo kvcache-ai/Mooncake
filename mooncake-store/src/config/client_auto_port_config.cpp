@@ -2,13 +2,13 @@
 
 #include "config.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
 ClientAutoPortConfig ClientAutoPortConfig::FromEnvironment(const Environ& env) {
     ClientAutoPortConfig config;
-    using Variables = ClientAutoPortEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::AutoPort;
 
     config.max_retries = env.GetTypedOr(
         Variables::MC_STORE_CLIENT_SETUP_RETRIES, config.max_retries);

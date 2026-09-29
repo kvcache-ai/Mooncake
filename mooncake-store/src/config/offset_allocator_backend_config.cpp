@@ -6,7 +6,7 @@
 
 #include "ascii_string.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
@@ -60,7 +60,7 @@ bool OffsetAllocatorBackendConfig::Validate() const {
 OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment(
     const Environ& env) {
     OffsetAllocatorBackendConfig cfg;
-    using Variables = OffsetAllocatorBackendEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Offload::OffsetAllocator;
 
     const auto policy =
         env.GetTyped(Variables::MOONCAKE_OFFSET_EVICTION_POLICY);

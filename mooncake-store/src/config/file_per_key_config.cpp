@@ -3,7 +3,7 @@
 #include <glog/logging.h>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
@@ -17,7 +17,7 @@ bool FilePerKeyConfig::Validate() const {
 
 FilePerKeyConfig FilePerKeyConfig::FromEnvironment(const Environ& env) {
     FilePerKeyConfig config;
-    using Variables = FilePerKeyEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Offload::FilePerKey;
 
     config.fsdir =
         env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_FSDIR, config.fsdir);

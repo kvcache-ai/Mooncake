@@ -7,14 +7,14 @@
 
 #include "client_metric.h"
 #include "environ.h"
-#include "environment_variables.h"
+#include "../src/config/client_environment_variables.h"
 
 namespace mooncake {
 namespace {
 
 class ClientMetricConfigTest : public ::testing::Test {
    protected:
-    using Variables = ClientMetricEnvironmentVariables;
+    using Variables = ClientEnvironmentVariables::Metric;
 
     void SetUp() override {
         google::InitGoogleLogging("ClientMetricConfigTest");

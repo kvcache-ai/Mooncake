@@ -6,14 +6,14 @@
 #include <cctype>
 
 #include "environ.h"
-#include "environment_variables.h"
+#include "client_environment_variables.h"
 
 namespace mooncake {
 
 NoFRegisterConfig NoFRegisterConfig::FromEnvironment(const Environ& env) {
     NoFRegisterConfig config;
     config.transport_type =
-        env.GetTyped(NoFRegisterEnvironmentVariables::MC_NOF_TRTYPE)
+        env.GetTyped(ClientEnvironmentVariables::NoF::Register::MC_NOF_TRTYPE)
             .value_or("RDMA");
     std::transform(config.transport_type.begin(), config.transport_type.end(),
                    config.transport_type.begin(), [](unsigned char c) {
