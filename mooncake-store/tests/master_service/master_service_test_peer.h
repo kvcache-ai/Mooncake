@@ -86,9 +86,6 @@ class MasterServiceTestPeer {
     // The argument reports the scan's own progress, not a container index.
     void SetRemoveAllTenantHookForTesting(std::function<void(size_t)> hook);
 
-    // Runs the hook once a group eviction has settled every member.
-    void SetGroupEvictionSettledHookForTesting(std::function<void()> hook);
-
     // Counts of published clears and clears suppressed by a concurrent commit.
     uint64_t GetKvClearedPublishedForTesting() const;
 

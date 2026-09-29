@@ -2201,10 +2201,6 @@ class MasterService {
     // which is the only point where a test can commit into an already-scanned
     // region. The argument reports the walk's progress.
     std::function<void(size_t)> kv_remove_all_tenant_hook_;
-    // Fires when a group eviction has settled every member: the point where a
-    // test can land a replica on a member the sweep invalidated, and see that
-    // the sweep does not drop it.
-    std::function<void()> group_eviction_settled_hook_;
 
     static size_t KvTenantEpochSlot(const std::string& tenant) {
         return std::hash<std::string>{}(tenant) % kKvTenantEpochSlots;

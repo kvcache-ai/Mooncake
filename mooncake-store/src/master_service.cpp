@@ -1998,9 +1998,6 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
             break;
         }
     }
-    if (group_eviction_settled_hook_) {
-        group_eviction_settled_hook_();
-    }
     return result;
 }
 

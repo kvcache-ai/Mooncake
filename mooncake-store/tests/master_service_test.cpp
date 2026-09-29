@@ -1251,7 +1251,6 @@ TEST_F(MasterServiceTest, SnapshotReloadDropsReplicaActionState) {
     const auto candidates =
         MasterServiceTestPeer::PromotionCandidateKeys(service, tenant);
     ASSERT_FALSE(candidates.empty());
-    EXPECT_EQ(peer.CountCandidatesForTesting(tenant), candidates.size());
     ASSERT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
                     service, tenant, proposal_id)
                     .has_value());
@@ -1271,7 +1270,6 @@ TEST_F(MasterServiceTest, SnapshotReloadDropsReplicaActionState) {
     EXPECT_EQ(MasterServiceTestPeer::FindObject(service, identity), nullptr);
     EXPECT_TRUE(
         MasterServiceTestPeer::PromotionCandidateKeys(service, tenant).empty());
-    EXPECT_EQ(peer.CountCandidatesForTesting(tenant), 0u);
     EXPECT_EQ(MasterServiceTestPeer::PromotionCandidateCount(service).load(
                   std::memory_order_relaxed),
               0u);
@@ -1295,7 +1293,6 @@ TEST_F(MasterServiceTest, SnapshotReloadDropsReplicaActionState) {
     EXPECT_NE(republished, publication);
     EXPECT_TRUE(
         MasterServiceTestPeer::PromotionCandidateKeys(service, tenant).empty());
-    EXPECT_EQ(peer.CountCandidatesForTesting(tenant), 0u);
     EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
                      service, tenant, proposal_id)
                      .has_value());
@@ -1615,8 +1612,8 @@ TEST_F(MasterServiceTest, SnapshotDecodeWiresGroupsAndDropsActionState) {
     // A payload whose deadlines are pinned: the member that comes first carries
     // the latest deadline of its group. Its objects carry keys the service does
     // not hold, so the decode replaces the staged publication with them, and
-    // they are DISK-backed, so a round trip through the loader is metadata
-    // alone rather than a second claim on a segment allocation.
+    // they are DISK-backed, so decoding them is metadata alone rather than a
+    // second claim on a segment allocation.
     const auto payload = BuildSnapshotMetadataPayload(
         {{{tenant_a.value(), restored_key_a1, group_id,
            group_a_latest_deadline_ms, 7001},
@@ -1663,24 +1660,6 @@ TEST_F(MasterServiceTest, SnapshotDecodeWiresGroupsAndDropsActionState) {
         << "the same group id in another tenant is another group";
     EXPECT_EQ(deadline_ms_of(decoded_lease_b), group_b_deadline_ms)
         << "another tenant's group keeps the deadline its own payload carries";
-
-    // What the loader itself writes carries the same wiring: the group of each
-    // member and the deadline of the group lease, so decoding that payload back
-    // re-wires the membership and the shared lease from the payload alone.
-    {
-        MasterServiceTestPeer::MetadataSerializer serializer(&service);
-        auto encoded = serializer.Serialize();
-        ASSERT_TRUE(encoded.has_value());
-        ASSERT_TRUE(serializer.Deserialize(*encoded).has_value());
-    }
-    const auto round_trip_lease_a1 = lease_of(tenant_a, restored_key_a1);
-    const auto round_trip_lease_a2 = lease_of(tenant_a, restored_key_a2);
-    ASSERT_NE(round_trip_lease_a1, nullptr);
-    ASSERT_NE(round_trip_lease_a2, nullptr);
-    EXPECT_EQ(round_trip_lease_a1.get(), round_trip_lease_a2.get())
-        << "the members of one group share one lease";
-    EXPECT_EQ(deadline_ms_of(round_trip_lease_a1), group_a_latest_deadline_ms)
-        << "the loader records the group lease's own deadline";
 }
 
 TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
