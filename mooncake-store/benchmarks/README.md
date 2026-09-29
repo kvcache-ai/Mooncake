@@ -144,8 +144,14 @@ TTL.
 
 For manual master management, invoke the C++ binary with `--trace`,
 `--master_server`, `--output`, `--samples` and `--heartbeats`.
-It creates one trace worker per distinct `client_id`; worker count is not
-configurable. Each registered client also has an independent heartbeat thread.
+Each registered client has an independent heartbeat thread. By default, the
+replayer preconnects eight TCP connections per client, without using the SDK's
+process-wide shared pool. `--connections N` changes this default;
+`--shared-connections` instead creates exactly N connections for the whole
+replayer, useful for connection-count controls. Requests select connections
+round-robin and can be pipelined: waiting for a response does not reserve a
+connection. This benchmark transport uses the normal master wire protocol and
+timeout configuration; transport failures are reported without retrying mutations.
 The replayer loads the trace once before issuing RPCs and checks that its header
 uses a supported format. There is no separate validation pass; the producer is
 responsible for satisfying the trace contract below.
@@ -166,7 +172,7 @@ key operations share the same timeline and may be interleaved.
 
 | Operation | Additional fields |
 | --- | --- |
-| `ReMountSegment` | `segments: []`; one initial handshake per client, before its other events. |
+| `ReMountSegment` | `segments: []`; one initial handshake per client. Optional positive `workers` and `connections` override that client's defaults. Shared-connection mode ignores per-client connection counts. |
 | `MountSegment` | `segment_id`, positive `size_bytes`. |
 | `UnmountSegment` | `segment_id`; same owner as mount. |
 | `BatchExistKey`, `BatchGetReplicaList`, `BatchRemove` | Nonempty ordered `keys`. |
@@ -182,8 +188,8 @@ operation implicitly depends on its registration, and each unmount depends on
 its corresponding mount. Other ordering must be recorded in `depends_on`:
 for example, a put that requires newly mounted capacity should depend on that
 mount, and an unmount that must follow particular reads should depend on them.
-Different clients can execute concurrently. Calls within a client execute in
-file order, including lifecycle calls; unmount does not drain other clients.
+Different clients can execute concurrently. Unmount does not implicitly drain
+other clients; record the required completion dependencies.
 The replayer sends only recorded lifecycle calls, including unmounts. A trace
 may end with segments still mounted; the launcher then stops its dedicated
 master. Nonempty remount recovery is unsupported.
@@ -197,16 +203,42 @@ skipped, no finalization RPC is issued.
 `value_sizes` gives one positive byte length per key, with one slice per value.
 For multi-slice objects, `value_slices` instead gives one nonempty array of
 positive slice lengths per key: `[[4194288, 4194288, 32], [8192]]` describes two
-objects, with three slices and one slice respectively. The replayer preserves
-these boundaries; the producer must follow its Mooncake client's slice limits.
+objects, with three slices and one slice respectively. As in `MasterClient`,
+slice lengths are summed per object before sending the master RPC. The producer
+must follow its Mooncake client's slice limits.
 The two fields are mutually exclusive. Remove respects leases (`force=false`).
 
 `depends_on` lists earlier event IDs. Dependencies wait for completion; they do
 not imply success. Producers must preserve write/read/remove ordering for shared
 keys, including reads that must precede a later mutation. Producers must also
 preserve serial call-flow dependencies, including completion of a blocking put
-before the next batch in that flow. Different clients can execute concurrently;
-all recorded flows sharing a client are serialized in file order by its worker.
+before the next batch in that flow.
+
+For parallel RealClient replay, give **every event** an `operation_id`. Events
+sharing an operation ID must belong to one client and execute in file order on
+one worker. Put Start and End/Revoke must share an operation ID. Other calls can
+each be their own operation. Dependencies on an event in another operation wait
+for that entire operation, including its transfer hold, to finish. Cycles between
+operations are rejected before workers start. Do not create dependencies that
+require another operation to interleave inside an unfinished operation.
+
+`delay_us` waits after the preceding RPC in an operation, in addition to observing
+the event's planned timestamp. For example, record a put's simulated transfer
+duration on its End event. `hold_us` keeps the worker occupied after a call, such
+as the simulated transfer following GetReplicaList. Both default to zero and are
+synthetic delays; no KV payload moves. Record how these durations were obtained,
+since a fixed trace cannot adapt transfer sizes to different replay outcomes.
+
+`--workers-per-client N` sets the default number of whole-operation workers;
+registration's `workers` can override it. One TP8 inference instance per host
+can be represented by one client with eight workers and eight connections, while
+its eight dummy ranks retain separate key namespaces, batches and flow edges.
+Separate storage clients can use one worker and one connection each. Heartbeats
+run independently of these workers.
+
+Legacy traces without operation IDs retain one worker per client and file-order
+serialization. They require a worker count of one and cannot specify delays or
+holds. Mixing the two event formats is rejected.
 Unknown fields are ignored. Event fields and lifecycle
 consistency are not prevalidated; JSON decoding or dependency lookup can still
 fail while loading a malformed trace.
@@ -215,15 +247,16 @@ Record producer revision, model, physical key layout, batch sizes, object sizes,
 cache capacities, routing, topology, random seed, initial state and timing model
 in `metadata`. A logical GPU count is not a calibration of real serving load.
 The replayer does not infer requests, prefix relationships or cache policy.
-Pinning, group IDs, placement overrides, disk replicas, transfers and HA are not
+Pinning, replica group IDs, placement overrides, disk replicas, actual transfers and HA are not
 modeled. Do not silently discard these semantics in a producer.
 
 ### Arrival control and results
 
 Timestamps are replayed unchanged, relative to the replay start. Each client has
-one trace worker and at most one recorded API call in flight. Its background
-Ping may overlap that call. A slow recorded call delays later recorded calls
-from that client, even if their timestamps differ. Overdue events stay queued;
+its own queue of dependency-ready operations, ordered by planned start time.
+Each worker executes one complete operation at a time. A slow call occupies its
+worker and delays dependent operations; independent operations can use the
+client's other workers. Background Ping may overlap business calls. Overdue events stay queued;
 planned arrival times do not move to conceal overload. Dispatch lag includes
 waiting for earlier calls from the same client, dependencies and scheduling.
 A fixed trace does not model serving feedback caused by a slow or failed master.
@@ -237,6 +270,7 @@ run-001/
   result.json
   samples.jsonl
   heartbeats.jsonl
+  connections.json
   traffic.json
   evictions.json
   replay.json
@@ -246,6 +280,12 @@ run-001/
   master.log
   replayer.log
 ```
+
+`connections.json` records actual connection counts and each connection's total
+calls (including readiness probes), peak concurrent calls and remaining calls.
+For operation traces, each sample also records `operation_id`, the client-local
+worker index and `operation_finish_us`. RPC latency excludes synthetic transfer
+waits; operation completion includes them.
 
 For example, `result.json` contains these references alongside its summaries:
 

@@ -224,6 +224,9 @@ def main():
     parser.add_argument("--master-cpus", required=True)
     parser.add_argument("--replay-cpus", required=True)
     parser.add_argument("--rpc-threads", type=int, default=4)
+    parser.add_argument("--connections", type=int, default=8)
+    parser.add_argument("--shared-connections", action="store_true")
+    parser.add_argument("--workers-per-client", type=int, default=1)
     parser.add_argument("--sample-interval", type=float, default=0.2)
     parser.add_argument("--timeout", type=float, default=600)
     args = parser.parse_args()
@@ -231,7 +234,7 @@ def main():
         parser.error("process sampling and CPU affinity require Linux")
     if cpu_set(args.master_cpus) & cpu_set(args.replay_cpus):
         parser.error("master and replay CPU sets must be disjoint")
-    if args.rpc_threads < 1 or any(
+    if min(args.rpc_threads, args.connections, args.workers_per_client) < 1 or any(
         not math.isfinite(value) or value <= 0
         for value in (args.sample_interval, args.timeout)
     ):
@@ -269,6 +272,9 @@ def main():
         f"--output={directory / 'replay.json'}",
         f"--samples={directory / 'samples.jsonl'}",
         f"--heartbeats={directory / 'heartbeats.jsonl'}",
+        f"--connections={args.connections}",
+        f"--shared_connections={str(args.shared_connections).lower()}",
+        f"--workers_per_client={args.workers_per_client}",
         "--logtostderr=1",
     ]
     processes = []
@@ -362,6 +368,15 @@ def main():
             write_json(directory / "traffic.json", traffic_summary(samples))
             result.update(
                 {
+                    "connection_config": {
+                        key: value
+                        for key, value in replay["connections"].items()
+                        if key != "groups"
+                    },
+                    "connections": "connections.json",
+                    "workers": replay["workers"],
+                    "logical_clients": replay["logical_clients"],
+                    "replay_policy": replay["replay_policy"],
                     "success": replayer.returncode == 0 and not replay["has_errors"],
                     "samples": "samples.jsonl",
                     "heartbeats": "heartbeats.jsonl",
@@ -373,6 +388,7 @@ def main():
                     "operations": replay["operations"],
                 }
             )
+            write_json(directory / "connections.json", replay["connections"])
     except Exception as error:
         result["error"] = str(error)
         raise
