@@ -294,6 +294,10 @@ TEST_F(MasterServiceEvictScenarioTest, TargetEqualsLowerBoundEvictsExactCount) {
         .Then(Object(Key(kExpectedEvicted)).IsReadable());
 }
 
+auto to_duration(const std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds> & time_point) {
+    return std::chrono::time_point_cast<std::chrono::system_clock::duration>(time_point);
+}
+
 TEST_F(MasterServiceEvictScenarioTest, SoftPinnedObjectsAreFallbackCandidates) {
     constexpr size_t kUnpinnedCount = 10;
     constexpr size_t kSoftPinnedCount = 10;
@@ -311,7 +315,7 @@ TEST_F(MasterServiceEvictScenarioTest, SoftPinnedObjectsAreFallbackCandidates) {
         .Given(IndexedObjects(kUnpinnedCount, kUnpinnedCount + kSoftPinnedCount)
                    .Size(kObjectSize)
                    .CompleteOn("memory")
-                   .ExpiredFrom(base + std::chrono::nanoseconds(kUnpinnedCount))
+                   .ExpiredFrom(to_duration(base + std::chrono::nanoseconds(kUnpinnedCount)))
                    .SoftPinnedUntil(active_soft_pin))
         .When(EvictMemory(0.80))
         .Then(
@@ -339,7 +343,7 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsWholeGroupTogether) {
         .Given(IndexedObjects(kGroupSize, kObjectCount)
                    .Size(kObjectSize)
                    .CompleteOn("memory")
-                   .ExpiredFrom(base + std::chrono::nanoseconds(kGroupSize)))
+                   .ExpiredFrom(to_duration(base + std::chrono::nanoseconds(kGroupSize))))
         .When(EvictMemory(0.10))
         .Then(ReadableCount(IndexedObjects(0, kObjectCount),
                             kObjectCount - kGroupSize))
@@ -363,7 +367,7 @@ TEST_F(MasterServiceEvictScenarioTest, ActiveGroupMemberBlocksWholeGroup) {
         .Given(IndexedObjects(kGroupSize, kObjectCount)
                    .Size(kObjectSize)
                    .CompleteOn("memory")
-                   .ExpiredFrom(base + std::chrono::nanoseconds(kGroupSize)))
+                   .ExpiredFrom(to_duration(base + std::chrono::nanoseconds(kGroupSize))))
         .When(ExpireAt(Key(kGroupSize - 1), std::chrono::system_clock::now() +
                                                 std::chrono::hours(1)))
         .When(EvictMemory(0.10))
@@ -418,7 +422,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Given(IndexedObjects(plain_begin, total)
                    .Size(kObjectSize)
                    .CompleteOn("memory")
-                   .ExpiredFrom(base + std::chrono::nanoseconds(plain_begin)))
+                   .ExpiredFrom(to_duration(base + std::chrono::nanoseconds(plain_begin))))
         .When(EvictMemory(0.05))
         .Then(ReadableCount(IndexedObjects(0, total), total - kExpectedEvicted))
         .Then(IndexedObjects(0, kBlockedCount + 1).AreReadable())
@@ -453,7 +457,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Given(IndexedObjects(plain_begin, total)
                    .Size(kObjectSize)
                    .CompleteOn("memory")
-                   .ExpiredFrom(base + std::chrono::nanoseconds(plain_begin)))
+                   .ExpiredFrom(to_duration(base + std::chrono::nanoseconds(plain_begin))))
         .When(EvictMemory(0.05))
         .Then(ReadableCount(IndexedObjects(0, total), total - kExpectedEvicted))
         .Then(IndexedObjects(0, kBlockedCount + 1).AreReadable());
@@ -678,7 +682,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Given(IndexedObjects(2, 14)
                    .Size(kLargeObject)
                    .CompleteOn("memory")
-                   .ExpiredFrom(ExpiredBase() + std::chrono::nanoseconds(2)))
+                   .ExpiredFrom(to_duration(ExpiredBase() + std::chrono::nanoseconds(2))))
         .When(PutStart(Key(14), 3 * kLargeObject)
                   .Eventually(std::chrono::seconds(10)))
         .When(PutEnd(Key(14)))
@@ -742,7 +746,7 @@ TEST_F(MasterServiceEvictScenarioTest, HardPinnedObjectsSurvivePressure) {
         .Given(IndexedObjects(1, 14)
                    .Size(kLargeObject)
                    .CompleteOn("memory")
-                   .ExpiredFrom(ExpiredBase() + std::chrono::nanoseconds(1)))
+                   .ExpiredFrom(to_duration(ExpiredBase() + std::chrono::nanoseconds(1))))
         .When(PutStart(Key(14), 3 * kLargeObject)
                   .Eventually(std::chrono::seconds(10)))
         .When(PutEnd(Key(14)))
@@ -769,12 +773,12 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Given(IndexedObjects(1, 2)
                    .Size(kLargeObject)
                    .CompleteOn("memory")
-                   .ExpiredFrom(ExpiredBase() + std::chrono::nanoseconds(1))
+                   .ExpiredFrom(to_duration(ExpiredBase() + std::chrono::nanoseconds(1)))
                    .SoftPinnedUntil(active_pin))
         .Given(IndexedObjects(2, 14)
                    .Size(kLargeObject)
                    .CompleteOn("memory")
-                   .ExpiredFrom(ExpiredBase() + std::chrono::nanoseconds(2)))
+                   .ExpiredFrom(to_duration(ExpiredBase() + std::chrono::nanoseconds(2))))
         .When(PutStart(Key(14), 3 * kLargeObject)
                   .Eventually(std::chrono::seconds(10)))
         .When(PutEnd(Key(14)))

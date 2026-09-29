@@ -136,7 +136,7 @@ TEST(MasterServiceSsdScenarioTest, MemoryPressureEvictsOnlyTheMemoryHalf) {
             .When(PutEnd(PressureKey(index)).OfType(ReplicaType::MEMORY))
             .When(PutEnd(PressureKey(index)).OfType(ReplicaType::DISK))
             .When(ExpireAt(PressureKey(index),
-                           expired_base + std::chrono::nanoseconds(index)));
+                           std::chrono::time_point_cast<std::chrono::system_clock::duration>(expired_base + std::chrono::nanoseconds(index))));
     }
     scenario
         .When(PutStart(PressureKey(kFilled), 3 * kLargeObject)

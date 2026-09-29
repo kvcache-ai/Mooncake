@@ -54,8 +54,11 @@ class Lease {
     }
 
     std::chrono::system_clock::time_point ExpiresAt() const {
-        return std::chrono::system_clock::time_point(std::chrono::nanoseconds(
-            deadline_ns_.load(std::memory_order_relaxed)));
+        auto ns_val = deadline_ns_.load(std::memory_order_relaxed);
+        auto dur = std::chrono::nanoseconds(ns_val);
+        return std::chrono::system_clock::time_point{
+            std::chrono::duration_cast<std::chrono::system_clock::duration>(dur)
+        };
     }
 
    private:

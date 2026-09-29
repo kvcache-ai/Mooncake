@@ -427,10 +427,10 @@ MasterScenario& MasterScenario::Given(ObjectsSpec<> objects) {
         When(std::move(put));
         When(PutEnd(key).By(objects.actor).ForTenant(objects.tenant));
 
+        auto ts = *objects.lease_timeout_base + objects.lease_timeout_step * offset;
+        auto p = std::chrono::time_point_cast<std::chrono::system_clock::duration>(ts);
         if (objects.lease_timeout_base.has_value()) {
-            auto expire = ExpireAt(key, *objects.lease_timeout_base +
-                                            objects.lease_timeout_step * offset)
-                              .ForTenant(objects.tenant);
+            auto expire = ExpireAt(key, p).ForTenant(objects.tenant);
             if (objects.soft_pin_timeout.has_value()) {
                 expire.SoftPinnedUntil(*objects.soft_pin_timeout);
             }
