@@ -360,10 +360,12 @@ scraping adds overhead; hold its interval fixed between comparisons.
 capacity and allocation, which differ from the master's actual process RSS.
 Use the metrics to check capacity throughout the replay.
 Throughput includes initial idle time and final drain. Client-call latency
-includes API/RPC work; it is not server-only processing time. Calls count
-MasterClient API invocations; retries can create extra wire traffic. Compare
-server metrics as well. Miss, not-ready and already-exists outcomes have separate
-counts and are not successful-hit counts.
+includes connection scheduling, transport and master work; it is not server-only
+processing time. Calls count RPCs issued by the replayer; skipped finalizations
+do not count. There are no automatic mutation retries. Connection readiness
+probes precede the replay clock, and heartbeat traffic is reported separately.
+Compare server metrics as well. Miss, not-ready and already-exists outcomes have
+separate counts and are not successful-hit counts.
 
 After successful registration, each client starts a background Ping loop that
 waits one second after each response before sending again. It shares that
@@ -378,7 +380,9 @@ When migrating older traces, remove Ping events and their dependency edges;
 retain ordering between all remaining events. Compare recorded business calls
 separately from heartbeat traffic when comparing measurements.
 
-High replay lag with low master utilization indicates a load-generator limit.
-Vary the input workload or client count and check offered versus achieved rates
-before attributing a throughput ceiling to master locks. This benchmark reports
-whole-master load; lock attribution additionally requires profiling.
+High replay lag alone does not locate the bottleneck. Compare RPC latency,
+worker occupancy, offered versus achieved rates, and master and replayer CPU
+use. Low master CPU use can also occur while its threads wait for locks. Vary
+the input workload or client count to distinguish a workload limit from a master
+limit. This benchmark reports whole-master load; lock attribution additionally
+requires profiling.
