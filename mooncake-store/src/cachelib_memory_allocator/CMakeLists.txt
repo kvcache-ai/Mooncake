@@ -1,6 +1,6 @@
 project(cachelib_memory_allocator)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 
 add_library(
   cachelib_memory_allocator STATIC

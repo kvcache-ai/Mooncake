@@ -777,6 +777,11 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_max_retry_attempts);
 }
 
+namespace google {
+    using gflags::CommandLineFlagInfo;
+    using gflags::GetCommandLineFlagInfo;
+}
+
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                            bool conf_set) {
     if (FLAGS_max_threads != 16) {  // 16 is the default value

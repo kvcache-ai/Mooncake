@@ -209,3 +209,6 @@ core_*
 # MacOS
 .DS_Store
 .envrc
+.venv-conan/
+conan/generators/
+install/

@@ -8,4 +8,5 @@ hypothesis==6.141.0
 typing_extensions==4.13.2
 codespell==2.2.6
 cmake-format==0.6.13
+conan==2.32.0
 # clang-format is provided via system package (e.g., sudo apt-get install -y clang-format-20) or toolchain
