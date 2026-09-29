@@ -130,7 +130,7 @@ class Transport {
         std::string peer_nic_path;
         std::string source_location;
         SliceStatus status;
-        TransferTask *task;
+        std::atomic<TransferTask *> task;
         // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
         // are 32-bit. Use a scoped alias so the width is defined in one place.
 #if defined(USE_EFA) || defined(USE_CXI)
@@ -210,18 +210,19 @@ class Transport {
        public:
         void markSuccess() {
             status = Slice::SUCCESS;
-            __atomic_fetch_add(&task->transferred_bytes, length,
-                               __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
+            TransferTask *t = task.load(std::memory_order_acquire);
+            __atomic_fetch_add(&t->transferred_bytes, length, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&t->success_slice_count, 1, __ATOMIC_ACQ_REL);
 
-            check_batch_completion(task, false);
+            check_batch_completion(t, false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
+            TransferTask *t = task.load(std::memory_order_acquire);
+            __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
 
-            check_batch_completion(task, true);
+            check_batch_completion(t, true);
         }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
