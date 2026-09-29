@@ -940,6 +940,13 @@ JitKernelStatus launch_jit_kernel(const JitKernelVariant& variant,
         return JitKernelStatus::kUnsupportedDevice;
     }
 
+    if (variant.min_sm < 0) {
+        if (error != nullptr) {
+            *error = log_prefix + " min_sm was not set by the caller";
+        }
+        return JitKernelStatus::kUnsupportedDevice;
+    }
+
     const int sm = prop.major * 10 + prop.minor;
     if (sm < variant.min_sm) {
         if (error != nullptr) {
