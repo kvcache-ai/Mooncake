@@ -1,6 +1,6 @@
 # mooncake-store-bench
 
-`mooncake-store-bench` is a standalone benchmark and verification tool for the Mooncake store. It ships inside the wheel as an entry-point binary alongside `mooncake-store-client` and `mooncake-store-admin`.
+`mooncake-store-bench` is a standalone benchmark and verification tool for the Mooncake store. It is built from the Rust workspace alongside `mooncake-store-client` and `mooncake-store-admin`.
 
 ## Commands
 
@@ -273,15 +273,16 @@ Keyspace behavior is conditional:
 - scratch-only mode (`storage_bytes=0`) reuses the configured keyspace, or `mc/store-rs/v2` when `--keyspace` is omitted
 - storage-owning mode (`storage_bytes>0`) auto-generates `mc/store-rs/bench/<unique>` when `--keyspace` is omitted
 
-## Wheel packaging
+## Build
 
-The binary is installed alongside `mooncake-store-client` and `mooncake-store-admin`:
+Build the benchmark and client commands from the workspace:
 
-- `build-wheel.sh` installs `mooncake-store-bench` to `dist/bin/` and injects it into the wheel zip under `mooncake_store_rs/mooncake-store-bench`
-- `pyproject.toml` registers `mooncake-store-bench = "mooncake_store_rs.cli:main"` as an entry point
-- `_runtime.py` recognises `mooncake-store-bench` in `invoked_binary_name()` and dispatches `execute_packaged_binary`
+```bash
+cargo build --release -p mooncake-store-py --bin mooncake-store-bench --bin mooncake-store-client --bin mooncake-store-admin
+export PATH="$PWD/target/release:$PATH"
+```
 
-After `pip install mooncake-store-rs`, the tool is available as `mooncake-store-bench` on `$PATH`.
+The binaries are written to `target/release/` unless `CARGO_TARGET_DIR` is set.
 
 ## Next reading
 

@@ -1,6 +1,5 @@
 """Exercise native shim builds with explicit CMake source/build paths."""
 
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -9,8 +8,6 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 CRATE = ROOT / "crates/mooncake-transport-sys"
-WHEEL_SCRIPT = ROOT / "scripts/build/build-wheel.sh"
-DOCKER_WRAPPER = ROOT / "scripts/build/build-wheel-ubuntu-docker.sh"
 
 
 def test_native_shims_use_explicit_paths_without_configuring_cmake(tmp_path):
@@ -108,96 +105,3 @@ fn consumes_explicit_paths_and_never_runs_cmake() {
         capture_output=True,
         text=True,
     )
-
-
-def test_build_wheel_requires_explicit_source_paths(tmp_path):
-    store_rs = tmp_path / "store-rs"
-    upstream = tmp_path / "upstream"
-    build = tmp_path / "build"
-    (store_rs / "crates/mooncake-store-py").mkdir(parents=True)
-    (upstream / "mooncake-transfer-engine").mkdir(parents=True)
-    (upstream / "mooncake-common").mkdir()
-
-    values = {
-        "MOONCAKE_STORE_RS_DIR": str(store_rs),
-        "MOONCAKE_ROOT_DIR": str(upstream),
-        "MOONCAKE_BUILD_DIR": str(build),
-    }
-    help_result = subprocess.run(
-        ["bash", str(WHEEL_SCRIPT), "--help"],
-        env={key: value for key, value in os.environ.items() if key not in values},
-        capture_output=True,
-        text=True,
-    )
-    assert help_result.returncode == 0
-    assert "MOONCAKE_STORE_RS_DIR" in help_result.stdout
-
-    for missing_key in values:
-        for missing_value in (None, ""):
-            env = {**os.environ, **values}
-            if missing_value is None:
-                env.pop(missing_key)
-            else:
-                env[missing_key] = missing_value
-            result = subprocess.run(
-                ["bash", str(WHEEL_SCRIPT)],
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            assert result.returncode != 0
-            assert f"{missing_key} must be set" in result.stderr
-
-
-def test_docker_wrapper_maps_explicit_paths_without_building_an_image(tmp_path):
-    upstream = tmp_path / "Mooncake"
-    store_rs = upstream / "mooncake-store-rs"
-    (store_rs / "crates/mooncake-store-py").mkdir(parents=True)
-    docker_dir = tmp_path / "bin"
-    docker_dir.mkdir()
-    docker_args = tmp_path / "docker-args.json"
-    docker = docker_dir / "docker"
-    docker.write_text(
-        f"#!{sys.executable}\n"
-        + r"""
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-if args[:2] == ["image", "inspect"]:
-    sys.exit(0)
-with open(os.environ["DOCKER_ARGS_PATH"], "w") as output:
-    json.dump(args, output)
-"""
-    )
-    docker.chmod(0o755)
-
-    subprocess.run(
-        ["bash", str(DOCKER_WRAPPER)],
-        env={
-            **os.environ,
-            "PATH": str(docker_dir) + os.pathsep + os.environ["PATH"],
-            "DOCKER_ARGS_PATH": str(docker_args),
-            "DOCKER_IMAGE": "test-image",
-            "CN_MIRROR": "0",
-            "MOONCAKE_STORE_RS_DIR": str(store_rs),
-            "MOONCAKE_ROOT_DIR": str(upstream),
-        },
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    args = json.loads(docker_args.read_text())
-    environment = {
-        args[index + 1]
-        for index, value in enumerate(args[:-1])
-        if value == "-e"
-    }
-    assert "MOONCAKE_STORE_RS_DIR=/work/mooncake-store-rs" in environment
-    assert "MOONCAKE_ROOT_DIR=/work" in environment
-    assert any(value.startswith("MOONCAKE_BUILD_DIR=/cache/") for value in environment)
-    assert "-v" in args
-    assert f"{upstream}:/work" in args
-    assert args[args.index("-w") + 1] == "/work/mooncake-store-rs"

@@ -494,7 +494,7 @@ What this means in practice:
 - the same metrics and tracing capabilities are available
 - the same replication controls are exposed through `ReplicateConfig`
 - the same standalone compatibility server can serve dummy clients
-- the wheel packaging flow ships the native extension with bundled runtime libraries
+- the Python compatibility modules are exercised from the source checkout
 
 ### Dummy and real compatibility paths
 

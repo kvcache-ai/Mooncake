@@ -5,19 +5,7 @@ import os
 import pathlib
 import subprocess
 import sys
-import tempfile
 
-# Directories that follow auditwheel's vendoring layout, where libraries carry
-# a `libfoo-<hash>.so` suffix. The upstream `mooncake-transfer-engine` wheel is
-# listed too: when it is co-installed its vendored transfer-engine libraries are
-# usable, so they are worth probing.
-_VENDORED_LIB_DIRS = ("mooncake_store_rs.libs", "mooncake.libs")
-
-# Only *this* package's vendored directory means "auditwheel already wired up
-# our libraries via RPATH, so preloading is unnecessary". Checking the upstream
-# directory here would suppress our own preload the moment the upstream wheel is
-# installed alongside us -- the co-installation this package is built for.
-_OWN_VENDORED_LIB_DIRS = ("mooncake_store_rs.libs",)
 _NATIVE_LIBRARIES = (
     "libasio.so",
     "libmooncake_common.so",
@@ -93,10 +81,6 @@ def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]
         [
             root,
             root / "lib",
-            # Our own vendored copy first: a co-installed upstream wheel pins
-            # its own transfer-engine build, which need not match ours.
-            root.parent / "mooncake_store_rs.libs",
-            root.parent / "mooncake.libs",
         ]
     )
 
@@ -109,16 +93,6 @@ def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]
         seen.add(path)
         resolved.append(path)
     return resolved
-
-
-def hashed_library(library_dir: pathlib.Path, prefix: str) -> pathlib.Path | None:
-    matches = sorted(library_dir.glob(f"{prefix}-*.so*"))
-    if matches:
-        return matches[0]
-    original = library_dir / f"{prefix}.so"
-    if original.exists():
-        return original
-    return None
 
 
 def native_library_candidates(
@@ -136,12 +110,7 @@ def native_library_candidates(
                     continue
         candidate_path: pathlib.Path | None = None
         for library_dir in library_dirs(package_root):
-            if library_dir.name in _VENDORED_LIB_DIRS:
-                candidate = hashed_library(library_dir, library_name[:-3])
-            else:
-                candidate = library_dir / library_name
-            if candidate is None:
-                continue
+            candidate = library_dir / library_name
             resolved = safe_resolve(candidate)
             if resolved is None or not resolved.exists():
                 continue
@@ -153,9 +122,6 @@ def native_library_candidates(
 
 
 def preload_native_libraries(package_root: pathlib.Path | None = None) -> None:
-    root = package_root if package_root is not None else package_dir()
-    if any((root.parent / name).is_dir() for name in _OWN_VENDORED_LIB_DIRS):
-        return
     for library in native_library_candidates(package_root):
         try:
             ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
@@ -174,7 +140,6 @@ def binary_path(
 
     source_root = source_tree_root()
     if source_root is not None:
-        candidates.append(source_root / "dist" / "bin" / binary_name)
         candidates.append(source_root / "target" / "release" / binary_name)
 
     build_root = explicit_path("MOONCAKE_BUILD_DIR")
@@ -185,56 +150,32 @@ def binary_path(
 
     resolved = resolve_first(candidates)
     if resolved is None:
-        raise FileNotFoundError(f"cannot find packaged {binary_name} binary")
+        raise FileNotFoundError(f"cannot find {binary_name} in configured source/build paths")
     return resolved
 
 
 def prepare_library_env(
     package_root: pathlib.Path | None = None,
-) -> tuple[dict[str, str], tempfile.TemporaryDirectory[str] | None]:
+) -> dict[str, str]:
     root = package_root if package_root is not None else package_dir()
     env = os.environ.copy()
-    temp_dir: tempfile.TemporaryDirectory[str] | None = None
-    search_paths: list[str] = []
-
-    for library_dir in library_dirs(root):
-        search_paths.append(str(library_dir))
-        if library_dir.name not in _VENDORED_LIB_DIRS:
-            continue
-        if temp_dir is None:
-            temp_dir = tempfile.TemporaryDirectory(prefix="mooncake-cli-")
-        compat_dir = pathlib.Path(temp_dir.name)
-        for library_name in _NATIVE_LIBRARIES:
-            target = hashed_library(library_dir, library_name[:-3])
-            if target is None:
-                continue
-            alias = compat_dir / library_name
-            if alias.exists():
-                continue
-            alias.symlink_to(target)
-        search_paths.insert(0, str(compat_dir))
-
+    search_paths = [str(path) for path in library_dirs(root)]
     current = env.get("LD_LIBRARY_PATH")
     env["LD_LIBRARY_PATH"] = ":".join(search_paths + ([current] if current else []))
-    return env, temp_dir
+    return env
 
 
 def execute_packaged_binary(binary_name: str, argv: list[str]) -> int:
     root = package_dir()
     binary = binary_path(binary_name, root)
     binary.chmod(0o755)
-    env, temp_dir = prepare_library_env(root)
-    try:
-        return subprocess.call([str(binary), *argv], env=env)
-    finally:
-        if temp_dir is not None:
-            temp_dir.cleanup()
+    env = prepare_library_env(root)
+    return subprocess.call([str(binary), *argv], env=env)
 
 
 def invoked_binary_name() -> str:
     program_name = pathlib.Path(sys.argv[0]).name
-    # Must stay in sync with [project.scripts]. `transfer_engine_bench` is
-    # deliberately absent: it belongs to the upstream wheel.
+    # Must stay in sync with the Store-RS console scripts.
     if program_name in {
         "mooncake-store-client",
         "mooncake-store-admin",

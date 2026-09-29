@@ -161,7 +161,7 @@ What it contains:
 
 Purpose:
 
-- package convenience layer around the native extension
+- source compatibility layer around the native extension
 - find and load the built shared library from the repository checkout
 
 It also provides Python-friendly wrappers for batch and buffer-oriented methods.
@@ -189,7 +189,7 @@ The e2e binary validates:
 
 Purpose:
 
-- provide a standalone, production-grade benchmark and verification tool that ships inside the wheel
+- provide a standalone, production-grade benchmark and verification binary built from the Rust workspace
 
 The bench binary provides three subcommands:
 

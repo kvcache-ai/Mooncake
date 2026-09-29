@@ -173,7 +173,7 @@ Use `query_route()` to inspect the storage placement for one key:
 ```python
 import json
 
-from mooncake.store import MooncakeDistributedStore
+from mooncake_store_rs.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup({

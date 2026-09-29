@@ -11,7 +11,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/e2e/run-local-hot-cache-e2e.sh [all|real|dummy]
 
-Validate the local hot-cache v2 behavior against a real wheel/runtime:
+Validate the local hot-cache v2 behavior against the Python source runtime:
 
   real   - rw-only real client keeps a locally cached value after the origin key
            is deleted remotely.
@@ -20,9 +20,6 @@ Validate the local hot-cache v2 behavior against a real wheel/runtime:
   all    - run both phases (default).
 
 Environment:
-  MC_STORE_RS_REFRESH_WHEEL                   Rebuild/reinstall the latest wheel
-                                              into .venv-wheel before running
-                                              (default: 1)
   MC_STORE_RS_LOCAL_HOT_CACHE_E2E_REDIS_PORT  Fixed Redis port; auto-allocates
                                               when empty
   MC_STORE_RS_LOCAL_HOT_CACHE_E2E_STORAGE_BYTES
@@ -60,7 +57,6 @@ REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an expli
   exit 1
 }
 
-REFRESH_WHEEL="${MC_STORE_RS_REFRESH_WHEEL:-1}"
 STORAGE_BYTES="${MC_STORE_RS_LOCAL_HOT_CACHE_E2E_STORAGE_BYTES:-$((64 * 1024 * 1024))}"
 SCRATCH_BYTES="${MC_STORE_RS_LOCAL_HOT_CACHE_E2E_SCRATCH_BYTES:-$((16 * 1024 * 1024))}"
 HOT_CACHE_BYTES="${MC_STORE_RS_LOCAL_HOT_CACHE_E2E_CACHE_BYTES:-$((1 * 1024 * 1024))}"
@@ -85,46 +81,13 @@ print(int(time.time() * 1000))
 PY
 }
 
-resolve_python_bin() {
-  if [[ -x "${REPO_ROOT}/.venv-wheel/bin/python" ]]; then
-    printf '%s\n' "${REPO_ROOT}/.venv-wheel/bin/python"
-    return 0
-  fi
-  printf '%s\n' python3
-}
-
 ensure_runtime_ready() {
-  local python_bin
-  python_bin=$(resolve_python_bin)
-
-  if [[ "${REFRESH_WHEEL}" == "1" ]]; then
-    echo "==> rebuilding and reinstalling latest wheel into .venv-wheel"
-    bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-    bash "${REPO_ROOT}/scripts/build/install-wheel.sh"
-    PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
-    return 0
-  fi
-
-  if [[ ! -x "${python_bin}" ]]; then
-    echo "python runtime not found at ${python_bin}; rebuilding wheel runtime" >&2
-    bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-    bash "${REPO_ROOT}/scripts/build/install-wheel.sh"
-    PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
-    return 0
-  fi
-
-  if ! "${python_bin}" - <<'PY' >/dev/null 2>&1
-from mooncake_store_rs.store import MooncakeDistributedStore  # noqa: F401
-PY
-  then
-    echo "==> installed wheel missing or stale; rebuilding .venv-wheel runtime"
-    bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-    bash "${REPO_ROOT}/scripts/build/install-wheel.sh"
-    PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
-    return 0
-  fi
-
-  PYTHON_BIN="${python_bin}"
+  echo "==> building Python extension and standalone client from source"
+  (
+    cd "${REPO_ROOT}"
+    cargo build --release -p mooncake-store-py --lib --bin mooncake-store-client
+  )
+  PYTHON_BIN="python3"
 }
 
 wait_for_redis_up() {
@@ -279,12 +242,6 @@ trap cleanup EXIT
 start_redis "${REDIS_DIR}"
 ensure_runtime_ready
 
-echo "==> building latest mooncake-store-client binary"
-(
-  cd "${REPO_ROOT}"
-  cargo build -p mooncake-store-py --bin mooncake-store-client
-)
-
 export MC_STORE_LOCAL_HOT_CACHE_SIZE="${HOT_CACHE_BYTES}"
 export MC_STORE_LOCAL_HOT_BLOCK_SIZE="${HOT_BLOCK_BYTES}"
 
@@ -395,7 +352,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
   export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_DAEMON_HOST="127.0.0.1:$(allocate_port)"
   export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_DUMMY_ADDR="127.0.0.1:$(allocate_port)"
   export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_DUMMY_WRITER_HOST="127.0.0.1:$(allocate_port)"
-  DAEMON_BIN="${REPO_ROOT}/target/debug/mooncake-store-client"
+  DAEMON_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/release/mooncake-store-client"
   env \
     MC_STORE_LOCAL_HOT_CACHE_SIZE="${HOT_CACHE_BYTES}" \
     MC_STORE_LOCAL_HOT_BLOCK_SIZE="${HOT_BLOCK_BYTES}" \

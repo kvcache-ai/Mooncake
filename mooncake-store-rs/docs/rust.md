@@ -347,7 +347,7 @@ It covers:
 
 ## Benchmarking
 
-Use `mooncake-store-bench` for throughput measurement, correctness verification, and long-duration stability testing. It is built from `crates/mooncake-store-py/src/bin/mooncake_store_bench/` and ships in the wheel.
+Use `mooncake-store-bench` for throughput measurement, correctness verification, and long-duration stability testing. It is built from `crates/mooncake-store-py/src/bin/mooncake_store_bench/` as part of the Rust workspace.
 
 Quick start:
 

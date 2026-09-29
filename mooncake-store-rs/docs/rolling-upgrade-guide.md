@@ -116,7 +116,7 @@ mooncake-store-client promoted stable_id=client-a epoch=2 from_epoch=1 kind=HotU
 
 ```python
 import time
-from mooncake.store import MooncakeDistributedStore
+from mooncake_store_rs.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 assert store.setup(

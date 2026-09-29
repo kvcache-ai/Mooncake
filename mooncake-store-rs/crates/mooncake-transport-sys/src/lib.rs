@@ -5,8 +5,6 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const WHEEL_LIB_DIRS: [&str; 2] = ["mooncake.libs", "mooncake_store_rs.libs"];
-
 #[derive(Copy, Clone)]
 struct LibrarySpec {
     file_name: &'static str,
@@ -123,17 +121,9 @@ fn add_base_search_dirs(base_dir: &Path, dirs: &mut Vec<PathBuf>) {
     push_unique_dir(dirs, base_dir);
     push_unique_dir(dirs, &base_dir.join("lib"));
     if let Some(parent) = base_dir.parent() {
-        for wheel_dir in WHEEL_LIB_DIRS {
-            push_unique_dir(dirs, &parent.join(wheel_dir));
-        }
         if base_dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
             push_unique_dir(dirs, parent);
             push_unique_dir(dirs, &parent.join("lib"));
-            if let Some(grandparent) = parent.parent() {
-                for wheel_dir in WHEEL_LIB_DIRS {
-                    push_unique_dir(dirs, &grandparent.join(wheel_dir));
-                }
-            }
         }
         add_transport_build_out_dirs(parent, dirs);
     }
@@ -188,26 +178,7 @@ fn push_library_candidate(candidates: &mut Vec<PathBuf>, path: &Path, file_name:
 
 fn search_library_in_dir(library_dir: &Path, file_name: &str) -> Option<PathBuf> {
     let direct = library_dir.join(file_name);
-    if direct.exists() {
-        return Some(direct);
-    }
-    let prefix = file_name.strip_suffix(".so").unwrap_or(file_name);
-    let prefix = format!("{prefix}-");
-    let Ok(entries) = fs::read_dir(library_dir) else {
-        return None;
-    };
-    let mut hashed_matches = Vec::new();
-    for entry in entries.flatten() {
-        let candidate = entry.path();
-        let Some(name) = candidate.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if name.starts_with(&prefix) && name.contains(".so") {
-            hashed_matches.push(candidate);
-        }
-    }
-    hashed_matches.sort();
-    hashed_matches.into_iter().next()
+    direct.exists().then_some(direct)
 }
 
 fn push_unique_dir(dirs: &mut Vec<PathBuf>, candidate: &Path) {
@@ -993,9 +964,7 @@ mod tests {
     fn search_library_in_dir_prefers_direct_match() {
         let temp_dir = TempDir::new();
         let direct = temp_dir.path().join("libtransfer_engine.so");
-        let hashed = temp_dir.path().join("libtransfer_engine-abcd1234.so");
         fs::write(&direct, b"").expect("direct library should create");
-        fs::write(&hashed, b"").expect("hashed library should create");
 
         let selected = search_library_in_dir(temp_dir.path(), "libtransfer_engine.so")
             .expect("library should resolve");
@@ -1004,30 +973,11 @@ mod tests {
     }
 
     #[test]
-    fn search_library_in_dir_accepts_hashed_wheel_libraries() {
-        let temp_dir = TempDir::new();
-        let hashed = temp_dir
-            .path()
-            .join("libmooncake_classic_shim-deadbeef.so.1");
-        fs::write(&hashed, b"").expect("hashed library should create");
-
-        let selected = search_library_in_dir(temp_dir.path(), "libmooncake_classic_shim.so")
-            .expect("hashed library should resolve");
-
-        assert_eq!(selected, hashed);
-    }
-
-    #[test]
     fn add_base_search_dirs_includes_package_relative_dirs() {
         let temp_dir = TempDir::new();
-        let site_packages = temp_dir.path().join("site-packages");
-        let package_dir = site_packages.join("mooncake");
+        let package_dir = temp_dir.path().join("mooncake");
         let package_lib_dir = package_dir.join("lib");
-        let wheel_lib_dir = site_packages.join("mooncake.libs");
-        let compat_wheel_lib_dir = site_packages.join("mooncake_store_rs.libs");
         fs::create_dir_all(&package_lib_dir).expect("package lib dir should create");
-        fs::create_dir_all(&wheel_lib_dir).expect("wheel lib dir should create");
-        fs::create_dir_all(&compat_wheel_lib_dir).expect("compat wheel lib dir should create");
 
         let mut dirs = Vec::new();
         add_base_search_dirs(&package_dir, &mut dirs);
@@ -1041,16 +991,6 @@ mod tests {
             &package_lib_dir
                 .canonicalize()
                 .expect("package lib dir should resolve")
-        ));
-        assert!(dirs.contains(
-            &wheel_lib_dir
-                .canonicalize()
-                .expect("wheel lib dir should resolve")
-        ));
-        assert!(dirs.contains(
-            &compat_wheel_lib_dir
-                .canonicalize()
-                .expect("compat wheel lib dir should resolve")
         ));
     }
 

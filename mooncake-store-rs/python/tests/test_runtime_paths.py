@@ -1,11 +1,3 @@
-"""Runtime library discovery when the upstream wheel is co-installed.
-
-The upstream ``mooncake-transfer-engine`` wheel ships an auditwheel-vendored
-``mooncake.libs/`` directory on every non-NPU build. Since this package is
-designed to sit alongside it, nothing here may treat that directory as evidence
-about *our* installation.
-"""
-
 from __future__ import annotations
 
 import pathlib
@@ -16,91 +8,6 @@ from unittest.mock import patch
 from mooncake_store_rs import _runtime
 
 
-class _Layout:
-    """A throwaway site-packages tree."""
-
-    def __init__(self, stack: tempfile.TemporaryDirectory[str]) -> None:
-        self.site = pathlib.Path(stack.name)
-        self.package = self.site / "mooncake_store_rs"
-        self.package.mkdir()
-
-    def add_vendored(self, name: str, *libraries: str) -> pathlib.Path:
-        vendored = self.site / name
-        vendored.mkdir(exist_ok=True)
-        for library in libraries:
-            (vendored / f"{library[:-3]}-abc123.so").touch()
-        return vendored
-
-
-class PreloadSuppressionTests(unittest.TestCase):
-    def setUp(self) -> None:
-        stack = tempfile.TemporaryDirectory()
-        self.addCleanup(stack.cleanup)
-        self.layout = _Layout(stack)
-        self.preloaded: list[str] = []
-
-    def _run_preload(self) -> None:
-        original = _runtime.ctypes.CDLL
-        _runtime.ctypes.CDLL = lambda path, mode=0: self.preloaded.append(str(path))
-        try:
-            _runtime.preload_native_libraries(self.layout.package)
-        finally:
-            _runtime.ctypes.CDLL = original
-
-    def test_upstream_vendored_dir_does_not_suppress_our_preload(self) -> None:
-        # The regression: installing the upstream wheel used to make this
-        # package skip preloading, so a working install broke the moment the
-        # other wheel showed up.
-        self.layout.add_vendored("mooncake.libs", "libtransfer_engine.so")
-
-        self._run_preload()
-
-        self.assertTrue(
-            self.preloaded,
-            "preload must still run when only the upstream wheel is vendored",
-        )
-
-    def test_our_own_vendored_dir_suppresses_preload(self) -> None:
-        self.layout.add_vendored("mooncake_store_rs.libs", "libtransfer_engine.so")
-
-        self._run_preload()
-
-        self.assertEqual(self.preloaded, [])
-
-
-class LibraryPrecedenceTests(unittest.TestCase):
-    def setUp(self) -> None:
-        stack = tempfile.TemporaryDirectory()
-        self.addCleanup(stack.cleanup)
-        self.layout = _Layout(stack)
-
-    def test_our_vendored_dir_is_probed_before_upstream(self) -> None:
-        # Both wheels vendor a transfer engine, and they need not be the same
-        # build, so ours has to win.
-        self.layout.add_vendored("mooncake.libs", "libtransfer_engine.so")
-        self.layout.add_vendored("mooncake_store_rs.libs", "libtransfer_engine.so")
-
-        dirs = [d.name for d in _runtime.library_dirs(self.layout.package)]
-
-        self.assertIn("mooncake_store_rs.libs", dirs)
-        self.assertIn("mooncake.libs", dirs)
-        self.assertLess(
-            dirs.index("mooncake_store_rs.libs"), dirs.index("mooncake.libs")
-        )
-
-    def test_upstream_vendored_libraries_are_still_reachable(self) -> None:
-        # Reusing the upstream wheel's transfer engine is a supported fallback
-        # when this package has no vendored copy of its own.
-        self.layout.add_vendored("mooncake.libs", "libtransfer_engine.so")
-
-        found = _runtime.native_library_candidates(self.layout.package)
-
-        self.assertTrue(
-            any("libtransfer_engine-abc123.so" in str(path) for path in found),
-            f"expected the upstream vendored library to be probed, got {found}",
-        )
-
-
 class _Checkout:
     """A throwaway source checkout of this package."""
 
@@ -108,7 +15,7 @@ class _Checkout:
         self.base = pathlib.Path(stack.name)
 
     def store_rs(self, *parents: str) -> pathlib.Path:
-        """Create a store-rs checkout nested under `parents`."""
+        """Create a Store-RS checkout nested under `parents`."""
         root = self.base.joinpath(*parents) if parents else self.base / "store-rs"
         (root / "crates").mkdir(parents=True)
         package = root / "python" / "mooncake_store_rs"
@@ -122,7 +29,7 @@ class _Checkout:
         return built.resolve()
 
 
-class LayoutDetectionTests(unittest.TestCase):
+class RuntimePathTests(unittest.TestCase):
     def setUp(self) -> None:
         stack = tempfile.TemporaryDirectory()
         self.addCleanup(stack.cleanup)
@@ -139,7 +46,7 @@ class LayoutDetectionTests(unittest.TestCase):
             self.assertTrue((source_root / "crates").is_dir())
 
     def test_source_tree_is_not_inferred_without_environment(self) -> None:
-        root = self.checkout.store_rs().parent
+        self.checkout.store_rs()
 
         with patch.dict("os.environ", {"MOONCAKE_STORE_RS_DIR": ""}):
             self.assertIsNone(_runtime.source_tree_root())

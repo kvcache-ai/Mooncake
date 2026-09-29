@@ -126,13 +126,8 @@ The `/metrics` surface is now split by metric family instead of one flat operati
 - `MooncakeHostMemAllocator` for registered buffer ownership
 - dummy and real HiCache-compatible execution paths
 - daemon-local hot read cache for the Python compatibility runtime, with optional shm-backed payload sharing for dummy clients attached to the same standalone daemon
-- wheel packaging with bundled native runtime libraries
-- wheel-installed `mooncake-store-client` console command
-- wheel-installed `mooncake-store-admin` maintenance command
-- wheel-installed `mooncake-store-bench` benchmark / verify / soak command
-- standalone `mooncake-store-client` binary artifact in `dist/bin/`
-- standalone `mooncake-store-admin` binary artifact in `dist/bin/`
-- standalone `mooncake-store-bench` binary artifact in `dist/bin/`
+- source-checkout Python compatibility API backed by the Rust runtime
+- standalone `mooncake-store-client`, `mooncake-store-admin`, and `mooncake-store-bench` Rust binaries
 - hugepage-aware allocator options
 - `ReplicateConfig` request policy mapping
 - batch APIs, route query, metrics helpers, lifecycle helpers
@@ -353,7 +348,7 @@ This script verifies:
 
 - a real-mode reader reuses daemon-local cached bytes after the origin key is removed remotely
 - two dummy clients attached to one standalone daemon reuse a shm-backed hot-cache hit
-- local Redis, wheel runtime, and standalone daemon startup are wired automatically for the check
+- local Redis, the source Python runtime, and standalone daemon startup are wired automatically for the check
 
 For script knobs and cache tuning, read `docs/deployment.md` and `docs/configuration.md`.
 
@@ -422,8 +417,8 @@ Treat this summary as the primary throughput signal. The per-phase `stress phase
 
 ### Run `mooncake-store-bench`
 
-Use the shipped benchmark binary when you want a first-party verify / benchmark /
-soak surface against the same runtime that the wheel packages.
+Use the Store-RS benchmark binary when you want a first-party verify / benchmark /
+soak surface against the Rust runtime.
 
 Correctness smoke check:
 
@@ -556,49 +551,6 @@ python3 ./scripts/clients/dummy_client_rw.py \
   --key_prefix smoke \
   --batch_size 4
 ```
-
-To package the Python module and the standalone client command together:
-
-```bash
-export MOONCAKE_STORE_RS_DIR=/path/to/mooncake-store-rs
-export MOONCAKE_ROOT_DIR=/path/to/Mooncake
-export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
-./scripts/build/build-wheel.sh
-python3 -m venv .venv-wheel-test
-. .venv-wheel-test/bin/activate
-pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
-mooncake-store-client --help
-mooncake-store-client -v
-python -c "import mooncake_store_rs as m; print(m.__version__, m.__edition__)"
-python -c "import mooncake_store_rs as m; print(m.__build_info__)"
-```
-
-If the host OS is missing build dependencies, use the Ubuntu Docker wrapper:
-
-```bash
-MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
-MOONCAKE_ROOT_DIR=/path/to/Mooncake \
-PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
-```
-
-The Docker wrapper produces the same `dist/wheels/` and `dist/bin/` outputs and
-defaults to CN mirrors for rustup, cargo, and pip. Set `CN_MIRROR=0` to force
-the upstream endpoints.
-
-This packaging flow produces a single wheel, `mooncake_store_rs-*.whl`, imported
-as `mooncake_store_rs`.
-
-It owns its own top-level name, so it installs alongside the upstream
-`mooncake-transfer-engine` wheel without either overwriting the other's files.
-Code that expects the upstream import path keeps working by opting in:
-
-```bash
-export MOONCAKE_STORE_BACKEND=rs   # `from mooncake.store import ...` now resolves here
-python -m mooncake_store_rs.doctor # report which backend is active
-```
-
-See `docs/python.md` for how the redirect works and why the variable has to be
-exported before the interpreter starts.
 
 ### SGLang HiCache integration
 
@@ -810,68 +762,33 @@ For a fuller Rust guide, including lifecycle and buffer-oriented APIs, read `doc
 
 ## Python Usage
 
-Build the native module and expose the Python package from the repository checkout:
-
-First build TE/TENT with CMake; the explicit source and build paths below identify those existing
-artifacts for the Rust shim build.
+Build Store-RS and its Python extension from the repository checkout:
 
 ```bash
+export MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs
 export MOONCAKE_ROOT_DIR=/path/to/Mooncake
 export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
-cargo build -p mooncake-store-py
-export PYTHONPATH="$PWD/python"
+cmake -S "${MOONCAKE_ROOT_DIR}" -B "${MOONCAKE_BUILD_DIR}" \
+  -DWITH_TE=ON -DUSE_TENT=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON
+cmake --build "${MOONCAKE_BUILD_DIR}" --target build_store_rs
+export MOONCAKE_PYTHON_TARGET_DIR="${MOONCAKE_BUILD_DIR}/mooncake-store-rs"
+export PYTHONPATH="${MOONCAKE_STORE_RS_DIR}/python"
 ```
 
-Build a distributable wheel and package the standalone client binary:
+Build the standalone Rust commands from the same workspace:
 
 ```bash
-export MOONCAKE_STORE_RS_DIR=/path/to/mooncake-store-rs
-export MOONCAKE_ROOT_DIR=/path/to/Mooncake
-export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
-./scripts/build/build-wheel.sh
+cd "${MOONCAKE_STORE_RS_DIR}"
+cargo build --release -p mooncake-store-py --bin mooncake-store-client --bin mooncake-store-admin --bin mooncake-store-bench
+export PATH="${MOONCAKE_STORE_RS_DIR}/target/release:${PATH}"
 ```
 
-Or build in Ubuntu Docker with an explicit Python runtime:
-
-```bash
-MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
-MOONCAKE_ROOT_DIR=/path/to/Mooncake \
-PYTHON_VERSION=3.12 ./scripts/build/build-wheel-ubuntu-docker.sh
-```
-
-The default output layout is:
-
-- `dist/wheels/mooncake_store_rs-*.whl` for the runtime package
-- `dist/bin/mooncake-store-client` for the standalone client runtime
-- `dist/bin/mooncake-store-bench` for the standalone benchmark / verify / soak runtime
-
-Recommended installation flow:
-
-```bash
-python3 -m venv .venv-wheel-test
-. .venv-wheel-test/bin/activate
-pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
-python -c "import mooncake_store_rs as m; print(m.__version__, m.__edition__)"
-python -c "import mooncake_store_rs as m; print(m.__build_info__)"
-mooncake-store-client --version
-mooncake-store-client -v
-mooncake-store-bench --help
-```
-
-For local wheelhouse installs, `scripts/build/install-wheel.sh` wraps the same flow.
-
-Packaging model:
-
-- users install `mooncake-store-rs`, which imports as `mooncake_store_rs`
-- the upstream `mooncake-transfer-engine` wheel can be installed at the same
-  time; the two share no files, so neither needs uninstalling first
-- integrations written against `from mooncake.store import ...` work unchanged
-  once `MOONCAKE_STORE_BACKEND=rs` is exported, which redirects that import here
-- without that variable the upstream implementation stays in charge, so
-  installing this wheel does not change existing behaviour
+The Python compatibility modules currently run from this source checkout. The
+workspace does not publish a separate Python distribution.
 
 ```python
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 store.setup(
@@ -897,7 +814,7 @@ store.put("replicated", b"payload", config=config)
 Use the host allocator when the application wants stable registered buffers:
 
 ```python
-from mooncake.store import MooncakeHostMemAllocator
+from mooncake_store_rs.store import MooncakeHostMemAllocator
 
 allocator = MooncakeHostMemAllocator(use_hugepage=True, hugepage_size="2MB")
 ptr = allocator.alloc(2 * 1024 * 1024)
@@ -995,11 +912,11 @@ crates/
   mooncake-transport/       Safe Rust wrapper around Mooncake TE/TENT
   mooncake-transport-sys/   Native FFI and upstream Mooncake build integration
 python/
-  mooncake/                 Python convenience package
+  mooncake_store_rs/        Store-RS Python compatibility source
 scripts/
   format.sh                 Unified Rust/Python formatter plus Rust clippy gate
   run-all-tests.sh            Unified scripts regression runner for CI and local use
-  build/                    Wheel, coverage, and packaging helpers
+  build/                    Native dependency and coverage helpers
   clients/                  Real-mode and dummy-mode black-box validators
   e2e/                      Generic local compatibility and stress runners
   lib/                      Shared shell bootstrap helpers for script entrypoints

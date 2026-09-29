@@ -90,7 +90,7 @@ def _load_native():
 
 _native = _load_native()
 
-# Re-export native buffer pool type so `from mooncake.store import BufferPool` works.
+# Re-export the native buffer pool type through the Store-RS source API.
 BufferPool = getattr(_native, "BufferPool", None)
 
 _CACHE_STATUS = "status"
@@ -1785,7 +1785,7 @@ def _items_use_bytes_payloads(items: Sequence[tuple]) -> bool:
     return isinstance(sample, (bytes, bytearray, memoryview))
 
 
-# Parallelism types from native module (optional — absent in older wheels)
+# Parallelism types from native module (optional in builds that omit them)
 try:
     ParallelAxis = _native.ParallelAxis
     TensorParallelism = _native.TensorParallelism

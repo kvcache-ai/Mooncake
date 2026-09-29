@@ -20,8 +20,6 @@ Bring up a local Redis metadata backend plus two storage clients, then validate:
                writes/reads still work.
 
 Environment:
-  MC_STORE_RS_REFRESH_WHEEL              Rebuild/reinstall the latest wheel into
-                                         .venv-wheel before running (default: 1)
   MC_STORE_RS_TTL_RECOVERY_REDIS_PORT    Fixed Redis port; auto-allocates when empty
   MC_STORE_RS_TTL_RECOVERY_PROTOCOL      tcp / rdma / auto (default: tcp)
   MC_STORE_RS_TTL_RECOVERY_TRANSPORT_BACKEND
@@ -80,7 +78,6 @@ SCRATCH_BYTES="${MC_STORE_RS_TTL_RECOVERY_SCRATCH_BYTES:-$((16 * 1024 * 1024))}"
 LEASE_MS="${MC_STORE_RS_TTL_RECOVERY_LEASE_MS:-10000}"
 DOWN_SECONDS="${MC_STORE_RS_TTL_RECOVERY_DOWN_SECONDS:-15}"
 HOLD_SECONDS="${MC_STORE_RS_TTL_RECOVERY_HOLD_SECONDS:-600}"
-REFRESH_WHEEL="${MC_STORE_RS_REFRESH_WHEEL:-1}"
 
 allocate_port() {
   python3 - <<'PY'
@@ -100,48 +97,13 @@ print(int(time.time() * 1000))
 PY
 }
 
-resolve_python_bin() {
-  if [[ -x "${REPO_ROOT}/.venv-wheel/bin/python" ]]; then
-    printf '%s\n' "${REPO_ROOT}/.venv-wheel/bin/python"
-    return 0
-  fi
-  printf '%s\n' python3
-}
-
-python_can_import_store() {
-  local python_bin=$1
-  "${python_bin}" - <<'PY' >/dev/null 2>&1
-from mooncake_store_rs.store import MooncakeDistributedStore  # noqa: F401
-PY
-}
-
 ensure_runtime_ready() {
-  local python_bin
-  python_bin=$(resolve_python_bin)
-
-  if [[ "${REFRESH_WHEEL}" == "1" ]]; then
-    echo "==> rebuilding and reinstalling latest wheel into .venv-wheel"
-    bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-    bash "${REPO_ROOT}/scripts/build/install-wheel.sh"
-    PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
-    return 0
-  fi
-
-  if [[ -x "${python_bin}" ]] && python_can_import_store "${python_bin}"; then
-    PYTHON_BIN="${python_bin}"
-    return 0
-  fi
-
-  if [[ "${python_bin}" != "python3" ]] && command -v python3 >/dev/null 2>&1 && python_can_import_store python3; then
-    echo "==> wheel runtime unavailable; falling back to system python3"
-    PYTHON_BIN="python3"
-    return 0
-  fi
-
-  echo "==> installed wheel missing or stale; rebuilding .venv-wheel runtime"
-  bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-  bash "${REPO_ROOT}/scripts/build/install-wheel.sh"
-  PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
+  echo "==> building Python extension and standalone client from source"
+  (
+    cd "${REPO_ROOT}"
+    cargo build --release -p mooncake-store-py --lib --bin mooncake-store-client
+  )
+  PYTHON_BIN="python3"
 }
 
 wait_for_redis_up() {

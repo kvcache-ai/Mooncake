@@ -17,7 +17,7 @@ Runtime-local CLI, Python, and environment route/resource knobs remain available
 - Rust toolchain
 - `cmake` and a C++ toolchain
 - `redis-server` and `redis-cli`
-- Git submodule support for native dependencies used by wheel builds
+- Git submodule support for native dependencies
 - Python 3, if you want to run the Python compatibility layer
 
 ## Prepare the Repository
@@ -98,7 +98,7 @@ Run the daemon-local hot-cache validation:
 
 What the script does:
 
-- rebuilds or reuses `.venv-wheel`, then builds the standalone `mooncake-store-client` binary
+- builds the Python extension and standalone `mooncake-store-client` binary from the source checkout
 - Phase A validates that a real-mode reader reuses daemon-local cached bytes after the origin key is removed remotely
 - Phase B validates that two dummy clients attached to one standalone daemon reuse a shm-backed hot-cache hit
 - starts a temporary Redis instance automatically and tears it down after the run
@@ -107,7 +107,6 @@ Important inputs:
 
 | Variable | Default | Used By |
 |----------|---------|---------|
-| `MC_STORE_RS_REFRESH_WHEEL` | `1` | rebuild and reinstall the latest wheel into `.venv-wheel` |
 | `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_REDIS_PORT` | auto | temporary Redis port |
 | `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_STORAGE_BYTES` | `64 MiB` | storage bytes for the local standalone daemon |
 | `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_SCRATCH_BYTES` | `16 MiB` | scratch bytes per local client |
@@ -350,61 +349,6 @@ For the shipped operator-facing benchmark, correctness checker, and soak runner,
 use `mooncake-store-bench`; see `docs/bench.md`. Its default mode is scratch-only
 RW benchmarking (`MC_BENCH_STORAGE_BYTES=0`) against separate `storage=true`
 daemons, and it joins `mc/store-rs/v2` when no explicit keyspace is provided.
-
-### Wheel packaging
-
-Build the Python wheel and stage the standalone client binary:
-
-```bash
-./scripts/build/build-wheel.sh
-```
-
-The wheel stages the upstream Python helpers listed in
-`scripts/build/build-wheel.sh` under `mooncake_store_rs`. The release replacement
-script uses the same asset set. `python/tests/test_shim.py` checks that each
-helper exists in the selected upstream source tree and has an import redirect.
-The wheel also includes the upstream TENT metrics runtime library
-`libtent_metrics.so` alongside the packaged TENT libraries.
-
-If the host OS is missing wheel-build dependencies, use the Ubuntu Docker
-wrapper and pin the Python runtime explicitly:
-
-```bash
-PYTHON_VERSION=3.11 ./scripts/build/build-wheel-ubuntu-docker.sh
-```
-
-The Docker wrapper writes the same wheelhouse outputs as the host build script.
-It defaults to CN mirrors for rustup, cargo, and pip; set `CN_MIRROR=0` to use
-the upstream endpoints instead.
-
-Default outputs:
-
-- `dist/wheels/mooncake_store_rs-*.whl`
-- `dist/bin/mooncake-store-client`
-- `dist/bin/mooncake-store-bench`
-
-Recommended installation flow:
-
-```bash
-python3 -m venv .venv-wheel-test
-. .venv-wheel-test/bin/activate
-pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
-```
-
-Or use the repository helper:
-
-```bash
-./scripts/build/install-wheel.sh
-```
-
-Operational meaning:
-
-- `mooncake-store-rs` is the package users install; it imports as `mooncake_store_rs`
-- it co-installs with the upstream `mooncake-transfer-engine` wheel, so switching
-  a host between the two implementations does not require uninstalling either
-- integrations that import `mooncake.store`, such as SGLang, are redirected here
-  by exporting `MOONCAKE_STORE_BACKEND=rs` before the process starts; see
-  `docs/python.md`
 
 ## Deployment Roles
 

@@ -1,90 +1,14 @@
 # Python Guide
 
-`mooncake-store-rs` ships a Python compatibility layer in `crates/mooncake-store-py` and a convenience package in `python/mooncake_store_rs`.
+Store-RS Python bindings are implemented by the PyO3 crate `crates/mooncake-store-py` and the source modules under `python/mooncake_store_rs`.
 
-The Python package does not wrap a second store implementation. It reuses the same Rust runtime, control plane, allocator, reclaim logic, tracing, and metrics that the Rust client uses.
+The Python API reuses the Rust runtime, control plane, allocator, reclaim logic, tracing, and metrics. The Python modules currently run from a source checkout and are not published as a separate distribution.
 
-## Package Model
-
-The repository builds one Python wheel, `mooncake_store_rs-*.whl`, which imports
-as `mooncake_store_rs`.
-
-Recommended installation flow:
-
-```bash
-./scripts/build/install-wheel.sh
-```
-
-Equivalent raw pip flow:
-
-```bash
-pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
-```
-
-The install helper also supports bundle-local wheelhouses on another machine:
-
-```bash
-./scripts/build/install-wheel.sh --wheel-dir /path/to/wheelhouse
-```
-
-After installation:
-
-- Python code imports `mooncake_store_rs`
-- `pip list` shows `mooncake-store-rs`
-- the upstream `mooncake-transfer-engine` wheel may be installed alongside it;
-  the two packages share no files, so neither has to be uninstalled first
-
-### Using the upstream import path
-
-Integrations are usually written against the upstream API:
-
-```python
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
-```
-
-Those keep working against this backend once the operator opts in:
-
-```bash
-export MOONCAKE_STORE_BACKEND=rs
-```
-
-`rust`, `store-rs` and `masterless` are accepted as synonyms. Anything else, or
-leaving the variable unset, leaves the upstream implementation in charge —
-installing this wheel on its own changes nothing.
-
-Two properties are worth knowing before relying on it:
-
-- **The variable must be exported before the interpreter starts.** The redirect
-  is registered from a `.pth` file at startup, so setting `os.environ[...]` from
-  inside Python is too late and will silently keep the upstream backend.
-- **Tracebacks name the real file.** A frame from the redirected module shows
-  `mooncake_store_rs/store.py` even though the import said `mooncake.store`.
-
-To check what is actually in effect:
-
-```bash
-python -m mooncake_store_rs.doctor
-```
-
-It prints the requested backend, whether the redirect is installed, and the file
-`mooncake.store` currently resolves to. It exits non-zero when this backend was
-requested but the redirect is not active, which is the signature of setting the
-variable too late.
-
-Only the modules that both packages implement are redirected: `store`,
-`buffer_pool`, `cli`, `cli_client` and `structured_object_store`. Everything else
-under `mooncake.*` continues to come from the upstream wheel.
-
-The API examples throughout the rest of this document use the upstream
-`mooncake.*` paths, since that is what integrations such as SGLang are written
-against — they assume the variable is exported. Code that only ever targets this
-backend can skip the redirect entirely and import directly:
+Use the Store-RS source import path:
 
 ```python
 from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 ```
-
-That form needs no environment variable.
 
 ## What the Python Layer Provides
 
@@ -95,7 +19,6 @@ That form needs no environment variable.
 - the same storage-owner CLOCK eviction and route-owner CAS reclaim as Rust callers
 - the same background watermark eviction defaults as Rust callers
 - route query, lifecycle, and metrics helpers
-- wheel packaging for the native extension plus the bundled runtime libraries
 
 ## Execution Modes
 
@@ -217,131 +140,35 @@ Design boundary:
 export MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs
 export MOONCAKE_ROOT_DIR=/path/to/Mooncake
 export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
-cd "${MOONCAKE_STORE_RS_DIR}"
-cargo build -p mooncake-store-py
+cmake -S "${MOONCAKE_ROOT_DIR}" -B "${MOONCAKE_BUILD_DIR}" \
+  -DWITH_TE=ON -DUSE_TENT=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON
+cmake --build "${MOONCAKE_BUILD_DIR}" --target build_store_rs
+export MOONCAKE_PYTHON_TARGET_DIR="${MOONCAKE_BUILD_DIR}/mooncake-store-rs"
 export PYTHONPATH="${MOONCAKE_STORE_RS_DIR}/python"
 ```
 
-The package loads the native extension from the local `target` directory and
-preloads Mooncake TE/TENT shared libraries from the CMake build tree. Set the
-three variables to absolute paths before a direct Cargo build; the build path
-identifies an existing tree with TE, TENT, and yalantinglibs artifacts. CMake
-sets the same paths when it builds Store-RS as a target.
-
-## Build a Wheel
-
-Use the repository packaging script with explicit package, source, and CMake
-build paths:
-
-```bash
-export MOONCAKE_STORE_RS_DIR=/path/to/mooncake-store-rs
-export MOONCAKE_ROOT_DIR=/path/to/Mooncake
-export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
-./scripts/build/build-wheel.sh
-```
-
-By default the script:
-
-- creates or reuses `.venv-wheel`
-- installs `maturin`
-- embeds the standalone `mooncake-store-client` and `mooncake-store-admin` binaries into the runtime wheel package
-- embeds the build Python `libpython*.so` needed by those standalone binaries and restores that dependency after `auditwheel repair`, because the binaries run as subprocesses from a wheel install rather than as Python extension modules
-- builds the wheel into `dist/wheels/`
-- copies the standalone `mooncake-store-client` and `mooncake-store-admin` artifacts into `dist/bin/`
-
-Repository packaging rule:
-
-- `scripts/build/build-wheel.sh` is the single owner of wheel asset injection and `auditwheel repair`
-- the wheel helper configures the explicitly selected Mooncake source and build
-  trees, and the Rust native shims use the CMake-fetched header-only yalantinglibs
-  from that build tree
-- wheel and native-library build helpers share that CMake dependency source;
-  yalantinglibs requires no separate installation or prebuilt prefix
-
-Common variants:
-
-```bash
-./scripts/build/build-wheel.sh --interpreter python3.11
-DIST_DIR=artifacts ./scripts/build/build-wheel.sh
-```
-
-Build environments that already provide native artifacts can skip the wheel
-helper's CMake portion and reuse the explicitly selected build tree directly:
-
-```bash
-MOONCAKE_REUSE_NATIVE_ARTIFACTS=1 \
-MOONCAKE_SKIP_NATIVE_BUILD=1 \
-MOONCAKE_STORE_RS_DIR=/path/to/mooncake-store-rs \
-MOONCAKE_ROOT_DIR=/path/to/Mooncake \
-MOONCAKE_BUILD_DIR="$PWD/build" \
-MOONCAKE_CLASSIC_SHIM_LIB_PATH="$PWD/dist/lib/libmooncake_classic_shim.so" \
-MOONCAKE_TENT_SHIM_LIB_PATH="$PWD/dist/lib/libmooncake_tent_shim.so" \
-./scripts/build/build-wheel.sh --interpreter python3.10
-```
-
-When the host OS is missing build dependencies, use the Ubuntu Docker wrapper
-instead. It reuses `scripts/build/build-wheel.sh` inside the container and
-produces the same `dist/wheels/` and `dist/bin/` outputs:
-
-```bash
-MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
-MOONCAKE_ROOT_DIR=/path/to/Mooncake \
-./scripts/build/build-wheel-ubuntu-docker.sh
-MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
-MOONCAKE_ROOT_DIR=/path/to/Mooncake PYTHON_VERSION=3.11 \
-./scripts/build/build-wheel-ubuntu-docker.sh
-MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs \
-MOONCAKE_ROOT_DIR=/path/to/Mooncake PYTHON_VERSION=3.12 \
-./scripts/build/build-wheel-ubuntu-docker.sh
-```
-
-Docker wheel notes:
-
-- `PYTHON_VERSION=system|3.10|3.11|3.12` selects the interpreter installed in the builder image
-- `UBUNTU_VERSION` selects the base image used for the build environment
-- `CN_MIRROR=1` is enabled by default for rustup, cargo, and pip downloads; set `CN_MIRROR=0` to use the upstream endpoints
-- `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` are forwarded into the Docker build/run steps for local proxy setups
-
-Install the wheel into any compatible virtualenv:
-
-```bash
-./scripts/build/install-wheel.sh
-```
-
-Or with raw pip:
-
-```bash
-pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
-```
-
-After installation, both interfaces are available:
-
-- `python -c "import mooncake_store_rs"` loads package metadata only; the native extension is loaded lazily when callers access `mooncake_store_rs.store` or the top-level compatibility exports
-- `python -c "import mooncake_store_rs as m; print(m.__version__, m.__edition__)"` shows the active runtime
-- `python -c "import mooncake_store_rs as m; print(m.__build_info__)"` shows the packaged build branch, commit, and build time without loading the native extension
-- `mooncake-store-client --help` runs the packaged standalone client command
-- `mooncake-store-client -v` prints the packaged version plus wheel build branch, commit, and build time
-- `mooncake-store-admin --help` runs the packaged metadata maintenance and route-policy management command
-- `mooncake-store-bench --help` runs the packaged benchmark / verify / soak runtime
+The CMake target uses the selected CMake build tree for Transfer Engine and TENT,
+and places the PyO3 extension under `mooncake-store-rs` in that build tree. Set
+`MOONCAKE_PYTHON_TARGET_DIR` and `PYTHONPATH` before importing the source module.
+This checkout path is used by the Python compatibility e2e scripts.
 
 ## Standalone Client Binary
 
 You can build the standalone compatibility server directly:
 
 ```bash
-cargo build -p mooncake-store-py --bin mooncake-store-client --release
+cargo build --release -p mooncake-store-py --bin mooncake-store-client --bin mooncake-store-admin --bin mooncake-store-bench
 ```
 
-Or use `./scripts/build/build-wheel.sh`, which also copies the binary to `dist/bin/`.
-
-When the client is installed from a wheel, the same binary is also embedded inside the package and exposed through the `mooncake-store-client` console script, matching the upstream Mooncake packaging style.
-
-The same wheel also exposes `mooncake-store-admin` for explicit metadata maintenance and admin-managed tenant policy operations.
+The executables are written to `target/release/` unless `CARGO_TARGET_DIR` is
+set. CMake builds the native extension and standalone Rust executables from the
+same workspace; it does not install a separate Python distribution.
 
 Start a storage client:
 
 ```bash
-./dist/bin/mooncake-store-client \
+./target/release/mooncake-store-client \
   --local-hostname 127.0.0.1 \
   --metadata-url redis://127.0.0.1:6380/0 \
   --storage-bytes $((128 * 1024 * 1024)) \
@@ -400,11 +227,11 @@ Heartbeat behavior:
 
 ## Metadata Maintenance
 
-Use the packaged admin binary when metadata still contains stale segment registrations
+Use the standalone Rust admin binary when metadata still contains stale segment registrations
 from dead storage owners:
 
 ```bash
-mooncake-store-admin \
+./target/release/mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   cleanup-stale-segments
 ```
@@ -416,12 +243,12 @@ mooncake-store-admin \
 For the operator workflow, task semantics, and request examples, see
 [Route Migration 使用手册](./route-migration-usage.md).
 
-The packaged `mooncake-store-admin` binary acts as an operator client for that
+The standalone Rust `mooncake-store-admin` binary acts as an operator client for that
 HTTP surface. Route-migration tasks are not kept in the CLI process, so
 `migrate ...` commands must point at a long-lived admin server with `--admin-url`:
 
 ```bash
-mooncake-store-admin \
+./target/release/mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   --admin-url http://127.0.0.1:18080 \
   migrate copy \
@@ -436,7 +263,7 @@ mooncake-store-admin \
   --task-executor executor-store \
   --max-retries 5
 
-mooncake-store-admin \
+./target/release/mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   --admin-url http://127.0.0.1:18080 \
   migrate task list
@@ -472,28 +299,28 @@ Operational notes:
 - current CLI support covers `migrate copy`, `migrate move`, `migrate task list`, and `migrate task get`
 - `migrate` commands require `--admin-url`; the CLI no longer starts a private in-process task queue for these asynchronous operations
 
-Manage tenant policy or clean up stale segment registrations with the packaged admin binary:
+Manage tenant policy or clean up stale segment registrations with the standalone Rust admin binary:
 
 ```bash
-mooncake-store-admin \
+./target/release/mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy set \
   --tenant tenant-a \
   --route-topk 3 \
   --route-control embedded-wrh
 
-mooncake-store-admin \
+./target/release/mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy get \
   --tenant tenant-a
 
-mooncake-store-admin \
+./target/release/mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reservations \
   --tenant tenant-a \
   --state pending
 
-mooncake-store-admin \
+./target/release/mooncake-store-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reconcile \
   --tenant tenant-a \
@@ -511,7 +338,7 @@ Notes:
 
 ## Structured Object Store Helper
 
-`mooncake.structured_object_store` provides a higher-level helper for one logical object that contains multiple named members.
+`mooncake_store_rs.structured_object_store` provides a higher-level helper for one logical object that contains multiple named members.
 It is designed for cases such as rollout / batch transfer where callers want to keep their own object semantics locally while using Mooncake for fast payload movement.
 
 The helper separates two concepts:
@@ -522,7 +349,7 @@ The helper separates two concepts:
 ### Main types
 
 ```python
-from mooncake.structured_object_store import (
+from mooncake_store_rs.structured_object_store import (
     MooncakeBundleTransfer,
     StructuredMemberSlice,
     StructuredObjectPayload,
@@ -539,8 +366,8 @@ Use `put_structured_object()` to write one structured object. The default read p
 
 ```python
 import numpy as np
-from mooncake.store import MooncakeDistributedStore
-from mooncake.structured_object_store import MooncakeBundleTransfer, StructuredObjectPayload
+from mooncake_store_rs.store import MooncakeDistributedStore
+from mooncake_store_rs.structured_object_store import MooncakeBundleTransfer, StructuredObjectPayload
 
 store = MooncakeDistributedStore()
 transfer = MooncakeBundleTransfer(store, key_prefix="demo/structured")
@@ -617,7 +444,7 @@ Use the bundle path when the object is just a manifest plus named payloads, and 
 ## Basic Real-Mode Example
 
 ```python
-from mooncake.store import MooncakeDistributedStore
+from mooncake_store_rs.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup(
@@ -646,7 +473,7 @@ When `domain` and `object_set` are omitted from `setup(...)`, the Python wrapper
 ## Routed Writes
 
 ```python
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 store.setup(
@@ -704,7 +531,6 @@ This script validates two phases:
 
 Useful inputs:
 
-- `MC_STORE_RS_REFRESH_WHEEL=0` to reuse the current `.venv-wheel`
 - `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_REDIS_PORT` to pin the temporary Redis port
 - `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_STORAGE_BYTES` and `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_SCRATCH_BYTES` to size the local runtime
 - `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_CACHE_BYTES` and `MC_STORE_RS_LOCAL_HOT_CACHE_E2E_BLOCK_BYTES` to tune the cache under test
@@ -802,7 +628,7 @@ Current script behavior:
 Start the standalone compatibility server first:
 
 ```bash
-./dist/bin/mooncake-store-client \
+./target/release/mooncake-store-client \
   --local-hostname 127.0.0.1 \
   --metadata-url redis://127.0.0.1:6380/0 \
   --storage-bytes $((64 * 1024 * 1024)) \
@@ -814,7 +640,7 @@ Start the standalone compatibility server first:
 Then connect from Python:
 
 ```python
-from mooncake.store import MooncakeDistributedStore, MooncakeHostMemAllocator
+from mooncake_store_rs.store import MooncakeDistributedStore, MooncakeHostMemAllocator
 
 store = MooncakeDistributedStore()
 store.setup_dummy(
@@ -850,7 +676,7 @@ Hugepage options:
 Example:
 
 ```python
-from mooncake.store import MooncakeHostMemAllocator
+from mooncake_store_rs.store import MooncakeHostMemAllocator
 
 allocator = MooncakeHostMemAllocator(use_hugepage=True, hugepage_size="2MB")
 ptr = allocator.alloc(2 * 1024 * 1024)
@@ -885,7 +711,7 @@ Import paths:
 ```python
 from mooncake import BufferPool
 # or
-from mooncake.store import BufferPool
+from mooncake_store_rs.store import BufferPool
 # or
 from mooncake.buffer_pool import BufferPool
 ```
@@ -893,7 +719,7 @@ from mooncake.buffer_pool import BufferPool
 Basic usage:
 
 ```python
-from mooncake.store import BufferPool, MooncakeDistributedStore
+from mooncake_store_rs.store import BufferPool, MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 store.setup(
@@ -1113,7 +939,7 @@ These values map to the Rust `ReplicationPolicy` used by `StoreClient`.
 Validation entry points are now grouped by purpose:
 
 - `scripts/run-all-tests.sh` — unified discovery + execution entrypoint for shell-based regressions
-- `scripts/build/` — wheel build, wheel install, and coverage helpers
+- `scripts/build/` — native dependency and coverage helpers
 - `scripts/clients/` — black-box real/dummy read-write validators
 - `scripts/e2e/` — generic compatibility and stress runners
 - `scripts/lib/` — shared shell bootstrap helpers used by script entrypoints

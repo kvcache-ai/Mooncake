@@ -89,7 +89,6 @@ run_rust_checks() {
 select_python_formatter() {
   local repo_python=
   for repo_python in \
-    "${REPO_ROOT}/.venv-wheel/bin/python" \
     "${REPO_ROOT}/.venv/bin/python"; do
     if [[ -x "${repo_python}" ]] && "${repo_python}" -m ruff --version >/dev/null 2>&1; then
       printf '%s\n' "${repo_python} -m ruff"
@@ -113,7 +112,6 @@ select_python_formatter() {
   fi
 
   for repo_python in \
-    "${REPO_ROOT}/.venv-wheel/bin/python" \
     "${REPO_ROOT}/.venv/bin/python"; do
     if [[ -x "${repo_python}" ]] && "${repo_python}" -m black --version >/dev/null 2>&1; then
       printf '%s\n' "${repo_python} -m black"
