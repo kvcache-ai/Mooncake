@@ -57,6 +57,12 @@ The cluster's available resources are viewed as a large resource pool, managed c
 
 ### Snapshot & Restore
 
+```{warning}
+Removal in progress: this legacy Master-generated snapshot and restore path is
+being retired. HA recovery is moving to the standby-generated batch OpLog
+snapshot path; this section remains as a record of the code being removed.
+```
+
 To reduce cache warm-up time after a master restart, the Master Service supports periodic snapshots of its in-memory metadata and recovery from these snapshots.
 
 - Snapshot generation

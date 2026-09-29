@@ -13,7 +13,7 @@ HA_CLIENT="$BUILD_DIR/mooncake-store/tests/e2e/oplog_ha_client"
 require_executable "$HA_CLIENT"
 mkdir -p "$RUN_DIR/configs"
 MASTER_CONFIG="$RUN_DIR/configs/snapshot.yaml"
-printf 'snapshot_interval_seconds: 2\nenable_snapshot: true\nenable_snapshot_restore: true\nsnapshot_catalog_store_type: invalid\n' >"$MASTER_CONFIG"
+printf 'snapshot_interval_seconds: 2\n' >"$MASTER_CONFIG"
 trap 'down_cluster >/dev/null 2>&1 || true' EXIT
 # Static dependency failures must terminate before any leadership work.
 python3 - "$BUILD_DIR/mooncake-store/src/mooncake_master" "$RUN_DIR" <<'PYTEST'
