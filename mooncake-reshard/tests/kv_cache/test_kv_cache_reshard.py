@@ -170,13 +170,9 @@ def _binding(
     for buffer_index, (layer_id, component) in enumerate(
         (layer_id, component)
         for layer_id in part.layer_ids
-        for component in KVCacheComponent
+        for component in placement.descriptor.components
     ):
-        head_dim = (
-            placement.descriptor.key_head_dim
-            if component is KVCacheComponent.KEY
-            else placement.descriptor.value_head_dim
-        )
+        head_dim = placement.descriptor.head_dim(component)
         shape = (capacity_tokens, part.head_count, head_dim)
         nbytes = prod(shape) * placement.descriptor.itemsize
         address = base_address + buffer_index * 1_000_000

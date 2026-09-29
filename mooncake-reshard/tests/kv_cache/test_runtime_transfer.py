@@ -56,12 +56,8 @@ def memory_binding(
     endpoint = endpoint or f"{participant_id}:12345"
     regions, ranges, buffers = [], [], []
     for layer in part.layer_ids:
-        for component in KVCacheComponent:
-            dim = (
-                placement.descriptor.key_head_dim
-                if component is KVCacheComponent.KEY
-                else placement.descriptor.value_head_dim
-            )
+        for component in placement.descriptor.components:
+            dim = placement.descriptor.head_dim(component)
             head_stride = dim * 2 + padding
             row_stride = part.head_count * head_stride + padding
             buffer = ctypes.create_string_buffer(snapshot.token_count * row_stride)
@@ -125,11 +121,7 @@ def assert_content(placement, binding):
     regions = {r.region_id: r for r in binding.regions}
     touched = set()
     for item in binding.ranges:
-        dim = (
-            placement.descriptor.key_head_dim
-            if item.component is KVCacheComponent.KEY
-            else placement.descriptor.value_head_dim
-        )
+        dim = placement.descriptor.head_dim(item.component)
         for token in range(item.token_start, item.token_end):
             for head in range(item.head_start, item.head_end):
                 address = item.address(regions[item.region_id], token, head)
@@ -726,11 +718,11 @@ def test_adjacent_registered_regions_must_not_be_coalesced():
                 ctypes.addressof(allocation) + index * 320,
                 320,
             )
-            for index, component in enumerate(KVCacheComponent)
+            for index, component in enumerate(placement.descriptor.components)
         )
         ranges = tuple(
             KVCacheResolvedRange(0, component, 0, 5, 0, 4, component.value, 0, 64, 16)
-            for component in KVCacheComponent
+            for component in placement.descriptor.components
         )
         bindings.append(
             KVCacheResolvedRuntimeBinding(

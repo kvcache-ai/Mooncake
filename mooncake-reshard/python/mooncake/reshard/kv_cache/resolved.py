@@ -168,9 +168,7 @@ def _head_bytes(
     placement: KVCachePlacementManifest, component: KVCacheComponent
 ) -> int:
     d = placement.descriptor
-    return d.itemsize * (
-        d.key_head_dim if component is KVCacheComponent.KEY else d.value_head_dim
-    )
+    return d.itemsize * d.head_dim(component)
 
 
 def _physical_spans(
@@ -333,7 +331,9 @@ def _validated_range_spans(
         groups.setdefault((item.global_layer_id, item.component), []).append(item)
     _check_disjoint(spans, "binding")
     expected_keys = {
-        (layer, component) for layer in part.layer_ids for component in KVCacheComponent
+        (layer, component)
+        for layer in part.layer_ids
+        for component in placement.descriptor.components
     }
     if set(groups) != expected_keys:
         raise ValueError("resolved binding misses layer/component coverage")

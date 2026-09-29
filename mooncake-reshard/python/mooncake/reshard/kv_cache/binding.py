@@ -9,7 +9,7 @@ from .placement import KVCachePlacementManifest
 from .runtime import KVCacheRuntimeBindingManifest
 from .snapshot import KVCacheSnapshotDescriptor
 from .types import (
-    KVCacheComponent,
+    KVCacheLayout,
     KVCacheRuntimeBuffer,
     canonical_strides_bytes,
     placement_fragment_id,
@@ -48,7 +48,7 @@ def validate_runtime_binding(
     expected_keys = {
         (layer_id, component)
         for layer_id in part.layer_ids
-        for component in KVCacheComponent
+        for component in placement.descriptor.components
     }
     actual_keys = {(item.global_layer_id, item.component) for item in binding.buffers}
     if expected_keys != actual_keys:
@@ -77,26 +77,28 @@ def validate_runtime_binding(
             raise ValueError("runtime binding itemsize differs from placement")
         if len(fragment.local_shape) != 3:
             raise ValueError("NHD runtime buffer must have rank three")
-        expected_dim = (
-            descriptor.key_head_dim
-            if item.component is KVCacheComponent.KEY
-            else descriptor.value_head_dim
-        )
+        expected_dim = descriptor.head_dim(item.component)
         if fragment.local_shape[1:] != (part.head_count, expected_dim):
             raise ValueError("runtime binding local_shape differs from placement")
-        expected_nbytes = (
-            fragment.local_shape[0]
-            * fragment.local_shape[1]
-            * fragment.local_shape[2]
-            * fragment.itemsize
-        )
-        if fragment.nbytes != expected_nbytes:
-            raise ValueError("runtime binding nbytes differs from local_shape")
         expected_strides = canonical_strides_bytes(
             fragment.local_shape, fragment.itemsize
         )
-        if fragment.strides_bytes != expected_strides:
-            raise ValueError("runtime binding is not a contiguous NHD row layout")
+        if descriptor.layout is KVCacheLayout.NHD:
+            if fragment.strides_bytes != expected_strides:
+                raise ValueError("runtime binding is not a contiguous NHD row layout")
+        elif (
+            fragment.strides_bytes[1:] != expected_strides[1:]
+            or fragment.strides_bytes[0] < expected_strides[0]
+            or fragment.strides_bytes[0] % fragment.itemsize
+        ):
+            raise ValueError(
+                "runtime binding must contain disjoint contiguous NHD rows"
+            )
+        expected_nbytes = (fragment.local_shape[0] - 1) * fragment.strides_bytes[
+            0
+        ] + expected_strides[0]
+        if fragment.nbytes != expected_nbytes:
+            raise ValueError("runtime binding nbytes differs from local_shape")
     _validate_address_ranges(binding)
 
 

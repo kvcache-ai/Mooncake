@@ -323,6 +323,28 @@ lifetime. `KVCacheSnapshotDescriptor` independently describes model and token
 semantics. Legacy logical planning permits omission for compatibility; the
 Runtime-to-Runtime executor requires an explicit snapshot and operation ID.
 
+A descriptor defaults to `components=(KEY, VALUE)`. Single-component resources
+can declare `LATENT`, `CONV`, or `SSM`; their shard-unit width is `key_head_dim`
+(`value_head_dim` remains the width of `VALUE`). Components share the descriptor's
+layer set, dtype and ownership. Use separate resources for different dtypes or
+shard axes, such as a BF16 convolution buffer and an FP32 recurrent state.
+Existing K/V JSON and canonical identities remain unchanged.
+
+For MLA, declare one global latent unit and explicit TP replicas, so the planner
+chooses one source replica per target. For recurrent state, use `page_size=1`
+and let the framework map request slots to rows. GDN convolution Q/K/V groups
+must be separate resources because each group is independently TP-sharded.
+`NHD_STRIDED` permits a row pitch larger than its contiguous head/dimension
+payload; `nbytes` describes the physical span including gaps. Storage offsets
+can select a group within a fused allocation. The ordinary `NHD` contract
+continues to require dense rows. These are byte-copy layouts, not dtype
+conversion, quantization, or arbitrary tensor transposition.
+
+The framework retains responsibility for token-page and state-slot mappings,
+cache lifetime, coordinating all resources, and withholding request completion
+until every required resource writer succeeds. Mooncake does not infer model
+architecture or treat recurrent state as token-indexed KV.
+
 The KV-cache implementation is split by responsibility:
 
 - `snapshot.py` defines content identity;
