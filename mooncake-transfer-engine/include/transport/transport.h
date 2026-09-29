@@ -107,6 +107,47 @@ class Transport {
     struct BatchDesc;
     struct TransferTask;
 
+    // `Slice::task` is produced on the submit thread and consumed on the
+    // completion thread, so it must be read/written atomically. `std::atomic`
+    // is neither copyable nor movable, which breaks the transports/tests that
+    // reset a `Slice` by value (`slice = Transport::Slice()`); wrap it while
+    // keeping the pointer ergonomics (`->`, bool, store/load) the transports
+    // rely on.
+    struct SliceTaskPtr {
+        std::atomic<TransferTask *> value{nullptr};
+
+        SliceTaskPtr() = default;
+        SliceTaskPtr(const SliceTaskPtr &) = delete;
+        SliceTaskPtr &operator=(const SliceTaskPtr &) = delete;
+
+        SliceTaskPtr(SliceTaskPtr &&other) noexcept
+            : value(other.value.load(std::memory_order_relaxed)) {}
+
+        SliceTaskPtr &operator=(SliceTaskPtr &&other) noexcept {
+            value.store(other.value.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+            return *this;
+        }
+
+        SliceTaskPtr &operator=(TransferTask *task) {
+            value.store(task, std::memory_order_seq_cst);
+            return *this;
+        }
+
+        TransferTask *operator->() const {
+            return value.load(std::memory_order_seq_cst);
+        }
+
+        operator TransferTask *() const {
+            return value.load(std::memory_order_seq_cst);
+        }
+
+        TransferTask *load(
+            std::memory_order order = std::memory_order_seq_cst) const {
+            return value.load(order);
+        }
+    };
+
     // NOTE ABOUT BatchID → BatchDesc conversion:
     //
     // BatchID is an opaque 64‑bit unsigned integer that carries a
@@ -142,7 +183,7 @@ class Transport {
         }
         std::string source_location;
         SliceStatus status;
-        std::atomic<TransferTask *> task;
+        SliceTaskPtr task;
         // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
         // are 32-bit. Use a scoped alias so the width is defined in one place.
 #if defined(USE_EFA) || defined(USE_CXI)
