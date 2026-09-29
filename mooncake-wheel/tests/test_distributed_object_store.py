@@ -207,6 +207,14 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.store.put_batch(["test_non_contiguous_batch"], [view])
 
+    def test_parts_strided_view_rejected(self):
+        """put_parts/upsert_parts must reject strided 1-D views too (#4299)."""
+        view = memoryview(b"abcdefgh")[::2]
+        with self.assertRaises(RuntimeError):
+            self.store.put_parts("test_parts_strided_put", view)
+        with self.assertRaises(RuntimeError):
+            self.store.upsert_parts("test_parts_strided_upsert", view)
+
     def test_soft_pin_config_forwarding(self):
         """Test soft-pin action and TTL forwarding through Store operations."""
         from mooncake.store import ReplicateConfig
