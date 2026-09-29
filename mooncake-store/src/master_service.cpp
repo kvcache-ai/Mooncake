@@ -3402,17 +3402,20 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
 
     // The snapshot lock is taken per chunk of keys rather than once for the
     // whole batch: each key is resolved under the entry's own lock anyway, so a
-    // long batch must not keep a reload out for its whole length.
+    // long batch must not keep a reload out for its whole length. The tenant is
+    // resolved once per chunk, under that lock, and every key of the chunk
+    // reads through the handle it resolved.
     for (size_t begin = 0; begin < keys.size();
          begin += kBatchReadLockChunkKeys) {
         const size_t end =
             std::min(begin + kBatchReadLockChunkKeys, keys.size());
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        const auto tenant = tenants_.Lookup(normalized_tenant);
         for (size_t i = begin; i < end; ++i) {
             const std::string& key = keys[i];
             bool metadata_invalid = false;
             const auto exists = WithObjectMetadataForRead(
-                normalized_tenant, key,
+                tenant, key,
                 [&](const metadata::Tenant&,
                     const std::shared_ptr<ObjectEntry>&,
                     const ObjectMetadata& metadata,
@@ -4586,19 +4589,21 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         // The shared lock covers the metadata reads only, and is taken per
         // chunk of keys rather than once for the whole batch: the candidate
         // queues below resolve their keys again under their own locks, and a
-        // long batch must not keep a reload out for its whole length.
+        // long batch must not keep a reload out for its whole length. The
+        // tenant is resolved once per chunk, under that lock.
         for (size_t chunk_begin = 0; chunk_begin < keys.size();
              chunk_begin += kBatchReadLockChunkKeys) {
             const size_t chunk_end =
                 std::min(chunk_begin + kBatchReadLockChunkKeys, keys.size());
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+            const auto tenant = tenants_.Lookup(normalized_tenant);
             for (size_t original_idx = chunk_begin; original_idx < chunk_end;
                  ++original_idx) {
                 const std::string& key = keys[original_idx];
                 MasterMetricManager::instance().inc_total_get_nums();
 
                 auto outcome = WithObjectMetadataForRead(
-                    normalized_tenant, key,
+                    tenant, key,
                     [&](const metadata::Tenant&,
                         const std::shared_ptr<ObjectEntry>&,
                         const ObjectMetadata& metadata,
@@ -4720,15 +4725,17 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     const TenantId& normalized_tenant = tenant_id;
     // The snapshot lock is taken per chunk of keys rather than once for the
     // whole batch, so a long batch does not keep a reload out for its length.
+    // The tenant is resolved once per chunk, under that lock.
     for (size_t begin = 0; begin < keys.size();
          begin += kBatchReadLockChunkKeys) {
         const size_t end =
             std::min(begin + kBatchReadLockChunkKeys, keys.size());
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        const auto tenant = tenants_.Lookup(normalized_tenant);
         for (size_t original_idx = begin; original_idx < end; ++original_idx) {
             const std::string& key = keys[original_idx];
             auto outcome = WithObjectMetadataForRead(
-                normalized_tenant, key,
+                tenant, key,
                 [&](const metadata::Tenant&,
                     const std::shared_ptr<ObjectEntry>&,
                     const ObjectMetadata& metadata,
@@ -8411,18 +8418,20 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
         // The bucket goes as a whole: every member is validated before the
         // allocator commits the bucket, and one member that may not be evicted
         // aborts the attempt. A prepared eviction keeps the bucket's extents
-        // out of allocation until it is committed or aborted, so each member is
-        // resolved through its own tenant and read under its own entry lock,
-        // the way the shard allocator's cycle does it.
+        // out of allocation until it is committed or aborted, so every member
+        // is resolved through the tenant this bucket belongs to and read under
+        // its own entry lock, the way the shard allocator's cycle does it.
         bool all_accepted = true;
         ImmutableBucketAllocator::EvictedBucket evicted_bucket;
         bool logical_committed = false;
         {
             std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
             auto now = std::chrono::system_clock::now();
+            const auto tenant =
+                tenants_.Lookup(ResolveRequestTenantId(tenant_id));
             for (const auto& candidate : candidates) {
                 const auto accepted = WithObjectMetadataForRead(
-                    MakeObjectIdentityForRequest(candidate.key, tenant_id),
+                    tenant, candidate.key,
                     [&](const metadata::Tenant&,
                         const std::shared_ptr<ObjectEntry>&,
                         const ObjectMetadata& metadata,

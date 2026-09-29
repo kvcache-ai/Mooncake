@@ -1286,19 +1286,33 @@ class MasterService {
     // write form above is skipped, because a reader must not mutate what it
     // reads.
     //
-    // The registry is the authority on which tenant instance is current, so the
-    // tenant is resolved for the key being read. A batch uses this form per key
-    // and passes the key as a view it keeps alive for the call only, instead of
-    // building an owning identity per key. An absent tenant, an unrouted key or
-    // a publication the route no longer holds reads as an empty result.
+    // The registry is the authority on which tenant instance is current, so a
+    // read that starts from a tenant id resolves the tenant here.
     template <typename Fn>
     [[nodiscard]] auto WithObjectMetadataForRead(const TenantId& tenant_id,
                                                  std::string_view user_key,
                                                  Fn&& fn) const {
+        return WithObjectMetadataForRead(tenants_.Lookup(tenant_id), user_key,
+                                         std::forward<Fn>(fn));
+    }
+
+    // The same read through a tenant handle the caller already resolved. A
+    // caller that reads many keys under one hold of the snapshot lock resolves
+    // the tenant once and reads every key of that hold through the same
+    // instance: the registry retires a tenant only from the decode paths that
+    // take that lock exclusively, so nothing replaces the instance a chunk
+    // resolved while the chunk runs, and a tenant that appears while the chunk
+    // runs belongs to the next chunk. The key is passed as a view the caller
+    // keeps alive for the call only, instead of building an owning identity per
+    // key. An absent tenant, an unrouted key or a publication the route no
+    // longer holds reads as an empty result.
+    template <typename Fn>
+    [[nodiscard]] auto WithObjectMetadataForRead(
+        const std::shared_ptr<metadata::Tenant>& tenant,
+        std::string_view user_key, Fn&& fn) const {
         using Result = std::invoke_result_t<
             Fn, const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
             const ObjectMetadata&, const ObjectEntry::State&>;
-        const auto tenant = tenants_.Lookup(tenant_id);
         if (tenant == nullptr) {
             return PublishedResult<Result>{};
         }
