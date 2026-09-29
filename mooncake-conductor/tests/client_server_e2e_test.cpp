@@ -134,10 +134,15 @@ void SeedEngine(EventManager& manager, const ContextKey& context,
 // model (non-empty string), block_size (positive integer), token_ids
 // (integer array). When tenant_id is omitted, the parsing layer normalizes
 // it to "default", matching the explicit context.tenant_id on the RPC side.
-std::string QueryMsgpackBody(const QueryRequest& request) {
+std::string QueryMsgpackBody(const QueryRequest& request,
+                             bool include_tenant = false) {
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> packer(&buffer);
-    packer.pack_map(3);
+    packer.pack_map(include_tenant ? 4 : 3);
+    if (include_tenant) {
+        packer.pack("tenant_id");
+        packer.pack(request.context.tenant_id);
+    }
     packer.pack("model");
     packer.pack(request.context.model_name);
     packer.pack("block_size");
@@ -478,6 +483,103 @@ TEST(ClientServerE2ETest, QueryEquivalenceAcrossProtocols) {
     ASSERT_TRUE(http_json.isMember("instances"));
     EXPECT_EQ(http_json, QueryResultToJson(*rpc_result));
 
+    client.Close();
+    manager.Stop();
+}
+
+TEST(ClientServerE2ETest, EmptyTenantUsesDefaultAcrossProtocols) {
+    EventManager manager({}, /*http_server_port=*/0, kRpcPort);
+    ASSERT_TRUE(manager.StartHTTPServer());
+    ASSERT_TRUE(manager.StartRPCServer());
+    manager.Start();
+    const uint16_t http_port = EventManagerTestPeer::HttpPort(manager);
+    ConductorClient client;
+    ASSERT_NO_FATAL_FAILURE(
+        SetupWithRetry(client, "127.0.0.1:" + std::to_string(kRpcPort)));
+    coro_http::coro_http_client http;
+
+    QueryRequest request;
+    request.context = E2EContext();
+    request.token_ids = Sequence(1, 48);
+    ASSERT_NO_FATAL_FAILURE(
+        SeedEngine(manager, request.context, E2EProfile(), request.token_ids));
+    for (const std::string tenant : {"", "default", "other-tenant"}) {
+        SCOPED_TRACE(tenant);
+        request.context.tenant_id = tenant;
+        const auto rpc = client.Query(request);
+        ASSERT_TRUE(rpc.has_value());
+        const auto response = HttpPost(http, http_port, "/query",
+                                       QueryMsgpackBody(request, true));
+        ASSERT_EQ(response.status, 200);
+        EXPECT_EQ(DecodeMsgpackBody(response.body), QueryResultToJson(*rpc));
+        if (tenant == "other-tenant") {
+            EXPECT_TRUE(rpc->instances.empty());
+        } else {
+            ASSERT_EQ(rpc->instances.size(), 1u);
+            EXPECT_EQ(rpc->instances.at("e2e-engine").longest_match_tokens, 48);
+        }
+    }
+
+    auto svc = E2EService("empty-tenant", "tcp://127.0.0.1:29421");
+    svc.tenant_id.clear();
+    ASSERT_TRUE(client.Register(svc).has_value());
+    const auto removed = client.Unregister(svc.instance_id, "", 0);
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(removed->removed_key, "empty-tenant|default|0");
+    EXPECT_EQ(
+        DecodeMsgpackBody(HttpGet(http, http_port, "/services").body)["count"]
+            .asInt64(),
+        0);
+
+    ASSERT_TRUE(client.Register(svc).has_value());
+    EXPECT_EQ(HttpPost(http, http_port, "/unregister",
+                       UnregisterMsgpackBody(svc.instance_id, "", 0))
+                  .status,
+              200);
+    const auto services = client.ListServices();
+    ASSERT_TRUE(services.has_value());
+    EXPECT_TRUE(services->empty());
+    client.Close();
+    manager.Stop();
+}
+
+TEST(ClientServerE2ETest, InvalidQueriesRejectedAcrossProtocols) {
+    EventManager manager({}, /*http_server_port=*/0, kRpcPort);
+    ASSERT_TRUE(manager.StartHTTPServer());
+    ASSERT_TRUE(manager.StartRPCServer());
+    manager.Start();
+    const uint16_t http_port = EventManagerTestPeer::HttpPort(manager);
+    ConductorClient client;
+    ASSERT_NO_FATAL_FAILURE(
+        SetupWithRetry(client, "127.0.0.1:" + std::to_string(kRpcPort)));
+    coro_http::coro_http_client http;
+
+    QueryRequest request;
+    request.context = E2EContext();
+    request.token_ids = {1, 2, 3};
+    for (const auto& context : std::vector<ContextKey>{
+             {.model_name = "", .block_size = 16},
+             {.model_name = "e2e-model", .block_size = 0},
+             {.model_name = "e2e-model", .block_size = -1}}) {
+        SCOPED_TRACE(context.block_size);
+        request.context = context;
+        const auto rpc = client.Query(request);
+        ASSERT_FALSE(rpc.has_value());
+        EXPECT_EQ(rpc.error(), ErrorCode::INVALID_PARAMS);
+        const auto response =
+            HttpPost(http, http_port, "/query", QueryMsgpackBody(request));
+        EXPECT_EQ(response.status, 400);
+    }
+
+    // HTTP permits an empty token list; validation must not reject it.
+    request.context = E2EContext();
+    request.token_ids.clear();
+    const auto rpc = client.Query(request);
+    ASSERT_TRUE(rpc.has_value());
+    const auto response =
+        HttpPost(http, http_port, "/query", QueryMsgpackBody(request));
+    EXPECT_EQ(response.status, 200);
+    EXPECT_EQ(DecodeMsgpackBody(response.body), QueryResultToJson(*rpc));
     client.Close();
     manager.Stop();
 }

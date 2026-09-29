@@ -1,5 +1,7 @@
 #include "conductor/kvevent/conductor_service.h"
 
+#include <optional>
+
 #include "conductor/kvevent/event_manager.h"
 #include "conductor/prefixindex/hash_strategy.h"
 
@@ -67,10 +69,21 @@ tl::expected<QueryResult, ErrorCode> ConductorService::Query(
     if (manager_.IsStopped()) {
         return tl::make_unexpected(ErrorCode::CONDUCTOR_UNAVAILABLE);
     }
+    // RPC bypasses the HTTP parser, but must enforce the same value contract.
+    if (request.context.model_name.empty() || request.context.block_size <= 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Only copy the context when normalization is needed; token_ids and the
+    // usual explicit-tenant context remain borrowed from the request.
+    std::optional<prefixindex::ContextKey> normalized_context;
+    if (request.context.tenant_id.empty()) {
+        normalized_context = request.context;
+        normalized_context->tenant_id = "default";
+    }
     QueryResult result;
-    result.instances =
-        manager_.indexer_.Query(request.context, request.token_ids,
-                                request.cache_salt, request.instance_filter);
+    result.instances = manager_.indexer_.Query(
+        normalized_context ? *normalized_context : request.context,
+        request.token_ids, request.cache_salt, request.instance_filter);
     return result;
 }
 
@@ -137,9 +150,12 @@ tl::expected<RegisterResult, ErrorCode> ConductorService::Register(
 
 tl::expected<UnregisterResult, ErrorCode> ConductorService::Unregister(
     const std::string& instance_id, const std::string& tenant_id, int dp_rank) {
-    const std::string key = MakeServiceKey(instance_id, tenant_id, dp_rank);
-    auto [removed, error] =
-        manager_.UnsubscribeFromService(instance_id, tenant_id, dp_rank);
+    const std::string normalized_tenant =
+        tenant_id.empty() ? "default" : tenant_id;
+    const std::string key =
+        MakeServiceKey(instance_id, normalized_tenant, dp_rank);
+    auto [removed, error] = manager_.UnsubscribeFromService(
+        instance_id, normalized_tenant, dp_rank);
     if (!removed) {
         return tl::make_unexpected(ErrorCode::SERVICE_NOT_FOUND);
     }
