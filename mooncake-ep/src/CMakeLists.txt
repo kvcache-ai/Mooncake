@@ -58,6 +58,29 @@ if(USE_CUDA)
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_utils.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/nvcc_compiler.cpp")
 
+  # The JIT engine runs nvcc at runtime, so the kernel headers the generated
+  # source #includes have to exist as files then. Bake their paths into the
+  # engine via jit_config.h.
+  set(MOONCAKE_EP_JIT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+  # jit_config.h is only used to build this library, so keep it in the binary
+  # dir rather than next to any headers that get installed.
+  set(MOONCAKE_EP_JIT_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/jit_generated")
+
+  set(MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR "")
+  if(CUDAToolkit_INCLUDE_DIRS)
+    list(GET CUDAToolkit_INCLUDE_DIRS 0 MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR)
+  endif()
+
+  # NCCL DeviceTransport is the only kernel dependency living outside the
+  # Mooncake tree and the CUDA toolkit.
+  set(MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR "")
+  if(USE_NCCL_DEVICE AND NCCL_DEVICE_INCLUDE_DIR)
+    set(MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR "${NCCL_DEVICE_INCLUDE_DIR}")
+  endif()
+
+  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_config.h.in"
+                 "${MOONCAKE_EP_JIT_GENERATED_DIR}/jit/jit_config.h" @ONLY)
+
   # Keep CUDA fatbins in a separate library.  The Python host extension can
   # then pass through auditwheel while this library is injected afterwards.
   add_library(mooncake_ep_device SHARED ${MOONCAKE_EP_DEVICE_SOURCES}
@@ -74,7 +97,8 @@ if(USE_CUDA)
   target_include_directories(
     mooncake_ep_device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include
+    ${MOONCAKE_EP_JIT_GENERATED_DIR})
   target_compile_options(
     mooncake_ep_device PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>
