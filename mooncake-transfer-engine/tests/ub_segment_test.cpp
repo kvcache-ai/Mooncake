@@ -41,9 +41,8 @@ TEST(UbSegmentTest, RegistrationIsIdempotent) {
     g_register_calls = 0;
     g_unregister_calls = 0;
     UbSegment segment;
-    EXPECT_EQ(segment.RegUbSegment("npu:0", 0x2000, 4096), 0);
-    if (g_register_calls == 0)
-        GTEST_SKIP() << "Ascend symbols are not available in this test binary";
+    ASSERT_EQ(segment.RegUbSegment("npu:0", 0x2000, 4096), 0);
+    ASSERT_EQ(g_register_calls, 1);
     EXPECT_EQ(segment.RegUbSegment("npu:0", 0x2000, 4096), 0);
     EXPECT_EQ(g_register_calls, 1);
     EXPECT_EQ(segment.UnRegUbSegment("npu:0", 0x2000), 0);
@@ -54,9 +53,8 @@ TEST(UbSegmentTest, RegistrationIsIdempotent) {
 TEST(UbSegmentTest, MismatchedSizeIsRejected) {
     g_register_calls = 0;
     UbSegment segment;
-    EXPECT_EQ(segment.RegUbSegment("npu:1", 0x3000, 4096), 0);
-    if (g_register_calls == 0)
-        GTEST_SKIP() << "Ascend symbols are not available in this test binary";
+    ASSERT_EQ(segment.RegUbSegment("npu:1", 0x3000, 4096), 0);
+    ASSERT_EQ(g_register_calls, 1);
     EXPECT_NE(segment.RegUbSegment("npu:1", 0x3000, 8192), 0);
     EXPECT_EQ(segment.UnRegUbSegment("npu:1", 0x3000), 0);
 }

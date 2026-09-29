@@ -25,14 +25,12 @@
 #include <mutex>
 #include <string_view>
 
-#if !defined(__APPLE__)
-extern "C" int halMemRegUbSegment(uint32_t, uint64_t, uint64_t)
-    __attribute__((weak));
-extern "C" int halMemUnRegUbSegment(uint32_t, uint64_t, uint64_t)
-    __attribute__((weak));
-extern "C" int aclrtGetLogicDevIdByUserDevId(int32_t, int32_t *)
-    __attribute__((weak));
-#endif
+extern "C" __attribute__((weak)) int halMemRegUbSegment(uint32_t, uint64_t,
+                                                      uint64_t);
+extern "C" __attribute__((weak)) int halMemUnRegUbSegment(uint32_t, uint64_t,
+                                                        uint64_t);
+extern "C" __attribute__((weak)) int aclrtGetLogicDevIdByUserDevId(int32_t,
+                                                                int32_t *);
 
 namespace mooncake {
 namespace {
@@ -45,50 +43,90 @@ struct AscendSymbols {
     HalRegisterFn register_segment = nullptr;
     HalUnregisterFn unregister_segment = nullptr;
     GetLogicDeviceIdFn get_logic_device_id = nullptr;
+    // Keep libraries opened here loaded for the lifetime of the process so
+    // cached function pointers remain valid.
     void *hal_handle = nullptr;
     void *acl_handle = nullptr;
 };
 
+void *loadAscendLibrary(const char *library) {
+    dlerror();
+    void *handle = dlopen(library, RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) {
+        const char *error = dlerror();
+        LOG(ERROR) << "Failed to load Ascend library " << library << ": "
+                   << (error ? error : "unknown loader error");
+    }
+    return handle;
+}
+
+void *findAscendSymbol(void *handle, const char *symbol,
+                       const char *library = nullptr) {
+    dlerror();
+    void *address = dlsym(handle, symbol);
+    const char *error = dlerror();
+    if (error || !address) {
+        // A global lookup can miss before the fallback library is loaded.
+        // Only report failure for the final lookup in that library.
+        if (library) {
+            LOG(ERROR) << "Failed to resolve Ascend symbol " << symbol
+                       << " from " << library << ": "
+                       << (error ? error : "symbol resolved to null");
+        }
+        return nullptr;
+    }
+    return address;
+}
+
 AscendSymbols &symbols() {
     static AscendSymbols result;
+    // Cache failures as well as successes; runtime libraries must be available
+    // before the first NPU registration attempt.
     static std::once_flag once;
     std::call_once(once, [] {
-#if !defined(__APPLE__)
         auto &out = result;
         out.register_segment = halMemRegUbSegment;
         out.unregister_segment = halMemUnRegUbSegment;
         out.get_logic_device_id = aclrtGetLogicDevIdByUserDevId;
-#else
-        auto &out = result;
-#endif
-
-        out.hal_handle = dlopen("libascend_hal.so", RTLD_LAZY | RTLD_LOCAL);
-        out.acl_handle = dlopen("libascendcl.so", RTLD_LAZY | RTLD_LOCAL);
 
         if (!out.register_segment) {
             out.register_segment = reinterpret_cast<HalRegisterFn>(
-                dlsym(RTLD_DEFAULT, "halMemRegUbSegment"));
+                findAscendSymbol(RTLD_DEFAULT, "halMemRegUbSegment"));
         }
         if (!out.unregister_segment) {
             out.unregister_segment = reinterpret_cast<HalUnregisterFn>(
-                dlsym(RTLD_DEFAULT, "halMemUnRegUbSegment"));
+                findAscendSymbol(RTLD_DEFAULT, "halMemUnRegUbSegment"));
         }
         if (!out.get_logic_device_id) {
             out.get_logic_device_id = reinterpret_cast<GetLogicDeviceIdFn>(
-                dlsym(RTLD_DEFAULT, "aclrtGetLogicDevIdByUserDevId"));
+                findAscendSymbol(RTLD_DEFAULT,
+                                 "aclrtGetLogicDevIdByUserDevId"));
         }
 
-        if (!out.register_segment && out.hal_handle) {
-            out.register_segment = reinterpret_cast<HalRegisterFn>(
-                dlsym(out.hal_handle, "halMemRegUbSegment"));
+        if (!out.register_segment || !out.unregister_segment) {
+            constexpr const char *library = "libascend_hal.so";
+            out.hal_handle = loadAscendLibrary(library);
+            if (out.hal_handle) {
+                if (!out.register_segment) {
+                    out.register_segment = reinterpret_cast<HalRegisterFn>(
+                        findAscendSymbol(out.hal_handle, "halMemRegUbSegment",
+                                         library));
+                }
+                if (!out.unregister_segment) {
+                    out.unregister_segment = reinterpret_cast<HalUnregisterFn>(
+                        findAscendSymbol(out.hal_handle, "halMemUnRegUbSegment",
+                                         library));
+                }
+            }
         }
-        if (!out.unregister_segment && out.hal_handle) {
-            out.unregister_segment = reinterpret_cast<HalUnregisterFn>(
-                dlsym(out.hal_handle, "halMemUnRegUbSegment"));
-        }
-        if (!out.get_logic_device_id && out.acl_handle) {
-            out.get_logic_device_id = reinterpret_cast<GetLogicDeviceIdFn>(
-                dlsym(out.acl_handle, "aclrtGetLogicDevIdByUserDevId"));
+        if (!out.get_logic_device_id) {
+            constexpr const char *library = "libascendcl.so";
+            out.acl_handle = loadAscendLibrary(library);
+            if (out.acl_handle) {
+                out.get_logic_device_id = reinterpret_cast<GetLogicDeviceIdFn>(
+                    findAscendSymbol(out.acl_handle,
+                                     "aclrtGetLogicDevIdByUserDevId", library));
+            }
         }
     });
     return result;
@@ -118,14 +156,6 @@ bool symbolsAvailable(const AscendSymbols &resolved) {
            resolved.get_logic_device_id;
 }
 
-void warnSymbolsUnavailable() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        LOG(WARNING) << "USE_ASCEND_RDMA is enabled, but Ascend UB symbols "
-                        "are unavailable; UB segment registration is skipped";
-    });
-}
-
 }  // namespace
 
 int UbSegment::RegUbSegment(const std::string &location, uint64_t va,
@@ -146,8 +176,9 @@ int UbSegment::RegUbSegment(const std::string &location, uint64_t va,
 
     auto &resolved = symbols();
     if (!symbolsAvailable(resolved)) {
-        warnSymbolsUnavailable();
-        return 0;
+        LOG(ERROR) << "Cannot register UB segment for location " << location
+                   << ": required Ascend UB symbols are unavailable";
+        return -1;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -244,7 +275,9 @@ int UbSegment::UnRegUbSegment(const std::string &location, uint64_t va) {
             }
         }
     } else {
-        warnSymbolsUnavailable();
+        LOG(ERROR) << "Cannot unregister UB segment for location " << location
+                   << ": required Ascend UB symbols are unavailable";
+        first_error = -1;
     }
 
     entries.erase(entry_it);
