@@ -54,6 +54,29 @@ All_TEST_SCRIPTS_VLLM=(
     "test_vllm_1p1d_erdma.sh"
 )
 
+list_tests() {
+    case "${1:-default}" in
+        default)
+            printf '%s\n' "${All_TEST_SCRIPTS_SGLANG[@]}" "${All_TEST_SCRIPTS_VLLM[@]}"
+            ;;
+        SGLANG)
+            printf '%s\n' "${All_TEST_SCRIPTS_SGLANG[@]}"
+            ;;
+        VLLM)
+            printf '%s\n' "${All_TEST_SCRIPTS_VLLM[@]}"
+            ;;
+        *)
+            echo "ERROR: Unknown framework '$1'. Use SGLANG or VLLM." >&2
+            return 1
+            ;;
+    esac
+}
+
+if [ "${1:-}" = "list-tests" ]; then
+    list_tests "${2:-default}"
+    exit $?
+fi
+
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-"$REMOTE_IP"}
 SSH_CMD=${SSH_CMD:-"ssh -o StrictHostKeyChecking=no"}
 RSYNC_RSH=${RSYNC_RSH:-"ssh -o StrictHostKeyChecking=no"}
