@@ -75,6 +75,8 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_metadata_config_test master_metadata_config_test.cpp)
+add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
 add_store_test(master_service_weight_management_test
                master_service_weight_management_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
@@ -169,6 +171,8 @@ add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 if(USE_TENT)
+  target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
+  target_link_libraries(transfer_task_test PRIVATE tent)
   add_test(
     NAME transfer_task_tent_completion_test
     COMMAND transfer_task_test
@@ -187,16 +191,24 @@ endif()
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(transfer_task_test PRIVATE USE_CUDA)
-  if(USE_TENT)
-    add_test(
-      NAME transfer_scatter_tent_test
-      COMMAND
-        transfer_task_test
-        --gtest_filter=TransferTaskTest.TransferScatterWritesGpuDestinationDirectly
-    )
-    set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                               "MC_USE_TENT=1")
-  endif()
+endif()
+if(USE_TENT)
+  add_test(
+    NAME transfer_scatter_tent_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
+  )
+  set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
+                                                           "MC_USE_TENT=1")
+  add_test(
+    NAME transfer_submitter_scatter_tent_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
+  )
+  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
+                       ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
@@ -206,6 +218,8 @@ add_store_test(object_index_test object_index_test.cpp)
 add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
+add_store_test(metadata_tenant_test metadata_tenant_test.cpp)
+add_store_test(metadata_tenant_registry_test metadata_tenant_registry_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -219,18 +233,24 @@ add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
 add_store_test(hugepage_config_test hugepage_config_test.cpp)
+add_store_test(shm_spdk_registration_config_test
+               shm_spdk_registration_config_test.cpp)
 add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
 add_store_test(random_test random_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
 add_store_test(client_auto_discovery_config_test
                client_auto_discovery_config_test.cpp)
+add_store_test(client_object_checksum_config_test
+               client_object_checksum_config_test.cpp)
 add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(local_hot_cache_concurrency_test
                local_hot_cache_concurrency_test.cpp)
+add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 if(USE_CUDA)
@@ -243,6 +263,13 @@ add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(client_host_identity_config_test
                client_host_identity_config_test.cpp)
 add_store_test(client_metric_config_test client_metric_config_test.cpp)
+add_test(
+  NAME client_metric_cluster_id_test
+  COMMAND
+    client_metric_config_test
+    --gtest_filter=ClientMetricClusterIdTest.MergeLabelsUsesConfiguredClusterId)
+set_tests_properties(client_metric_cluster_id_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_CLUSTER_ID=test-cluster")
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(allocator_metric_test allocator_metric_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
@@ -306,6 +333,7 @@ add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_connector_config_test nvme_kv/connector_config_test.cpp)
+add_store_test(nvme_kv_executor_config_test nvme_kv/executor_config_test.cpp)
 add_store_test(ha_cluster_namespace_config_test
                ha_cluster_namespace_config_test.cpp)
 add_store_test(redis_connection_config_test redis_connection_config_test.cpp)
@@ -324,6 +352,8 @@ add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
 add_store_test(fileread_worker_pool_config_test
                fileread_worker_pool_config_test.cpp)
+add_store_test(nof_worker_pool_config_test nof_worker_pool_config_test.cpp)
+add_store_test(nof_debug_config_test nof_debug_config_test.cpp)
 add_store_test(fileread_worker_pool_test fileread_worker_pool_test.cpp)
 if(MOONCAKE_OSS_ADAPTER_ENABLED)
   target_compile_definitions(file_storage_test PRIVATE HAVE_OSS_ADAPTER)

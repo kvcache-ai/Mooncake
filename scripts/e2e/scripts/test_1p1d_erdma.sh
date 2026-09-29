@@ -28,7 +28,7 @@ start_server()
         mode_name=decode
     fi
 
-    local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}"
+    local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-6} --mem-fraction-static 0.70"
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
         extra_args="${extra_args} --disaggregation-ib-device=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
     fi
@@ -96,7 +96,7 @@ run_single_model()
         status=1
     else
         # Remote start server
-        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
+        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$E2E_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
             echo "ERROR: Failed to start remote server for model $model_name"
             status=1
         else
