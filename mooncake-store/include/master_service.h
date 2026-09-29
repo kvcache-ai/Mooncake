@@ -1083,16 +1083,15 @@ class MasterService {
         std::string promotion_retry_resume_key;
     };
 
-    // One control-plane lock over the whole table, and a known boundary of the
-    // tenant-first migration: the records are keyed by tenant, but a lease
-    // proposal, a candidate index change and a teardown all take this same
-    // lock, so tenants serialize against each other here. The object route, the
-    // group table and the quota account are per-tenant and do not. Moving these
-    // records into per-tenant runtime with their own lock is follow-up work,
-    // not a correctness gap: the table is touched on the action paths below,
-    // never on a read of the object route. `DynamicReplicationLeaseTable` keeps
-    // its own internal lock, so a future per-tenant split does not need to
-    // widen this one.
+    // One control-plane lock over the whole table: the records are keyed by
+    // tenant, but a lease proposal, a candidate index change and a teardown all
+    // take this same lock, so tenants serialize against each other here. The
+    // object route, the group table and the quota account are per-tenant and do
+    // not. The table is touched on the action paths below, never on a read of
+    // the object route, so giving each tenant its own lock here is a change of
+    // granularity rather than of correctness. `DynamicReplicationLeaseTable`
+    // keeps its own internal lock, so a per-tenant split does not need to widen
+    // this one.
     mutable std::mutex replica_action_mutex_;
     std::unordered_map<TenantId, TenantReplicaActionState, TenantIdHash>
         replica_action_state_ GUARDED_BY(replica_action_mutex_);

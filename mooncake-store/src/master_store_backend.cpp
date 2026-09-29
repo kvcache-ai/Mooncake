@@ -79,8 +79,8 @@ MasterStoreBackend::SnapshotWeightGroup(
             return tl::make_unexpected(WeightManagementError::NOT_FOUND);
         }
         if (!*published) {
-            // A member that no longer belongs to the group is a conflict, the
-            // same answer the shard model gave when the group had moved on.
+            // The key is routed, but not to a member of this group: the group
+            // moved on, which is a conflict for the caller.
             return tl::make_unexpected(WeightManagementError::CONFLICT);
         }
         members.push_back(std::move(*snapshot));

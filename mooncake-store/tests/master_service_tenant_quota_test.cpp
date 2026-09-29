@@ -957,9 +957,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         StageReplacementPublication(service, tenant, key, object_size);
         ASSERT_NE(replacement_.entry, superseded_.entry);
         if (invalidate_replacement_handle) {
-            // The replacement's handle is dead, the state the read-write
-            // accessor the older cleanups resolved through drops before its
-            // callback.
+            // The replacement's handle is dead: the state a cleanup that
+            // resolves the key drops before its callback.
             PrepareSegmentUnmount(service, replacement_.segment);
             ASSERT_EQ(InvalidHandleCountOf(replacement_.entry), 1u);
         }
@@ -1569,9 +1568,9 @@ TEST_F(MasterServiceTenantQuotaTest, DurableMetadataEraseSparesTheRecreate) {
     const auto before =
         CapturePublicationState(service, peer, tenant, replacement_.entry,
                                 replacement_.task, replacement_.proposal);
-    // The replacement owns the soft-pin registration this erase used to take by
-    // key, and the superseded publication's charge is still on the tenant:
-    // dropping its route slot released nothing.
+    // The replacement owns the soft-pin registration for the key, and the
+    // superseded publication's charge is still on the tenant: dropping its
+    // route slot released nothing.
     ASSERT_EQ(peer.SoftPinRegistrationCount(), 1u);
     ASSERT_EQ(before.charged_bytes, 2 * object_size);
 
@@ -1589,10 +1588,9 @@ TEST_F(MasterServiceTenantQuotaTest, DurableMetadataEraseSparesTheRecreate) {
 }
 
 // The expired-processing cleanup resolves through the tenant's plain published
-// object. It used to resolve through the read-write accessor, whose
-// invalid-replica cleanup ran on whatever the route published, so a same-key
-// recreate whose own replica has a dead handle was dropped and torn down before
-// the cleanup compared the publication it was armed for.
+// object, so a same-key recreate whose own replica has a dead handle survives
+// it: the cleanup compares the publication it was armed for before it acts on
+// anything.
 TEST_F(MasterServiceTenantQuotaTest,
        DurableExpiredProcessingCleanupSparesTheRecreate) {
     const TenantId tenant("tenant-a");
