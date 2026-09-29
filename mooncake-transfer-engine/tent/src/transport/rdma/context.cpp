@@ -33,9 +33,8 @@
 #include <cstdlib>
 #include <dlfcn.h>
 
-#ifdef USE_CUDA
-#include <cuda.h>
-#include <cuda_runtime.h>
+#if defined(USE_CUDA) || defined(USE_SUPA)
+#include "cuda_alike.h"
 #endif
 
 #include "ib_link_speed.h"
@@ -542,7 +541,7 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
         return nullptr;
     }
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_SUPA)
     // Ensure CUDA context is current for GPU memory registration
     // This is needed for worker threads or callers from non-CUDA threads
     CUmemorytype memType;

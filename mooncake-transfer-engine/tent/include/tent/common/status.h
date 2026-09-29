@@ -41,7 +41,7 @@
         if (!status.ok()) return status; \
     } while (0)
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_SUPA)
 #include <glog/logging.h>
 
 #define CHECK_CUDA(call)                                                      \

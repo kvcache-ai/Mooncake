@@ -17,8 +17,7 @@
 #include "tent/common/status.h"
 
 #include <bits/stdint-uintn.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include "cuda_alike.h"
 #include <glog/logging.h>
 #include <mutex>
 #include <numa.h>
@@ -49,8 +48,8 @@ bool cudaPrimaryContextIsActive(int device) {
 // current context. Only save/restore the caller's device when one exists.
 bool cudaHasCurrentContext() {
     if (!ensureCudaDriverInit()) return false;
-    CUcontext ctx = nullptr;
-    return cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx != nullptr;
+    CUcontext ctx = 0;
+    return cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx != 0;
 }
 
 }  // namespace

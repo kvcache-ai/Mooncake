@@ -252,13 +252,15 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
     // ib_core), so the amdgpu module itself is the presence signal.
     // Hygon: the hycu driver provides the same peer-memory support.
+    // Biren: the biren driver exposes GPU memory through DMA-BUF.
     std::ifstream modules("/proc/modules");
     std::string line;
     while (std::getline(modules, line)) {
         const auto name_end = line.find(' ');
         const auto name =
             name_end == std::string::npos ? line : line.substr(0, name_end);
-        if (name == "nvidia_peermem" || name == "amdgpu" || name == "hycu") {
+        if (name == "nvidia_peermem" || name == "amdgpu" || name == "hycu" ||
+            name == "biren") {
             return true;
         }
     }
