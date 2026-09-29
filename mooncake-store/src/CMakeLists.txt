@@ -12,6 +12,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     uds_transport.cpp
     config/distributed_storage_config.cpp
     config/rpc_protocol_config.cpp
+    config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp)
@@ -19,13 +20,18 @@ set(MOONCAKE_STORE_SHARED_SOURCES
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    config/dfs_enablement_config.cpp
     config/ha_cluster_namespace_config.cpp
+    config/master_metadata_config.cpp
     config/local_file_snapshot_config.cpp
+    config/metrics_bootstrap_config_loader.cpp
     config/redis_connection_config.cpp
     config/s3_client_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
     master_service.cpp
+    master_store_backend.cpp
+    weight_store_manager.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
@@ -50,7 +56,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     offset_allocator.cpp
     http_metadata_server.cpp
     serialize/serializer.cpp
-    storage/distributed/dfs_global_allocator.cpp
+    storage/distributed/shard_allocator.cpp
+    storage/distributed/immutable_bucket_allocator.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
@@ -103,6 +110,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/backend.cpp
     nvme_kv/connector.cpp
     nvme_kv/config/connector_config.cpp
+    nvme_kv/config/executor_config.cpp
     nvme_kv/config/io_concurrency_config.cpp
     nvme_kv/config/u32_parser.cpp
     nvme_kv/executor_io_uring.cpp
@@ -112,7 +120,9 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/key_conflict_policy.cpp
     nvme_kv/object_layout.cpp
     transfer_task.cpp
+    config/nof_debug_config.cpp
     config/fileread_worker_pool_config.cpp
+    config/nof_worker_pool_config.cpp
     posix_file.cpp
     client_buffer.cpp
     aligned_client_buffer.cpp
@@ -121,9 +131,11 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     registered_pinned_memory.cpp
     dummy_client.cpp
     shm_helper.cpp
+    config/shm_spdk_registration_config.cpp
     file_storage.cpp
     config/client_host_identity_config.cpp
     config/client_metric_config.cpp
+    config/client_object_checksum_config.cpp
     config/file_storage_config.cpp
     config/bucket_backend_config.cpp
     config/file_per_key_config.cpp
@@ -453,11 +465,10 @@ target_include_directories(mooncake_store_shared_objects
 target_link_libraries(
   mooncake_store_shared_objects
   PRIVATE cachelib_memory_allocator
-          transfer_metadata_plugin
           glog::glog
           gflags::gflags
           mooncake_common
-          numa
+          $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
 if(STORE_USE_ETCD)
@@ -479,7 +490,6 @@ target_link_libraries(
   mooncake_store_master_objects
   PRIVATE mooncake_store_shared_objects
           mooncake_local_ssd
-          transfer_metadata_plugin
           cachelib_memory_allocator
           glog::glog
           gflags::gflags
@@ -529,7 +539,7 @@ target_link_libraries(
           yaml-cpp
           Mooncake::xxhash
           mooncake_common
-          numa
+          $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
 if(BUILD_UNIT_TESTS)
@@ -567,6 +577,10 @@ if(USE_ASCEND
   target_include_directories(mooncake_store_client_objects
                              PRIVATE $ENV{ASCEND_PATH}/include)
 endif()
+if(USE_TENT)
+  target_compile_definitions(mooncake_store_client_objects PRIVATE USE_TENT)
+  target_link_libraries(mooncake_store_client_objects PRIVATE tent)
+endif()
 
 # Reduced Store library linked by mooncake_master.
 add_library(
@@ -590,13 +604,12 @@ target_link_libraries(
           Mooncake::zstd
           asio_shared
           yalantinglibs::yalantinglibs
-          transfer_metadata_plugin
           gflags::gflags
           JsonCpp::JsonCpp
           yaml-cpp
           Mooncake::xxhash
           OpenSSL::Crypto
-          numa)
+          $<$<PLATFORM_ID:Linux>:numa>)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store_master PRIVATE Mooncake::libzmq)
 endif()
@@ -628,7 +641,7 @@ target_link_libraries(
          transfer_engine
          yalantinglibs::yalantinglibs
   PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash
-          OpenSSL::Crypto numa)
+          OpenSSL::Crypto $<$<PLATFORM_ID:Linux>:numa>)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()
@@ -654,6 +667,7 @@ if(USE_SUNRISE)
     mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
+
 if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
@@ -669,7 +683,7 @@ target_link_libraries(
   PRIVATE mooncake_store_master
           cachelib_memory_allocator
           pthread
-          ibverbs
+          $<$<BOOL:${YLT_ENABLE_IBV}>:ibverbs>
           mooncake_common
           glog::glog
           gflags::gflags

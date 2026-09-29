@@ -155,6 +155,9 @@ if(WITH_STORE)
     store/engram_store_py.cpp
     integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
+  if(USE_TENT)
+    target_link_libraries(store PRIVATE tent)
+  endif()
   if(USE_ASCEND_DIRECT)
     target_link_libraries(
       store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags
@@ -219,7 +222,7 @@ endif()
 if(NOT SKBUILD)
   install(
     FILES
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/http_metadata_server.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_launcher.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli_bench.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/transfer_engine_topology_dump.py"

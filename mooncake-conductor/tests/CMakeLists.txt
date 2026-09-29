@@ -14,7 +14,10 @@ add_executable(
   model_context_test.cpp
   compute_hash_test.cpp
   prefix_indexer_test.cpp
-  msg_decoder_test.cpp)
+  msgpack_reader_test.cpp
+  msg_decoder_test.cpp
+  zmq_client_test.cpp
+  event_manager_test.cpp)
 
 target_link_libraries(conductor_test PRIVATE conductor_cpp_core
                                              ${CONDUCTOR_GTEST_LIBS})

@@ -12,13 +12,14 @@ Serving-framework users can then connect SGLang, vLLM or other systems.
 ## Prerequisites
 
 - **Python**: 3.10 or later; a virtual environment is recommended.
-- **RDMA**: an RDMA driver and SDK (for example, Mellanox OFED), if you plan to use RDMA for data transfer.
+- **RDMA**: an RDMA driver and SDK (for example, Mellanox OFED), if you plan to use RDMA for data transfer. On ScaleFabric SHCA systems, install `shca-tools` and build with `-DUSE_SHCA=ON`.
 - **CUDA**: 12.1 or later. For most CUDA-enabled use cases, such as RDMA-based KV cache transfer between GPUs or between GPU and DRAM, NVIDIA GPUDirect support is also required. You may install CUDA from [the NVIDIA downloads page](https://developer.nvidia.com/cuda-downloads).
 
 ```{note}
 The default pip, build and Docker paths target NVIDIA CUDA. For other
 platforms, see [Other Platforms](#other-platforms) below.
 ```
+
 
 ## Installation
 

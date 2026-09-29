@@ -14,10 +14,26 @@
 
 #include <chrono>
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include "error.h"
+
+namespace mooncake {
+namespace {
+
+bool isTransferEngineEnvEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "off") != 0 && std::strcmp(value, "no") != 0;
+}
+
+}  // namespace
+}  // namespace mooncake
 
 #ifndef USE_TENT
 #include "transfer_engine.h"
@@ -190,6 +206,11 @@ int TransferEngine::freeSharedMemory(void* addr) {
 }
 
 Status TransferEngine::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    return impl_->submitTransfer(batch_id, entries);
+}
+
+Status TransferEngine::submitScatterTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     return impl_->submitTransfer(batch_id, entries);
 }
@@ -378,6 +399,12 @@ std::string TransferEngine::showLinks(bool json) const {
 namespace mooncake {
 namespace {
 
+#ifdef USE_TENT
+std::optional<tent::Request::OpCode> toTentOpcode(
+    TransferRequest::OpCode opcode);
+std::optional<tent::IntentType> toTentIntent(int intent_type);
+#endif
+
 int tentToClassicError(tent::Status::Code code) {
     using Code = tent::Status::Code;
     // Integer-returning classic APIs use ERR_*, whose values do not match
@@ -500,7 +527,8 @@ void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
 }  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+    if (isTransferEngineEnvEnabled("MC_USE_TENT") ||
+        isTransferEngineEnvEnabled("MC_USE_TEV1")) {
         use_tent_ = true;
     }
     if (!use_tent_) {
@@ -508,9 +536,37 @@ TransferEngine::TransferEngine(bool auto_discover) {
     }
 }
 
+Status TransferEngine::submitScatterTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    if (use_tent_) {
+        std::vector<mooncake::tent::Request> requests;
+        requests.reserve(entries.size());
+        for (const auto& item : entries) {
+            mooncake::tent::Request req;
+            req.opcode =
+                static_cast<mooncake::tent::Request::OpCode>(item.opcode);
+            req.length = item.length;
+            req.source = item.source;
+            req.target_id = item.target_id;
+            req.target_offset = item.target_offset;
+            req.transport_hint =
+                mooncake::tent::c_to_transport_hint(item.transport_hint);
+            requests.push_back(req);
+        }
+        auto status = impl_tent_->submitTransferRequiringPostSubmitCancellation(
+            batch_id, requests);
+        if (status.ok()) return Status::OK();
+        if (status.IsNotImplemented())
+            return Status::NotImplemented(status.message());
+        return Status::Context(status.ToString());
+    }
+    return impl_->submitTransfer(batch_id, entries);
+}
+
 TransferEngine::TransferEngine(bool auto_discover,
                                const std::vector<std::string>& filter) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+    if (isTransferEngineEnvEnabled("MC_USE_TENT") ||
+        isTransferEngineEnvEnabled("MC_USE_TEV1")) {
         use_tent_ = true;
     }
     if (use_tent_) {
@@ -851,7 +907,11 @@ Status TransferEngine::submitTransfer(
         std::vector<mooncake::tent::Request> requests;
         for (auto& item : entries) {
             mooncake::tent::Request req;
-            req.opcode = (mooncake::tent::Request::OpCode)(int)item.opcode;
+            auto opcode = toTentOpcode(item.opcode);
+            auto intent = toTentIntent(item.intent_type);
+            if (!opcode || !intent)
+                return Status::InvalidArgument("invalid TENT transfer request");
+            req.opcode = *opcode;
             req.length = item.length;
             req.source = item.source;
             req.target_id = item.target_id;
@@ -859,6 +919,7 @@ Status TransferEngine::submitTransfer(
             req.priority = item.priority;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
+            req.intent_type = *intent;
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransfer(batch_id, requests);
@@ -878,7 +939,11 @@ Status TransferEngine::submitTransferWithNotify(
         std::vector<mooncake::tent::Request> requests;
         for (auto& item : entries) {
             mooncake::tent::Request req;
-            req.opcode = (mooncake::tent::Request::OpCode)(int)item.opcode;
+            auto opcode = toTentOpcode(item.opcode);
+            auto intent = toTentIntent(item.intent_type);
+            if (!opcode || !intent)
+                return Status::InvalidArgument("invalid TENT transfer request");
+            req.opcode = *opcode;
             req.length = item.length;
             req.source = item.source;
             req.target_id = item.target_id;
@@ -886,6 +951,7 @@ Status TransferEngine::submitTransferWithNotify(
             req.priority = item.priority;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
+            req.intent_type = *intent;
             requests.push_back(req);
         }
         mooncake::tent::Notification notifi;
@@ -1174,6 +1240,54 @@ std::string TransferEngine::showLinks(bool json) const {
 #endif
 
 namespace mooncake {
+namespace {
+
+#ifdef USE_TENT
+std::optional<tent::Request::OpCode> toTentOpcode(
+    TransferRequest::OpCode opcode);
+std::optional<tent::IntentType> toTentIntent(int intent_type);
+#endif
+
+#ifdef USE_TENT
+std::optional<tent::Request::OpCode> toTentOpcode(
+    TransferRequest::OpCode opcode) {
+    switch (opcode) {
+        case TransferRequest::READ:
+            return tent::Request::READ;
+        case TransferRequest::WRITE:
+            return tent::Request::WRITE;
+        default:
+            return std::nullopt;
+    }
+}
+
+// NOTE: This handles raw int values 0-6 including CHECKPOINT (4),
+// WEIGHT_LOADING (5), STAGING_INTERNAL (6) for forward compatibility.
+// The store-layer ToTentIntent in transfer_task.cpp only handles
+// TransferIntent enum values (0-3).
+std::optional<tent::IntentType> toTentIntent(int intent_type) {
+    switch (intent_type) {
+        case transfer_intent_values::kUnspecified:
+            return tent::IntentType::INTENT_UNSPEC;
+        case transfer_intent_values::kForegroundGet:
+            return tent::IntentType::FOREGROUND_GET;
+        case transfer_intent_values::kBackgroundPrefetch:
+            return tent::IntentType::BACKGROUND_PREFETCH;
+        case transfer_intent_values::kMigration:
+            return tent::IntentType::MIGRATION;
+        case 4:
+            return tent::IntentType::CHECKPOINT;
+        case 5:
+            return tent::IntentType::WEIGHT_LOADING;
+        case 6:
+            return tent::IntentType::STAGING_INTERNAL;
+        default:
+            return std::nullopt;
+    }
+}
+#endif
+
+}  // namespace
 
 int TransferEngine::getSegmentBuffers(SegmentHandle handle,
                                       std::vector<SegmentBufferInfo>& buffers) {
@@ -1323,6 +1437,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
         completed_ = true;
         callbacks_.clear();
         requests_.clear();
+#ifdef USE_TENT
+        tent_requests_.clear();
+#endif
         request_fragments_.clear();
         done_.clear();
         task_sizes_.clear();
@@ -1373,6 +1490,80 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #endif
     }
 
+    bool legacyBatchPhysicallyDrained() {
+        if (useTent() || batch_id_ == INVALID_BATCH_ID) return false;
+        auto& batch = Transport::toBatchDesc(batch_id_);
+        for (auto& task : batch.task_list) {
+            if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE)) continue;
+            const auto slice_count =
+                __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+            const auto success_count =
+                __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+            const auto failure_count =
+                __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+            if (legacy_submit_failed_ && slice_count == 0) {
+                __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+                continue;
+            }
+            if (slice_count == 0 || success_count > slice_count ||
+                failure_count > slice_count - success_count)
+                return false;
+            if (success_count + failure_count != slice_count) return false;
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            // The completion thread publishes is_finished only after its final
+            // access to the batch. Slice counters can become complete earlier.
+            return false;
+#endif
+        }
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+        for (auto& task : batch.task_list)
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+#endif
+        return true;
+    }
+
+    bool finishDrainedLegacyFailure(const Status& status) {
+        if (!legacyBatchPhysicallyDrained()) return false;
+        remember(status);
+        size_t request_index = 0;
+        for (size_t task_id = 0; task_id < task_sizes_.size(); ++task_id) {
+            const size_t request_start = request_index;
+            request_index += task_sizes_[task_id];
+            if (done_[request_start]) continue;
+
+            std::vector<TransferStatusEnum> request_statuses;
+            auto detail_status = backend_.legacy->getScatterRequestStatuses(
+                batch_id_, task_id, request_statuses);
+            if (!detail_status.ok() ||
+                request_statuses.size() != task_sizes_[task_id]) {
+                remember(detail_status.ok()
+                             ? Status::Context(
+                                   "invalid grouped scatter status count")
+                             : detail_status);
+                continue;
+            }
+            for (size_t i = request_start; i < request_index; ++i) {
+                const auto fragment_status =
+                    request_statuses[i - request_start] ==
+                            TransferStatusEnum::COMPLETED
+                        ? Status::OK()
+                        : Status::Socket("scatter transfer fragment failed");
+                completeRequest(i, fragment_status);
+            }
+        }
+        // Fragment callbacks may inspect state associated with the live batch.
+        // Resolve every callback before releasing that batch.
+        failPending(status);
+        auto free_status = freeBatch(batch_id_);
+        if (!free_status.ok() && !free_status.IsBatchCleanupDeferred()) {
+            remember(free_status);
+            return false;
+        }
+        batch_id_ = INVALID_BATCH_ID;
+        finish();
+        return true;
+    }
+
     void build(TransferEngine& engine,
                const std::vector<ScatterTransferRange>& ranges) {
         for (size_t range_index = 0; range_index < ranges.size();
@@ -1420,9 +1611,20 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     auto [segment, inserted] = segment_handles_.emplace(
                         range.remote_segment,
                         static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT));
-                    if (inserted)
-                        segment->second =
-                            engine.openSegment(range.remote_segment);
+                    if (inserted) {
+#ifdef USE_TENT
+                        if (useTent()) {
+                            tent::SegmentID segment_id;
+                            auto status = backend_.tent->openSegment(
+                                segment_id, range.remote_segment);
+                            if (status.ok()) segment->second = segment_id;
+                        } else
+#endif
+                        {
+                            segment->second =
+                                engine.openSegment(range.remote_segment);
+                        }
+                    }
                     segment_handle = &segment->second;
                 }
                 if (*segment_handle ==
@@ -1433,7 +1635,21 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     continue;
                 }
 
-                requests_.push_back(TransferRequest{
+#ifdef USE_TENT
+                std::optional<tent::Request::OpCode> tent_opcode;
+                std::optional<tent::IntentType> tent_intent;
+                if (useTent()) {
+                    tent_opcode = toTentOpcode(range.opcode);
+                    tent_intent = toTentIntent(range.intent_type);
+                    if (!tent_opcode || !tent_intent) {
+                        complete(range_index, fragment_index,
+                                 Status::InvalidArgument(
+                                     "invalid TENT scatter transfer request"));
+                        continue;
+                    }
+                }
+#endif
+                TransferRequest req{
                     .opcode = range.opcode,
                     .source =
                         static_cast<char*>(range.local_buffer) + local_offset,
@@ -1441,7 +1657,21 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     .target_offset = range.remote_base_offset + remote_offset,
                     .length = length,
                     .task_group_id = 1,
-                });
+                };
+                req.intent_type = range.intent_type;
+                requests_.push_back(req);
+#ifdef USE_TENT
+                if (useTent()) {
+                    tent::Request tent_request;
+                    tent_request.opcode = *tent_opcode;
+                    tent_request.source = req.source;
+                    tent_request.target_id = req.target_id;
+                    tent_request.target_offset = req.target_offset;
+                    tent_request.length = req.length;
+                    tent_request.intent_type = *tent_intent;
+                    tent_requests_.push_back(tent_request);
+                }
+#endif
                 request_fragments_.emplace_back(range_index, fragment_index);
             }
         }
@@ -1455,9 +1685,26 @@ class TransferEngine::ScatterTransferOperation::Impl {
         Status submit_status = Status::OK();
         if (useTent()) {
             task_sizes_.assign(requests_.size(), 1);
-            batch_id_ = engine.allocateBatchID(requests_.size());
-            if (batch_id_ != INVALID_BATCH_ID)
-                submit_status = engine.submitTransfer(batch_id_, requests_);
+#ifdef USE_TENT
+            batch_id_ = backend_.tent->allocateBatch(requests_.size());
+            if (batch_id_ == 0) {
+                batch_id_ = INVALID_BATCH_ID;
+                submit_status = Status::InvalidArgument(
+                    "failed to allocate TENT scatter transfer batch");
+            } else {
+                auto status =
+                    backend_.tent
+                        ->submitTransferRequiringPostSubmitCancellation(
+                            batch_id_, tent_requests_);
+                if (!status.ok()) {
+                    if (status.IsNotImplemented())
+                        submit_status =
+                            Status::NotImplemented(status.message());
+                    else
+                        submit_status = Status::Context(status.ToString());
+                }
+            }
+#endif
         } else {
             MultiTransport::ScatterSubmission submission;
             submit_status =
@@ -1499,6 +1746,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #endif
 
         requestAbort(submit_status);
+        legacy_submit_failed_ = true;
         // Published tasks own the exact fragment results, even when submit
         // itself reports an error. Poll them to physical completion.
         if (!task_sizes_.empty()) return;
@@ -1518,6 +1766,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
             auto result = getStatus(batch_id_, task_id, status);
             if (!result.ok()) {
                 requestAbort(result);
+                if (finishDrainedLegacyFailure(result)) return;
                 continue;
             }
 
@@ -1558,7 +1807,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 fragment_status =
                     Status::Socket("scatter transfer fragment timed out");
                 requestAbort(fragment_status);
-                if (!useTent()) continue;
+                if (!useTent()) {
+                    if (finishDrainedLegacyFailure(fragment_status)) return;
+                    continue;
+                }
             } else {
                 fragment_status =
                     Status::Socket("scatter transfer fragment failed");
@@ -1572,14 +1824,17 @@ class TransferEngine::ScatterTransferOperation::Impl {
 
         if (remaining_ != 0) return;
         auto free_status = freeBatch(batch_id_);
-        if (free_status.IsBatchBusy()) return;
-        remember(free_status);
+        if (!free_status.ok() && !free_status.IsBatchCleanupDeferred())
+            remember(free_status);
         batch_id_ = INVALID_BATCH_ID;
         finish();
     }
 
     Backend backend_;
     std::vector<TransferRequest> requests_;
+#ifdef USE_TENT
+    std::vector<tent::Request> tent_requests_;
+#endif
     std::vector<std::pair<size_t, size_t>> request_fragments_;
     std::vector<std::function<void(size_t, const Status&)>> callbacks_;
     std::unordered_map<std::string, SegmentHandle> segment_handles_;
@@ -1589,6 +1844,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
     size_t remaining_ = 0;
     Status aggregate_status_;
     bool abort_requested_ = false;
+    // A failed submit with zero slices is unpublished because the Transport
+    // contract forbids publishing slices after submitTransferTask() returns.
+    bool legacy_submit_failed_ = false;
     bool completed_ = false;
 };
 
