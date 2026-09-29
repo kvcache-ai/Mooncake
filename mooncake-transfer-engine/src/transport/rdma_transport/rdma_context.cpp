@@ -584,8 +584,16 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // resulting dma_buf, and ibv_reg_dmabuf_mr() below then fails with
         // EINVAL for every buffer larger than one chunk (Mooncake#2511).
         //
-        // When the reported allocation does not cover the range the caller is
-        // about to register, export exactly [addr, addr + length) instead.
+        // The opposite case matters too: when the allocation is LARGER than
+        // the range being registered (a sub-range of one big cudaMalloc, e.g.
+        // each pre-touch block of a KV cache in preTouchMemory(), or several
+        // buffers carved out of one allocation), exporting the whole
+        // allocation makes every ibv_reg_dmabuf_mr() import map the full
+        // allocation through BAR1. N concurrent imports of an N-way split then
+        // exhaust BAR1 and fail with ENOMEM, notably on MIG instances.
+        //
+        // So whenever the reported allocation is not exactly the range the
+        // caller is about to register, export exactly [addr, addr + length).
         // cuMemGetHandleForAddressRange() accepts a range spanning several
         // mappings as long as they are contiguously mapped, which is precisely
         // the expandable-segment layout. The export base is page-aligned so
@@ -594,7 +602,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         CUdeviceptr exportBase = allocBase;
         size_t exportSize = allocSize;
         uint64_t exportOffset = (uintptr_t)addr - (uintptr_t)allocBase;
-        if (exportOffset + length > allocSize) {
+        if (length > 0 && (exportOffset != 0 || length != allocSize)) {
             const size_t page = (size_t)sysconf(_SC_PAGESIZE);
             uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
             if (aligned < (uintptr_t)allocBase) aligned = (uintptr_t)allocBase;
@@ -604,12 +612,13 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
                 (exportOffset + length + page - 1) & ~(size_t)(page - 1);
             VLOG(1) << "dma_buf: reported allocation for " << (uintptr_t)addr
                     << " (base=" << (uintptr_t)allocBase
-                    << " size=" << allocSize << ") does not cover length "
-                    << length << "; exporting the requested range instead"
-                    << " (base=" << (uintptr_t)exportBase
-                    << " size=" << exportSize
+                    << " size=" << allocSize << ") differs from the " << length
+                    << "-byte range being registered; exporting"
+                    << " the requested range instead (base="
+                    << (uintptr_t)exportBase << " size=" << exportSize
                     << "). Expected for CUDA VMM allocations such as PyTorch"
-                       " expandable_segments.";
+                       " expandable_segments, and for sub-ranges of a larger"
+                       " allocation.";
         }
 
         // Without Data Direct, flags must be 0: the PCIE-BAR1 mapping flag is

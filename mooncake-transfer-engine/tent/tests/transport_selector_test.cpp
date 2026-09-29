@@ -290,7 +290,8 @@ TEST(TransportTypeTest, WireValuesRemainStableWithXpuAppended) {
     EXPECT_EQ(static_cast<int>(MPCOMM), 12);
     EXPECT_EQ(static_cast<int>(HP_TCP), 13);
     EXPECT_EQ(static_cast<int>(XPU), 14);
-    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 15);
+    EXPECT_EQ(static_cast<int>(HYLINK), 15);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 16);
 }
 
 // MPComm is appended after UB, so it takes wire value 12. The same integer is
@@ -873,6 +874,54 @@ TEST(TransportSelectorTest, NvLinkAvailableSameMachine) {
     auto result = selector.select(ctx, transports);
     EXPECT_EQ(result.transport, NVLINK)
         << "NVLINK should be available for same-machine transfers";
+}
+
+TEST(TransportSelectorTest, HylinkAvailableSameMachine) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[HYLINK] = std::make_shared<FakeTransport>(HYLINK);
+    auto* hylink = static_cast<FakeTransport*>(transports[HYLINK].get());
+    hylink->setGpuToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {HYLINK};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_memory_type = MTYPE_CUDA;
+    ctx.remote_memory_type = MTYPE_CUDA;
+    ctx.buffer_transports = &buffer_transports;
+
+    auto result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, HYLINK)
+        << "HYLINK should carry same-machine DCU traffic over HIP IPC";
+}
+
+TEST(TransportSelectorTest, HylinkAvailableCrossMachine) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[HYLINK] = std::make_shared<FakeTransport>(HYLINK);
+    auto* hylink = static_cast<FakeTransport*>(transports[HYLINK].get());
+    hylink->setGpuToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {HYLINK};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CUDA;
+    ctx.remote_memory_type = MTYPE_CUDA;
+    ctx.buffer_transports = &buffer_transports;
+
+    auto result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, HYLINK)
+        << "HYLINK should stay selectable across machines for DTK fabric";
 }
 
 // ---------------------------------------------------------------------------

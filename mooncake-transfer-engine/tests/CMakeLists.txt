@@ -231,6 +231,16 @@ add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
+if(USE_CUDA AND NOT USE_HIP)
+  # GPU sub-range export test (skipped at runtime without a CUDA device).
+  # WITH_NVIDIA_PEERMEM defaults to true, which selects ibv_reg_mr instead of
+  # the DMA-BUF export under test.
+  target_include_directories(dmabuf_export_test
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(dmabuf_export_test PUBLIC CUDA::cudart)
+  set_tests_properties(dmabuf_export_test PROPERTIES ENVIRONMENT
+                                                     "WITH_NVIDIA_PEERMEM=0")
+endif()
 
 if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
@@ -442,6 +452,12 @@ add_executable(rdma_context_reprobe_test
 target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
+
+add_executable(rdma_memory_location_test
+               ${WORKSPACE}/rdma_memory_location_test.cpp)
+target_link_libraries(rdma_memory_location_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+add_test(NAME rdma_memory_location_test COMMAND rdma_memory_location_test)
 
 add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)

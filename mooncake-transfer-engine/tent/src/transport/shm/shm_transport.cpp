@@ -162,10 +162,14 @@ Status ShmTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status ShmTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
-    if (options.shm_path.empty())
-        return Status::OK();  // Return silently but not regard it as valid
-                              // buffer for shared memory transport
     desc.shm_path = options.shm_path;
+    if (desc.shm_path.empty()) {
+        // The basic allocation API cannot return MemoryOptions to the caller.
+        std::lock_guard<std::mutex> lock(shm_path_mutex_);
+        auto it = shm_path_map_.find(reinterpret_cast<void *>(desc.addr));
+        if (it == shm_path_map_.end()) return Status::OK();
+        desc.shm_path = it->second;
+    }
     desc.transports.push_back(TransportType::SHM);
     // desc.shm_offset = options.shm_offset;
     LOG(INFO) << "Registered shared memory: " << (void *)desc.addr << "--"

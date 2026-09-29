@@ -910,6 +910,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[GDS]) result.push_back(GDS);
     if (transport_list_[MPCOMM]) result.push_back(MPCOMM);
     if (transport_list_[TPU]) result.push_back(TPU);
+    if (transport_list_[HYLINK]) result.push_back(HYLINK);
     return result;
 }
 

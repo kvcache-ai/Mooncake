@@ -161,6 +161,13 @@ starting Mooncake to use DMA-BUF. Set `WITH_NVIDIA_PEERMEM=1` to use the legacy
 `ibv_reg_mr` path, which requires `nvidia-peermem`. See Section 3.7 of
 https://docs.nvidia.com/cuda/gpudirect-rdma/ for `nvidia-peermem` installation
 instructions.
+
+When `WITH_NVIDIA_PEERMEM` is **unset**, Mooncake uses the legacy `ibv_reg_mr`
+path. On hosts without `nvidia-peermem` (for example the NVIDIA open kernel
+modules with the inbox RDMA stack and no MLNX_OFED), GPU memory registration
+then fails with `Failed to register memory 0x...: Bad address [14]`; set
+`WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA open kernel modules and
+Linux 5.12 or later.
 ```
 
 ## Use Mooncake in Docker Containers
