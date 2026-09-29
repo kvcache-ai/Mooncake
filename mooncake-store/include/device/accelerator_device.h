@@ -15,6 +15,7 @@ enum class AcceleratorVendor {
     kMaca,
     kHygon,
     kCorex,
+    kSupa,
     kHip,
     kAscend,
     kSunrise,
