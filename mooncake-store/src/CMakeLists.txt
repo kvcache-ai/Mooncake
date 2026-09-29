@@ -642,7 +642,6 @@ if(MOONCAKE_ENABLE_OTEL_TRACING)
     target_link_libraries(
       mooncake_store_master PRIVATE opentelemetry-cpp::otlp_grpc_client)
   endif()
-  endif()
 endif()
 
 # Complete public Store library.
