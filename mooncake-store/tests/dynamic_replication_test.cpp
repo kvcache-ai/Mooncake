@@ -263,7 +263,7 @@ class DynamicReplicationTest : public ::testing::Test {
             return;
         }
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            *tenant_handle,
+            *tenant_handle, TenantId::Default(),
             std::chrono::system_clock::now() + std::chrono::seconds(1));
     }
 

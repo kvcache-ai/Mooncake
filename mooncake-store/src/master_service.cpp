@@ -10921,9 +10921,10 @@ void MasterService::EvictionThreadFunc() {
                 std::shared_lock<std::shared_mutex> shared_lock(
                     snapshot_mutex_);
                 tenants_.Visit(
-                    [&](const TenantId&,
+                    [&](const TenantId& tenant_id,
                         const std::shared_ptr<metadata::Tenant>& tenant) {
-                        DiscardExpiredProcessingReplicas(*tenant, now);
+                        DiscardExpiredProcessingReplicas(*tenant, tenant_id,
+                                                         now);
                     });
                 ReleaseExpiredDiscardedReplicas(now);
             }
@@ -11310,21 +11311,11 @@ void MasterService::DiscardExpiredInFlightState(
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
-    metadata::Tenant& tenant,
+    metadata::Tenant& tenant, const TenantId& tenant_id,
     const std::chrono::system_clock::time_point& now) {
     // The snapshot walks every object of the tenant once; the discard below
     // reads an object under its own lock only when it has something in flight.
     const auto entries = tenant.SnapshotObjects();
-
-    // The handle does not carry the tenant id, and the bookkeeping a removal
-    // feeds is keyed by it, so the id is read from the first object.
-    TenantId tenant_id = TenantId::Default();
-    if (!entries.empty()) {
-        entries.front()->WithSharedAccess(
-            [&](const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                tenant_id = metadata.tenant_id;
-            });
-    }
 
     DiscardExpiredInFlightState(tenant, tenant_id, entries, 0, entries.size(),
                                 now);
@@ -12934,11 +12925,11 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     // Count every object first: the target is a share of the whole population.
     // Discarding expired processing replicas before the count keeps the count
     // and the eviction pass on the same population.
-    tenants_.Visit(
-        [&](const TenantId&, const std::shared_ptr<metadata::Tenant>& tenant) {
-            DiscardExpiredProcessingReplicas(*tenant, now);
-            object_count += static_cast<long>(tenant->ObjectCount());
-        });
+    tenants_.Visit([&](const TenantId& tenant_id,
+                       const std::shared_ptr<metadata::Tenant>& tenant) {
+        DiscardExpiredProcessingReplicas(*tenant, tenant_id, now);
+        object_count += static_cast<long>(tenant->ObjectCount());
+    });
     const long ideal_evict_num =
         static_cast<long>(std::ceil(object_count * evict_ratio_target));
 

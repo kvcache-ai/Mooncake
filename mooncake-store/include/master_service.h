@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -40,7 +41,6 @@
 #include "metadata/tenant_registry.h"
 #include "mutex.h"
 #include "object_entry.h"
-#include "object_index.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
@@ -1559,10 +1559,12 @@ class MasterService {
     TenantQuotaHandle BoundTenantQuotaHandle(const TenantId& tenant_id);
 
     /**
-     * @brief Helper to discard this tenant's expired processing replicas.
+     * @brief Helper to discard one tenant's expired processing replicas. The
+     * tenant id travels with the tenant: the bookkeeping a removal feeds is
+     * keyed by it, and the handles the route holds do not carry it.
      */
     void DiscardExpiredProcessingReplicas(
-        metadata::Tenant& tenant,
+        metadata::Tenant& tenant, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now);
     /**
      * @brief Settles the expired in-flight state of `objects[begin, end)`: the
@@ -1863,7 +1865,6 @@ class MasterService {
     // How many candidates the last round examined, so the work a round did is
     // readable from outside it.
     std::atomic<size_t> promotion_retry_last_scanned_{0};
-    static constexpr size_t kPromotionRetryShardBatch = 64;
     static constexpr std::chrono::milliseconds kPromotionCandidateTtl{300000};
     static constexpr std::chrono::milliseconds
         kPromotionCandidateInitialBackoff{10};

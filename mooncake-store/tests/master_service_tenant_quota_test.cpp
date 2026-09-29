@@ -396,7 +396,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id);
         ASSERT_NE(tenant, nullptr);
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            *tenant, std::chrono::system_clock::time_point::max());
+            *tenant, tenant_id, std::chrono::system_clock::time_point::max());
     }
 
     // Runs the durable processing cleanup the sweep arms for this publication's
