@@ -1565,13 +1565,6 @@ class MasterService {
         metadata::Tenant& tenant,
         const std::chrono::system_clock::time_point& now);
     /**
-     * @brief Whether one object carries state the discard has work for: an
-     * in-flight write round, a replication task, an offload task or a promotion
-     * task. Read under the entry's own shared lock.
-     */
-    [[nodiscard]] bool HasInFlightState(
-        const std::shared_ptr<ObjectEntry>& entry) const;
-    /**
      * @brief Settles the expired in-flight state of `objects[begin, end)`: the
      * processing replicas of a write round past its release deadline, a
      * replication task past its deadline, and expired offload and promotion
@@ -1676,23 +1669,6 @@ class MasterService {
     std::chrono::milliseconds CandidateBackoff(uint32_t retry_count) const;
     bool IsTransientResult(PromotionQueueResult result) const;
     size_t RunPromotionCandidateRetry();
-
-    // Erase any in-flight PromotionTask for `key`, refund its pending charge,
-    // and decrement the cluster-wide in-flight counter. Safe no-op if no task
-    // exists. Takes the entry's own lock; callers that already hold it must use
-    // ErasePromotionTaskLocked instead.
-    void ErasePromotionTaskIfPresent(metadata::Tenant& tenant,
-                                     const std::string& key)
-        NO_THREAD_SAFETY_ANALYSIS {
-        const auto entry = tenant.Get(key);
-        if (entry == nullptr) {
-            return;
-        }
-        entry->WithExclusiveAccess(
-            [&](ObjectMetadata&, ObjectEntry::State& state) {
-                ErasePromotionTaskLocked(tenant, state);
-            });
-    }
 
     // The erase under a lock the caller already holds.
     void ErasePromotionTaskLocked(metadata::Tenant& tenant,

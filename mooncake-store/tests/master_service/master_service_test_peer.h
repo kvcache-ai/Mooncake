@@ -806,42 +806,6 @@ class MasterServiceTestPeer {
             });
     }
 
-    // Walks every object every tenant routes, running
-    // `fn(tenant_id, entry, metadata, state)` under that entry's own shared
-    // lock. Entries are locked one at a time over a snapshot taken up front, so
-    // the walk never holds two locks and visits what it snapshotted.
-    template <typename Fn>
-    static void ForEachObjectForTesting(MasterService& service, Fn&& fn) {
-        service.tenants_.Visit(
-            [&](const TenantId& tenant_id,
-                const std::shared_ptr<metadata::Tenant>& tenant) {
-                for (const auto& entry : tenant->SnapshotObjects()) {
-                    entry->WithSharedAccess(
-                        [&](const ObjectMetadata& metadata,
-                            const ObjectEntry::State& state) {
-                            fn(tenant_id, entry, metadata, state);
-                        });
-                }
-            });
-    }
-
-    // The same walk under each entry's own exclusive lock, for a callback that
-    // mutates what it visits.
-    template <typename Fn>
-    static void ForEachObjectForWriteForTesting(MasterService& service,
-                                                Fn&& fn) {
-        service.tenants_.Visit(
-            [&](const TenantId& tenant_id,
-                const std::shared_ptr<metadata::Tenant>& tenant) {
-                for (const auto& entry : tenant->SnapshotObjects()) {
-                    entry->WithExclusiveAccess([&](ObjectMetadata& metadata,
-                                                   ObjectEntry::State& state) {
-                        fn(tenant_id, entry, metadata, state);
-                    });
-                }
-            });
-    }
-
    private:
     // The tenant `tenant_id` names, resolved the way the service resolves a
     // request tenant, or null when no tenant is registered for it.

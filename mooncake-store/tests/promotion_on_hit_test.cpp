@@ -3354,6 +3354,9 @@ TEST_F(PromotionOnHitTest, RetryCandidate_SliceResumesThroughTheIndex) {
     config.default_kv_lease_ttl = 2000;
     config.eviction_high_watermark_ratio = 0.0;
     auto service = std::make_unique<MasterService>(config);
+    // The slices this test checks are taken from the index a background pass
+    // would also advance, so that pass is stopped before anything is injected.
+    QuiesceEvictionWorker(*service);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg =

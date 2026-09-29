@@ -10981,18 +10981,6 @@ void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_stopped";
 }
 
-bool MasterService::HasInFlightState(
-    const std::shared_ptr<ObjectEntry>& entry) const {
-    bool in_flight = false;
-    entry->WithSharedAccess([&](const ObjectMetadata&,
-                                const ObjectEntry::State& state) {
-        in_flight = state.is_processing || state.replication_task.has_value() ||
-                    state.offloading_task.has_value() ||
-                    state.promotion_task.has_value();
-    });
-    return in_flight;
-}
-
 void MasterService::DiscardExpiredInFlightState(
     metadata::Tenant& tenant, const TenantId& tenant_id,
     const std::vector<std::shared_ptr<ObjectEntry>>& objects, size_t begin,
@@ -11003,7 +10991,15 @@ void MasterService::DiscardExpiredInFlightState(
     std::vector<std::shared_ptr<ObjectEntry>> in_flight;
     in_flight.reserve(end - begin);
     for (size_t i = begin; i < end; ++i) {
-        if (HasInFlightState(objects[i])) {
+        bool in_flight_state = false;
+        objects[i]->WithSharedAccess(
+            [&](const ObjectMetadata&, const ObjectEntry::State& state) {
+                in_flight_state = state.is_processing ||
+                                  state.replication_task.has_value() ||
+                                  state.offloading_task.has_value() ||
+                                  state.promotion_task.has_value();
+            });
+        if (in_flight_state) {
             in_flight.push_back(objects[i]);
         }
     }
@@ -12384,21 +12380,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::vector<std::shared_ptr<ObjectEntry>> objects;
     };
     // The handles are strong, so a tenant created or removed while the census
-    // runs leaves no dangling tenant.
+    // runs leaves no dangling tenant. `Visit` runs its callback after it has
+    // released the registry lock, so each snapshot is taken from the callback.
     std::vector<TenantCensus> census_inputs;
-    {
-        std::vector<std::pair<TenantId, std::shared_ptr<metadata::Tenant>>>
-            handles;
-        tenants_.Visit([&](const TenantId& tenant_id,
-                           const std::shared_ptr<metadata::Tenant>& tenant) {
-            handles.emplace_back(tenant_id, tenant);
-        });
-        census_inputs.reserve(handles.size());
-        for (auto& handle : handles) {
-            census_inputs.push_back(TenantCensus{
-                handle.first, handle.second, handle.second->SnapshotObjects()});
-        }
-    }
+    tenants_.Visit([&](const TenantId& tenant_id,
+                       const std::shared_ptr<metadata::Tenant>& tenant) {
+        census_inputs.push_back(
+            TenantCensus{tenant_id, tenant, tenant->SnapshotObjects()});
+    });
 
     struct CensusUnit {
         size_t tenant_index;
@@ -12408,10 +12397,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
     constexpr size_t kCensusChunkObjects = 4096;
     constexpr size_t kMaxCensusThreads = 16;
     std::vector<CensusUnit> units;
+    // Diagnostic population of this pass: what the snapshots hold, so this
+    // count and the eviction base counted from the same snapshots agree. A
+    // route that gains or loses objects while the census runs is seen at the
+    // snapshot of its own tenant, and its change shows in the next pass.
     long object_count = 0;
     for (size_t i = 0; i < census_inputs.size(); ++i) {
         const auto& input = census_inputs[i];
-        object_count += static_cast<long>(input.tenant->ObjectCount());
+        object_count += static_cast<long>(input.objects.size());
         for (size_t begin = 0; begin < input.objects.size();
              begin += kCensusChunkObjects) {
             units.push_back(CensusUnit{
