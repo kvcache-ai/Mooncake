@@ -520,7 +520,8 @@ while snapshot metadata is reconciled. A standalone snapshot prunes stale DFS
 replicas (and objects left without a valid replica). Allocator-only active
 records are quarantined from barrier-open for the maximum of the deferred-free
 duration, read lease, and Put-start release timeout. Recovered pending frees
-receive a fresh deferred-free interval. Capacity pressure never shortens either
+wait from barrier-open for the longer of the deferred-free interval and read
+lease. Capacity pressure never shortens either
 safety window. HA, OpLog recovery, and standby promotion are intentionally out
 of scope and cannot be enabled with descriptor-based DFS.
 

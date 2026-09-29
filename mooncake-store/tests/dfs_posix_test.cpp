@@ -531,6 +531,32 @@ TEST(ShardAllocatorRecoveryTest, ActiveOrphanUsesDedicatedQuarantineDuration) {
     EXPECT_EQ(replacement.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
+TEST(ShardAllocatorRecoveryTest, PendingFreeRetainsReadLeaseAfterRestart) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_recover_pending_read_lease");
+    auto config = MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096);
+    config.deferred_free_duration = std::chrono::seconds(0);
+    {
+        ShardAllocator allocator;
+        ASSERT_TRUE(allocator.Init(config));
+        auto descriptor = allocator.Allocate("released", 100);
+        ASSERT_TRUE(descriptor.has_value());
+        allocator.Free("released", *descriptor);
+        ASSERT_TRUE(allocator.Checkpoint().has_value());
+    }
+
+    ShardAllocator recovered;
+    ASSERT_TRUE(recovered.Init(config, true));
+    ASSERT_TRUE(recovered.CompleteRecovery({}, std::chrono::seconds(60),
+                                           std::chrono::seconds(60))
+                    .has_value());
+    ASSERT_TRUE(recovered.RunMaintenance().has_value());
+    auto replacement = recovered.Allocate("replacement", 100);
+    ASSERT_FALSE(replacement);
+    EXPECT_EQ(replacement.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
 TEST(ShardAllocatorRecoveryTest, CorruptCheckpointFailsClosed) {
     EnvGuard env;
     ConfigurePosixDfs(env);

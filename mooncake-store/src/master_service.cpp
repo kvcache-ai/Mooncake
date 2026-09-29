@@ -304,7 +304,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
         RestoreState();
     } else if (shard_allocator_) {
         auto recovered = shard_allocator_->CompleteRecovery(
-            {}, DfsRecoveryOrphanQuarantineDuration());
+            {}, DfsRecoveryOrphanQuarantineDuration(),
+            DfsRecoveryReadLeaseDuration());
         if (!recovered) {
             throw std::runtime_error("failed to complete empty DFS recovery");
         }
@@ -10908,7 +10909,8 @@ void MasterService::RestoreState() {
     const auto complete_empty_dfs_recovery = [this]() {
         if (!shard_allocator_ || shard_allocator_->IsRecoveryReady()) return;
         auto result = shard_allocator_->CompleteRecovery(
-            {}, DfsRecoveryOrphanQuarantineDuration());
+            {}, DfsRecoveryOrphanQuarantineDuration(),
+            DfsRecoveryReadLeaseDuration());
         if (!result) {
             throw std::runtime_error(
                 "failed to complete empty DFS allocator recovery");
@@ -11019,6 +11021,37 @@ MasterService::ReconcileDfsMetadataAfterSnapshot() {
     if (!shard_allocator_ || shard_allocator_->IsRecoveryReady()) return {};
 
     std::vector<ShardAllocator::RecoveryReference> references;
+    // Validate the complete candidate before pruning any replica. A stale
+    // descriptor can be removed, but malformed extent metadata is not evidence
+    // of snapshot staleness and must fail recovery closed.
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (const auto& tenant_entry : shard->tenants) {
+            for (const auto& metadata_entry : tenant_entry.second.metadata) {
+                const auto& metadata = metadata_entry.second;
+                for (const auto& replica : metadata.GetAllReplicas()) {
+                    if (!replica.is_dfs_replica()) continue;
+                    const auto& descriptor = replica.get_dfs_descriptor();
+                    const auto match = shard_allocator_->ClassifyRecoveryReference(
+                        metadata.user_key, descriptor);
+                    if (match == ShardAllocator::RecoveryMatch::kInvalid) {
+                        LOG(ERROR) << "Invalid DFS snapshot extent, key="
+                                   << metadata.user_key << ", shard="
+                                   << descriptor.shard_idx << ", offset="
+                                   << descriptor.offset;
+                        return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+                    }
+                    if (match == ShardAllocator::RecoveryMatch::kMatch &&
+                        replica.is_completed()) {
+                        references.push_back({metadata.user_key, descriptor});
+                    }
+                }
+            }
+        }
+    }
+    auto validated = shard_allocator_->ValidateRecoveryReferences(references);
+    if (!validated) return validated;
+
     size_t pruned_replicas = 0;
     size_t pruned_objects = 0;
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
@@ -11032,11 +11065,10 @@ MasterService::ReconcileDfsMetadataAfterSnapshot() {
                 auto invalid = PopReplicasWithCacheTotalAccounting(
                     metadata, [this, &metadata](const Replica& replica) {
                         if (!replica.is_dfs_replica()) return false;
-                        return !shard_allocator_
-                                    ->ValidateAllocation(
-                                        metadata.user_key,
-                                        replica.get_dfs_descriptor())
-                                    .has_value();
+                        return shard_allocator_->ClassifyRecoveryReference(
+                                   metadata.user_key,
+                                   replica.get_dfs_descriptor()) ==
+                               ShardAllocator::RecoveryMatch::kStale;
                     });
                 if (!invalid.empty()) {
                     pruned_replicas += invalid.size();
@@ -11060,12 +11092,6 @@ MasterService::ReconcileDfsMetadataAfterSnapshot() {
                                                 QuotaEraseMode::kFull, &shard);
                     continue;
                 }
-                for (const auto& replica : metadata.GetAllReplicas()) {
-                    if (replica.is_dfs_replica() && replica.is_completed()) {
-                        references.push_back(
-                            {metadata.user_key, replica.get_dfs_descriptor()});
-                    }
-                }
                 ++metadata_it;
             }
             if (tenant_state.Empty()) {
@@ -11077,7 +11103,8 @@ MasterService::ReconcileDfsMetadataAfterSnapshot() {
     }
 
     auto completed = shard_allocator_->CompleteRecovery(
-        references, DfsRecoveryOrphanQuarantineDuration());
+        references, DfsRecoveryOrphanQuarantineDuration(),
+        DfsRecoveryReadLeaseDuration());
     if (!completed) return tl::make_unexpected(completed.error());
     LOG(INFO) << "DFS snapshot reconciliation completed, live_replicas="
               << references.size() << ", pruned_replicas=" << pruned_replicas
@@ -11085,12 +11112,16 @@ MasterService::ReconcileDfsMetadataAfterSnapshot() {
     return {};
 }
 
-std::chrono::seconds MasterService::DfsRecoveryOrphanQuarantineDuration()
-    const {
-    const auto read_lease = std::chrono::duration_cast<std::chrono::seconds>(
+std::chrono::seconds MasterService::DfsRecoveryReadLeaseDuration() const {
+    return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::milliseconds(default_kv_lease_ttl_) +
         std::chrono::milliseconds(999));
-    return std::max(put_start_release_timeout_sec_, read_lease);
+}
+
+std::chrono::seconds MasterService::DfsRecoveryOrphanQuarantineDuration()
+    const {
+    return std::max(put_start_release_timeout_sec_,
+                    DfsRecoveryReadLeaseDuration());
 }
 
 void MasterService::ResetStateAfterFailedRestoreAttempt() {

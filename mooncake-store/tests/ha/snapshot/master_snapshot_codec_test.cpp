@@ -531,6 +531,36 @@ TEST_F(MasterSnapshotCodecTest, ReconciliationPrunesStaleDfsReplica) {
     std::filesystem::remove_all(root);
 }
 
+TEST_F(MasterSnapshotCodecTest, ReconciliationRejectsMalformedDfsExtent) {
+    const std::string root =
+        (std::filesystem::temp_directory_path() /
+         ("snapshot_dfs_invalid_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+
+    const std::string key = "snapshot-dfs-invalid";
+    auto descriptor =
+        InstallRecoveringDfsAllocator(*master_service_, root, key);
+    const std::string stale_key = "snapshot-dfs-stale-before-invalid";
+    SeedDfsReplica(*master_service_, stale_key, descriptor);
+    ++descriptor.offset;
+    SeedDfsReplica(*master_service_, key, descriptor);
+
+    auto reconciled = ReconcileDfsSnapshot(*master_service_);
+    ASSERT_FALSE(reconciled.has_value());
+    EXPECT_EQ(reconciled.error(), ErrorCode::INVALID_REPLICA);
+    EXPECT_FALSE(IsDfsRecoveryReady(*master_service_));
+    EXPECT_TRUE(
+        master_service_->GetReplicaList(key, TenantId::Default()).has_value());
+    EXPECT_TRUE(master_service_
+                    ->GetReplicaList(stale_key, TenantId::Default())
+                    .has_value());
+
+    master_service_.reset();
+    std::filesystem::remove_all(root);
+}
+
 TEST_F(MasterSnapshotCodecTest, ReconciliationRetainsMatchingDfsReplica) {
     const std::string root =
         (std::filesystem::temp_directory_path() /

@@ -1128,6 +1128,13 @@ void ShardAllocator::UpdateAccess(const std::string& key, int shard_idx,
 
 tl::expected<void, ErrorCode> ShardAllocator::ValidateAllocation(
     const std::string& key, const DistributedFSDescriptor& descriptor) const {
+    if (ClassifyRecoveryReference(key, descriptor) == RecoveryMatch::kMatch)
+        return {};
+    return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+}
+
+ShardAllocator::RecoveryMatch ShardAllocator::ClassifyRecoveryReference(
+    const std::string& key, const DistributedFSDescriptor& descriptor) const {
     const auto shards =
         std::atomic_load_explicit(&shards_, std::memory_order_acquire);
     if (!initialized_.load(std::memory_order_acquire) || key.empty() ||
@@ -1136,49 +1143,63 @@ tl::expected<void, ErrorCode> ShardAllocator::ValidateAllocation(
         descriptor.object_size == 0 ||
         descriptor.object_size >
             std::numeric_limits<uint64_t>::max() - (alignment_ - 1) ||
-        descriptor.file_path !=
-            ShardDataPath(*(*shards)[descriptor.shard_idx]) ||
         descriptor.offset % alignment_ != 0 ||
         descriptor.aligned_size != AlignSize(descriptor.object_size)) {
-        return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        return RecoveryMatch::kInvalid;
     }
     const auto& shard = *(*shards)[descriptor.shard_idx];
     if (descriptor.offset > shard.capacity ||
         descriptor.aligned_size > shard.capacity - descriptor.offset) {
-        return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        return RecoveryMatch::kInvalid;
     }
+    if (descriptor.file_path != ShardDataPath(shard))
+        return RecoveryMatch::kStale;
     std::lock_guard lock(shard.mutex);
     auto it = shard.offset_to_handle.find(descriptor.offset);
     if (it == shard.offset_to_handle.end() || it->second.key != key ||
         it->second.object_size != descriptor.object_size ||
         it->second.aligned_size != descriptor.aligned_size ||
         it->second.allocation_id != descriptor.GetAllocationId()) {
-        return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        return RecoveryMatch::kStale;
+    }
+    return RecoveryMatch::kMatch;
+}
+
+tl::expected<void, ErrorCode> ShardAllocator::ValidateRecoveryReferences(
+    const std::vector<RecoveryReference>& references) const {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    std::set<std::pair<int, uint64_t>> claimed;
+    for (const auto& reference : references) {
+        if (ClassifyRecoveryReference(reference.key, reference.descriptor) !=
+                RecoveryMatch::kMatch ||
+            !claimed.emplace(reference.descriptor.shard_idx,
+                             reference.descriptor.offset)
+                 .second) {
+            return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        }
     }
     return {};
 }
 
 tl::expected<void, ErrorCode> ShardAllocator::CompleteRecovery(
     const std::vector<RecoveryReference>& references,
-    std::chrono::seconds active_orphan_quarantine) {
+    std::chrono::seconds active_orphan_quarantine,
+    std::chrono::seconds read_lease) {
     const auto shards =
         std::atomic_load_explicit(&shards_, std::memory_order_acquire);
-    if (!initialized_.load(std::memory_order_acquire)) {
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    }
+    auto validated = ValidateRecoveryReferences(references);
+    if (!validated) return validated;
     std::set<std::pair<int, uint64_t>> claimed;
     for (const auto& reference : references) {
-        auto valid = ValidateAllocation(reference.key, reference.descriptor);
-        if (!valid || !claimed
-                           .emplace(reference.descriptor.shard_idx,
-                                    reference.descriptor.offset)
-                           .second) {
-            return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
-        }
+        claimed.emplace(reference.descriptor.shard_idx,
+                        reference.descriptor.offset);
     }
 
     const auto barrier_open = std::chrono::steady_clock::now();
-    const auto pending_free_at = barrier_open + deferred_free_duration_;
+    const auto pending_free_at =
+        barrier_open + std::max(deferred_free_duration_, read_lease);
     const auto orphan_free_at =
         barrier_open +
         std::max(deferred_free_duration_, active_orphan_quarantine);

@@ -1541,6 +1541,7 @@ class MasterService {
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     tl::expected<void, ErrorCode> ReconcileDfsMetadataAfterSnapshot();
+    std::chrono::seconds DfsRecoveryReadLeaseDuration() const;
     std::chrono::seconds DfsRecoveryOrphanQuarantineDuration() const;
     void RunDfsEviction();
     void RunShardDfsEviction();

@@ -36,6 +36,8 @@ class ShardAllocator final : public DfsAllocatorInterface {
         DistributedFSDescriptor descriptor;
     };
 
+    enum class RecoveryMatch { kMatch, kStale, kInvalid };
+
     // Keeps selected allocations pinned while the master decides which
     // candidates can be evicted. An unresolved transaction is aborted on
     // destruction so candidates cannot get stuck outside the LRU.
@@ -111,10 +113,16 @@ class ShardAllocator final : public DfsAllocatorInterface {
     tl::expected<void, ErrorCode> ValidateAllocation(
         const std::string& key,
         const DistributedFSDescriptor& descriptor) const;
+    RecoveryMatch ClassifyRecoveryReference(
+        const std::string& key,
+        const DistributedFSDescriptor& descriptor) const;
+    tl::expected<void, ErrorCode> ValidateRecoveryReferences(
+        const std::vector<RecoveryReference>& references) const;
     tl::expected<void, ErrorCode> CompleteRecovery(
         const std::vector<RecoveryReference>& references,
         std::chrono::seconds active_orphan_quarantine =
-            std::chrono::seconds::zero());
+            std::chrono::seconds::zero(),
+        std::chrono::seconds read_lease = std::chrono::seconds::zero());
     tl::expected<void, ErrorCode> RunMaintenance();
     tl::expected<void, ErrorCode> Checkpoint();
 
