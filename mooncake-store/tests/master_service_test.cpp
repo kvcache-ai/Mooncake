@@ -1429,6 +1429,100 @@ TEST_F(MasterServiceTest, SnapshotDecodeReplacesPublishedMetadata) {
     EXPECT_EQ(RegisteredTenantCount(service), 0u);
 }
 
+// Decoding a snapshot wires what the payload carries: the group membership of
+// every member, one shared lease per group, a same-named group in another
+// tenant kept apart, and no replica-action state inherited from before the
+// decode.
+TEST_F(MasterServiceTest, SnapshotDecodeWiresGroupsAndDropsActionState) {
+    const TenantId tenant_a("tenant_decode_groups_a");
+    const TenantId tenant_b("tenant_decode_groups_b");
+    const std::string group_id = "decode-shared-group";
+    const std::string key_a = "decode_group_a1";
+    const std::string key_a2 = "decode_group_a2";
+    const std::string key_b = "decode_group_b1";
+
+    MasterService service(
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+    PutCompletedObject(service, context.client_id, key_a, tenant_a, config);
+    PutCompletedObject(service, context.client_id, key_a2, tenant_a, config);
+    PutCompletedObject(service, context.client_id, key_b, tenant_b, config);
+
+    ASSERT_EQ(
+        GetGroupMemberKeysForTest(service, group_id, tenant_a.value()).size(),
+        2u);
+    ASSERT_EQ(
+        GetGroupMemberKeysForTest(service, group_id, tenant_b.value()).size(),
+        1u);
+    const auto lease_before =
+        GetGroupLeaseForTest(service, group_id, tenant_a.value());
+    ASSERT_NE(lease_before, nullptr);
+
+    // Replica-action state the decode must not inherit.
+    const auto publication = MasterServiceTestPeer::FindObject(
+        service, MasterServiceTestPeer::ObjectIdentity{tenant_a, key_a});
+    ASSERT_NE(publication, nullptr);
+    const UUID proposal_id = generate_uuid();
+    ReplicaActionLease lease;
+    lease.proposal_id = proposal_id;
+    lease.lease_id = proposal_id;
+    lease.tenant_id = tenant_a.value();
+    lease.key = key_a;
+    lease.expire_at_ms_epoch =
+        MasterServiceTestPeer::DynamicReplicationNowMs() + 3600000;
+    MasterServiceTestPeer(service).PutDynamicReplicationLeaseForTesting(
+        tenant_a, publication, proposal_id, lease);
+
+    std::vector<uint8_t> payload;
+    {
+        MasterServiceTestPeer::MetadataSerializer serializer(&service);
+        auto encoded = serializer.Serialize();
+        ASSERT_TRUE(encoded.has_value());
+        payload = std::move(*encoded);
+    }
+
+    MasterServiceTestPeer::MetadataSerializer reader(&service);
+    ASSERT_TRUE(reader.Deserialize(payload).has_value());
+
+    // Membership is rewired per tenant from the payload, and a group with the
+    // same id in another tenant stays that tenant's own.
+    EXPECT_EQ(
+        GetGroupMemberKeysForTest(service, group_id, tenant_a.value()).size(),
+        2u);
+    EXPECT_EQ(
+        GetGroupMemberKeysForTest(service, group_id, tenant_b.value()).size(),
+        1u);
+    // Every member of one group shares the lease the decode wired, and a group
+    // of another tenant is another group with its own lease. The payload keeps
+    // the deadline in milliseconds, so a decoded lease carries that value and
+    // the live one was taken within a millisecond of it.
+    const auto lease_after =
+        GetGroupLeaseForTest(service, group_id, tenant_a.value());
+    ASSERT_NE(lease_after, nullptr);
+    const auto lease_b =
+        GetGroupLeaseForTest(service, group_id, tenant_b.value());
+    ASSERT_NE(lease_b, nullptr);
+    EXPECT_NE(lease_after.get(), lease_b.get())
+        << "the same group id in another tenant is another group";
+    const auto milliseconds_between = [](const std::shared_ptr<Lease>& left,
+                                         const std::shared_ptr<Lease>& right) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   left->ExpiresAt() - right->ExpiresAt())
+            .count();
+    };
+    EXPECT_LT(std::abs(milliseconds_between(lease_after, lease_before)), 2)
+        << "the shared lease must keep the deadline the payload carries";
+    EXPECT_LT(std::abs(milliseconds_between(lease_b, lease_before)), 2);
+
+    // The lease staged before the decode is the state's, not the payload's.
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant_a, proposal_id)
+                     .has_value());
+}
+
 TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
     const TenantId tenant_a("tenant_get_all_keys_a");
     auto service_ = std::make_unique<MasterService>(MakeStrictTenantConfig(

@@ -1470,7 +1470,6 @@ class MasterService {
         const std::string& why, const TenantId& tenant_id,
         const std::shared_ptr<ObjectEntry>& entry, const std::string& key,
         ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan);
-    void RebuildGroupState();
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
@@ -1655,12 +1654,6 @@ class MasterService {
     void DecrementCandidateCount();
     void BackoffCandidate(const ObjectIdentity& object_id,
                           PromotionQueueResult result);
-    // Reconciles the promotion bookkeeping with the routes the service
-    // publishes now: it unindexes every entry's candidate and zeroes the
-    // candidate count, the retry cursor and the in-flight counter that shadow
-    // it. This is a step of the reload reset above and of the snapshot restore,
-    // never a reset of its own.
-    void ReconcilePromotionBookkeeping();
     std::chrono::milliseconds CandidateBackoff(uint32_t retry_count) const;
     bool IsTransientResult(PromotionQueueResult result) const;
     size_t RunPromotionCandidateRetry();
@@ -2194,6 +2187,10 @@ class MasterService {
     // which is the only point where a test can commit into an already-scanned
     // region. The argument reports the walk's progress.
     std::function<void(size_t)> kv_remove_all_tenant_hook_;
+    // Fires when a group eviction has settled every member: the point where a
+    // test can land a replica on a member the sweep invalidated, and see that
+    // the sweep does not drop it.
+    std::function<void()> group_eviction_settled_hook_;
 
     static size_t KvTenantEpochSlot(const std::string& tenant) {
         return std::hash<std::string>{}(tenant) % kKvTenantEpochSlots;

@@ -52,6 +52,11 @@ void MasterServiceTestPeer::SetRemoveAllTenantHookForTesting(
     service_.kv_remove_all_tenant_hook_ = std::move(hook);
 }
 
+void MasterServiceTestPeer::SetGroupEvictionSettledHookForTesting(
+    std::function<void()> hook) {
+    service_.group_eviction_settled_hook_ = std::move(hook);
+}
+
 uint64_t MasterServiceTestPeer::GetKvClearedPublishedForTesting() const {
     return service_.kv_cleared_published_.load(std::memory_order_relaxed);
 }

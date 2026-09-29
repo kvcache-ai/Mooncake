@@ -535,7 +535,14 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     void RebuildGroupStateForTest(MasterService& service) {
-        MasterServiceTestPeer(service).RebuildGroupState();
+        // Snapshot deserialization wires membership as it routes each object,
+        // so this pass is the test's own: it drives the per-tenant rebuild
+        // directly.
+        MasterServiceTestPeer::Tenants(service).Visit(
+            [](const TenantId&,
+               const std::shared_ptr<metadata::Tenant>& handle) {
+                handle->RebuildGroupState();
+            });
     }
 
     // The shared group lease, read from a member's own lease: every grouped

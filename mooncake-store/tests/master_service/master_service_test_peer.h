@@ -86,6 +86,9 @@ class MasterServiceTestPeer {
     // The argument reports the scan's own progress, not a container index.
     void SetRemoveAllTenantHookForTesting(std::function<void(size_t)> hook);
 
+    // Runs the hook once a group eviction has settled every member.
+    void SetGroupEvictionSettledHookForTesting(std::function<void()> hook);
+
     // Counts of published clears and clears suppressed by a concurrent commit.
     uint64_t GetKvClearedPublishedForTesting() const;
 
@@ -438,10 +441,6 @@ class MasterServiceTestPeer {
         service_.CleanupExpiredSoftPins(now);
     }
 
-    void ReconcilePromotionBookkeeping() {
-        service_.ReconcilePromotionBookkeeping();
-    }
-
     // Drops `key`'s pending dynamic-replication task state under the entry's
     // own lock, the way the sweep paths do.
     void ClearDynamicReplicationStateForKey(const TenantId& tenant_id,
@@ -620,8 +619,6 @@ class MasterServiceTestPeer {
         std::vector<UUID>* mirror_clients = nullptr) {
         return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
     }
-
-    void RebuildGroupState() { service_.RebuildGroupState(); }
 
     void RebuildTenantQuotaUsageFromMetadata() {
         service_.RebuildTenantQuotaUsageFromMetadata();

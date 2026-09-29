@@ -1149,9 +1149,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         bool unsupported_cxl = false;
         // Strong handles, so every object this walk touched stays alive until
         // the repair below reaches it; there the entry is re-locked and
-        // re-checked, and an entry torn down in the meantime is skipped.
+        // re-checked, and an entry torn down in the meantime is skipped. One
+        // route holds one entry per key, so the walk yields each entry once.
         std::vector<std::shared_ptr<ObjectEntry>> affected_objects;
-        std::unordered_set<const ObjectEntry*> affected_object_set;
         const bool any_standby_kept_alive = std::any_of(
             segments.begin(), segments.end(), [this](const Segment& segment) {
                 return standby_accounted_memory_bytes_.contains(segment.name);
@@ -1205,8 +1205,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                 }
                             });
                     });
-                    if (matched_this_object &&
-                        affected_object_set.insert(entry.get()).second) {
+                    if (matched_this_object) {
                         affected_objects.push_back(entry);
                     }
                 }
@@ -1953,7 +1952,6 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
         return IsEvictableMemoryReplica(replica);
     };
 
-    std::vector<std::shared_ptr<ObjectEntry>> members_to_erase;
     for (const auto& member_key : member_keys) {
         // One member at a time, re-validated under its own entry lock: a live
         // shared group lease leaves no member's lease expired, so the group is
@@ -1969,10 +1967,15 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
                     !member_metadata.HasReplica(is_evictable_memory_replica)) {
                     return;
                 }
-                // The callback performs only the path-specific eviction (oplog
-                // persist, offload, publish). Member teardown happens below,
-                // after this lock is released, so no member is erased while
-                // another one's lock is held. `key` is the caller's to erase.
+                // The path-specific eviction (oplog persist, offload, publish)
+                // runs first, then a member it left with nothing valid is torn
+                // down right here: this callback already holds that entry's
+                // lock, and the access re-checked that the route publishes it.
+                // A pass that ran later would have to establish both again, and
+                // a replica another path added to this entry in between -- an
+                // AddReplica, or an offload completion landing while a tenant
+                // quota eviction is in flight -- would have gone down with the
+                // entry. `key` is the caller's to erase.
                 EvictMemberOutcome member_outcome = evict_one_member(
                     member_key, member_metadata, state, tenant);
                 result.freed_bytes += member_outcome.freed_bytes;
@@ -1982,28 +1985,21 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
                     result.error = member_outcome.error;
                     return;
                 }
-                // A member the eviction left with nothing valid is torn down
-                // below, after this lock is released: the callback held that
-                // entry's lock, so `member_entry` is what the route publishes.
-                if (member_key != key && !member_metadata.IsValid()) {
-                    const auto member_entry = tenant.Get(member_key);
-                    if (member_entry != nullptr) {
-                        members_to_erase.push_back(member_entry);
-                    }
+                if (member_key == key || member_metadata.IsValid()) {
+                    return;
+                }
+                const auto member_entry = tenant.Get(member_key);
+                if (member_entry != nullptr) {
+                    (void)EraseMetadata(tenant, member_entry, member_metadata,
+                                        state, tenant_id);
                 }
             });
         if (result.stop_scan) {
             break;
         }
     }
-    // Erasing takes each member's lock again and drops its route slot only
-    // while that slot still publishes it, so a same-key replacement survives.
-    for (const auto& member_entry : members_to_erase) {
-        member_entry->WithExclusiveAccess(
-            [&](ObjectMetadata& member_metadata, ObjectEntry::State& state) {
-                (void)EraseMetadata(tenant, member_entry, member_metadata,
-                                    state, tenant_id);
-            });
+    if (group_eviction_settled_hook_) {
+        group_eviction_settled_hook_();
     }
     return result;
 }
@@ -2171,96 +2167,88 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (tenant == nullptr) {
         return;
     }
-    // The plain published-object access, not the read-write one: the
-    // invalid-replica cleanup that accessor runs first would mutate whatever
-    // the route publishes now, including a replacement this cleanup does not
-    // own.
-    (void)tenant->WithPublishedObject(
-        durable_entry.object_key,
-        [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
-            // Identity gate: act only while the route still publishes the
-            // entry this cleanup was armed for. A same-key recreate that landed
-            // while it was in flight keeps its own replicas, quota, KV state
-            // and task records untouched.
-            const auto published = tenant->Get(durable_entry.object_key);
-            if (published != entry) {
-                return;
-            }
-            std::unordered_set<ReplicaID> ids(replica_ids.begin(),
-                                              replica_ids.end());
-            // Finalized replicas are already marked REMOVED, so their media is
-            // missing from the completed-replica view: snapshot the pre-removal
-            // set for the event delta.
-            auto previous_media = KvRemovalSnapshot(metadata);
-            previous_media.insert(previous_media.end(),
-                                  previous_media_hint.begin(),
-                                  previous_media_hint.end());
-            auto erased_replicas = PopReplicasWithCacheTotalAccounting(
-                metadata, [&ids](const Replica& replica) {
-                    return replica.status() == ReplicaStatus::REMOVED &&
-                           ids.contains(replica.id());
-                });
-            if (erased_replicas.empty()) {
-                return;
-            }
-            std::vector<ReplicaID> erased_replica_ids;
-            erased_replica_ids.reserve(erased_replicas.size());
-            for (const auto& replica : erased_replicas) {
-                erased_replica_ids.push_back(replica.id());
-            }
-            RecordDynamicReplicaRemoval(metadata, erased_replica_ids);
-            const uint64_t erased_memory_replicas = static_cast<uint64_t>(
-                std::count_if(erased_replicas.begin(), erased_replicas.end(),
-                              [](const Replica& replica) {
-                                  return replica.is_memory_replica();
-                              }));
-            const bool has_processing_memory =
-                metadata.HasReplica([](const Replica& replica) {
-                    return replica.is_memory_replica() &&
-                           replica.is_processing();
-                });
-            if (enable_multi_tenants_ && erased_memory_replicas > 0 &&
-                has_processing_memory) {
-                const uint64_t committed_charge =
-                    metadata.quota_ledger.CommittedBytes();
-                if (metadata.size > committed_charge / erased_memory_replicas) {
-                    LOG(ERROR)
-                        << "tenant quota removed-replica release exceeds "
-                           "committed bytes, tenant="
-                        << tenant_id.value()
-                        << ", key=" << durable_entry.object_key
-                        << ", object_size=" << metadata.size
-                        << ", erased_memory_replicas=" << erased_memory_replicas
-                        << ", committed_bytes=" << committed_charge;
-                } else {
-                    const uint64_t release_bytes =
-                        metadata.size * erased_memory_replicas;
-                    auto release_result =
-                        metadata.quota_ledger.ReleaseCommitted(
-                            GetBoundTenantQuotaHandle(*tenant), release_bytes);
-                    LogTenantQuotaLedgerError(release_result,
-                                              "release_committed", tenant_id,
-                                              durable_entry.object_key);
-                }
-            }
-            ReleaseLocalDiskUsage(erased_replicas);
-            FreeDfsReplicas(metadata.user_key, erased_replicas);
-            CancelPromotionTaskForRemovedReplicas(*tenant, metadata, state,
-                                                  erased_replica_ids);
-            if (!metadata.IsValid()) {
-                (void)EraseMetadata(*tenant, published, metadata, state,
-                                    tenant_id, quota_mode, previous_media);
+    // The captured entry's own lock, not an access that resolves the key again:
+    // a same-key recreate that landed while this cleanup was in flight is then
+    // neither locked nor swept for invalid replicas on this cleanup's behalf.
+    entry->WithExclusiveAccess([&](ObjectMetadata& metadata,
+                                   ObjectEntry::State& state) -> void {
+        // Identity gate before any side effect: once the entry is torn down
+        // or the route publishes a replacement, this cleanup is not that
+        // publication's business.
+        if (state.is_torn_down || tenant->Get(entry->key()) != entry) {
+            return;
+        }
+        std::unordered_set<ReplicaID> ids(replica_ids.begin(),
+                                          replica_ids.end());
+        // Finalized replicas are already marked REMOVED, so their media is
+        // missing from the completed-replica view: snapshot the pre-removal
+        // set for the event delta.
+        auto previous_media = KvRemovalSnapshot(metadata);
+        previous_media.insert(previous_media.end(), previous_media_hint.begin(),
+                              previous_media_hint.end());
+        auto erased_replicas = PopReplicasWithCacheTotalAccounting(
+            metadata, [&ids](const Replica& replica) {
+                return replica.status() == ReplicaStatus::REMOVED &&
+                       ids.contains(replica.id());
+            });
+        if (erased_replicas.empty()) {
+            return;
+        }
+        std::vector<ReplicaID> erased_replica_ids;
+        erased_replica_ids.reserve(erased_replicas.size());
+        for (const auto& replica : erased_replicas) {
+            erased_replica_ids.push_back(replica.id());
+        }
+        RecordDynamicReplicaRemoval(metadata, erased_replica_ids);
+        const uint64_t erased_memory_replicas = static_cast<uint64_t>(
+            std::count_if(erased_replicas.begin(), erased_replicas.end(),
+                          [](const Replica& replica) {
+                              return replica.is_memory_replica();
+                          }));
+        const bool has_processing_memory =
+            metadata.HasReplica([](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_processing();
+            });
+        if (enable_multi_tenants_ && erased_memory_replicas > 0 &&
+            has_processing_memory) {
+            const uint64_t committed_charge =
+                metadata.quota_ledger.CommittedBytes();
+            if (metadata.size > committed_charge / erased_memory_replicas) {
+                LOG(ERROR) << "tenant quota removed-replica release exceeds "
+                              "committed bytes, tenant="
+                           << tenant_id.value()
+                           << ", key=" << durable_entry.object_key
+                           << ", object_size=" << metadata.size
+                           << ", erased_memory_replicas="
+                           << erased_memory_replicas
+                           << ", committed_bytes=" << committed_charge;
             } else {
-                SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
-                                  previous_media);
-                auto settle_result =
-                    SettlePrimaryWriteQuotaIfReady(*tenant, metadata);
-                if (settle_result &&
-                    metadata.AllReplicas(&Replica::fn_is_completed)) {
-                    state.is_processing = false;
-                }
+                const uint64_t release_bytes =
+                    metadata.size * erased_memory_replicas;
+                auto release_result = metadata.quota_ledger.ReleaseCommitted(
+                    GetBoundTenantQuotaHandle(*tenant), release_bytes);
+                LogTenantQuotaLedgerError(release_result, "release_committed",
+                                          tenant_id, durable_entry.object_key);
             }
-        });
+        }
+        ReleaseLocalDiskUsage(erased_replicas);
+        FreeDfsReplicas(metadata.user_key, erased_replicas);
+        CancelPromotionTaskForRemovedReplicas(*tenant, metadata, state,
+                                              erased_replica_ids);
+        if (!metadata.IsValid()) {
+            (void)EraseMetadata(*tenant, entry, metadata, state, tenant_id,
+                                quota_mode, previous_media);
+        } else {
+            SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
+                              previous_media);
+            auto settle_result =
+                SettlePrimaryWriteQuotaIfReady(*tenant, metadata);
+            if (settle_result &&
+                metadata.AllReplicas(&Replica::fn_is_completed)) {
+                state.is_processing = false;
+            }
+        }
+    });
 }
 
 void MasterService::FinalizeMetadataEraseAfterDurable(
@@ -2301,16 +2289,14 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
     if (tenant == nullptr || entry == nullptr) {
         return;
     }
-    // The plain published-object access, so a replacement that landed while
-    // this cleanup was in flight is not even swept for invalid replicas.
-    (void)tenant->WithPublishedObject(
-        durable_entry.object_key,
-        [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
-            // Identity gate: the durable cleanup was requested for the
-            // publication that is still routed, so a same-key recreate keeps
-            // its own replicas, quota and task state.
-            const auto published = tenant->Get(durable_entry.object_key);
-            if (published != entry) {
+    // The captured entry's own lock, so a replacement that landed while this
+    // cleanup was in flight is not lockable, and not sweepable, through it.
+    entry->WithExclusiveAccess(
+        [&](ObjectMetadata& metadata, ObjectEntry::State& state) -> void {
+            // Identity gate before any side effect: once the entry is torn down
+            // or the route publishes a replacement, this cleanup is not that
+            // publication's business.
+            if (state.is_torn_down || tenant->Get(entry->key()) != entry) {
                 return;
             }
             // Only the replicas this cleanup was armed for, and only while they
@@ -2340,9 +2326,8 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
                 return;
             }
             if (!metadata.IsValid()) {
-                (void)EraseMetadata(*tenant, published, metadata, state,
-                                    tenant_id, QuotaEraseMode::kFull,
-                                    previous_media);
+                (void)EraseMetadata(*tenant, entry, metadata, state, tenant_id,
+                                    QuotaEraseMode::kFull, previous_media);
             } else {
                 SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
                                   previous_media);
@@ -2367,80 +2352,76 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
     if (tenant == nullptr || entry == nullptr) {
         return;
     }
-    // The plain published-object access, so a replacement that landed while
-    // this cleanup was in flight is not even swept for invalid replicas.
-    (void)tenant->WithPublishedObject(
-        durable_entry.object_key,
-        [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
-            // Identity gate before any side effect: the cleanup belongs to the
-            // publication that armed it.
-            const auto published = tenant->Get(durable_entry.object_key);
-            if (published != entry) {
-                return;
-            }
-            // The task records the ids and the lease it was created with, so
-            // the routed publication proves this cleanup belongs to it.
-            if (!state.replication_task.has_value()) {
-                return;
-            }
-            const auto& task = *state.replication_task;
-            if (!task.durable_cleanup_pending || task.source_id != source_id ||
-                task.replica_ids != target_ids ||
-                task.dynamic_replication_lease_id !=
-                    dynamic_replication_lease_id ||
-                task.dynamic_replication_version_epoch !=
-                    dynamic_replication_version_epoch) {
-                return;
-            }
+    // The captured entry's own lock, so a replacement that landed while this
+    // cleanup was in flight is not lockable, and not sweepable, through it.
+    entry->WithExclusiveAccess([&](ObjectMetadata& metadata,
+                                   ObjectEntry::State& state) -> void {
+        // Identity gate before any side effect: once the entry is torn down
+        // or the route publishes a replacement, this cleanup is not that
+        // publication's business.
+        if (state.is_torn_down || tenant->Get(entry->key()) != entry) {
+            return;
+        }
+        // The task records the ids and the lease it was created with, so
+        // the routed publication proves this cleanup belongs to it.
+        if (!state.replication_task.has_value()) {
+            return;
+        }
+        const auto& task = *state.replication_task;
+        if (!task.durable_cleanup_pending || task.source_id != source_id ||
+            task.replica_ids != target_ids ||
+            task.dynamic_replication_lease_id != dynamic_replication_lease_id ||
+            task.dynamic_replication_version_epoch !=
+                dynamic_replication_version_epoch) {
+            return;
+        }
 
-            if (auto source = metadata.GetReplicaByID(source_id);
-                source != nullptr) {
-                source->dec_refcnt();
-            }
+        if (auto source = metadata.GetReplicaByID(source_id);
+            source != nullptr) {
+            source->dec_refcnt();
+        }
 
-            // Snapshot the media before popping: targets match by id regardless
-            // of status, so a COMPLETE replica dropped here would otherwise be
-            // unrecoverable for the remove delta.
-            const auto previous_media = KvRemovalSnapshot(metadata);
-            std::unordered_set<ReplicaID> ids(target_ids.begin(),
-                                              target_ids.end());
-            auto replicas = PopReplicasWithCacheTotalAccounting(
-                metadata, [&ids](const Replica& replica) {
-                    return ids.contains(replica.id());
-                });
-            std::vector<ReplicaID> erased_replica_ids;
-            erased_replica_ids.reserve(replicas.size());
-            for (const auto& replica : replicas) {
-                erased_replica_ids.push_back(replica.id());
+        // Snapshot the media before popping: targets match by id regardless
+        // of status, so a COMPLETE replica dropped here would otherwise be
+        // unrecoverable for the remove delta.
+        const auto previous_media = KvRemovalSnapshot(metadata);
+        std::unordered_set<ReplicaID> ids(target_ids.begin(), target_ids.end());
+        auto replicas = PopReplicasWithCacheTotalAccounting(
+            metadata, [&ids](const Replica& replica) {
+                return ids.contains(replica.id());
+            });
+        std::vector<ReplicaID> erased_replica_ids;
+        erased_replica_ids.reserve(replicas.size());
+        for (const auto& replica : replicas) {
+            erased_replica_ids.push_back(replica.id());
+        }
+        const bool dynamic_task = dynamic_replication_lease_id != UUID{} ||
+                                  dynamic_replication_version_epoch != 0;
+        RecordDynamicReplicaRemoval(metadata, erased_replica_ids);
+        if (!replicas.empty()) {
+            FreeDfsReplicas(metadata.user_key, replicas);
+            std::lock_guard lock(discarded_replicas_mutex_);
+            discarded_replicas_.emplace_back(std::move(replicas), ttl);
+        }
+        if (dynamic_task) {
+            ClearDynamicReplicationStateLocked(tenant_id, entry, state);
+        }
+        if (!metadata.IsValid()) {
+            (void)EraseMetadata(*tenant, entry, metadata, state, tenant_id,
+                                QuotaEraseMode::kFull, previous_media);
+        } else {
+            // Publish before the task is dropped: dropping it ends this
+            // cleanup.
+            SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
+                              previous_media);
+            if (state.replication_task.has_value()) {
+                ReleaseTenantQuota(
+                    GetBoundTenantQuotaHandle(*tenant),
+                    state.replication_task->pending_quota_charge_bytes);
+                state.replication_task.reset();
             }
-            const bool dynamic_task = dynamic_replication_lease_id != UUID{} ||
-                                      dynamic_replication_version_epoch != 0;
-            RecordDynamicReplicaRemoval(metadata, erased_replica_ids);
-            if (!replicas.empty()) {
-                FreeDfsReplicas(metadata.user_key, replicas);
-                std::lock_guard lock(discarded_replicas_mutex_);
-                discarded_replicas_.emplace_back(std::move(replicas), ttl);
-            }
-            if (dynamic_task) {
-                ClearDynamicReplicationStateLocked(tenant_id, published, state);
-            }
-            if (!metadata.IsValid()) {
-                (void)EraseMetadata(*tenant, published, metadata, state,
-                                    tenant_id, QuotaEraseMode::kFull,
-                                    previous_media);
-            } else {
-                // Publish before the task is dropped: dropping it ends this
-                // cleanup.
-                SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
-                                  previous_media);
-                if (state.replication_task.has_value()) {
-                    ReleaseTenantQuota(
-                        GetBoundTenantQuotaHandle(*tenant),
-                        state.replication_task->pending_quota_charge_bytes);
-                    state.replication_task.reset();
-                }
-            }
-        });
+        }
+    });
 }
 
 MasterService::StaleHandleCleanupPlan
@@ -2692,17 +2673,6 @@ void MasterService::ReleaseLocalDiskUsage(
     for (const auto& [client_id, bytes] : bytes_by_client) {
         local_ssd_manager_.AdjustUsedBytes(client_id, -bytes);
     }
-}
-
-void MasterService::RebuildGroupState() {
-    // Group membership and the shared group leases are derived from the
-    // grouped objects each tenant publishes, so the rebuild is per tenant. The
-    // maximum restored deadline per group keeps a grouped object off a
-    // zero-deadline lease that post-restore cleanup would drop.
-    tenants_.Visit(
-        [](const TenantId&, const std::shared_ptr<metadata::Tenant>& tenant) {
-            tenant->RebuildGroupState();
-        });
 }
 
 void MasterService::SoftPinDeadlineIndex::MaybeCompactLocked() {
@@ -8021,7 +7991,6 @@ long MasterService::RemoveAll(bool force) {
                         }
 
                         total_freed_size += metadata.size * mem_rep_count;
-                        ErasePromotionTaskLocked(*tenant, state);
                         (void)EraseMetadata(*tenant, entry, metadata, state,
                                             tenant_id);
                         removed_count++;
@@ -8155,7 +8124,6 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                             }
                         }
                         total_freed_size += metadata.size * mem_rep_count;
-                        ErasePromotionTaskLocked(*tenant_handle, state);
                         (void)EraseMetadata(*tenant_handle, entry, metadata,
                                             state, normalized_tenant);
                         removed_count++;
@@ -9423,21 +9391,6 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
                 now + CandidateBackoff(candidate.retry_count);
         }
     });
-}
-
-void MasterService::ReconcilePromotionBookkeeping() {
-    tenants_.Visit([this](const TenantId& tenant_id,
-                          const std::shared_ptr<metadata::Tenant>& tenant) {
-        for (const auto& entry : tenant->SnapshotObjects()) {
-            entry->WithExclusiveAccess(
-                [&](ObjectMetadata&, ObjectEntry::State& state) {
-                    EraseCandidateLocked(tenant_id, entry, state);
-                });
-        }
-    });
-    promotion_candidate_count_.store(0, std::memory_order_relaxed);
-    promotion_retry_cursor_.store(0, std::memory_order_relaxed);
-    promotion_in_flight_.store(0, std::memory_order_relaxed);
 }
 
 size_t MasterService::RunPromotionCandidateRetry() {
@@ -11914,8 +11867,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                            member_metadata, normalized_tenant);
             }
             // A non-trigger member the eviction left invalid is torn down by
-            // EvictGroupOrObject once this lock has been released, so this
-            // callback does not erase it.
+            // EvictGroupOrObject inside this callback, so this path only frees
+            // what it was asked to free.
             return outcome;
         };
 
@@ -12336,8 +12289,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                            member_metadata, tenant_id);
             }
             // A non-trigger member the eviction left invalid is torn down by
-            // EvictGroupOrObject once this lock has been released, so this
-            // callback does not erase it.
+            // EvictGroupOrObject inside this callback, so this path only frees
+            // what it was asked to free.
             return outcome;
         };
 
@@ -13648,17 +13601,14 @@ MasterService::MetadataSerializer::Deserialize(
     // The payload is the whole metadata this service publishes, so decoding
     // replaces what the routes held: a tenant the payload does not carry would
     // otherwise keep publishing the keys of the state this call started from.
-    {
-        std::vector<TenantId> replaced_tenants;
-        service_->tenants_.Visit(
-            [&replaced_tenants](const TenantId& tenant_id,
-                                const std::shared_ptr<metadata::Tenant>&) {
-                replaced_tenants.push_back(tenant_id);
-            });
-        for (const auto& tenant_id : replaced_tenants) {
-            service_->tenants_.Remove(tenant_id);
-        }
-    }
+    // The walk hands each tenant id to the callback after it has released the
+    // registry lock and it iterates its own frame, so removing from inside is
+    // the same set of removals this call makes with a collected list: a tenant
+    // created after the frame was taken is not in this walk either way.
+    service_->tenants_.Visit([this](const TenantId& tenant_id,
+                                    const std::shared_ptr<metadata::Tenant>&) {
+        service_->tenants_.Remove(tenant_id);
+    });
     service_->ResetReplicaActionStateForReload();
 
     // Iterate and deserialize each tenant entry
@@ -13732,29 +13682,25 @@ MasterService::MetadataSerializer::Deserialize(
             ErrorCode::DESERIALIZE_FAIL, "Invalid weight_metadata snapshot"));
     }
 
-    // Deserialization already routed every object, so only the group membership
-    // and the shared leases are rebuilt here.
-    service_->RebuildGroupState();
-    service_->ReconcilePromotionBookkeeping();
+    // Nothing to rebuild after the objects are routed: InsertObject wired each
+    // object's group membership and shared lease, and the ExtendTo that follows
+    // it takes the group lease to the latest deadline of the members decoded so
+    // far, so the group ends at the maximum over its members. The entries are
+    // new, so no entry carries a promotion candidate to unindex, and the counts
+    // that shadow them were zeroed by the reset before this decode started.
     return {};
 }
 
 void MasterService::MetadataSerializer::Reset() {
     service_->weight_manager_.Clear();
     service_->soft_pin_deadline_index_.Clear();
-    {
-        // The ids are collected before any removal: Visit walks one immutable
-        // frame, so a removal from inside the callback would not apply to the
-        // frame being walked.
-        std::vector<TenantId> tenant_ids;
-        service_->tenants_.Visit([&](const TenantId& tenant_id,
-                                     const std::shared_ptr<metadata::Tenant>&) {
-            tenant_ids.push_back(tenant_id);
-        });
-        for (const auto& tenant_id : tenant_ids) {
-            service_->tenants_.Remove(tenant_id);
-        }
-    }
+    // The walk hands each tenant id to the callback after it has released the
+    // registry lock and it iterates its own frame, so removing from inside
+    // retires exactly the tenants this walk saw, as a collected list would.
+    service_->tenants_.Visit([this](const TenantId& tenant_id,
+                                    const std::shared_ptr<metadata::Tenant>&) {
+        service_->tenants_.Remove(tenant_id);
+    });
     // The tenants are gone, so their replica-action records name keys no
     // publication owns: leases a client could still act on, and candidate index
     // entries the retry loop would keep retrying.
