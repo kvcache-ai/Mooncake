@@ -240,6 +240,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 #include "tent/common/types.h"
 
 namespace mooncake {
+class TransferEngine;
 class TransferEngineImplTestPeer;
 namespace tent {
 class TransferEngineImpl;
@@ -357,7 +358,11 @@ class TransferEngine {
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
    private:
+    Status submitTransferRequiringPostSubmitCancellation(
+        BatchID batch_id, const std::vector<Request>& request_list);
+
     std::unique_ptr<TransferEngineImpl> impl_;
+    friend class ::mooncake::TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 };
 }  // namespace tent

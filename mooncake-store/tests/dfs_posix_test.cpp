@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "replica.h"
-#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage_backend.h"
@@ -139,8 +139,8 @@ DistributedStorageConfig MakeAllocatorConfig(const std::string& mount_path,
     return config;
 }
 
-std::vector<DfsGlobalAllocator::EvictionCandidate>
-PrepareAndCommitPreparedEviction(DfsGlobalAllocator& allocator) {
+std::vector<ShardAllocator::EvictionCandidate> PrepareAndCommitPreparedEviction(
+    ShardAllocator& allocator) {
     auto pending = allocator.PrepareEviction();
     auto candidates = pending.Candidates();
     allocator.CommitPreparedEviction(std::move(pending));
@@ -307,12 +307,12 @@ TEST_F(FsAdapterFdTest, PreallocateLargeSparseFile) {
     adapter_->CloseFile(*fd);
 }
 
-TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
+TEST(ShardAllocatorTest, AllocateFreeAndFormatShardIdx) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_alloc");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 4, 1024 * 1024, 4096)));
 
@@ -327,21 +327,21 @@ TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
     auto desc2 = alloc.Allocate("key2", 100);
     EXPECT_TRUE(desc2.has_value());
 
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(0, 64), "00");
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(9, 64), "09");
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(10, 64), "10");
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(63, 64), "63");
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(100, 1000), "100");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(0, 64), "00");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(9, 64), "09");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(10, 64), "10");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(63, 64), "63");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(100, 1000), "100");
 }
 
-TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
+TEST(ShardAllocatorTest, InitReturnsSpecificErrors) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_init_error");
 
     DistributedStorageConfig invalid_config =
         MakeAllocatorConfig(tmp.path(), 1, 1024 * 1024, 3);
-    DfsGlobalAllocator invalid_allocator;
+    ShardAllocator invalid_allocator;
     auto invalid_result = invalid_allocator.Init(invalid_config);
     ASSERT_FALSE(invalid_result);
     EXPECT_EQ(invalid_result.error(), ErrorCode::INVALID_PARAMS);
@@ -353,18 +353,18 @@ TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
 
     DistributedStorageConfig file_error_config =
         MakeAllocatorConfig(file_path, 1, 1024 * 1024, 4096);
-    DfsGlobalAllocator file_error_allocator;
+    ShardAllocator file_error_allocator;
     auto file_error_result = file_error_allocator.Init(file_error_config);
     ASSERT_FALSE(file_error_result);
     EXPECT_EQ(file_error_result.error(), ErrorCode::FILE_WRITE_FAIL);
 }
 
-TEST(DfsGlobalAllocatorTest, AllocateReservesAlignmentPadding) {
+TEST(ShardAllocatorTest, AllocateReservesAlignmentPadding) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_alloc_padding");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
     auto desc = alloc.Allocate("key1", 100);
@@ -381,14 +381,14 @@ TEST(DfsGlobalAllocatorTest, AllocateReservesAlignmentPadding) {
     EXPECT_TRUE(after_free.has_value());
 }
 
-TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
+TEST(ShardAllocatorTest, ExhaustionAndEviction) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.5");
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.25");
     TempDir tmp("dfs_exhaust");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
@@ -421,14 +421,14 @@ TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
     EXPECT_TRUE(after_evict.has_value());
 }
 
-TEST(DfsGlobalAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
+TEST(ShardAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
     TempDir tmp("dfs_abort_eviction");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
@@ -452,14 +452,14 @@ TEST(DfsGlobalAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
     alloc.RestorePreparedEviction(std::move(retry));
 }
 
-TEST(DfsGlobalAllocatorTest, PartialResolutionContinuesToLowWatermark) {
+TEST(ShardAllocatorTest, PartialResolutionContinuesToLowWatermark) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
     TempDir tmp("dfs_partial_eviction");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
@@ -492,7 +492,7 @@ TEST(DfsGlobalAllocatorTest, PartialResolutionContinuesToLowWatermark) {
     EXPECT_TRUE(complete.Empty());
 }
 
-TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
+TEST(ShardAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
@@ -500,7 +500,7 @@ TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
     env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "30");
     TempDir tmp("dfs_pending_watermark");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
@@ -524,12 +524,12 @@ TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
     EXPECT_EQ(before_release.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
-TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
+TEST(ShardAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_free_lru_reuse");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
     auto desc_a = alloc.Allocate("A", 100);
@@ -548,12 +548,12 @@ TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     EXPECT_EQ(evicted.front().key, "B");
 }
 
-TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
+TEST(ShardAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_stale_free");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
     auto desc_a = alloc.Allocate("A", 100);
@@ -574,12 +574,12 @@ TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     EXPECT_EQ(evicted.front().key, "B");
 }
 
-TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {
+TEST(ShardAllocatorTest, ConcurrentAllocate) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_concurrent");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 4, 128 * 1024, 4096)));
 
@@ -607,11 +607,11 @@ TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {
     EXPECT_EQ(fail_count.load(), 0);
 }
 
-TEST(DfsGlobalAllocatorTest, ExpansionValidatesCountAndUsesEmptyShards) {
+TEST(ShardAllocatorTest, ExpansionValidatesCountAndUsesEmptyShards) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_expand_capacity");
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
     auto old = alloc.Allocate("old", 100);
     ASSERT_TRUE(old);
@@ -649,7 +649,7 @@ TEST(DfsGlobalAllocatorTest, ExpansionValidatesCountAndUsesEmptyShards) {
     alloc.Free(added->offset, added->aligned_size, added->shard_idx, key);
 }
 
-TEST(DfsGlobalAllocatorTest, ExpansionPreservesLegacyPathsAndRestartsLayout) {
+TEST(ShardAllocatorTest, ExpansionPreservesLegacyPathsAndRestartsLayout) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_expand_legacy");
@@ -658,14 +658,13 @@ TEST(DfsGlobalAllocatorTest, ExpansionPreservesLegacyPathsAndRestartsLayout) {
     PosixFsAdapter adapter;
     ASSERT_TRUE(adapter.Init(tmp.path()));
     for (int i = 0; i < 100; ++i) {
-        const auto path =
-            tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(i, 100) +
-                     ".data");
+        const auto path = tmp.file(
+            "dfs_shard_" + ShardAllocator::FormatShardIdx(i, 100) + ".data");
         ASSERT_TRUE(adapter.PreallocateFile(path, 8192));
     }
     std::string old_path;
     {
-        DfsGlobalAllocator alloc;
+        ShardAllocator alloc;
         ASSERT_TRUE(
             alloc.Init(MakeAllocatorConfig(tmp.path(), 100, 8192, 4096)));
         auto old = alloc.Allocate("preserved", 100);
@@ -688,13 +687,13 @@ TEST(DfsGlobalAllocatorTest, ExpansionPreservesLegacyPathsAndRestartsLayout) {
     }
     // Only the shard layout is recovered. This deliberately makes no claim
     // about recovering the previous object's allocation or Master metadata.
-    DfsGlobalAllocator restarted;
+    ShardAllocator restarted;
     ASSERT_TRUE(restarted.Init(MakeAllocatorConfig(tmp.path(), 2, 8192, 4096)));
     EXPECT_EQ(restarted.GetShardCount(), 101);
     EXPECT_TRUE(std::filesystem::exists(old_path));
 }
 
-TEST(DfsGlobalAllocatorTest, ExpansionRetainsPaddedLegacyShardDescriptors) {
+TEST(ShardAllocatorTest, ExpansionRetainsPaddedLegacyShardDescriptors) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_expand_padded");
@@ -702,7 +701,7 @@ TEST(DfsGlobalAllocatorTest, ExpansionRetainsPaddedLegacyShardDescriptors) {
     ASSERT_TRUE(adapter.Init(tmp.path()));
     ASSERT_TRUE(adapter.PreallocateFile(tmp.file("dfs_shard_000.data"), 8192));
     ASSERT_TRUE(adapter.PreallocateFile(tmp.file("dfs_shard_001.data"), 8192));
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 2, 8192, 4096)));
     auto old = alloc.Allocate("old", 100);
     ASSERT_TRUE(old);
@@ -715,7 +714,7 @@ TEST(DfsGlobalAllocatorTest, ExpansionRetainsPaddedLegacyShardDescriptors) {
     EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
 }
 
-TEST(DfsGlobalAllocatorTest, InitRejectsMalformedShardNames) {
+TEST(ShardAllocatorTest, InitRejectsMalformedShardNames) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     for (const std::string& name :
@@ -727,7 +726,7 @@ TEST(DfsGlobalAllocatorTest, InitRejectsMalformedShardNames) {
         PosixFsAdapter adapter;
         ASSERT_TRUE(adapter.Init(tmp.path()));
         ASSERT_TRUE(adapter.PreallocateFile(tmp.file(name), 8192));
-        DfsGlobalAllocator alloc;
+        ShardAllocator alloc;
         auto result =
             alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096));
         ASSERT_FALSE(result);
@@ -739,7 +738,7 @@ TEST(DfsGlobalAllocatorTest, InitRejectsMalformedShardNames) {
     }
 }
 
-TEST(DfsGlobalAllocatorTest, InitRejectsAmbiguousOrNoncontiguousLayout) {
+TEST(ShardAllocatorTest, InitRejectsAmbiguousOrNoncontiguousLayout) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     for (const std::string& second_name :
@@ -751,7 +750,7 @@ TEST(DfsGlobalAllocatorTest, InitRejectsAmbiguousOrNoncontiguousLayout) {
         ASSERT_TRUE(
             adapter.PreallocateFile(tmp.file("dfs_shard_00.data"), 8192));
         ASSERT_TRUE(adapter.PreallocateFile(tmp.file(second_name), 8192));
-        DfsGlobalAllocator alloc;
+        ShardAllocator alloc;
         auto result =
             alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096));
         ASSERT_FALSE(result);
@@ -764,7 +763,7 @@ TEST(DfsGlobalAllocatorTest, InitRejectsAmbiguousOrNoncontiguousLayout) {
     }
 }
 
-TEST(DfsGlobalAllocatorTest, InitRejectsExistingCapacityWithoutTruncation) {
+TEST(ShardAllocatorTest, InitRejectsExistingCapacityWithoutTruncation) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_invalid_shard_capacity");
@@ -772,7 +771,7 @@ TEST(DfsGlobalAllocatorTest, InitRejectsExistingCapacityWithoutTruncation) {
     PosixFsAdapter adapter;
     ASSERT_TRUE(adapter.Init(tmp.path()));
     ASSERT_TRUE(adapter.PreallocateFile(path, 4096));
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     auto result = alloc.Init(MakeAllocatorConfig(tmp.path(), 2, 8192, 4096));
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
@@ -782,11 +781,11 @@ TEST(DfsGlobalAllocatorTest, InitRejectsExistingCapacityWithoutTruncation) {
     EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
 }
 
-TEST(DfsGlobalAllocatorTest, FailedExpansionPreservesExistingUnpublishedShard) {
+TEST(ShardAllocatorTest, FailedExpansionPreservesExistingUnpublishedShard) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_expand_existing_failure");
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
     // A previous interrupted expansion may have left a complete shard. Failed
     // retries must only clean files created by the current operation.
@@ -806,11 +805,11 @@ TEST(DfsGlobalAllocatorTest, FailedExpansionPreservesExistingUnpublishedShard) {
     EXPECT_EQ(alloc.GetShardCount(), 4);
 }
 
-TEST(DfsGlobalAllocatorTest, FailedExpansionDoesNotPublishPartialCapacity) {
+TEST(ShardAllocatorTest, FailedExpansionDoesNotPublishPartialCapacity) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_expand_failure");
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
     // The second new shard cannot be prepared. The first must not become
     // visible to allocators when the whole expansion request fails.
@@ -829,11 +828,11 @@ TEST(DfsGlobalAllocatorTest, FailedExpansionDoesNotPublishPartialCapacity) {
     EXPECT_EQ(alloc.GetShardCount(), 3);
 }
 
-TEST(DfsGlobalAllocatorTest, PreparedEvictionRemainsValidAcrossExpansion) {
+TEST(ShardAllocatorTest, PreparedEvictionRemainsValidAcrossExpansion) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_expand_eviction");
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
     auto old = alloc.Allocate("old", 100);
     ASSERT_TRUE(old);
@@ -848,11 +847,11 @@ TEST(DfsGlobalAllocatorTest, PreparedEvictionRemainsValidAcrossExpansion) {
     EXPECT_TRUE(alloc.PrepareEviction().Empty());
 }
 
-TEST(DfsGlobalAllocatorTest, ConcurrentExpansionAllocationAndEvictionRestore) {
+TEST(ShardAllocatorTest, ConcurrentExpansionAllocationAndEvictionRestore) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_expand_concurrent");
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 1 << 20, 4096)));
     std::atomic<bool> start{false};
     std::atomic<int> failures{0};
@@ -968,7 +967,7 @@ class DfsBackendTest : public ::testing::Test {
 
     std::string ShardPath(int shard_idx) const {
         return tmp_->file("dfs_shard_" +
-                          DfsGlobalAllocator::FormatShardIdx(shard_idx, 4) +
+                          ShardAllocator::FormatShardIdx(shard_idx, 4) +
                           ".data");
     }
 
@@ -1162,7 +1161,7 @@ TEST(DfsBackendInitializationTest, ClientBeforeMasterDoesNotCreateShards) {
     ASSERT_TRUE(client.Init());
     EXPECT_TRUE(std::filesystem::is_empty(tmp.path()));
 
-    DfsGlobalAllocator allocator;
+    ShardAllocator allocator;
     ASSERT_TRUE(allocator.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
     EXPECT_EQ(allocator.GetShardCount(), 1);
     EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
@@ -1187,7 +1186,7 @@ TEST(DfsBackendInitializationTest, DoesNotCacheRolledBackPreparedShard) {
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_prepared_shard_rollback");
     auto config = MakeAllocatorConfig(tmp.path(), 1, 8192, 4096);
-    DfsGlobalAllocator allocator;
+    ShardAllocator allocator;
     ASSERT_TRUE(allocator.Init(config));
     PosixFsAdapter adapter;
     ASSERT_TRUE(adapter.Init(tmp.path()));

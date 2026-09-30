@@ -769,6 +769,7 @@ endif()
 
 if(USE_SHCA)
   add_compile_definitions(USE_SHCA)
-else()
+elseif(YLT_ENABLE_IBV)
+  # YLT_ENABLE_IBV is set in FindYLT.cmake (OFF on macOS).
   add_compile_definitions(YLT_ENABLE_IBV)
 endif()

@@ -153,9 +153,12 @@ struct Request {
                  // name transport.
     // Optional SLO deadline as an absolute steady_clock timestamp in
     // nanoseconds. 0 = no deadline (default), behaves exactly as today.
-    // When set, the engine emits an observability-only feasibility metric
-    // (MLU = actual transfer time / available window) on completion; it does
-    // not yet drive any admission or scheduling decision. See RFC #2519.
+    // When set, the engine records the feasibility metric (MLU = actual
+    // transfer time / available window) on completion, and -- each opt-in --
+    // the admission queue orders, promotes and may cancel the request by it
+    // (runtime_queue/*) and the RDMA workers order posts by it
+    // (transports/rdma/deadline_bw_arbitration). See RFC #2519, RFC #2792
+    // and docs/source/design/tent/deadline-scheduling.md.
     uint64_t deadline_ns = 0;
     IntentType intent_type = IntentType::INTENT_UNSPEC;
 };

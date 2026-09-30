@@ -144,6 +144,12 @@ Status TransferEngine::submitTransfer(
     return impl_->submitTransfer(batch_id, request_list);
 }
 
+Status TransferEngine::submitTransferRequiringPostSubmitCancellation(
+    BatchID batch_id, const std::vector<Request>& request_list) {
+    return impl_->submitTransferRequiringPostSubmitCancellation(batch_id,
+                                                                request_list);
+}
+
 Status TransferEngine::submitTransfer(BatchID batch_id,
                                       const std::vector<Request>& request_list,
                                       const Notification& notifi) {

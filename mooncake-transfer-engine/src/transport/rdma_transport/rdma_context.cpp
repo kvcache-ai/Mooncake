@@ -332,6 +332,16 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
         cq_list_[i].native = cq;
     }
 
+    native_notify_enabled_ = globalConfig().rdma_notify_enabled &&
+                             std::string(engine_.getName()) == "rdma";
+    if (native_notify_enabled_) {
+        notify_cq_ = ibv_create_cq(context_, globalConfig().max_cqe, nullptr,
+                                   nullptr, 0);
+        if (!notify_cq_) {
+            PLOG(ERROR) << "Failed to create notification completion queue";
+            return ERR_CONTEXT;
+        }
+    }
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
 
 #ifdef USE_MLX5DV
@@ -350,6 +360,45 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 #endif
 
     return 0;
+}
+
+void RdmaContext::registerNotifyQp(
+    uint32_t qp_num, const std::weak_ptr<RdmaEndPoint> &endpoint) {
+    std::lock_guard<std::mutex> guard(notify_mutex_);
+    notify_endpoints_[qp_num] = endpoint;
+}
+
+void RdmaContext::unregisterNotifyQp(uint32_t qp_num) {
+    std::lock_guard<std::mutex> guard(notify_mutex_);
+    notify_endpoints_.erase(qp_num);
+}
+
+void RdmaContext::dispatchNotificationCompletion(
+    const ibv_wc &wc, std::vector<TransferMetadata::NotifyDesc> &received) {
+    std::shared_ptr<RdmaEndPoint> endpoint;
+    {
+        std::lock_guard<std::mutex> guard(notify_mutex_);
+        auto it = notify_endpoints_.find(wc.qp_num);
+        if (it != notify_endpoints_.end()) endpoint = it->second.lock();
+    }
+    // Never acquire endpoint locks under notify_mutex_. Teardown takes them
+    // in the opposite direction. The strong reference protects this callback.
+    if (endpoint) endpoint->handleNotificationCompletion(wc, received);
+}
+
+int RdmaContext::pollNotificationCq() {
+    if (!notify_cq_) return 0;
+    ibv_wc completions[32];
+    const int count = ibv_poll_cq(notify_cq_, 32, completions);
+    if (count < 0) {
+        PLOG(ERROR) << "Failed to poll notification completion queue";
+        return count;
+    }
+    std::vector<TransferMetadata::NotifyDesc> received;
+    for (int i = 0; i < count; ++i)
+        dispatchNotificationCompletion(completions[i], received);
+    for (const auto &message : received) engine_.meta()->pushNotify(message);
+    return count;
 }
 
 int RdmaContext::socketId() {
@@ -391,6 +440,16 @@ int RdmaContext::deconstruct() {
             LOG(ERROR) << "Failed to destroy all QPs before MR deregistration";
         }
     }
+
+    // All endpoint QPs must be destroyed before the shared notification CQ.
+    if (notify_cq_) {
+        if (ibv_destroy_cq(notify_cq_)) {
+            LOG(ERROR) << "Failed to destroy shared notification CQ";
+        } else {
+            notify_cq_ = nullptr;
+        }
+    }
+    notify_endpoints_.clear();
 
     for (auto &[_, entry] : memory_region_map_) {
         int ret = ibv_dereg_mr(entry.mr);
