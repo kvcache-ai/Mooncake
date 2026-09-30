@@ -11229,19 +11229,30 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 segment_name);
         }
 
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
         std::vector<std::pair<Segment, UUID>> unready_segments;
-        if (segment_access.GetUnreadySegments(unready_segments) ==
-            ErrorCode::OK) {
+        ErrorCode unready_err = ErrorCode::SEGMENT_NOT_FOUND;
+        {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            unready_err = segment_access.GetUnreadySegments(unready_segments);
+        }
+        if (unready_err == ErrorCode::OK) {
             for (const auto& [segment, client_id] : unready_segments) {
                 UnmountSegment(segment.id, client_id);
             }
         }
 
         std::vector<std::pair<Segment, UUID>> all_segments;
-        auto err = segment_access.GetAllSegments(all_segments);
+        ErrorCode err = ErrorCode::SEGMENT_NOT_FOUND;
+        {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            err = segment_access.GetAllSegments(all_segments);
+        }
 
+        // UnmountSegment() and Ping() acquire client_mutex_; do not call them
+        // while holding segment_mutex_, or the order inverts against
+        // MountSegment()/UnmountSegment() and can deadlock.
         if (err == ErrorCode::OK) {
             int64_t total_size = 0;
             for (const auto& [segment, client_id] : all_segments) {
