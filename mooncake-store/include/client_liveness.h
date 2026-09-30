@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 
 namespace mooncake {
@@ -145,8 +147,7 @@ class ClientLivenessRecord {
                 case ClientLivenessState::ACTIVE:
                     if (now - last_liveness_at_ >= active_ttl) {
                         suspected_since_ = now;
-                        state_.store(ClientLivenessState::SUSPECTED,
-                                     std::memory_order_release);
+                        PublishStateLocked(ClientLivenessState::SUSPECTED);
                         transition = ClientLivenessTransition::BECAME_SUSPECTED;
                     }
                     break;
@@ -155,8 +156,7 @@ class ClientLivenessRecord {
                         // Publish the external barrier before OFFLINE so a
                         // concurrent snapshot cannot miss terminal work.
                         std::forward<ReserveRetirement>(reserve_retirement)();
-                        state_.store(ClientLivenessState::OFFLINE,
-                                     std::memory_order_release);
+                        PublishStateLocked(ClientLivenessState::OFFLINE);
                         transition = ClientLivenessTransition::BECAME_OFFLINE;
                     }
                     break;
@@ -174,12 +174,51 @@ class ClientLivenessRecord {
     }
 
    private:
+    friend class SegmentAllocatorRegistration;
+
+    // These callbacks only update serving-name counters. They must not acquire
+    // transition_mutex_ or any client, segment, or metadata lock. A separate
+    // mutex allows mounting to subscribe inside ObserveAndRun's operation.
+    void AddServingObserver(const void* owner,
+                            std::function<void(bool)> observer) {
+        std::lock_guard lock(serving_observers_mutex_);
+        const auto [it, inserted] =
+            serving_observers_.emplace(owner, std::move(observer));
+        if (inserted && IsServing()) {
+            it->second(true);
+        }
+    }
+
+    void RemoveServingObserver(const void* owner) {
+        std::lock_guard lock(serving_observers_mutex_);
+        const auto it = serving_observers_.find(owner);
+        if (it != serving_observers_.end()) {
+            if (IsServing()) {
+                it->second(false);
+            }
+            serving_observers_.erase(it);
+        }
+    }
+
+    // Caller holds transition_mutex_. Ordinary ACTIVE heartbeats never enter
+    // this path; observers run only when the serving state changes.
+    void PublishStateLocked(ClientLivenessState next) {
+        std::lock_guard lock(serving_observers_mutex_);
+        const bool was_serving = IsServing();
+        state_.store(next, std::memory_order_release);
+        const bool serving = next == ClientLivenessState::ACTIVE;
+        if (was_serving != serving) {
+            for (const auto& [owner, observer] : serving_observers_) {
+                observer(serving);
+            }
+        }
+    }
+
     [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
         TimePoint now, ClientLivenessState current_state) {
         last_liveness_at_ = now;
         if (current_state == ClientLivenessState::SUSPECTED) {
-            state_.store(ClientLivenessState::ACTIVE,
-                         std::memory_order_release);
+            PublishStateLocked(ClientLivenessState::ACTIVE);
             return ClientLivenessObservation::RECOVERED_ACTIVE;
         }
         return ClientLivenessObservation::REFRESHED_ACTIVE;
@@ -187,6 +226,9 @@ class ClientLivenessRecord {
 
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
     std::mutex transition_mutex_;
+    std::mutex serving_observers_mutex_;
+    std::unordered_map<const void*, std::function<void(bool)>>
+        serving_observers_;
     TimePoint last_liveness_at_;
     TimePoint suspected_since_{};
 };

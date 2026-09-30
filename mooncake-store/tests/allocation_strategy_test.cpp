@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <cmath>
 #include <iomanip>
 #include <memory>
@@ -11,6 +13,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -161,6 +164,145 @@ TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
                       .buffer_descriptor.transport_endpoint_,
                   expected_endpoint);
     }
+}
+
+TEST_F(AllocationStrategyTest, ServingNameCountTracksDistinctNamesAndLiveness) {
+    using namespace std::chrono_literals;
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    auto first = std::make_shared<ClientLivenessRecord>(initial);
+    auto second = std::make_shared<ClientLivenessRecord>(initial);
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "count", DEFAULT_CXL_BASE, 64 * MiB, "count");
+    AllocatorManager manager;
+    const auto check_count = [&](size_t expected) {
+        EXPECT_EQ(manager.getServingNameCount(), expected);
+        EXPECT_EQ(manager.getServingNameCount(),
+                  manager.getServingNames().size());
+    };
+    check_count(0);
+    auto shared_first = manager.addAllocator("shared", allocator, first);
+    auto only_first = manager.addAllocator("only_first", allocator, first);
+    check_count(2);
+    ASSERT_EQ(second->Evaluate(initial + 1s, 1s, 1s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    std::shared_ptr<SegmentAllocatorRegistration> shared_second;
+    // Mount subscribes inside ObserveAndRun, while transition_mutex_ is held.
+    EXPECT_EQ(second->ObserveAndRun(initial + 2s,
+                                    [&] {
+                                        shared_second = manager.addAllocator(
+                                            "shared", allocator, second);
+                                        return true;
+                                    }),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    check_count(2);
+    EXPECT_EQ(first->Evaluate(initial + 3s, 1s, 1s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    check_count(1);
+    EXPECT_EQ(second->Evaluate(initial + 3s, 1s, 1s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    check_count(0);
+    EXPECT_EQ(first->Observe(initial + 4s),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    check_count(2);
+    EXPECT_EQ(first->Observe(initial + 5s),
+              ClientLivenessObservation::REFRESHED_ACTIVE);
+    check_count(2);
+    EXPECT_TRUE(manager.removeAllocator("only_first", only_first));
+    check_count(1);
+    EXPECT_TRUE(manager.removeAllocator("shared", shared_first));
+    check_count(0);
+    EXPECT_EQ(second->Evaluate(initial + 5s, 1s, 1s),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    EXPECT_EQ(second->Observe(initial + 6s),
+              ClientLivenessObservation::REJECTED_OFFLINE);
+    check_count(0);
+    EXPECT_TRUE(manager.removeAllocator("shared", shared_second));
+    auto unbound = manager.addAllocator("unbound", allocator);
+    check_count(1);
+    EXPECT_TRUE(manager.removeAllocator("unbound", unbound));
+    check_count(0);
+}
+
+TEST_F(AllocationStrategyTest,
+       ServingNameCountSurvivesMovesAndDetachedSnapshots) {
+    using namespace std::chrono_literals;
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    auto first = std::make_shared<ClientLivenessRecord>(initial);
+    auto replaced = std::make_shared<ClientLivenessRecord>(initial);
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "count", DEFAULT_CXL_BASE, 64 * MiB, "count");
+    AllocatorManager manager;
+    manager.addAllocator("first", allocator, first);
+    auto snapshot = manager.Snapshot();
+    manager.addAllocator("second", allocator);
+    EXPECT_EQ(snapshot.getServingNameCount(), 1);
+    EXPECT_EQ(manager.getServingNameCount(), 2);
+    AllocatorManager moved(std::move(manager));
+    AllocatorManager target;
+    target.addAllocator("replaced", allocator, replaced);
+    auto replaced_snapshot = target.Snapshot();
+    target = std::move(moved);
+    EXPECT_EQ(replaced->Evaluate(initial + 1s, 1s, 1s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_EQ(target.getServingNameCount(), 2);
+    EXPECT_EQ(replaced_snapshot.getServingNameCount(), 0);
+    EXPECT_EQ(first->Evaluate(initial + 1s, 1s, 1s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_EQ(target.getServingNameCount(), 1);
+    EXPECT_EQ(snapshot.getServingNameCount(), 0);
+    snapshot = AllocatorManager();
+    EXPECT_EQ(first->Observe(initial + 2s),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    EXPECT_EQ(target.getServingNameCount(), 2);
+    target = AllocatorManager();
+    EXPECT_EQ(first->Evaluate(initial + 3s, 1s, 1s),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_EQ(target.getServingNameCount(), 0);
+}
+
+TEST_F(AllocationStrategyTest,
+       ServingNameCountHandlesConcurrentSubscriptionChanges) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    auto record = std::make_shared<ClientLivenessRecord>(initial);
+    auto other_record = std::make_shared<ClientLivenessRecord>(initial);
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "count", DEFAULT_CXL_BASE, 64 * MiB, "count");
+    AllocatorManager manager;
+    manager.addAllocator("shared", allocator, record);
+    manager.addAllocator("shared", allocator, other_record);
+    std::barrier start(4);
+    std::atomic<int> running{3};
+    const auto change_state = [&](const auto& client) {
+        start.arrive_and_wait();
+        for (int i = 0; i < 1000; ++i) {
+            (void)client->Evaluate(initial, {}, {});
+            (void)client->Observe(initial);
+        }
+        --running;
+    };
+    std::thread transitions([&] { change_state(record); });
+    std::thread other_transitions([&] { change_state(other_record); });
+    std::thread subscriptions([&] {
+        start.arrive_and_wait();
+        for (int i = 0; i < 1000; ++i) {
+            auto registration =
+                manager.addAllocator("shared", allocator, record);
+            EXPECT_TRUE(manager.removeAllocator("shared", registration));
+        }
+        --running;
+    });
+    start.arrive_and_wait();
+    bool count_in_range = true;
+    while (running.load() != 0) {
+        count_in_range &= manager.getServingNameCount() <= 1;
+        std::this_thread::yield();
+    }
+    transitions.join();
+    other_transitions.join();
+    subscriptions.join();
+    EXPECT_TRUE(count_in_range);
+    EXPECT_EQ(manager.getServingNameCount(), 1);
+    EXPECT_EQ(manager.getServingNameCount(), manager.getServingNames().size());
 }
 
 // Test preferred segment allocation when available
