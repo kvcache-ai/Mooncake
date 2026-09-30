@@ -127,7 +127,8 @@ bool ParseCacheGroup(const Json::Value& raw,
 
 }  // namespace
 
-std::vector<common::ServiceConfig> ParseConfig(int* http_server_port) {
+std::vector<common::ServiceConfig> ParseConfig(int* http_server_port,
+                                               int* rpc_server_port) {
     const std::string config_path =
         common::LoadEnv("CONDUCTOR_CONFIG_PATH", DefaultConductorConfigPath());
 
@@ -155,6 +156,13 @@ std::vector<common::ServiceConfig> ParseConfig(int* http_server_port) {
         cfg.isMember("http_server_port") && cfg["http_server_port"].isNumeric()
             ? cfg["http_server_port"].asInt()
             : 0;
+
+    // An absent rpc_server_port field keeps the caller's incoming value, so
+    // the compiled-in default stays in effect; an explicit 0 disables the
+    // RPC channel.
+    if (cfg.isMember("rpc_server_port") && cfg["rpc_server_port"].isNumeric()) {
+        *rpc_server_port = cfg["rpc_server_port"].asInt();
+    }
 
     std::vector<common::ServiceConfig> services;
     const Json::Value& instances = cfg["kvevent_instance"];

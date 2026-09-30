@@ -79,6 +79,8 @@ struct CacheHitResult {
     int64_t cpu_local = 0;
     int64_t cpu_share = 0;
     int64_t disk = 0;
+
+    bool operator==(const CacheHitResult&) const = default;
 };
 
 struct ContextView {
