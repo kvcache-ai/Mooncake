@@ -96,6 +96,7 @@ TransferEngine::TransferEngine(bool auto_discover,
 TransferEngine::TransferEngine(TransferEngine&& other) noexcept
     : impl_(std::move(other.impl_)),
       impl_tent_(std::move(other.impl_tent_)),
+      metadata_conn_string_(std::move(other.metadata_conn_string_)),
       use_tent_(other.use_tent_) {
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -111,6 +112,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     impl_ = std::move(other.impl_);
     impl_tent_ = std::move(other.impl_tent_);
     tent_device_filter_ = std::move(other.tent_device_filter_);
+    metadata_conn_string_ = std::move(other.metadata_conn_string_);
     use_tent_ = other.use_tent_;
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -127,8 +129,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name,
                          uint64_t rpc_port) {
-    return impl_->init(metadata_conn_string, local_server_name, ip_or_host_name,
-                       rpc_port);
+    const int result = impl_->init(metadata_conn_string, local_server_name,
+                                   ip_or_host_name, rpc_port);
+    if (result == 0) metadata_conn_string_ = metadata_conn_string;
+    return result;
 }
 
 int TransferEngine::init(const std::string& metadata_conn_string,
@@ -141,6 +145,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
+    metadata_conn_string_.clear();
     detachShutdownToken(shutdown_token_);
     if (impl_) {
         if (impl_.use_count() == 1) impl_->freeEngine();
@@ -582,6 +587,7 @@ TransferEngine::TransferEngine(TransferEngine&& other) noexcept
       tent_compat_transport_(std::move(other.tent_compat_transport_)),
       shutdown_token_(nullptr),
       tent_device_filter_(std::move(other.tent_device_filter_)),
+      metadata_conn_string_(std::move(other.metadata_conn_string_)),
       use_tent_(other.use_tent_) {
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -598,6 +604,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     impl_tent_ = std::move(other.impl_tent_);
     tent_compat_transport_ = std::move(other.tent_compat_transport_);
     tent_device_filter_ = std::move(other.tent_device_filter_);
+    metadata_conn_string_ = std::move(other.metadata_conn_string_);
     use_tent_ = other.use_tent_;
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -665,8 +672,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
     if (!use_tent_) {
-        return impl_->init(metadata_conn_string, local_server_name,
-                           ip_or_host_name, rpc_port);
+        const int result = impl_->init(metadata_conn_string, local_server_name,
+                                       ip_or_host_name, rpc_port);
+        if (result == 0) metadata_conn_string_ = metadata_conn_string;
+        return result;
     } else {
         auto config = buildTentConfig(metadata_conn_string, local_server_name);
         if (protocol == "tcp") {
@@ -691,11 +700,14 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         }
 #endif
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
-        return impl_tent_->available() ? 0 : ERR_CONTEXT;
+        if (!impl_tent_->available()) return ERR_CONTEXT;
+        metadata_conn_string_ = metadata_conn_string;
+        return 0;
     }
 }
 
 int TransferEngine::freeEngine() {
+    metadata_conn_string_.clear();
     detachShutdownToken(shutdown_token_);
     {
         std::lock_guard<std::mutex> lock(tent_compat_transport_mutex_);

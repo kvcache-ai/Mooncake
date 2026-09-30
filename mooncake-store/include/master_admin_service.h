@@ -28,6 +28,8 @@ class MasterAdminServer {
 
     ~MasterAdminServer();
 
+    uint16_t port() const { return http_server_.port(); }
+
     bool Start();
 
     void Stop();
