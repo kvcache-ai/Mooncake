@@ -84,6 +84,7 @@ class OrderedOpLogWriter;
 
 namespace test {
 class MasterServiceTestPeer;
+class PrefetchTaskMasterTest;
 }  // namespace test
 
 // std::unordered_map/set never shrink their bucket array on erase, so a
@@ -127,6 +128,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 class MasterService {
     friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
+    friend class test::PrefetchTaskMasterTest;
     friend class MasterSnapshotManager;  // Allow access to internal state for
                                          // snapshot
     friend class ClientOffboardingWorker;
@@ -805,6 +807,30 @@ class MasterService {
                              const TenantId& tenant_id, uint64_t size,
                              const std::vector<std::string>& preferred_segments)
         -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
+
+    /**
+     * @brief Register an in-flight promotion task for SSD prefetch.
+     *
+     * Records a PromotionTask without going through the promotion-on-hit
+     * admission gates (frequency sketch, DRAM watermark) and without pushing
+     * onto the holder client's promotion heartbeat mailbox. The caller (the
+     * holder of the LOCAL_DISK replica) is expected to execute the transfer
+     * immediately via PromotionAllocStart + PromotionWrite +
+     * NotifyPromotionSuccess (e.g. FileStorage::PrefetchKeys).
+     *
+     * Shares the promotion_in_flight_ / promotion_queue_limit_ cap with
+     * promotion-on-hit: prefetch and on-hit promotion compete for the same
+     * DRAM resource, so they draw from the same budget.
+     *
+     * Returns PROMOTION_ALREADY_EXISTS when a MEMORY replica or an in-flight
+     * promotion task already exists for the key — a normal outcome for
+     * best-effort prefetch, not an error; callers should skip silently.
+     * Only the holder client may register (holder_id == client_id), others
+     * receive INVALID_PARAMS.
+     */
+    auto RegisterPrefetchTask(const UUID& client_id, const std::string& key,
+                              const TenantId& tenant_id)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; decrement source

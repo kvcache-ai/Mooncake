@@ -10080,6 +10080,102 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
                                              promotion_max_per_heartbeat_);
 }
 
+auto MasterService::RegisterPrefetchTask(const UUID& client_id,
+                                         const std::string& key,
+                                         const TenantId& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    const auto record = FindClientRecord(client_id);
+    auto serving_guard =
+        record ? record->TryAcquireServingGuard() : std::nullopt;
+    if (!serving_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    auto& tenant_state = accessor.GetTenantState();
+
+    // A primary Put/Upsert owns all PROCESSING replicas while the key is in
+    // processing_keys. Prefetch promotion must not establish a second owner.
+    if (accessor.InProcessing()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Already resident or already in flight (either a prefetch task or a
+    // promotion-on-hit task): a normal outcome for best-effort prefetch,
+    // reported distinctly so the caller can skip silently instead of
+    // running the promotion chain into a guaranteed failure.
+    if (metadata.HasReplica(&Replica::fn_is_memory_replica) ||
+        tenant_state.promotion_tasks.count(object_id.user_key) > 0) {
+        return tl::make_unexpected(ErrorCode::PROMOTION_ALREADY_EXISTS);
+    }
+
+    // Find a COMPLETE LOCAL_DISK source replica. A still-PROCESSING disk
+    // replica (offload in flight) is not readable yet.
+    Replica* source = nullptr;
+    metadata.VisitReplicas(&Replica::fn_is_local_disk_replica,
+                           [&source](Replica& r) {
+                               if (source == nullptr && r.is_completed()) {
+                                   source = &r;
+                               }
+                           });
+    if (source == nullptr) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Holder-only gate, mirroring PromotionAllocStart: the client executing
+    // the promotion must own the source LOCAL_DISK replica.
+    auto holder_id = source->get_local_disk_client_id();
+    if (!holder_id.has_value() || holder_id.value() != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Shared cap with promotion-on-hit (advisory TOCTOU, same as the
+    // admission path's soft cap).
+    if (promotion_in_flight_.load(std::memory_order_relaxed) >=
+        promotion_queue_limit_) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+
+    // Pin the source replica, then record the in-flight task. alloc_id is
+    // filled in by PromotionAllocStart once the new MEMORY replica is
+    // staged. No promotion mailbox push: the prefetch caller drives the
+    // execution chain directly.
+    //
+    // Propagate the execution-failure count across the candidate's
+    // consumption, same contract as TryPushPromotionQueue: without it a
+    // persistently failing hot key would cycle prefetch -> fail -> on-hit
+    // retry -> re-record -> prefetch with the breaker reset to zero every
+    // time a probe re-triggers.
+    source->inc_refcnt();
+    const uint64_t object_size =
+        source->get_descriptor().get_local_disk_descriptor().object_size;
+    uint32_t execution_failures = 0;
+    if (auto cit = tenant_state.promotion_candidates.find(object_id.user_key);
+        cit != tenant_state.promotion_candidates.end()) {
+        execution_failures = cit->second.execution_failures;
+    }
+    EraseCandidate(tenant_state, object_id.user_key);
+    tenant_state.promotion_tasks.emplace(
+        object_id.user_key,
+        PromotionTask{.source_id = source->id(),
+                      .alloc_id = 0,
+                      .object_size = object_size,
+                      .start_time = std::chrono::system_clock::now(),
+                      .holder_id = holder_id.value(),
+                      .execution_failures = execution_failures,
+                      .from_prefetch = true});
+    promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().inc_promotion_in_flight();
+    VLOG(1) << "prefetch_task_registered key=" << object_id.user_key
+            << " size=" << object_size;
+    return {};
+}
+
 auto MasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     uint64_t size, const std::vector<std::string>& preferred_segments)
@@ -10251,6 +10347,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (task_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    const bool from_prefetch = task_it->second.from_prefetch;
 
     bool committed = false;
     Replica* staged = metadata.GetReplicaByID(task_it->second.alloc_id);
@@ -10342,6 +10439,12 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
     SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
+    if (from_prefetch) {
+        // Prefetch-promoted keys get the same read lease as exist/get so the
+        // DRAM replica survives until the follow-up get() arrives.
+        metadata.GrantReadLease(
+            std::chrono::milliseconds(default_kv_lease_ttl_));
+    }
     return {};
 }
 
@@ -10397,6 +10500,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // Capture the chain's execution-failure count BEFORE erasing the task
     // (the iterator is invalidated by the erase).
     const uint32_t prior_failures = task_it->second.execution_failures;
+    const bool from_prefetch = task_it->second.from_prefetch;
     tenant_state.promotion_tasks.erase(task_it);
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     MasterMetricManager::instance().dec_promotion_in_flight();
@@ -10419,7 +10523,14 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // re-record -> re-admit -> fail -> re-record forever, monopolizing
     // delivery slots with no read demand. Once the bound is hit we stop
     // re-recording — a genuine read can still re-admit the key (fresh chain).
-    if (!metadata.HasReplica(&Replica::fn_is_memory_replica) &&
+    //
+    // from_prefetch tasks skip this re-record: prefetch retries are driven
+    // by the client-side throttle (probe re-trigger after its backoff), not
+    // by the on-hit retry pipeline. With promotion_on_hit off the sweeper
+    // never runs, so a recorded candidate would leak (and pin the tenant
+    // state) permanently.
+    if (!from_prefetch &&
+        !metadata.HasReplica(&Replica::fn_is_memory_replica) &&
         metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
         if (prior_failures >= kMaxPromotionExecutionFailures) {
             LOG(WARNING) << "promotion_execution_gave_up key="

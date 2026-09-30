@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -281,6 +282,18 @@ class StorageBackendInterface {
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
 
     virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
+
+    /**
+     * @brief Returns the stored data size for a key, or std::nullopt when the
+     * key is unknown (or the backend cannot answer cheaply). Used by SSD
+     * prefetch to size the staging allocation from authoritative local
+     * metadata instead of trusting a remote caller's hint.
+     */
+    virtual std::optional<int64_t> GetObjectDataSize(
+        const std::string& key) const {
+        (void)key;
+        return std::nullopt;
+    }
 
     virtual tl::expected<bool, ErrorCode> IsEnableOffloading() = 0;
 
@@ -810,6 +823,13 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+
+    /**
+     * @brief Returns the data size recorded in the in-memory bucket index,
+     * or std::nullopt when the key is unknown.
+     */
+    std::optional<int64_t> GetObjectDataSize(
+        const std::string& key) const override;
 
     /**
      * @brief Scan existing object metadata from storage and report via handler.

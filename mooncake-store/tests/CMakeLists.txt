@@ -260,6 +260,9 @@ add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(client_host_identity_config_test
                client_host_identity_config_test.cpp)
+add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
+add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)
+add_store_test(prefetch_task_master_test prefetch_task_master_test.cpp)
 add_store_test(client_metric_config_test client_metric_config_test.cpp)
 add_test(
   NAME client_metric_cluster_id_test

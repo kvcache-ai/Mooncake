@@ -2170,6 +2170,15 @@ PYBIND11_MODULE(store, m) {
         .value("FAILED", ReplicaStatus::FAILED)
         .export_values();
 
+    py::class_<ExistOptions>(m, "ExistOptions")
+        .def(py::init<>())
+        .def_readwrite("prefetch_to_memory", &ExistOptions::prefetch_to_memory)
+        .def("__str__", [](const ExistOptions &options) {
+            std::ostringstream oss;
+            oss << options;
+            return oss.str();
+        });
+
     py::class_<MemoryDescriptor>(m, "MemoryDescriptor")
         .def_readwrite("buffer_descriptor",
                        &MemoryDescriptor::buffer_descriptor);
@@ -2474,7 +2483,15 @@ PYBIND11_MODULE(store, m) {
             "  tenant_id: Tenant identifier (default 'default').\n"
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
-            "  client_http_port: Client HTTP metrics port (default 9300).")
+            "  client_http_port: Client HTTP metrics port (default 9300).\n"
+            "  enable_ssd_prefetch: Enable best-effort SSD-to-DRAM prefetch "
+            "on exist probes (default false).\n"
+            "  ssd_prefetch_cooldown_sec: Prefetch memory-pressure backoff "
+            "in seconds (default 5, 0 disables).\n"
+            "  ssd_prefetch_dedup_ttl_sec: Prefetch per-key dedup/rate-limit "
+            "TTL in seconds (default 30, 0 disables).\n"
+            "  ssd_get_wait_ms: get-side prefetch wait budget in "
+            "milliseconds (default 0 = no waiting).")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
@@ -2583,20 +2600,32 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"), py::arg("force") = false,
             "Batch remove objects by keys. Returns a list of status codes "
             "(0=success, negative=error code) for each key.")
-        .def("is_exist",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
-                 py::gil_scoped_release release;
-                 return self.store_->isExist(key);
-             })
+        .def(
+            "is_exist",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               const ExistOptions &options) {
+                py::gil_scoped_release release;
+                return self.store_->isExist(key, options);
+            },
+            py::arg("key"), py::arg("options") = ExistOptions{},
+            "Check if an object exists. Returns 1 if exists, 0 if not "
+            "exists, negative error code on failure. When "
+            "options.prefetch_to_memory is true and the client is configured "
+            "with enable_ssd_prefetch, SSD-only keys get a best-effort "
+            "asynchronous SSD-to-DRAM promotion so a later get can hit DRAM.")
         .def(
             "batch_is_exist",
             [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+               const std::vector<std::string> &keys,
+               const ExistOptions &options) {
                 py::gil_scoped_release release;
-                return self.store_->batchIsExist(keys);
+                return self.store_->batchIsExist(keys, options);
             },
-            py::arg("keys"),
-            "Check if multiple objects exist. Returns list of results: 1 if "
+            py::arg("keys"), py::arg("options") = ExistOptions{},
+            "Check if multiple objects exist. When options.prefetch_to_memory "
+            "is true (and enable_ssd_prefetch is configured), triggers "
+            "best-effort SSD-to-DRAM promotion for keys that only have "
+            "LOCAL_DISK replicas. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
         .def(
             "probe_key",
