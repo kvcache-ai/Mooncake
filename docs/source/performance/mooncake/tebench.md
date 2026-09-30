@@ -263,7 +263,10 @@ Example:
 
 ### 5.2 Data Consistency Check (`--check_consistency`)
 
-When enabled, the benchmark validates correctness in `mix` mode:
+When enabled, the benchmark runs and reports `mix` mode, including when
+`--op_type=read` or `--op_type=write` is requested. The `op_type` field in
+`--result_output_jsonl` records this effective mode. Both WRITE and READ
+batches contribute latency samples and transferred bytes:
 
 * Source buffers are filled with a known pattern before WRITE
 * Data is READ back and verified on the initiator
