@@ -1,6 +1,5 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 
-#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -9,6 +8,7 @@
 #include <glog/logging.h>
 
 #include "types.h"
+#include "config/ha_cluster_namespace_config.h"
 #include "ascii_string.h"
 #include "integer_parser.h"
 #ifdef STORE_USE_REDIS
@@ -331,11 +331,7 @@ ClusterNamespace RedisSnapshotCatalogStore::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
-    if (env_cluster_id != nullptr && *env_cluster_id != '\0') {
-        return env_cluster_id;
-    }
-    return DEFAULT_CLUSTER_ID;
+    return HaClusterNamespaceConfig::FromEnvironment().cluster_namespace;
 }
 
 std::string RedisSnapshotCatalogStore::BuildLatestKey(

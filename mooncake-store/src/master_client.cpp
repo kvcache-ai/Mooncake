@@ -28,8 +28,18 @@ struct RpcNameTraits<&WrappedMasterService::ExistKey> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ProbeKey> {
+    static constexpr const char* value = "ProbeKey";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
     static constexpr const char* value = "BatchExistKey";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchProbeKey> {
+    static constexpr const char* value = "BatchProbeKey";
 };
 
 template <>
@@ -343,6 +353,10 @@ template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
     const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
     Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     // Increment RPC counter
     if (metrics_) {
         metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
@@ -398,6 +412,11 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<ResultType, ErrorCode>>(
+            input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+    }
     auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
@@ -446,7 +465,14 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         }());
 }
 
-MasterClient::~MasterClient() = default;
+MasterClient::~MasterClient() {
+    // Never release the pool under a suspended request coroutine (#3909).
+    // 30s is generous: every request carries its own RPC timeout.
+    if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "MasterClient teardown: RPCs still in flight after "
+                      "30s drain; releasing the pool regardless";
+    }
+}
 
 void MasterClient::EnableHaConnectionPolicy() {
     MutexLocker lock(&connect_mutex_);
@@ -522,6 +548,28 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
+tl::expected<bool, ErrorCode> MasterClient::ProbeKey(
+    const std::string& object_key) {
+    ScopedVLogTimer timer(1, "MasterClient::ProbeKey");
+    timer.LogRequest("object_key=", object_key);
+
+    auto result = invoke_rpc<&WrappedMasterService::ProbeKey, bool>(
+        object_key, tenant_id_.value());
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchProbeKey(
+    const std::vector<std::string>& object_keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchProbeKey");
+    timer.LogRequest("keys_count=", object_keys.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchProbeKey, bool>(
+        object_keys.size(), object_keys, tenant_id_.value());
+    timer.LogResponse("result=", result.size(), " keys");
+    return result;
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 MasterClient::CalcCacheStats() {
     return invoke_rpc<&WrappedMasterService::CalcCacheStats,
@@ -553,8 +601,8 @@ MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
                      ", client_id=", client_id,
                      ", segment_name=", segment_name);
     auto result = invoke_rpc<&WrappedMasterService::BatchReplicaClear,
-                             std::vector<std::string>>(object_keys, client_id,
-                                                       segment_name);
+                             std::vector<std::string>>(
+        object_keys, client_id, segment_name, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }

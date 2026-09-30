@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -33,8 +34,16 @@ namespace mooncake {
 class ShutdownToken;
 class TransferEngineImpl;
 namespace tent {
+class Config;
 class TransferEngine;
-};
+};  // namespace tent
+
+namespace transfer_intent_values {
+inline constexpr int kUnspecified = 0;
+inline constexpr int kForegroundGet = 1;
+inline constexpr int kBackgroundPrefetch = 2;
+inline constexpr int kMigration = 3;
+}  // namespace transfer_intent_values
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 namespace device {
@@ -56,6 +65,12 @@ using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
 using NicLoadStats = Transport::NicLoadStats;
+
+struct SegmentBufferInfo {
+    uint64_t addr;
+    uint64_t length;
+    std::string location;
+};
 
 enum class PeerLiveness : uint8_t {
     Alive = 0,
@@ -104,6 +119,11 @@ class TransferEngine {
              const std::string& ip_or_host_name = "",
              uint64_t rpc_port = 12345);
 
+    int init(const std::string& metadata_conn_string,
+             const std::string& local_server_name,
+             const std::string& ip_or_host_name, uint64_t rpc_port,
+             const std::string& protocol);
+
     int freeEngine();
 
     Transport* installTransport(const std::string& proto, void** args);
@@ -115,8 +135,26 @@ class TransferEngine {
     int getRpcPort();
 
     bool isUsingTent() const { return use_tent_; }
+    // Expose the internal TENT engine so callers (Store, TransferSubmitter)
+    // can call tent::TransferEngine native API directly, bypassing the
+    // compat-layer type conversion. Returns nullptr when not in TENT mode.
+    std::shared_ptr<mooncake::tent::TransferEngine> getTentEngine() const {
+        return use_tent_ ? impl_tent_ : nullptr;
+    }
+
+    // Configuration of the successfully initialized engine, for clients that
+    // reuse it without repeating the metadata connection string.
+    const std::string& getMetadataConnectionString() const {
+        return metadata_conn_string_;
+    }
 
     SegmentHandle openSegment(const std::string& segment_name);
+
+    // Replace buffers with a snapshot of the segment's memory buffers.
+    // Return 0 on success (including an empty segment), or a negative ERR_*.
+    // On error, buffers is empty. Does not close the segment handle.
+    int getSegmentBuffers(SegmentHandle handle,
+                          std::vector<SegmentBufferInfo>& buffers);
 
     Status CheckSegmentStatus(SegmentID sid);
 
@@ -129,11 +167,14 @@ class TransferEngine {
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
-    // Allocate POSIX shm that ShmTransport can export to same-host peers.
+    // Allocate shared memory that ShmTransport can export to same-host peers.
     // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
     // Caller must registerLocalMemory before remote access. Returns nullptr
-    // on failure.
+    // on failure. Default: POSIX /dev/shm. With
+    // SharedMemoryOptions.use_hugepage and hugepage_size 2MB/512MB/1GB:
+    // matching hugetlbfs (no silent tmpfs fallback).
     void* allocateSharedMemory(size_t length);
+    void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
 
     int freeSharedMemory(void* addr);
 
@@ -153,6 +194,7 @@ class TransferEngine {
         std::span<const size_t> remote_offsets;
         std::span<const size_t> lengths;
         std::function<void(size_t, const Status&)> on_fragment_complete;
+        int intent_type = 0;
     };
 
     class ScatterTransferOperation {
@@ -183,6 +225,10 @@ class TransferEngine {
         friend class TransferEngine;
     };
 
+    // Under TENT, scatter pins a direct transport route that supports
+    // post-submit cancellation. Non-cancellable and staged routes are
+    // rejected before transport work is published; runtime queue admission
+    // and automatic failover are not used for this operation.
     ScatterTransferOperation submitScatter(
         const std::vector<ScatterTransferRange>& ranges);
     Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
@@ -218,10 +264,14 @@ class TransferEngine {
 
     BatchID allocateBatchID(size_t batch_size);
 
+    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
+    // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
+    // RDMA success means queued on the notification QP, not remote delivery.
+    // Completion errors are processed asynchronously; TCP fallback is sync.
     int sendNotifyByID(SegmentID target_id,
                        TransferMetadata::NotifyDesc notify_msg);
 
@@ -289,9 +339,23 @@ class TransferEngine {
     std::string showLinks(bool json = false) const;
 
    private:
+    Status submitScatterTransfer(BatchID batch_id,
+                                 const std::vector<TransferRequest>& entries);
+
+    std::shared_ptr<mooncake::tent::Config> buildTentConfig(
+        const std::string& metadata_conn_string,
+        const std::string& local_server_name) const;
+
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::unique_ptr<Transport> tent_compat_transport_;
+    std::mutex tent_compat_transport_mutex_;
+    std::once_flag tent_compat_log_once_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
+    // Classic callers provide this through TransferEngine(auto_discover,
+    // filter) before init() creates the native TENT engine.
+    std::vector<std::string> tent_device_filter_;
+    std::string metadata_conn_string_;
     bool use_tent_{false};
     friend class TransferEngineImplTestPeer;
 };

@@ -81,6 +81,7 @@ struct XferBenchConfig {
     static double qos_link_capacity_gbps;
     static std::string qos_output_jsonl;
     static std::string result_output_jsonl;
+    static std::string split_output_jsonl;
     static uint64_t request_interval_us;
     static uint64_t deadline_us;
     static int deadline_tight_threads;
@@ -91,6 +92,9 @@ struct XferBenchConfig {
     static int rpc_server_port;
     static std::string xport_type;
     static std::string backend;
+    static bool use_hugepage;
+    static size_t hugepage_size;
+    static std::string hugetlbfs_path;
     static bool notifi;
     static std::string tent_transport_hint;
     static std::string tent_intent_type;

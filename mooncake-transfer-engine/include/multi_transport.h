@@ -15,7 +15,11 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <condition_variable>
 #include <functional>
+#include <map>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #include "transport/transport.h"
@@ -24,11 +28,13 @@ namespace mooncake {
 class TransferEngineImpl;
 class TransferEngineImplTestPeer;
 class MultiTransportTestPeer;
+class MultiTransportBatchTestPeer;
 
 class MultiTransport {
     friend class TransferEngineImpl;
     friend class TransferEngineImplTestPeer;
     friend class MultiTransportTestPeer;
+    friend class MultiTransportBatchTestPeer;
 
    public:
     using BatchID = Transport::BatchID;
@@ -49,6 +55,8 @@ class MultiTransport {
 
     BatchID allocateBatchID(size_t batch_size);
 
+    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
+    // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
@@ -98,7 +106,21 @@ class MultiTransport {
                           const std::vector<TransferRequest> &entries,
                           std::vector<size_t> *task_sizes);
 
-    Status selectTransport(const TransferRequest &entry, Transport *&transport);
+    Status selectTransports(const std::vector<TransferRequest> &entries,
+                            std::vector<Transport *> &transports);
+
+    // If `allows_reuse` is non-null it is written on every return. True means
+    // this segment's transport is a function of `target_id` only, so the
+    // caller may reuse the returned pointer for later requests with the same
+    // `target_id`. False for mixed-protocol segments (comma in `protocol`) and
+    // invalid IDs. Passing nullptr skips the flag.
+    Status selectTransport(const TransferRequest &entry, Transport *&transport,
+                           bool *allows_reuse = nullptr);
+
+    Status tryFreeBatchID(BatchID batch_id,
+                          const std::function<void()> &before_delete);
+
+    void deferredCleanupLoop();
 
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_selectTransport(const TransferRequest &entry,
@@ -112,6 +134,13 @@ class MultiTransport {
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
+
+    std::mutex deferred_cleanup_mutex_;
+    std::condition_variable deferred_cleanup_cv_;
+    std::unordered_map<BatchID, std::function<void()>>
+        deferred_cleanup_batches_;
+    bool stop_deferred_cleanup_ = false;
+    std::thread deferred_cleanup_thread_;
 };
 }  // namespace mooncake
 
