@@ -34,6 +34,7 @@
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
 #include "tent/runtime/transport.h"
+#include "tent/common/selection_stats.h"
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/hp_tcp_transport_config.h"
 
@@ -338,6 +339,7 @@ class TransferEngineImpl {
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
+    Status getSelectionStats(SelectionStats& stats) const;
 
     Status waitTransferCompletion(BatchID batch_id);
 

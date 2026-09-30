@@ -23,8 +23,10 @@
 
 #include <memory>
 #include <sstream>
+#include <thread>
 #include <utility>
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 namespace mooncake {
@@ -386,6 +388,8 @@ TEST(DeviceSelectorTransmitTest, MultiPathChargesActualSliceBytes) {
         ASSERT_TRUE(ids[i] == 0 || ids[i] == 1);
         expected[ids[i]] += std::min<uint64_t>(kBlock, kTotal - i * kBlock);
     }
+    EXPECT_GT(expected[0], 0u);
+    EXPECT_GT(expected[1], 0u);
     EXPECT_EQ(sel.getInflightBytes(0), expected[0]);
     EXPECT_EQ(sel.getInflightBytes(1), expected[1]);
 
@@ -925,6 +929,171 @@ TEST(DeviceSelectorTransmitTest, PostedBytesTrackTheHardwareBacklog) {
     sel->notePostEnded(kDev, kMiB, kT0);
     EXPECT_EQ(sel->getPostedBytes(kDev), 0u);
     EXPECT_EQ(sel->getPostedBytes(7), 0u);  // unknown device
+}
+
+TEST(DeviceSelectorSelectionStatsTest, RecordsSingleAndMultiPathAllocations) {
+    auto sel = makeTwoNicSelector();
+    int chosen = -1;
+    ASSERT_TRUE(sel->allocate(kMiB, "cpu:0", chosen).ok());
+    ASSERT_TRUE(sel->release(chosen, kMiB, 0.0).ok());
+
+    constexpr uint64_t kTotal = 3 * kMiB + 17;
+    constexpr uint32_t kSlices = 4;
+    std::vector<int> selected;
+    ASSERT_TRUE(sel->allocate(kTotal, kSlices, kMiB, "cpu:0", selected).ok());
+    ASSERT_EQ(selected.size(), kSlices);
+
+    const auto stats = sel->getSelectionStats();
+    EXPECT_EQ(stats.allocations, 2u);
+    EXPECT_EQ(stats.single_path_allocations, 1u);
+    EXPECT_EQ(stats.multi_path_allocations, 1u);
+    uint64_t selected_bytes = 0;
+    for (const auto& device : stats.devices)
+        selected_bytes += device.selected_bytes;
+    EXPECT_EQ(selected_bytes, kMiB + kTotal);
+
+    for (uint32_t i = 0; i < kSlices; ++i) {
+        const uint64_t bytes = (i + 1 == kSlices) ? kTotal - i * kMiB : kMiB;
+        ASSERT_TRUE(sel->release(selected[i], bytes, 0.0).ok());
+    }
+}
+
+TEST(DeviceSelectorSelectionStatsTest, UnavailableDeviceKeepsHistoricalStats) {
+    auto sel = makeTwoNicSelector();
+    constexpr uint64_t kTotal = 3 * kMiB + 17;
+    std::vector<int> selected;
+    ASSERT_TRUE(sel->allocate(kTotal, 4, kMiB, "cpu:0", selected).ok());
+    for (uint32_t i = 0; i < selected.size(); ++i) {
+        const uint64_t bytes =
+            (i + 1 == selected.size()) ? kTotal - i * kMiB : kMiB;
+        ASSERT_TRUE(sel->release(selected[i], bytes, 0.0).ok());
+    }
+
+    const auto before = sel->getSelectionStats();
+    const auto previous =
+        std::find_if(before.devices.begin(), before.devices.end(),
+                     [](const auto& device) { return device.dev_id == kDev1; });
+    ASSERT_NE(previous, before.devices.end());
+    ASSERT_GT(previous->selected_bytes, 0u);
+    ASSERT_TRUE(sel->setDeviceAvailable(kDev1, false).ok());
+
+    int chosen = -1;
+    ASSERT_TRUE(sel->allocate(kMiB, "cpu:0", chosen).ok());
+    EXPECT_EQ(chosen, kDev0);
+    ASSERT_TRUE(sel->release(chosen, kMiB, 0.0).ok());
+
+    const auto after = sel->getSelectionStats();
+    const auto failed =
+        std::find_if(after.devices.begin(), after.devices.end(),
+                     [](const auto& device) { return device.dev_id == kDev1; });
+    ASSERT_NE(failed, after.devices.end());
+    EXPECT_FALSE(failed->available);
+    EXPECT_EQ(failed->selected_bytes, previous->selected_bytes);
+}
+
+TEST(DeviceSelectorSelectionStatsTest, ResetPreservesSchedulingState) {
+    auto sel = makeTwoNicSelector();
+    int chosen = -1;
+    ASSERT_TRUE(sel->allocate(kMiB, "cpu:0", chosen).ok());
+    ASSERT_TRUE(sel->release(chosen, kMiB, kMiB / 1e9).ok());
+    const double ewma = sel->getAggregateEwmaBandwidth();
+
+    ASSERT_TRUE(sel->allocate(kMiB, "cpu:0", chosen).ok());
+    const auto inflight = sel->getInflightBytes(chosen);
+    ASSERT_EQ(inflight, kMiB);
+
+    sel->resetSelectionStats();
+    const auto stats = sel->getSelectionStats();
+    EXPECT_EQ(stats.allocations, 0u);
+    EXPECT_EQ(stats.single_path_allocations, 0u);
+    EXPECT_EQ(stats.multi_path_allocations, 0u);
+    for (const auto& device : stats.devices) {
+        EXPECT_EQ(device.selected_slices, 0u);
+        EXPECT_EQ(device.selected_bytes, 0u);
+    }
+    EXPECT_DOUBLE_EQ(sel->getAggregateEwmaBandwidth(), ewma);
+    EXPECT_EQ(sel->getInflightBytes(chosen), inflight);
+    ASSERT_TRUE(sel->release(chosen, kMiB, 0.0).ok());
+}
+
+TEST(DeviceSelectorSelectionStatsTest, EmptySelectionDoesNotRecordCounters) {
+    auto sel = makeTwoNicSelector();
+    std::vector<int> selected;
+    ASSERT_TRUE(sel->allocate(kMiB, 0, kMiB, "cpu:0", selected).ok());
+    EXPECT_TRUE(selected.empty());
+
+    const auto stats = sel->getSelectionStats();
+    EXPECT_EQ(stats.allocations, 0u);
+    EXPECT_EQ(stats.single_path_allocations, 0u);
+    EXPECT_EQ(stats.multi_path_allocations, 0u);
+    EXPECT_EQ(stats.probe_allocations, 0u);
+    for (const auto& device : stats.devices) {
+        EXPECT_EQ(device.selected_slices, 0u);
+        EXPECT_EQ(device.selected_bytes, 0u);
+    }
+}
+
+TEST(DeviceSelectorSelectionStatsTest, FailedAllocationDoesNotRecordCounters) {
+    auto sel = makeTwoNicSelector();
+    ASSERT_TRUE(sel->setDeviceAvailable(kDev0, false).ok());
+    ASSERT_TRUE(sel->setDeviceAvailable(kDev1, false).ok());
+
+    std::vector<int> selected;
+    EXPECT_FALSE(sel->allocate(kMiB, 2, kMiB, "cpu:0", selected).ok());
+    EXPECT_TRUE(selected.empty());
+
+    const auto stats = sel->getSelectionStats();
+    EXPECT_EQ(stats.allocations, 0u);
+    EXPECT_EQ(stats.single_path_allocations, 0u);
+    EXPECT_EQ(stats.multi_path_allocations, 0u);
+    EXPECT_EQ(stats.probe_allocations, 0u);
+}
+
+TEST(DeviceSelectorSelectionStatsTest, ProbeAllocationIsCounted) {
+    std::thread worker([] {
+        auto sel = makeTwoNicSelector();
+        for (int call = 0; call < 100; ++call) {
+            std::vector<int> selected;
+            ASSERT_TRUE(
+                sel->allocate(2 * kMiB, 2, kMiB, "cpu:0", selected).ok());
+            ASSERT_EQ(selected.size(), 2u);
+            for (int dev_id : selected) sel->release(dev_id, kMiB, 0.0);
+        }
+        const auto stats = sel->getSelectionStats();
+        EXPECT_EQ(stats.allocations, 100u);
+        EXPECT_EQ(stats.probe_allocations, 1u);
+    });
+    worker.join();
+}
+
+TEST(DeviceSelectorSelectionStatsTest, ConcurrentSnapshotsRemainReadable) {
+    auto sel = makeTwoNicSelector();
+    std::atomic<bool> start{false};
+    std::atomic<bool> done{false};
+    std::thread allocator([&] {
+        while (!start.load(std::memory_order_acquire)) {
+        }
+        for (int call = 0; call < 1000; ++call) {
+            int dev_id = -1;
+            if (sel->allocate(kMiB, "cpu:0", dev_id).ok())
+                sel->release(dev_id, kMiB, 0.0);
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    start.store(true, std::memory_order_release);
+    uint64_t previous_allocations = 0;
+    do {
+        const auto stats = sel->getSelectionStats();
+        EXPECT_GE(stats.allocations, previous_allocations);
+        previous_allocations = stats.allocations;
+        EXPECT_TRUE(std::is_sorted(stats.devices.begin(), stats.devices.end(),
+                                   [](const auto& lhs, const auto& rhs) {
+                                       return lhs.dev_id < rhs.dev_id;
+                                   }));
+    } while (!done.load(std::memory_order_acquire));
+    allocator.join();
+    EXPECT_GT(sel->getSelectionStats().allocations, 0u);
 }
 
 }  // namespace

@@ -32,6 +32,7 @@
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/common/selection_stats.h"
 
 namespace mooncake {
 namespace tent {
@@ -188,6 +189,11 @@ class Transport {
     virtual double getEstimatedBandwidth() const { return -1.0; }
 
     virtual Status getNicLoadStats(std::vector<NicLoadStats>&) const {
+        return Status::OK();
+    }
+
+    // Default: contribute no selection data and leave the output unchanged.
+    virtual Status getSelectionStats(SelectionStats&) const {
         return Status::OK();
     }
 

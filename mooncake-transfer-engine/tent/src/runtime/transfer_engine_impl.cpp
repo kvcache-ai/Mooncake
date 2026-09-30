@@ -3389,6 +3389,14 @@ Status TransferEngineImpl::getNicLoadStats(
     return Status::OK();
 }
 
+Status TransferEngineImpl::getSelectionStats(SelectionStats& stats) const {
+    stats = {};
+    for (const auto& transport : transport_list_) {
+        if (transport) CHECK_STATUS(transport->getSelectionStats(stats));
+    }
+    return Status::OK();
+}
+
 void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
     if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
 }

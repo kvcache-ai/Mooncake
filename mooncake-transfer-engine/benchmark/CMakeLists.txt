@@ -108,4 +108,24 @@ if(BUILD_UNIT_TESTS)
   target_include_directories(tebench_split_output_test
                              PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME tebench_split_output_test COMMAND tebench_split_output_test)
+
+  add_executable(tebench_selection_metrics_test tests/selection_metrics_test.cpp
+                                                selection_metrics.cpp)
+  target_link_libraries(tebench_selection_metrics_test PRIVATE gtest gtest_main)
+  target_include_directories(
+    tebench_selection_metrics_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_selection_metrics_test
+           COMMAND tebench_selection_metrics_test)
+
+  add_executable(tebench_measurement_barrier_test
+                 tests/measurement_barrier_test.cpp)
+  target_link_libraries(tebench_measurement_barrier_test PRIVATE gtest
+                                                                 gtest_main)
+  target_include_directories(tebench_measurement_barrier_test
+                             PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(NAME tebench_measurement_barrier_test
+           COMMAND tebench_measurement_barrier_test)
+  set_tests_properties(tebench_measurement_barrier_test PROPERTIES TIMEOUT 30)
 endif()
