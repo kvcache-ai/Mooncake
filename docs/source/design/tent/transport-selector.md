@@ -105,6 +105,14 @@ For `memory` segments, you can filter by source/destination memory type:
 | `"npu"` | Ascend NPU memory |
 | `"*"` | Any memory type |
 
+For standard `tcp`, the local memory type always describes the initiating
+process's buffer, for both READ and WRITE. A CPU-only build can transfer between
+its host buffer and a peer's registered GPU buffer when the peer exports that
+buffer over TCP. The peer's device-enabled RPC handler performs the GPU copy
+through host staging; the initiator does not need a local GPU runtime. Local GPU
+buffers still require a device-enabled build. This applies to standard `tcp`;
+`hp_tcp` currently supports host memory only.
+
 ### Size Filters
 
 Restrict policies to specific transfer sizes:

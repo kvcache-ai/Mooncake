@@ -14,12 +14,14 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/transport_selector.h"
 #include "tent/transport/tcp/tcp_transport.h"
 
 namespace mooncake {
@@ -73,6 +75,57 @@ TEST(TcpTransportConfigTest, InstallReadsConfigKeys) {
     EXPECT_EQ(params.max_concurrent_tasks, 32u);
 
     EXPECT_TRUE(transport.uninstall().ok());
+}
+
+TEST(TcpTransportCapabilityTest, CpuPlatformCanSelectPeerGpu) {
+    if (Platform::getLoader().type() != "cpu") {
+        GTEST_SKIP() << "Requires a CPU-only build";
+    }
+
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/tcp/max_concurrent_tasks", 1);
+    auto transport = std::make_shared<TcpTransport>();
+    auto metadata = makeP2PMetadata();
+    std::string name = "tcp-cpu-peer-gpu";
+    ASSERT_TRUE(transport->install(name, metadata, nullptr, conf).ok());
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[TCP] = transport;
+    const std::vector<TransportType> tcp_buffer{TCP};
+    const std::vector<TransportType> no_tcp_buffer{};
+
+    struct Case {
+        const char* name;
+        MemoryType local;
+        MemoryType peer;
+        bool peer_exports_tcp;
+        TransportType expected;
+    };
+    const Case cases[] = {
+        {"host_peer_host", MTYPE_CPU, MTYPE_CPU, true, TCP},
+        {"host_peer_gpu", MTYPE_CPU, MTYPE_CUDA, true, TCP},
+        {"host_peer_gpu_without_tcp", MTYPE_CPU, MTYPE_CUDA, false, UNSPEC},
+        {"local_gpu_peer_host", MTYPE_CUDA, MTYPE_CPU, true, UNSPEC},
+        {"local_gpu_peer_gpu", MTYPE_CUDA, MTYPE_CUDA, true, UNSPEC},
+    };
+    // These are selection metadata, not device allocations or GPU transfers.
+    // READ and WRITE keep the same local/peer roles in SelectionContext.
+    for (const auto& test : cases) {
+        SCOPED_TRACE(test.name);
+        SelectionContext context{};
+        context.segment_type = SegmentType::Memory;
+        context.local_memory_type = test.local;
+        context.remote_memory_type = test.peer;
+        context.buffer_transports =
+            test.peer_exports_tcp ? &tcp_buffer : &no_tcp_buffer;
+        context.transfer_size = 1;
+        EXPECT_EQ(selector.select(context, transports, 0, TCP).transport,
+                  test.expected);
+    }
+
+    EXPECT_TRUE(transport->uninstall().ok());
 }
 
 TEST(TcpSubBatchTest, PointerStabilityAfterReserve) {
