@@ -315,10 +315,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             } else {
                 LOG(WARNING) << "Failed to load custom topology from " << path
                              << ", falling back to auto-detect.";
-                local_topology_->discover(filter_);
+                local_topology_->discover(filter_, /*exclude_efa=*/true);
             }
         } else {
-            local_topology_->discover(filter_);
+            local_topology_->discover(filter_, /*exclude_efa=*/true);
         }
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
