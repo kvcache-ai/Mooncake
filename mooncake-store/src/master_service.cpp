@@ -4461,15 +4461,18 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     }
 
     // Durable repair for conflict-derived discards: a later promotion must
-    // not replay what this one dropped. One record per affected object goes
-    // through the fenced writer (REMOVE for full drops, canonical PUT_END
+    // not replay what this one dropped. The whole repair set goes out as one
+    // indivisible batch record (REMOVE for full drops, canonical PUT_END
     // carrying only the survivors for partial ones), and the restore fails
-    // unless the batch becomes durable, so the candidate never serves an
-    // index whose discards could resurrect. With no OpLog configured there
-    // is nothing to replay into, so the local filter stands alone. With
-    // OpLog enabled but no writer available (e.g. no HA backend connection
-    // string), a filtered discard would be silently unrepaired, so the
-    // restore fails explicitly instead.
+    // unless that record becomes durable, so the candidate never serves an
+    // index whose discards could resurrect. Committing the entries one by
+    // one would let the set split across batch records, and a durable
+    // prefix covering only part of it leaves exactly one side of a conflict
+    // pair able to survive a later replay on its own. With no OpLog
+    // configured there is nothing to replay into, so the local filter
+    // stands alone. With OpLog enabled but no writer available (e.g. no HA
+    // backend connection string), a filtered discard would be silently
+    // unrepaired, so the restore fails explicitly instead.
     if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
         enable_oplog_ && !ordered_oplog_writer_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: conflict discards need "
@@ -4480,8 +4483,38 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     }
     if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
         enable_oplog_ && ordered_oplog_writer_) {
-        const size_t total =
-            repair_remove_keys.size() + repair_canonical_keys.size();
+        std::vector<OpLogEntry> repair_entries;
+        repair_entries.reserve(repair_remove_keys.size() +
+                               repair_canonical_keys.size());
+        for (const auto& [tenant, key] : repair_remove_keys) {
+            OpLogEntry entry;
+            entry.op_type = OpType::REMOVE;
+            entry.tenant_id = tenant.value();
+            entry.object_key = key;
+            repair_entries.push_back(std::move(entry));
+        }
+        for (const auto& [tenant, key] : repair_canonical_keys) {
+            const size_t shard_idx = getShardIndex(tenant, key);
+            MetadataShardAccessorRO shard(this, shard_idx);
+            auto tenant_it = shard->tenants.find(tenant);
+            OpLogEntry entry;
+            entry.tenant_id = tenant.value();
+            entry.object_key = key;
+            if (tenant_it == shard->tenants.end() ||
+                !tenant_it->second.metadata.contains(key)) {
+                // Survived the conflict but failed construction (e.g.
+                // capacity): nothing installed, so the canonical state is
+                // absence. Repudiate the key outright.
+                entry.op_type = OpType::REMOVE;
+            } else {
+                entry.op_type = OpType::PUT_END;
+                entry.payload = SerializeMetadataForOpLog(
+                    tenant_it->second.metadata.at(key));
+            }
+            repair_entries.push_back(std::move(entry));
+        }
+
+        const size_t total = repair_entries.size();
         auto remaining = std::make_shared<std::atomic<size_t>>(total);
         auto done = std::make_shared<std::promise<void>>();
         std::future<void> durable_future = done->get_future();
@@ -4492,39 +4525,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         };
 
         ErrorCode repair_err = ErrorCode::OK;
-        for (const auto& [tenant, key] : repair_remove_keys) {
-            auto r = AppendOpLogWithDurableFinalize(
-                OpType::REMOVE, tenant.value(), key, {}, on_durable);
-            if (!r) {
-                repair_err = r.error();
-                break;
-            }
-        }
-        for (const auto& [tenant, key] : repair_canonical_keys) {
-            if (repair_err != ErrorCode::OK) break;
-            const size_t shard_idx = getShardIndex(tenant, key);
-            MetadataShardAccessorRO shard(this, shard_idx);
-            auto tenant_it = shard->tenants.find(tenant);
-            if (tenant_it == shard->tenants.end() ||
-                !tenant_it->second.metadata.contains(key)) {
-                // Survived the conflict but failed construction (e.g.
-                // capacity): nothing installed, so the canonical state is
-                // absence. Repudiate the key outright.
-                auto r = AppendOpLogWithDurableFinalize(
-                    OpType::REMOVE, tenant.value(), key, {}, on_durable);
-                if (!r) {
-                    repair_err = r.error();
-                    break;
-                }
-                continue;
-            }
-            auto r = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, tenant.value(), key,
-                SerializeMetadataForOpLog(tenant_it->second.metadata.at(key)),
-                on_durable);
-            if (!r) {
-                repair_err = r.error();
-            }
+        auto appended = AppendOpLogBatchWithDurableFinalize(
+            std::move(repair_entries), on_durable);
+        if (!appended) {
+            repair_err = appended.error();
         }
         if (repair_err == ErrorCode::OK &&
             durable_future.wait_for(std::chrono::seconds(10)) !=
@@ -15692,6 +15696,40 @@ MasterService::ReserveBatchOpLogSlot() {
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     return ordered_oplog_writer_->Reserve();
+}
+
+tl::expected<uint64_t, ErrorCode>
+MasterService::AppendOpLogBatchWithDurableFinalize(
+    std::vector<OpLogEntry> entries, DurableFinalizeCallback callback) {
+    if (!enable_oplog_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!ordered_oplog_writer_) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (entries.empty()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (auto& entry : entries) {
+        const TenantId resolved_tenant(
+            enable_multi_tenants_ ? entry.tenant_id
+                                  : std::string(TenantId::kDefaultValue));
+        if (!resolved_tenant.IsValid()) {
+            return tl::unexpected(ErrorCode::TENANT_NOT_REGISTERED);
+        }
+        entry.tenant_id = resolved_tenant.value();
+    }
+    auto reservation = ordered_oplog_writer_->ReserveBatch(entries.size());
+    if (!reservation) {
+        return tl::unexpected(reservation.error());
+    }
+    auto pending = ordered_oplog_writer_->CommitBatch(
+        std::move(reservation.value()), std::move(entries),
+        std::move(callback));
+    if (!pending) {
+        return tl::unexpected(pending.error());
+    }
+    return pending.value().back().sequence_id();
 }
 
 tl::expected<OpLogEntry, ErrorCode>

@@ -2514,6 +2514,11 @@ class MasterService {
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
+    // Commit a set of entries as one indivisible batch record, so a durable
+    // prefix either covers the whole set or none of it. Returns the last
+    // assigned sequence id on success.
+    tl::expected<uint64_t, ErrorCode> AppendOpLogBatchWithDurableFinalize(
+        std::vector<OpLogEntry> entries, DurableFinalizeCallback callback);
     tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
     ReserveBatchOpLogSlot();
     tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
