@@ -7,6 +7,7 @@
 #include <glog/logging.h>
 
 #include "config/metrics_bootstrap_config.h"
+#include "config/tenant_quota_bootstrap_config.h"
 #include "config_helper.h"
 #include "types.h"
 
@@ -157,9 +158,7 @@ struct MasterConfig {
     // Storage backend eviction configuration
     bool enable_disk_eviction;
     uint64_t quota_bytes;
-    bool enable_multi_tenants = false;
-    std::string tenant_quota_connector_type = "file";
-    std::string tenant_quota_connector_uri;
+    TenantQuotaBootstrapConfig tenant_quota;
 
     bool enable_snapshot_restore;
     bool enable_snapshot;
@@ -459,9 +458,11 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
-        enable_multi_tenants = config.enable_multi_tenants;
-        tenant_quota_connector_type = config.tenant_quota_connector_type;
-        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
+        enable_multi_tenants = config.tenant_quota.enable_multi_tenants;
+        tenant_quota_connector_type =
+            config.tenant_quota.tenant_quota_connector_type;
+        tenant_quota_connector_uri =
+            config.tenant_quota.tenant_quota_connector_uri;
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
@@ -720,9 +721,11 @@ class WrappedMasterServiceConfig {
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
-        enable_multi_tenants = config.enable_multi_tenants;
-        tenant_quota_connector_type = config.tenant_quota_connector_type;
-        tenant_quota_connector_uri = config.tenant_quota_connector_uri;
+        enable_multi_tenants = config.tenant_quota.enable_multi_tenants;
+        tenant_quota_connector_type =
+            config.tenant_quota.tenant_quota_connector_type;
+        tenant_quota_connector_uri =
+            config.tenant_quota.tenant_quota_connector_uri;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
