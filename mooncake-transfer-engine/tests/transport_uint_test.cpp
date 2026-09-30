@@ -329,6 +329,32 @@ void expectForcedTcpConstraint(const tent::Config& config) {
     EXPECT_FALSE(config.get("transports/rdma/enable", true));
 }
 
+TEST(TransferEngineTentCompatibilityTest, QosInitOverloadsKeepTcpProtocol) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+    for (int qos : {0, 3, 7}) {
+        TransferEngine engine(true);
+        const std::string resources =
+            "{\"comm_resource_config.qos\":" + std::to_string(qos) + "}";
+        ASSERT_EQ(
+            engine.init(P2PHANDSHAKE, "qos-overload-" + std::to_string(qos), "",
+                        0, "tcp", resources),
+            0);
+        std::array<char, 64> buffer{};
+        ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+        EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+        EXPECT_EQ(engine.freeEngine(), 0);
+    }
+    TransferEngine five(true);
+    ASSERT_EQ(five.init(P2PHANDSHAKE, "qos-five", "", 0, "tcp"), 0);
+    ScopedEnvVar four_tcp("MC_FORCE_TCP", "1");
+    TransferEngine four(true), defaults(true);
+    ASSERT_EQ(four.init(P2PHANDSHAKE, "qos-four", "", 0), 0);
+    ASSERT_EQ(defaults.init(P2PHANDSHAKE, "qos-defaults"), 0);
+}
+
 TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");
     ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);

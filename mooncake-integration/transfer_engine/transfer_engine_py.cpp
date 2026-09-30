@@ -292,6 +292,19 @@ int TransferEnginePy::initialize(const char* local_hostname,
                          device_name, conn_string.first.c_str());
 }
 
+int TransferEnginePy::initializeWithAscendResourceConfig(
+    const char* local_hostname, const char* metadata_server,
+    const char* device_name, const std::string& resource_config) {
+#ifdef USE_ASCEND_DIRECT
+    if (engine_ || resource_config.empty()) return -1;
+    ascend_resource_config_ = resource_config;
+    return initialize(local_hostname, metadata_server, "ascend", device_name);
+#else
+    LOG(ERROR) << "Rebuild with USE_ASCEND_DIRECT for per-engine QoS";
+    return -1;
+#endif
+}
+
 int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* metadata_server,
                                     const char* protocol,
@@ -341,13 +354,14 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
-        int ret = engine_->init(conn_string, local_hostname,
-                                hostname_port.first.c_str(),
-                                hostname_port.second, proto);
+        int ret = engine_->init(
+            conn_string, local_hostname, hostname_port.first.c_str(),
+            hostname_port.second, proto, ascend_resource_config_);
         if (ret) return -1;
     } else {
         // the last two params are unused
-        int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
+        int ret = engine_->init(conn_string, local_hostname, "", 0, proto,
+                                ascend_resource_config_);
         if (ret) return -1;
     }
 
@@ -1538,6 +1552,8 @@ PYBIND11_MODULE(engine, m) {
             .def(py::init<>())
             .def("initialize", &TransferEnginePy::initialize)
             .def("initialize_ext", &TransferEnginePy::initializeExt)
+            .def("initialize_with_ascend_resource_config",
+                 &TransferEnginePy::initializeWithAscendResourceConfig)
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
             .def("allocate_managed_buffer",
                  &TransferEnginePy::allocateManagedBuffer)
