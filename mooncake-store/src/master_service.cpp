@@ -767,6 +767,7 @@ MasterService::~MasterService() {
         metrics.on_client_liveness_record_removed(record->state());
     }
     client_liveness_records_.clear();
+    local_disk_client_records_.clear();
 }
 
 void MasterService::SetBatchOpLogTerminalCallback(
@@ -1363,11 +1364,34 @@ std::shared_ptr<ClientLivenessRecord> MasterService::FindClientRecord(
     return it == client_liveness_records_.end() ? nullptr : it->second;
 }
 
+std::shared_ptr<ClientLivenessRecord> MasterService::FindLocalDiskClientRecord(
+    const UUID& client_id) {
+    {
+        std::shared_lock lock(client_mutex_);
+        const auto it = local_disk_client_records_.find(client_id);
+        if (it != local_disk_client_records_.end()) {
+            return it->second;
+        }
+    }
+    // Legacy AddReplica/NotifyOffloadSuccess can register disk replicas with
+    // offloading disabled, when MountLocalDiskSegment is unavailable.
+    std::unique_lock lock(client_mutex_);
+    const auto it = client_liveness_records_.find(client_id);
+    if (it == client_liveness_records_.end()) {
+        return nullptr;
+    }
+    local_disk_client_records_.emplace(client_id, it->second);
+    return it->second;
+}
+
 std::unordered_set<UUID, boost::hash<UUID>>
 MasterService::GetRetainingClientIdsLocked() const {
     std::unordered_set<UUID, boost::hash<UUID>> clients;
-    clients.reserve(client_liveness_records_.size());
-    for (const auto& [client_id, record] : client_liveness_records_) {
+    if (local_disk_client_records_.empty()) {
+        return clients;
+    }
+    clients.reserve(local_disk_client_records_.size());
+    for (const auto& [client_id, record] : local_disk_client_records_) {
         if (record->ShouldRetainResources()) {
             clients.insert(client_id);
         }
@@ -3085,6 +3109,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     if (current != client_liveness_records_.end() &&
         current->second == job.liveness) {
         const auto state = current->second->state();
+        local_disk_client_records_.erase(job.client_id);
         client_liveness_records_.erase(current);
         MasterMetricManager::instance().on_client_liveness_record_removed(
             state);
@@ -3593,6 +3618,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>
         new_known_owner_records;
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        restored_local_disk_records;
     const auto record_for_known_owner = [&](const UUID& owner) {
         const auto existing = client_liveness_records_.find(owner);
         if (existing != client_liveness_records_.end()) {
@@ -3860,11 +3888,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                             << ", key=" << user_key;
                         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     }
-                    replicas.push_back(Replica(
-                        desc.id, local_disk_desc.client_id,
-                        local_disk_desc.object_size,
-                        local_disk_desc.transport_endpoint, desc.status,
-                        record_for_known_owner(local_disk_desc.client_id)));
+                    const auto record =
+                        record_for_known_owner(local_disk_desc.client_id);
+                    replicas.push_back(
+                        Replica(desc.id, local_disk_desc.client_id,
+                                local_disk_desc.object_size,
+                                local_disk_desc.transport_endpoint, desc.status,
+                                record));
+                    restored_local_disk_records.emplace(
+                        local_disk_desc.client_id, record);
                 } else {
                     LOG(ERROR)
                         << "RestoreFromStandbySnapshot: unsupported replica "
@@ -3973,6 +4005,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         client_liveness_records_.emplace(client_id, std::move(record));
         MasterMetricManager::instance().client_liveness_record_created();
     }
+    local_disk_client_records_.merge(restored_local_disk_records);
 
     if (max_live_id != 0) {
         const ReplicaID desired_next_id = max_live_id + 1;
@@ -5154,8 +5187,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         {
             std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            auto retaining_clients = GetRetainingClientIdsLocked();
-            client_lock.unlock();
             const size_t lookup_shard_idx =
                 getShardIndex(object_id.tenant_id, object_id.user_key);
             MetadataShardAccessorRW shard(this, lookup_shard_idx);
@@ -5171,6 +5202,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             }
 
             auto it = tenant_state.metadata.find(key);
+            std::unordered_set<UUID, boost::hash<UUID>> retaining_clients;
+            if (it != tenant_state.metadata.end() &&
+                it->second.HasReplica(&Replica::fn_is_local_disk_replica)) {
+                retaining_clients = GetRetainingClientIdsLocked();
+            }
+            client_lock.unlock();
             if (it != tenant_state.metadata.end()) {
                 auto cleanup_plan =
                     BuildStaleHandleCleanupPlan(it->second, retaining_clients);
@@ -5437,7 +5474,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                const TenantId& tenant_id, Replica& replica)
     -> tl::expected<bool, ErrorCode> {
-    const auto client_liveness = FindClientRecord(client_id);
+    const auto client_liveness = FindLocalDiskClientRecord(client_id);
     auto retaining_guard = client_liveness
                                ? client_liveness->TryAcquireRetainingGuard()
                                : std::nullopt;
@@ -8497,6 +8534,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
                      "signal=local_disk_mount";
     }
 
+    local_disk_client_records_.emplace(client_id, record);
     return {};
 }
 
@@ -8652,7 +8690,7 @@ auto MasterService::NotifyOffloadSuccess(
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const auto record = FindClientRecord(client_id);
+    const auto record = FindLocalDiskClientRecord(client_id);
     auto retaining_guard =
         record ? record->TryAcquireRetainingGuard() : std::nullopt;
     if (!retaining_guard) {
@@ -11032,6 +11070,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
         ok_client_.clear();
         client_host_id_.clear();
         client_liveness_records_.clear();
+        local_disk_client_records_.clear();
     }
 
     MasterMetricManager::instance().reset_allocated_mem_size();
@@ -11058,8 +11097,10 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         (void)segment;
         client_ids.insert(owner);
     }
+    std::unordered_set<UUID, boost::hash<UUID>> local_disk_client_ids;
     for (const auto& client_id : local_ssd_manager_.GetClientIds()) {
         client_ids.insert(client_id);
+        local_disk_client_ids.insert(client_id);
     }
 
     for (const auto& shard : metadata_shards_) {
@@ -11072,6 +11113,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
                         const auto owner = replica.get_local_disk_client_id();
                         if (owner) {
                             client_ids.insert(*owner);
+                            local_disk_client_ids.insert(*owner);
                         }
                     }
                 }
@@ -11133,6 +11175,11 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
         client_liveness_records_ = std::move(records);
+        local_disk_client_records_.clear();
+        for (const auto& client_id : local_disk_client_ids) {
+            local_disk_client_records_.emplace(
+                client_id, client_liveness_records_.at(client_id));
+        }
     }
     MasterMetricManager::instance().reset_client_liveness_metrics(
         static_cast<int64_t>(client_ids.size()));

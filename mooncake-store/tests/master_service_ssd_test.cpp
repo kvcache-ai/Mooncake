@@ -4,6 +4,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -569,6 +570,145 @@ TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     ASSERT_FALSE(r1.has_value())
         << "empty segment names must not report a silent success (issue #2997)";
     EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r1.error());
+}
+
+TEST_F(MasterServiceSSDTest, RetainingClientsExcludeMemoryOnlyOwners) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.client_active_ttl_sec = 3600;
+    config.client_suspicion_ttl_sec = 3600;
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    const UUID memory_owner = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "retaining_memory_only";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x310000000;
+    segment.size = 64 * 1024 * 1024;
+    ASSERT_TRUE(service.MountSegment(segment, memory_owner));
+    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+
+    const UUID disk_owner = generate_uuid();
+    // Disabling new offload work does not discard an owner's existing data.
+    ASSERT_TRUE(service.MountLocalDiskSegment(disk_owner, false));
+    Replica replica(disk_owner, 1024, "disk:1234", ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service.AddReplica(disk_owner, "retained_disk",
+                                   TenantId::Default(), replica));
+    auto retaining = peer.GetRetainingClientIds();
+    EXPECT_EQ(retaining.size(), 1);
+    EXPECT_TRUE(retaining.contains(disk_owner));
+    const auto record = peer.FindClientRecord(disk_owner);
+    ASSERT_TRUE(record);
+    const auto now = ClientLivenessRecord::Clock::now();
+    const auto zero = ClientLivenessRecord::Clock::duration::zero();
+    ASSERT_EQ(record->Evaluate(now, zero, zero),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    EXPECT_TRUE(peer.GetRetainingClientIds().contains(disk_owner));
+    peer.ClearInvalidHandles();
+    EXPECT_EQ(service.GetKeyCount(), 1);
+    ASSERT_EQ(record->Evaluate(now, zero, zero),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    // PutStart must discard the offline disk replica and accept a fresh write.
+    ASSERT_TRUE(service.PutStart(memory_owner, "retained_disk",
+                                 TenantId::Default(), 1024,
+                                 {.replica_num = 1}));
+    ASSERT_TRUE(service.PutEnd(memory_owner, "retained_disk",
+                               TenantId::Default(), ReplicaType::MEMORY));
+    EXPECT_TRUE(service.GetReplicaList("retained_disk", TenantId::Default()));
+    EXPECT_FALSE(service.MountLocalDiskSegment(disk_owner, true));
+    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+}
+
+TEST_F(MasterServiceSSDTest, DiskOwnerCandidateEndsWithClientIncarnation) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    const UUID owner = generate_uuid();
+    ASSERT_TRUE(service.MountLocalDiskSegment(owner, true));
+    ASSERT_TRUE(service.UnmountLocalDiskSegment(owner));
+    // A disk unmount must not change the liveness-based cleanup predicate.
+    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+
+    ClientOffboardingJob job;
+    job.client_id = owner;
+    job.liveness = peer.FindClientRecord(owner);
+    ASSERT_TRUE(peer.ProcessClientOffboardingJob(job));
+    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "remounted_memory_only";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x310000000;
+    segment.size = 64 * 1024 * 1024;
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    EXPECT_NE(peer.FindClientRecord(owner), job.liveness);
+    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    ASSERT_TRUE(service.MountLocalDiskSegment(owner, true));
+    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+}
+
+TEST_F(MasterServiceSSDTest, RecoveredDiskOwnersRetainReplicasBeforeRemount) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    const UUID owner = generate_uuid();
+    StandbyObjectEntry object;
+    object.key = "recovered_disk_owner";
+    object.metadata.client_id = generate_uuid();
+    object.metadata.size = 1024;
+    object.metadata.replicas.push_back(
+        Replica(owner, 1024, "disk:1234", ReplicaStatus::COMPLETE)
+            .get_descriptor());
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({object}, 0, {}));
+    EXPECT_TRUE(
+        MasterServiceTestPeer::LocalSsdManager(service).GetClientIds().empty());
+    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+    peer.ClearInvalidHandles();
+    EXPECT_TRUE(service.GetReplicaList(object.key, TenantId::Default()));
+
+    const UUID registered_owner = generate_uuid();
+    ASSERT_TRUE(service.MountLocalDiskSegment(registered_owner, false));
+    // The snapshot rebuild must include both registry-only and metadata-only
+    // owners, replacing the old record pointers with the restored incarnation.
+    const auto old_record = peer.FindClientRecord(owner);
+    ASSERT_TRUE(peer.RebuildClientLivenessAfterSnapshotRestore());
+    EXPECT_NE(peer.FindClientRecord(owner), old_record);
+    auto retaining = peer.GetRetainingClientIds();
+    EXPECT_EQ(retaining.size(), 2);
+    EXPECT_TRUE(retaining.contains(owner));
+    EXPECT_TRUE(retaining.contains(registered_owner));
+    peer.ClearInvalidHandles();
+    EXPECT_TRUE(service.GetReplicaList(object.key, TenantId::Default()));
+
+    peer.ResetStateAfterFailedRestoreAttempt();
+    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+}
+
+TEST_F(MasterServiceSSDTest, LegacyDiskRegistrationRetainsOwnerWithoutMount) {
+    MasterService service;
+    MasterServiceTestPeer peer(service);
+    const UUID owner = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "legacy_disk_owner";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x310000000;
+    segment.size = 64 * 1024 * 1024;
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    Replica replica(owner, 1024, "disk:1234", ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(
+        service.AddReplica(owner, "legacy_disk", TenantId::Default(), replica));
+    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+    peer.ClearInvalidHandles();
+    EXPECT_TRUE(service.GetReplicaList("legacy_disk", TenantId::Default()));
 }
 
 }  // namespace mooncake::test

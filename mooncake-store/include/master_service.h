@@ -1026,7 +1026,10 @@ class MasterService {
                                      const TenantId& tenant_id,
                                      Replica& replica)
         -> tl::expected<bool, ErrorCode>;
-    // Caller must hold client_mutex_.
+    std::shared_ptr<ClientLivenessRecord> FindLocalDiskClientRecord(
+        const UUID& client_id);
+    // Clients whose LOCAL_DISK replicas must be retained. Caller must hold
+    // client_mutex_; memory replica validity is tracked by segment lifetime.
     std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
         const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
@@ -2018,6 +2021,13 @@ class MasterService {
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>
         client_liveness_records_;
+    // Subset of client_liveness_records_, protected by client_mutex_. Include
+    // owners recovered from LOCAL_DISK replicas even before they remount.
+    // Keep candidates until client offboarding: disk unmount alone must not
+    // change the liveness-based stale-replica predicate during cleanup.
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        local_disk_client_records_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
