@@ -738,6 +738,12 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     EXPECT_EQ(seg_status.http_status, 503);
     EXPECT_NE(seg_status.body.find(unavailable_msg), std::string::npos);
 
+    auto set_seg_status =
+        HttpPutJson(port, "/api/v1/segments/status?segment=foo",
+                    R"({"status":"DRAINING"})");
+    EXPECT_EQ(set_seg_status.http_status, 503);
+    EXPECT_NE(set_seg_status.body.find(unavailable_msg), std::string::npos);
+
     auto tenant_quotas = HttpGet(port, "/api/v1/tenant_quotas");
     EXPECT_EQ(tenant_quotas.http_status, 503);
     EXPECT_NE(tenant_quotas.body.find(unavailable_msg), std::string::npos);
@@ -983,6 +989,13 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         coro_http::coro_http_client client;
         auto result = client.post(BaseUrl() + path, body,
                                   coro_http::req_content_type::json);
+        return {result.status, std::string(result.resp_body)};
+    }
+
+    HttpResponse HttpPutJson(const std::string& path, const std::string& body) {
+        coro_http::coro_http_client client;
+        auto result = async_simple::coro::syncAwait(client.async_put(
+            BaseUrl() + path, body, coro_http::req_content_type::json));
         return {result.status, std::string(result.resp_body)};
     }
 
@@ -1253,6 +1266,82 @@ TEST_F(MasterAdminServerWithServiceTest,
        SegmentStatusReturnsErrorForNonexistentSegment) {
     auto resp = HttpGet("/api/v1/segments/status?segment=no_such_segment");
     EXPECT_EQ(resp.http_status, 404);
+}
+
+// -----------------------------------------------------------------------
+// PUT /api/v1/segments/status
+// -----------------------------------------------------------------------
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusSwitchesBetweenOkAndDraining) {
+    std::string seg = "set_status_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xB00000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
+    const std::string path = "/api/v1/segments/status?segment=" + seg;
+
+    for (const std::string target : {"DRAINING", "DRAINING", "OK"}) {
+        auto put_resp = HttpPutJson(path, R"({"status":")" + target + R"("})");
+        ASSERT_EQ(put_resp.http_status, 200);
+        HttpSegmentStatusResponse put_parsed;
+        struct_json::from_json(put_parsed, put_resp.body);
+        EXPECT_TRUE(put_parsed.success);
+        EXPECT_EQ(put_parsed.segment, seg);
+        EXPECT_EQ(put_parsed.status_name, target);
+
+        auto get_resp = HttpGet(path);
+        ASSERT_EQ(get_resp.http_status, 200);
+        HttpSegmentStatusResponse get_parsed;
+        struct_json::from_json(get_parsed, get_resp.body);
+        EXPECT_EQ(get_parsed.status_name, target);
+    }
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusRejectsInvalidRequests) {
+    const std::string path = "/api/v1/segments/status?segment=" + segment_.name;
+    EXPECT_EQ(HttpPutJson(path, R"({"status":"DRAINED"})").http_status, 400);
+    EXPECT_EQ(HttpPutJson(path, R"({"status":"UNMOUNTING"})").http_status, 400);
+    EXPECT_EQ(HttpPutJson(path, "{}").http_status, 400);
+    EXPECT_EQ(HttpPutJson(path, "not json").http_status, 400);
+    EXPECT_EQ(HttpPutJson("/api/v1/segments/status", R"({"status":"DRAINING"})")
+                  .http_status,
+              400);
+
+    auto get_resp = HttpGet(path);
+    ASSERT_EQ(get_resp.http_status, 200);
+    HttpSegmentStatusResponse parsed;
+    struct_json::from_json(parsed, get_resp.body);
+    EXPECT_EQ(parsed.status_name, "OK");
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusReturns404ForNonexistentSegment) {
+    auto resp = HttpPutJson("/api/v1/segments/status?segment=no_such_segment",
+                            R"({"status":"DRAINING"})");
+    EXPECT_EQ(resp.http_status, 404);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusReturns409ForSegmentUnderDrainJob) {
+    std::string seg = "set_status_drain_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xC00000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
+
+    auto create_resp = HttpPostJson("/api/v1/drain_jobs",
+                                    R"({"segments":[")" + seg + R"("]})");
+    ASSERT_EQ(create_resp.http_status, 200);
+
+    auto resp = HttpPutJson("/api/v1/segments/status?segment=" + seg,
+                            R"({"status":"OK"})");
+    EXPECT_EQ(resp.http_status, 409);
 }
 
 // -----------------------------------------------------------------------
