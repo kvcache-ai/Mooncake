@@ -371,10 +371,10 @@ mooncake-store-rs-bench --metadata-url redis://127.0.0.1:6379/0 soak \
   --duration 3600 --fault redis-jitter:5:50 --verify-reads
 ```
 
-See `docs/bench.md` for the full CLI reference and architecture description.
+See the [Store-RS benchmark guide](../../performance/mooncake/store-rs-benchmark.md) for the full CLI reference.
 
 ## Next Reading
 
-- `docs/configuration.md` for defaults and knobs
-- `docs/deployment.md` for local and multi-role deployment
-- `docs/architecture.md` for runtime behavior
+- [Configuration](../../deployment/store-rs/configuration.md) for defaults and knobs
+- [Deployment](../../deployment/store-rs/deployment.md) for local and multi-role deployment
+- [Architecture](../../design/store/store-rs/architecture.md) for runtime behavior

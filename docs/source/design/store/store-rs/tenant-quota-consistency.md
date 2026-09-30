@@ -94,7 +94,7 @@ This design follows that family of solutions.
 
 ## Current Architecture Constraints
 
-From `docs/architecture.md`, the current Store-RS write path has these important properties:
+From the [Store-RS architecture](architecture.md), the current Store-RS write path has these important properties:
 
 - `StoreClient` performs request-path admission, allocation, transfer, and route publication
 - `RouteDirectory` owns route lookup and route CAS
@@ -599,7 +599,7 @@ Reservation retention is now split by lifecycle state:
 - the default terminal retention window is `24h`
 - terminal retention uses Redis TTL on both the reservation record and its per-tenant index entry so completed history does not accumulate indefinitely
 
-This matches the existing admin philosophy in `docs/multi-tenant-admin-control-plane-design.md`. Runtimes now also export tenant-quota reservation/finalize/abort/reconcile counters through the built-in Prometheus metrics registry.
+This matches the existing admin philosophy in the [multi-tenant admin design](multi-tenant-admin-control-plane.md). Runtimes now also export tenant-quota reservation/finalize/abort/reconcile counters through the built-in Prometheus metrics registry.
 
 ---
 

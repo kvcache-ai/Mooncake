@@ -866,3 +866,73 @@ For upgrade and elasticity flows:
 - preserve `stable_id`
 - start the successor with the same `stable_id`; the metadata backend allocates the next epoch atomically
 - use `expand_local_memory`, `drain_segment`, `retire_segment`, and `evacuate_owned_replicas`
+
+---
+
+## Python Configuration
+
+These sections supplement the client and operator settings above with Python-specific metadata, transport, and framework configuration.
+
+## Metadata URLs
+
+The compatibility layer accepts these metadata URL forms:
+
+| Scheme | Meaning |
+|--------|---------|
+| `redis://host:port/db` | Redis metadata backend |
+| `etcd://host1:2379,host2:2379` | etcd metadata backend |
+
+Redis authentication follows the same environment variables as the native store:
+
+```bash
+export MC_REDIS_PASSWORD='<redis-password>'
+# Optional when Redis ACLs require a named user:
+export MC_REDIS_USERNAME='<redis-username>'
+```
+
+Credentials embedded in `redis://username:password@host:port/db` are also accepted and take precedence over the environment variables. Prefer environment variables when passwords contain URL-reserved characters such as `@`.
+
+### Python setup positional layout
+
+`setup(local_hostname, transport_metadata_url, global_segment_size, local_buffer_size, protocol, rdma_devices, metadata_url)`.
+
+- `transport_metadata_url` is forwarded to the Transfer Engine only. Accepts `redis://...` or `P2PHANDSHAKE`. **Default value is `P2PHANDSHAKE`** everywhere it can be defaulted: the Python dict-form (resolution order: dict key → `MC_STORE_RS_TRANSPORT_METADATA_URL` env → `P2PHANDSHAKE`), the standalone CLI bins (`mooncake-store-rs-client` / `mooncake-store-rs-bench` without `--transport-metadata-url` or env), and other defaultable surfaces. The Python positional `setup(...)` requires it explicitly because Python disallows defaults on a positional that precedes required positionals; pass `"P2PHANDSHAKE"` to opt into the default. The dict-form also accepts the upstream Mooncake key `metadata_server` as an alias.
+- `metadata_url` is the Store-RS metadata URL. Accepts `redis://...` or `etcd://...` and is required. The dict-form `setup({...})` also accepts the upstream Mooncake keys `master_server`, `master_server_addr`, and `master_server_address` interchangeably as aliases, with `MC_STORE_RS_METADATA_URL` env honored as a final fallback. The standalone CLI bins use the same env for their `--metadata-url` flag.
+
+### Important note for etcd
+
+When `metadata_url` is an etcd URL, the Transfer Engine still needs its own metadata: pass either `redis://...` or `P2PHANDSHAKE` at `transport_metadata_url`. For `classic_te`, `P2PHANDSHAKE` (the transfer-engine peer-handshake mode) is the default; `tent` always needs an explicit `redis://...`.
+
+## Python Transport Backend Selection
+
+The compatibility layer can choose the transport backend at runtime.
+
+Supported values:
+
+- `tent`
+- `classic_te`
+
+Selection order:
+
+1. explicit `transport_backend=...` argument to `setup(...)`
+2. `MC_STORE_RS_TRANSPORT_BACKEND`
+3. default `classic_te`
+
+The standalone client follows the same rule, except the explicit override is `--transport-backend`.
+
+## SGLang Environment Fallbacks
+
+Current upstream SGLang only forwards legacy Mooncake setup fields. When SGLang cannot pass Store-RS setup extensions, the Python wrapper reads these environment variables as fallbacks:
+
+- `MC_STORE_RS_METADATA_URL` (dict-form `metadata_url` fallback) and `MC_STORE_RS_TRANSPORT_METADATA_URL` (dict-form `transport_metadata_url` fallback; defaults to `P2PHANDSHAKE` when unset)
+- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
+- `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
+- `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
+- `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
+- `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
+- `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
+- `MC_STORE_RS_METRICS_ADDR=host:port`
+- `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC client capacity; default `2`
+- `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS=<n>` to tune embedded control-plane gRPC server capacity; default `4`
+
+Explicit `setup(...)` arguments still take precedence. `MC_STORE_RS_METRICS_ADDR` starts the Python real-client `/metrics` endpoint after `setup(...)`. `MC_STORE_RS_LABELS` accepts either JSON (`{"storage":"false","pool":"rw"}`) or comma-separated pairs (`storage=false,pool=rw`).

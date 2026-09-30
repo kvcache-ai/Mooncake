@@ -118,6 +118,18 @@ enabled. To activate, add the repository in the pre-commit.ci dashboard; no
 further changes are needed.
 
 
+## Store-RS Test Entry Point
+
+Run the component Python compatibility validator from the repository root:
+
+```bash
+mooncake-store-rs/scripts/e2e/run-python-compat-e2e.sh
+```
+
+It requires a root wheel built with `WITH_STORE_RS=ON`. See the [Store-RS
+validation guide](docs/source/deployment/store-rs/testing.md) for the required
+Python environment and scenario-specific checks.
+
 ## Code Quality
 
 The PR needs to meet the following code quality standards:

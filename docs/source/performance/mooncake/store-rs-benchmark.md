@@ -275,20 +275,10 @@ Keyspace behavior is conditional:
 
 ## Build
 
-Build the benchmark and client commands from the workspace:
-
-```bash
-cargo build --release -p mooncake-store-rs-cli -p mooncake-store-rs-admin --bins
-export PATH="$PWD/target/release:$PATH"
-```
-
-Direct Cargo builds require the explicit source, build, and CMake shim paths
-described in `docs/rust.md`. The top-level `build_store_rs` CMake target builds
-the native shims and Rust command binaries together. Direct Cargo binaries are
-written to `target/release/` unless `CARGO_TARGET_DIR` is set.
+Configure the root CMake project as described in the [Store-RS source-checkout quickstart](../../getting_started/store-rs.md), then build the build_store_rs_cli target. The unified root wheel installs the client, admin, and benchmark commands for direct use from its Python environment.
 
 ## Next reading
 
-- `docs/rust.md` for store client API reference
-- `docs/configuration.md` for Redis and transport options
-- `crates/mooncake-store-e2e/src/main.rs` for the upstream correctness test suite
+- [Rust API](../../api-reference/rust/store-rs.md) for store client usage
+- [Configuration](../../deployment/store-rs/configuration.md) for Redis and transport options
+- `mooncake-store-rs/crates/mooncake-store-e2e/src/main.rs` for the upstream correctness test suite

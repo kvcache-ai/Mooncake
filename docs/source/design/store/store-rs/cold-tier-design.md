@@ -1,4 +1,4 @@
-# Storage Backend Hot/Cold Design
+# Store-RS Cold-Tier Design
 
 This document defines the target backend semantics for `mooncake-store-rs` after switching from the current locator-as-replica model to a hot/cold storage model.
 
@@ -338,21 +338,10 @@ Current scope limitations:
 - SSD intent is validated structurally (directory / UUID resolution) and does not attempt hardware-media certification
 - NFS validation is mount-type based and does not attempt deeper storage benchmarking
 
-## SSD end-to-end validation status
-
-The current e2e binary now validates the directory-backed SSD flow end to end:
-
-- explicit SSD cold tier target wiring through `ColdTierTargetConfig::directory(...)`
-- hot write -> pending cold backing -> materialized cold backing transition
-- backend object materialization on disk
-- overwrite path with new cold backing identity
-- tenant-scoped delete and backend cleanup
-- benchmark phases followed by benchmark object cleanup so later shrink validation is not polluted by leftover benchmark routes
-- true client shrink validation with convergence-aware waiting in the full e2e environment
-
-This was validated with a full local run of `cargo run -p mooncake-store-e2e` on the current host using a directory-backed SSD target root.
-
 ## Compatibility strategy
+
+The following records the original migration proposal. Current implementation status appears above; consult the deployment pages for current operating steps.
+
 
 The codebase already has history and compatibility paths for `ReplicaLocator::BackendObject`.
 
@@ -386,7 +375,10 @@ Migration should therefore be phased:
 - cold tier usage accounting must reserve before backend write and must release or commit on every outcome
 - unregister cannot strand cold-only objects on a removed device; safe force unregister only marks hot-replicated materialized backings for deletion
 
-## Implementation sequence
+## Original implementation sequence
+
+This sequence records the design plan and is not a list of remaining work. Current implementation status appears above.
+
 
 1. extend route schema with `cold_backing`
 2. update write path to DRAM-first + `PendingOffload`
@@ -396,53 +388,16 @@ Migration should therefore be phased:
 6. add overwrite/delete cold cleanup
 7. add legacy route compatibility and recovery/repair
 
-## Files most likely to change
+## Implementation touchpoints
 
-- `crates/mooncake-store-core/src/route.rs`
-- `crates/mooncake-store-client/src/client/runtime_write.rs`
-- `crates/mooncake-store-client/src/client/runtime_io.rs`
-- `crates/mooncake-store-client/src/client/state_store.rs`
-- `crates/mooncake-store-client/src/client/runtime_alloc.rs`
-- `crates/mooncake-store-client/src/client/state_core.rs`
-- `crates/mooncake-store-client/src/client/backend.rs`
-- `crates/mooncake-store-client/src/client/posix_backend.rs`
-
-## Testing focus
-
-- write returns after DRAM publish even before backend materialization
-- successful offload marks `cold_backing = Materialized`
-- eviction never removes a hot replica without materialized cold backing
-- last-hot eviction produces a cold-only route instead of dropping the object
-- read miss restores from backend and can return data even if promotion fails
-- two-client remote restore covers an embedded storage client that writes, evicts to a materialized cold-only route, reads back from cold tier, and allows a second client to trigger owner-side cold read
-- owner-side staging ACK releases read pins and recycles staging slots without leaking or prematurely reusing memory
-- batch cold restore uses backend batch read/read-into paths when objects share a backend/device
-- overwrite/delete clean up old cold objects
-- startup/heartbeat rebuild can materialize pending offloads from persisted pending source
-- a full e2e flow covers write -> materialize -> cold-only eviction -> backend restore -> overwrite -> delete
-- legacy backend-object routes remain readable during migration
-
-## Admin HTTP control plane
-
-The Admin HTTP API uses `/v1/cold-tier` as its base path. It manages Mooncake cold tier devices, not operating-system block devices or mounts. Operating-system provisioning remains the responsibility of deployment tooling.
-
-Device identity fields:
-
-| Field | Meaning |
-|---|---|
-| `device_id` | Mooncake-managed logical device identity used by routes and placement |
-| `cold_tier_id` | Human-readable cold tier alias, for example `ssd-0` |
-| `stable_id` | Storage runtime stable identity |
-| `epoch` | Current live runtime incarnation for fencing |
-| `kind` | Cold tier kind, for example `ssd` or `nfs` |
-| `target` | Runtime-resolved target spec such as a directory or filesystem UUID |
-| `root_dir` | Resolved cold root directory |
-| `state` | Device lifecycle state |
-| `schedulable` | Whether the device accepts new offload placement |
-
-Implemented device operations include create, list, get, register, unregister, disable, enable, drain, blockers query, manual GC, manual free, object cold backing query, pending offload trigger, offload task status/listing, and quarantine reporting.
-
-`register` and `unregister` are Mooncake registry operations. `unregister` without force must not strand cold-only objects on the removed device. Safe forced unregister is allowed only when materialized objects still have hot replicas and can be marked `PendingDelete`.
+- `mooncake-store-rs/crates/mooncake-store-core/src/route.rs`
+- `mooncake-store-rs/crates/mooncake-store-client/src/client/runtime_write.rs`
+- `mooncake-store-rs/crates/mooncake-store-client/src/client/runtime_io.rs`
+- `mooncake-store-rs/crates/mooncake-store-client/src/client/state_store.rs`
+- `mooncake-store-rs/crates/mooncake-store-client/src/client/runtime_alloc.rs`
+- `mooncake-store-rs/crates/mooncake-store-client/src/client/state_core.rs`
+- `mooncake-store-rs/crates/mooncake-store-client/src/client/backend.rs`
+- `mooncake-store-rs/crates/mooncake-store-client/src/client/posix_backend.rs`
 
 ## Scheduling, capacity, and backpressure
 
@@ -552,41 +507,10 @@ Design invariants for the SSD KV engine:
 - batch paths should not be thin loops around single-object operations
 - no RocksDB/LSM, per-object JSON files, runtime JSON fallback, or public `backend` terminology for cold-tier APIs
 
-## ExtentStore performance review and optimization direction
+## Document boundaries
 
-The community Mooncake `io_uring` implementations and this ExtentStore direction operate at different abstraction layers:
-
-- community `io_uring` file/transport code is a simple low-risk offset I/O accelerator
-- ExtentStore is a KVCache-aware cold storage engine that owns object layout, extent locators, route-authoritative visibility, restore/offload semantics, liveness, and recovery boundaries
-
-The optimization direction is therefore not to replace ExtentStore with a generic `io_uring` transport. ExtentStore should keep the KV-like engine semantics, while absorbing the community design lessons that avoid global contention and keep the I/O fast path simple, observable, and fallback-friendly.
-
-Key architectural conclusions:
-
-- ExtentStore's main advantage is KVCache lifecycle awareness, not fixed-file or fixed-buffer registration by itself.
-- Append-only segment layout can create restore locality only if runtime restore uses backend batch reads instead of issuing mostly single-object restores.
-- Route metadata remains the authoritative index; the engine should not introduce an independent LSM-style object index for visibility.
-- Restore correctness must not depend on DRAM promotion succeeding.
-- Cleaner/GC is a storage-engine responsibility once cold objects are packed into shared segments.
-- Delete journal durability should support a strict mode for tests/strong durability and a normal group-commit mode for high-churn cache workloads.
-- Worker/ring design should evolve toward per-device/per-queue sharding when profiling shows the current dedicated worker is a bottleneck; avoid a global ring or global lock hot path.
-- Direct I/O, fixed file, fixed buffer, and GDS paths are optimizations, not the core design. They must expose hit/fallback counters and should not dominate the control flow before batch restore and copy reduction are addressed.
-
-Profiling must come before structural optimization. The minimum profiling surface should split restore/offload latency into route lookup, locator parse, singleflight wait/leader work, backend queue wait, physical I/O submit/complete, checksum/decode, copy-to-caller, promotion allocation/copy/CAS, delete journal append/sync, and total p50/p95/p99. It should also expose object size distribution, batch size distribution, coalesced read ratio, average physical read size, SQE count per logical object, direct/scratch/buffered ratios, scratch copy bytes, worker busy ratio, queue depth, and route CAS retry counts.
-
-The prioritized optimization sequence is:
-
-1. Add fine-grained profiling and benchmark coverage for restore/offload and worker contention.
-2. Connect runtime cold batch restore to backend batch read/read-into-buffer by grouping locators by cold device/backend and preserving object-level singleflight initially.
-3. Reduce restore copies with read-into-destination singleflight: single waiter reads into caller or promotion buffer; multiple waiters share a leader buffer and copy only when necessary.
-4. Implement a minimal conservative cleaner for sealed segments: choose high-dead-ratio candidates, verify each live record against the current route, copy-forward live records, CAS routes to new locators, and treat CAS-lost copies as dead.
-5. Add delete journal batching/group commit with strict and normal modes; normal mode may conservatively leak space across a crash window but must not make live data unreachable.
-6. Add minimal KVCache-aware segment placement, starting with size class and TTL/session bucket before adding more dimensions.
-7. Shard I/O workers/rings by device and queue class only if profiling shows the single worker/queue is limiting throughput or p99.
-8. Clarify GPU/GDS restore paths with large aligned direct reads, pooled pinned-host fallback, and success/fallback counters.
-
-For architecture-level changes in these phases, use profiling data and compare against mature storage/runtime patterns before implementation. Relevant references include log-structured segment cleaning, RocksDB-style compaction tradeoffs where applicable, `io_uring` per-thread/per-device queue patterns, and cache admission/promotion strategies. Do not introduce speculative abstractions or complex fast paths without a measured bottleneck and a clear fallback.
-
-## Consolidated development scope
-
-This document is the single cold tier design reference. Detailed research notes, local findings, SSD KV engine notes, and previous Chinese design/review drafts have been consolidated or removed from the PR to avoid splitting the same design across multiple documents.
+This page records cold-tier architecture and implementation status.
+[Deployment validation](../../../deployment/store-rs/cold-tier.md), [Admin HTTP
+endpoints](../../../api-reference/http/store-rs-admin.md), and
+[performance design direction](../../../performance/mooncake/store-rs-cold-tier-performance.md)
+are documented separately.

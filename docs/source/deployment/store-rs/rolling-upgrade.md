@@ -8,7 +8,7 @@ This document describes how to perform a rolling upgrade on a Mooncake Store clu
 
 - The new version only increments `store_api_minor_version` (minor version) and does **not** change `store_api_version` (major version)
 - The changes in the new version are backward-compatible (e.g., adding fields, adding RPCs) and do not alter existing API semantics
-- The new version binary has been compiled and deployed to the target machine
+- Both versions were built from their own root CMake build trees using the [Store-RS source-checkout quickstart](../../getting_started/store-rs.md)
 
 ### Compatibility Guarantees
 
@@ -28,11 +28,13 @@ This document describes how to perform a rolling upgrade on a Mooncake Store clu
 # Verify the Redis metadata backend is available
 redis-cli -p 6380 ping
 
-# Verify the new version binary is compiled
-ls -la target/debug/mooncake-store-rs-client
+# Point each variable at its version's root CMake build tree.
+export CLIENT_BIN_V1=/path/to/v1-build/mooncake-store-rs/cargo-cli/release/mooncake-store-rs-client
+export CLIENT_BIN_V2=/path/to/v2-build/mooncake-store-rs/cargo-cli/release/mooncake-store-rs-client
 
-# Back up the old version binary (optional, for rollback)
-cp target/debug/mooncake-store-rs-client target/debug/mooncake-store-rs-client-v1
+# Verify the new binary and keep the predecessor available for rollback.
+ls -la "$CLIENT_BIN_V2"
+cp "$CLIENT_BIN_V1" "$CLIENT_BIN_V1.backup"
 ```
 
 ### Step 1: Start the New Version Successor in Standby Mode
@@ -40,7 +42,7 @@ cp target/debug/mooncake-store-rs-client target/debug/mooncake-store-rs-client-v
 Launch the new version binary with the **same `stable_id`** as the predecessor. The metadata backend allocates the next epoch automatically.
 
 ```bash
-./target/debug/mooncake-store-rs-client \
+$CLIENT_BIN_V2 \
   --local-hostname 127.0.0.1 \
   --metadata-url "redis://127.0.0.1:6380/0" \
   --storage-bytes 1048576 \
@@ -169,7 +171,7 @@ If the new version encounters issues, you can roll back using the same mechanism
 ```bash
 # Roll back client-a using the V1 binary — the successor gets the next epoch
 # from the metadata backend (epoch=3 in a 1 -> 2 -> 3 rollout sequence).
-./target/debug/mooncake-store-rs-client-v1 \
+$CLIENT_BIN_V1 \
   --local-hostname 127.0.0.1 \
   --metadata-url "redis://127.0.0.1:6380/0" \
   --storage-bytes 1048576 \

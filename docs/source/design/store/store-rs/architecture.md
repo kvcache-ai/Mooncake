@@ -560,9 +560,9 @@ This preserves compatibility for integrations that expect a dummy client / exter
 ## When to Read Which Document
 
 - Start with `README.md` for setup and a first run
-- Read `docs/deployment.md` for local scripts and deployment roles
-- Read `docs/rust.md` for Rust integration
-- Read `docs/configuration.md` for defaults and tuning knobs
-- Read `docs/python.md` for the Python layer
-- Read `docs/testing.md` for the test suite layout, fault-injection model, and CI entry point
+- Read the [deployment guide](../../../deployment/store-rs/deployment.md) for scenarios and deployment roles
+- Read the [Rust API](../../../api-reference/rust/store-rs.md) for Rust integration
+- Read [configuration](../../../deployment/store-rs/configuration.md) for defaults and tuning knobs
+- Read the [Python API](../../../api-reference/python/store-rs.md) for the Python layer
+- Read [testing and validation](../../../deployment/store-rs/testing.md) for scenarios and fault-injection coverage
 - Read `crates/mooncake-store-e2e/src/main.rs` for a complete runnable example

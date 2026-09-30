@@ -46,7 +46,7 @@ Use this command for QA verification with minimal benchmark noise:
 ```bash
 MC_STORE_RS_ENABLE_RDMA=0 \
 MC_STORE_RS_BENCH_ITERS=1 \
-scripts/e2e/run-local-e2e.sh
+mooncake-store-rs/scripts/e2e/run-local-e2e.sh
 ```
 
 ## Expected Success Signal

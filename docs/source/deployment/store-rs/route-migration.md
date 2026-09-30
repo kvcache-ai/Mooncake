@@ -39,17 +39,7 @@ There is currently no dedicated Python route-migration API.
 
 ### 2.1 HTTP API
 
-The long-lived `mooncake-store-rs-admin server` exposes:
-
-- `POST /v1/route-migrations/copy`
-- `POST /v1/route-migrations/move`
-- `GET /v1/route-migrations`
-- `GET /v1/route-migrations/<task_id>`
-
-Implementation entry points:
-
-- [http.rs](../crates/mooncake-store-rs-admin/src/admin/http.rs)
-- [service.rs](../crates/mooncake-store-rs-admin/src/admin/service.rs)
+Endpoint paths, request fields, and retry semantics are documented in the [Store-RS Admin HTTP API reference](../../api-reference/http/store-rs-admin.md).
 
 ### 2.2 CLI
 
@@ -65,7 +55,7 @@ Current commands:
 
 Implementation entry point:
 
-- [mooncake-store-rs-admin.rs](../crates/mooncake-store-rs-admin/src/bin/mooncake-store-rs-admin.rs)
+- [mooncake-store-rs-admin.rs](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store-rs/crates/mooncake-store-rs-admin/src/bin/mooncake-store-rs-admin.rs)
 
 Key constraints:
 
@@ -94,15 +84,15 @@ The current end-to-end flow is:
 Key implementation locations:
 
 - admin scheduling and retry:
-  - [service.rs](../crates/mooncake-store-rs-admin/src/admin/service.rs)
+  - [service.rs](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store-rs/crates/mooncake-store-rs-admin/src/admin/service.rs)
 - control-plane migration service:
-  - [control_plane/mod.rs](../crates/mooncake-store-client/src/control_plane/mod.rs)
-  - [server.rs](../crates/mooncake-store-client/src/control_plane/server.rs)
-  - [client.rs](../crates/mooncake-store-client/src/control_plane/client.rs)
+  - [control_plane/mod.rs](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store-rs/crates/mooncake-store-client/src/control_plane/mod.rs)
+  - [server.rs](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store-rs/crates/mooncake-store-client/src/control_plane/server.rs)
+  - [client.rs](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store-rs/crates/mooncake-store-client/src/control_plane/client.rs)
 - executor-side worker:
-  - [state_adapters.rs](../crates/mooncake-store-client/src/client/state_adapters.rs)
+  - [state_adapters.rs](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store-rs/crates/mooncake-store-client/src/client/state_adapters.rs)
 - migration execution kernel:
-  - [runtime_io.rs](../crates/mooncake-store-client/src/client/runtime_io.rs)
+  - [runtime_io.rs](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store-rs/crates/mooncake-store-client/src/client/runtime_io.rs)
 
 ## 4. What `task_executor` Means
 
@@ -189,61 +179,11 @@ curl http://127.0.0.1:18080/v1/route-migrations/<task_id>
 
 ## 6. Request Fields
 
-The current request surface uses these key fields:
-
-- `authority`
-  - route authority stable id
-- `tenant`
-  - required
-- `domain`
-  - optional, defaults to the default domain
-- `object_set`
-  - optional, defaults to the default object set
-- `key`
-  - logical object key
-- `source_segment`
-  - segment that currently hosts the source replica
-- `target_segments`
-  - explicit target segment list
-- `task_executor`
-  - stable id of the runtime that executes the task
-- `max_retries`
-  - admin-side retry budget override; default is `5`
-
-Constraints:
-
-- `copy` requires at least one target
-- `move` currently requires exactly one target
-- `task_executor` must not be empty
-- the admin queue is not persisted; queued tasks are lost if the admin server
-  restarts
+See the [HTTP API request reference](../../api-reference/http/store-rs-admin.md#route-migration-api) for field names and request constraints.
 
 ## 7. Failure and Retry Semantics
 
-Retry is owned by the admin server, not by the CLI.
-
-Current semantics:
-
-- while admin is alive, it automatically retries executor loss and transient RPC
-  failures
-- the default retry budget is `5`
-- if executor status is lost but the authoritative route already shows the task
-  is complete, admin marks the task as `succeeded`
-- if the admin process restarts, the in-memory queue is lost; the durable truth
-  remains the route
-
-Task states currently exposed to callers:
-
-- `pending`
-- `dispatching`
-- `running`
-- `retry_wait`
-- `succeeded`
-- `failed`
-
-Reserved but not currently exposed in P1:
-
-- `cancelled`
+See the [HTTP API retry reference](../../api-reference/http/store-rs-admin.md#route-migration-api) for completion and failure semantics.
 
 ## 8. Scope Boundaries
 
@@ -261,7 +201,7 @@ What this feature is not:
 
 ## 9. Related Docs
 
-- [Python Guide](./python.md)
-- [Features](./features.md)
-- [Configuration Reference](./configuration.md)
-- [Architecture](./architecture.md)
+- [Python Guide](../../api-reference/python/store-rs.md)
+- [Features](../../getting_started/store-rs-features.md)
+- [Configuration Reference](configuration.md)
+- [Architecture](../../design/store/store-rs/architecture.md)

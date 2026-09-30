@@ -227,15 +227,15 @@ The bench binary provides three subcommands:
 - `verify` — sequential correctness checks including configurable single-key or batch read/write paths, `get_into`, `is_exist`, overwrite correctness, delete/reclaim, and tenant isolation
 - `soak` — long-duration stability test with per-operation fault injection (Redis jitter, metadata drop, transport delay, transport error) and optional read verification
 
-See `docs/bench.md` for full usage and design.
+See the [benchmark guide](../../../performance/mooncake/store-rs-benchmark.md) for full usage.
 
 ## Suggested Reading Order
 
-1. `README.md`
-2. `docs/deployment.md`
-3. `docs/rust.md`
-4. `docs/configuration.md`
+1. [Source-checkout quickstart](../../../getting_started/store-rs.md)
+2. [Deployment](../../../deployment/store-rs/deployment.md)
+3. [Rust API](../../../api-reference/rust/store-rs.md)
+4. [Configuration](../../../deployment/store-rs/configuration.md)
 5. `crates/mooncake-store-core`
-6. `docs/features.md`
-7. `docs/architecture.md`
-8. `crates/mooncake-store-e2e/src/main.rs`
+6. [Features](../../../getting_started/store-rs-features.md)
+7. [Architecture](architecture.md)
+8. [Test and validation guide](../../../deployment/store-rs/testing.md)

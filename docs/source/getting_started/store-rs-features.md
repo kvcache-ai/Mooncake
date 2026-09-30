@@ -149,7 +149,7 @@ For simpler bring-up or debugging, the runtime can store and resolve routes dire
 
 The current implementation also exposes admin-driven explicit route migration tasks for key-level `copy` and `move`.
 
-See [Route Migration Guide](./route-migration-usage.md) for the current
+See [Route Migration Guide](../deployment/store-rs/route-migration.md) for the current
 operator workflow, task semantics, and request examples.
 
 What it provides:
@@ -505,11 +505,10 @@ The compatibility layer exposes two integration modes:
 
 Both paths are covered by repository validation scripts.
 
-The standard read/write entry point is:
-
-```bash
-./scripts/tests/client/test-client-rw-cli.sh
-```
+The component Python compatibility validation entry point is
+`mooncake-store-rs/scripts/e2e/run-python-compat-e2e.sh`. See the
+[validation guide](../deployment/store-rs/testing.md) for its required
+environment and additional scenario-specific checks.
 
 Manual path-specific validators stay available as:
 

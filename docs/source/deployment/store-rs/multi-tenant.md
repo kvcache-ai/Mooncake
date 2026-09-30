@@ -338,18 +338,18 @@ Backend behavior:
 
 If you want to validate the feature end-to-end:
 
-- `scripts/e2e/run-local-e2e.sh` covers multi-tenant behavior and strict tenant quota in the Rust e2e harness
-- `scripts/e2e/run-python-compat-e2e.sh` covers the Python compatibility API surface
-- `scripts/e2e/run-local-hot-cache-e2e.sh` validates real-mode local hot-cache reuse and dummy-mode shm-backed hot-cache reuse
-- `docs/deployment.md` describes the recommended operator workflow from policy authoring to local validation
-- `docs/python.md` documents the current Python `keyspace` / `worker_scope` behavior in more detail
+- `mooncake-store-rs/scripts/e2e/run-local-e2e.sh` covers multi-tenant behavior and strict tenant quota in the Rust e2e harness
+- `mooncake-store-rs/scripts/e2e/run-python-compat-e2e.sh` covers the Python compatibility API surface
+- `mooncake-store-rs/scripts/e2e/run-local-hot-cache-e2e.sh` validates real-mode local hot-cache reuse and dummy-mode shm-backed hot-cache reuse
+- [Deployment](deployment.md) describes the recommended operator workflow from policy authoring to local validation
+- [Python API](../../api-reference/python/store-rs.md) documents current keyspace and worker_scope behavior
 
 ## Related Documents
 
-- `docs/deployment.md` — runtime and operator deployment workflow
-- `docs/python.md` — Python real-mode and dummy-mode isolation semantics
-- `docs/configuration.md` — precedence and fallback behavior for tenant-scoped settings
-- `docs/multi-tenant-admin-control-plane-design.md` — control-plane design and admin command model
-- `docs/tenant-quota-consistency-design.md` — strict quota design and metadata protocol
-- `docs/architecture.md` — metadata model and runtime integration details
-- `docs/rust.md` — Rust client usage and tenant-scoped runtime notes
+- [Deployment](deployment.md) — runtime and operator workflow
+- [Python API](../../api-reference/python/store-rs.md) — real-mode and dummy-mode isolation semantics
+- [Configuration](configuration.md) — precedence and fallback behavior for tenant-scoped settings
+- [Admin control-plane design](../../design/store/store-rs/multi-tenant-admin-control-plane.md) — control-plane design and admin command model
+- [Quota design](../../design/store/store-rs/tenant-quota-consistency.md) — strict quota semantics and metadata protocol
+- [Architecture](../../design/store/store-rs/architecture.md) — metadata model and runtime integration
+- [Rust API](../../api-reference/rust/store-rs.md) — Rust client usage and tenant-scoped runtime notes
