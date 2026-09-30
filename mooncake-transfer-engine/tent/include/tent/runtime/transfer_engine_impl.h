@@ -410,6 +410,14 @@ class TransferEngineImpl {
     SelectionResult getTransportType(const Request& request,
                                      int transport_index = 0);
 
+    // One selection pass behind getTransportType(). `allow_xpu_direct` lets a
+    // dma-buf-registered XPU buffer route directly over RDMA (see
+    // xpuDirectRdmaReady); when false every XPU side is host-staged.
+    // `xpu_direct`, if given, reports whether this pass planned the direct
+    // route, so the caller can retry staged when it yields no transport.
+    SelectionResult planTransport(const Request& request, int transport_index,
+                                  bool allow_xpu_direct, bool* xpu_direct);
+
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
@@ -516,6 +524,14 @@ class TransferEngineImpl {
 
     void findStagingPolicy(const Request& req,
                            std::vector<std::string>& policy);
+
+    // True when a request touching Intel XPU memory can go over RDMA without
+    // host staging: the RDMA transport advertises the device capability the
+    // memory-type pair needs, and every buffer involved was registered on RDMA
+    // (an XPU buffer only carries RDMA when its dma-buf registration
+    // succeeded). `remote_entry` is the remote buffer the request targets.
+    bool xpuDirectRdmaReady(const Request& req, const BufferDesc* remote_entry,
+                            MemoryType local_mtype, MemoryType remote_mtype);
 
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 

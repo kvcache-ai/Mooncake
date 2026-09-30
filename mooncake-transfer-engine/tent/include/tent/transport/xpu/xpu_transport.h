@@ -57,15 +57,15 @@ struct XpuSubBatch : public Transport::SubBatch {
 };
 
 // XpuTransport is the Intel-XPU vendor transport, the oneAPI/SYCL analog of
-// NVLinkTransport. For the correctness-first MVP (PR2) it implements only the
-// local VRAM<->host-DRAM staging hop: it advertises the device<->host
-// capabilities (gpu_to_dram / dram_to_gpu) and runs the copy through the active
-// XpuPlatform for LOCAL_SEGMENT_ID requests, while the host<->host hop is
-// carried by RDMA/TCP and ProxyManager chains the two stages (see
-// findStagingPolicy). gpu_to_gpu is left false so the engine always stages
-// cross-node traffic through host DRAM; direct VRAM RDMA (dma-buf) and PCIe
-// peer-to-peer arrive later, exactly as NVLinkTransport already exposes them
-// for CUDA.
+// NVLinkTransport. It implements the local VRAM<->host-DRAM staging hop: it
+// advertises the device<->host capabilities (gpu_to_dram / dram_to_gpu) and
+// runs the copy through the active XpuPlatform for LOCAL_SEGMENT_ID requests,
+// while the host<->host hop is carried by RDMA/TCP and ProxyManager chains the
+// two stages (see findStagingPolicy). Cross-node VRAM traffic bypasses this
+// transport entirely when RdmaTransport registered both ends through dma-buf
+// (GPUDirect-style, see xpuDirectRdmaReady); staging remains the fallback
+// for hosts or buffers without it. gpu_to_gpu is left false here because PCIe
+// peer-to-peer between XPUs is not implemented yet.
 //
 // Like NVLinkTransport binds to CudaPlatform, this transport binds to the
 // concrete XpuPlatform in install() and drives every device operation -- USM

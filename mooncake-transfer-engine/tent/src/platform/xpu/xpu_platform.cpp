@@ -151,5 +151,35 @@ const std::vector<RangeLocation> XpuPlatform::getLocation(void* start,
     return CpuPlatform::getLocation(start, len, skip_prefault);
 }
 
+Status XpuPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
+    out = DmabufExport{};
+    auto& be = backend();
+    if (!be.isDevicePtr(addr))
+        return Status::InvalidArgument("not an XPU device allocation" LOC_MARK);
+    int fd = -1;
+    uint64_t offset = 0;
+    const int rc = be.exportDmabuf(addr, &fd, &offset);
+    if (rc == XpuSyclBackend::kExportPooled) {
+        LOG(WARNING) << "XpuPlatform: " << addr << " (" << length
+                     << " bytes) lives in a pooled USM allocation whose "
+                        "dma-buf is shared with other allocations; "
+                        "transfers will be staged through host. Set "
+                        "NEOReadDebugKeys=1 EnableDeviceUsmAllocationPool=0 "
+                        "to disable pooling in the Intel compute runtime";
+        return Status::InternalError(
+            "pooled USM allocation cannot be exported as dma-buf" LOC_MARK);
+    }
+    if (rc != XpuSyclBackend::kExportOk) {
+        LOG(WARNING) << "XpuPlatform: dma-buf export failed for " << addr
+                     << " (" << length
+                     << " bytes); transfers will be staged through host";
+        return Status::InternalError(
+            "Level Zero dma-buf export failed" LOC_MARK);
+    }
+    out.fd = fd;
+    out.offset = offset;
+    return Status::OK();
+}
+
 }  // namespace tent
 }  // namespace mooncake
