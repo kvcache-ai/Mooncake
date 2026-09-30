@@ -18,6 +18,63 @@ if(USE_CUDA)
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_utils.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/nvcc_compiler.cpp")
 
+  # The JIT engine runs nvcc at runtime, so the kernel headers the generated
+  # source #includes have to exist as files then. Stage a copy into the build
+  # tree and bake its path into the engine via jit_config.h.
+  #
+  # configure_file tracks each explicitly listed header, so edits refresh the
+  # staged copy and invalidate the JIT cache fingerprint.
+  set(MOONCAKE_EP_JIT_STAGE_ROOT "${CMAKE_BINARY_DIR}/mooncake_ep_jit")
+  set(MOONCAKE_EP_JIT_SOURCE_DIR
+      "${MOONCAKE_EP_JIT_STAGE_ROOT}/include/mooncake_ep")
+  set(MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine")
+  set(MOONCAKE_EP_JIT_GENERATED_DIR "${MOONCAKE_EP_JIT_STAGE_ROOT}/generated")
+
+  set(MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR "")
+  if(CUDAToolkit_INCLUDE_DIRS)
+    list(GET CUDAToolkit_INCLUDE_DIRS 0 MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR)
+  endif()
+
+  # NCCL DeviceTransport is the only kernel dependency living outside the
+  # Mooncake tree and the CUDA toolkit.
+  set(MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR "")
+  if(USE_NCCL_DEVICE AND NCCL_DEVICE_INCLUDE_DIR)
+    set(MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR "${NCCL_DEVICE_INCLUDE_DIR}")
+  endif()
+
+  set(MOONCAKE_EP_JIT_HEADERS
+      mooncake_ep_configs.cuh
+      mooncake_ep_device.h
+      mooncake_ep_utils.cuh)
+
+  set(MOONCAKE_EP_JIT_TRANSFER_HEADERS
+      include/cuda_alike.h
+      include/cuda_fabric_compat.h
+      include/transport/device/comm_device.cuh
+      include/transport/device/cuda/cuda_ops.cuh
+      include/transport/device/device_ops.cuh
+      include/transport/device/ibgda/mlx5gda.h
+      include/transport/device/ibgda_device.cuh
+      include/transport/device/p2p_device.cuh
+      tent/include/tent/common/cuda_fabric_compat.h)
+
+  file(MAKE_DIRECTORY "${MOONCAKE_EP_JIT_SOURCE_DIR}")
+  foreach(header IN LISTS MOONCAKE_EP_JIT_HEADERS)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../include/${header}"
+                   "${MOONCAKE_EP_JIT_SOURCE_DIR}/${header}" COPYONLY)
+  endforeach()
+  foreach(header IN LISTS MOONCAKE_EP_JIT_TRANSFER_HEADERS)
+    get_filename_component(header_dir "${header}" DIRECTORY)
+    file(MAKE_DIRECTORY "${MOONCAKE_EP_JIT_STAGE_ROOT}/${header_dir}")
+    configure_file(
+      "${MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR}/${header}"
+      "${MOONCAKE_EP_JIT_STAGE_ROOT}/${header}" COPYONLY)
+  endforeach()
+
+  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_config.h.in"
+                 "${MOONCAKE_EP_JIT_GENERATED_DIR}/jit/jit_config.h" @ONLY)
+
   # Keep CUDA fatbins in a separate library.  The Python host extension can
   # then pass through auditwheel while this library is injected afterwards.
   add_library(mooncake_ep_device SHARED ${MOONCAKE_EP_DEVICE_SOURCES}
@@ -34,7 +91,8 @@ if(USE_CUDA)
   target_include_directories(
     mooncake_ep_device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include
+    ${MOONCAKE_EP_JIT_GENERATED_DIR})
   target_compile_options(
     mooncake_ep_device PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3>
