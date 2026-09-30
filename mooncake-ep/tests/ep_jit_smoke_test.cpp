@@ -95,6 +95,40 @@ TEST_F(JitSmokeTest, CompilesLoadsAndLaunches) {
     EXPECT_EQ(read_back(), 42);
 }
 
+// Every mooncake-ep kernel spins across blocks and so relies on cooperative
+// launch keeping them all resident; dropping the attribute hangs instead of
+// failing, and only on configurations large enough to oversubscribe the SMs.
+// Nothing in the tree sets JitKernelVariant::cooperative explicitly, so the
+// guarantee rests entirely on its default -- pin that down here.
+//
+// The lever is the grid-size cap: a cooperative launch may not ask for more
+// blocks than fit on the device at once, while a plain launch may.  Running
+// the same oversized grid both ways turns a silently dropped attribute into a
+// test failure, without needing a grid-syncing kernel that would deadlock.
+TEST_F(JitSmokeTest, CooperativeAttributeIsApplied) {
+    static const int identity = 0;
+    JitKernelVariant oversized = make_variant(&identity);
+    oversized.num_blocks = 1 << 20;
+
+    SmokeArgs args{device_out_, 1};
+    std::string error;
+
+    // Establish that the grid size itself is launchable before attributing the
+    // failure below to the cooperative cap.
+    JitKernelVariant plain = oversized;
+    plain.cooperative = false;
+    ASSERT_EQ(mooncake::jit::launch_jit_kernel(plain, &args, nullptr, &error),
+              JitKernelStatus::kLaunched)
+        << error;
+    ASSERT_EQ(cudaStreamSynchronize(nullptr), cudaSuccess);
+
+    EXPECT_EQ(
+        mooncake::jit::launch_jit_kernel(oversized, &args, nullptr, &error),
+        JitKernelStatus::kLaunchFailed)
+        << "oversized cooperative launch succeeded, so the attribute was "
+           "dropped";
+}
+
 // The warm path must serve the kernel from the in-process cache without the
 // source text, which is what real callers rely on to skip building it.
 TEST_F(JitSmokeTest, WarmLaunchHitsProcessCache) {
