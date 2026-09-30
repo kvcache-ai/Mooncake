@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "master_metric_manager.h"
+#include "ha/standby_metadata_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -709,6 +710,63 @@ TEST_F(MasterServiceSSDTest, LegacyDiskRegistrationRetainsOwnerWithoutMount) {
     EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
     peer.ClearInvalidHandles();
     EXPECT_TRUE(service.GetReplicaList("legacy_disk", TenantId::Default()));
+}
+
+TEST_F(MasterServiceSSDTest, FailedChunkedRestoreKeepsPublishedDiskOwner) {
+    MasterService service;
+    MasterServiceTestPeer peer(service);
+    const UUID owner = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "existing_memory_owner";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x310000000;
+    segment.size = 64 * 1024 * 1024;
+    ASSERT_TRUE(service.MountSegment(segment, owner));
+    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    for (int i = 0; i < 2; ++i) {
+        StandbyObjectMetadata metadata;
+        metadata.client_id = owner;
+        metadata.size = 1024;
+        Replica::Descriptor disk;
+        disk.id = 41 + i;
+        disk.status = ReplicaStatus::COMPLETE;
+        disk.descriptor_variant = LocalDiskDescriptor{owner, 1024, "disk:1234"};
+        metadata.replicas.push_back(disk);
+        Replica::Descriptor memory;
+        memory.id = 51 + i;
+        memory.status = ReplicaStatus::COMPLETE;
+        MemoryDescriptor descriptor;
+        descriptor.buffer_descriptor.transport_endpoint_ =
+            "overlapping_restore";
+        descriptor.buffer_descriptor.buffer_address_ = 0x320000000;
+        descriptor.buffer_descriptor.size_ = 1024;
+        memory.descriptor_variant = descriptor;
+        metadata.replicas.push_back(memory);
+        ASSERT_TRUE(source->PutMetadata("default", "chunk_" + std::to_string(i),
+                                        metadata));
+    }
+    StandbySegmentInfo restored_segment;
+    restored_segment.segment_name = "overlapping_restore";
+    restored_segment.transport_endpoint = restored_segment.segment_name;
+    restored_segment.capacity = 64 * 1024 * 1024;
+    restored_segment.is_memory_segment = true;
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {restored_segment};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 52;
+    // Whichever key is drained first is published; the second chunk fails
+    // because both memory descriptors refer to the same address range.
+    auto result = service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_EQ(service.GetKeyCount(), 1);
+    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+    peer.ClearInvalidHandles();
+    EXPECT_EQ(service.GetKeyCount(), 1);
 }
 
 }  // namespace mooncake::test

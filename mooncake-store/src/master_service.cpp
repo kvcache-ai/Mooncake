@@ -3624,6 +3624,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     const auto record_for_known_owner = [&](const UUID& owner) {
         const auto existing = client_liveness_records_.find(owner);
         if (existing != client_liveness_records_.end()) {
+            // Earlier chunks can remain published if a later chunk fails.
+            // Track already-live owners even when the whole restore fails.
+            local_disk_client_records_.emplace(owner, existing->second);
             return existing->second;
         }
         auto [record, inserted] = new_known_owner_records.try_emplace(
