@@ -2512,6 +2512,33 @@ std::vector<int> RealClient::batchIsExist(
     return results;
 }
 
+int RealClient::probeKey(const std::string &key) {
+    auto result = probeKey_internal(key);
+
+    if (result.has_value()) {
+        return *result ? 1 : 0;  // 1 if exists, 0 if not
+    } else {
+        return toInt(result.error());
+    }
+}
+
+std::vector<int> RealClient::batchProbeKey(
+    const std::vector<std::string> &keys) {
+    auto internal_results = batchProbeKey_internal(keys);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+
+    for (const auto &result : internal_results) {
+        if (result.has_value()) {
+            results.push_back(result.value() ? 1 : 0);  // 1 if exists, 0 if not
+        } else {
+            results.push_back(toInt(result.error()));
+        }
+    }
+
+    return results;
+}
+
 tl::expected<int64_t, ErrorCode> RealClient::getSize_internal(
     const std::string &key) {
     if (!client_) {
@@ -6167,6 +6194,32 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
     return client_->BatchIsExist(keys);
 }
 
+tl::expected<bool, ErrorCode> RealClient::probeKey_internal(
+    const std::string &key) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->ProbeKey(key);
+}
+
+std::vector<tl::expected<bool, ErrorCode>> RealClient::batchProbeKey_internal(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    if (keys.empty()) {
+        LOG(WARNING) << "Empty keys vector provided to batchProbeKey_internal";
+        return std::vector<tl::expected<bool, ErrorCode>>();
+    }
+
+    // Call client BatchProbeKey and return the vector<expected> directly
+    return client_->BatchProbeKey(keys);
+}
+
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
                                        void *metadata_buffer, size_t size,
                                        size_t metadata_size,
@@ -8106,10 +8159,12 @@ RealClient::batch_get_into_offload_object_internal(
 
 ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
+#ifdef YLT_ENABLE_IBV
     if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
+#endif
     // Configure reasonable retry limits for SSD offload RPC connections.
     // - connect_retry_count: Maximum connection retry attempts (default: 3)
     // - reconnect_wait_time: Wait time between retries (default: 1000ms)

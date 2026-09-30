@@ -805,9 +805,9 @@ for each axis, or accept an arbitrary strategy dictionary.
   compatible source/target tensor descriptors. The planner is copy-only; it
   does not convert dtype, quantization, packing, or model semantics.
 
-See the [manifest contracts](../../design/reshard-manifest.md),
-[weight reshard planner](../../design/model-weight-reshard-planner.md), and
-[Store upload planning](../../design/model-weight-store-upload-planning.md)
+See the [manifest contracts](../../design/mooncake-reshard/reshard-manifest.md),
+[weight reshard planner](../../design/mooncake-reshard/model-weight-reshard-planner.md), and
+[Store upload planning](../../design/mooncake-reshard/model-weight-store-upload-planning.md)
 for the configuration and execution boundaries.
 
 ## Model Weight Snapshot API
@@ -1508,6 +1508,67 @@ results = store.batch_is_exist(keys)
 for key, exists in zip(keys, results):
     status = "exists" if exists == 1 else "not found" if exists == 0 else "error"
     print(f"{key}: {status}")
+```
+
+---
+
+#### probe_key()
+Point-in-time existence check that grants no read lease.
+
+Unlike `is_exist()`, a successful probe does not extend the object's lease,
+so probed objects remain eligible for eviction. A `1` result only means the
+object existed at the time of the call; it may be evicted before a
+subsequent `get`, and callers must treat a following miss as normal. This is
+suited for speculative scans (e.g., probing candidate keys to estimate
+prefix reuse) where the caller reads back only a subset of the probed keys.
+
+```python
+def probe_key(self, key: str) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier to check
+
+**Returns:**
+- `int`:
+  - `1`: Object existed at the time of the call
+  - `0`: Object didn't exist
+  - `-1`: Error occurred
+
+**Example:**
+```python
+exists = store.probe_key("my_key")
+if exists == 1:
+    print("Object existed at probe time (no lease granted)")
+elif exists == 0:
+    print("Object not found")
+else:
+    print("Error checking existence")
+```
+
+---
+
+#### batch_probe_key()
+Point-in-time existence check for multiple objects in a single batch
+operation, granting no read leases.
+
+```python
+def batch_probe_key(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers to check
+
+**Returns:**
+- `List[int]`: List of existence results (1=existed at probe time,
+0=not exists, -1=error)
+
+**Example:**
+```python
+keys = ["key1", "key2", "key3"]
+results = store.batch_probe_key(keys)
+candidates = [key for key, exists in zip(keys, results) if exists == 1]
+print("Probed candidates (unprotected from eviction):", candidates)
 ```
 
 ---

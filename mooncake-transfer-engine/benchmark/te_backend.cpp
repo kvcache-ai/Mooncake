@@ -16,6 +16,7 @@
 
 #include "te_backend.h"
 #include "utils.h"
+#include "split_output.h"
 #include "common.h"
 #include "char_util.h"
 
@@ -559,15 +560,44 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         entry.target_offset = target_addr + block_size * i;
         requests.emplace_back(entry);
     }
-    XferBenchTimer timer;
+    if (!splitOutputEnabled()) {
+        XferBenchTimer timer;
+        CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+        while (g_te_running) {
+            mooncake::TransferStatus overall_status;
+            CHECK_FAIL(
+                engine_->getBatchTransferStatus(batch_id, overall_status));
+            if (overall_status.s == TransferStatusEnum::COMPLETED) {
+                auto duration = timer.lap_us();
+                CHECK_FAIL(engine_->freeBatchID(batch_id));
+                return duration;
+            }
+            if (overall_status.s == TransferStatusEnum::FAILED ||
+                overall_status.s == TransferStatusEnum::TIMEOUT ||
+                overall_status.s == TransferStatusEnum::CANCELED ||
+                overall_status.s == TransferStatusEnum::INVALID) {
+                LOG(ERROR) << "Failed transfer detected";
+                exit(EXIT_FAILURE);
+            }
+        }
+        (void)engine_->freeBatchID(batch_id);
+        return -1.0;
+    }
+
+    XferBenchTimer submit_timer;
     CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+    const uint64_t submit_us = submit_timer.lap_us();
+    XferBenchTimer wait_timer;
+    uint64_t polls = 0;
     while (g_te_running) {
         mooncake::TransferStatus overall_status;
         CHECK_FAIL(engine_->getBatchTransferStatus(batch_id, overall_status));
+        polls++;
         if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            auto duration = timer.lap_us();
+            const uint64_t wait_us = wait_timer.lap_us();
+            logSplitXfer({batch_size, submit_us, wait_us, polls});
             CHECK_FAIL(engine_->freeBatchID(batch_id));
-            return duration;
+            return static_cast<double>(submit_us + wait_us);
         }
         if (overall_status.s == TransferStatusEnum::FAILED ||
             overall_status.s == TransferStatusEnum::TIMEOUT ||

@@ -117,6 +117,14 @@ qos
 slice-spraying
 :::
 
+## TENT Deadline Scheduling
+
+:::{toctree}
+:maxdepth: 1
+
+deadline-scheduling
+:::
+
 ## TENT Failover
 
 :::{toctree}

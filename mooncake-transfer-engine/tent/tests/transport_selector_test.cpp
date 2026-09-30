@@ -274,7 +274,7 @@ TEST(TransportSelectorTest, UbTransportNameRoundTrips) {
     EXPECT_EQ(parseTransportType(name), UB);
 }
 
-TEST(TransportTypeTest, WireValuesRemainStableWithHpTcpAppended) {
+TEST(TransportTypeTest, WireValuesRemainStableWithXpuAppended) {
     EXPECT_EQ(static_cast<int>(UNSPEC), 0);
     EXPECT_EQ(static_cast<int>(RDMA), 1);
     EXPECT_EQ(static_cast<int>(MNNVL), 2);
@@ -289,7 +289,8 @@ TEST(TransportTypeTest, WireValuesRemainStableWithHpTcpAppended) {
     EXPECT_EQ(static_cast<int>(UB), 11);
     EXPECT_EQ(static_cast<int>(MPCOMM), 12);
     EXPECT_EQ(static_cast<int>(HP_TCP), 13);
-    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 14);
+    EXPECT_EQ(static_cast<int>(XPU), 14);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 15);
 }
 
 // MPComm is appended after UB, so it takes wire value 12. The same integer is
@@ -314,6 +315,18 @@ TEST(TransportTypeTest, HpTcpWireValueMatchesCApiAndRoundTrips) {
     EXPECT_EQ(c_to_transport_hint(TRANSPORT_HP_TCP), HP_TCP);
     EXPECT_STREQ(transportTypeName(HP_TCP), "hp_tcp");
     EXPECT_EQ(parseTransportType("hp_tcp"), HP_TCP);
+}
+
+// XPU is appended after HP_TCP, so it takes wire value 14. Like the other
+// appended transports its integer is a compatibility contract shared with the
+// C API macro and the Python binding; pybind.cpp carries a matching
+// static_assert.
+TEST(TransportTypeTest, XpuWireValueMatchesCApiAndRoundTrips) {
+    EXPECT_EQ(static_cast<int>(XPU), 14);
+    EXPECT_EQ(TRANSPORT_XPU, static_cast<int>(XPU));
+    EXPECT_EQ(c_to_transport_hint(TRANSPORT_XPU), XPU);
+    EXPECT_STREQ(transportTypeName(XPU), "xpu");
+    EXPECT_EQ(parseTransportType("xpu"), XPU);
 }
 
 // Topology::NicType is serialized as an integer. These values are therefore a
@@ -570,6 +583,143 @@ TEST(TransportSelectorTest, TransportCapabilityGpuToDram) {
     auto result = selector.select(ctx, transports);
     EXPECT_EQ(result.transport, RDMA)
         << "RDMA should be available for CUDA-to-CPU";
+}
+
+// The XPU staging transport advertises only gpu_to_dram / dram_to_gpu, and XPU
+// VRAM (MTYPE_XPU) must be treated as a device type by the selector's is_gpu
+// predicate. The local VRAM->host stage is therefore routed to XpuTransport via
+// gpu_to_dram, and because XpuTransport never advertises gpu_to_gpu a VRAM<->
+// VRAM hop is not directly available (the engine stages it through host DRAM).
+TEST(TransportSelectorTest, XpuStagingRoutesDeviceToHostViaGpuToDram) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[XPU] = std::make_shared<FakeTransport>(XPU);
+    auto* xpu = static_cast<FakeTransport*>(transports[XPU].get());
+    xpu->setGpuToDram(true);
+    xpu->setDramToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {XPU};
+
+    // Local stage: XPU VRAM -> host DRAM. XpuTransport is a same-machine-only
+    // executor, so the staging hop is always same_machine.
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = true;
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    auto result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, XPU)
+        << "XPU VRAM->host stage should route to XpuTransport (gpu_to_dram)";
+
+    // The mirrored host->VRAM direction uses dram_to_gpu.
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_XPU;
+    result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, XPU)
+        << "host->XPU VRAM stage should route to XpuTransport (dram_to_gpu)";
+
+    // VRAM<->VRAM needs gpu_to_gpu, which XpuTransport never advertises, so it
+    // is not directly available and the engine must stage through host DRAM.
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_XPU;
+    result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, UNSPEC)
+        << "XPU VRAM<->VRAM must not be directly routable (forces staging)";
+}
+
+// Regression: XPU is a local-stage-only executor, so it must never be selected
+// for a remote (cross-machine) hop -- the same invariant TPU has. Without XPU
+// in the selector's same-machine guard, an XPU-tagged buffer on a remote
+// segment would be picked via gpu_to_dram and only fail later at execution
+// time.
+TEST(TransportSelectorTest, XpuIsNotRoutableAcrossMachines) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[XPU] = std::make_shared<FakeTransport>(XPU);
+    auto* xpu = static_cast<FakeTransport*>(transports[XPU].get());
+    xpu->setGpuToDram(true);
+    xpu->setDramToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {XPU};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;  // remote hop
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
+        << "XPU must never carry a remote hop; it is local-stage-only";
+    ctx.same_machine = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
+        << "a different segment on the same host is not process-local";
+}
+
+// Regression: a SelectionPolicy memory pattern of "xpu" must match XPU VRAM
+// (MTYPE_XPU). matchesMemoryPattern maps MTYPE_XPU -> "xpu"; without that arm
+// XPU fell through to "unknown" and no xpu-scoped policy could ever match.
+TEST(TransportSelectorTest, XpuMemoryPatternMatchesPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"xpu_stage","segment_type":"memory","local_memory":"xpu","transports":["xpu"]}]})")
+            .ok());
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[XPU] = std::make_shared<FakeTransport>(XPU);
+    static_cast<FakeTransport*>(transports[XPU].get())->setGpuToDram(true);
+
+    std::vector<TransportType> buffer_transports = {XPU};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;  // XPU stage is same-machine only
+    ctx.local_segment = true;
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, XPU)
+        << "an 'xpu' local_memory policy must match MTYPE_XPU buffers";
+}
+
+TEST(TransportSelectorTest, XpuStagingUsesHostCapsWithoutBypassingPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(conf->load(R"({"policy":[{"name":"xpu_network",
+        "segment_type":"memory","local_memory":"xpu",
+        "transports":["hp_tcp","rdma"]}]})")
+                    .ok());
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    for (auto type : {HP_TCP, RDMA, TCP}) {
+        transports[type] = std::make_shared<FakeTransport>(type);
+        static_cast<FakeTransport*>(transports[type].get())
+            ->setDramToDram(true);
+    }
+    SelectionContext ctx{};
+    ctx.segment_type = SegmentType::Memory;
+    ctx.local_memory_type = ctx.remote_memory_type = MTYPE_XPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
+    ctx.host_staging = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, HP_TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 0, RDMA).transport, RDMA);
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, UNSPEC);
+    EXPECT_EQ(selector.select(ctx, transports, 0, XPU).transport, UNSPEC);
+    ctx.local_memory_type = MTYPE_CPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
+        << "staging must not bypass the original memory policy";
 }
 
 TEST(TransportSelectorTest, FileSegmentDramToFile) {

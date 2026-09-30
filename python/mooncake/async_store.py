@@ -1,16 +1,23 @@
 import asyncio
 import functools
+
 from mooncake.store import MooncakeDistributedStore
+
 
 class MooncakeDistributedStoreAsync(MooncakeDistributedStore):
     def __getattr__(self, name: str):
         if not name.startswith("async_"):
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
 
         sync_method_name = name[6:]
 
         if not hasattr(self, sync_method_name):
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}' (nor '{sync_method_name}')")
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}' "
+                f"(nor '{sync_method_name}')"
+            )
 
         sync_method = getattr(self, sync_method_name)
 

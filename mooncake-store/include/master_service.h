@@ -41,6 +41,7 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "weight_store_manager.h"
 #include "master_config.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
@@ -69,7 +70,9 @@ struct MasterSnapshotPayloads;
 }  // namespace ha
 
 class EtcdOpLogStore;
-class DfsGlobalAllocator;
+class ShardAllocator;
+class DfsAllocatorInterface;
+class ImmutableBucketAllocator;
 
 // Forward declarations
 class AllocationStrategy;
@@ -78,7 +81,6 @@ class HaKvBackend;
 class HttpMetadataServer;
 class OpLogBatchStorage;
 class OrderedOpLogWriter;
-struct MetadataStoragePlugin;
 
 namespace test {
 class MasterServiceTestPeer;
@@ -123,6 +125,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  */
 
 class MasterService {
+    friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
@@ -153,6 +156,24 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+
+    WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request) const;
+    WeightMetadataStore::Result<ListWeightRevisionsResponse>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
@@ -241,6 +262,18 @@ class MasterService {
         -> tl::expected<bool, ErrorCode>;
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+        const std::vector<std::string>& keys, const TenantId& tenant_id);
+
+    /**
+     * @brief Point-in-time existence check that grants no read lease.
+     *        A `true` result only means the object existed at the time of
+     *        the call; it may be evicted before a subsequent Get.
+     * @return ErrorCode::OK if exists, otherwise return other ErrorCode
+     */
+    auto ProbeKey(const std::string& key, const TenantId& tenant_id)
+        -> tl::expected<bool, ErrorCode>;
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
         const std::vector<std::string>& keys, const TenantId& tenant_id);
 
     /**
@@ -869,7 +902,8 @@ class MasterService {
     tl::expected<void, ErrorCode> RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const WeightMetadataSnapshot& weight_metadata = {});
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         BatchOpLogPromotionHandoff handoff,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
@@ -921,7 +955,8 @@ class MasterService {
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
-        std::optional<ReplicaID> expected_max_replica_id);
+        std::optional<ReplicaID> expected_max_replica_id,
+        const WeightMetadataSnapshot* legacy_weight_metadata);
 
     // Tolerant legacy snapshot restore (#3760), one phase per method so each
     // stays single-purpose.
@@ -945,6 +980,15 @@ class MasterService {
 
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
+
+    // Shared lookup path for ExistKey/ProbeKey (and their batch variants).
+    // When grant_lease is false, the check acquires no read lease and is a
+    // point-in-time existence probe only.
+    auto ExistKeyImpl(const std::string& key, const TenantId& tenant_id,
+                      bool grant_lease) -> tl::expected<bool, ErrorCode>;
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyImpl(
+        const std::vector<std::string>& keys, const TenantId& tenant_id,
+        bool grant_lease);
 
     // Restore master state
     void RestoreState();
@@ -1096,6 +1140,8 @@ class MasterService {
         std::unordered_map<std::string, GroupState> groups GUARDED_BY(mutex);
     };
     GroupDomain group_domain_;
+    MasterStoreBackend weight_backend_{*this};
+    WeightStoreManager weight_manager_{weight_backend_};
 
     class SoftPinDeadlineIndex {
         friend class test::MasterServiceTestPeer;
@@ -1474,7 +1520,8 @@ class MasterService {
     // before the old metadata is removed.
     auto AllocateReplicas(const std::string& key, uint64_t value_length,
                           const ReplicateConfig& config,
-                          const std::string& writer_host_id)
+                          const std::string& writer_host_id,
+                          bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
@@ -1499,7 +1546,8 @@ class MasterService {
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
-            committed_soft_pin_timeout = std::nullopt)
+            committed_soft_pin_timeout = std::nullopt,
+        bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -1511,6 +1559,10 @@ class MasterService {
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
+    void RunShardDfsEviction();
+    void RunBucketDfsEviction();
+    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -1866,7 +1918,8 @@ class MasterService {
         MetadataSerializer(MasterService* service) : service_(service) {}
 
         // Serialize metadata of all shards
-        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+        tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
+            const WeightMetadataSnapshot* frozen_weight_metadata = nullptr);
 
         tl::expected<void, SerializationError> Deserialize(
             const std::vector<uint8_t>& data);
@@ -2155,6 +2208,7 @@ class MasterService {
     static int64_t DynamicReplicationNowMs();
 
     const bool enable_oplog_;
+    const bool weight_management_mutations_enabled_;
     const uint32_t oplog_batch_max_entries_;
 
     // cluster id for persistent sub directory
@@ -2174,9 +2228,10 @@ class MasterService {
     // nullptr means cleanup is disabled
     HttpMetadataServer* http_metadata_server_{nullptr};
 
-    // Remote HTTP metadata client, used when the metadata server is deployed
-    // separately. nullptr = no remote cleanup (co-located prefers the pointer).
-    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
+    // Remote HTTP metadata server URL, used when the metadata server is
+    // deployed separately. Empty = no remote cleanup (co-located prefers the
+    // pointer).
+    std::string http_metadata_remote_url_;
 
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;
@@ -2190,6 +2245,9 @@ class MasterService {
     std::vector<std::string> http_metadata_cleanup_queue_;
 
     void HttpMetadataCleanupThreadFunc();
+    // Sends an HTTP DELETE for one key to the remote metadata server; true on
+    // success.
+    bool removeRemoteHttpMetadataKey(const std::string& key) const;
 
     // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
     // segment. For the co-located case this is synchronous (no network I/O);
@@ -2198,7 +2256,13 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
+    std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
+    ShardAllocator* shard_allocator_{nullptr};
+    ImmutableBucketAllocator* bucket_allocator_{nullptr};
+    // Serializes allocation-failure recovery so concurrent writers can reuse
+    // capacity made available by the first recovery instead of each evicting
+    // a different frozen bucket.
+    std::mutex dfs_bucket_recovery_mutex_;
 
     // Segment management
     SegmentManager segment_manager_;
