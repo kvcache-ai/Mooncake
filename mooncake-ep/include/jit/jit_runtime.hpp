@@ -42,10 +42,10 @@ struct JitKernelVariant {
     int dynamic_smem_bytes = 0;
     int min_sm = -1;
     std::string_view target_arch;
-    // Optional launch attributes (default = off).
+    // All the kernel in mooncake-ep are launched with cooperative launch.
     // Cooperative launch enables cg::this_grid().sync() inside the kernel.
     // Cluster dim > 1 enables distributed shared memory across the cluster.
-    bool cooperative = false;
+    bool cooperative = true;
     int cluster_dim_x = 1;
     int cluster_dim_y = 1;
     int cluster_dim_z = 1;
