@@ -13,6 +13,7 @@ if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
 
   set(MOONCAKE_EP_JIT_SOURCES
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/dispatch_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_runtime.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_cache.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_utils.cpp"
@@ -46,6 +47,7 @@ if(USE_CUDA)
   set(MOONCAKE_EP_JIT_HEADERS
       mooncake_ep_configs.cuh
       mooncake_ep_device.h
+      mooncake_ep_dispatch.cuh
       mooncake_ep_utils.cuh)
 
   set(MOONCAKE_EP_JIT_TRANSFER_HEADERS
