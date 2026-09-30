@@ -745,12 +745,6 @@ class MasterServiceHATest : public ::testing::Test {
         return MasterServiceTestPeer::NeedMemEviction(service).load();
     }
 
-    static void ClearInvalidHandlesForTesting(
-        MasterService& service,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
-        MasterServiceTestPeer(service).ClearInvalidHandles(alive_clients);
-    }
-
     static void ClearInvalidHandlesForTesting(MasterService& service) {
         MasterServiceTestPeer(service).ClearInvalidHandles();
     }
@@ -828,7 +822,8 @@ class MasterServiceHATest : public ::testing::Test {
 
     static std::shared_ptr<ClientLivenessRecord> ClientRecordForTesting(
         MasterService& service, const UUID& client_id) {
-        return MasterServiceTestPeer(service).FindClientRecord(client_id);
+        return ClientSessionRegistryTestPeer::Find(
+            MasterServiceTestPeer::ClientSessions(service), client_id);
     }
 
     static tl::expected<bool, ErrorCode> AddReplicaForRetainedClientForTesting(
@@ -928,10 +923,8 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService& service, const UUID& source_client,
         const TenantId& tenant_id, const std::string& key,
         CreateTask create_task) {
-        auto liveness =
-            MasterServiceTestPeer(service).FindClientRecord(source_client);
-        auto serving_guard =
-            liveness ? liveness->TryAcquireServingGuard() : std::nullopt;
+        auto serving_guard = MasterServiceTestPeer::ClientSessions(service)
+                                 .TryAcquireServingSession(source_client);
         if (!serving_guard) {
             return false;
         }
@@ -980,20 +973,19 @@ class MasterServiceHATest : public ::testing::Test {
         if (object_lock.owns_lock()) {
             return false;
         }
-        std::unique_lock<std::shared_mutex> client_lock(
-            MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
-        if (!client_lock.owns_lock()) {
-            return false;
-        }
         std::unique_lock<std::shared_mutex> snapshot_lock(
             MasterServiceTestPeer::SnapshotMutex(service), std::try_to_lock);
         return !snapshot_lock.owns_lock();
     }
 
-    static std::unique_lock<std::shared_mutex> LockClientForTesting(
+    static void StopClientSessionsForTesting(MasterService& service) {
+        // These tests drive residual jobs manually, without live listeners.
+        MasterServiceTestPeer::ClientSessions(service).Stop();
+    }
+
+    static ClientSessionRegistry::RestoreBatch RestoreClientsForTesting(
         MasterService& service) {
-        return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::ClientMutex(service));
+        return MasterServiceTestPeer::ClientSessions(service).BeginRestore();
     }
 
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
@@ -1756,13 +1748,15 @@ TEST_F(MasterServiceHATest,
         FAIL() << "PutStart did not reach the snapshot barrier";
     }
 
-    // ReMountSegment holds client_mutex_ exclusively while waiting for the
+    // ReMountSegment holds the registry exclusively while waiting for the
     // snapshot barrier. PutStart must not reacquire it inside that barrier.
-    auto client_lock = LockClientForTesting(service);
-    shard_lock.unlock();
-    const bool completed_while_client_locked =
-        put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
-    client_lock.unlock();
+    bool completed_while_client_locked = false;
+    {
+        auto restore = RestoreClientsForTesting(service);
+        shard_lock.unlock();
+        completed_while_client_locked =
+            put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    }
 
     ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = put.get();
@@ -1809,19 +1803,24 @@ TEST_F(MasterServiceHATest,
                     .has_value());
     const auto record = ClientRecordForTesting(service, mounted.client_id);
     ASSERT_TRUE(record);
-    auto retaining_guard = record->TryAcquireRetainingGuard();
+    auto retaining_guard = MasterServiceTestPeer::ClientSessions(service)
+                               .TryAcquireRetainingSession(mounted.client_id);
     ASSERT_TRUE(retaining_guard);
 
     Replica replica(mounted.client_id, 1024, "retained_add_replica_endpoint",
                     ReplicaStatus::COMPLETE, record);
-    auto client_lock = LockClientForTesting(service);
-    auto add = std::async(std::launch::async, [&] {
-        return AddReplicaForRetainedClientForTesting(
-            service, mounted.client_id, "retained_add_replica_key", replica);
-    });
-    const bool completed_while_client_locked =
-        add.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
-    client_lock.unlock();
+    std::future<tl::expected<bool, ErrorCode>> add;
+    bool completed_while_client_locked = false;
+    {
+        auto restore = RestoreClientsForTesting(service);
+        add = std::async(std::launch::async, [&] {
+            return AddReplicaForRetainedClientForTesting(
+                service, mounted.client_id, "retained_add_replica_key",
+                replica);
+        });
+        completed_while_client_locked =
+            add.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    }
 
     ASSERT_EQ(add.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = add.get();
@@ -1849,23 +1848,18 @@ TEST_F(MasterServiceHATest,
 
     const auto liveness = ClientRecordForTesting(service, client_id);
     ASSERT_TRUE(liveness);
+    StopClientSessionsForTesting(service);
     const auto now = ClientLivenessRecord::Clock::now();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_OFFLINE);
-    MasterMetricManager::instance().client_liveness_became_offline();
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
+    job.retired_session = liveness;
 
     writer->RejectNextCommit();
     ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
@@ -1903,23 +1897,18 @@ TEST_F(MasterServiceHATest,
 
     const auto liveness = ClientRecordForTesting(service, client_id);
     ASSERT_TRUE(liveness);
+    StopClientSessionsForTesting(service);
     const auto now = ClientLivenessRecord::Clock::now();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
     ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
                                  std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_OFFLINE);
-    MasterMetricManager::instance().client_liveness_became_offline();
 
     ClientOffboardingJob job;
     job.client_id = client_id;
-    job.liveness = liveness;
-    job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
+    job.retired_session = liveness;
 
     writer->RejectNextSegmentUnmount();
     ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));

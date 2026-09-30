@@ -146,7 +146,6 @@ class MasterMetricManager {
     void client_liveness_recovered();
     void client_liveness_became_offline();
     void on_client_liveness_record_removed(ClientLivenessState state);
-    void reset_client_liveness_metrics(int64_t active_records = 0);
     void inc_client_offboarding_queue_depth(int64_t jobs = 1);
     void dec_client_offboarding_queue_depth(int64_t jobs = 1);
     void inc_client_offboarding_retry();

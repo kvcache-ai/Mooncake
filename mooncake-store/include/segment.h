@@ -82,9 +82,8 @@ class ScopedSegmentAccess {
     /**
      * @brief Mount a segment
      */
-    ErrorCode MountSegment(
-        const Segment& segment, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+    ErrorCode MountSegment(const Segment& segment, const UUID& client_id,
+                           ClientSessionSharedPtr owner_session);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -92,9 +91,9 @@ class ScopedSegmentAccess {
      * errors. When encounters unsolvable errors, the segment will not be
      * mounted while the return value will be OK.
      */
-    ErrorCode ReMountSegment(
-        const std::vector<Segment>& segments, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
+                             const UUID& client_id,
+                             ClientSessionSharedPtr owner_session);
 
     ErrorCode ValidateRemountSegment(const Segment& segment,
                                      const UUID& client_id) const;
@@ -142,13 +141,11 @@ class ScopedSegmentAccess {
                                 std::vector<Segment>& segments) const;
 
     /**
-     * @brief Rebind restored client-owned segment resources to a fresh
-     *        liveness record. Segment snapshots intentionally do not persist
-     *        record implementation state.
+     * @brief Bind restored segment resources to their owner session.
+     *        Segment snapshots intentionally do not persist session state.
      */
-    void BindClientLiveness(
-        const UUID& client_id,
-        const std::shared_ptr<ClientLivenessRecord>& client_liveness);
+    void BindClientSession(const UUID& client_id,
+                           const ClientSessionSharedPtr& owner_session);
     void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
     [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
