@@ -260,6 +260,10 @@ transfer_check_status(batch_id)
 
 Checks the status of an asynchronous transfer operation.
 
+Each batch ID must have only one polling caller. Do not poll it concurrently with
+`get_batch_transfer_status()`. A return value of `1` or `-1` frees the batch;
+do not use the ID again afterward.
+
 **Parameters:**
 - `batch_id` (int): The batch ID returned from transfer_submit_write()
 
@@ -475,6 +479,11 @@ get_batch_transfer_status(batch_ids)
 ```
 
 Waits for multiple batch asynchronous transfer operations to complete.
+
+Each asynchronous batch can be consumed by only one waiter. Do not pass the same
+batch ID to concurrent calls or poll it with `transfer_check_status()` while this
+method is waiting. Once this call accepts the batch IDs, it consumes them even if
+a transfer fails or times out; do not reuse those IDs after the call returns.
 
 **Parameters:**
 - `batch_ids` (List[int]): List of batch IDs returned from batch async transfer operations
