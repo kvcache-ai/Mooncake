@@ -189,6 +189,18 @@ buffers whose dma-buf cannot be registered per allocation; such buffers are
 staged through host memory. Run with `NEOReadDebugKeys=1
 EnableDeviceUsmAllocationPool=0` to disable pooling if direct RDMA on small
 foreign allocations is required.
+
+On the same node, registered XPU memory is also shared between processes with
+Level Zero IPC handles, so VRAM-to-VRAM transfers between two local engines
+(for example prefill and decode workers) are local XPU copies rather than
+network transfers. Importing a handle uses `pidfd_getfd(2)` on the exporting
+process and therefore needs ptrace permission over it. The Level Zero runtime
+marks every process that opens a device with `PR_SET_PTRACER_ANY`, so the same
+user in the same pid namespace with Yama `ptrace_scope` 0 or 1 (the default on
+most distributions) is enough; `ptrace_scope` 2 needs `CAP_SYS_PTRACE` (in
+Kubernetes, `securityContext.capabilities.add: [SYS_PTRACE]`) and 3 forbids it.
+Without that permission, or with `transports/xpu/disable_ipc: true` in the
+TENT configuration, those transfers use the RDMA or TCP transport instead.
 ```
 
 ## Use Mooncake in Docker Containers
@@ -268,7 +280,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
 | `-DUSE_SUPA=ON/OFF` | `OFF` | Enable Biren GPU support via the SUPA SDK. Uses a CUDA-compatible runtime. Set `BIREN_HOME` to the SDK root. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
-| `-DUSE_XPU=ON/OFF` | `OFF` | Enable Intel XPU memory support in TENT via SYCL/Level Zero: memory detection, host staging, and dma-buf GPUDirect RDMA registration. Requires `-DUSE_TENT=ON` and the `icpx` compiler. |
+| `-DUSE_XPU=ON/OFF` | `OFF` | Enable Intel XPU memory support in TENT via SYCL/Level Zero: memory detection, host staging, intra-node PCIe P2P copies between XPUs, and dma-buf GPUDirect RDMA registration. Requires `-DUSE_TENT=ON` and the `icpx` compiler. |
 | `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
 | `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
