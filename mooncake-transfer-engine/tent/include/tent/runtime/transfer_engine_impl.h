@@ -412,9 +412,11 @@ class TransferEngineImpl {
 
     // One selection pass behind getTransportType(). `allow_xpu_direct` lets a
     // dma-buf-registered XPU buffer route directly over RDMA (see
-    // xpuDirectRdmaReady); when false every XPU side is host-staged.
-    // `xpu_direct`, if given, reports whether this pass planned the direct
-    // route, so the caller can retry staged when it yields no transport.
+    // xpuDirectRdmaReady) or a same-host peer's XPU buffer be reached through
+    // its Level Zero IPC mapping (see xpuIpcReady); when false every XPU side
+    // is host-staged. `xpu_direct`, if given, reports whether this pass
+    // planned an unstaged route, so the caller can retry staged when it
+    // yields no transport.
     SelectionResult planTransport(const Request& request, int transport_index,
                                   bool allow_xpu_direct, bool* xpu_direct);
 
@@ -532,6 +534,13 @@ class TransferEngineImpl {
     // succeeded). `remote_entry` is the remote buffer the request targets.
     bool xpuDirectRdmaReady(const Request& req, const BufferDesc* remote_entry,
                             MemoryType local_mtype, MemoryType remote_mtype);
+
+    // True when the XPU buffer `remote_entry` of same-host segment `desc` is
+    // mapped into this process by XpuTransport (Level Zero IPC), so the
+    // request can run as a local PCIe P2P copy instead of RDMA or staging.
+    // Imports on first use; always false without USE_XPU.
+    bool xpuIpcReady(const Request& req, const SegmentDesc* desc,
+                     const BufferDesc* remote_entry);
 
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 
