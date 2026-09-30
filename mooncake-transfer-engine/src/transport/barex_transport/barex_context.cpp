@@ -14,6 +14,8 @@
 
 #include "transport/barex_transport/barex_context.h"
 
+#include <unordered_set>
+
 namespace mooncake {
 
 using namespace accl::barex;
@@ -53,6 +55,15 @@ std::vector<XChannel*> BarexContext::getAllChannel() {
 
 int BarexContext::submitPostSend(
     const std::vector<Transport::Slice*>& slice_list) {
+    std::unordered_set<Transport::Slice*> submitted_slices;
+    auto mark_unsubmitted_failed = [&]() {
+        for (auto* slice : slice_list) {
+            if (submitted_slices.count(slice) == 0) {
+                slice->markFailed();
+            }
+        }
+    };
+
     std::unordered_map<
         SegmentID, std::unordered_map<int, std::vector<accl::barex::rw_memp_t>>>
         sid_dev_data_map;
@@ -116,6 +127,7 @@ int BarexContext::submitPostSend(
                 }
                 if (!channel) {
                     LOG(ERROR) << "Write fail, no channel found";
+                    mark_unsubmitted_failed();
                     return -1;
                 }
 
@@ -164,8 +176,11 @@ int BarexContext::submitPostSend(
                         true);
                     if (r != accl::barex::BAREX_SUCCESS) {
                         LOG(ERROR) << "WriteBatch fail, ret " << r;
+                        mark_unsubmitted_failed();
                         return -2;
                     }
+                    submitted_slices.insert(slice_chunk_write->begin(),
+                                            slice_chunk_write->end());
                 }
                 if (!data_chunk_read->empty()) {
                     BarexResult r = channel->ReadBatch(
@@ -186,8 +201,11 @@ int BarexContext::submitPostSend(
                         true);
                     if (r != accl::barex::BAREX_SUCCESS) {
                         LOG(ERROR) << "ReadBatch fail, ret " << r;
+                        mark_unsubmitted_failed();
                         return -2;
                     }
+                    submitted_slices.insert(slice_chunk_read->begin(),
+                                            slice_chunk_read->end());
                 }
                 begin_idx += batch_size;
             }

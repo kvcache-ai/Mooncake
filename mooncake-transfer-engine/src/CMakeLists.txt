@@ -122,7 +122,7 @@ if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
 endif()
 
 if(USE_SUPA)
-  target_link_libraries(transfer_engine PUBLIC supa supart)
+  target_link_libraries(transfer_engine PUBLIC ${SUPA_LIBRARIES})
 endif()
 
 if(USE_MACA)

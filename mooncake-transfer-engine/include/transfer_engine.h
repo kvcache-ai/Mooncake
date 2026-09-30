@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -35,7 +36,14 @@ class TransferEngineImpl;
 namespace tent {
 class Config;
 class TransferEngine;
-};
+};  // namespace tent
+
+namespace transfer_intent_values {
+inline constexpr int kUnspecified = 0;
+inline constexpr int kForegroundGet = 1;
+inline constexpr int kBackgroundPrefetch = 2;
+inline constexpr int kMigration = 3;
+}  // namespace transfer_intent_values
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 namespace device {
@@ -127,6 +135,12 @@ class TransferEngine {
     int getRpcPort();
 
     bool isUsingTent() const { return use_tent_; }
+    // Expose the internal TENT engine so callers (Store, TransferSubmitter)
+    // can call tent::TransferEngine native API directly, bypassing the
+    // compat-layer type conversion. Returns nullptr when not in TENT mode.
+    std::shared_ptr<mooncake::tent::TransferEngine> getTentEngine() const {
+        return use_tent_ ? impl_tent_ : nullptr;
+    }
 
     SegmentHandle openSegment(const std::string& segment_name);
 
@@ -174,6 +188,7 @@ class TransferEngine {
         std::span<const size_t> remote_offsets;
         std::span<const size_t> lengths;
         std::function<void(size_t, const Status&)> on_fragment_complete;
+        int intent_type = 0;
     };
 
     class ScatterTransferOperation {
@@ -243,6 +258,8 @@ class TransferEngine {
 
     BatchID allocateBatchID(size_t batch_size);
 
+    // An OK or BatchCleanupDeferred return invalidates batch_id. A deferred
+    // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
@@ -325,6 +342,9 @@ class TransferEngine {
 
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::unique_ptr<Transport> tent_compat_transport_;
+    std::mutex tent_compat_transport_mutex_;
+    std::once_flag tent_compat_log_once_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
     // Classic callers provide this through TransferEngine(auto_discover,
     // filter) before init() creates the native TENT engine.

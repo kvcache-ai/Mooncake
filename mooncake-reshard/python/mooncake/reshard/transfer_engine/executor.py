@@ -13,12 +13,17 @@ from .completion import (
     TransferCompletionInterrupted,
     TransferCompletionUnknownError,
     TransferEngineError,
+    TransferRegistrationCleanupPendingError,
     _CompletionUnknown,
     _CompletionWaitInterrupted,
     _batch_transfer_with_completion_fence,
 )
 from .contracts import TransferBatch, TransferBatchReceipt, TransferDirection
-from .lifetime import AllocationLifetimeToken, TerminalTransferState
+from .lifetime import (
+    AllocationLifetimeToken,
+    AllocationTokenSet,
+    TerminalTransferState,
+)
 
 
 class _TransferSubmissionState(Enum):
@@ -32,6 +37,7 @@ class TransferSubmission:
 
     _executor: MooncakeTransferEngineExecutor
     _state: _TransferSubmissionState
+    _physical_io_started: bool
 
     def __init__(self, executor: MooncakeTransferEngineExecutor) -> None:
         raise TransferEngineError(
@@ -46,7 +52,15 @@ class TransferSubmission:
         submission = object.__new__(cls)
         submission._executor = executor
         submission._state = _TransferSubmissionState.ACTIVE
+        submission._physical_io_started = False
         return submission
+
+    @property
+    def physical_io_started(self) -> bool:
+        return self._physical_io_started
+
+    def _mark_physical_io_started(self) -> None:
+        self._physical_io_started = True
 
     def execute_batch(
         self,
@@ -61,7 +75,7 @@ class TransferSubmission:
                 "another batch"
             )
         try:
-            return self._executor._execute_batch(batch, direction)
+            return self._executor._execute_batch(batch, direction, self)
         except (
             TransferCompletionInterrupted,
             TransferCompletionUnknownError,
@@ -130,6 +144,7 @@ class MooncakeTransferEngineExecutor:
         self,
         batch: TransferBatch,
         direction: TransferDirection,
+        submission: TransferSubmission,
     ) -> TransferBatchReceipt:
         """Execute a batch inside an already reserved resource submission."""
 
@@ -209,6 +224,7 @@ class MooncakeTransferEngineExecutor:
             )
             failure_label = f"to {batch.endpoint}"
 
+        submission._mark_physical_io_started()
         try:
             result = _batch_transfer_with_completion_fence(
                 self.engine,
@@ -321,6 +337,69 @@ class MooncakeTransferEngineExecutor:
             allocation_tokens=allocation_tokens,
             restart_required=restart_required,
         )
+
+    def finalize_terminal_resources(
+        self,
+        lifetime_tokens: AllocationTokenSet,
+        terminal_state: TerminalTransferState,
+    ) -> None:
+        """Release terminal resources through the recoverable pending path."""
+
+        if not isinstance(lifetime_tokens, AllocationTokenSet):
+            raise TypeError("lifetime_tokens must be an AllocationTokenSet")
+        if not isinstance(terminal_state, TerminalTransferState):
+            raise TypeError("terminal_state must be a TerminalTransferState")
+        if lifetime_tokens.pending or lifetime_tokens.released:
+            return
+        pending_transfer_id = self.retain_pending_registration_cleanup(
+            terminal_state=terminal_state,
+            registrations=(),
+            resources=(),
+            allocation_tokens=lifetime_tokens.tokens,
+        )
+        lifetime_tokens.handoff_to_pending()
+        try:
+            self.drain_pending_transfer(pending_transfer_id, timeout_ms=0)
+        except BaseException as error:
+            detail = (
+                f"allocation lifetime cleanup is quarantined as {pending_transfer_id}"
+            )
+            if isinstance(error, Exception):
+                raise TransferRegistrationCleanupPendingError(
+                    detail,
+                    pending_transfer_id=pending_transfer_id,
+                ) from error
+            add_note = getattr(error, "add_note", None)
+            if callable(add_note):
+                add_note(detail)
+            raise
+
+    def finalize_terminal_resource_sets(
+        self,
+        lifetime_token_sets: Sequence[AllocationTokenSet],
+        terminal_state: TerminalTransferState,
+    ) -> None:
+        """Finalize every acquired token set before surfacing cleanup errors."""
+
+        token_sets = tuple(lifetime_token_sets)
+        if any(not isinstance(item, AllocationTokenSet) for item in token_sets):
+            raise TypeError("lifetime_token_sets must contain AllocationTokenSet")
+        errors: list[BaseException] = []
+        for lifetime_tokens in token_sets:
+            try:
+                self.finalize_terminal_resources(lifetime_tokens, terminal_state)
+            except BaseException as error:
+                errors.append(error)
+        if not errors:
+            return
+        primary_error = errors[0]
+        add_note = getattr(primary_error, "add_note", None)
+        if callable(add_note):
+            for additional_error in errors[1:]:
+                add_note(
+                    f"additional terminal resource cleanup error: {additional_error}"
+                )
+        raise primary_error
 
     def pending_transfer_ids(self) -> tuple[str, ...]:
         return self._pending_manager.pending_transfer_ids()

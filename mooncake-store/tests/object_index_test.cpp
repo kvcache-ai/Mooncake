@@ -42,33 +42,61 @@ TEST(ObjectIndexTest, EraseIfHonoursEntryIdentity) {
     EXPECT_EQ(store.ObjectCount(), 0u);
 }
 
-TEST(ObjectIndexTest, InsertAssignsAMonotonicGeneration) {
-    ObjectIndex store;
-    auto e1 = test::MakeObjectEntry("k1");
-    EXPECT_EQ(e1->generation(), 0u);  // never published
-    ASSERT_TRUE(store.Insert(e1));
-    EXPECT_GT(e1->generation(), 0u);
-
-    // A replacement of the same key gets a fresh, higher generation, which is
-    // what lets a holder tell itself apart from the entry now published.
-    ASSERT_TRUE(store.EraseIf("k1", e1));
-    auto e2 = test::MakeObjectEntry("k1");
-    ASSERT_TRUE(store.Insert(e2));
-    EXPECT_GT(e2->generation(), e1->generation());
-}
-
 TEST(ObjectIndexTest, DuplicateInsertIsRejected) {
     ObjectIndex store;
     auto winner = test::MakeObjectEntry("k1");
     ASSERT_TRUE(store.Insert(winner));
 
     // The loser must neither clobber the routed entry nor look published: it
-    // never reaches the route, so it keeps generation 0.
+    // never reaches the route, so the slot still names the winner and the
+    // handle it kept stands for no publication.
     auto loser = test::MakeObjectEntry("k1");
     EXPECT_FALSE(store.Insert(loser));
-    EXPECT_EQ(loser->generation(), 0u);
+    EXPECT_FALSE(loser->IsPublished());
     EXPECT_EQ(store.ObjectCount(), 1u);
     EXPECT_EQ(store.Get("k1").get(), winner.get());
+}
+
+TEST(ObjectIndexTest, IsPublishedMarksTheOnePublicationOfAnInstance) {
+    ObjectIndex store;
+    auto entry = test::MakeObjectEntry("k1");
+    EXPECT_FALSE(entry->IsPublished());
+
+    ASSERT_TRUE(store.Insert(entry));
+    EXPECT_TRUE(entry->IsPublished());
+
+    // The claim is what forbids publishing this instance again, so erasing its
+    // slot does not take it back.
+    ASSERT_TRUE(store.EraseIf("k1", entry));
+    EXPECT_TRUE(entry->IsPublished());
+}
+
+TEST(ObjectIndexTest, IsCurrentComparesTheHandleTheRoutePublishes) {
+    ObjectIndex store;
+    auto e1 = test::MakeObjectEntry("k1");
+    EXPECT_FALSE(store.IsCurrent("k1", e1));  // never published
+    EXPECT_FALSE(store.IsCurrent("k1", nullptr));
+    EXPECT_FALSE(store.IsCurrent("k1", store.Get("k1")));
+
+    ASSERT_TRUE(store.Insert(e1));
+    EXPECT_TRUE(store.IsCurrent("k1", e1));
+    // The handle a lookup hands back names the publication it found.
+    EXPECT_TRUE(store.IsCurrent("k1", store.Get("k1")));
+
+    // Another instance under the same key is a different publication, and a
+    // key the route does not hold publishes nothing.
+    EXPECT_FALSE(store.IsCurrent("k1", test::MakeObjectEntry("k1")));
+    EXPECT_FALSE(store.IsCurrent("k2", e1));
+
+    // Nothing is current once the slot is gone.
+    ASSERT_TRUE(store.EraseIf("k1", e1));
+    EXPECT_FALSE(store.IsCurrent("k1", e1));
+
+    // A replacement is current under its own handle only.
+    auto e2 = test::MakeObjectEntry("k1");
+    ASSERT_TRUE(store.Insert(e2));
+    EXPECT_FALSE(store.IsCurrent("k1", e1));
+    EXPECT_TRUE(store.IsCurrent("k1", e2));
 }
 
 TEST(ObjectIndexTest, SnapshotObjectsEnumeratesEveryEntry) {

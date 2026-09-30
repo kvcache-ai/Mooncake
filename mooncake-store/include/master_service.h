@@ -127,8 +127,8 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 class MasterService {
     friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
-    friend class MasterSnapshotManager;    // Allow access to internal state for
-                                           // snapshot
+    friend class MasterSnapshotManager;  // Allow access to internal state for
+                                         // snapshot
     friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
@@ -894,6 +894,15 @@ class MasterService {
      */
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
+
+    /**
+     * @brief Switch a segment between OK and DRAINING without a drain job.
+     * DRAINING stops new allocations on the segment while its existing
+     * replicas stay readable. Rejected while an unfinished drain job lists
+     * the segment as a source.
+     */
+    tl::expected<void, ErrorCode> SetSegmentStatus(
+        const std::string& segment_name, SegmentStatus status);
 
     /**
      * @brief Restore primary state from standby promotion context.

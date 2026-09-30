@@ -126,6 +126,7 @@ option(
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
+option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -286,8 +287,30 @@ if(USE_SUPA)
     endif()
   endif()
   message(STATUS "  BIREN_HOME: ${BIREN_HOME}")
-  include_directories(${BIREN_HOME}/supa/include)
+  # The SUPA SDK ships generic header names (e.g. version.h) that must not
+  # shadow Mooncake's own headers, so expose it as a system include directory.
+  include_directories(SYSTEM ${BIREN_HOME}/supa/include)
   link_directories(${BIREN_HOME}/supa/lib ${BIREN_HOME}/brumd/lib)
+  # Resolve the runtime library by name: older SUPA SDKs ship libsupa.so with a
+  # separate libsupart.so, while newer SDKs ship a single libsupa-runtime.so.
+  find_library(
+    SUPA_RUNTIME_LIBRARY
+    NAMES supa supa-runtime
+    PATHS ${BIREN_HOME}/supa/lib)
+  find_library(
+    SUPA_PART_LIBRARY
+    NAMES supart
+    PATHS ${BIREN_HOME}/supa/lib)
+  if(NOT SUPA_RUNTIME_LIBRARY)
+    message(
+      FATAL_ERROR
+        "SUPA runtime library not found under ${BIREN_HOME}/supa/lib (expected libsupa.so, libsupa-runtime.so, or libsupart.so)"
+    )
+  endif()
+  set(SUPA_LIBRARIES ${SUPA_RUNTIME_LIBRARY})
+  if(SUPA_PART_LIBRARY)
+    list(APPEND SUPA_LIBRARIES ${SUPA_PART_LIBRARY})
+  endif()
 endif()
 
 if(USE_TPU)
@@ -475,6 +498,11 @@ if(USE_COREX)
   if(EXISTS "${COREX_LIB_DIR}")
     link_directories(${COREX_LIB_DIR})
   endif()
+endif()
+
+# Hylink builds on the HIP runtime; enable it automatically.
+if(USE_HYLINK AND NOT USE_HIP)
+  set(USE_HIP ON)
 endif()
 
 if(USE_HIP)
@@ -772,4 +800,9 @@ if(USE_SHCA)
 elseif(YLT_ENABLE_IBV)
   # YLT_ENABLE_IBV is set in FindYLT.cmake (OFF on macOS).
   add_compile_definitions(YLT_ENABLE_IBV)
+endif()
+
+if(USE_HYLINK)
+  add_compile_definitions(USE_HYLINK)
+  message(STATUS "Hylink transport is enabled")
 endif()
