@@ -5,6 +5,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -100,7 +101,9 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
 class CoordinatorHost {
    public:
     CoordinatorHost(const std::string& host_ip, int max_world_size,
-                    int64_t fault_reconciliation_window_us);
+                    int64_t fault_reconciliation_window_us,
+                    std::optional<DeviceAllReduceAlgorithm>
+                        all_reduce_algorithm = std::nullopt);
 
     ~CoordinatorHost();
 
