@@ -135,30 +135,25 @@ if(USE_UB)
 endif()
 
 if(USE_EFA)
-  # Find libfabric headers and library; default to AWS EFA installer path
+  # The EFA transport dlopens libfabric at runtime, so only the headers are
+  # needed here; default to the AWS EFA installer path.
   find_path(
     LIBFABRIC_INCLUDE_DIR rdma/fabric.h
     HINTS /opt/amazon/efa/include
     PATH_SUFFIXES include)
-  find_library(
-    LIBFABRIC_LIBRARY fabric
-    HINTS /opt/amazon/efa/lib
-    PATH_SUFFIXES lib lib64)
 
-  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+  if(NOT LIBFABRIC_INCLUDE_DIR)
     message(
       FATAL_ERROR
-        "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY."
+        "libfabric headers not found. Install libfabric-dev or AWS EFA, or set LIBFABRIC_INCLUDE_DIR."
     )
   endif()
 
-  get_filename_component(LIBFABRIC_LIB_DIR ${LIBFABRIC_LIBRARY} DIRECTORY)
   include_directories(${LIBFABRIC_INCLUDE_DIR})
-  link_directories(${LIBFABRIC_LIB_DIR})
   add_compile_definitions(USE_EFA)
   message(STATUS "AWS EFA (libfabric) transport is enabled")
   message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
-  message(STATUS "  libfabric library: ${LIBFABRIC_LIBRARY}")
+  message(STATUS "  libfabric is loaded at runtime (dlopen)")
 endif()
 if(USE_CXI)
   # Find libfabric headers and library; default to AWS EFA installer path
