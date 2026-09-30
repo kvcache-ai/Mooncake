@@ -66,6 +66,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     worker_pool_rail_state_test
     PRIVATE
     "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
+    "-Wl,--wrap=_ZN8mooncake11RdmaContext17ensureAutoGidRankEjPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
   )
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)

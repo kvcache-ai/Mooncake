@@ -49,6 +49,12 @@ enum class AutoGidRetryAction {
     kRetryWithObservedChange = 2,
 };
 
+enum class AutoGidDataPathAction {
+    kRetrySameRank = 0,
+    kAdvanceRank = 1,
+    kIgnoreDuplicate = 2,
+};
+
 struct AutoGidCandidate {
     int gid_index = -1;
     std::string gid;
@@ -67,11 +73,62 @@ struct AutoGidSelection {
     std::string gid;
     AutoGidCandidateClass candidate_class =
         AutoGidCandidateClass::kFallbackNonzero;
+    uint32_t rank = 0;
 };
 
 struct AutoGidSelectionIdentity {
     int gid_index = -1;
     std::string gid;
+};
+
+struct AutoGidConnectionIdentity {
+    std::string local_gid;
+    std::string peer_gid;
+    uint32_t selection_rank = 0;
+    uintptr_t endpoint_id = 0;
+    uint64_t qp_generation = 0;
+};
+
+class AutoGidDataPathFailureTracker {
+   public:
+    AutoGidDataPathAction recordFailure(
+        const AutoGidConnectionIdentity& connection) {
+        if (!pending_ || !samePath(connection_, connection)) {
+            connection_ = connection;
+            failure_count_ = 1;
+            pending_ = true;
+            return AutoGidDataPathAction::kRetrySameRank;
+        }
+        if (connection_.endpoint_id == connection.endpoint_id &&
+            connection_.qp_generation == connection.qp_generation) {
+            return AutoGidDataPathAction::kIgnoreDuplicate;
+        }
+        connection_ = connection;
+        ++failure_count_;
+        return failure_count_ >= 2 ? AutoGidDataPathAction::kAdvanceRank
+                                   : AutoGidDataPathAction::kRetrySameRank;
+    }
+
+    void recordSuccess() { reset(); }
+
+    bool pending() const { return pending_; }
+
+    void reset() {
+        connection_ = {};
+        failure_count_ = 0;
+        pending_ = false;
+    }
+
+   private:
+    static bool samePath(const AutoGidConnectionIdentity& lhs,
+                         const AutoGidConnectionIdentity& rhs) {
+        return lhs.local_gid == rhs.local_gid && lhs.peer_gid == rhs.peer_gid &&
+               lhs.selection_rank == rhs.selection_rank;
+    }
+
+    AutoGidConnectionIdentity connection_;
+    int failure_count_ = 0;
+    bool pending_ = false;
 };
 
 inline const char* autoGidCandidateClassToString(
@@ -191,6 +248,10 @@ inline std::vector<AutoGidSelection> rankAutoGidCandidates(
                           AutoGidCandidateClass::kFallbackNonzero});
     }
 
+    for (uint32_t rank = 0; rank < ranked.size(); ++rank) {
+        ranked[rank].rank = rank;
+    }
+
     return ranked;
 }
 
@@ -201,6 +262,13 @@ inline std::optional<AutoGidSelection> selectBestAutoGidCandidate(
         return std::nullopt;
     }
     return ranked.front();
+}
+
+inline std::optional<AutoGidSelection> selectAutoGidCandidateAtRank(
+    const std::vector<AutoGidCandidate>& candidates, uint32_t rank) {
+    auto ranked = rankAutoGidCandidates(candidates);
+    if (rank >= ranked.size()) return std::nullopt;
+    return ranked[rank];
 }
 
 inline bool shouldAttemptAutoGidHandshakeRetry(bool auto_gid_selection_enabled,

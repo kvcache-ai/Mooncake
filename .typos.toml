@@ -11,6 +11,8 @@ wqs = "wqs"
 hsa = "hsa"
 Optin = "Optin"
 HPE = "HPE"
+# Adjacent Itanium ABI pointer and nested-name markers in wrapped symbols.
+PN = "PN"
 
 [files]
 extend-exclude = [

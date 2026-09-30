@@ -20,6 +20,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifdef __linux__
 #include <limits>
@@ -63,6 +64,7 @@ struct FakeVerbsDevice {
     uint8_t active_speed = 0;
     uint8_t active_width = 0;
     uint32_t active_speed_ex = 0;
+    std::vector<ibv_gid_entry> gids;
 };
 
 FakeVerbsDevice fake_verbs;
@@ -77,6 +79,7 @@ class FakeVerbsDeviceScope {
         fake_verbs.active_speed = 0;
         fake_verbs.active_width = 0;
         fake_verbs.active_speed_ex = 0;
+        fake_verbs.gids.clear();
     }
 
     ~FakeVerbsDeviceScope() { fake_verbs.enabled = false; }
@@ -129,6 +132,7 @@ int ibv_query_port(ibv_context *context, uint8_t,
     port_attr->active_mtu = IBV_MTU_4096;
     port_attr->active_speed = fake_verbs.active_speed;
     port_attr->active_width = fake_verbs.active_width;
+    port_attr->gid_tbl_len = static_cast<int>(fake_verbs.gids.size());
 #ifdef HAVE_IBV_ACTIVE_SPEED_EX
     port_attr->active_speed_ex = fake_verbs.active_speed_ex;
 #endif
@@ -147,10 +151,26 @@ int ibv_query_device(ibv_context *context, ibv_device_attr *device_attr) {
     return 0;
 }
 
-int ibv_query_gid(ibv_context *context, uint8_t, int, ibv_gid *gid) {
+int ibv_query_gid(ibv_context *context, uint8_t, int index, ibv_gid *gid) {
     if (!fake_verbs.enabled || context != &fake_verbs.context) return EINVAL;
+    if (!fake_verbs.gids.empty()) {
+        if (index < 0 || static_cast<size_t>(index) >= fake_verbs.gids.size())
+            return EINVAL;
+        *gid = fake_verbs.gids[static_cast<size_t>(index)].gid;
+        return 0;
+    }
     *gid = {};
     gid->raw[15] = 1;
+    return 0;
+}
+
+int _ibv_query_gid_ex(ibv_context *context, uint32_t, uint32_t index,
+                      ibv_gid_entry *entry, uint32_t, size_t) {
+    if (!fake_verbs.enabled || context != &fake_verbs.context ||
+        index >= fake_verbs.gids.size()) {
+        return EINVAL;
+    }
+    *entry = fake_verbs.gids[index];
     return 0;
 }
 
@@ -367,6 +387,38 @@ TEST_F(RdmaContextReprobeTest,
     EXPECT_EQ(context_->gid(), formatGid(kCurrentGid));
     auto after_desc = localDesc();
     EXPECT_EQ(after_desc.get(), before_desc.get());
+}
+
+TEST_F(RdmaContextReprobeTest, AutoGidRankAdvancesMonotonicallyUntilExhausted) {
+#ifndef __linux__
+    GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
+#else
+    FakeVerbsDeviceScope fake_device(/*num_comp_vectors=*/1);
+    for (uint8_t suffix : {0x15, 0x17, 0x13}) {
+        ibv_gid_entry entry = {};
+        entry.gid.raw[15] = suffix;
+        entry.gid_type = IBV_GID_TYPE_ROCE_V2;
+        fake_verbs.gids.push_back(entry);
+    }
+    RdmaContextTestPeer::seedAutoGidState(
+        *context_, &fake_verbs.context, /*port=*/1, /*lid=*/23,
+        fake_verbs.gids[0].gid, /*gid_index=*/0);
+
+    EXPECT_EQ(context_->ensureAutoGidRank(1), GidRefreshResult::CHANGED);
+    auto rank1 = context_->gidSelection();
+    EXPECT_EQ(rank1.rank, 1U);
+    EXPECT_EQ(rank1.gid_index, 1);
+
+    EXPECT_EQ(context_->ensureAutoGidRank(0), GidRefreshResult::UNCHANGED);
+    EXPECT_EQ(context_->gidSelection().rank, 1U);
+
+    EXPECT_EQ(context_->ensureAutoGidRank(2), GidRefreshResult::CHANGED);
+    EXPECT_EQ(context_->gidSelection().rank, 2U);
+    EXPECT_EQ(context_->gidIndex(), 2);
+
+    EXPECT_EQ(context_->ensureAutoGidRank(3), GidRefreshResult::FAILED);
+    EXPECT_EQ(context_->gidSelection().rank, 2U);
+#endif
 }
 
 // Regression tests for the HCA-index / context_list_ alignment invariant.

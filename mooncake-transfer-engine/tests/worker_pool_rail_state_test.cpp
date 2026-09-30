@@ -35,6 +35,7 @@
 
 #include "rdma_test_peers.h"
 #include "transport/rdma_transport/rdma_context.h"
+#include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
 
@@ -63,6 +64,8 @@ using namespace mooncake;
 #ifdef __linux__
 namespace {
 std::function<GidRefreshResult()> gid_probe;
+std::function<GidRefreshResult(uint32_t, std::string *, std::string *)>
+    gid_rank_sync;
 }
 
 // Wrap the device probe, leaving the actual WorkerPool recovery path intact.
@@ -73,6 +76,17 @@ wrapRefreshCurrentGid(RdmaContext *, std::string *, std::string *) asm(
 extern "C" GidRefreshResult wrapRefreshCurrentGid(RdmaContext *, std::string *,
                                                   std::string *) {
     return gid_probe ? gid_probe() : GidRefreshResult::FAILED;
+}
+
+extern "C" GidRefreshResult
+wrapEnsureAutoGidRank(RdmaContext *, uint32_t, std::string *, std::string *) asm(
+    "__wrap__ZN8mooncake11RdmaContext17ensureAutoGidRankEjPNSt7__cxx1112basic_"
+    "stringIcSt11char_traitsIcESaIcEEES7_");
+extern "C" GidRefreshResult wrapEnsureAutoGidRank(RdmaContext *, uint32_t rank,
+                                                  std::string *previous_gid,
+                                                  std::string *next_gid) {
+    return gid_rank_sync ? gid_rank_sync(rank, previous_gid, next_gid)
+                         : GidRefreshResult::FAILED;
 }
 #endif
 
@@ -173,6 +187,30 @@ class WorkerPoolTestPeer {
     static int contextFailureThreshold() {
         return WorkerPool::kLocalCompletionFailureThreshold;
     }
+
+    static void recordAutoGidFailure(WorkerPool &pool,
+                                     Transport::Slice *slice) {
+        pool.recordAutoGidDataPathFailure(slice);
+    }
+
+    static void recordAutoGidSuccess(WorkerPool &pool,
+                                     Transport::Slice *slice) {
+        pool.recordAutoGidDataPathSuccess(slice);
+    }
+
+    static bool autoGidFailurePending(WorkerPool &pool) {
+        return pool.auto_gid_failure_pending_.load(std::memory_order_relaxed);
+    }
+};
+
+class RdmaEndPointTestPeer {
+   public:
+    static void seedAutoGidConnection(
+        RdmaEndPoint &endpoint,
+        const AutoGidConnectionIdentity &connection_identity) {
+        RWSpinlock::WriteGuard guard(endpoint.lock_);
+        endpoint.auto_gid_connection_ = connection_identity;
+    }
 };
 
 }  // namespace mooncake
@@ -206,6 +244,7 @@ class WorkerPoolRailStateTest : public ::testing::Test {
     void TearDown() override {
 #ifdef __linux__
         gid_probe = {};
+        gid_rank_sync = {};
 #endif
         worker_pool_.reset();
         context_.reset();
@@ -232,6 +271,76 @@ class WorkerPoolRailStateTest : public ::testing::Test {
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));
     EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest,
+       AutoGidDataPathFailureRetriesFreshEndpointBeforeAdvancing) {
+#ifndef __linux__
+    GTEST_SKIP() << "Requires Linux linker wrapping";
+#else
+    ibv_gid gid = {};
+    gid.raw[15] = 5;
+    RdmaContextTestPeer::seedAutoGidState(*context_, nullptr, /*port=*/1,
+                                          /*lid=*/0, gid, /*gid_index=*/5);
+    auto first_endpoint = std::make_unique<RdmaEndPoint>(*context_);
+    auto fresh_endpoint = std::make_unique<RdmaEndPoint>(*context_);
+    AutoGidConnectionIdentity first_identity{
+        /*local_gid=*/"local-5", /*peer_gid=*/"peer-5",
+        /*selection_rank=*/0, /*endpoint_id=*/0, /*qp_generation=*/0};
+    AutoGidConnectionIdentity fresh_identity = first_identity;
+    RdmaEndPointTestPeer::seedAutoGidConnection(*first_endpoint,
+                                                first_identity);
+    RdmaEndPointTestPeer::seedAutoGidConnection(*fresh_endpoint,
+                                                fresh_identity);
+
+    int sync_calls = 0;
+    uint32_t requested_rank = 0;
+    gid_rank_sync = [&](uint32_t rank, std::string *previous_gid,
+                        std::string *next_gid) {
+        ++sync_calls;
+        requested_rank = rank;
+        if (previous_gid) *previous_gid = "local-5";
+        if (next_gid) *next_gid = "local-7";
+        return GidRefreshResult::CHANGED;
+    };
+
+    Transport::Slice slice{};
+    slice.peer_nic_path = kPeerA;
+    slice.rdma.endpoint = first_endpoint.get();
+    WorkerPoolTestPeer::recordAutoGidFailure(*worker_pool_, &slice);
+    EXPECT_EQ(sync_calls, 0);
+    EXPECT_TRUE(WorkerPoolTestPeer::autoGidFailurePending(*worker_pool_));
+
+    slice.rdma.endpoint = fresh_endpoint.get();
+    WorkerPoolTestPeer::recordAutoGidFailure(*worker_pool_, &slice);
+    EXPECT_EQ(sync_calls, 1);
+    EXPECT_EQ(requested_rank, 1U);
+    EXPECT_FALSE(WorkerPoolTestPeer::autoGidFailurePending(*worker_pool_));
+#endif
+}
+
+TEST_F(WorkerPoolRailStateTest, AutoGidDataPathSuccessResetsFailureStreak) {
+    ibv_gid gid = {};
+    gid.raw[15] = 5;
+    RdmaContextTestPeer::seedAutoGidState(*context_, nullptr, /*port=*/1,
+                                          /*lid=*/0, gid, /*gid_index=*/5);
+    auto failed_endpoint = std::make_unique<RdmaEndPoint>(*context_);
+    auto successful_endpoint = std::make_unique<RdmaEndPoint>(*context_);
+    AutoGidConnectionIdentity identity{
+        /*local_gid=*/"local-5", /*peer_gid=*/"peer-5",
+        /*selection_rank=*/0, /*endpoint_id=*/0, /*qp_generation=*/0};
+    RdmaEndPointTestPeer::seedAutoGidConnection(*failed_endpoint, identity);
+    RdmaEndPointTestPeer::seedAutoGidConnection(*successful_endpoint, identity);
+
+    Transport::Slice slice{};
+    slice.peer_nic_path = kPeerA;
+    slice.rdma.endpoint = failed_endpoint.get();
+    WorkerPoolTestPeer::recordAutoGidFailure(*worker_pool_, &slice);
+    ASSERT_TRUE(WorkerPoolTestPeer::autoGidFailurePending(*worker_pool_));
+
+    slice.rdma.endpoint = successful_endpoint.get();
+    WorkerPoolTestPeer::recordAutoGidSuccess(*worker_pool_, &slice);
+    EXPECT_FALSE(WorkerPoolTestPeer::autoGidFailurePending(*worker_pool_));
 }
 
 TEST_F(WorkerPoolRailStateTest, FailuresBelowThresholdDoNotPauseCount) {
