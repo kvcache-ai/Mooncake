@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mooncake_store_core::{Result, StoreError};
-use mooncake_store_transport_core::{StoreTransport, StoreTransportFactory};
-use mooncake_transport::{
+use mooncake_store_rs_transport::{
     Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferBatchHints, TransferPacingMode,
     TransferProgress, TransferRequest, TransferStatus,
 };
+use mooncake_store_transport_core::{StoreTransport, StoreTransportFactory};
 use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------

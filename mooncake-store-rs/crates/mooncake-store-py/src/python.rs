@@ -2117,7 +2117,6 @@ mod tests {
     use std::thread::sleep;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_client::{
         snapshot_metrics, LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner,
         RouteControlMode, StoreClient, StoreClientBuilder, StoreTransport,
@@ -2131,7 +2130,8 @@ mod tests {
         TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaReservation,
         TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaState,
     };
-    use mooncake_transport::{
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
+    use mooncake_store_rs_transport::{
         Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
         TransferStatus,
     };

@@ -1,5 +1,5 @@
 [package]
-name = "mooncake-transport-sys"
+name = "mooncake-store-rs-transport-sys"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"

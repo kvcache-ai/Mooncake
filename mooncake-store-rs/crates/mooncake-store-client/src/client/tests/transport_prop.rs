@@ -1,7 +1,9 @@
 use mooncake_store_core::StoreError;
+use mooncake_store_rs_transport::{
+    Opcode, TransferBatchHints, TransferPacingMode, TransferRequest,
+};
 use mooncake_store_test_utils::transport::TestTransport;
 use mooncake_store_transport_core::StoreTransport;
-use mooncake_transport::{Opcode, TransferBatchHints, TransferPacingMode, TransferRequest};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -428,7 +430,10 @@ fn transport_overall_status_returns_completed_for_live_batch() {
     let _ = transport.allocate_memory(64, "cpu:0").unwrap();
     let batch = transport.allocate_batch(1).unwrap();
     let status = transport.overall_status(batch).unwrap();
-    assert_eq!(status.status, mooncake_transport::TransferStatus::Completed);
+    assert_eq!(
+        status.status,
+        mooncake_store_rs_transport::TransferStatus::Completed
+    );
     transport.free_batch(batch).unwrap();
 }
 

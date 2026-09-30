@@ -4,7 +4,7 @@
 //! `TensorMetadata` to stored objects, enabling typed tensor storage and
 //! retrieval with shape/dtype preservation.
 
-use mooncake_tensor::{TensorDtype, TensorMetadata};
+use mooncake_store_rs_tensor::{TensorDtype, TensorMetadata};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 

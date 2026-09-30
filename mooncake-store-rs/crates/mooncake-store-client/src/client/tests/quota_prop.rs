@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     MetadataBackend, StoreError, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
     TenantQuotaPolicy,
 };
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::metadata::{CountingMetadataBackend, FaultyMetadataBackend};
 use proptest::prelude::*;
 

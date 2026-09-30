@@ -1211,11 +1211,11 @@ fn avg_us(total_us: u64, count: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         CompatibilityDescriptor, MetadataBackend, StoreError,
     };
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 

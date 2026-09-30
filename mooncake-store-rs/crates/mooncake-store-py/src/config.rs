@@ -2,15 +2,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mooncake_metadata::{
-    resolve_redis_auth, EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace,
-    RedisMetadataBackend, RedisMetadataConfig,
-};
 #[cfg(test)]
 use mooncake_store_client::{ColdTierKind, ColdTierSsdEngine};
 use mooncake_store_client::{ColdTierTargetConfig, ColdTierTargetSpec};
 use mooncake_store_core::{MetadataBackend, Result, StoreError};
-use mooncake_transport::{ClassicEngineConfig, ClassicTransportProtocol, TentEngineConfig};
+use mooncake_store_rs_metadata::{
+    resolve_redis_auth, EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace,
+    RedisMetadataBackend, RedisMetadataConfig,
+};
+use mooncake_store_rs_transport::{
+    ClassicEngineConfig, ClassicTransportProtocol, TentEngineConfig,
+};
 use url::Url;
 
 pub const DEFAULT_COMPAT_LEASE_TTL_MS: u64 = 30_000;

@@ -4,7 +4,7 @@
 //! metadata tagging, and cross-TP scatter-gather reconstruction.
 
 use mooncake_store_client::ReadQueryResultCache;
-use mooncake_tensor::{
+use mooncake_store_rs_tensor::{
     build_raw_shard_write_plan, calculate_shard_range, calculate_strided_shard_ranges,
     get_parallelism_key_name, get_parallelism_manifest_key, get_writer_partition_key_name,
     parallelism_matches_metadata, validate_uniform_shard, ParallelAxisKind, ParallelAxisSpec,
@@ -186,7 +186,7 @@ struct TensorInfo {
     data_ptr: usize,
     data_bytes: usize,
     shape: Vec<i64>,
-    dtype: mooncake_tensor::TensorDtype,
+    dtype: mooncake_store_rs_tensor::TensorDtype,
 }
 
 fn extract_tensor_info(tensor: &Bound<'_, PyAny>) -> PyResult<TensorInfo> {

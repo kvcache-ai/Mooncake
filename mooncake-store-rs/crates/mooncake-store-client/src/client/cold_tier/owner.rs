@@ -1014,11 +1014,11 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::AtomicUsize;
 
-    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientStableId, ColdBackingRoute, CompatibilityDescriptor,
         ObjectKey, ObjectRoute, RouteState, RouteVersion,
     };
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 
     use super::*;
     use crate::client::LiveClientCache;

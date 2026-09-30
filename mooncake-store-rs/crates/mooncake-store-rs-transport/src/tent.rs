@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use mooncake_store_core::{Result, StoreError};
-use mooncake_transport_sys::tent as ffi;
+use mooncake_store_rs_transport_sys::tent as ffi;
 
 use crate::env::EnvOverrideGuard;
 use crate::{
@@ -574,7 +574,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
-    use mooncake_transport_sys::tent as ffi;
+    use mooncake_store_rs_transport_sys::tent as ffi;
 
     use super::{
         check_zero, cstring_from_path, decode_status, encode_opcode, parse_config_bool,

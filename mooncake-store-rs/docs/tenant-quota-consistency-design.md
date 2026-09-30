@@ -13,7 +13,7 @@ Relevant current path:
 - tenant quota policy model in:
   - `crates/mooncake-store-core/src/route.rs`
 - metadata-backed tenant policy storage in:
-  - `crates/mooncake-metadata`
+  - `crates/mooncake-store-rs-metadata`
 
 Current write flow is roughly:
 

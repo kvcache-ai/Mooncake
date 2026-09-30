@@ -34,10 +34,10 @@ The repository is organized by clear runtime responsibilities.
 | Module | Role | Why It Exists |
 |--------|------|---------------|
 | `mooncake-store-core` | Shared store model | Defines identities, leases, routes, segments, lifecycle, and traits |
-| `mooncake-metadata` | Metadata backends | Stores leases, segments, and route state in Redis, etcd, or memory |
+| `mooncake-store-rs-metadata` | Metadata backends | Stores leases, segments, and route state in Redis, etcd, or memory |
 | `mooncake-store-client` | Main runtime | Implements store APIs, routing, allocation, reclaim, control-plane RPC, and observability |
-| `mooncake-transport-sys` | Native FFI | Links Rust to upstream Mooncake native libraries |
-| `mooncake-transport` | Safe transport wrapper | Exposes TE/TENT as Rust-friendly transport abstractions |
+| `mooncake-store-rs-transport-sys` | Native FFI | Links Rust to upstream Mooncake native libraries |
+| `mooncake-store-rs-transport` | Safe transport wrapper | Exposes TE/TENT as Rust-friendly transport abstractions |
 | `mooncake-store-py` | Python bindings | Exposes the Rust client as a native Python module |
 | `mooncake-store-e2e` | Validation binary | Runs end-to-end checks and benchmark loops |
 
@@ -661,10 +661,10 @@ For Python build and API details, read `docs/python.md`.
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+use mooncake_store_rs_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{LocalMemoryConfig, MooncakeCompatibilityFacade, StoreClientBuilder};
 use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
-use mooncake_transport::{TentEngine, TentEngineConfig, TentTransportFactory};
+use mooncake_store_rs_transport::{TentEngine, TentEngineConfig, TentTransportFactory};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -906,12 +906,12 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 ```text
 crates/
   mooncake-store-core/      Shared types, identities, routes, lifecycle, traits
-  mooncake-metadata/        Redis, etcd, and in-memory metadata backends
+  mooncake-store-rs-metadata/        Redis, etcd, and in-memory metadata backends
   mooncake-store-client/    Client API, routing, allocation, control plane, transport glue
   mooncake-store-py/        Python compatibility bindings
   mooncake-store-e2e/       End-to-end validation and benchmarks
-  mooncake-transport/       Safe Rust wrapper around Mooncake TE/TENT
-  mooncake-transport-sys/   Native FFI and upstream Mooncake build integration
+  mooncake-store-rs-transport/       Safe Rust wrapper around Mooncake TE/TENT
+  mooncake-store-rs-transport-sys/   Native FFI and upstream Mooncake build integration
 python/
   mooncake/store/rs/        Store-RS Python implementation behind the facade
 scripts/

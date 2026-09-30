@@ -5587,7 +5587,7 @@ fn replica_balance_hash(reader_id: &str, key: &str) -> u64 {
 #[cfg(test)]
 mod runtime_io_tests {
     use super::*;
-    use mooncake_transport::{SegmentBuffer, SegmentKind};
+    use mooncake_store_rs_transport::{SegmentBuffer, SegmentKind};
 
     fn memory_segment(buffers: &[(u64, u64)]) -> SegmentInfo {
         SegmentInfo {

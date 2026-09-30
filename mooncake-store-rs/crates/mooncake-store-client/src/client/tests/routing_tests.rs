@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{ClientLifecycleState, StoreError};
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::transport::TestTransport;
 
 use crate::{MooncakeCompatibilityFacade, StoreClientBuilder};

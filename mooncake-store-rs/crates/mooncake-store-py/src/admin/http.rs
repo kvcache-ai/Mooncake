@@ -896,7 +896,6 @@ mod tests {
     use std::thread::sleep;
     use std::time::Duration;
 
-    use mooncake_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
     use mooncake_store_client::control_plane_pb;
     use mooncake_store_core::{
         scoped_object_key, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState,
@@ -906,6 +905,7 @@ mod tests {
         StoreError, TenantObjectAccountingState, TenantPolicySpec, TenantQuotaPolicy,
         TenantQuotaReservationRequest, TenantRoutePolicy,
     };
+    use mooncake_store_rs_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
     use parking_lot::Mutex;
 
     use crate::admin::models::PolicyPatchInput;

@@ -20,11 +20,11 @@ use _store_rs::admin::{
 };
 use _store_rs::build_info;
 use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use mooncake_metadata::MetadataKeyspace;
 use mooncake_store_client::init_tracing;
 use mooncake_store_core::{
     RoutePolicy, TenantPolicy, TenantPolicySpec, TenantQuotaReservationState,
 };
+use mooncake_store_rs_metadata::MetadataKeyspace;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tracing::{info, warn};
@@ -1361,8 +1361,8 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{MetadataBackend, TenantQuotaPolicy, TenantRoutePolicy};
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 
     use super::*;
 

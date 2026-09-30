@@ -5,7 +5,6 @@ use std::sync::{Arc, Barrier};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
     init_tracing_from_env, render_prometheus_metrics, start_metrics_http_server_from_env,
     BandwidthShaping, GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade,
@@ -18,7 +17,8 @@ use mooncake_store_core::{
     TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
     TenantQuotaReservationState,
 };
-use mooncake_transport::{TentEngine, TentEngineConfig};
+use mooncake_store_rs_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+use mooncake_store_rs_transport::{TentEngine, TentEngineConfig};
 
 const LEASE_MS: u64 = 600_000;
 const MEMORY_BYTES: usize = 128 * 1024 * 1024;

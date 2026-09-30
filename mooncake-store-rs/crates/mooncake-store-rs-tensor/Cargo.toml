@@ -1,5 +1,5 @@
 [package]
-name = "mooncake-tensor"
+name = "mooncake-store-rs-tensor"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

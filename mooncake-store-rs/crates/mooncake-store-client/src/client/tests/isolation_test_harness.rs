@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use mooncake_metadata::InMemoryMetadataBackend;
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientLifecycleState, MetadataBackend, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
     TenantQuotaPolicy,

@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mooncake_store_core::StoreError;
+use mooncake_store_rs_transport::{Opcode, TransferRequest};
 use mooncake_store_test_utils::transport::{FaultConfig, FaultyTransport, TestTransport};
 use mooncake_store_transport_core::StoreTransport;
-use mooncake_transport::{Opcode, TransferRequest};
 use proptest::prelude::*;
 
 // ===========================================================================
@@ -540,7 +540,10 @@ fn faulty_transport_overall_status_succeeds_when_connected() {
     let (faulty, _) = FaultyTransport::new(inner);
     let batch = faulty.allocate_batch(1).unwrap();
     let status = faulty.overall_status(batch).unwrap();
-    assert_eq!(status.status, mooncake_transport::TransferStatus::Completed);
+    assert_eq!(
+        status.status,
+        mooncake_store_rs_transport::TransferStatus::Completed
+    );
     faulty.free_batch(batch).unwrap();
 }
 

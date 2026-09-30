@@ -920,7 +920,7 @@ mod tests {
                 .expect("system time should be after epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "mooncake-transport-sys-test-{}-{suffix}",
+                "mooncake-store-rs-transport-sys-test-{}-{suffix}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).expect("temp dir should create");

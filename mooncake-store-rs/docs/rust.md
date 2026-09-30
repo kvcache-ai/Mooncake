@@ -23,12 +23,12 @@ You also need:
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+use mooncake_store_rs_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
     LocalMemoryConfig, MooncakeCompatibilityFacade, StoreClientBuilder, TentTransportFactory,
 };
 use mooncake_store_core::{ClientLifecycleState, CompatibilityDescriptor, Result};
-use mooncake_transport::{TentEngine, TentEngineConfig};
+use mooncake_store_rs_transport::{TentEngine, TentEngineConfig};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -115,7 +115,7 @@ Redis authentication can come from URL-embedded credentials or from `MC_REDIS_US
 
 ## Check Without Native Build
 
-`mooncake-transport-sys` compiles native shims against TE/TENT artifacts from an existing
+`mooncake-store-rs-transport-sys` compiles native shims against TE/TENT artifacts from an existing
 Mooncake CMake build tree. `MOONCAKE_ROOT_DIR` and `MOONCAKE_BUILD_DIR` come from the enclosing
 CMake build or must be set to absolute paths for direct Cargo builds. The build script never
 configures another Mooncake build.

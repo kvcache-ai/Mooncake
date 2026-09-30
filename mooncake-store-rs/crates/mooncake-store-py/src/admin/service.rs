@@ -9,10 +9,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mooncake_metadata::{
-    ClientLeaseLiveness, EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace,
-    RedisMetadataBackend, RedisMetadataCleanupReport, RedisMetadataConfig,
-};
 use mooncake_store_client::{
     control_plane_pb, record_tenant_quota_reconcile, MigrationControlClient,
 };
@@ -25,6 +21,10 @@ use mooncake_store_core::{
     TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaFinalizeRequest,
     TenantQuotaPolicy, TenantQuotaReservationState, TenantRoutePolicy, CONTROL_ADDR_LABEL,
     DEFAULT_DOMAIN, DEFAULT_OBJECT_SET, METRICS_PORT_LABEL,
+};
+use mooncake_store_rs_metadata::{
+    ClientLeaseLiveness, EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace,
+    RedisMetadataBackend, RedisMetadataCleanupReport, RedisMetadataConfig,
 };
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -2282,10 +2282,6 @@ mod tests {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use mooncake_metadata::{
-        EtcdMetadataBackend, EtcdMetadataConfig, InMemoryMetadataBackend, RedisMetadataBackend,
-        RedisMetadataConfig,
-    };
     use mooncake_store_client::control_plane_pb;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
@@ -2297,6 +2293,10 @@ mod tests {
         TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservation,
         TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaReservationState,
         TenantQuotaState, METRICS_PORT_LABEL,
+    };
+    use mooncake_store_rs_metadata::{
+        EtcdMetadataBackend, EtcdMetadataConfig, InMemoryMetadataBackend, RedisMetadataBackend,
+        RedisMetadataConfig,
     };
     use parking_lot::Mutex;
 

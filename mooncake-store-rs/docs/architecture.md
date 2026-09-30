@@ -526,7 +526,7 @@ This preserves compatibility for integrations that expect a dummy client / exter
 | Path | Role |
 |------|------|
 | `crates/mooncake-store-core` | Shared contracts and store model |
-| `crates/mooncake-metadata` | Backend implementations for metadata |
+| `crates/mooncake-store-rs-metadata` | Backend implementations for metadata |
 | `crates/mooncake-store-route` | object route table component split into `shim` for public operation/integration facade and metadata adapter, `table` for single-authority local route tables, `mesh` for distributed route-authority protocol, plus `control`, `metrics`, and `util` |
 | `crates/mooncake-store-client/src/client/mod.rs` | `StoreClient` assembly and module composition |
 | `crates/mooncake-store-client/src/client/builder.rs` | builder defaults, lease publication, membership prewarm |

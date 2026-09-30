@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_client::{
     LocalMemoryConfig, MooncakeCompatibilityFacade, PutRequest, StoreClient, StoreClientBuilder,
 };
@@ -29,6 +28,7 @@ use mooncake_store_core::{
     ClientLifecycleState, MetadataBackend, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
     TenantQuotaPolicy,
 };
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::fixtures::test_future_expiry_ms;
 use mooncake_store_test_utils::transport::TestTransport;
 

@@ -31,11 +31,11 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientLifecycleState, MetadataBackend, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
     TenantQuotaPolicy,
 };
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::fixtures::test_future_expiry_ms;
 use mooncake_store_test_utils::metadata::{CountingMetadataBackend, OperationCounts};
 use mooncake_store_test_utils::transport::TestTransport;

@@ -690,11 +690,11 @@ Why this set first:
 
 - `crates/mooncake-store-core/src/traits.rs`
   - add tenant policy trait methods
-- `crates/mooncake-metadata/src/redis_backend.rs`
+- `crates/mooncake-store-rs-metadata/src/redis_backend.rs`
   - store/load/list/delete tenant policy
-- `crates/mooncake-metadata/src/etcd_backend.rs`
+- `crates/mooncake-store-rs-metadata/src/etcd_backend.rs`
   - matching implementation
-- `crates/mooncake-metadata/src/in_memory.rs`
+- `crates/mooncake-store-rs-metadata/src/in_memory.rs`
   - test implementation
 
 #### Core policy types

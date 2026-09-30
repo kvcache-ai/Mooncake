@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
     init_tracing_from_env, ColdTierOffloadMode, ColdTierWatermarkConfig, DebugEvictAllResult,
     ExtentStoreExecutor, ExtentStoreExecutorConfig, GetRequest, LocalMemoryConfig,
@@ -15,7 +14,8 @@ use mooncake_store_client::{
     StoreClientBuilder, StoreTransport,
 };
 use mooncake_store_core::{ClientLifecycleState, ColdBackingState, Result, StoreError};
-use mooncake_transport::{
+use mooncake_store_rs_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+use mooncake_store_rs_transport::{
     SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
 };
 use redis::Commands;
@@ -103,14 +103,14 @@ impl StoreTransport for NoopTransport {
 
     fn task_status(&self, _batch_id: u64, _task_id: usize) -> Result<TransferProgress> {
         Ok(TransferProgress {
-            status: mooncake_transport::TransferStatus::Completed,
+            status: mooncake_store_rs_transport::TransferStatus::Completed,
             transferred_bytes: 0,
         })
     }
 
     fn overall_status(&self, _batch_id: u64) -> Result<TransferProgress> {
         Ok(TransferProgress {
-            status: mooncake_transport::TransferStatus::Completed,
+            status: mooncake_store_rs_transport::TransferStatus::Completed,
             transferred_bytes: 0,
         })
     }

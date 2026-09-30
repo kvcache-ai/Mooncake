@@ -9,7 +9,7 @@ use mooncake_store_core::{
     ClientRuntimeId, HugePageConfig, Result, SegmentAnnouncement, SegmentLifecycleState,
     SegmentName, SegmentTargetChunk, StoreError,
 };
-use mooncake_transport::SegmentInfo;
+use mooncake_store_rs_transport::SegmentInfo;
 use parking_lot::Mutex;
 
 use crate::transport::{registration_chunks, StoreTransport};
@@ -1173,7 +1173,7 @@ struct TargetMapping {
 
 fn build_target_mappings(
     local_chunks: &[(*mut c_void, usize)],
-    target_buffers: &[&mooncake_transport::SegmentBuffer],
+    target_buffers: &[&mooncake_store_rs_transport::SegmentBuffer],
 ) -> Result<Option<Vec<TargetMapping>>> {
     let mut mappings = Vec::with_capacity(local_chunks.len());
     for ((local_addr, local_len), target_buffer) in local_chunks.iter().zip(target_buffers.iter()) {
@@ -1495,7 +1495,7 @@ mod tests {
     use std::sync::Arc;
 
     use mooncake_store_core::{HugePageConfig, SegmentLifecycleState, SegmentName, StoreError};
-    use mooncake_transport::{
+    use mooncake_store_rs_transport::{
         SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest, TransferStatus,
     };
     use parking_lot::Mutex;

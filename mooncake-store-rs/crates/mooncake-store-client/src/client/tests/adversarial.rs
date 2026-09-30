@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend, StoreError,
 };
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::{
     fixtures::{now_ms, test_future_expiry_ms},
     metadata::{CountingMetadataBackend, FaultyMetadataBackend},
@@ -587,7 +587,7 @@ fn test_transport_factory_creates_instances_sharing_segment_state() {
 
 #[test]
 fn test_transport_fail_next_submit_injects_error_for_named_segment() {
-    use mooncake_transport::{Opcode, TransferRequest};
+    use mooncake_store_rs_transport::{Opcode, TransferRequest};
 
     let transport = TestTransport::new("seg-fail");
     let _addr = transport
@@ -617,7 +617,7 @@ fn test_transport_fail_next_submit_injects_error_for_named_segment() {
 
 #[test]
 fn test_transport_submit_batch_size_is_tracked() {
-    use mooncake_transport::{Opcode, TransferBatchHints, TransferRequest};
+    use mooncake_store_rs_transport::{Opcode, TransferBatchHints, TransferRequest};
 
     let transport = TestTransport::new("seg-track");
     let addr = transport

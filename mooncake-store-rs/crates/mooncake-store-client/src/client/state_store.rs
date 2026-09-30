@@ -318,7 +318,7 @@ impl StoreState {
 #[cfg(test)]
 mod state_store_tests {
     use super::*;
-    use mooncake_transport::{SegmentBuffer, SegmentKind, TransferProgress};
+    use mooncake_store_rs_transport::{SegmentBuffer, SegmentKind, TransferProgress};
     use parking_lot::Mutex;
     use std::ffi::c_void;
     use std::sync::Arc;

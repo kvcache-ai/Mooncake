@@ -9,12 +9,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{MetadataBackend, Result, SegmentName, StoreError};
-use mooncake_store_transport_core::MemoryRegistration;
-use mooncake_transport::{
+use mooncake_store_rs_transport::{
     ClassicEngineConfig, ClassicTransferEngine, Opcode, SegmentBuffer, SegmentInfo, SegmentKind,
     TentEngine, TentEngineConfig, TransferBatchHints, TransferProgress, TransferRequest,
     TransferStatus,
 };
+use mooncake_store_transport_core::MemoryRegistration;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
@@ -595,7 +595,7 @@ impl ClassicTeTransport {
             engine: RwLock::new(engine),
             max_registration_bytes: matches!(
                 config.transport_protocol(),
-                mooncake_transport::ClassicTransportProtocol::Rdma
+                mooncake_store_rs_transport::ClassicTransportProtocol::Rdma
             )
             .then(ClassicTransferEngine::rdma_max_registration_size)
             .flatten(),
@@ -659,7 +659,7 @@ impl ClassicTeTransport {
         let location = self.registration_location(entries[0].addr, entries[0].size);
         if matches!(
             self.config.transport_protocol(),
-            mooncake_transport::ClassicTransportProtocol::Rdma
+            mooncake_store_rs_transport::ClassicTransportProtocol::Rdma
         ) && total_registration_bytes(entries) >= CLASSIC_RDMA_STARTUP_PRETOUCH_THRESHOLD_BYTES
         {
             pretouch_registration_entries(entries)?;
@@ -1121,7 +1121,7 @@ impl StoreTransport for ClassicTeTransport {
     fn supports_parallel_startup_registration(&self) -> bool {
         matches!(
             self.config.transport_protocol(),
-            mooncake_transport::ClassicTransportProtocol::Rdma
+            mooncake_store_rs_transport::ClassicTransportProtocol::Rdma
         )
     }
 
@@ -2009,7 +2009,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use mooncake_store_core::{ClientLease, Result, StoreError};
-    use mooncake_transport::{
+    use mooncake_store_rs_transport::{
         ClassicEngineConfig, Opcode, SegmentInfo, TransferBatchHints, TransferPacingMode,
         TransferProgress, TransferRequest, TransferStatus,
     };

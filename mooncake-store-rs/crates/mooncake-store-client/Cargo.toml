@@ -17,7 +17,7 @@ io-uring = "0.7"
 mooncake-store-core           = { path = "../mooncake-store-core" }
 mooncake-store-route          = { path = "../mooncake-store-route" }
 mooncake-store-transport-core = { path = "../mooncake-store-transport-core" }
-mooncake-transport            = { path = "../mooncake-transport" }
+mooncake-store-rs-transport            = { path = "../mooncake-store-rs-transport" }
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
@@ -39,7 +39,7 @@ protoc-bin-vendored = "3"
 tonic-build = "0.12"
 
 [dev-dependencies]
-mooncake-metadata         = { path = "../mooncake-metadata" }
+mooncake-store-rs-metadata         = { path = "../mooncake-store-rs-metadata" }
 mooncake-store-test-utils = { path = "../mooncake-store-test-utils" }
 proptest                  = "1"
 criterion                 = { version = "0.5", features = ["html_reports"] }

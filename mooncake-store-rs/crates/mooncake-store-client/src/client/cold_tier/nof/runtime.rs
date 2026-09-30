@@ -1461,11 +1461,11 @@ impl PersistentStorageBackend for NofObjectAdapter {
 
 #[cfg(test)]
 mod tests {
-    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientStableId,
         CompatibilityDescriptor, ObjectKey, RouteState, RouteVersion,
     };
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 
     use super::*;
     use crate::client::cold_tier::owner::{NOF_TARGET_SET_LABEL, NOF_UNHEALTHY_TARGETS_LABEL};

@@ -17,11 +17,11 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, CompatibilityDescriptor, MetadataBackend,
     ObjectKey, ObjectRoute, RouteDirectory, RouteState, RouteVersion, StoreError,
 };
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::transport::{FaultyTransport, TestTransport};
 
 use crate::{

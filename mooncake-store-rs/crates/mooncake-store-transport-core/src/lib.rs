@@ -2,7 +2,9 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use mooncake_store_core::Result;
-use mooncake_transport::{SegmentInfo, TransferBatchHints, TransferProgress, TransferRequest};
+use mooncake_store_rs_transport::{
+    SegmentInfo, TransferBatchHints, TransferProgress, TransferRequest,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryRegistration {

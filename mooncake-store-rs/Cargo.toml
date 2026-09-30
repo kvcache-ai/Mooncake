@@ -1,16 +1,16 @@
 [workspace]
 members = [
-    "crates/mooncake-transport-sys",
-    "crates/mooncake-transport",
+    "crates/mooncake-store-rs-transport-sys",
+    "crates/mooncake-store-rs-transport",
     "crates/mooncake-store-core",
     "crates/mooncake-store-route",
     "crates/mooncake-store-transport-core",
-    "crates/mooncake-metadata",
+    "crates/mooncake-store-rs-metadata",
     "crates/mooncake-store-client",
     "crates/mooncake-store-e2e",
     "crates/mooncake-store-py",
     "crates/mooncake-store-test-utils",
-    "crates/mooncake-tensor",
+    "crates/mooncake-store-rs-tensor",
 ]
 resolver = "2"
 

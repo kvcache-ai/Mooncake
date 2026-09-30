@@ -2,7 +2,7 @@ use std::ffi::{c_void, CString};
 use std::sync::{Mutex, OnceLock};
 
 use mooncake_store_core::{Result, StoreError};
-use mooncake_transport_sys::classic as ffi;
+use mooncake_store_rs_transport_sys::classic as ffi;
 
 use crate::env::EnvOverrideGuard;
 use crate::{
@@ -529,7 +529,7 @@ mod tests {
     use std::ffi::c_void;
     use std::mem::ManuallyDrop;
 
-    use mooncake_transport_sys::classic as ffi;
+    use mooncake_store_rs_transport_sys::classic as ffi;
 
     use super::{
         check_zero, classic_engine_create_lock, decode_status, encode_opcode, encode_request,

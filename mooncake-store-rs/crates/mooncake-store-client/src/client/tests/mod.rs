@@ -7,7 +7,6 @@ use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId,
@@ -19,7 +18,8 @@ use mooncake_store_core::{
     TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy, TenantQuotaReservation,
     TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
 };
-use mooncake_transport::{Opcode, TransferPacingMode};
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
+use mooncake_store_rs_transport::{Opcode, TransferPacingMode};
 use parking_lot::Mutex;
 
 use super::{

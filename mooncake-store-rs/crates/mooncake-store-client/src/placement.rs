@@ -431,11 +431,11 @@ fn locality_bonus(candidate: &ClientLease, object: &ObjectRef<'_>) -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         CompatibilityDescriptor, MetadataBackend, SegmentName,
     };
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 
     use super::PlacementPlanner;
     use crate::ObjectRef;

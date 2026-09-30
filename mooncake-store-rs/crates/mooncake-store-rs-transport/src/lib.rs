@@ -63,9 +63,11 @@ pub struct TransferBatchHints {
 }
 
 pub fn rdma_device_max_registration_size() -> Option<usize> {
-    usize::try_from(unsafe { mooncake_transport_sys::tent::mooncake_tent_probe_rdma_max_mr_size() })
-        .ok()
-        .filter(|value| *value > 0)
+    usize::try_from(unsafe {
+        mooncake_store_rs_transport_sys::tent::mooncake_tent_probe_rdma_max_mr_size()
+    })
+    .ok()
+    .filter(|value| *value > 0)
 }
 
 pub(crate) fn clamp_registration_size(

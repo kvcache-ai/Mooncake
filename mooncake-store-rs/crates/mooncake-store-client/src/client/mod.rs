@@ -23,7 +23,7 @@ use mooncake_store_core::{
     TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
 };
 use mooncake_store_route::{RouteHitReporter, RouteOperations};
-use mooncake_transport::{
+use mooncake_store_rs_transport::{
     Opcode, SegmentBuffer, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode,
     TransferRequest,
 };

@@ -6,13 +6,13 @@ use std::sync::{
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
     CompatibilityDescriptor, LogicalObjectId, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
     ReplicaTier, Result as StoreResult, RouteCasRequest, RouteDirectory, RouteState, RouteVersion,
     SegmentName, StoreError,
 };
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::transport::TestTransport;
 use parking_lot::Mutex;
 

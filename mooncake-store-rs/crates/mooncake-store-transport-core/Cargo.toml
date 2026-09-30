@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 mooncake-store-core = { path = "../mooncake-store-core" }
-mooncake-transport   = { path = "../mooncake-transport" }
+mooncake-store-rs-transport   = { path = "../mooncake-store-rs-transport" }
 
 [lints]
 workspace = true

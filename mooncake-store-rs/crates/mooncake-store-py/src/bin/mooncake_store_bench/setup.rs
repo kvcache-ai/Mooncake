@@ -6,9 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use _store_rs::runtime::{CompatRuntime, CompatRuntimeArgs, CompatSetupArgs};
-use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{MooncakeCompatibilityFacade, StoreClient};
 use mooncake_store_core::{ClientLease, ClientLifecycleState, MetadataBackend, RouteControlMode};
+use mooncake_store_rs_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use tracing::{debug, info, trace, warn};
 use url::Url;
 
@@ -798,10 +798,10 @@ fn transport_backend_name(transport_backend: &TransportBackend) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, SegmentName,
     };
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 
     fn publish_storage_lease(
         metadata: &InMemoryMetadataBackend,

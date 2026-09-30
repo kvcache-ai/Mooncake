@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, MetadataBackend, ObjectKey,
     ObjectRoute, ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy, RoutePolicyDomain,
     RouteState, RouteVersion, SegmentName, StoreError,
 };
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::metadata::{CountingMetadataBackend, FaultyMetadataBackend};
 use proptest::prelude::*;
 

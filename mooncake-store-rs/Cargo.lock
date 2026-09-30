@@ -1241,20 +1241,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mooncake-metadata"
-version = "0.1.0"
-dependencies = [
- "etcd-client",
- "mooncake-store-core",
- "parking_lot",
- "redis",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "mooncake-store-client"
 version = "0.1.0"
 dependencies = [
@@ -1262,12 +1248,12 @@ dependencies = [
  "io-uring",
  "is-terminal",
  "libc",
- "mooncake-metadata",
  "mooncake-store-core",
  "mooncake-store-route",
+ "mooncake-store-rs-metadata",
+ "mooncake-store-rs-transport",
  "mooncake-store-test-utils",
  "mooncake-store-transport-core",
- "mooncake-transport",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -1300,10 +1286,10 @@ dependencies = [
 name = "mooncake-store-e2e"
 version = "0.1.0"
 dependencies = [
- "mooncake-metadata",
  "mooncake-store-client",
  "mooncake-store-core",
- "mooncake-transport",
+ "mooncake-store-rs-metadata",
+ "mooncake-store-rs-transport",
  "redis",
 ]
 
@@ -1314,11 +1300,11 @@ dependencies = [
  "clap",
  "ctrlc",
  "libc",
- "mooncake-metadata",
  "mooncake-store-client",
  "mooncake-store-core",
- "mooncake-tensor",
- "mooncake-transport",
+ "mooncake-store-rs-metadata",
+ "mooncake-store-rs-tensor",
+ "mooncake-store-rs-transport",
  "parking_lot",
  "prost 0.13.5",
  "protoc-bin-vendored",
@@ -1347,13 +1333,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "mooncake-store-rs-metadata"
+version = "0.1.0"
+dependencies = [
+ "etcd-client",
+ "mooncake-store-core",
+ "parking_lot",
+ "redis",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mooncake-store-rs-tensor"
+version = "0.1.0"
+
+[[package]]
+name = "mooncake-store-rs-transport"
+version = "0.1.0"
+dependencies = [
+ "mooncake-store-core",
+ "mooncake-store-rs-transport-sys",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mooncake-store-rs-transport-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mooncake-store-test-utils"
 version = "0.1.0"
 dependencies = [
- "mooncake-metadata",
  "mooncake-store-core",
+ "mooncake-store-rs-metadata",
+ "mooncake-store-rs-transport",
  "mooncake-store-transport-core",
- "mooncake-transport",
  "parking_lot",
 ]
 
@@ -1362,28 +1383,7 @@ name = "mooncake-store-transport-core"
 version = "0.1.0"
 dependencies = [
  "mooncake-store-core",
- "mooncake-transport",
-]
-
-[[package]]
-name = "mooncake-tensor"
-version = "0.1.0"
-
-[[package]]
-name = "mooncake-transport"
-version = "0.1.0"
-dependencies = [
- "mooncake-store-core",
- "mooncake-transport-sys",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "mooncake-transport-sys"
-version = "0.1.0"
-dependencies = [
- "libc",
+ "mooncake-store-rs-transport",
 ]
 
 [[package]]

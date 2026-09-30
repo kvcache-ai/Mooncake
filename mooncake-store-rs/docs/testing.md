@@ -23,7 +23,7 @@ and conventions are the contract.
 ## Test Inventory
 
 Workspace `cargo test --lib` runs 879 tests across the workspace crates listed
-below. The Redis-backed integration tests inside `mooncake-metadata` and
+below. The Redis-backed integration tests inside `mooncake-store-rs-metadata` and
 `mooncake-store-py` skip silently when no `redis-server` binary is on `PATH`;
 the etcd-backed integration tests skip when no local `etcd` binary is
 available; all other tests run unconditionally.
@@ -32,10 +32,10 @@ available; all other tests run unconditionally.
 |---|---:|---|
 | `mooncake-store-client` | 537 | Dominant runtime; includes property tests and fault-injection integration |
 | `mooncake-store-core` | 112 | Pure-type contracts: identity, route, compat, error, codec |
-| `mooncake-metadata` | 111 | In-memory backend + keyspace + segment state + Redis / etcd integration |
+| `mooncake-store-rs-metadata` | 111 | In-memory backend + keyspace + segment state + Redis / etcd integration |
 | `mooncake-store-py` | 94 | PyO3 bindings, admin service, setup helpers (3 `#[ignore]`, including Redis-backed and etcd-backed admin maintenance tests) |
-| `mooncake-transport` | 21 | Transport-core trait behaviour |
-| `mooncake-transport-sys` | 4 | FFI shim sanity checks |
+| `mooncake-store-rs-transport` | 21 | Transport-core trait behaviour |
+| `mooncake-store-rs-transport-sys` | 4 | FFI shim sanity checks |
 | `mooncake-store-test-utils` | 0 | Test-only crate — no self-tests |
 | `mooncake-store-transport-core` | 0 | Trait definitions only |
 
@@ -112,8 +112,8 @@ Crafted inputs that attack parser, codec, or validator paths:
 
 ### 4. Concurrency
 
-Multi-thread races against shared state. `mooncake-metadata::in_memory`
-carries three of these; `mooncake-metadata::redis_backend` has one more
+Multi-thread races against shared state. `mooncake-store-rs-metadata::in_memory`
+carries three of these; `mooncake-store-rs-metadata::redis_backend` has one more
 (skipped without `redis-server`):
 
 | Test | What it stresses |
@@ -157,11 +157,11 @@ invariant must hold for every generated case.
 
 End-to-end flows that compose ≥2 real components without mocks.
 
-- `mooncake-metadata::redis_backend::tests::redis_backend_*` — 35+ tests
+- `mooncake-store-rs-metadata::redis_backend::tests::redis_backend_*` — 35+ tests
   spin up a local `redis-server` (falling back to no-op if absent), exercise
   the full metadata surface, Lua-script atomicity, transient-error retry, and
   TTL-backed client resource hashes.
-- `mooncake-metadata::etcd_backend::tests::etcd_backend_*` — 7 tests gated
+- `mooncake-store-rs-metadata::etcd_backend::tests::etcd_backend_*` — 7 tests gated
   on a local `etcd` binary, covering round-trip metadata behavior plus expiry
   work-index and owner-scoped cleanup semantics.
 - `mooncake-store-py::admin::service::tests::*stale_segments*` — 4 backend-integrated
@@ -302,7 +302,7 @@ See `store_client_tests::make_faulty_reader` for the pattern.
 
 ## Redis-backed Integration: Conditional Skip
 
-`RedisTestServer::start()` in both `mooncake-metadata/src/redis_backend.rs`
+`RedisTestServer::start()` in both `mooncake-store-rs-metadata/src/redis_backend.rs`
 and `crates/mooncake-store-py/src/admin/service.rs` spawns a local
 `redis-server` child process on an ephemeral port. Every Redis-backed
 integration test begins with:
@@ -340,7 +340,7 @@ Admin service scenarios covered:
 
 ## Etcd-backed Integration: Conditional Skip
 
-`EtcdTestServer::start()` in `mooncake-metadata/src/etcd_backend.rs` and
+`EtcdTestServer::start()` in `mooncake-store-rs-metadata/src/etcd_backend.rs` and
 `crates/mooncake-store-py/src/admin/service.rs` spawns a local single-node
 `etcd` child process on ephemeral client/peer ports. The readiness probe waits
 for the server to accept traffic before the test continues.
@@ -415,7 +415,7 @@ Matches the command CI runs. Completes in ≈17 s on a warm cache.
 
 ```bash
 cargo test -p mooncake-store-client --lib
-cargo test -p mooncake-metadata --lib
+cargo test -p mooncake-store-rs-metadata --lib
 cargo test -p mooncake-store-core --lib
 cargo test -p mooncake-store-py --lib
 cargo test -p mooncake-store-py --bin mooncake-store-admin
@@ -426,7 +426,7 @@ cargo test -p mooncake-store-py --bin mooncake-store-admin
 ```bash
 cargo test -p mooncake-store-client --lib lifecycle_tests
 cargo test -p mooncake-store-client --lib faulty_transport
-cargo test -p mooncake-metadata --lib transient_error
+cargo test -p mooncake-store-rs-metadata --lib transient_error
 ```
 
 ### Property-test case count
@@ -437,7 +437,7 @@ Override the default case count for a one-off deep-dive:
 PROPTEST_CASES=5000 cargo test -p mooncake-store-client --lib prop_align_up
 ```
 
-Redis-backed lib tests inside `mooncake-metadata` and `mooncake-store-py`
+Redis-backed lib tests inside `mooncake-store-rs-metadata` and `mooncake-store-py`
 run only if the CI image has a `redis-server` binary. Etcd-backed tests run
 only if the image also includes a local `etcd` binary. Redis coverage runs on
 the current CI image; etcd coverage depends on the builder image contents.
@@ -456,7 +456,7 @@ Decision tree:
    `route.rs`, `error.rs`, ...).
 2. **Single-module internal helper?** → inline test module in the module
    file (`mooncake-store-client/src/memory.rs`,
-   `mooncake-metadata/src/segment_state.rs`).
+   `mooncake-store-rs-metadata/src/segment_state.rs`).
 3. **Client builder / API surface contract?** →
    `mooncake-store-client/src/client/tests/unit_tests.rs`.
 4. **Client + metadata integration scenario?** →

@@ -11,11 +11,11 @@
 
 use std::sync::Arc;
 
-use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, HandoffKind, MetadataBackend, SegmentLifecycleState,
     SegmentName, StoreError,
 };
+use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::transport::TestTransport;
 
 use crate::{

@@ -35,7 +35,7 @@ pub use client::{
 pub use control_plane::{pb as control_plane_pb, MigrationControlClient};
 pub use memory::{LocalMemoryConfig, ScratchReservation};
 pub use mooncake_store_core::RouteControlMode;
-pub use mooncake_transport::{TransferBatchHints, TransferPacingMode};
+pub use mooncake_store_rs_transport::{TransferBatchHints, TransferPacingMode};
 pub use observability::{
     init_tracing, init_tracing_from_env, metrics_http_server_addr, record_heartbeat_health,
     record_tenant_local_eviction, record_tenant_quota_reconcile, register_debug_evict_all,

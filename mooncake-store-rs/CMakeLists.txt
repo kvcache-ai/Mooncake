@@ -22,7 +22,7 @@ if(NOT Python3_SOABI)
 endif()
 
 set(STORE_RS_SHIM_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/crates/mooncake-transport-sys/src)
+    ${CMAKE_CURRENT_SOURCE_DIR}/crates/mooncake-store-rs-transport-sys/src)
 set(STORE_RS_YLT_INCLUDE_DIR
     ${yalantinglibs_SOURCE_DIR}/include)
 set(STORE_RS_NATIVE_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/native-shims)

@@ -7,9 +7,9 @@ This document explains the repository by module and by runtime role.
 | Layer | Main Crates | Responsibility |
 |------|-------------|----------------|
 | Store model | `mooncake-store-core` | Shared types, traits, lifecycle, and route model |
-| Metadata | `mooncake-metadata` | Persistent leases, segments, route policy, handoff, and `MetadataOnly` route state |
+| Metadata | `mooncake-store-rs-metadata` | Persistent leases, segments, route policy, handoff, and `MetadataOnly` route state |
 | Runtime | `mooncake-store-client` | User-facing API and all runtime decisions |
-| Transport binding | `mooncake-transport-sys`, `mooncake-transport` | Native TE/TENT linkage and Rust wrappers |
+| Transport binding | `mooncake-store-rs-transport-sys`, `mooncake-store-rs-transport` | Native TE/TENT linkage and Rust wrappers |
 | Compatibility | `mooncake-store-py` | Python binding and compatibility API |
 | Validation | `mooncake-store-e2e` | End-to-end correctness and benchmark runs |
 
@@ -34,7 +34,7 @@ Read this crate first if you want to understand the data model before reading th
 
 ## Metadata Backends
 
-### `mooncake-metadata`
+### `mooncake-store-rs-metadata`
 
 Purpose:
 
@@ -110,7 +110,7 @@ on top of.
 
 ## Transport Layer
 
-### `mooncake-transport-sys`
+### `mooncake-store-rs-transport-sys`
 
 Purpose:
 
@@ -124,7 +124,7 @@ What it does:
 - links `libtransfer_engine.so` and `libtent_shared.so`
 - exports FFI for classic TE and TENT
 
-### `mooncake-transport`
+### `mooncake-store-rs-transport`
 
 Purpose:
 
