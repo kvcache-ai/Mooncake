@@ -14,6 +14,7 @@ if(HAVE_IBV_ACTIVE_SPEED_EX)
   add_compile_definitions(HAVE_IBV_ACTIVE_SPEED_EX)
 endif()
 
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/AscendGeBoundary.cmake")
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -67,6 +68,7 @@ if(USE_HTTP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+mooncake_isolate_ascend_ge(transfer_engine)
 target_include_directories(
   transfer_engine
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>

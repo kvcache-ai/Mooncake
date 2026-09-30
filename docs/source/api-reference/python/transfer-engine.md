@@ -103,6 +103,58 @@ Initializes the transfer engine with extended configuration including metadata t
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
+#### initialize_with_ascend_resource_config()
+
+```python
+initialize_with_ascend_resource_config(
+    local_hostname, metadata_server, device_name, resource_config
+)
+```
+
+Initialize a new Ascend Direct engine with a per-engine JSON resource
+configuration. Requires `USE_ASCEND_DIRECT=ON`; returns `0` on success and
+a nonzero value on failure. Calling it on an initialized engine or with an
+empty configuration is rejected. Existing initialization methods are unchanged.
+
+```python
+import json
+from mooncake.engine import TransferEngine
+
+engine = TransferEngine()
+status = engine.initialize_with_ascend_resource_config(
+    "127.0.0.1", "P2PHANDSHAKE", "",
+    json.dumps({"comm_resource_config.qos": 7}),
+)
+if status != 0:
+    raise RuntimeError(f"Ascend engine initialization failed: {status}")
+```
+
+Resource keys are literal flat names such as `comm_resource_config.qos`.
+The configuration is copied into the engine; it does not mutate
+`ASCEND_GLOBAL_RESOURCE_CONFIG`. With TENT, an explicit resource configuration
+takes precedence over `MC_TENT_CONF`; omitted configuration keeps file defaults.
+The native `TransferEngine::init` API adds a sixth resource-configuration string
+after `protocol`, retaining the existing four- and five-argument overloads.
+
+`mooncake.qos_lane.QosStorePool` and `mooncake.qos_pd_lane.QosPDPool` build
+independent engines for integer QoS values `0..7`. Higher-level clients choose
+the lane for each request; the pools do not reorder requests. Store lanes share
+the same keys and tenant, with only the default lane contributing capacity.
+Registered caller buffers are shared across lanes. Stop transfer workers before
+calling `close()` and release buffers only after it returns successfully.
+
+The Store pool accepts `qos_values`, `default_qos`, `setup_kwargs`, and optional
+`resource_config` keyword arguments. It exposes `register_buffers`, `transfer`,
+`default_store`, and `close`. The PD pool accepts `host`, `device_name`,
+`qos_values`, `default_qos`, and optional `resource_config`, and exposes
+`register_buffers`, `read`, `rpc_ports`, and `close`. The caller must exchange
+the per-lane RPC ports with its peer. The Store pool requires `protocol=ascend`
+and rejects SSD offload and fabric-memory mode.
+
+SDK error-registry symbols are kept local to Ascend Direct shared libraries to
+avoid interposition with CANN's GE singleton during process shutdown. The wheel
+continues to resolve CANN/HIXL libraries from the installed SDK.
+
 ### Engine Information
 
 #### get_engine()

@@ -253,7 +253,9 @@ int TransferExecutorBase::initEngines() {
         globalConfig().ascend_store_te_init ? "true" : "false";
     char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
     std::string resolved_resource_config =
-        ResolveAscendGlobalResourceConfig(global_resource_config);
+        params_.resource_config.empty()
+            ? ResolveAscendGlobalResourceConfig(global_resource_config)
+            : params_.resource_config;
     if (!resolved_resource_config.empty()) {
         options["GlobalResourceConfig"] = resolved_resource_config.c_str();
         LOG(INFO) << "[AscendTE] init adxl, te is created for store="

@@ -1,0 +1,7 @@
+{
+  local:
+    /* Itanium names for these two GE implementation classes, including
+       constructors, destructors, singleton storage and its guard. */
+    _Z*N2ge13StatusFactory*;
+    _Z*N2ge17ErrorNoRegisterar*;
+};
