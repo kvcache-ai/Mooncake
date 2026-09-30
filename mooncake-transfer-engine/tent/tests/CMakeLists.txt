@@ -833,7 +833,9 @@ if(TARGET tent_xport_fabric)
     TransfersStraddleChunks
     LoopbackToOwnSegment
     UnregisteredTargetIsRejected
-    PeerLossFails)
+    PeerLossFails
+    QueuedOpFailsWhileCreditIsHeld
+    OverdueOpHoldsTaskAndBuffer)
     add_test(NAME tent_fabric_transport_${case}
              COMMAND tent_fabric_transport_test
                      --gtest_filter=FabricTransportTest.${case})

@@ -63,11 +63,17 @@ struct FabricParams {
     std::vector<std::string> devices;  // optional domain whitelist
     size_t slice_size = 512 * 1024;
     uint64_t idle_sleep_us = 50;
+    // A queued op that could not be posted within this long (no credit, or
+    // -FI_EAGAIN) fails without reaching the provider.
     uint64_t post_timeout_ms = 10000;
     uint64_t quiesce_timeout_ms = 10000;
-    // A posted op without a completion after this long fails its task.
-    // Some providers (EFA over the NIC) retry a dead peer for much longer.
+    // A posted op without a completion after this long is overdue: new ops
+    // to its peer fail without being posted until it returns. The overdue
+    // op itself keeps its task pending and its buffers in use until the
+    // provider returns it, since the NIC may still access them. Some
+    // providers (EFA over the NIC) retry a dead peer for a long time.
     uint64_t op_timeout_ms = 10000;
+    size_t max_posted_ops = 0;  // per context; 0 = provider tx queue size
     size_t max_pte_entries = 22 * 1024 * 1024;
     size_t max_register_threads = 8;
 };
@@ -89,9 +95,7 @@ struct FabricOp {
     bool is_write = true;
     uint64_t enqueue_ns = 0;
     uint64_t post_ns = 0;
-    // Failure already reported to the task; the provider still owns the op
-    // until it completes or the endpoint is closed.
-    bool timed_out = false;
+    bool overdue = false;  // posted longer than op_timeout_ms
 };
 
 // Shared state of one transfer request, split into one or more FabricOps.
@@ -107,6 +111,9 @@ struct FabricTask {
     BatchID progress_batch_id{0};
     std::function<void(BatchID)> notify_progress;
     std::shared_ptr<void> local_buffer;  // keeps local MRs alive
+    // Tasks of the local buffer the provider may still access; decremented
+    // once the last op has returned.
+    std::atomic<uint64_t>* local_active = nullptr;
 
     void ref() { refs.fetch_add(1, std::memory_order_relaxed); }
     void unref();
@@ -179,6 +186,8 @@ class FabricContext {
     bool pollCompletions();
     void completeOp(FabricOp* op, bool ok);
     void expirePosted(uint64_t now_ns);
+    void expirePending(uint64_t now_ns);
+    bool failUnposted(const FabricOp* op, uint64_t now_ns) const;
 
    private:
     std::string name_;
@@ -214,6 +223,7 @@ class FabricContext {
     std::vector<FabricOp*> pending_;
     size_t pending_head_ = 0;
     std::unordered_set<FabricOp*> posted_;
+    std::unordered_map<fi_addr_t, size_t> overdue_peers_;  // peer -> ops
 
     std::atomic<uint64_t> inflight_{0};
     std::atomic<bool> running_{false};

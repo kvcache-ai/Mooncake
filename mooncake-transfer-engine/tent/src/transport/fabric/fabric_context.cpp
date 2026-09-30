@@ -117,6 +117,7 @@ void FabricTask::opDone(bool ok, size_t bytes) {
         transferred.store(length, std::memory_order_release);
         status.store(TransferStatusEnum::COMPLETED, std::memory_order_release);
     }
+    if (local_active) local_active->fetch_sub(1, std::memory_order_acq_rel);
     if (notify_progress) notify_progress(progress_batch_id);
 }
 
@@ -261,6 +262,8 @@ Status FabricContext::open(const FabricProfile& profile,
     rc = fi_cq_open(domain_, &cq_attr, &cq_, nullptr);
     if (rc) return fail("fi_cq_open", rc);
     credits_ = cq_attr.size ? std::min(tx_size, cq_attr.size) : tx_size;
+    if (params_.max_posted_ops)
+        credits_ = std::min(credits_, params_.max_posted_ops);
 
     rc = fi_endpoint(domain_, info_, &ep_, nullptr);
     if (rc) return fail("fi_endpoint", rc);
@@ -413,29 +416,63 @@ void FabricContext::submit(std::vector<FabricOp*>& ops) {
 void FabricContext::completeOp(FabricOp* op, bool ok) {
     FabricTask* task = op->task;
     const size_t length = op->length;
-    const bool reported = op->timed_out;
+    if (op->overdue) {
+        auto it = overdue_peers_.find(op->peer);
+        if (it != overdue_peers_.end() && --it->second == 0)
+            overdue_peers_.erase(it);
+    }
     freeFabricOp(op);
     inflight_.fetch_sub(1, std::memory_order_acq_rel);
-    if (!reported) task->opDone(ok, length);
+    task->opDone(ok, length);
     task->unref();
 }
 
 void FabricContext::expirePosted(uint64_t now_ns) {
     const uint64_t timeout_ns = params_.op_timeout_ms * 1000000ull;
-    size_t expired = 0;
+    size_t overdue = 0;
     for (auto* op : posted_) {
-        if (op->timed_out || now_ns - op->post_ns <= timeout_ns) continue;
-        // Report the failure now but keep the op (and its task reference)
-        // until the provider returns it: the NIC may still access the
-        // buffers.
-        op->timed_out = true;
-        op->task->opDone(false, 0);
-        ++expired;
+        if (op->overdue || now_ns - op->post_ns <= timeout_ns) continue;
+        // The task stays pending: the NIC may still access its buffers, so
+        // it must not be failed over or have its buffer unregistered yet.
+        op->overdue = true;
+        ++overdue_peers_[op->peer];
+        ++overdue;
     }
-    if (expired)
-        LOG(WARNING) << "Fabric " << name_ << ": " << expired
+    if (overdue)
+        LOG(WARNING) << "Fabric " << name_ << ": " << overdue
                      << " ops without completion after "
-                     << params_.op_timeout_ms << " ms, failing them";
+                     << params_.op_timeout_ms
+                     << " ms; failing new ops to their peers until they return";
+}
+
+bool FabricContext::failUnposted(const FabricOp* op, uint64_t now_ns) const {
+    if (!overdue_peers_.empty() && overdue_peers_.count(op->peer)) return true;
+    const uint64_t timeout_ns = params_.post_timeout_ms * 1000000ull;
+    return timeout_ns && now_ns - op->enqueue_ns > timeout_ns;
+}
+
+void FabricContext::expirePending(uint64_t now_ns) {
+    // Queued ops never reached the provider, so they can fail right away,
+    // whether or not a credit frees up.
+    size_t kept = pending_head_;
+    size_t failed = 0;
+    for (size_t i = pending_head_; i < pending_.size(); ++i) {
+        FabricOp* op = pending_[i];
+        if (!failUnposted(op, now_ns)) {
+            pending_[kept++] = op;
+            continue;
+        }
+        completeOp(op, false);
+        ++failed;
+    }
+    pending_.resize(kept);
+    if (kept == pending_head_) {
+        pending_.clear();
+        pending_head_ = 0;
+    }
+    if (failed)
+        LOG(WARNING) << "Fabric " << name_ << ": failed " << failed
+                     << " queued ops that could not be posted";
 }
 
 bool FabricContext::postPending(uint64_t now_ns) {
@@ -443,6 +480,12 @@ bool FabricContext::postPending(uint64_t now_ns) {
     const uint64_t timeout_ns = params_.post_timeout_ms * 1000000ull;
     while (pending_head_ < pending_.size() && posted_.size() < credits_) {
         FabricOp* op = pending_[pending_head_];
+        if (!overdue_peers_.empty() && overdue_peers_.count(op->peer)) {
+            ++pending_head_;
+            completeOp(op, false);
+            progressed = true;
+            continue;
+        }
         ssize_t rc;
         if (op->is_write) {
             rc = fi_write(ep_, op->local, op->length, op->desc, op->peer,
@@ -540,10 +583,13 @@ void FabricContext::workerLoop() {
         // Always poll: providers with manual progress (tcp;ofi_rxm) only
         // serve remote RMA while their CQ is being read.
         progressed |= pollCompletions();
-        if (params_.op_timeout_ms && !posted_.empty()) {
+        const bool queued = pending_head_ < pending_.size();
+        if (queued || !posted_.empty()) {
             const uint64_t now_ns = getCurrentTimeInNano();
             if (now_ns - last_expire_ns > kExpireIntervalNs) {
-                expirePosted(now_ns);
+                if (params_.op_timeout_ms && !posted_.empty())
+                    expirePosted(now_ns);
+                if (queued) expirePending(now_ns);
                 last_expire_ns = now_ns;
             }
         }

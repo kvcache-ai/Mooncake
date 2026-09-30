@@ -24,6 +24,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -67,7 +68,33 @@ bool providerAvailable() {
     return rc == 0;
 }
 
-std::shared_ptr<Config> makeFabricConfig(uint64_t max_mr_size) {
+// Providers that run RMA in software need the target to make progress, so
+// stopping the target process withholds completions.
+bool targetDrivenProgress() { return testProvider() == "tcp"; }
+
+// The first non-loopback domain, so a test can pin both sides to one NIC.
+std::string firstDomain() {
+    struct fi_info* hints = fi_allocinfo();
+    hints->ep_attr->type = FI_EP_RDM;
+    hints->caps = FI_RMA;
+    hints->fabric_attr->prov_name = strdup(libfabricProvider().c_str());
+    struct fi_info* info = nullptr;
+    std::string name;
+    if (fi_getinfo(fi_version(), nullptr, nullptr, 0, hints, &info) == 0) {
+        for (auto* cur = info; cur; cur = cur->next) {
+            if (!cur->domain_attr || !cur->domain_attr->name) continue;
+            if (name.empty() || name == "lo") name = cur->domain_attr->name;
+        }
+    }
+    fi_freeinfo(hints);
+    if (info) fi_freeinfo(info);
+    return name;
+}
+
+using ConfigTweak = std::function<void(Config&)>;
+
+std::shared_ptr<Config> makeFabricConfig(uint64_t max_mr_size,
+                                         const ConfigTweak& tweak = {}) {
     auto config = std::make_shared<Config>();
     config->set("metadata_type", "p2p");
     config->set("metadata_servers", "P2PHANDSHAKE");
@@ -80,7 +107,15 @@ std::shared_ptr<Config> makeFabricConfig(uint64_t max_mr_size) {
     config->set("transports/fabric/max_mr_size", max_mr_size);
     config->set("transports/fabric/post_timeout_ms", 5000);
     config->set("transports/fabric/op_timeout_ms", 3000);
+    if (tweak) tweak(*config);
     return config;
+}
+
+TransferStatusEnum batchStatus(TransferEngine& engine, BatchID batch) {
+    TransferStatus status;
+    if (!engine.getTransferStatus(batch, status).ok())
+        return TransferStatusEnum::FAILED;
+    return status.s;
 }
 
 int waitBatch(TransferEngine& engine, BatchID batch, int timeout_ms = 20000) {
@@ -106,7 +141,7 @@ struct Server {
     ~Server() { stop(); }
 
     // Returns false if the child could not start a fabric engine.
-    bool start(uint64_t max_mr_size) {
+    bool start(uint64_t max_mr_size, const ConfigTweak& tweak = {}) {
         int ready[2], stop_pipe[2];
         if (pipe(ready) || pipe(stop_pipe)) return false;
         pid = fork();
@@ -114,7 +149,7 @@ struct Server {
         if (pid == 0) {
             close(ready[0]);
             close(stop_pipe[1]);
-            TransferEngine server(makeFabricConfig(max_mr_size));
+            TransferEngine server(makeFabricConfig(max_mr_size, tweak));
             if (!server.available()) _exit(2);
             std::vector<uint8_t> buffer(kBufferLength, 0);
             if (!server.registerLocalMemory(buffer.data(), kBufferLength).ok())
@@ -141,8 +176,17 @@ struct Server {
         return ok;
     }
 
+    // A stopped server withholds completions from software providers.
+    void pause() {
+        if (pid > 0) ::kill(pid, SIGSTOP);
+    }
+    void resume() {
+        if (pid > 0) ::kill(pid, SIGCONT);
+    }
+
     int stop() {
         if (pid <= 0) return 0;
+        resume();
         close(stop_fd);
         int status = 0;
         waitpid(pid, &status, 0);
@@ -170,9 +214,12 @@ class FabricTransportTest : public ::testing::Test {
 
     // Starts the server and a client engine with a registered buffer, and
     // opens the server segment. Chunk sizes may differ on the two sides.
-    void connect(uint64_t server_mr, uint64_t client_mr) {
-        ASSERT_TRUE(server_.start(server_mr)) << "fabric server did not start";
-        client_ = std::make_unique<TransferEngine>(makeFabricConfig(client_mr));
+    void connect(uint64_t server_mr, uint64_t client_mr,
+                 const ConfigTweak& tweak = {}) {
+        ASSERT_TRUE(server_.start(server_mr, tweak))
+            << "fabric server did not start";
+        client_ = std::make_unique<TransferEngine>(
+            makeFabricConfig(client_mr, tweak));
         ASSERT_TRUE(client_->available());
         buffer_.assign(kBufferLength, 0);
         ASSERT_TRUE(
@@ -209,6 +256,25 @@ class FabricTransportTest : public ::testing::Test {
         request.length = length;
         request.transport_hint = FABRIC;
         return request;
+    }
+
+    BatchID submit(const std::vector<Request>& requests) {
+        BatchID batch = client_->allocateBatch(requests.size());
+        EXPECT_TRUE(client_->submitTransfer(batch, requests).ok());
+        return batch;
+    }
+
+    // Polls until the batch leaves PENDING or timeout_ms passes.
+    TransferStatusEnum settle(BatchID batch, int timeout_ms) {
+        auto status = batchStatus(*client_, batch);
+        for (int i = 0; i < timeout_ms; ++i) {
+            if (status == TransferStatusEnum::COMPLETED ||
+                status == TransferStatusEnum::FAILED)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            status = batchStatus(*client_, batch);
+        }
+        return status;
     }
 
     int run(const std::vector<Request>& requests) {
@@ -311,6 +377,85 @@ TEST_F(FabricTransportTest, PeerLossFails) {
                                        t * 1024 * 1024, 1024 * 1024));
     const int result = run(requests);
     EXPECT_TRUE(result == -1 || result == -2) << "result " << result;
+}
+
+// Pins both sides to one NIC with the given op limits.
+ConfigTweak oneNic(size_t max_posted_ops, uint64_t op_timeout_ms,
+                   uint64_t post_timeout_ms) {
+    const std::string domain = firstDomain();
+    return [=](Config& config) {
+        config.set("transports/fabric/devices",
+                   std::vector<std::string>{domain});
+        config.set("transports/fabric/max_posted_ops", max_posted_ops);
+        config.set("transports/fabric/op_timeout_ms", op_timeout_ms);
+        config.set("transports/fabric/post_timeout_ms", post_timeout_ms);
+        config.set("transports/fabric/quiesce_timeout_ms", 20000);
+        // Nothing to fail over to; the engine would refetch the metadata
+        // of the stopped server first and wait for the RPC to time out.
+        config.set("max_failover_attempts", 0);
+    };
+}
+
+// With one credit held by an op that does not complete, a queued op still
+// fails once its post deadline passes, and the held op completes later.
+TEST_F(FabricTransportTest, QueuedOpFailsWhileCreditIsHeld) {
+    if (!targetDrivenProgress())
+        GTEST_SKIP() << "needs a provider driven by target progress";
+    connect(0, 0, oneNic(1, 60000, 500));
+    roundTrip(0, 0, 4096, 1, 4096);
+    server_.pause();
+    BatchID held = submit({makeRequest(Request::WRITE, 0, 0, 64 * 1024)});
+    BatchID queued =
+        submit({makeRequest(Request::WRITE, 1 << 20, 1 << 20, 64 * 1024)});
+    EXPECT_EQ(settle(queued, 5000), TransferStatusEnum::FAILED);
+    EXPECT_EQ(batchStatus(*client_, held), TransferStatusEnum::PENDING);
+    server_.resume();
+    EXPECT_EQ(settle(held, 10000), TransferStatusEnum::COMPLETED);
+    (void)client_->freeBatch(held);
+    (void)client_->freeBatch(queued);
+}
+
+// An op past op_timeout_ms keeps its task pending, so the engine cannot
+// fail it over, and keeps its buffer from being unregistered while the
+// provider may still write into it. New ops to that peer fail unposted.
+TEST_F(FabricTransportTest, OverdueOpHoldsTaskAndBuffer) {
+    if (!targetDrivenProgress())
+        GTEST_SKIP() << "needs a provider driven by target progress";
+    connect(0, 0, oneNic(0, 200, 5000));
+    const size_t length = 64 * 1024;
+    for (size_t i = 0; i < length; ++i) buffer_[i] = pattern(i, 5);
+    ASSERT_EQ(run({makeRequest(Request::WRITE, 0, 0, length)}), 1);
+
+    std::vector<uint8_t> scratch(1 << 20, 0);
+    ASSERT_TRUE(
+        client_->registerLocalMemory(scratch.data(), scratch.size()).ok());
+    Request read = makeRequest(Request::READ, 0, 0, length);
+    read.source = scratch.data();
+
+    server_.pause();
+    BatchID overdue = submit({read});
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    EXPECT_EQ(batchStatus(*client_, overdue), TransferStatusEnum::PENDING);
+    EXPECT_EQ(run({makeRequest(Request::WRITE, 0, 4096, 4096)}), -1);
+
+    std::atomic<bool> unregistered{false};
+    std::thread unregister([&] {
+        EXPECT_TRUE(
+            client_->unregisterLocalMemory(scratch.data(), scratch.size())
+                .ok());
+        unregistered.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_FALSE(unregistered.load());
+
+    server_.resume();
+    EXPECT_EQ(settle(overdue, 10000), TransferStatusEnum::COMPLETED);
+    unregister.join();
+    EXPECT_TRUE(unregistered.load());
+    EXPECT_EQ(std::memcmp(scratch.data(), buffer_.data(), length), 0);
+    (void)client_->freeBatch(overdue);
+    // The peer is usable again once its overdue op has returned.
+    EXPECT_EQ(run({makeRequest(Request::WRITE, 0, 4096, 4096)}), 1);
 }
 
 }  // namespace

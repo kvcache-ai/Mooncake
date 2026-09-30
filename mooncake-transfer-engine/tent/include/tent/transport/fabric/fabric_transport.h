@@ -50,6 +50,8 @@ struct FabricLocalBuffer {
     std::vector<FabricChunkRange> ranges;
     std::vector<FabricContext*> contexts;
     std::atomic<bool> released{false};
+    // Tasks whose ops the provider may still be running on this buffer.
+    std::atomic<uint64_t> active{0};
 
     ~FabricLocalBuffer() { release(); }
     void release();

@@ -130,6 +130,8 @@ Status FabricTransport::install(std::string& local_segment_name,
             "transports/fabric/quiesce_timeout_ms", params_.quiesce_timeout_ms);
         params_.op_timeout_ms =
             conf->get("transports/fabric/op_timeout_ms", params_.op_timeout_ms);
+        params_.max_posted_ops = conf->get("transports/fabric/max_posted_ops",
+                                           params_.max_posted_ops);
         params_.max_pte_entries = conf->get("transports/fabric/max_pte_entries",
                                             params_.max_pte_entries);
         params_.max_register_threads =
@@ -473,6 +475,7 @@ Status FabricTransport::planRequest(const Request& request, FabricTask* task,
     }
 
     task->local_buffer = local;
+    task->local_active = &local->active;
     for (const auto& span : spans) {
         const auto& lchunk = local->chunks[span.local_chunk];
         const auto& rchunk = target.buffer->attr.chunks[span.remote_chunk];
@@ -569,6 +572,7 @@ Status FabricTransport::submitTransferTasks(
         } else {
             task->pending.store(count, std::memory_order_relaxed);
             task->refs.fetch_add(count, std::memory_order_relaxed);
+            task->local_active->fetch_add(1, std::memory_order_acq_rel);
         }
         fabric_batch->task_list.push_back(task);
     }
@@ -762,6 +766,18 @@ Status FabricTransport::removeMemoryBuffer(BufferDesc& desc) {
         std::remove(desc.transports.begin(), desc.transports.end(),
                     TransportType::FABRIC),
         desc.transports.end());
+    // The provider may still read or write the buffer for tasks that have
+    // not completed, so the caller must not reuse it before they do.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(params_.quiesce_timeout_ms);
+    while (uint64_t active = buffer->active.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::InternalError("Fabric buffer unregistered with " +
+                                         std::to_string(active) +
+                                         " transfers still in flight" LOC_MARK);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     return Status::OK();
 }
 
