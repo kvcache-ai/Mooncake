@@ -535,10 +535,10 @@ class RealClient : public PyClient {
                                 int32_t device_id, const UUID &client_id);
 
     // Hop A (dummy -> real server) entry. The value-returning
-    // batch_get_into_dummy_helper stays the shared body (also used
-    // in-process by the real path); this wrapper installs a CurrentCtxScope
-    // before syncAwait so the hop B master RPC re-attaches the request
-    // context.
+    // batch_get_into_dummy_helper stays the shared body (also used in-process
+    // by the real path); this wrapper installs a CurrentCtxScope before
+    // syncAwait so the hop B master RPC (BatchQuery -> BatchGetReplicaList)
+    // re-attaches the request context.
     void batch_get_into_dummy_helper_rpc(
         coro_rpc::context<std::vector<tl::expected<int64_t, ErrorCode>>> ctx,
         const std::vector<std::string> &keys,
@@ -553,8 +553,8 @@ class RealClient : public PyClient {
         int32_t device_id, const UUID &client_id);
 
     // Hop A (dummy -> real server) entry for the value-returning
-    // batch_put_from_dummy_helper body; bridges the request context to hop
-    // B through the synchronous master RPC.
+    // batch_put_from_dummy_helper body; bridges the request context to hop B
+    // through the synchronous master RPC (BatchPut -> BatchPutStart).
     void batch_put_from_dummy_helper_rpc(
         coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
         const std::vector<std::string> &keys,

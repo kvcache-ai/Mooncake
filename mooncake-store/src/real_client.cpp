@@ -8641,8 +8641,8 @@ void RealClient::batch_get_into_dummy_helper_rpc(
     ScopedSpan span("mooncake-real-client", "rc.batch_get", &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
-    // Hop B path: batch_get_into_dummy_helper -> client_->Query ->
-    // master_client_.GetReplicaList.
+    // Hop B path: batch_get_into_dummy_helper -> batch_get_into_internal
+    // -> client_->BatchQuery -> master_client_.BatchGetReplicaList.
     auto result = async_simple::coro::syncAwait(batch_get_into_dummy_helper(
         keys, dummy_buffers, sizes, device_id, client_id));
     SetSpanError(span, result);
@@ -8661,8 +8661,8 @@ void RealClient::batch_put_from_dummy_helper_rpc(
                     &request_context);
     span.PopulateRequestContext(request_context);
     CurrentCtxScope guard(std::move(request_context));
-    // Hop B path: batch_put_from_dummy_helper -> client_->BatchPutFrom ->
-    // master_client_.BatchPutStart.
+    // Hop B path: batch_put_from_dummy_helper -> batch_put_from_internal ->
+    // client_->BatchPut -> master_client_.BatchPutStart.
     auto result = batch_put_from_dummy_helper(keys, dummy_buffers, sizes,
                                               config, device_id, client_id);
     SetSpanError(span, result);
