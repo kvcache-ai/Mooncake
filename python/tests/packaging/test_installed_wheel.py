@@ -131,6 +131,15 @@ assert {{
     "mooncake/mooncake_ssd_unregister.py",
     "mooncake/spdk_tgt_create.py",
 }} <= installed_files
+assert util.find_spec("numpy") is None
+assert util.find_spec("PIL") is None
+assert util.find_spec("mooncake.structured_object_store") is not None
+assert "mooncake.structured_object_store" not in sys.modules
+assert "mooncake/structured_object_store.py" in installed_files
+assert any(
+    path.startswith("mooncake/_fast_copy.") and path.endswith(".so")
+    for path in installed_files
+)
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],
@@ -236,3 +245,43 @@ assert {{
         check=True,
     )
     check_help()
+
+    if project_file == "pyproject.toml":
+        structured_requirements = [
+            f"mooncake-transfer-engine[structured] @ {wheel.as_uri()}"
+        ]
+    else:
+        # The legacy setuptools wheel does not declare the structured extra.
+        structured_requirements = [str(wheel), "numpy", "pillow"]
+    subprocess.run(
+        [str(python), "-m", "pip", "install", *structured_requirements],
+        check=True,
+    )
+    structured_smoke_script = f"""
+import ctypes
+from pathlib import Path
+import numpy as np
+from PIL import Image
+import mooncake.structured_object_store as structured_object_store
+from mooncake._fast_copy import concat_arrays_into
+
+module_path = Path(structured_object_store.__file__).resolve()
+repository_path = Path({str(REPOSITORY_ROOT)!r}).resolve()
+assert not module_path.is_relative_to(repository_path), (module_path, repository_path)
+assert structured_object_store.MooncakeBundleTransfer is not None
+assert Image is not None
+
+source = np.arange(8, dtype=np.uint8)
+destination = ctypes.create_string_buffer(source.nbytes)
+copied = concat_arrays_into(
+    [source], ctypes.addressof(destination), len(destination)
+)
+assert copied == source.nbytes
+assert destination.raw == source.tobytes()
+"""
+    subprocess.run(
+        [str(python), "-I", "-c", structured_smoke_script],
+        cwd=tmp_path,
+        env=clean_environment,
+        check=True,
+    )
