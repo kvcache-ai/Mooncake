@@ -40,8 +40,13 @@
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 
 #include <dlfcn.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -51,10 +56,10 @@
 namespace mooncake {
 namespace tent {
 
-// The Level Zero entry points the dma-buf path needs, resolved lazily from
-// the loader the SYCL runtime already has open (libze_loader.so.1). The SYCL
-// Level Zero adapter has called zeInit by the time a SYCL context exists, so
-// no separate initialisation is performed here.
+// The Level Zero entry points the dma-buf and IPC paths need, resolved lazily
+// from the loader the SYCL runtime already has open (libze_loader.so.1). The
+// SYCL Level Zero adapter has called zeInit by the time a SYCL context exists,
+// so no separate initialisation is performed here.
 class ZeLoader {
    public:
     static ZeLoader &instance() {
@@ -76,6 +81,28 @@ class ZeLoader {
 
     ze_result_t memFree(ze_context_handle_t ctx, void *ptr) const {
         return mem_free_(ctx, ptr);
+    }
+
+    // Cross-process sharing (zeMemGetIpcHandle on the exporter,
+    // zeMemOpenIpcHandle + zeMemCloseIpcHandle on the importer) is available.
+    bool canShare() const { return get_ipc_ && open_ipc_ && close_ipc_; }
+
+    ze_result_t memGetIpcHandle(ze_context_handle_t ctx, const void *ptr,
+                                ze_ipc_mem_handle_t *handle) const {
+        return get_ipc_(ctx, ptr, handle);
+    }
+
+    ze_result_t memOpenIpcHandle(ze_context_handle_t ctx,
+                                 ze_device_handle_t device,
+                                 ze_ipc_mem_handle_t handle,
+                                 ze_ipc_memory_flags_t flags,
+                                 void **pptr) const {
+        return open_ipc_(ctx, device, handle, flags, pptr);
+    }
+
+    ze_result_t memCloseIpcHandle(ze_context_handle_t ctx,
+                                  const void *ptr) const {
+        return close_ipc_(ctx, ptr);
     }
 
     ze_result_t memGetAllocProperties(ze_context_handle_t ctx, const void *ptr,
@@ -100,6 +127,12 @@ class ZeLoader {
         alloc_device_ =
             reinterpret_cast<AllocDevice>(dlsym(handle_, "zeMemAllocDevice"));
         mem_free_ = reinterpret_cast<MemFree>(dlsym(handle_, "zeMemFree"));
+        get_ipc_ =
+            reinterpret_cast<GetIpc>(dlsym(handle_, "zeMemGetIpcHandle"));
+        open_ipc_ =
+            reinterpret_cast<OpenIpc>(dlsym(handle_, "zeMemOpenIpcHandle"));
+        close_ipc_ =
+            reinterpret_cast<CloseIpc>(dlsym(handle_, "zeMemCloseIpcHandle"));
     }
     ~ZeLoader() = default;  // Keep the loader mapped for the process lifetime.
 
@@ -113,20 +146,30 @@ class ZeLoader {
                                         size_t, size_t, ze_device_handle_t,
                                         void **);
     using MemFree = ze_result_t (*)(ze_context_handle_t, void *);
+    using GetIpc = ze_result_t (*)(ze_context_handle_t, const void *,
+                                   ze_ipc_mem_handle_t *);
+    using OpenIpc = ze_result_t (*)(ze_context_handle_t, ze_device_handle_t,
+                                    ze_ipc_mem_handle_t, ze_ipc_memory_flags_t,
+                                    void **);
+    using CloseIpc = ze_result_t (*)(ze_context_handle_t, const void *);
 
     void *handle_ = nullptr;
     GetAllocProperties get_alloc_properties_ = nullptr;
     GetAddressRange get_range_ = nullptr;
     AllocDevice alloc_device_ = nullptr;
     MemFree mem_free_ = nullptr;
+    GetIpc get_ipc_ = nullptr;
+    OpenIpc open_ipc_ = nullptr;
+    CloseIpc close_ipc_ = nullptr;
 };
 
 // Minimal USM-device backend with an interior-pointer registry.
 //
 // Two classification paths are combined:
-//  1. Allocations made through this backend are tracked in a [base, base+size)
-//    interval registry, so interior addresses (staging hands the backend
-//    base + chunk_offset) resolve without touching the SYCL runtime.
+//  1. Allocations made through this backend, and peer allocations imported
+//    with importIpc, are tracked in a [base, base+size) interval registry,
+//    so interior addresses (staging hands the backend base + chunk_offset)
+//    resolve without touching the SYCL runtime.
 //  2. Anything else is classified with sycl::get_pointer_type against the
 //    platform default context. That is the context PyTorch's XPU allocator
 //    uses (device.get_platform().ext_oneapi_get_default_context()), so a
@@ -163,6 +206,26 @@ class XpuSyclBackend {
             for (const auto &d : sycl::device::get_devices()) {
                 if (d.is_gpu() && usable(d)) devices.push_back(d);
             }
+            // The oneAPI runtime exposes each Intel GPU twice, once through
+            // Level Zero and once through the OpenCL adapter. Keep only the
+            // Level Zero view when it is present: it is the one that supports
+            // dma-buf export and peer access, and advertising the OpenCL
+            // duplicates would turn a 2-GPU node into four "xpu:N" nodes.
+            const bool has_level_zero = std::any_of(
+                devices.begin(), devices.end(), [](const sycl::device &d) {
+                    return d.get_backend() ==
+                           sycl::backend::ext_oneapi_level_zero;
+                });
+            if (has_level_zero) {
+                devices.erase(
+                    std::remove_if(
+                        devices.begin(), devices.end(),
+                        [](const sycl::device &d) {
+                            return d.get_backend() !=
+                                   sycl::backend::ext_oneapi_level_zero;
+                        }),
+                    devices.end());
+            }
             if (devices.empty()) {
                 // No usable Intel GPU visible -- fall back to any device that
                 // still supports USM device allocations (e.g. the OpenCL CPU
@@ -186,6 +249,7 @@ class XpuSyclBackend {
                 if (!known) contexts_.push_back(ctx);
                 queues_.emplace_back(ctx, d, sycl::property::queue::in_order());
             }
+            enablePeerAccessLocked();
             initialized_ = true;
             return 0;
         } catch (const sycl::exception &) {
@@ -193,6 +257,7 @@ class XpuSyclBackend {
             // from an empty queue list, not resume with duplicate ordinals.
             queues_.clear();
             contexts_.clear();
+            peer_.clear();
             return 1;
         }
     }
@@ -300,6 +365,60 @@ class XpuSyclBackend {
         return copy(device_dst, host_src, len, /*to_host=*/false);
     }
 
+    // Device-to-device copy. Same device: a plain memcpy on its queue. Two
+    // devices with peer access (see enablePeerAccessLocked): one memcpy on the
+    // source device's queue, which pushes the bytes to the destination over
+    // PCIe (or Xe Link) without touching host memory; if only the reverse
+    // direction is enabled, the destination's queue pulls instead. Devices
+    // that cannot reach each other fall back to a chunked bounce through a
+    // host buffer, so the copy is always correct and callers never need to
+    // stage device<->device traffic themselves.
+    int copyD2D(void *dst, const void *src, size_t len) {
+        std::optional<sycl::queue> direct, src_q, dst_q;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            const int src_dev = resolveLocked(src, len);
+            const int dst_dev = resolveLocked(dst, len);
+            if (src_dev < 0 || dst_dev < 0) return 1;
+            if (src_dev == dst_dev || peerLocked(src_dev, dst_dev)) {
+                direct = queues_[src_dev];
+            } else if (peerLocked(dst_dev, src_dev)) {
+                direct = queues_[dst_dev];
+            } else {
+                src_q = queues_[src_dev];
+                dst_q = queues_[dst_dev];
+            }
+        }
+        try {
+            if (direct) {
+                direct->memcpy(dst, src, len).wait();
+                return 0;
+            }
+            std::vector<uint8_t> bounce(std::min(len, kBounceChunk));
+            for (size_t off = 0; off < len; off += bounce.size()) {
+                const size_t n = std::min(bounce.size(), len - off);
+                src_q
+                    ->memcpy(bounce.data(),
+                             static_cast<const uint8_t *>(src) + off, n)
+                    .wait();
+                dst_q
+                    ->memcpy(static_cast<uint8_t *>(dst) + off, bounce.data(),
+                             n)
+                    .wait();
+            }
+            return 0;
+        } catch (const sycl::exception &) {
+            return 1;
+        }
+    }
+
+    // True when device `from` may directly access USM device memory that
+    // lives on device `to` (always true for from == to).
+    bool canAccessPeer(int from, int to) {
+        std::lock_guard<std::mutex> lock(mu_);
+        return peerLocked(from, to);
+    }
+
     enum ExportResult {
         kExportOk = 0,
         // Not device memory, not Level Zero, or the driver refused.
@@ -386,6 +505,158 @@ class XpuSyclBackend {
         return kExportOk;
     }
 
+    static constexpr size_t kIpcHandleSize = ZE_MAX_IPC_HANDLE_SIZE;
+    using IpcHandleBytes = std::array<uint8_t, kIpcHandleSize>;
+
+    // Describe the USM device allocation containing `addr` for another
+    // process: its base and size (zeMemGetAddressRange) and the Level Zero
+    // IPC handle of the allocation (zeMemGetIpcHandle). The handle is an
+    // opaque ZE_MAX_IPC_HANDLE_SIZE-byte blob whose first field is the
+    // allocation's dma-buf fd in this process; pooled allocations carry their
+    // pool offset inside it, so unlike exportDmabuf this works for small
+    // foreign allocations too. The fd behind the handle stays open for the
+    // allocation's lifetime (the runtime caches one per allocation and closes
+    // it on free); zeMemPutIpcHandle is deliberately not used since the same
+    // descriptor doubles as exportDmabuf's for direct RDMA. Returns 0 on
+    // success; non-zero when `addr` is not device memory this backend can
+    // resolve or the driver cannot produce a handle.
+    int exportIpc(const void *addr, uint64_t *base, uint64_t *size,
+                  IpcHandleBytes *handle) {
+        if (!base || !size || !handle) return 1;
+        std::optional<sycl::context> ctx;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            int device_index = classifyLocked(addr);
+            if (device_index < 0) return 1;
+            ctx = queues_[device_index].get_context();
+        }
+        auto &ze = ZeLoader::instance();
+        if (!ze.available() || !ze.canShare()) return 1;
+        ze_context_handle_t ze_ctx = nullptr;
+        try {
+            if (ctx->get_backend() != sycl::backend::ext_oneapi_level_zero)
+                return 1;
+            ze_ctx =
+                sycl::get_native<sycl::backend::ext_oneapi_level_zero>(*ctx);
+        } catch (const sycl::exception &) {
+            return 1;
+        }
+        void *range_base = nullptr;
+        size_t range_size = 0;
+        if (ze.memGetAddressRange(ze_ctx, addr, &range_base, &range_size) !=
+                ZE_RESULT_SUCCESS ||
+            !range_base || !range_size)
+            return 1;
+        ze_ipc_mem_handle_t ipc{};
+        if (ze.memGetIpcHandle(ze_ctx, range_base, &ipc) != ZE_RESULT_SUCCESS)
+            return 1;
+        static_assert(sizeof(ipc.data) == kIpcHandleSize);
+        std::memcpy(handle->data(), ipc.data, kIpcHandleSize);
+        *base = reinterpret_cast<uintptr_t>(range_base);
+        *size = range_size;
+        return 0;
+    }
+
+    // Map an allocation described by exportIpc in process `exporter_pid`
+    // (possibly this one) into this process as USM device memory that device
+    // `device_index` can address, so a queue on that device reads or writes
+    // the peer's VRAM over PCIe P2P (or Xe Link) without a host bounce.
+    //
+    // The handle names the exporter's dma-buf by *its* fd number, which is
+    // meaningless here. The compute runtime can translate it itself ("opaque"
+    // handles, 2024+ runtimes: pidfd_getfd on the exporter with a socket
+    // fallback), but that path caches the fetched descriptor per (exporter
+    // pid, exporter fd) and never drops the entry when the mapping is closed,
+    // so once the exporter frees the allocation and a new one lands on the
+    // same fd number, importers silently map the *old* buffer (observed with
+    // compute-runtime 1.17). The translation is therefore always done here --
+    // dup() within one process, pidfd_getfd() otherwise, which needs ptrace
+    // permission over the exporter -- and the handle is rewritten so that the
+    // runtime takes its uncached legacy route: the fd field gets the local
+    // descriptor and the opaque mirror field a value that can never equal it.
+    // Legacy runtimes ignore the mirror and read the same fd/poolOffset/type
+    // fields, so one encoding serves both generations.
+    //
+    // The fetched descriptor is owned by the mapping and closed in
+    // closeImport; the runtime does not close it. The mapping is recorded in
+    // the registry with `size` so classification, bounds checks and copyD2D
+    // treat it as ordinary device memory on `device_index`. Returns 0 and
+    // fills *pptr on success; non-zero when the runtime lacks IPC, the device
+    // cannot map the peer, the handle is stale, or pidfd_getfd is refused --
+    // errno is left describing that last case (EPERM: no ptrace permission
+    // over the exporter).
+    int importIpc(const IpcHandleBytes &handle, pid_t exporter_pid, size_t size,
+                  int device_index, void **pptr) {
+        if (!size || !pptr || exporter_pid <= 0) return 1;
+        auto &ze = ZeLoader::instance();
+        if (!ze.canShare()) return 1;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_ || device_index < 0 ||
+            device_index >= static_cast<int>(queues_.size()))
+            return 1;
+        sycl::queue &q = queues_[device_index];
+        ze_context_handle_t ze_ctx = nullptr;
+        ze_device_handle_t ze_dev = nullptr;
+        try {
+            if (q.get_context().get_backend() !=
+                sycl::backend::ext_oneapi_level_zero)
+                return 1;
+            ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                q.get_context());
+            ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                q.get_device());
+        } catch (const sycl::exception &) {
+            return 1;
+        }
+        int64_t exporter_fd = 0;
+        std::memcpy(&exporter_fd, handle.data(), sizeof(exporter_fd));
+        if (exporter_fd < 0 || exporter_fd > INT32_MAX) return 1;
+        const int fd = fetchFd(exporter_pid, static_cast<int>(exporter_fd));
+        if (fd < 0) return 1;
+        ze_ipc_mem_handle_t ipc{};
+        std::memcpy(ipc.data, handle.data(), kIpcHandleSize);
+        const uint64_t local = static_cast<uint64_t>(fd);
+        std::memcpy(ipc.data + kIpcHandleFdOffset, &local, sizeof(local));
+        const uint64_t mirror = ~uint64_t{0};
+        std::memcpy(ipc.data + kIpcHandleMirrorOffset, &mirror, sizeof(mirror));
+        void *p = nullptr;
+        if (ze.memOpenIpcHandle(ze_ctx, ze_dev, ipc, /*flags=*/0, &p) !=
+                ZE_RESULT_SUCCESS ||
+            !p) {
+            close(fd);
+            return 1;
+        }
+        imports_.push_back(
+            Import{reinterpret_cast<uintptr_t>(p), size, device_index, fd});
+        *pptr = p;
+        return 0;
+    }
+
+    // Unmap a range returned by importIpc and close any descriptor fetched
+    // for it.
+    int closeImport(void *ptr) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        for (size_t i = 0; i < imports_.size(); ++i) {
+            if (imports_[i].base != addr) continue;
+            int rc = 0;
+            try {
+                auto ze_ctx =
+                    sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                        queues_[imports_[i].device].get_context());
+                if (ZeLoader::instance().memCloseIpcHandle(ze_ctx, ptr) !=
+                    ZE_RESULT_SUCCESS)
+                    rc = 1;
+            } catch (const sycl::exception &) {
+                rc = 1;
+            }
+            if (imports_[i].fd >= 0) close(imports_[i].fd);
+            imports_.erase(imports_.begin() + i);
+            return rc;
+        }
+        return 1;
+    }
+
     int deviceCount() {
         std::lock_guard<std::mutex> lock(mu_);
         return static_cast<int>(queues_.size());
@@ -406,21 +677,68 @@ class XpuSyclBackend {
         int device;
         bool ze_owned;  // allocated with zeMemAllocDevice, freed with zeMemFree
     };
+    // A peer allocation mapped by importIpc: `device` is the local device it
+    // was opened on (not where the bytes live), `fd` the descriptor fetched
+    // from the exporter that keeps the mapping alive.
+    struct Import {
+        uintptr_t base;
+        size_t size;
+        int device;
+        int fd;
+    };
 
-    // Resolve an address (base or interior) to its owning allocation.
-    const Alloc *findLocked(const void *addr) const {
+    // Layout of the Intel compute runtime's IPC memory handle, from
+    // level_zero/core/source/context/context.h (#pragma pack(1)). Legacy
+    // IpcMemoryData: handle (8) | poolOffset (8) | type (1). Opaque
+    // IpcOpaqueMemoryData: handle (8) | poolOffset (8) | processId (4) |
+    // type (1) | memoryType (1) | opaqueHandle (8) | reservedHandleData (32)
+    // | compressedMemory (1). Both keep the fd in the first 8 bytes; the
+    // opaque runtime treats a handle whose opaqueHandle differs from handle
+    // as user-modified and imports the fd directly.
+    static constexpr size_t kIpcHandleFdOffset = 0;
+    static constexpr size_t kIpcHandleMirrorOffset = 22;
+
+    // Duplicate descriptor `fd` of process `pid` into this process (dup()
+    // within the process, pidfd_open + pidfd_getfd otherwise, which needs
+    // ptrace permission over `pid`). Returns -1 with errno set on failure.
+    static int fetchFd(pid_t pid, int fd) {
+        if (pid == getpid()) return dup(fd);
+        const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+        if (pidfd < 0) return -1;
+        const int local =
+            static_cast<int>(syscall(SYS_pidfd_getfd, pidfd, fd, 0));
+        const int saved = errno;
+        close(pidfd);
+        errno = saved;
+        return local;
+    }
+
+    struct Range {
+        uintptr_t base;
+        size_t size;
+        int device;
+    };
+
+    // Resolve an address (base or interior) to its owning allocation or
+    // imported mapping.
+    std::optional<Range> findLocked(const void *addr) const {
         const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
         for (const auto &al : allocs_) {
-            if (a >= al.base && a < al.base + al.size) return &al;
+            if (a >= al.base && a < al.base + al.size)
+                return Range{al.base, al.size, al.device};
         }
-        return nullptr;
+        for (const auto &im : imports_) {
+            if (a >= im.base && a < im.base + im.size)
+                return Range{im.base, im.size, im.device};
+        }
+        return std::nullopt;
     }
 
     // Device ordinal owning `addr`, or -1 when it is not USM device memory.
     // Own allocations resolve through the registry; anything else is asked of
     // the SYCL runtime against every default context we hold.
     int classifyLocked(const void *addr) const {
-        if (const Alloc *a = findLocked(addr)) return a->device;
+        if (auto a = findLocked(addr)) return a->device;
         for (const auto &ctx : contexts_) {
             try {
                 if (sycl::get_pointer_type(addr, ctx) !=
@@ -441,6 +759,68 @@ class XpuSyclBackend {
         return -1;
     }
 
+    // Device ordinal owning the device range [dev, dev+len), or -1 when it is
+    // not device memory or (for our own allocations) runs past the end.
+    int resolveLocked(const void *dev, size_t len) const {
+        if (auto a = findLocked(dev)) {
+            const uintptr_t start = reinterpret_cast<uintptr_t>(dev);
+            if (start + len > a->base + a->size) return -1;
+            return a->device;
+        }
+        return classifyLocked(dev);
+    }
+
+    bool peerLocked(int from, int to) const {
+        const int n = static_cast<int>(queues_.size());
+        if (from < 0 || to < 0 || from >= n || to >= n) return false;
+        if (from == to) return true;
+        return peer_[from * n + to];
+    }
+
+    // Probe every ordered Level Zero device pair with
+    // sycl_ext_oneapi_peer_access and enable access where the driver allows
+    // it, so a later copyD2D between the pair runs as one direct copy. Peer
+    // access needs both devices in the same SYCL context; pairs that fail the
+    // query, or whose enable call fails, are simply left disabled and copyD2D
+    // bounces through the host for them. Called from init() under mu_.
+    //
+    // Only Level Zero is probed: it is the sole Intel backend implementing the
+    // extension, and the OpenCL adapter aborts the process (ur_die) instead of
+    // throwing when asked. Not guarded by SYCL_EXT_ONEAPI_PEER_ACCESS either:
+    // USE_XPU builds require the Intel DPC++ compiler, whose headers ship
+    // device::ext_oneapi_*_peer_access but (as of oneAPI 2026.1) do not define
+    // the feature-test macro, so the guard would compile the probe out.
+    void enablePeerAccessLocked() {
+        const size_t n = queues_.size();
+        peer_.assign(n * n, false);
+        for (size_t i = 0; i < n; ++i) {
+            if (queues_[i].get_backend() !=
+                sycl::backend::ext_oneapi_level_zero)
+                continue;
+            for (size_t j = 0; j < n; ++j) {
+                if (i == j) continue;
+                if (queues_[i].get_context() != queues_[j].get_context())
+                    continue;
+                sycl::device from = queues_[i].get_device();
+                sycl::device to = queues_[j].get_device();
+                try {
+                    if (!from.ext_oneapi_can_access_peer(
+                            to,
+                            sycl::ext::oneapi::peer_access::access_supported))
+                        continue;
+                    from.ext_oneapi_enable_peer_access(to);
+                    peer_[i * n + j] = true;
+                } catch (const sycl::exception &e) {
+                    // errc::invalid means access is already enabled (by
+                    // another component sharing the runtime); the query
+                    // above said it is possible, so keep it.
+                    if (e.code() == sycl::errc::invalid)
+                        peer_[i * n + j] = true;
+                }
+            }
+        }
+    }
+
     int copy(void *dst, const void *src, size_t len, bool to_host) {
         // Validate and resolve the target queue under the lock, but run the
         // blocking memcpy().wait() outside it so copies on different devices
@@ -450,17 +830,8 @@ class XpuSyclBackend {
         std::optional<sycl::queue> q;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            const void *dev = to_host ? src : dst;
-            const Alloc *a = findLocked(dev);
-            int device_index;
-            if (a) {
-                const uintptr_t start = reinterpret_cast<uintptr_t>(dev);
-                if (start + len > a->base + a->size) return 1;  // runs past end
-                device_index = a->device;
-            } else {
-                device_index = classifyLocked(dev);
-                if (device_index < 0) return 1;  // not device memory
-            }
+            const int device_index = resolveLocked(to_host ? src : dst, len);
+            if (device_index < 0) return 1;  // not device memory / past end
             q = queues_[device_index];
         }
         try {
@@ -471,11 +842,18 @@ class XpuSyclBackend {
         }
     }
 
+    // Host bounce granularity for device pairs without peer access.
+    static constexpr size_t kBounceChunk = size_t{8} << 20;
+
     std::mutex mu_;
     bool initialized_ = false;
     std::vector<sycl::context> contexts_;
     std::vector<sycl::queue> queues_;
+    // Row-major queues_.size() x queues_.size(): peer_[i*n+j] is true when
+    // device i has peer access to device j's memory.
+    std::vector<bool> peer_;
     std::vector<Alloc> allocs_;
+    std::vector<Import> imports_;
 };
 
 }  // namespace tent
