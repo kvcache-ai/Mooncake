@@ -61,6 +61,10 @@ def test_dependency_boundaries_are_declared() -> None:
         "vllm",
     }
     assert metadata["optional-dependencies"]["administration"] == ["paramiko"]
+    assert set(metadata["optional-dependencies"]["structured"]) == {
+        "numpy",
+        "pillow",
+    }
 
 
 def test_legacy_wheel_administration_extra_matches_root_project() -> None:
@@ -247,7 +251,6 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
         "vllm_v1_proxy_server.py",
         "pg.py",
         "structured_object_store.py",
-        "dataproto_catalog.py",
     ):
         assert (REPOSITORY_ROOT / "mooncake-wheel" / "mooncake" / module).is_file()
 
@@ -355,6 +358,23 @@ def test_ssd_administration_modules_have_one_authoritative_source() -> None:
     assert not (
         REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_spdk_tgt_create.py"
     ).exists()
+
+
+def test_dataproto_catalog_has_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    tests_root = REPOSITORY_ROOT / "python" / "tests"
+    legacy_root = REPOSITORY_ROOT / "mooncake-wheel"
+
+    assert (package_root / "dataproto_catalog.py").is_file()
+    assert (
+        tests_root / "integration" / "dataproto" / "test_dataproto_catalog.py"
+    ).is_file()
+    assert not (legacy_root / "mooncake" / "dataproto_catalog.py").exists()
+    assert not (legacy_root / "tests" / "test_dataproto_catalog.py").exists()
+    assert (
+        'PATTERN "dataproto_catalog.py" EXCLUDE'
+        in (REPOSITORY_ROOT / "python" / "CMakeLists.txt").read_text()
+    )
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(

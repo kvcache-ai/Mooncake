@@ -1,12 +1,43 @@
 from __future__ import annotations
 
 import copy
+import os
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from mooncake.dataproto_catalog import DataProtoCatalog, DataProtoCatalogTransfer
 from mooncake.structured_object_store import import_dataproto_ref
+
+
+def test_catalog_source_import_keeps_structured_object_import_lazy() -> None:
+    repository_root = Path(__file__).resolve().parents[4]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (
+            str(repository_root / "python"),
+            str(repository_root / "mooncake-wheel"),
+        )
+    )
+    environment["PYTHONNOUSERSITE"] = "1"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import mooncake.dataproto_catalog as catalog; "
+                "assert catalog.DataProtoCatalog is not None; "
+                "assert 'mooncake.structured_object_store' not in sys.modules"
+            ),
+        ],
+        cwd=repository_root,
+        env=environment,
+        check=True,
+    )
 
 
 def handle(name: str, fields: list[str], batch_size: int = 2) -> dict:
@@ -178,14 +209,17 @@ def test_catalog_append_replaces_managed_handle_ownership() -> None:
         "member": "batch.score",
         "section": "batch",
     }
-    assert "fragment identity" in catalog.publish_append(
-        "wrong-partition",
-        "manifest/base",
-        "other",
-        ["a"],
-        previous_handle=base,
-        handle=appended,
-    )["append_rejected"]
+    assert (
+        "fragment identity"
+        in catalog.publish_append(
+            "wrong-partition",
+            "manifest/base",
+            "other",
+            ["a"],
+            previous_handle=base,
+            handle=appended,
+        )["append_rejected"]
+    )
     catalog.publish_append(
         "append-op",
         "manifest/base",
@@ -202,14 +236,17 @@ def test_catalog_append_replaces_managed_handle_ownership() -> None:
         previous_handle=base,
         handle=appended,
     )["fields"] == ["input", "value", "score"]
-    assert "stale" in catalog.publish_append(
-        "stale-op",
-        "manifest/base",
-        "train",
-        ["a"],
-        previous_handle=base,
-        handle=appended,
-    )["append_rejected"]
+    assert (
+        "stale"
+        in catalog.publish_append(
+            "stale-op",
+            "manifest/base",
+            "train",
+            ["a"],
+            previous_handle=base,
+            handle=appended,
+        )["append_rejected"]
+    )
 
     plan = catalog.resolve("train", ["a"])
     assert plan["fields"] == ["input", "value", "score"]

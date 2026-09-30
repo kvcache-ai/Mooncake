@@ -42,6 +42,7 @@ cp -r python/tests/services test_env/service_tests
 cp -r python/tests/unit test_env/unit_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cp -r python/tests/ssd test_env/ssd_tests
+cp -r python/tests/integration/dataproto test_env/dataproto_tests
 cd test_env
 pip install torch numpy
 python -c "import mooncake._fast_copy"
@@ -57,6 +58,9 @@ python unit_tests/test_mooncake_config.py
 echo "Running reshard contract tests..."
 python -m pip install pytest hypothesis==6.141.0 paramiko
 python -m pytest reshard_tests ssd_tests -q
+
+echo "Running DataProto catalog tests..."
+python -m pytest dataproto_tests -q
 
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable
