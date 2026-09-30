@@ -24,6 +24,7 @@
 #include <shared_mutex>
 #include <mutex>
 
+#include "tent/common/selection_stats.h"
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
 
@@ -99,6 +100,9 @@ class DeviceSelector {
         uint64_t padding4[7];
         std::atomic<uint64_t> total_bytes{0};
         uint64_t padding3[7];
+        std::atomic<uint64_t> selected_slices{0};
+        std::atomic<uint64_t> selected_bytes{0};
+        uint64_t padding_selection[6];
         // Bytes handed to the hardware: charged when a WR is posted and
         // returned when it leaves the queue pair. Unlike inflight_bytes
         // (charged at allocation) this is the NIC's own backlog.
@@ -261,6 +265,13 @@ class DeviceSelector {
 
     Status getNicLoadStats(std::vector<NicLoadStats> &stats) const;
 
+    // Return allocation-only counters for scheduler baseline collection.
+    // These counters do not participate in device scoring or accounting.
+    // Concurrent snapshots are best-effort and may span in-flight allocations.
+    SelectionStats getSelectionStats() const;
+    // Reset a measurement window while no allocations are in progress.
+    void resetSelectionStats();
+
     void updateTrafficStats(int dev_id, uint64_t length) {
         auto it = devices_.find(dev_id);
         if (it != devices_.end()) {
@@ -374,6 +385,10 @@ class DeviceSelector {
     std::shared_ptr<SharedSlotManager> slot_manager_;
     bool smart_selection_enabled_ = true;
     SchedulingParams sched_params_;
+    std::atomic<uint64_t> selection_allocations_{0};
+    std::atomic<uint64_t> selection_single_path_allocations_{0};
+    std::atomic<uint64_t> selection_multi_path_allocations_{0};
+    std::atomic<uint64_t> selection_probe_allocations_{0};
 
     // Bytes/s the device is rated for: bw_gbps when it is inside the
     // configured [min, max], default_bandwidth_gbps otherwise.
@@ -388,6 +403,9 @@ class DeviceSelector {
     // + (1 - alpha) * observed.
     void learnRate(const DeviceInfo &dev, std::atomic<double> &series,
                    double alpha, double observed_bps) const;
+
+    void recordSelection(const std::vector<int> &slice_dev_ids,
+                         uint64_t total_length, uint64_t slice_bytes);
 
     // Known to the selector and currently able to carry traffic.
     bool usable(int dev_id) const {

@@ -238,6 +238,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 #include <vector>
 
 #include "tent/common/status.h"
+#include "tent/common/selection_stats.h"
 #include "tent/common/types.h"
 
 namespace mooncake {
@@ -357,6 +358,9 @@ class TransferEngine {
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
+    // Replace stats with a best-effort RDMA allocation snapshot. Without an
+    // RDMA transport, return OK with zero counters and an empty device list.
+    Status getSelectionStats(SelectionStats& stats) const;
 
    private:
     Status submitTransferRequiringPostSubmitCancellation(

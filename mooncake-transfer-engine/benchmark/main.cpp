@@ -17,7 +17,9 @@
 #include "common.h"
 
 #include "bench_runner.h"
+#include "measurement_barrier.h"
 #include "qos_metrics_adapter.h"
+#include "selection_metrics.h"
 #include "target_metrics.h"
 #include "te_backend.h"
 #include "workload_config.h"
@@ -45,6 +47,10 @@ int processBatchSizes(
     BenchRunner& runner, size_t block_size, size_t batch_size, int num_threads,
     const std::vector<QosClassConfig>& qos_classes,
     const std::vector<WorkloadClassConfig>& workload_classes = {}) {
+#ifdef USE_TENT
+    SelectionStats selection_start;
+    auto* tent_runner = dynamic_cast<TENTBenchRunner*>(&runner);
+#endif
     bool mixed_opcode = false;
     bool write_seed = false;
     bool read_verify = false;
@@ -85,8 +91,7 @@ int processBatchSizes(
     XferBenchStats tight_stats;
     XferBenchStats loose_stats;
     std::mutex mutex;
-    std::atomic<int> measurement_ready{0};
-    std::atomic<bool> measurement_started{false};
+    MeasurementBarrier measurement_barrier(num_threads);
     auto paceRequest = [&]() {
         if (XferBenchConfig::request_interval_us == 0) return;
         const uint64_t interval_ns =
@@ -146,26 +151,38 @@ int processBatchSizes(
         };
 
         auto failTask = [&]() {
-            measurement_started.store(true, std::memory_order_release);
+            measurement_barrier.fail();
             return -1;
         };
 
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {
+            if (measurement_barrier.failed()) return -1;
             if (runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
                 return failTask();
             }
         }
-        if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
-            num_threads) {
-            measurement_started.store(true, std::memory_order_release);
-        } else {
-            while (!measurement_started.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-        }
+        if (!measurement_barrier.arriveAndWait([&] {
+#ifdef USE_TENT
+                // All warmup transfers have completed. Snapshot before any
+                // worker is released into the measured workload.
+                if (tent_runner &&
+                    !XferBenchConfig::result_output_jsonl.empty()) {
+                    const auto status =
+                        tent_runner->getSelectionStats(selection_start);
+                    if (!status.ok()) {
+                        LOG(ERROR)
+                            << "Failed to snapshot RDMA selection stats: "
+                            << status.ToString();
+                        return false;
+                    }
+                }
+#endif
+                return true;
+            }))
+            return -1;
         timer.reset();
         std::vector<double> transfer_duration;
         std::vector<double> thread_instant_bandwidth;
@@ -257,7 +274,28 @@ int processBatchSizes(
         return 0;
     });
 
-    if (rc != 0) return -1;
+    if (rc != 0) {
+        // A backend may wake the coordinator as soon as a transfer fails.
+        // Release barrier waiters and join callbacks before their captures
+        // (including the snapshot and barrier) leave scope.
+        measurement_barrier.fail();
+        runner.stopInitiator();
+        return -1;
+    }
+    // Backends need not propagate individual callback return values. A failed
+    // warmup/snapshot must still suppress benchmark output.
+    if (measurement_barrier.failed()) return -1;
+#ifdef USE_TENT
+    SelectionStats selection_end;
+    if (tent_runner && !XferBenchConfig::result_output_jsonl.empty()) {
+        const auto status = tent_runner->getSelectionStats(selection_end);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to snapshot RDMA selection stats: "
+                       << status.ToString();
+            return -1;
+        }
+    }
+#endif
     if (workload_classes.empty())
         printStats(block_size, batch_size, stats, num_threads);
     auto target_report = calculateTargetMetrics(
@@ -271,6 +309,19 @@ int processBatchSizes(
             LOG(ERROR) << error;
             return -1;
         }
+#ifdef USE_TENT
+        if (tent_runner) {
+            const auto selection_report = calculateRdmaSelectionMetrics(
+                block_size, batch_size, num_threads, XferBenchConfig::backend,
+                XferBenchConfig::op_type, selection_start, selection_end);
+            if (!appendRdmaSelectionMetricsJsonl(
+                    XferBenchConfig::result_output_jsonl, selection_report,
+                    &error)) {
+                LOG(ERROR) << error;
+                return -1;
+            }
+        }
+#endif
     }
     if (!qos_classes.empty()) {
         std::vector<uint64_t> bytes_per_operation;
