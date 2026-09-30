@@ -1088,12 +1088,10 @@ class MasterService {
     // take this same lock, so tenants serialize against each other here. The
     // object route, the group table and the quota account are per-tenant and do
     // not. The table is touched on the action paths below, never on a read of
-    // the object route, so giving each tenant its own lock is a change of
-    // granularity rather than of correctness; a per-tenant split has to be
-    // measured on the p50, p99 and p999 of these action paths, the wait on this
-    // lock and their throughput, with promotion and dynamic replication on and
-    // off. `DynamicReplicationLeaseTable` keeps its own internal lock, so the
-    // split does not have to widen this one.
+    // the object route, so one lock per tenant would change the granularity
+    // without changing what the records guarantee.
+    // `DynamicReplicationLeaseTable` keeps its own internal lock, so a split
+    // would not widen this one.
     mutable std::mutex replica_action_mutex_;
     std::unordered_map<TenantId, TenantReplicaActionState, TenantIdHash>
         replica_action_state_ GUARDED_BY(replica_action_mutex_);
@@ -1301,8 +1299,8 @@ class MasterService {
     // the tenant once and reads every key of that hold through the same
     // instance: the registry retires a tenant only from the decode paths that
     // take that lock exclusively, so nothing replaces the instance a chunk
-    // resolved while the chunk runs, and a tenant that appears while the chunk
-    // runs belongs to the next chunk. The key is passed as a view the caller
+    // resolved while the chunk runs, and a tenant created while the chunk runs
+    // is resolved by the next chunk. The key is passed as a view the caller
     // keeps alive for the call only, instead of building an owning identity per
     // key. An absent tenant, an unrouted key or a publication the route no
     // longer holds reads as an empty result.
@@ -1559,9 +1557,9 @@ class MasterService {
         bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
-    // The quota account a tenant id is bound to, created when it has none yet.
-    // Getting one does not register a metadata tenant: the tenant factory binds
-    // this same account to the tenant it builds.
+    // The quota account a tenant id is bound to, created when the table holds
+    // none for it. Getting one does not register a metadata tenant: the tenant
+    // factory binds this same account to the tenant it builds.
     TenantQuotaHandle GetOrCreateQuotaHandleForTenantId(
         const TenantId& tenant_id);
 
