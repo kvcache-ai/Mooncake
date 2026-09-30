@@ -5190,6 +5190,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         {
             std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+            auto retaining_clients = GetRetainingClientIdsLocked();
+            client_lock.unlock();
             const size_t lookup_shard_idx =
                 getShardIndex(object_id.tenant_id, object_id.user_key);
             MetadataShardAccessorRW shard(this, lookup_shard_idx);
@@ -5205,12 +5207,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             }
 
             auto it = tenant_state.metadata.find(key);
-            std::unordered_set<UUID, boost::hash<UUID>> retaining_clients;
-            if (it != tenant_state.metadata.end() &&
-                it->second.HasReplica(&Replica::fn_is_local_disk_replica)) {
-                retaining_clients = GetRetainingClientIdsLocked();
-            }
-            client_lock.unlock();
             if (it != tenant_state.metadata.end()) {
                 auto cleanup_plan =
                     BuildStaleHandleCleanupPlan(it->second, retaining_clients);
