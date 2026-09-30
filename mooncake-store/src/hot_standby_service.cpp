@@ -181,21 +181,6 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
     if (batch_oplog_snapshot_provider_ && config_.enable_snapshot_bootstrap) {
         return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id);
     }
-    if (!config_.enable_oplog_following) {
-        if (metadata_store_ && metadata_store_->GetKeyCount() > 0) {
-            LOG(INFO) << "Snapshot-only restart discards local metadata and "
-                         "reloads the latest catalog snapshot";
-        }
-
-        auto snapshot_err = LoadSnapshotBaselineLocked(baseline_seq_id);
-        if (snapshot_err != ErrorCode::OK) {
-            return snapshot_err;
-        }
-        applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
-        primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
-        return ErrorCode::OK;
-    }
-
     if (has_recoverable_local_state) {
         LOG(INFO) << "Standby warm start: reuse local metadata (keys="
                   << metadata_store_->GetKeyCount()
@@ -219,61 +204,6 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     baseline_seq_id = 0;
     metadata_store_->Clear();
     oplog_applier_->Recover(0);
-
-    if (!config_.enable_snapshot_bootstrap || !snapshot_provider_) {
-        return ErrorCode::OK;
-    }
-
-    auto snapshot_result = snapshot_provider_->LoadLatestSnapshot(cluster_id_);
-    if (!snapshot_result) {
-        if (config_.enable_oplog_following) {
-            LOG(WARNING) << "Failed to load snapshot baseline, falling back "
-                            "to OpLog-only bootstrap: "
-                         << toString(snapshot_result.error());
-            return ErrorCode::OK;
-        }
-        LOG(ERROR) << "Failed to load snapshot baseline for snapshot-only "
-                   << "standby bootstrap: "
-                   << toString(snapshot_result.error());
-        return snapshot_result.error();
-    }
-
-    if (!snapshot_result->has_value()) {
-        if (config_.enable_oplog_following) {
-            LOG(INFO) << "No snapshot available, falling back to OpLog-only "
-                         "bootstrap";
-        } else {
-            LOG(INFO) << "No snapshot available for snapshot-only bootstrap; "
-                         "standby starts from empty baseline";
-        }
-        return ErrorCode::OK;
-    }
-
-    const auto& snapshot = snapshot_result->value();
-    LOG(INFO) << "Loaded snapshot baseline: snapshot_id="
-              << snapshot.snapshot_id
-              << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
-              << ", keys=" << snapshot.metadata.size();
-    for (const auto& entry : snapshot.metadata) {
-        if (!metadata_store_->RestoreMetadata(entry.tenant_id, entry.key,
-                                              entry.metadata)) {
-            LOG(ERROR) << "Snapshot baseline contains duplicate object: tenant="
-                       << entry.tenant_id << ", key=" << entry.key;
-            metadata_store_->Clear();
-            return ErrorCode::DESERIALIZE_FAIL;
-        }
-    }
-    if (!metadata_store_->RestoreWeightMetadata(snapshot.weight_metadata)) {
-        LOG(ERROR) << "Snapshot baseline contains invalid weight metadata";
-        metadata_store_->Clear();
-        return ErrorCode::DESERIALIZE_FAIL;
-    }
-    // Load segment registry from snapshot
-    if (oplog_applier_) {
-        oplog_applier_->LoadSegmentRegistry(snapshot.segments);
-    }
-    oplog_applier_->Recover(snapshot.snapshot_sequence_id);
-    baseline_seq_id = snapshot.snapshot_sequence_id;
     return ErrorCode::OK;
 }
 
@@ -1023,16 +953,6 @@ void HotStandbyService::CancelSnapshotCapture() {
         state->cv.notify_all();
     }
     ready_capture.reset();
-}
-
-void HotStandbyService::SetSnapshotProvider(
-    std::unique_ptr<SnapshotProvider> provider) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (provider) {
-        snapshot_provider_ = std::move(provider);
-    } else {
-        snapshot_provider_ = std::make_unique<NoopSnapshotProvider>();
-    }
 }
 
 void HotStandbyService::SetBatchOpLogSnapshotProvider(

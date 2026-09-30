@@ -32,21 +32,6 @@ namespace mooncake::test {
 
 namespace {
 
-class FakeSnapshotProvider final : public SnapshotProvider {
-   public:
-    explicit FakeSnapshotProvider(
-        tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result)
-        : result_(std::move(result)) {}
-
-    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
-        const std::string& /*cluster_id*/) override {
-        return result_;
-    }
-
-   private:
-    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
-};
-
 class FakeCaptureHaKvBackend final : public HaKvBackend {
    public:
     ErrorCode DeleteRange(std::string_view, std::string_view) override {
@@ -240,19 +225,6 @@ OpLogBatchRecord MakeCaptureBatch(uint64_t batch_id, uint64_t sequence_id,
     return batch;
 }
 
-LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
-                            std::string key, uint64_t size) {
-    LoadedSnapshot snapshot;
-    snapshot.snapshot_id = std::move(snapshot_id);
-    snapshot.snapshot_sequence_id = seq_id;
-
-    StandbyObjectMetadata metadata;
-    metadata.client_id = UUID{1, 2};
-    metadata.size = size;
-    snapshot.metadata.emplace_back("default", std::move(key), metadata);
-    return snapshot;
-}
-
 std::shared_ptr<FakeHaKvBackend> MakeBackendWithBatch(
     const std::string& cluster_id, uint64_t batch_id, uint64_t first_seq,
     uint64_t last_seq) {
@@ -283,58 +255,6 @@ bool WaitForState(HotStandbyService& service, StandbyState state,
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     return service.GetState() == state;
-}
-
-WeightMetadataSnapshot MakeWeightMetadataSnapshot() {
-    const WeightRevisionIdentity identity{
-        .tenant_id = "default",
-        .name_space = "production",
-        .resource_id = "llama-70b",
-        .revision = "step-100",
-        .weight_generation = 7,
-    };
-    return WeightMetadataSnapshot{
-        .metadata = {WeightRevisionMetadata{
-            .identity = identity,
-            .manifest =
-                WeightManifestReference{
-                    .manifest_key =
-                        "weights/production/llama-70b/step-100/7/manifest",
-                    .manifest_sha256 = std::string(64, 'a'),
-                    .payload_group_id = MakeWeightPayloadGroupId(identity),
-                    .payload_keys_sha256 = std::string(64, 'b'),
-                    .payload_count = 1,
-                    .logical_bytes = 1024,
-                },
-            .availability = WeightAvailabilityState::READY,
-            .residency = WeightResidencyState::HOT,
-            .operation = WeightOperationState::EVICTING,
-            .operation_id = 3,
-            .metadata_generation = 4,
-            .created_at_ms = 100,
-            .updated_at_ms = 200,
-        }},
-        .leases = {WeightRevisionLease{
-            .lease_id = 5,
-            .identity = identity,
-            .holder = "worker-0",
-            .expires_at_ms = 300,
-            .fenced_metadata_generation = 2,
-        }},
-        .operations = {WeightResidencyOperation{
-            .operation_id = 3,
-            .identity = identity,
-            .operation = WeightOperationState::EVICTING,
-            .target_residency = WeightResidencyState::COLD,
-            .fenced_metadata_generation = 4,
-            .started_at_ms = 150,
-            .updated_at_ms = 200,
-            .cursor = {},
-            .message = {},
-        }},
-        .next_lease_id = 6,
-        .next_operation_id = 4,
-    };
 }
 
 }  // namespace
@@ -368,24 +288,16 @@ class HotStandbyServiceTest : public ::testing::Test {
 
 namespace {
 
-std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
+std::unique_ptr<HotStandbyService> CreateOplogReadyStandby(
     HotStandbyConfig config, const std::string& cluster_id) {
-    config.enable_snapshot_bootstrap = true;
-    config.enable_oplog_following = false;
-
+    config.enable_snapshot_bootstrap = false;
+    config.enable_oplog_following = true;
+    config.oplog_poll_interval_ms = 1;
     auto service = std::make_unique<HotStandbyService>(config);
-    LoadedSnapshot snapshot;
-    snapshot.snapshot_id = "20260330_120000_000";
-    snapshot.snapshot_sequence_id = 42;
-
-    StandbyObjectMetadata metadata;
-    metadata.client_id = UUID{1, 2};
-    metadata.size = 4096;
-    snapshot.metadata.emplace_back("default", "key-1", metadata);
-
-    service->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        std::optional<LoadedSnapshot>(snapshot)));
+    auto backend = MakeBackendWithBatch(cluster_id, 1, 1, 1);
+    service->SetCatchUpBatchKvBackendForTesting(backend);
     EXPECT_EQ(ErrorCode::OK, service->Start("", "", cluster_id));
+    EXPECT_TRUE(WaitForAppliedSequence(*service, 1));
     EXPECT_EQ(StandbyState::WATCHING, service->GetState());
     return service;
 }
@@ -419,7 +331,7 @@ TEST_F(HotStandbyServiceTest, TestStart) {
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
-    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+    service_ = CreateOplogReadyStandby(config_, cluster_id_);
 
     EXPECT_EQ(ErrorCode::OK,
               service_->Start("unused", "unused", "unused-cluster"));
@@ -568,52 +480,12 @@ TEST_F(HotStandbyServiceTest, TestPromote_WhenNotReady) {
 }
 
 TEST_F(HotStandbyServiceTest, TestPromote_WhenReady) {
-    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+    service_ = CreateOplogReadyStandby(config_, cluster_id_);
 
     ErrorCode err = service_->Promote();
     EXPECT_EQ(ErrorCode::OK, err);
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
-    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
-}
-
-TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
-    // Setup: snapshot-only standby with baseline seq=10
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = false;
-    service_ = std::make_unique<HotStandbyService>(config_);
-
-    LoadedSnapshot snapshot;
-    snapshot.snapshot_id = "snap-001";
-    snapshot.snapshot_sequence_id = 10;
-
-    StandbyObjectMetadata metadata;
-    metadata.client_id = UUID{1, 2};
-    metadata.size = 4096;
-    snapshot.metadata.emplace_back("default", "key-1", metadata);
-
-    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        std::optional<LoadedSnapshot>(snapshot)));
-
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-    EXPECT_EQ(10u, service_->GetLatestAppliedSequenceId());
-
-    // Export before promotion: seq should be 10
-    StandbySnapshot pre_snapshot;
-    EXPECT_TRUE(service_->ExportStandbySnapshot(pre_snapshot));
-    EXPECT_EQ(10u, pre_snapshot.oplog_sequence_id);
-
-    // Promote and export atomically
-    StandbySnapshot post_snapshot;
-    ErrorCode err = service_->PromoteAndExportSnapshot(post_snapshot);
-    EXPECT_EQ(ErrorCode::OK, err);
-    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
-
-    // After promotion, exported seq should still be 10 (no new OpLog in
-    // snapshot-only)
-    EXPECT_EQ(10u, post_snapshot.oplog_sequence_id);
-    ASSERT_EQ(1u, post_snapshot.objects.size());
-    EXPECT_EQ("key-1", post_snapshot.objects[0].key);
+    EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
 }
 
 // ========== 6.1.5 Warm start tests ==========
@@ -656,116 +528,6 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
     EXPECT_EQ(0u, service_->GetMetadataCount());
 }
 
-TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
-    auto backend = std::make_shared<FakeHaKvBackend>();
-    ASSERT_EQ(
-        ErrorCode::OK,
-        backend->Put(BuildDurablePrefixKey(cluster_id_),
-                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = true;
-    config_.oplog_poll_interval_ms = 1;
-    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
-    service_->SetSnapshotProvider(
-        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
-            MakeSnapshot("warm-start-snapshot", 42, "key-1", 4096))));
-
-    ASSERT_EQ(ErrorCode::OK,
-              service_->Start("primary", oplog_endpoints_, cluster_id_));
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
-    EXPECT_EQ(1u, service_->GetMetadataCount());
-}
-
-TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = false;
-    service_ = std::make_unique<HotStandbyService>(config_);
-
-    auto snapshot = MakeSnapshot("20260330_120000_000", 42, "key-1", 4096);
-
-    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        std::optional<LoadedSnapshot>(snapshot)));
-
-    auto err = service_->Start("", "", cluster_id_);
-    EXPECT_EQ(ErrorCode::OK, err);
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-    EXPECT_EQ(1u, service_->GetMetadataCount());
-    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
-
-    auto status = service_->GetSyncStatus();
-    EXPECT_EQ(42u, status.applied_seq_id);
-    EXPECT_EQ(42u, status.primary_seq_id);
-    EXPECT_TRUE(status.is_connected);
-
-    std::vector<StandbyObjectEntry> exported;
-    EXPECT_TRUE(service_->ExportMetadataSnapshot(exported));
-    ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ("key-1", exported[0].key);
-    EXPECT_EQ(4096u, exported[0].metadata.size);
-}
-
-TEST_F(HotStandbyServiceTest,
-       TestStart_SnapshotOnlyRestartRefreshesNewerCatalogSnapshot) {
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = false;
-    service_ = std::make_unique<HotStandbyService>(config_);
-
-    service_->SetSnapshotProvider(
-        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
-            MakeSnapshot("20260330_120000_000", 42, "key-old", 4096))));
-
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
-    EXPECT_EQ(1u, service_->GetMetadataCount());
-    service_->Stop();
-
-    service_->SetSnapshotProvider(
-        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
-            MakeSnapshot("20260330_121500_000", 84, "key-new", 8192))));
-
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-    EXPECT_EQ(84u, service_->GetLatestAppliedSequenceId());
-    EXPECT_EQ(1u, service_->GetMetadataCount());
-
-    std::vector<StandbyObjectEntry> exported;
-    ASSERT_TRUE(service_->ExportMetadataSnapshot(exported));
-    ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ("key-new", exported[0].key);
-    EXPECT_EQ(8192u, exported[0].metadata.size);
-}
-
-TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = false;
-    service_ = std::make_unique<HotStandbyService>(config_);
-
-    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        tl::make_unexpected(ErrorCode::PERSISTENT_FAIL)));
-
-    auto err = service_->Start("", "", cluster_id_);
-    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
-    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
-}
-
-TEST_F(HotStandbyServiceTest, SnapshotRestoreRejectsDuplicateObject) {
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = false;
-    service_ = std::make_unique<HotStandbyService>(config_);
-
-    auto snapshot = MakeSnapshot("snapshot", 42, "key", 1);
-    snapshot.metadata.push_back(snapshot.metadata.front());
-    snapshot.metadata.back().metadata.size = 2;
-    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        std::optional<LoadedSnapshot>(std::move(snapshot))));
-
-    EXPECT_EQ(ErrorCode::DESERIALIZE_FAIL,
-              service_->Start("", "", cluster_id_));
-    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
-}
-
 // ========== 6.1.6 Metadata operation tests ==========
 
 TEST_F(HotStandbyServiceTest, TestGetMetadataCount) {
@@ -790,112 +552,16 @@ TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_NotRunning) {
     EXPECT_FALSE(service_->ExportStandbySnapshot(snapshot));
 }
 
-TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_SnapshotOnly) {
-    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_OpLogOnly) {
+    service_ = CreateOplogReadyStandby(config_, cluster_id_);
 
     StandbySnapshot snapshot;
     EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
-    EXPECT_EQ(42u, snapshot.oplog_sequence_id);
+    EXPECT_EQ(1u, snapshot.oplog_sequence_id);
     ASSERT_EQ(1u, snapshot.objects.size());
-    EXPECT_EQ("key-1", snapshot.objects[0].key);
+    EXPECT_EQ("batch_key_1", snapshot.objects[0].key);
     EXPECT_EQ(4096u, snapshot.objects[0].metadata.size);
-    // Segment registry is empty because snapshot-only standby has no
-    // oplog_applier
-    EXPECT_TRUE(snapshot.segments.empty());
-}
-
-TEST_F(HotStandbyServiceTest, SnapshotWeightMetadataSurvivesPromotionExport) {
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = false;
-    service_ = std::make_unique<HotStandbyService>(config_);
-    LoadedSnapshot loaded;
-    loaded.snapshot_id = "weight-snapshot";
-    loaded.snapshot_sequence_id = 42;
-    loaded.weight_metadata = MakeWeightMetadataSnapshot();
-    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        std::optional<LoadedSnapshot>(std::move(loaded))));
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
-
-    StandbySnapshot exported;
-    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(exported));
-    ASSERT_TRUE(exported.weight_metadata.has_value());
-    EXPECT_EQ(MakeWeightMetadataSnapshot(), exported.weight_metadata.value());
-}
-
-TEST_F(HotStandbyServiceTest, AppliesNewerWeightMetadataOpLogAfterSnapshot) {
-    const std::string cluster_id = "weight-snapshot-catch-up";
-    auto backend = std::make_shared<FakeCaptureHaKvBackend>();
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = true;
-    config_.oplog_poll_interval_ms = 1;
-    service_ = std::make_unique<HotStandbyService>(config_);
-    service_->SetCatchUpBatchKvBackendForTesting(backend);
-
-    auto baseline_weight_metadata = MakeWeightMetadataSnapshot();
-    baseline_weight_metadata.leases.clear();
-    baseline_weight_metadata.operations.clear();
-    baseline_weight_metadata.next_lease_id = 1;
-    baseline_weight_metadata.next_operation_id = 1;
-    auto& baseline_metadata = baseline_weight_metadata.metadata.front();
-    baseline_metadata.availability = WeightAvailabilityState::IMPORTING;
-    baseline_metadata.residency = WeightResidencyState::UNKNOWN;
-    baseline_metadata.operation = WeightOperationState::NONE;
-    baseline_metadata.operation_id = 0;
-    baseline_metadata.metadata_generation = 1;
-    baseline_metadata.updated_at_ms = 100;
-    LoadedSnapshot loaded;
-    loaded.snapshot_id = "weight-baseline";
-    loaded.snapshot_sequence_id = 1;
-    loaded.weight_metadata = baseline_weight_metadata;
-    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        std::optional<LoadedSnapshot>(std::move(loaded))));
-
-    auto ready = baseline_metadata;
-    ready.availability = WeightAvailabilityState::READY;
-    ready.residency = WeightResidencyState::HOT;
-    ready.metadata_generation = 2;
-    ready.updated_at_ms = 200;
-    const auto encoded = struct_pack::serialize(ready);
-    auto batch = MakeCaptureBatch(1, 2, OpType::WEIGHT_METADATA_UPSERT,
-                                  MakeWeightRevisionMetadataKey(ready.identity),
-                                  std::string(encoded.begin(), encoded.end()));
-    batch.entries.front().tenant_id = ready.identity.tenant_id;
-    ASSERT_EQ(ErrorCode::OK, backend->Put(BuildBatchRecordKey(cluster_id, 1),
-                                          EncodeOpLogBatchRecord(batch)));
-    ASSERT_EQ(
-        ErrorCode::OK,
-        backend->Put(BuildDurablePrefixKey(cluster_id),
-                     EncodeDurablePrefix({.batch_id = 1, .last_seq = 2})));
-
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id));
-    for (int i = 0; i < 100 && service_->GetLatestAppliedSequenceId() < 2;
-         ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    ASSERT_EQ(2u, service_->GetLatestAppliedSequenceId());
-
-    StandbySnapshot promoted;
-    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(promoted));
-    ASSERT_TRUE(promoted.weight_metadata.has_value());
-    ASSERT_EQ(1u, promoted.weight_metadata->metadata.size());
-    EXPECT_EQ(ready, promoted.weight_metadata->metadata.front());
-}
-
-TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = false;
-    service_ = std::make_unique<HotStandbyService>(config_);
-
-    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        std::optional<LoadedSnapshot>(LoadedSnapshot{})));
-
-    EXPECT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-
-    StandbySnapshot snapshot;
-    EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
-    EXPECT_EQ(0u, snapshot.oplog_sequence_id);
-    EXPECT_TRUE(snapshot.objects.empty());
+    // The test log contains objects but no mounted segments.
     EXPECT_TRUE(snapshot.segments.empty());
 }
 
@@ -986,25 +652,6 @@ TEST_F(HotStandbyServiceTest, PromotionCancelsActiveSnapshotCapture) {
 
     std::vector<StandbyObjectEntry> chunk;
     EXPECT_FALSE(service_->CopyNextBatchOpLogSnapshotChunk(1, *capture, chunk));
-}
-
-TEST_F(HotStandbyServiceTest, SnapshotCaptureRejectsInconsistentSequence) {
-    auto backend = std::make_shared<FakeCaptureHaKvBackend>();
-    ASSERT_EQ(
-        ErrorCode::OK,
-        backend->Put(BuildDurablePrefixKey(cluster_id_),
-                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
-    config_.enable_snapshot_bootstrap = true;
-    config_.enable_oplog_following = true;
-    config_.oplog_poll_interval_ms = 1;
-    service_ = std::make_unique<HotStandbyService>(config_);
-    service_->SetSnapshotProvider(
-        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
-            MakeSnapshot("snapshot", 42, "key", 4096))));
-    service_->SetCatchUpBatchKvBackendForTesting(backend);
-    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
-
-    EXPECT_FALSE(service_->BeginBatchOpLogSnapshotCapture().has_value());
 }
 
 // ========== 6.1.7 Replication loop tests ==========
@@ -1300,22 +947,6 @@ TEST_F(PromotionCatchUpTest, MissingDurablePrefixPromotesAtSequenceZero) {
     StandbySnapshot out;
     ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
     EXPECT_EQ(0u, out.oplog_sequence_id);
-}
-
-TEST_F(PromotionCatchUpTest, MissingDurablePrefixRejectsNonzeroSequence) {
-    config_.enable_snapshot_bootstrap = true;
-    service_ = std::make_unique<HotStandbyService>(config_);
-    service_->SetCatchUpBatchKvBackendForTesting(batch_backend_);
-    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
-        std::optional<LoadedSnapshot>(MakeSnapshot("baseline", 1, "key", 1))));
-
-    ASSERT_EQ(ErrorCode::OK,
-              service_->Start("", oplog_endpoints_, cluster_id_));
-    ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
-    StandbySnapshot out;
-    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
-              service_->PromoteAndExportSnapshot(out));
-    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }
 
 TEST_F(PromotionCatchUpTest, CatchesUpPrefixThatAppearsBeforePromotion) {

@@ -11,7 +11,6 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
-#include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
 
@@ -34,8 +33,7 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .verification_interval_sec = 30,
         .max_replication_lag_entries = 1000,
         .enable_verification = false,
-        .enable_snapshot_bootstrap =
-            config.enable_oplog_snapshot || config.enable_snapshot_restore,
+        .enable_snapshot_bootstrap = config.enable_oplog_snapshot,
         .enable_oplog_following = capabilities.has_oplog_following,
         .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
         .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
@@ -45,8 +43,7 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
 StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
     StandbyRuntimeCapabilities capabilities;
-    capabilities.has_snapshot_bootstrap =
-        config.enable_oplog_snapshot || config.enable_snapshot_restore;
+    capabilities.has_snapshot_bootstrap = config.enable_oplog_snapshot;
     capabilities.has_oplog_following =
         config.enable_oplog && spec.type == HABackendType::ETCD;
     return capabilities;
@@ -119,20 +116,6 @@ class CapabilityDrivenStandbyController final : public StandbyController {
           config_(config),
           capabilities_(BuildStandbyRuntimeCapabilities(spec, config)),
           standby_service_(CreateStandbyService(config, capabilities_)) {
-        if (config_.enable_snapshot_restore && !config_.enable_oplog_snapshot) {
-            auto snapshot_provider =
-                CreateCatalogBackedSnapshotProvider(config_);
-            if (!snapshot_provider) {
-                dependency_init_error_ = snapshot_provider.error();
-                LOG(ERROR) << "Failed to initialize standby snapshot provider, "
-                           << "backend=" << HABackendTypeToString(spec_.type)
-                           << ", error=" << toString(dependency_init_error_);
-            } else {
-                standby_service_->SetSnapshotProvider(
-                    std::move(snapshot_provider.value()));
-            }
-        }
-
         if (config_.enable_oplog_snapshot) {
             try {
                 if (!capabilities_.has_oplog_following ||
@@ -345,7 +328,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             return ctx;
         }
 
-        // Atomic legacy promote + export (final catch-up happens inside).
+        // Export the in-memory OpLog state when snapshot production is
+        // disabled.
         StandbySnapshot snapshot;
         ErrorCode err = standby_service_->PromoteAndExportSnapshot(snapshot);
         if (err != ErrorCode::OK) {

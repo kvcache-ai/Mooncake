@@ -420,9 +420,6 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         mooncake::WrappedMasterServiceConfig wrapped_config(
             config, leadership_session->view.view_version);
-        // In HA serving-primary mode, snapshot bootstrap belongs to standby.
-        // The new primary must restore from PromotionContext only.
-        wrapped_config.enable_snapshot_restore = false;
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
         // Keep the gate alive until after the service is destroyed because the

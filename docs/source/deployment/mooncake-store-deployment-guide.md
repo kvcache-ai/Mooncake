@@ -172,6 +172,12 @@ mooncake_master \
 
 ### Snapshot & Restore — Backup / Disaster Recovery
 
+```{warning}
+Removal in progress: the legacy Master-generated snapshot and restore path
+described in this section is being retired. Do not use it for new deployments;
+use the standby-generated batch OpLog snapshot path for HA recovery instead.
+```
+
 ```{caution}
 Metadata Snapshot And Restore is experimental feature.
 ```
@@ -385,6 +391,11 @@ HA leadership and metadata replication are configured separately:
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
 
 For legacy catalog snapshot-based standby bootstrap, configure:
+
+```{warning}
+Removal in progress: legacy catalog-backed standby bootstrap is being removed.
+New HA deployments should use batch OpLog snapshots.
+```
 
 - `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
 - `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
@@ -772,6 +783,11 @@ Metadata Snapshot And Restore is experimental feature.
 ```
 
 **Metadata Snapshot And Restore**
+
+```{warning}
+Removal in progress: these flags belong to the legacy Master-generated
+snapshot and restore path and will be removed.
+```
 
 | Flag | Default | Description |
 |------|---------|-------------|

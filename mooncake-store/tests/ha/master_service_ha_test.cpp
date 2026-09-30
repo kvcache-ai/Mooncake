@@ -689,10 +689,6 @@ class MasterServiceHATest : public ::testing::Test {
                      .holder_id = holder_id});
     }
 
-    static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
-        return MasterServiceTestPeer::SnapshotManager(service) != nullptr;
-    }
-
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
         return MasterServiceTestPeer::NeedMemEviction(service).load(
             std::memory_order_relaxed);
@@ -911,7 +907,7 @@ class MasterServiceHATest : public ::testing::Test {
     static std::unique_lock<std::shared_mutex> LockSnapshotForTesting(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
     }
 
     static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
@@ -986,7 +982,7 @@ class MasterServiceHATest : public ::testing::Test {
             return false;
         }
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            MasterServiceTestPeer::SnapshotMutex(service), std::try_to_lock);
+            MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
         return !snapshot_lock.owns_lock();
     }
 
@@ -3081,21 +3077,6 @@ TEST_F(MasterServiceHATest, OplogDoesNotStartWithUnsupportedHABackend) {
 
     MasterService service(config);
     EXPECT_FALSE(HasOpLogWriter(service));
-}
-
-TEST_F(MasterServiceHATest, BatchPrimaryDoesNotStartSnapshotWorker) {
-    auto config =
-        MasterServiceConfig::builder()
-            .set_enable_ha(true)
-            .set_enable_oplog(true)
-            .set_cluster_id("batch_snapshot_gate")
-            .set_enable_snapshot(true)
-            .set_snapshot_backup_dir(LegacyOpLogRootDir() + "/batch_snapshot")
-            .set_snapshot_object_store_type("local")
-            .build();
-
-    MasterService service(config);
-    EXPECT_FALSE(SnapshotManagerCreatedForTesting(service));
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
