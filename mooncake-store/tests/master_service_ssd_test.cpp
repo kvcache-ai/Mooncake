@@ -4,6 +4,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -588,7 +589,7 @@ TEST_F(MasterServiceSSDTest, RetainingClientsExcludeMemoryOnlyOwners) {
     segment.base = 0x310000000;
     segment.size = 64 * 1024 * 1024;
     ASSERT_TRUE(service.MountSegment(segment, memory_owner));
-    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    EXPECT_TRUE(peer.GetRetainingClientIds()->empty());
 
     const UUID disk_owner = generate_uuid();
     // Disabling new offload work does not discard an owner's existing data.
@@ -597,8 +598,9 @@ TEST_F(MasterServiceSSDTest, RetainingClientsExcludeMemoryOnlyOwners) {
     ASSERT_TRUE(service.AddReplica(disk_owner, "retained_disk",
                                    TenantId::Default(), replica));
     auto retaining = peer.GetRetainingClientIds();
-    EXPECT_EQ(retaining.size(), 1);
-    EXPECT_TRUE(retaining.contains(disk_owner));
+    EXPECT_EQ(retaining->size(), 1);
+    EXPECT_TRUE(retaining->contains(disk_owner));
+    EXPECT_EQ(peer.GetRetainingClientIds(), retaining);
     const auto record = peer.FindClientRecord(disk_owner);
     ASSERT_TRUE(record);
     const auto now = ClientLivenessRecord::Clock::now();
@@ -606,13 +608,24 @@ TEST_F(MasterServiceSSDTest, RetainingClientsExcludeMemoryOnlyOwners) {
     ASSERT_EQ(record->Evaluate(now, zero, zero),
               ClientLivenessTransition::BECAME_SUSPECTED);
     MasterMetricManager::instance().client_liveness_became_suspected();
-    EXPECT_TRUE(peer.GetRetainingClientIds().contains(disk_owner));
+    EXPECT_TRUE(peer.GetRetainingClientIds()->contains(disk_owner));
+    EXPECT_EQ(peer.GetRetainingClientIds(), retaining);
+    ASSERT_EQ(record->Observe(now),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    MasterMetricManager::instance().client_liveness_recovered();
+    EXPECT_EQ(peer.GetRetainingClientIds(), retaining);
+    ASSERT_EQ(record->Evaluate(now, zero, zero),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
     peer.ClearInvalidHandles();
     EXPECT_EQ(service.GetKeyCount(), 1);
     ASSERT_EQ(record->Evaluate(now, zero, zero),
               ClientLivenessTransition::BECAME_OFFLINE);
     MasterMetricManager::instance().client_liveness_became_offline();
-    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    EXPECT_TRUE(peer.GetRetainingClientIds()->empty());
+    EXPECT_NE(peer.GetRetainingClientIds(), retaining);
+    // An RPC that already released client_mutex_ keeps its immutable view.
+    EXPECT_TRUE(retaining->contains(disk_owner));
     // PutStart must discard the offline disk replica and accept a fresh write.
     ASSERT_TRUE(service.PutStart(memory_owner, "retained_disk",
                                  TenantId::Default(), 1024,
@@ -621,7 +634,7 @@ TEST_F(MasterServiceSSDTest, RetainingClientsExcludeMemoryOnlyOwners) {
                                TenantId::Default(), ReplicaType::MEMORY));
     EXPECT_TRUE(service.GetReplicaList("retained_disk", TenantId::Default()));
     EXPECT_FALSE(service.MountLocalDiskSegment(disk_owner, true));
-    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    EXPECT_TRUE(peer.GetRetainingClientIds()->empty());
 }
 
 TEST_F(MasterServiceSSDTest, DiskOwnerCandidateEndsWithClientIncarnation) {
@@ -633,13 +646,13 @@ TEST_F(MasterServiceSSDTest, DiskOwnerCandidateEndsWithClientIncarnation) {
     ASSERT_TRUE(service.MountLocalDiskSegment(owner, true));
     ASSERT_TRUE(service.UnmountLocalDiskSegment(owner));
     // A disk unmount must not change the liveness-based cleanup predicate.
-    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+    EXPECT_TRUE(peer.GetRetainingClientIds()->contains(owner));
 
     ClientOffboardingJob job;
     job.client_id = owner;
     job.liveness = peer.FindClientRecord(owner);
     ASSERT_TRUE(peer.ProcessClientOffboardingJob(job));
-    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    EXPECT_TRUE(peer.GetRetainingClientIds()->empty());
 
     Segment segment;
     segment.id = generate_uuid();
@@ -649,9 +662,18 @@ TEST_F(MasterServiceSSDTest, DiskOwnerCandidateEndsWithClientIncarnation) {
     segment.size = 64 * 1024 * 1024;
     ASSERT_TRUE(service.MountSegment(segment, owner));
     EXPECT_NE(peer.FindClientRecord(owner), job.liveness);
-    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    EXPECT_TRUE(peer.GetRetainingClientIds()->empty());
     ASSERT_TRUE(service.MountLocalDiskSegment(owner, true));
-    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+    EXPECT_TRUE(peer.GetRetainingClientIds()->contains(owner));
+    // The detached incarnation must no longer update this owner's membership.
+    auto retaining = peer.GetRetainingClientIds();
+    const auto now = ClientLivenessRecord::Clock::now();
+    const auto zero = ClientLivenessRecord::Clock::duration::zero();
+    EXPECT_EQ(job.liveness->Evaluate(now, zero, zero),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_EQ(job.liveness->Evaluate(now, zero, zero),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    EXPECT_EQ(peer.GetRetainingClientIds(), retaining);
 }
 
 TEST_F(MasterServiceSSDTest, RecoveredDiskOwnersRetainReplicasBeforeRemount) {
@@ -670,7 +692,7 @@ TEST_F(MasterServiceSSDTest, RecoveredDiskOwnersRetainReplicasBeforeRemount) {
     ASSERT_TRUE(service.RestoreFromStandbySnapshot({object}, 0, {}));
     EXPECT_TRUE(
         MasterServiceTestPeer::LocalSsdManager(service).GetClientIds().empty());
-    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+    EXPECT_TRUE(peer.GetRetainingClientIds()->contains(owner));
     peer.ClearInvalidHandles();
     EXPECT_TRUE(service.GetReplicaList(object.key, TenantId::Default()));
 
@@ -682,14 +704,70 @@ TEST_F(MasterServiceSSDTest, RecoveredDiskOwnersRetainReplicasBeforeRemount) {
     ASSERT_TRUE(peer.RebuildClientLivenessAfterSnapshotRestore());
     EXPECT_NE(peer.FindClientRecord(owner), old_record);
     auto retaining = peer.GetRetainingClientIds();
-    EXPECT_EQ(retaining.size(), 2);
-    EXPECT_TRUE(retaining.contains(owner));
-    EXPECT_TRUE(retaining.contains(registered_owner));
+    EXPECT_EQ(retaining->size(), 2);
+    EXPECT_TRUE(retaining->contains(owner));
+    EXPECT_TRUE(retaining->contains(registered_owner));
+    const auto now = ClientLivenessRecord::Clock::now();
+    const auto zero = ClientLivenessRecord::Clock::duration::zero();
+    EXPECT_EQ(old_record->Evaluate(now, zero, zero),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    EXPECT_EQ(old_record->Evaluate(now, zero, zero),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    EXPECT_EQ(peer.GetRetainingClientIds(), retaining);
     peer.ClearInvalidHandles();
     EXPECT_TRUE(service.GetReplicaList(object.key, TenantId::Default()));
 
     peer.ResetStateAfterFailedRestoreAttempt();
-    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    EXPECT_TRUE(peer.GetRetainingClientIds()->empty());
+    EXPECT_EQ(retaining->size(), 2);
+}
+
+TEST_F(MasterServiceSSDTest, RetainingSnapshotsSurviveConcurrentOfflining) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.client_active_ttl_sec = 3600;
+    config.client_suspicion_ttl_sec = 3600;
+    MasterService service(config);
+    MasterServiceTestPeer peer(service);
+    std::vector<std::shared_ptr<ClientLivenessRecord>> records;
+    for (int i = 0; i < 128; ++i) {
+        const auto owner = generate_uuid();
+        ASSERT_TRUE(service.MountLocalDiskSegment(owner, false));
+        records.push_back(peer.FindClientRecord(owner));
+    }
+    const auto initial = peer.GetRetainingClientIds();
+    ASSERT_EQ(initial->size(), records.size());
+    std::atomic<bool> start{false};
+    std::atomic<bool> done{false};
+    std::thread reader([&] {
+        start.store(true);
+        size_t previous_size = initial->size();
+        while (!done.load()) {
+            auto snapshot = peer.GetRetainingClientIds();
+            EXPECT_LE(snapshot->size(), previous_size);
+            previous_size = snapshot->size();
+            for (const auto& id : *snapshot) {
+                EXPECT_TRUE(initial->contains(id));
+            }
+        }
+    });
+    while (!start.load()) {
+        std::this_thread::yield();
+    }
+    const auto now = ClientLivenessRecord::Clock::now();
+    const auto zero = ClientLivenessRecord::Clock::duration::zero();
+    for (const auto& record : records) {
+        EXPECT_EQ(record->Evaluate(now, zero, zero),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+        MasterMetricManager::instance().client_liveness_became_suspected();
+        EXPECT_EQ(record->Evaluate(now, zero, zero),
+                  ClientLivenessTransition::BECAME_OFFLINE);
+        MasterMetricManager::instance().client_liveness_became_offline();
+    }
+    done.store(true);
+    reader.join();
+    EXPECT_TRUE(peer.GetRetainingClientIds()->empty());
+    EXPECT_EQ(initial->size(), records.size());
 }
 
 TEST_F(MasterServiceSSDTest, LegacyDiskRegistrationRetainsOwnerWithoutMount) {
@@ -703,11 +781,11 @@ TEST_F(MasterServiceSSDTest, LegacyDiskRegistrationRetainsOwnerWithoutMount) {
     segment.base = 0x310000000;
     segment.size = 64 * 1024 * 1024;
     ASSERT_TRUE(service.MountSegment(segment, owner));
-    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    EXPECT_TRUE(peer.GetRetainingClientIds()->empty());
     Replica replica(owner, 1024, "disk:1234", ReplicaStatus::COMPLETE);
     ASSERT_TRUE(
         service.AddReplica(owner, "legacy_disk", TenantId::Default(), replica));
-    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+    EXPECT_TRUE(peer.GetRetainingClientIds()->contains(owner));
     peer.ClearInvalidHandles();
     EXPECT_TRUE(service.GetReplicaList("legacy_disk", TenantId::Default()));
 }
@@ -723,7 +801,7 @@ TEST_F(MasterServiceSSDTest, FailedChunkedRestoreKeepsPublishedDiskOwner) {
     segment.base = 0x310000000;
     segment.size = 64 * 1024 * 1024;
     ASSERT_TRUE(service.MountSegment(segment, owner));
-    EXPECT_TRUE(peer.GetRetainingClientIds().empty());
+    EXPECT_TRUE(peer.GetRetainingClientIds()->empty());
 
     auto source = std::make_unique<StandbyMetadataStore>();
     for (int i = 0; i < 2; ++i) {
@@ -764,7 +842,7 @@ TEST_F(MasterServiceSSDTest, FailedChunkedRestoreKeepsPublishedDiskOwner) {
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     ASSERT_EQ(service.GetKeyCount(), 1);
-    EXPECT_TRUE(peer.GetRetainingClientIds().contains(owner));
+    EXPECT_TRUE(peer.GetRetainingClientIds()->contains(owner));
     peer.ClearInvalidHandles();
     EXPECT_EQ(service.GetKeyCount(), 1);
 }

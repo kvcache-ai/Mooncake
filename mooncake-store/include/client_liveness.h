@@ -175,41 +175,55 @@ class ClientLivenessRecord {
 
    private:
     friend class SegmentAllocatorRegistration;
+    friend class MasterService;
 
-    // These callbacks only update serving-name counters. They must not acquire
-    // transition_mutex_ or any client, segment, or metadata lock. A separate
-    // mutex allows mounting to subscribe inside ObserveAndRun's operation.
-    void AddServingObserver(const void* owner,
-                            std::function<void(bool)> observer) {
-        std::lock_guard lock(serving_observers_mutex_);
-        const auto [it, inserted] =
-            serving_observers_.emplace(owner, std::move(observer));
-        if (inserted && IsServing()) {
-            it->second(true);
+    enum class ResourceRequirement { SERVING, RETAINING };
+    struct ResourceObserver {
+        ResourceRequirement requirement;
+        std::function<void(bool)> notify;
+
+        bool Matches(ClientLivenessState state) const {
+            return requirement == ResourceRequirement::SERVING
+                       ? state == ClientLivenessState::ACTIVE
+                       : state != ClientLivenessState::OFFLINE;
+        }
+    };
+
+    // These callbacks only update derived resource indexes. They must not
+    // acquire transition_mutex_ or any client, segment, or metadata lock. A
+    // separate mutex allows mounting to subscribe inside ObserveAndRun's
+    // operation.
+    void AddResourceObserver(const void* owner, ResourceRequirement requirement,
+                             std::function<void(bool)> observer) {
+        std::lock_guard lock(resource_observers_mutex_);
+        const auto [it, inserted] = resource_observers_.emplace(
+            owner, ResourceObserver{requirement, std::move(observer)});
+        if (inserted && it->second.Matches(state())) {
+            it->second.notify(true);
         }
     }
 
-    void RemoveServingObserver(const void* owner) {
-        std::lock_guard lock(serving_observers_mutex_);
-        const auto it = serving_observers_.find(owner);
-        if (it != serving_observers_.end()) {
-            if (IsServing()) {
-                it->second(false);
+    void RemoveResourceObserver(const void* owner) {
+        std::lock_guard lock(resource_observers_mutex_);
+        const auto it = resource_observers_.find(owner);
+        if (it != resource_observers_.end()) {
+            if (it->second.Matches(state())) {
+                it->second.notify(false);
             }
-            serving_observers_.erase(it);
+            resource_observers_.erase(it);
         }
     }
 
     // Caller holds transition_mutex_. Ordinary ACTIVE heartbeats never enter
-    // this path; observers run only when the serving state changes.
+    // this path; each observer runs only when its predicate changes.
     void PublishStateLocked(ClientLivenessState next) {
-        std::lock_guard lock(serving_observers_mutex_);
-        const bool was_serving = IsServing();
+        std::lock_guard lock(resource_observers_mutex_);
+        const auto previous = state();
         state_.store(next, std::memory_order_release);
-        const bool serving = next == ClientLivenessState::ACTIVE;
-        if (was_serving != serving) {
-            for (const auto& [owner, observer] : serving_observers_) {
-                observer(serving);
+        for (const auto& [owner, observer] : resource_observers_) {
+            const bool matches = observer.Matches(next);
+            if (observer.Matches(previous) != matches) {
+                observer.notify(matches);
             }
         }
     }
@@ -226,9 +240,8 @@ class ClientLivenessRecord {
 
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
     std::mutex transition_mutex_;
-    std::mutex serving_observers_mutex_;
-    std::unordered_map<const void*, std::function<void(bool)>>
-        serving_observers_;
+    std::mutex resource_observers_mutex_;
+    std::unordered_map<const void*, ResourceObserver> resource_observers_;
     TimePoint last_liveness_at_;
     TimePoint suspected_since_{};
 };

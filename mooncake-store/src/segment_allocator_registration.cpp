@@ -50,8 +50,9 @@ void SegmentAllocatorRegistration::SubscribeServingCount() {
     const auto record =
         std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
     if (record) {
-        record->AddServingObserver(
-            this, [counter = serving_name_counter_](bool serving) {
+        record->AddResourceObserver(
+            this, ClientLivenessRecord::ResourceRequirement::SERVING,
+            [counter = serving_name_counter_](bool serving) {
                 counter->Update(serving);
             });
     } else {
@@ -66,7 +67,7 @@ void SegmentAllocatorRegistration::UnsubscribeServingCount() {
     const auto record =
         std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
     if (record) {
-        record->RemoveServingObserver(this);
+        record->RemoveResourceObserver(this);
     } else {
         serving_name_counter_->Update(false);
     }
