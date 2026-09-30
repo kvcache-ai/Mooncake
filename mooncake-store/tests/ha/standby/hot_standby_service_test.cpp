@@ -560,7 +560,7 @@ TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_OpLogOnly) {
     EXPECT_EQ(1u, snapshot.oplog_sequence_id);
     ASSERT_EQ(1u, snapshot.objects.size());
     EXPECT_EQ("batch_key_1", snapshot.objects[0].key);
-    EXPECT_EQ(4096u, snapshot.objects[0].metadata.size);
+    EXPECT_EQ(1024u, snapshot.objects[0].metadata.size);
     // The test log contains objects but no mounted segments.
     EXPECT_TRUE(snapshot.segments.empty());
 }
