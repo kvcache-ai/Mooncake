@@ -71,6 +71,18 @@ set_target_properties(
              "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
 
 if(BUILD_UNIT_TESTS)
+  if(USE_TENT)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(
+      NAME tebench_op_mode_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env
+        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>:$ENV{LD_LIBRARY_PATH}"
+        ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/op_mode_test.py
+        $<TARGET_FILE:tebench>)
+    set_tests_properties(tebench_op_mode_test PROPERTIES TIMEOUT 150 LABELS
+                                                         integration)
+  endif()
   add_executable(
     tebench_qos_metrics_test tests/qos_metrics_test.cpp qos_metrics_adapter.cpp
                              workload_config.cpp utils.cpp)
