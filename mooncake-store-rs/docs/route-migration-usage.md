@@ -24,7 +24,7 @@ Shared constraints:
 
 - the migration granularity is `tenant/domain/object_set/key`
 - the durable truth remains the object route, not the admin task record
-- the admin task queue exists only in the memory of `mooncake-store-admin server`
+- the admin task queue exists only in the memory of `mooncake-store-rs-admin server`
 - multi-target `copy` currently uses all-or-nothing semantics
 - `task_executor` must be explicitly selected
 
@@ -33,13 +33,13 @@ Shared constraints:
 The current product surface exposes two operator entry points:
 
 1. admin HTTP API
-2. `mooncake-store-admin --admin-url ...` CLI
+2. `mooncake-store-rs-admin --admin-url ...` CLI
 
 There is currently no dedicated Python route-migration API.
 
 ### 2.1 HTTP API
 
-The long-lived `mooncake-store-admin server` exposes:
+The long-lived `mooncake-store-rs-admin server` exposes:
 
 - `POST /v1/route-migrations/copy`
 - `POST /v1/route-migrations/move`
@@ -48,24 +48,24 @@ The long-lived `mooncake-store-admin server` exposes:
 
 Implementation entry points:
 
-- [http.rs](../crates/mooncake-store-py/src/admin/http.rs)
-- [service.rs](../crates/mooncake-store-py/src/admin/service.rs)
+- [http.rs](../crates/mooncake-store-rs-admin/src/admin/http.rs)
+- [service.rs](../crates/mooncake-store-rs-admin/src/admin/service.rs)
 
 ### 2.2 CLI
 
-`mooncake-store-admin` is an operator client for the admin HTTP surface. It does
+`mooncake-store-rs-admin` is an operator client for the admin HTTP surface. It does
 not own a private task queue.
 
 Current commands:
 
-- `mooncake-store-admin ... migrate copy`
-- `mooncake-store-admin ... migrate move`
-- `mooncake-store-admin ... migrate task list`
-- `mooncake-store-admin ... migrate task get`
+- `mooncake-store-rs-admin ... migrate copy`
+- `mooncake-store-rs-admin ... migrate move`
+- `mooncake-store-rs-admin ... migrate task list`
+- `mooncake-store-rs-admin ... migrate task get`
 
 Implementation entry point:
 
-- [mooncake-store-admin.rs](../crates/mooncake-store-py/src/bin/mooncake-store-admin.rs)
+- [mooncake-store-rs-admin.rs](../crates/mooncake-store-rs-admin/src/bin/mooncake-store-rs-admin.rs)
 
 Key constraints:
 
@@ -80,8 +80,8 @@ Key constraints:
 The current end-to-end flow is:
 
 1. the caller submits a task through admin HTTP or through
-   `mooncake-store-admin --admin-url ...`
-2. `mooncake-store-admin server` stores the task in an in-memory queue
+   `mooncake-store-rs-admin --admin-url ...`
+2. `mooncake-store-rs-admin server` stores the task in an in-memory queue
 3. admin resolves the live lease for the selected `task_executor`
 4. admin submits `SubmitMigrationTask` through control-plane RPC to the chosen
    executor runtime
@@ -94,7 +94,7 @@ The current end-to-end flow is:
 Key implementation locations:
 
 - admin scheduling and retry:
-  - [service.rs](../crates/mooncake-store-py/src/admin/service.rs)
+  - [service.rs](../crates/mooncake-store-rs-admin/src/admin/service.rs)
 - control-plane migration service:
   - [control_plane/mod.rs](../crates/mooncake-store-client/src/control_plane/mod.rs)
   - [server.rs](../crates/mooncake-store-client/src/control_plane/server.rs)
@@ -129,7 +129,7 @@ execute the task”, not “one task equals one thread”.
 Prefer the CLI for manual operations or lightweight scripts:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   --admin-url http://127.0.0.1:18080 \
   migrate copy \
@@ -148,12 +148,12 @@ mooncake-store-admin \
 Query tasks:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   --admin-url http://127.0.0.1:18080 \
   migrate task list
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   --admin-url http://127.0.0.1:18080 \
   migrate task get \

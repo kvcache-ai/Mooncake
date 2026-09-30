@@ -574,10 +574,10 @@ Keep reconciliation simple and operator-visible:
 
 Suggested admin surface:
 
-- `mooncake-store-admin quota state --tenant <t>`
-- `mooncake-store-admin quota reservations --tenant <t>`
-- `mooncake-store-admin quota abort --tenant <t> --reservation-id <id> [--dry-run]`
-- `mooncake-store-admin quota reconcile --tenant <t> [--dry-run]`
+- `mooncake-store-rs-admin quota state --tenant <t>`
+- `mooncake-store-rs-admin quota reservations --tenant <t>`
+- `mooncake-store-rs-admin quota abort --tenant <t> --reservation-id <id> [--dry-run]`
+- `mooncake-store-rs-admin quota reconcile --tenant <t> [--dry-run]`
 
 The current implementation also exposes matching HTTP endpoints:
 

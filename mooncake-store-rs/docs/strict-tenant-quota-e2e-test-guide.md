@@ -35,7 +35,7 @@ Before running the e2e locally, ensure:
 - Redis is available on the configured port
 - the workspace builds successfully
 - the local environment can run the standard e2e harness
-- `mooncake-store-admin` can reach the same metadata namespace if you want follow-up inspection after the run
+- `mooncake-store-rs-admin` can reach the same metadata namespace if you want follow-up inspection after the run
 
 The default local script uses the same conventions as the rest of the repository.
 
@@ -153,12 +153,12 @@ When coordinating with QA, ask them to verify:
 After a successful or failed run, operators can inspect the same tenant through admin:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota state \
   --tenant tenant-quota-e2e
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reservations \
   --tenant tenant-quota-e2e
@@ -167,7 +167,7 @@ mooncake-store-admin \
 If the run is interrupted mid-flight and pending reservations remain visible, inspect the repair plan first:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reconcile \
   --tenant tenant-quota-e2e \

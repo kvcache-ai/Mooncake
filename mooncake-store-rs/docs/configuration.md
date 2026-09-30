@@ -4,7 +4,7 @@ This document collects the main runtime knobs exposed by the current implementat
 
 ## Tenant Policy Precedence
 
-Tenant-scoped routing and resource policy should be authored through `mooncake-store-admin policy ...`
+Tenant-scoped routing and resource policy should be authored through `mooncake-store-rs-admin policy ...`
 and stored in durable metadata. Runtime-local knobs remain available as compatibility fallbacks.
 
 Precedence is:
@@ -24,11 +24,11 @@ Keep this distinction clear:
 
 The admin surface now exposes metadata-backed strict quota inspection plus explicit repair commands:
 
-- `mooncake-store-admin quota state --tenant <tenant> [--domain <domain>] [--object-set <set>]`
-- `mooncake-store-admin quota object --tenant <tenant> [--domain <domain>] [--object-set <set>] --key <logical-key>`
-- `mooncake-store-admin quota reservations --tenant <tenant> [--domain <domain>] [--object-set <set>] [--state pending|finalized|aborted]`
-- `mooncake-store-admin quota abort --tenant <tenant> [--domain <domain>] [--object-set <set>] --reservation-id <id> [--dry-run]`
-- `mooncake-store-admin quota reconcile --tenant <tenant> [--domain <domain>] [--object-set <set>] [--dry-run]`
+- `mooncake-store-rs-admin quota state --tenant <tenant> [--domain <domain>] [--object-set <set>]`
+- `mooncake-store-rs-admin quota object --tenant <tenant> [--domain <domain>] [--object-set <set>] --key <logical-key>`
+- `mooncake-store-rs-admin quota reservations --tenant <tenant> [--domain <domain>] [--object-set <set>] [--state pending|finalized|aborted]`
+- `mooncake-store-rs-admin quota abort --tenant <tenant> [--domain <domain>] [--object-set <set>] --reservation-id <id> [--dry-run]`
+- `mooncake-store-rs-admin quota reconcile --tenant <tenant> [--domain <domain>] [--object-set <set>] [--dry-run]`
 
 Operational notes:
 
@@ -49,9 +49,9 @@ The same admin server can also run tenant-quota reservation reconcile for an exp
 
 Relevant surfaces:
 
-- `mooncake-store-admin cleanup-stale-segments`
-- `mooncake-store-admin server --cleanup-interval-ms <ms> --cleanup-batch-size <n>`
-- `mooncake-store-admin server --quota-reconcile-interval-ms <ms> --quota-reconcile-tenant <tenant>`
+- `mooncake-store-rs-admin cleanup-stale-segments`
+- `mooncake-store-rs-admin server --cleanup-interval-ms <ms> --cleanup-batch-size <n>`
+- `mooncake-store-rs-admin server --quota-reconcile-interval-ms <ms> --quota-reconcile-tenant <tenant>`
 
 Operational model:
 
@@ -68,14 +68,14 @@ Operational model:
 
 ## Admin tracing fanout
 
-`mooncake-store-admin server` is the cluster-level entry point for dynamic Jaeger tracing control.
+`mooncake-store-rs-admin server` is the cluster-level entry point for dynamic Jaeger tracing control.
 Operators should send tracing commands to the admin HTTP server instead of addressing every
 store node manually:
 
-- `mooncake-store-admin tracing status --admin-url http://<admin-host>:<port>`
-- `mooncake-store-admin tracing on --admin-url http://<admin-host>:<port> [--endpoint <otlp-endpoint>] [--sample-ratio <0..1>]`
-- `mooncake-store-admin tracing off --admin-url http://<admin-host>:<port>`
-- `mooncake-store-admin tracing flush --admin-url http://<admin-host>:<port>`
+- `mooncake-store-rs-admin tracing status --admin-url http://<admin-host>:<port>`
+- `mooncake-store-rs-admin tracing on --admin-url http://<admin-host>:<port> [--endpoint <otlp-endpoint>] [--sample-ratio <0..1>]`
+- `mooncake-store-rs-admin tracing off --admin-url http://<admin-host>:<port>`
+- `mooncake-store-rs-admin tracing flush --admin-url http://<admin-host>:<port>`
 
 The admin server discovers store-node tracing endpoints from live client leases. Store runtimes
 publish only the system label `metrics_port=<port>` when the metrics HTTP endpoint is enabled.
@@ -100,14 +100,14 @@ Server maintenance defaults:
 - `--quota-reconcile-interval-ms 0` disables background tenant quota reconcile
 - `--quota-reconcile-tenant <tenant>` can be repeated; when unset, no tenant quota reconcile worker is started
 
-`mooncake-store-admin` accepts every CLI parameter through an environment
+`mooncake-store-rs-admin` accepts every CLI parameter through an environment
 variable as a fallback. Explicit CLI flags override environment values.
 
 Global admin knobs:
 
 | CLI flag | Environment variable | Default | Meaning |
 |----------|----------------------|---------|---------|
-| `--metadata-url` (alias `--metadata_url`) | `MC_STORE_RS_METADATA_URL` | required | Store-RS metadata URL (`redis://...` or `etcd://...`). Same naming as `mooncake-store-client` / `mooncake-store-bench`. |
+| `--metadata-url` (alias `--metadata_url`) | `MC_STORE_RS_METADATA_URL` | required | Store-RS metadata URL (`redis://...` or `etcd://...`). Same naming as `mooncake-store-rs-client` / `mooncake-store-rs-bench`. |
 | `--admin-url` | `MC_STORE_ADMIN_URL` | command-dependent | admin HTTP endpoint used by route-migration client commands |
 | `--keyspace` | `MC_STORE_RS_KEYSPACE` | default keyspace | metadata keyspace |
 | `--trace-filter` | `MC_STORE_ADMIN_TRACE_FILTER` | tracing default | tracing filter for the admin process |
@@ -184,7 +184,7 @@ Environment knobs:
 
 Notes:
 
-- these knobs are read by `mooncake-store-admin server` through `AdminService::from_config(...)`
+- these knobs are read by `mooncake-store-rs-admin server` through `AdminService::from_config(...)`
 - the same defaults apply to tasks submitted through the long-lived admin HTTP server
 - task state is not persisted in metadata, so these settings control a live in-memory queue rather than a durable scheduler
 
@@ -263,7 +263,7 @@ Compatibility entrypoints expose the same background eviction watermarks:
 | Standalone client | `--eviction-high-watermark-percent` / `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` | `--eviction-low-watermark-percent` / `MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT` |
 | Python `setup(...)` | `eviction_high_watermark_percent=` or `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` | `eviction_low_watermark_percent=` or `MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT` |
 | Python config dict | `eviction_high_watermark_percent` | `eviction_low_watermark_percent` |
-| `mooncake-store-bench` | `--eviction-high-watermark-percent` / `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` | `--eviction-low-watermark-percent` / `MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT` |
+| `mooncake-store-rs-bench` | `--eviction-high-watermark-percent` / `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` | `--eviction-low-watermark-percent` / `MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT` |
 
 Startup registration behavior:
 
@@ -342,7 +342,7 @@ Startup bootstrap is metadata-authoritative:
 - startup then resolves the effective policy for the client's default tenant: tenant override first, otherwise the default cluster policy
 - later clients must match that effective policy or startup fails immediately
 
-Use `mooncake-store-admin policy set --tenant <tenant> --route-topk <n> --route-control <mode>` when one tenant in a shared metadata keyspace needs a different route-authority policy.
+Use `mooncake-store-rs-admin policy set --tenant <tenant> --route-topk <n> --route-control <mode>` when one tenant in a shared metadata keyspace needs a different route-authority policy.
 
 ## Routed Placement
 
@@ -447,7 +447,7 @@ Use `MC_REDIS_PASSWORD` for password-only Redis deployments, including cloud Red
 
 ```bash
 export MC_REDIS_PASSWORD='<redis-password>'
-mooncake-store-client \
+mooncake-store-rs-client \
   --local-hostname 127.0.0.1 \
   --metadata-url redis://redis.example.com:6379/0 \
   --stable-id store-a
@@ -472,7 +472,7 @@ For Redis 5 password-only deployments, the metadata backend also tolerates conne
 
 ## Standalone Client Configuration
 
-`mooncake-store-client run` accepts its runtime knobs either as CLI flags or as
+`mooncake-store-rs-client run` accepts its runtime knobs either as CLI flags or as
 environment variables. Explicit CLI flags override environment values. For
 environment-only startup, keep the `run` subcommand because the root command with
 no arguments still renders help.
@@ -513,7 +513,7 @@ no arguments still renders help.
 | `--route-control` | `MC_STORE_RS_ROUTE_CONTROL` | `embedded_wrh` | route-control fallback; accepts `embedded_wrh` / `embedded-wrh` or `metadata_only` / `metadata-only` |
 | `--drain-on-exit` | `MC_STORE_RS_DRAIN_ON_EXIT` | `false` | drain owned routes during graceful shutdown; env accepts falsey values such as `0`, `false`, `no`, or `off`, and treats other non-empty values as true |
 
-`mooncake-store-client stats` also supports `MC_STORE_RS_STATS_SERVER` for
+`mooncake-store-rs-client stats` also supports `MC_STORE_RS_STATS_SERVER` for
 `--server` and `MC_STORE_RS_STATS_JSON` for `--json`; the JSON switch uses the
 same falsey-value parsing as the standalone runtime boolean flags.
 
@@ -627,7 +627,7 @@ Behavior notes:
 - successful read misses populate the cache from the fetched value
 - successful local writes and deletes invalidate the matching local cache entry on that daemon
 - Python compatibility runtimes partition local entries by effective namespace scope, including `tenant`, `domain`, and `object_set`, so different object sets do not reuse the same cached value even inside one process
-- shm mode shares payload bytes with dummy clients connected to the same `mooncake-store-client`, while LRU metadata, generations, and pins remain private to the daemon
+- shm mode shares payload bytes with dummy clients connected to the same `mooncake-store-rs-client`, while LRU metadata, generations, and pins remain private to the daemon
 - cache entries are daemon-local only and are never published to Redis or etcd
 - metadata keyspace remains the authoritative read/write isolation boundary; cache partitioning does not make objects visible across keyspaces
 
@@ -661,9 +661,9 @@ The current repository uses these environment variables.
 | `MOONCAKE_LOCAL_HOSTNAME` | standalone client and bench | hostname or IP published by the runtime |
 | `MOONCAKE_PROTOCOL` | standalone client and bench | transport protocol such as `tcp` or `rdma` |
 | `MC_STORE_RS_TRANSPORT_BACKEND` | compatibility layer, standalone client, Python wrapper | select `tent` or `classic_te` as the default real transport backend |
-| `MC_STORE_RS_METADATA_URL` | standalone client, standalone admin, and bench | Store-RS metadata URL. Backs `--metadata-url` on `mooncake-store-client`, `mooncake-store-admin`, and `mooncake-store-bench`. The Python wrapper `setup({...})` dict-form also honors it as a fallback when neither `metadata_url` nor any of the upstream aliases (`master_server` / `master_server_addr` / `master_server_address`) is provided. |
-| `MC_STORE_RS_TRANSPORT_METADATA_URL` | standalone client, bench, Python wrapper dict-form fallback | Transfer Engine metadata input. Backs `--transport-metadata-url` on `mooncake-store-client` and `mooncake-store-bench`. The Python wrapper `setup({...})` dict-form honors it as a fallback when neither `transport_metadata_url` nor the upstream alias `metadata_server` is provided (default value `P2PHANDSHAKE`). |
-| `MC_STORE_RS_STORAGE_BYTES` | standalone client | local storage bytes for `mooncake-store-client run` |
+| `MC_STORE_RS_METADATA_URL` | standalone client, standalone admin, and bench | Store-RS metadata URL. Backs `--metadata-url` on `mooncake-store-rs-client`, `mooncake-store-rs-admin`, and `mooncake-store-rs-bench`. The Python wrapper `setup({...})` dict-form also honors it as a fallback when neither `metadata_url` nor any of the upstream aliases (`master_server` / `master_server_addr` / `master_server_address`) is provided. |
+| `MC_STORE_RS_TRANSPORT_METADATA_URL` | standalone client, bench, Python wrapper dict-form fallback | Transfer Engine metadata input. Backs `--transport-metadata-url` on `mooncake-store-rs-client` and `mooncake-store-rs-bench`. The Python wrapper `setup({...})` dict-form honors it as a fallback when neither `transport_metadata_url` nor the upstream alias `metadata_server` is provided (default value `P2PHANDSHAKE`). |
+| `MC_STORE_RS_STORAGE_BYTES` | standalone client | local storage bytes for `mooncake-store-rs-client run` |
 | `MC_STORE_RS_SCRATCH_BYTES` | standalone client and bench | local scratch bytes for compatibility-managed clients |
 | `MC_STORE_RS_RDMA_DEVICES` | standalone client and Rust e2e | RDMA device list |
 | `MC_STORE_RS_KEYSPACE` | standalone client, standalone admin, and Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace`; this also defines Python compatibility read/write visibility and local hot-cache partitioning |
@@ -691,7 +691,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS` | dummy compatibility clients | dummy gRPC timeout; falls back to `MC_STORE_RS_REQUEST_TIMEOUT_MS` when unset |
 | `MC_STORE_RS_CLIENT_SERVER_ADDRESS` | standalone client | dummy compatibility gRPC server address |
 | `MC_STORE_RS_DRAIN_ON_EXIT` | standalone client | drain owned routes during graceful shutdown; accepts falsey values such as `0`, `false`, `no`, or `off` |
-| `MC_STORE_RS_STATS_SERVER` | standalone client stats command | server address used by `mooncake-store-client stats --server` |
+| `MC_STORE_RS_STATS_SERVER` | standalone client stats command | server address used by `mooncake-store-rs-client stats --server` |
 | `MC_STORE_RS_STATS_JSON` | standalone client stats command | emit compact JSON from the stats command; accepts falsey values such as `0`, `false`, `no`, or `off` |
 | `MC_STORE_RS_CONTROL_PLANE_THREADS` | standalone client, Python compatibility runtime, applications | worker thread count for the shared control-plane RPC runtime; default `2`; must be `> 0` |
 | `MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS` | standalone client, Python compatibility runtime, applications | worker thread count for the embedded control-plane gRPC server; default `4`; must be `> 0` |
@@ -713,10 +713,10 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_OTLP_SERVICE_INSTANCE_ID` | standalone client, Python real mode, bench, and applications | Jaeger service instance id; defaults to `HOSTNAME` when present |
 | `MC_STORE_RS_OTLP_TIMEOUT_MS` | standalone client, Python real mode, bench, and applications | OTLP export timeout; default `3000` |
 | `MC_STORE_RS_OTLP_SAMPLE_RATIO` | standalone client, Python real mode, bench, and applications | OTLP trace sampling ratio from `0.0` to `1.0`; default `1.0`, lower it for high-throughput profiling |
-| `MC_BENCH_TRACE_FILE` | `mooncake-store-bench` | append bench tracing logs to this file; bench otherwise logs to `stderr` and does not use `MC_STORE_RS_TRACE_FILE` for its own output |
-| `MC_BENCH_INTERFACES` | `mooncake-store-bench` | combined write/read interface selector; accepts `<write>,<read>`, `<write>:<read>`, or `write=<...>,read=<...>`; when set it overrides non-CLI interface defaults |
-| `MC_BENCH_WRITE_INTERFACE` | `mooncake-store-bench` | measured write-side bench API; `put`, `batch_put`, or `batch_put_from`; default `batch_put_from` |
-| `MC_BENCH_READ_INTERFACE` | `mooncake-store-bench` | measured read-side bench API; `get`, `batch_get`, or `batch_get_into`; default `batch_get_into` |
+| `MC_BENCH_TRACE_FILE` | `mooncake-store-rs-bench` | append bench tracing logs to this file; bench otherwise logs to `stderr` and does not use `MC_STORE_RS_TRACE_FILE` for its own output |
+| `MC_BENCH_INTERFACES` | `mooncake-store-rs-bench` | combined write/read interface selector; accepts `<write>,<read>`, `<write>:<read>`, or `write=<...>,read=<...>`; when set it overrides non-CLI interface defaults |
+| `MC_BENCH_WRITE_INTERFACE` | `mooncake-store-rs-bench` | measured write-side bench API; `put`, `batch_put`, or `batch_put_from`; default `batch_put_from` |
+| `MC_BENCH_READ_INTERFACE` | `mooncake-store-rs-bench` | measured read-side bench API; `get`, `batch_get`, or `batch_get_into`; default `batch_get_into` |
 | `MC_STORE_RS_METRICS_ADDR` | Python wrapper setup fallback, e2e, and applications | bind address for the in-process metrics server |
 | `MC_STORE_RS_REDIS_URL` | Rust e2e | metadata Redis URL |
 | `MC_STORE_RS_REDIS_PORT` | local scripts and e2e | local Redis port |
@@ -736,7 +736,7 @@ The current repository uses these environment variables.
 | `MOONCAKE_ROOT_DIR` | local scripts and native shim builds | explicit Mooncake source tree |
 | `MOONCAKE_BUILD_DIR` | local scripts and native runtime loading | explicit Mooncake CMake build output tree |
 
-`mooncake-store-bench` reuses `MC_STORE_RS_TRACE_FILTER` for level control, but
+`mooncake-store-rs-bench` reuses `MC_STORE_RS_TRACE_FILTER` for level control, but
 it has its own trace-file surface. Use `MC_BENCH_TRACE_FILE` for bench logs and
 keep `MC_STORE_RS_TRACE_FILE` for standalone-client or Python real-client
 logging.
@@ -793,7 +793,7 @@ local debug captures.
 
 `/breakdown` returns JSON for SGLang/HiCache performance diagnosis. It includes
 API, phase, metadata-backend, transport, runtime, segment, and
-bottleneck-candidate sections. Use `mooncake-store-client stats --breakdown
+bottleneck-candidate sections. Use `mooncake-store-rs-client stats --breakdown
 --server <host:port>` for a compact human-readable summary, or add `--json` to
 print the raw JSON.
 

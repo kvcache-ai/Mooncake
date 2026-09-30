@@ -12,11 +12,11 @@ Store-RS already enforces multi-tenant isolation inside the runtime and control 
 
 What is missing is a **management surface** for operators to configure and inspect tenant-level policy without pushing that responsibility into the request path.
 
-This document proposes extending `mooncake-store-admin` into that management surface.
+This document proposes extending `mooncake-store-rs-admin` into that management surface.
 
 ## Goal
 
-Add a multi-tenant management plane to `mooncake-store-admin` so operators can:
+Add a multi-tenant management plane to `mooncake-store-rs-admin` so operators can:
 
 - configure tenant-scoped control-plane policy
 - inspect tenant-scoped state
@@ -43,13 +43,13 @@ Admin only manages policy and triggers explicit maintenance actions.
 
 ### Existing admin surface
 
-`mooncake-store-admin` currently provides a single explicit metadata maintenance command:
+`mooncake-store-rs-admin` currently provides a single explicit metadata maintenance command:
 
 - `cleanup-stale-segments`
 
 Current entrypoint:
 
-- `crates/mooncake-store-py/src/bin/mooncake-store-admin.rs`
+- `crates/mooncake-store-rs-admin/src/bin/mooncake-store-rs-admin.rs`
 
 ### Existing runtime/control-plane capabilities relevant to multi-tenancy
 
@@ -103,7 +103,7 @@ Relevant code:
 The core design in this document is now substantially implemented:
 
 - unified tenant policy is stored in metadata
-- `mooncake-store-admin` is the preferred tenant policy entrypoint
+- `mooncake-store-rs-admin` is the preferred tenant policy entrypoint
 - `policy list --tenant <tenant>` is pushed down to metadata backends instead of scanning every tenant policy in process
 - Store-RS runtime consumes and enforces tenant-scoped routing/quota/fairness/shaping/placement defaults
 - non-default object scopes use deterministic full-scope route keys, while the default namespace keeps the legacy `tenant::logical_key` route key
@@ -132,7 +132,7 @@ We need a dedicated management plane that:
 
 ## Design Summary
 
-Extend `mooncake-store-admin` with two new capability groups:
+Extend `mooncake-store-rs-admin` with two new capability groups:
 
 1. **Policy management**
    - get/set/delete tenant-scoped policy records in metadata
@@ -153,7 +153,7 @@ The design adds a new **Tenant Policy Store** in metadata and a thin **Admin Ser
 ```mermaid
 flowchart TB
     operator[Operator]
-    admin[mooncake-store-admin]
+    admin[mooncake-store-rs-admin]
 
     subgraph Admin Layer
         parser[CLI command parser]
@@ -274,7 +274,7 @@ Tenant-filtered listing is a backend concern: Redis and etcd narrow the read to 
 
 ## 2. Admin Service Layer
 
-Inside `mooncake-store-admin`, add an internal service layer that maps CLI commands to backends.
+Inside `mooncake-store-rs-admin`, add an internal service layer that maps CLI commands to backends.
 
 ### Responsibilities
 
@@ -325,7 +325,7 @@ That matches the same philosophy as `cleanup-stale-segments`: avoid automatic gu
 ## Top-level structure
 
 ```bash
-mooncake-store-admin [global flags] <group> <subcommand> [flags]
+mooncake-store-rs-admin [global flags] <group> <subcommand> [flags]
 ```
 
 ### Global flags
@@ -340,10 +340,10 @@ mooncake-store-admin [global flags] <group> <subcommand> [flags]
 ### 1. Policy management
 
 ```bash
-mooncake-store-admin policy get --tenant t1
-mooncake-store-admin policy set --tenant t1 --max-bytes 1TiB --max-objects 10000000
-mooncake-store-admin policy delete --tenant t1
-mooncake-store-admin policy list --tenant t1
+mooncake-store-rs-admin policy get --tenant t1
+mooncake-store-rs-admin policy set --tenant t1 --max-bytes 1TiB --max-objects 10000000
+mooncake-store-rs-admin policy delete --tenant t1
+mooncake-store-rs-admin policy list --tenant t1
 ```
 
 ### 2. Scope inspection
@@ -351,9 +351,9 @@ mooncake-store-admin policy list --tenant t1
 Implemented Phase 2 read-only inspection commands currently focus on strict-quota metadata:
 
 ```bash
-mooncake-store-admin quota state --tenant t1
-mooncake-store-admin quota object --tenant t1 --key object-a
-mooncake-store-admin quota reservations --tenant t1 --state pending
+mooncake-store-rs-admin quota state --tenant t1
+mooncake-store-rs-admin quota object --tenant t1 --key object-a
+mooncake-store-rs-admin quota reservations --tenant t1 --state pending
 ```
 
 The same data is also exposed over the admin HTTP surface:
@@ -373,9 +373,9 @@ Quota state and reservation listing intentionally collapse to the tenant-root sc
 ### 3. Explicit maintenance
 
 ```bash
-mooncake-store-admin maintain reconcile-routes --tenant t1
-mooncake-store-admin maintain cleanup-stale-routes --tenant t1
-mooncake-store-admin maintain cleanup-stale-segments --tenant t1
+mooncake-store-rs-admin maintain reconcile-routes --tenant t1
+mooncake-store-rs-admin maintain cleanup-stale-routes --tenant t1
+mooncake-store-rs-admin maintain cleanup-stale-segments --tenant t1
 ```
 
 > Note: existing global stale-segment cleanup remains, but tenant-scoped variants can be layered on top when enough route/segment metadata is scope-identifiable.
@@ -464,7 +464,7 @@ This preserves backward compatibility and keeps config layering intuitive. Objec
 ```mermaid
 sequenceDiagram
     participant Op as Operator
-    participant Admin as mooncake-store-admin
+    participant Admin as mooncake-store-rs-admin
     participant Meta as Metadata backend
     participant Client as Store client runtime
 
@@ -490,7 +490,7 @@ We should use optimistic concurrency for policy writes so operators do not unkno
 ```mermaid
 sequenceDiagram
     participant Op as Operator
-    participant Admin as mooncake-store-admin
+    participant Admin as mooncake-store-rs-admin
     participant Meta as Metadata backend
     participant CP as Control plane authority
 
@@ -517,7 +517,7 @@ The latter is slower but better for debugging divergence.
 ```mermaid
 sequenceDiagram
     participant Op as Operator
-    participant Admin as mooncake-store-admin
+    participant Admin as mooncake-store-rs-admin
     participant Meta as Metadata backend
     participant CP as Control plane authority
 
@@ -659,11 +659,11 @@ Add:
 If we want the smallest useful first cut, build exactly these commands first:
 
 ```bash
-mooncake-store-admin policy get --tenant <t>
-mooncake-store-admin policy set --tenant <t> [policy flags]
-mooncake-store-admin policy delete --tenant <t>
-mooncake-store-admin policy list
-mooncake-store-admin inspect routes --tenant <t>
+mooncake-store-rs-admin policy get --tenant <t>
+mooncake-store-rs-admin policy set --tenant <t> [policy flags]
+mooncake-store-rs-admin policy delete --tenant <t>
+mooncake-store-rs-admin policy list
+mooncake-store-rs-admin inspect routes --tenant <t>
 ```
 
 Why this set first:
@@ -681,7 +681,7 @@ Why this set first:
 
 #### Admin CLI
 
-- `crates/mooncake-store-py/src/bin/mooncake-store-admin.rs`
+- `crates/mooncake-store-rs-admin/src/bin/mooncake-store-rs-admin.rs`
   - add grouped subcommands
   - add shared scope flag parsing
   - call new admin service layer
@@ -727,7 +727,7 @@ This design matches existing repository principles:
 
 In short:
 
-- `mooncake-store-admin` becomes the **management plane entrypoint**
+- `mooncake-store-rs-admin` becomes the **management plane entrypoint**
 - metadata becomes the **durable tenant policy plane**
 - runtime/control plane remains the **enforcement plane**
 

@@ -28,9 +28,9 @@ CLI_ENTRY_POINTS = {
     "transfer_engine_topology_dump": "mooncake.transfer_engine_topology_dump:main",
 }
 STORE_RS_CLI_ENTRY_POINTS = {
-    "mooncake-store-client": "mooncake._launcher:store_rs_client",
-    "mooncake-store-admin": "mooncake._launcher:store_rs_admin",
-    "mooncake-store-bench": "mooncake._launcher:store_rs_bench",
+    "mooncake-store-rs-client": "mooncake._launcher:store_rs_client",
+    "mooncake-store-rs-admin": "mooncake._launcher:store_rs_admin",
+    "mooncake-store-rs-bench": "mooncake._launcher:store_rs_bench",
 }
 
 
@@ -303,6 +303,12 @@ def test_cli_entry_points_remain_stable_across_build_interfaces() -> None:
     root_project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
     scripts = root_project["project"]["scripts"]
     assert {name: scripts[name] for name in STORE_RS_CLI_ENTRY_POINTS} == STORE_RS_CLI_ENTRY_POINTS
+    old_store_rs_commands = {
+        "mooncake-store-client",
+        "mooncake-store-admin",
+        "mooncake-store-bench",
+    }
+    assert old_store_rs_commands.isdisjoint(scripts)
 
 
 def test_cli_build_inputs_use_the_canonical_sources() -> None:

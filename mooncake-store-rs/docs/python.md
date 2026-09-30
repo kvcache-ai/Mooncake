@@ -1,6 +1,6 @@
 # Python Guide
 
-The root `mooncake-transfer-engine` wheel owns the `mooncake` Python package and its Store facade. Store-RS bindings are implemented by `crates/mooncake-store-py` and the modules under `python/mooncake/store/rs`.
+The root `mooncake-transfer-engine` wheel owns the `mooncake` Python package and Store facade. PyO3 bindings come from `crates/mooncake-store-py`; the Python compatibility runtime lives in `crates/mooncake-store-rs-runtime`; Python Store-RS facades live under `python/mooncake/store/rs`.
 
 With `MOONCAKE_STORE_BACKEND` unset, the facade selects the C++ Store. Set the
 variable to exactly `cpp` or `rs` before importing `mooncake.store`. An empty or
@@ -37,7 +37,7 @@ The Python compatibility layer supports two execution styles.
 
 Use `setup(...)` when Python should talk to the native distributed store runtime directly.
 
-For tenant-scoped routing and resource policy, prefer `mooncake-store-admin policy ...` and durable metadata. Python `setup(...)` route knobs are kept as compatibility/bootstrap fallbacks.
+For tenant-scoped routing and resource policy, prefer `mooncake-store-rs-admin policy ...` and durable metadata. Python `setup(...)` route knobs are kept as compatibility/bootstrap fallbacks.
 
 Isolation knobs:
 
@@ -93,7 +93,7 @@ Use `setup_dummy(...)` when Python should behave like the upstream dummy compati
 
 This mode:
 
-- connects to a standalone `mooncake-store-client` process over gRPC
+- connects to a standalone `mooncake-store-rs-client` process over gRPC
 - registers shm regions by passing file descriptors over a Unix socket
 - only reports dummy `register_buffer(...)` success after the standalone daemon has installed the shared region in its dispatcher, so callers can issue `batch_put_from(...)` or `batch_get_into(...)` immediately without adding an extra sleep/retry fence
 - derives short hashed Unix socket filenames for dummy shm and hot-cache side channels so long worker scopes stay below AF_UNIX path limits
@@ -163,27 +163,35 @@ MOONCAKE_STORE_BACKEND=rs .venv-store-rs/bin/python -c \
   "from mooncake.store import MooncakeDistributedStore; print(MooncakeDistributedStore)"
 ```
 
-The wheel installs the private `mooncake._store_rs` extension and its CMake
-native dependencies in the `python` install component. Python imports use the
-installed package and its RPATH; they do not scan Cargo target directories or
-source checkouts.
+The CMake project builds and owns the classic-TE and TENT native shims, then
+installs those libraries and the private `mooncake._store_rs` extension through
+the `python` component. Python imports use the installed package and its RPATH;
+they do not scan Cargo target directories or source checkouts.
 
-## Standalone Client Binary
+## Standalone Store-RS Commands
 
-You can build the standalone compatibility server directly:
+The client and benchmark commands belong to the CLI crate; the admin command
+belongs to the admin crate. The Python package builds independently:
 
 ```bash
-cargo build --release -p mooncake-store-py --bin mooncake-store-client --bin mooncake-store-admin --bin mooncake-store-bench
+cargo build --release -p mooncake-store-rs-cli -p mooncake-store-rs-admin --bins
+cargo build --release -p mooncake-store-py --lib --features python-extension
 ```
 
+Direct Cargo builds require the explicit source, build, and CMake shim paths
+described in `docs/rust.md`. For an integrated build, configure the top-level
+Mooncake project with `WITH_STORE_RS=ON` and build the `build_store_rs` target.
+
 The executables are written to `target/release/` unless `CARGO_TARGET_DIR` is
-set. A root wheel built with `WITH_STORE_RS=ON` also installs the native
-commands next to the Python package and exposes them as console scripts.
+set. A root wheel built with `WITH_STORE_RS=ON` installs the three fixed-backend
+commands and private extension into the Python component. The standalone
+commands keep their `mooncake-store-rs-*` names regardless of the Python facade's
+`MOONCAKE_STORE_BACKEND` selection.
 
 Start a storage client:
 
 ```bash
-./target/release/mooncake-store-client \
+./target/release/mooncake-store-rs-client \
   --local-hostname 127.0.0.1 \
   --metadata-url redis://127.0.0.1:6380/0 \
   --storage-bytes $((128 * 1024 * 1024)) \
@@ -246,24 +254,24 @@ Use the standalone Rust admin binary when metadata still contains stale segment 
 from dead storage owners:
 
 ```bash
-./target/release/mooncake-store-admin \
+./target/release/mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   cleanup-stale-segments
 ```
 
 ## Admin HTTP Migration Tasks
 
-`mooncake-store-admin server` exposes an in-memory route-migration task queue over HTTP.
+`mooncake-store-rs-admin server` exposes an in-memory route-migration task queue over HTTP.
 
 For the operator workflow, task semantics, and request examples, see
 [Route Migration 使用手册](./route-migration-usage.md).
 
-The standalone Rust `mooncake-store-admin` binary acts as an operator client for that
+The standalone Rust `mooncake-store-rs-admin` binary acts as an operator client for that
 HTTP surface. Route-migration tasks are not kept in the CLI process, so
 `migrate ...` commands must point at a long-lived admin server with `--admin-url`:
 
 ```bash
-./target/release/mooncake-store-admin \
+./target/release/mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   --admin-url http://127.0.0.1:18080 \
   migrate copy \
@@ -278,7 +286,7 @@ HTTP surface. Route-migration tasks are not kept in the CLI process, so
   --task-executor executor-store \
   --max-retries 5
 
-./target/release/mooncake-store-admin \
+./target/release/mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   --admin-url http://127.0.0.1:18080 \
   migrate task list
@@ -317,25 +325,25 @@ Operational notes:
 Manage tenant policy or clean up stale segment registrations with the standalone Rust admin binary:
 
 ```bash
-./target/release/mooncake-store-admin \
+./target/release/mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy set \
   --tenant tenant-a \
   --route-topk 3 \
   --route-control embedded-wrh
 
-./target/release/mooncake-store-admin \
+./target/release/mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy get \
   --tenant tenant-a
 
-./target/release/mooncake-store-admin \
+./target/release/mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reservations \
   --tenant tenant-a \
   --state pending
 
-./target/release/mooncake-store-admin \
+./target/release/mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reconcile \
   --tenant tenant-a \
@@ -524,7 +532,7 @@ Use the repository-standard entry point to validate both compatibility paths in 
 
 This script:
 
-- builds the standalone `mooncake-store-client` binary
+- builds the standalone `mooncake-store-rs-client` binary
 - starts two storage daemons against a temporary Redis metadata backend
 - validates dummy single-item, shm batch, and shm multi-buffer read/write
 - validates real routed write/read across separate real clients
@@ -645,7 +653,7 @@ Current script behavior:
 Start the standalone compatibility server first:
 
 ```bash
-./target/release/mooncake-store-client \
+./target/release/mooncake-store-rs-client \
   --local-hostname 127.0.0.1 \
   --metadata-url redis://127.0.0.1:6380/0 \
   --storage-bytes $((64 * 1024 * 1024)) \
@@ -673,7 +681,7 @@ ptr = allocator.alloc(4096)
 store.register_buffer(ptr, 4096)
 ```
 
-`setup_dummy(...)` only needs `client_server_address` for the remote endpoint. It does not consume `transport_rpc_port`, because the standalone server owns the real store runtime and data-plane endpoint on behalf of the dummy client. Use `keyspace` to align with the intended metadata namespace and `worker_scope` when you need an explicit compat worker boundary for dummy-side cache and shm isolation. When callers omit `keyspace`, the Python wrapper now also falls back to `MC_STORE_RS_KEYSPACE` before deriving the dummy worker scope, so upstream SGLang dummy mode can share the same scoped side-channel namespace as a `mooncake-store-client --keyspace ... --client-server-address ...` gateway. A standalone daemon that binds `client_server_address` on a wildcard host also publishes side-channel aliases for its advertised host address, `127.0.0.1`, `::1`, and `localhost`, so dummy buffer clients do not need the daemon to bind the exact same host string they dial.
+`setup_dummy(...)` only needs `client_server_address` for the remote endpoint. It does not consume `transport_rpc_port`, because the standalone server owns the real store runtime and data-plane endpoint on behalf of the dummy client. Use `keyspace` to align with the intended metadata namespace and `worker_scope` when you need an explicit compat worker boundary for dummy-side cache and shm isolation. When callers omit `keyspace`, the Python wrapper now also falls back to `MC_STORE_RS_KEYSPACE` before deriving the dummy worker scope, so upstream SGLang dummy mode can share the same scoped side-channel namespace as a `mooncake-store-rs-client --keyspace ... --client-server-address ...` gateway. A standalone daemon that binds `client_server_address` on a wildcard host also publishes side-channel aliases for its advertised host address, `127.0.0.1`, `::1`, and `localhost`, so dummy buffer clients do not need the daemon to bind the exact same host string they dial.
 
 ## Host Allocator and Hugepages
 
@@ -867,7 +875,7 @@ length, and status. `MC_STORE_RS_TRACE_KEY_MODE=hash` is the default; use
 `full` only for local debug captures.
 
 The same metrics HTTP server also exposes `/breakdown` for SGLang/HiCache
-diagnosis. Use `mooncake-store-client stats --breakdown --server <host:port>`
+diagnosis. Use `mooncake-store-rs-client stats --breakdown --server <host:port>`
 for a readable summary, or add `--json` to keep the machine-readable API,
 phase, metadata, transport, runtime, and segment snapshot. The
 An external validation harness can save that endpoint after a real SGLang run.
@@ -895,7 +903,7 @@ Credentials embedded in `redis://username:password@host:port/db` are also accept
 
 `setup(local_hostname, transport_metadata_url, global_segment_size, local_buffer_size, protocol, rdma_devices, metadata_url)`.
 
-- `transport_metadata_url` is forwarded to the Transfer Engine only. Accepts `redis://...` or `P2PHANDSHAKE`. **Default value is `P2PHANDSHAKE`** everywhere it can be defaulted: the Python dict-form (resolution order: dict key → `MC_STORE_RS_TRANSPORT_METADATA_URL` env → `P2PHANDSHAKE`), the standalone CLI bins (`mooncake-store-client` / `mooncake-store-bench` without `--transport-metadata-url` or env), and other defaultable surfaces. The Python positional `setup(...)` requires it explicitly because Python disallows defaults on a positional that precedes required positionals; pass `"P2PHANDSHAKE"` to opt into the default. The dict-form also accepts the upstream Mooncake key `metadata_server` as an alias.
+- `transport_metadata_url` is forwarded to the Transfer Engine only. Accepts `redis://...` or `P2PHANDSHAKE`. **Default value is `P2PHANDSHAKE`** everywhere it can be defaulted: the Python dict-form (resolution order: dict key → `MC_STORE_RS_TRANSPORT_METADATA_URL` env → `P2PHANDSHAKE`), the standalone CLI bins (`mooncake-store-rs-client` / `mooncake-store-rs-bench` without `--transport-metadata-url` or env), and other defaultable surfaces. The Python positional `setup(...)` requires it explicitly because Python disallows defaults on a positional that precedes required positionals; pass `"P2PHANDSHAKE"` to opt into the default. The dict-form also accepts the upstream Mooncake key `metadata_server` as an alias.
 - `metadata_url` is the Store-RS metadata URL. Accepts `redis://...` or `etcd://...` and is required. The dict-form `setup({...})` also accepts the upstream Mooncake keys `master_server`, `master_server_addr`, and `master_server_address` interchangeably as aliases, with `MC_STORE_RS_METADATA_URL` env honored as a final fallback. The standalone CLI bins use the same env for their `--metadata-url` flag.
 
 ### Important note for etcd
@@ -1029,7 +1037,7 @@ Run the native CLI eviction black-box validation:
 
 This script verifies:
 
-- standalone `mooncake-store-client` storage process startup
+- standalone `mooncake-store-rs-client` storage process startup
 - routed writes from the Python compatibility layer into the CLI process
 - `put`, `get`, and `batch_get` around a real background eviction cycle
 - `/metrics` exposure for `storage_owner_background_eviction` and `storage_owner_evict_one`
@@ -1083,7 +1091,7 @@ python -m sglang.launch_server \
 - dummy-mode SGLang through a standalone routed gateway
 
 ```bash
-mooncake-store-client \
+mooncake-store-rs-client \
   --local-hostname 10.0.0.21 \
   --metadata-url redis://10.0.0.10:6379/0 \
   --storage-bytes 0 \
@@ -1120,8 +1128,8 @@ python -m sglang.launch_server \
   }'
 ```
 
-  Use this when SGLang should behave like the upstream dummy client. The standalone `mooncake-store-client` process owns the real runtime and exposes a dummy-compatible gRPC endpoint through `client_server_address`.
-  Because upstream SGLang still does not forward `worker_scope`, the standalone `mooncake-store-client --client-server-address` path now defaults its dummy side-channel scope to `worker-1` when `keyspace` is absent. That matches omitted-scope `setup_dummy(...)` clients in the serving process, so the default SGLang gateway topology can register shared-memory buffers without requiring a patched SGLang fork.
+  Use this when SGLang should behave like the upstream dummy client. The standalone `mooncake-store-rs-client` process owns the real runtime and exposes a dummy-compatible gRPC endpoint through `client_server_address`.
+  Because upstream SGLang still does not forward `worker_scope`, the standalone `mooncake-store-rs-client --client-server-address` path now defaults its dummy side-channel scope to `worker-1` when `keyspace` is absent. That matches omitted-scope `setup_dummy(...)` clients in the serving process, so the default SGLang gateway topology can register shared-memory buffers without requiring a patched SGLang fork.
   The standalone gateway may still bind `client_server_address` on `0.0.0.0` while dummy clients dial a concrete service IP. The dummy side channels now publish matching aliases for that concrete host string, so this wildcard-bind topology keeps working for registered-buffer and hot-cache paths.
 
 Port role summary:

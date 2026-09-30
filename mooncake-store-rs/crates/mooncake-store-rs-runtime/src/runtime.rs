@@ -8,9 +8,21 @@ use mooncake_store_client::{
 };
 use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
 
-pub use crate::config::{
-    CompatSetupArgs, CompatTimeoutCliOverrides, CompatTimeoutConfig, CompatTransportConfig,
-};
+use crate::config::{CompatSetupArgs, CompatTransportConfig};
+use crate::dispatcher::StoreDispatcher;
+
+pub fn finalize_real_dispatcher_setup(
+    dispatcher: &StoreDispatcher,
+    initial_state: ClientLifecycleState,
+    lease_ttl_ms: u64,
+) -> Result<()> {
+    dispatcher.register_local_memory()?;
+    if initial_state == ClientLifecycleState::Active {
+        dispatcher.activate()?;
+    }
+    dispatcher.start_heartbeat_loop(lease_ttl_ms, None)?;
+    Ok(())
+}
 
 pub struct CompatRuntime {
     pub client: StoreClient,

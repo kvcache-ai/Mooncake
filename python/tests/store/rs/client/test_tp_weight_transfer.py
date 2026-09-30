@@ -8,7 +8,7 @@ Scenarios:
   - TP 4→8 (split): each Rollouter rank reads half of one Trainer shard
   - TP 8→4 (merge): each Rollouter rank concatenates two full Trainer shards
 
-Requires a running mooncake-store-client daemon (dummy mode).
+Requires a running mooncake-store-rs-client daemon (dummy mode).
 
 Example:
     python3 python/tests/store/rs/client/test_tp_weight_transfer.py \

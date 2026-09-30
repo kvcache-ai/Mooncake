@@ -1,12 +1,10 @@
-"""
-Locate and launch native binaries bundled with the Mooncake wheel.
+"""Locate and launch fixed-backend native binaries bundled with the wheel.
 
-The CLI entry points in ``mooncake.cli`` / ``mooncake.cli_client`` /
-``mooncake.cli_bench`` are Python shims that ``exec`` a compiled C++ binary
-shipped inside the wheel. The binary is resolved through
-:func:`importlib.resources.files` so it stays agnostic to where the package is
-installed, and is made executable on the fly because ``setuptools``
-``package-data`` does not preserve the execute bit.
+The ``mooncake.cli`` / ``cli_client`` / ``cli_bench`` console entry points
+launch C++ binaries. The ``mooncake-store-rs-*`` entry points below launch the
+Store-RS binaries directly; they do not follow ``MOONCAKE_STORE_BACKEND``,
+which selects only the Python Store facade. Package resources keep both command
+families independent of their installation directory.
 """
 
 from __future__ import annotations
@@ -46,12 +44,12 @@ def _exec_store_rs_binary(name: str) -> None:
 
 
 def store_rs_client() -> None:
-    _exec_store_rs_binary("mooncake-store-client")
+    _exec_store_rs_binary("mooncake-store-rs-client")
 
 
 def store_rs_admin() -> None:
-    _exec_store_rs_binary("mooncake-store-admin")
+    _exec_store_rs_binary("mooncake-store-rs-admin")
 
 
 def store_rs_bench() -> None:
-    _exec_store_rs_binary("mooncake-store-bench")
+    _exec_store_rs_binary("mooncake-store-rs-bench")

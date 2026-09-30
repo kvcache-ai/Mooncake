@@ -5,7 +5,7 @@ Validates the full write/read cycle for parallelism-aware tensor operations,
 including cross-TP scatter-gather reconstruction, writer partitions, and
 multi-axis layouts.
 
-Requires a running mooncake-store-client daemon (dummy mode) and torch.
+Requires a running mooncake-store-rs-client daemon (dummy mode) and torch.
 
 Example:
     python3 python/tests/store/rs/client/test_unified_parallel_tensor.py \

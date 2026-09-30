@@ -1,11 +1,11 @@
-# mooncake-store-bench
+# mooncake-store-rs-bench
 
-`mooncake-store-bench` is a standalone benchmark and verification tool for the Mooncake store. It is built from the Rust workspace alongside `mooncake-store-client` and `mooncake-store-admin`.
+`mooncake-store-rs-bench` is a standalone benchmark and verification tool for the Mooncake store. It is built by `mooncake-store-rs-cli` alongside `mooncake-store-rs-client`; the separate admin command is built by `mooncake-store-rs-admin`.
 
 ## Commands
 
 ```
-mooncake-store-bench [global options] <COMMAND>
+mooncake-store-rs-bench [global options] <COMMAND>
 ```
 
 ### Global options
@@ -34,7 +34,7 @@ matching metadata, transport, and `--keyspace` settings before running the
 benchmark. This is the same storage/RW role split used by
 `scripts/tests/client/test-client-rw-cli.sh`. When `--keyspace` is omitted in
 scratch-only mode, bench joins the same default metadata namespace as
-`mooncake-store-client`: `mc/store-rs/v2`. When `--storage-bytes > 0` and
+`mooncake-store-rs-client`: `mc/store-rs/v2`. When `--storage-bytes > 0` and
 `--keyspace` is omitted, bench generates an isolated
 `mc/store-rs/bench/<unique>` keyspace for that run.
 
@@ -50,7 +50,7 @@ Startup safety gate for `classic_te` compatibility deployments:
 
 ### Tracing behavior
 
-`mooncake-store-bench` initializes its own tracing subscriber.
+`mooncake-store-rs-bench` initializes its own tracing subscriber.
 
 - default sink: `stderr`
 - effective filter: `--trace-filter`, then `MC_STORE_RS_TRACE_FILTER`, then `RUST_LOG`, then `info`
@@ -62,7 +62,7 @@ Startup safety gate for `classic_te` compatibility deployments:
 ### `bench` — throughput and latency
 
 ```
-mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 bench \
+mooncake-store-rs-bench --metadata-url redis://127.0.0.1:6379/0 bench \
   --mode mixed \
   --write-interface batch-put-from \
   --read-interface batch-get-into \
@@ -146,7 +146,7 @@ Counters always count API calls, not individual objects:
 ### `verify` — correctness checks
 
 ```
-mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 verify \
+mooncake-store-rs-bench --metadata-url redis://127.0.0.1:6379/0 verify \
   --write-interface batch-put-from \
   --read-interface batch-get-into \
   --verify-overwrite \
@@ -182,7 +182,7 @@ Default checks run without flags:
 ### `soak` — long-duration stability
 
 ```
-mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 soak \
+mooncake-store-rs-bench --metadata-url redis://127.0.0.1:6379/0 soak \
   --duration 3600 \
   --write-interface batch-put-from \
   --read-interface batch-get-into \
@@ -232,7 +232,7 @@ Progress is reported on a single line per interval:
 ### Module layout
 
 ```
-crates/mooncake-store-py/src/bin/mooncake_store_bench/
+crates/mooncake-store-rs-cli/src/bin/mooncake-store-rs-bench/
   main.rs      entry point: parse args, init bench-local tracing, install ctrlc, dispatch
   cli.rs       clap structs: GlobalArgs, BenchArgs, VerifyArgs, SoakArgs, FaultSpec
   datagen.rs   deterministic LCG payload generation; key naming helpers
@@ -261,7 +261,7 @@ All payloads are deterministic. The seed string is `{global_seed}-{key}-{generat
 
 `BenchCluster` wraps one or more `StoreClient` instances for writer and reader
 roles. It uses the same `CompatRuntimeArgs` / `CompatSetupArgs` path as
-`mooncake-store-client`, so transport backend selection, RDMA env passthrough,
+`mooncake-store-rs-client`, so transport backend selection, RDMA env passthrough,
 and compatibility defaults stay aligned with the normal runtime.
 
 Each client gets its own selected transport factory (`classic-te` by default,
@@ -278,11 +278,14 @@ Keyspace behavior is conditional:
 Build the benchmark and client commands from the workspace:
 
 ```bash
-cargo build --release -p mooncake-store-py --bin mooncake-store-bench --bin mooncake-store-client --bin mooncake-store-admin
+cargo build --release -p mooncake-store-rs-cli -p mooncake-store-rs-admin --bins
 export PATH="$PWD/target/release:$PATH"
 ```
 
-The binaries are written to `target/release/` unless `CARGO_TARGET_DIR` is set.
+Direct Cargo builds require the explicit source, build, and CMake shim paths
+described in `docs/rust.md`. The top-level `build_store_rs` CMake target builds
+the native shims and Rust command binaries together. Direct Cargo binaries are
+written to `target/release/` unless `CARGO_TARGET_DIR` is set.
 
 ## Next reading
 

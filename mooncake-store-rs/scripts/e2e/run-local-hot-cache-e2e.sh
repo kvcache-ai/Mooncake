@@ -342,7 +342,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
   export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_DAEMON_HOST="127.0.0.1:$(allocate_port)"
   export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_DUMMY_ADDR="127.0.0.1:$(allocate_port)"
   export MC_STORE_RS_LOCAL_HOT_CACHE_E2E_DUMMY_WRITER_HOST="127.0.0.1:$(allocate_port)"
-  DAEMON_BIN="${PYTHON_BIN%/*}/mooncake-store-client"
+  DAEMON_BIN="${PYTHON_BIN%/*}/mooncake-store-rs-client"
   env \
     MC_STORE_LOCAL_HOT_CACHE_SIZE="${HOT_CACHE_BYTES}" \
     MC_STORE_LOCAL_HOT_BLOCK_SIZE="${HOT_BLOCK_BYTES}" \
@@ -366,7 +366,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
   DAEMON_PID=$!
   wait_for_log_line \
     "${DAEMON_LOG}" \
-    "mooncake-store-client started stable_id=${DUMMY_DAEMON_STABLE_ID}" \
+    "mooncake-store-rs-client started stable_id=${DUMMY_DAEMON_STABLE_ID}" \
     15
 
   "${PYTHON_BIN}" - <<'PY'

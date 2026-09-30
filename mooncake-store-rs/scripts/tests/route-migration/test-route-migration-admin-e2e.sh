@@ -37,12 +37,12 @@ export PYTHONDONTWRITEBYTECODE=1
 cd "${REPO_ROOT}"
 
 echo "==> route migration admin e2e: admin HTTP server status flow"
-cargo test -p mooncake-store-py \
+cargo test -p mooncake-store-rs-admin --lib \
   admin_http_server_accepts_route_migration_tasks_and_reports_status \
   -- --nocapture
 
 echo "==> route migration admin e2e: operator CLI HTTP client flow"
-cargo test -p mooncake-store-py --bin mooncake-store-admin \
+cargo test -p mooncake-store-rs-admin --bin mooncake-store-rs-admin \
   route_migration_http_client_ \
   -- --nocapture
 

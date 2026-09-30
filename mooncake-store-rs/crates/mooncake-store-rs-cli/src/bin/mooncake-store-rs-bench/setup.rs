@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use _store_rs::runtime::{CompatRuntime, CompatRuntimeArgs, CompatSetupArgs};
 use mooncake_store_client::{MooncakeCompatibilityFacade, StoreClient};
 use mooncake_store_core::{ClientLease, ClientLifecycleState, MetadataBackend, RouteControlMode};
 use mooncake_store_rs_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+use mooncake_store_rs_runtime::{CompatRuntime, CompatRuntimeArgs, CompatSetupArgs};
 use tracing::{debug, info, trace, warn};
 use url::Url;
 

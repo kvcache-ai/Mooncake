@@ -59,6 +59,21 @@ def test_wheel_imports_outside_the_repository(
         if name.startswith("mooncake/_store_rs.") and name.endswith(".so")
     ]
     assert len(rs_extensions) <= 1
+    old_rs_binaries = {
+        "mooncake/mooncake-store-client",
+        "mooncake/mooncake-store-admin",
+        "mooncake/mooncake-store-bench",
+    }
+    new_rs_binaries = {
+        "mooncake/mooncake-store-rs-client",
+        "mooncake/mooncake-store-rs-admin",
+        "mooncake/mooncake-store-rs-bench",
+    }
+    assert old_rs_binaries.isdisjoint(wheel_files)
+    if rs_extensions:
+        assert new_rs_binaries <= wheel_files
+    else:
+        assert new_rs_binaries.isdisjoint(wheel_files)
 
     environment = tmp_path / "environment"
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
@@ -144,10 +159,16 @@ expected_entry_points = {{
 }}
 if {project_file == "pyproject.toml"!r}:
     expected_entry_points.update({{
-        "mooncake-store-client": "mooncake._launcher:store_rs_client",
-        "mooncake-store-admin": "mooncake._launcher:store_rs_admin",
-        "mooncake-store-bench": "mooncake._launcher:store_rs_bench",
+        "mooncake-store-rs-client": "mooncake._launcher:store_rs_client",
+        "mooncake-store-rs-admin": "mooncake._launcher:store_rs_admin",
+        "mooncake-store-rs-bench": "mooncake._launcher:store_rs_bench",
     }})
+    old_store_rs_commands = {{
+        "mooncake-store-client",
+        "mooncake-store-admin",
+        "mooncake-store-bench",
+    }}
+    assert old_store_rs_commands.isdisjoint(entry_points)
 assert {{name: entry_points[name] for name in expected_entry_points}} == expected_entry_points
 
 for module in (
@@ -209,16 +230,21 @@ for name, module in tuple(sys.modules.items()):
             env=rs_environment,
             check=True,
         )
-        cli = environment / "bin" / "mooncake-store-client"
-        result = subprocess.run(
-            [str(cli), "--help"],
-            cwd=tmp_path,
-            env=rs_environment,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        assert "Usage:" in result.stdout or "Usage:" in result.stderr
+        for name in (
+            "mooncake-store-rs-client",
+            "mooncake-store-rs-admin",
+            "mooncake-store-rs-bench",
+        ):
+            cli = environment / "bin" / name
+            result = subprocess.run(
+                [str(cli), "--help"],
+                cwd=tmp_path,
+                env=rs_environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert "Usage:" in result.stdout or "Usage:" in result.stderr
     else:
         missing_rs = clean_environment.copy()
         missing_rs["MOONCAKE_STORE_BACKEND"] = "rs"
@@ -346,6 +372,16 @@ def test_store_rs_backend_from_installed_root_wheel(tmp_path: Path) -> None:
         if name.startswith("mooncake/_store_rs.") and name.endswith(".so")
     ]
     assert len(rs_extensions) == 1
+    assert {
+        "mooncake/mooncake-store-rs-client",
+        "mooncake/mooncake-store-rs-admin",
+        "mooncake/mooncake-store-rs-bench",
+    } <= wheel_files
+    assert not {
+        "mooncake/mooncake-store-client",
+        "mooncake/mooncake-store-admin",
+        "mooncake/mooncake-store-bench",
+    } & wheel_files
     assert not any(name.endswith("mooncake_store_rs.pth") for name in wheel_files)
     assert not any(name.startswith("mooncake_store_rs/") for name in wheel_files)
 
@@ -383,9 +419,19 @@ assert store.RegisteredBufferPool is store.BufferPool
 assert not hasattr(store, "EngramStore")
 assert public_structured.MooncakeBundleTransfer is not rs_structured.MooncakeBundleTransfer
 assert public_structured.MooncakeBundleTransfer.__module__ == "mooncake.structured_object_store"
-assert "mooncake-store-client" in {
+entry_points = {
     item.name for item in metadata.entry_points(group="console_scripts")
 }
+assert {
+    "mooncake-store-rs-client",
+    "mooncake-store-rs-admin",
+    "mooncake-store-rs-bench",
+} <= entry_points
+assert not {
+    "mooncake-store-client",
+    "mooncake-store-admin",
+    "mooncake-store-bench",
+} & entry_points
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke],
@@ -394,16 +440,24 @@ assert "mooncake-store-client" in {
         check=True,
     )
 
-    cli = environment / "bin" / "mooncake-store-client"
-    result = subprocess.run(
-        [str(cli), "--help"],
-        cwd=tmp_path,
-        env=clean_environment,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert "Usage:" in result.stdout or "Usage:" in result.stderr
+    for backend in ("cpp", "rs"):
+        command_environment = clean_environment.copy()
+        command_environment["MOONCAKE_STORE_BACKEND"] = backend
+        for name in (
+            "mooncake-store-rs-client",
+            "mooncake-store-rs-admin",
+            "mooncake-store-rs-bench",
+        ):
+            cli = environment / "bin" / name
+            result = subprocess.run(
+                [str(cli), "--help"],
+                cwd=tmp_path,
+                env=command_environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert "Usage:" in result.stdout or "Usage:" in result.stderr
 
     for backend in ("", "other"):
         invalid_environment = clean_environment.copy()

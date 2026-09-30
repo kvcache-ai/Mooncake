@@ -10,13 +10,6 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use _store_rs::build_info;
-use _store_rs::dispatcher::{CompatNamespaceScope, StoreDispatcher};
-use _store_rs::dummy_service::start_dummy_store_server;
-use _store_rs::runtime::{
-    CompatRuntimeArgs, CompatSetupArgs, CompatTimeoutCliOverrides, CompatTimeoutConfig,
-};
-use _store_rs::DEFAULT_COMPAT_WORKER_SCOPE;
 use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_store_client::{
     init_tracing, stable_phase_spread_ms, start_metrics_http_server, stop_metrics_http_server,
@@ -25,6 +18,11 @@ use mooncake_store_client::{
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
     METRICS_PORT_LABEL,
+};
+use mooncake_store_rs_cli::build_info;
+use mooncake_store_rs_runtime::{
+    start_dummy_store_server, CompatNamespaceScope, CompatRuntimeArgs, CompatSetupArgs,
+    CompatTimeoutCliOverrides, CompatTimeoutConfig, StoreDispatcher, DEFAULT_COMPAT_WORKER_SCOPE,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -263,7 +261,7 @@ enum Command {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "mooncake-store-client")]
+#[command(name = "mooncake-store-rs-client")]
 #[command(about = "Standalone Mooncake store-rs client commands")]
 #[command(version = build_info::build::PKG_VERSION, long_version = build_info::long_version_static())]
 #[command(arg_required_else_help = true)]
@@ -301,7 +299,7 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     validate_args(&args)?;
     init_tracing(normalize_trace_filter(args.trace_filter.as_deref()))?;
     build_info::log_build_info();
-    info!(config = ?args, "mooncake-store-client configuration");
+    info!(config = ?args, "mooncake-store-rs-client configuration");
     if args.keyspace.is_some() {
         warn!(
             keyspace = ?args.keyspace,
@@ -393,9 +391,9 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
             .unwrap_or("disabled"),
         route_control = ?args.route_control,
         replica_count = args.replica_count,
-        "mooncake-store-client state snapshot"
+        "mooncake-store-rs-client state snapshot"
     );
-    info!(stable_id = %stable_id, "mooncake-store-client ready");
+    info!(stable_id = %stable_id, "mooncake-store-rs-client ready");
 
     let mut heartbeat_state = HeartbeatLoopState::new(now_ms());
     let mut next_heartbeat = now_ms().saturating_add(initial_heartbeat_delay_ms(
@@ -961,7 +959,7 @@ fn started_message(
     client_server_address: Option<&str>,
 ) -> String {
     format!(
-        "mooncake-store-client started stable_id={stable_id} epoch={} initial_state={} segment={segment_name} lease_ttl_ms={lease_ttl_ms} heartbeat_interval_ms={heartbeat_interval_ms} request_timeout_ms={} startup_timeout_ms={} heartbeat_timeout_ms={} transfer_stall_timeout_ms={} metrics_addr={} client_server_address={} ",
+        "mooncake-store-rs-client started stable_id={stable_id} epoch={} initial_state={} segment={segment_name} lease_ttl_ms={lease_ttl_ms} heartbeat_interval_ms={heartbeat_interval_ms} request_timeout_ms={} startup_timeout_ms={} heartbeat_timeout_ms={} transfer_stall_timeout_ms={} metrics_addr={} client_server_address={} ",
         epoch.0,
         lifecycle_state_label(initial_state),
         timeouts.request_timeout.as_millis(),
@@ -980,7 +978,7 @@ fn handoff_message(
     deadline_ms: u64,
 ) -> String {
     format!(
-        "mooncake-store-client handoff stable_id={stable_id} from_epoch={} to_runtime={} deadline_ms={deadline_ms}",
+        "mooncake-store-rs-client handoff stable_id={stable_id} from_epoch={} to_runtime={} deadline_ms={deadline_ms}",
         from_epoch.0, successor
     )
 }
@@ -992,7 +990,7 @@ fn promoted_message(
     kind: HandoffKind,
 ) -> String {
     format!(
-        "mooncake-store-client promoted stable_id={stable_id} epoch={} from_epoch={} kind={kind:?}",
+        "mooncake-store-rs-client promoted stable_id={stable_id} epoch={} from_epoch={} kind={kind:?}",
         epoch.0, from_epoch.0
     )
 }
@@ -1004,7 +1002,7 @@ fn upgraded_message(
     migrated_routes: usize,
 ) -> String {
     format!(
-        "mooncake-store-client upgraded stable_id={stable_id} from_epoch={} to_epoch={} migrated_routes={migrated_routes}",
+        "mooncake-store-rs-client upgraded stable_id={stable_id} from_epoch={} to_epoch={} migrated_routes={migrated_routes}",
         from_epoch.0, to_epoch.0
     )
 }
@@ -1021,7 +1019,7 @@ fn lifecycle_state_label(state: ClientLifecycleState) -> &'static str {
 
 fn drained_message(stable_id: &str, evacuated_routes: usize) -> String {
     format!(
-        "mooncake-store-client drained stable_id={stable_id} evacuated_routes={evacuated_routes}"
+        "mooncake-store-rs-client drained stable_id={stable_id} evacuated_routes={evacuated_routes}"
     )
 }
 
@@ -1104,12 +1102,12 @@ fn refresh_lease_or_retry(
             trace!(
                 stable_id,
                 expires_at_ms = now_ms.saturating_add(lease_ttl_ms),
-                "mooncake-store-client heartbeat refreshed"
+                "mooncake-store-rs-client heartbeat refreshed"
             );
             let recovered = state.record_success(now_ms);
             if recovered != 0 {
                 eprintln!(
-                    "mooncake-store-client heartbeat recovered stable_id={stable_id} recovered_after_failures={recovered}"
+                    "mooncake-store-rs-client heartbeat recovered stable_id={stable_id} recovered_after_failures={recovered}"
                 );
             }
             now_ms.saturating_add(heartbeat_interval_ms)
@@ -1118,7 +1116,7 @@ fn refresh_lease_or_retry(
             let failures = state.record_failure();
             let retry_after_ms = heartbeat_retry_delay_ms(heartbeat_interval_ms);
             eprintln!(
-                "mooncake-store-client heartbeat failed stable_id={stable_id} consecutive_failures={failures} last_success_age_ms={} retry_after_ms={retry_after_ms} error={error}",
+                "mooncake-store-rs-client heartbeat failed stable_id={stable_id} consecutive_failures={failures} last_success_age_ms={} retry_after_ms={retry_after_ms} error={error}",
                 now_ms.saturating_sub(state.last_success_ms),
             );
             now_ms.saturating_add(retry_after_ms)
@@ -1178,7 +1176,7 @@ mod tests {
     };
     use mooncake_store_core::{ClientEpoch, ClientLifecycleState, METRICS_PORT_LABEL};
 
-    use _store_rs::runtime::CompatTimeoutConfig;
+    use mooncake_store_rs_runtime::CompatTimeoutConfig;
 
     use std::path::PathBuf;
 
@@ -1195,7 +1193,7 @@ mod tests {
         ColdTierSsdEngineArg, Command, HeartbeatLoopState, InitialStateArg, RouteControlArg,
         RunArgs, TransportBackendArg,
     };
-    use _store_rs::DEFAULT_COMPAT_WORKER_SCOPE;
+    use mooncake_store_rs_runtime::DEFAULT_COMPAT_WORKER_SCOPE;
 
     fn sample_timeouts() -> CompatTimeoutConfig {
         CompatTimeoutConfig {
@@ -1345,7 +1343,7 @@ mod tests {
     fn args_parser_accepts_core_flags() {
         with_env_var("MC_STORE_RS_INITIAL_STATE", None, || {
             let cli = parse_cli_from([
-                "mooncake-store-client",
+                "mooncake-store-rs-client",
                 "--local-hostname",
                 "127.0.0.1",
                 "--metadata-url",
@@ -1392,7 +1390,7 @@ mod tests {
     #[test]
     fn args_parser_accepts_extended_optional_flags() {
         let cli = parse_cli_from([
-            "mooncake-store-client",
+            "mooncake-store-rs-client",
             "--local-hostname",
             "10.0.0.1",
             "--metadata-url",
@@ -1504,7 +1502,7 @@ mod tests {
                 ("MC_STORE_RS_DRAIN_ON_EXIT", Some("yes")),
             ],
             || {
-                let cli = parse_cli_from(["mooncake-store-client", "run"])
+                let cli = parse_cli_from(["mooncake-store-rs-client", "run"])
                     .expect("env-backed run args should parse");
                 let Command::Run(args) = cli.command else {
                     panic!("expected run command");
@@ -1570,7 +1568,7 @@ mod tests {
             ],
             || {
                 let cli = parse_cli_from([
-                    "mooncake-store-client",
+                    "mooncake-store-rs-client",
                     "run",
                     "--local-hostname",
                     "127.0.0.1",
@@ -1609,7 +1607,7 @@ mod tests {
                 ("MC_STORE_RS_STATS_JSON", Some("false")),
             ],
             || {
-                let cli = parse_cli_from(["mooncake-store-client", "run"])
+                let cli = parse_cli_from(["mooncake-store-rs-client", "run"])
                     .expect("falsey env-backed run args should parse");
                 let Command::Run(args) = cli.command else {
                     panic!("expected run command");
@@ -1620,7 +1618,7 @@ mod tests {
                 let runtime_args = build_runtime_args(&args, sample_timeouts(), None);
                 assert_eq!(runtime_args.setup.use_hugepage, Some(false));
 
-                let cli = parse_cli_from(["mooncake-store-client", "stats"])
+                let cli = parse_cli_from(["mooncake-store-rs-client", "stats"])
                     .expect("falsey env-backed stats args should parse");
                 let Command::Stats(args) = cli.command else {
                     panic!("expected stats command");
@@ -1635,7 +1633,7 @@ mod tests {
     fn args_parser_reads_trace_filter_from_env_when_cli_omits_it() {
         with_env_var("MC_STORE_RS_TRACE_FILTER", Some("debug"), || {
             let cli = parse_cli_from([
-                "mooncake-store-client",
+                "mooncake-store-rs-client",
                 "--local-hostname",
                 "10.0.0.1",
                 "--metadata-url",
@@ -1659,7 +1657,7 @@ mod tests {
     #[test]
     fn stats_subcommand_parses_server_and_json_flag() {
         let cli = parse_cli_from([
-            "mooncake-store-client",
+            "mooncake-store-rs-client",
             "stats",
             "--server",
             "127.0.0.1:19090",
@@ -1679,7 +1677,7 @@ mod tests {
     #[test]
     fn explicit_run_subcommand_parses_runtime_args() {
         let cli = parse_cli_from([
-            "mooncake-store-client",
+            "mooncake-store-rs-client",
             "run",
             "--local-hostname",
             "127.0.0.1",
@@ -1697,14 +1695,14 @@ mod tests {
 
     #[test]
     fn root_help_returns_display_help_error() {
-        let error = parse_cli_from(["mooncake-store-client", "--help"])
+        let error = parse_cli_from(["mooncake-store-rs-client", "--help"])
             .expect_err("help should short-circuit clap parsing");
         assert_eq!(error.kind(), ErrorKind::DisplayHelp);
     }
 
     #[test]
     fn no_args_returns_help_instead_of_missing_required_flags() {
-        let error = parse_cli_from(["mooncake-store-client"])
+        let error = parse_cli_from(["mooncake-store-rs-client"])
             .expect_err("empty argv should short-circuit to help");
         assert_eq!(
             error.kind(),
@@ -1715,7 +1713,7 @@ mod tests {
     #[test]
     fn hot_upgrade_startup_flags_flow_into_runtime_args() {
         let cli = parse_cli_from([
-            "mooncake-store-client",
+            "mooncake-store-rs-client",
             "run",
             "--local-hostname",
             "10.0.0.2",
@@ -2052,7 +2050,7 @@ mod tests {
 
         assert_eq!(
             drained_message("node-a", 7),
-            "mooncake-store-client drained stable_id=node-a evacuated_routes=7"
+            "mooncake-store-rs-client drained stable_id=node-a evacuated_routes=7"
         );
     }
 

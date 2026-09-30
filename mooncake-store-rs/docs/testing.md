@@ -22,26 +22,24 @@ and conventions are the contract.
 
 ## Test Inventory
 
-Workspace `cargo test --lib` runs 879 tests across the workspace crates listed
-below. The Redis-backed integration tests inside `mooncake-store-rs-metadata` and
-`mooncake-store-py` skip silently when no `redis-server` binary is on `PATH`;
-the etcd-backed integration tests skip when no local `etcd` binary is
-available; all other tests run unconditionally.
+`cargo test --lib` runs the workspace library tests. Redis-backed integration
+tests in the metadata and admin crates skip when `redis-server` is unavailable;
+etcd-backed tests skip when local `etcd` is unavailable. Unit tests in the
+runtime, CLI, and Python-binding crates remain in their owning packages.
 
-| Crate | `--lib` tests | Notes |
-|---|---:|---|
-| `mooncake-store-client` | 537 | Dominant runtime; includes property tests and fault-injection integration |
-| `mooncake-store-core` | 112 | Pure-type contracts: identity, route, compat, error, codec |
-| `mooncake-store-rs-metadata` | 111 | In-memory backend + keyspace + segment state + Redis / etcd integration |
-| `mooncake-store-py` | 94 | PyO3 bindings, admin service, setup helpers (3 `#[ignore]`, including Redis-backed and etcd-backed admin maintenance tests) |
-| `mooncake-store-rs-transport` | 21 | Transport-core trait behaviour |
-| `mooncake-store-rs-transport-sys` | 4 | FFI shim sanity checks |
-| `mooncake-store-test-utils` | 0 | Test-only crate — no self-tests |
-| `mooncake-store-transport-core` | 0 | Trait definitions only |
-
-Wall time on a warm cache stays in the low-20-second range, with
-`mooncake-store-client` still responsible for most of that time because it
-owns the fault-injection and property suites.
+| Crate | Test ownership |
+|---|---|
+| `mooncake-store-client` | Store SDK runtime, routing, allocator, and fault-injection/property tests |
+| `mooncake-store-rs-runtime` | Python compatibility configuration, dispatcher, dummy service, and shared-memory runtime tests |
+| `mooncake-store-rs-admin` | Admin service, HTTP queue, maintenance, and admin command tests |
+| `mooncake-store-rs-cli` | Standalone client and benchmark command tests |
+| `mooncake-store-py` | PyO3 bindings and Python-facing buffer/tensor wrapper tests |
+| `mooncake-store-core` | Pure-type contracts: identity, route, compat, error, codec |
+| `mooncake-store-rs-metadata` | In-memory backend, keyspace, segment state, and Redis / etcd integration |
+| `mooncake-store-rs-transport` | Transport-core trait behaviour |
+| `mooncake-store-rs-transport-sys` | Rust FFI boundary checks for CMake-built shims |
+| `mooncake-store-test-utils` | Test-only fixtures and decorators |
+| `mooncake-store-transport-core` | Trait definitions |
 
 ### Per-file breakdown — client tests
 
@@ -164,7 +162,7 @@ End-to-end flows that compose ≥2 real components without mocks.
 - `mooncake-store-rs-metadata::etcd_backend::tests::etcd_backend_*` — 7 tests gated
   on a local `etcd` binary, covering round-trip metadata behavior plus expiry
   work-index and owner-scoped cleanup semantics.
-- `mooncake-store-py::admin::service::tests::*stale_segments*` — 4 backend-integrated
+- `mooncake-store-rs-admin::admin::service::tests::*stale_segments*` — 4 backend-integrated
   admin-maintenance scenarios verify dead-owner cleanup and live-owner skip
   semantics against both Redis and etcd metadata backends.
 - `mooncake-store-client::client::tests::mod.rs` — 116 scenarios build
@@ -245,7 +243,7 @@ for the admin PR layer.
 It validates:
 
 - admin HTTP submit -> list -> status transitions
-- `mooncake-store-admin` as the operator-side HTTP client for route migration
+- `mooncake-store-rs-admin` as the operator-side HTTP client for route migration
 
 ### Unit and in-process integration
 
@@ -254,7 +252,7 @@ It validates:
   worker-failure recovery, and the main control-plane request / reply contracts.
 - `crates/mooncake-store-client/src/control_plane/tests.rs`
   covers migration RPC validation and client-side decoding failures.
-- `crates/mooncake-store-py/src/admin/*.rs`
+- `crates/mooncake-store-rs-admin/src/admin/*.rs`
   keeps admin HTTP / queue / CLI behaviour under in-process tests.
 
 ### Scripted E2E
@@ -303,7 +301,7 @@ See `store_client_tests::make_faulty_reader` for the pattern.
 ## Redis-backed Integration: Conditional Skip
 
 `RedisTestServer::start()` in both `mooncake-store-rs-metadata/src/redis_backend.rs`
-and `crates/mooncake-store-py/src/admin/service.rs` spawns a local
+and `crates/mooncake-store-rs-admin/src/admin/service.rs` spawns a local
 `redis-server` child process on an ephemeral port. Every Redis-backed
 integration test begins with:
 
@@ -341,7 +339,7 @@ Admin service scenarios covered:
 ## Etcd-backed Integration: Conditional Skip
 
 `EtcdTestServer::start()` in `mooncake-store-rs-metadata/src/etcd_backend.rs` and
-`crates/mooncake-store-py/src/admin/service.rs` spawns a local single-node
+`crates/mooncake-store-rs-admin/src/admin/service.rs` spawns a local single-node
 `etcd` child process on ephemeral client/peer ports. The readiness probe waits
 for the server to accept traffic before the test continues.
 
@@ -417,8 +415,11 @@ Matches the command CI runs. Completes in ≈17 s on a warm cache.
 cargo test -p mooncake-store-client --lib
 cargo test -p mooncake-store-rs-metadata --lib
 cargo test -p mooncake-store-core --lib
+cargo test -p mooncake-store-rs-runtime --lib
+cargo test -p mooncake-store-rs-admin --lib
+cargo test -p mooncake-store-rs-cli --bins
 cargo test -p mooncake-store-py --lib
-cargo test -p mooncake-store-py --bin mooncake-store-admin
+cargo test -p mooncake-store-rs-admin --bin mooncake-store-rs-admin
 ```
 
 ### Single test file or pattern
@@ -437,7 +438,7 @@ Override the default case count for a one-off deep-dive:
 PROPTEST_CASES=5000 cargo test -p mooncake-store-client --lib prop_align_up
 ```
 
-Redis-backed lib tests inside `mooncake-store-rs-metadata` and `mooncake-store-py`
+Redis-backed lib tests inside `mooncake-store-rs-metadata` and `mooncake-store-rs-admin`
 run only if the CI image has a `redis-server` binary. Etcd-backed tests run
 only if the image also includes a local `etcd` binary. Redis coverage runs on
 the current CI image; etcd coverage depends on the builder image contents.

@@ -48,7 +48,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 cd "${REPO_ROOT}"
 
-BIN="${PYTHON_BIN%/*}/mooncake-store-client"
+BIN="${PYTHON_BIN%/*}/mooncake-store-rs-client"
 
 if [[ ! -x "${BIN}" ]]; then
   echo "installed root wheel did not provide ${BIN}" >&2

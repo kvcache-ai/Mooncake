@@ -366,7 +366,7 @@ impl LocalHotCache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn contains(&self, key: &HotCacheKey) -> bool {
         self.inner.lock().key_to_block.contains_key(key)
     }

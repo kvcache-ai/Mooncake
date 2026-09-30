@@ -74,9 +74,9 @@ set(STORE_RS_TENT_SHIM "$<TARGET_FILE:mooncake_store_rs_tent_shim>")
 set(STORE_RS_PYTHON_EXTENSION
     ${STORE_RS_PYTHON_RELEASE_DIR}/lib_store_rs${CMAKE_SHARED_LIBRARY_SUFFIX})
 
-set(STORE_RS_CLI_CLIENT ${STORE_RS_CLI_RELEASE_DIR}/mooncake-store-client)
-set(STORE_RS_CLI_ADMIN ${STORE_RS_CLI_RELEASE_DIR}/mooncake-store-admin)
-set(STORE_RS_CLI_BENCH ${STORE_RS_CLI_RELEASE_DIR}/mooncake_store_bench)
+set(STORE_RS_CLI_CLIENT ${STORE_RS_CLI_RELEASE_DIR}/mooncake-store-rs-client)
+set(STORE_RS_CLI_ADMIN ${STORE_RS_CLI_RELEASE_DIR}/mooncake-store-rs-admin)
+set(STORE_RS_CLI_BENCH ${STORE_RS_CLI_RELEASE_DIR}/mooncake-store-rs-bench)
 
 add_custom_target(build_store_rs_cli
   COMMAND
@@ -87,11 +87,11 @@ add_custom_target(build_store_rs_cli
     "MOONCAKE_STORE_RS_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     "MOONCAKE_CLASSIC_SHIM_LIB_PATH=${STORE_RS_CLASSIC_SHIM}"
     "MOONCAKE_TENT_SHIM_LIB_PATH=${STORE_RS_TENT_SHIM}"
-    ${CARGO_EXECUTABLE} build -p mooncake-store-py --no-default-features --bins
-    --release
+    ${CARGO_EXECUTABLE} build -p mooncake-store-rs-cli -p mooncake-store-rs-admin
+    --bins --release
   BYPRODUCTS ${STORE_RS_CLI_CLIENT} ${STORE_RS_CLI_ADMIN} ${STORE_RS_CLI_BENCH}
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  COMMENT "Building Store-RS command-line tools without Python bindings"
+  COMMENT "Building Store-RS CLI tools without Python bindings"
   VERBATIM)
 add_dependencies(build_store_rs_cli transfer_engine tent_shared
                  mooncake_store_rs_classic_shim mooncake_store_rs_tent_shim)
@@ -106,7 +106,7 @@ add_custom_target(build_store_rs_python_extension
     "MOONCAKE_STORE_RS_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     "MOONCAKE_CLASSIC_SHIM_LIB_PATH=${STORE_RS_CLASSIC_SHIM}"
     "MOONCAKE_TENT_SHIM_LIB_PATH=${STORE_RS_TENT_SHIM}"
-    ${CARGO_EXECUTABLE} build -p mooncake-store-py --no-default-features --lib
+    ${CARGO_EXECUTABLE} build -p mooncake-store-py --lib
     --features python-extension --release
   BYPRODUCTS ${STORE_RS_PYTHON_EXTENSION}
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -129,12 +129,11 @@ install(
   RENAME _store_rs${STORE_RS_EXTENSION_SUFFIX}
   COMPONENT python)
 install(PROGRAMS ${STORE_RS_CLI_CLIENT} ${STORE_RS_CLI_ADMIN}
+                ${STORE_RS_CLI_BENCH}
         DESTINATION mooncake COMPONENT python)
-install(PROGRAMS ${STORE_RS_CLI_BENCH}
-        DESTINATION mooncake RENAME mooncake-store-bench COMPONENT python)
 
-# Unit tests use the default Python embedding feature; wheel builds use the
-# extension-module feature above and therefore do not link libpython.
+# Unit tests use the default embedded-Python configuration; wheel builds use
+# the extension-module feature above and therefore do not link libpython.
 add_custom_target(build_store_rs_tests
   COMMAND
     ${CMAKE_COMMAND} -E env

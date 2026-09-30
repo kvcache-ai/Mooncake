@@ -83,11 +83,11 @@ PIDS=()
 REDIS_STARTED=0
 SOURCE_PATCHED=0
 
-BIN_V1="${REPO_ROOT}/target/debug/mooncake-store-client-v1"
-BIN_V2="${REPO_ROOT}/target/debug/mooncake-store-client"
+BIN_V1="${REPO_ROOT}/target/debug/mooncake-store-rs-client-v1"
+BIN_V2="${REPO_ROOT}/target/debug/mooncake-store-rs-client"
 
 COMPAT_RS="${REPO_ROOT}/crates/mooncake-store-core/src/compat.rs"
-CLIENT_BIN_RS="${REPO_ROOT}/crates/mooncake-store-py/src/bin/mooncake-store-client.rs"
+CLIENT_BIN_RS="${REPO_ROOT}/crates/mooncake-store-rs-cli/src/bin/mooncake-store-rs-client.rs"
 PROTO_FILE="${REPO_ROOT}/crates/mooncake-store-client/proto/control_plane.proto"
 CODEC_RS="${REPO_ROOT}/crates/mooncake-store-client/src/control_plane/codec.rs"
 
@@ -132,7 +132,7 @@ echo "  RUN_ID: ${RUN_ID}"
 echo "============================================"
 echo ""
 echo "==> building V1 binary"
-cargo build -p mooncake-store-py
+cargo build -p mooncake-store-rs-cli --bin mooncake-store-rs-client
 cp "${BIN_V2}" "${BIN_V1}"
 
 # ── patch source for V2 ───────────────────────────────────────────────────
@@ -143,7 +143,7 @@ echo "==> patching source for V2"
 sed -i 's/store_api_minor_version: 0,/store_api_minor_version: 1,/' "${COMPAT_RS}"
 
 # 2) Add [v2] tag to startup log
-sed -i 's/"mooncake-store-client started stable_id={stable_id}/"mooncake-store-client started [v2] stable_id={stable_id}/' "${CLIENT_BIN_RS}"
+sed -i 's/"mooncake-store-rs-client started stable_id={stable_id}/"mooncake-store-rs-client started [v2] stable_id={stable_id}/' "${CLIENT_BIN_RS}"
 
 # 3) Add upgrade_tag field to proto
 sed -i '/uint32 store_api_minor_version = 5;/a\  string upgrade_tag = 6;' "${PROTO_FILE}"
@@ -158,7 +158,7 @@ sed -i '/^pub(super) fn pb_compatibility/,/^}/{
 SOURCE_PATCHED=1
 
 echo "==> building V2 binary"
-cargo build -p mooncake-store-py
+cargo build -p mooncake-store-rs-cli --bin mooncake-store-rs-client
 
 # ── common args ────────────────────────────────────────────────────────────
 
@@ -197,8 +197,8 @@ PIDS+=("${CLIENT_A_V1_PID}")
 CLIENT_B_V1_PID=$!
 PIDS+=("${CLIENT_B_V1_PID}")
 
-wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-client started stable_id=client-a epoch=1"
-wait_for_log "${TEMP_DIR}/client-b-v1.log" "mooncake-store-client started stable_id=client-b epoch=1"
+wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-rs-client started stable_id=client-a epoch=1"
+wait_for_log "${TEMP_DIR}/client-b-v1.log" "mooncake-store-rs-client started stable_id=client-b epoch=1"
 echo "  [OK] Both V1 clients started"
 
 REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" "${PYTHON_BIN}" - <<'PY'
@@ -240,7 +240,7 @@ echo "=== PHASE 2: Rolling upgrade client-a (V1 -> V2) ==="
   >"${TEMP_DIR}/client-a-v2.log" 2>&1 &
 CLIENT_A_V2_PID=$!
 PIDS+=("${CLIENT_A_V2_PID}")
-wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-client started" 20
+wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-rs-client started" 20
 echo "  [OK] client-a V2 successor started (standby)"
 
 if grep -q '\[v2\]' "${TEMP_DIR}/client-a-v2.log"; then
@@ -252,9 +252,9 @@ fi
 
 echo "  Sending SIGTERM to client-a V1 predecessor..."
 kill -TERM "${CLIENT_A_V1_PID}"
-wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-client handoff stable_id=client-a" 30
-wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-client upgraded stable_id=client-a" 30
-wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-client promoted stable_id=client-a" 30
+wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-rs-client handoff stable_id=client-a" 30
+wait_for_log "${TEMP_DIR}/client-a-v1.log" "mooncake-store-rs-client upgraded stable_id=client-a" 30
+wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-rs-client promoted stable_id=client-a" 30
 wait_for_exit "${CLIENT_A_V1_PID}" "client-a-v1" 30
 echo "  [OK] client-a V1 exited, V2 promoted"
 
@@ -314,7 +314,7 @@ echo "  Starting client-a V1 rollback with epoch=3 (standby)..."
   >"${TEMP_DIR}/client-a-rollback.log" 2>&1 &
 CLIENT_A_ROLLBACK_PID=$!
 PIDS+=("${CLIENT_A_ROLLBACK_PID}")
-wait_for_log "${TEMP_DIR}/client-a-rollback.log" "mooncake-store-client started stable_id=client-a epoch=3" 20
+wait_for_log "${TEMP_DIR}/client-a-rollback.log" "mooncake-store-rs-client started stable_id=client-a epoch=3" 20
 echo "  [OK] client-a V1 rollback successor started (standby, epoch=3)"
 
 # Verify the rollback instance does NOT have the [v2] tag
@@ -327,9 +327,9 @@ fi
 
 echo "  Sending SIGTERM to client-a V2 predecessor..."
 kill -TERM "${CLIENT_A_V2_PID}"
-wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-client handoff stable_id=client-a" 30
-wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-client upgraded stable_id=client-a" 30
-wait_for_log "${TEMP_DIR}/client-a-rollback.log" "mooncake-store-client promoted stable_id=client-a" 30
+wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-rs-client handoff stable_id=client-a" 30
+wait_for_log "${TEMP_DIR}/client-a-v2.log" "mooncake-store-rs-client upgraded stable_id=client-a" 30
+wait_for_log "${TEMP_DIR}/client-a-rollback.log" "mooncake-store-rs-client promoted stable_id=client-a" 30
 wait_for_exit "${CLIENT_A_V2_PID}" "client-a-v2" 30
 echo "  [OK] client-a V2 exited, V1 rollback instance promoted (epoch=3)"
 

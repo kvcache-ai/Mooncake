@@ -16,7 +16,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/tests/client/test-client-rw-cli.sh [all|real|dummy]
 
-Build and execute the standalone mooncake-store-client binary, then verify both
+Build and execute the standalone mooncake-store-rs-client binary, then verify both
 repository-standard read/write validators:
 
 - `python/tests/store/rs/clients/dummy_client_rw.py` against the daemon dummy API
@@ -124,7 +124,7 @@ mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
-BIN="${PYTHON_BIN%/*}/mooncake-store-client"
+BIN="${PYTHON_BIN%/*}/mooncake-store-rs-client"
 
 if [[ ! -x "${BIN}" ]]; then
   echo "installed root wheel did not provide ${BIN}" >&2

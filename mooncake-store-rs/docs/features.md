@@ -158,7 +158,7 @@ What it provides:
 - namespace-aware `tenant/domain/object_set/key` selection
 - multi-target `copy`, including multiple explicit target segments on the same storage runtime
 - single-target `move`
-- admin HTTP queue plus `mooncake-store-admin migrate ...` operator commands
+- admin HTTP queue plus `mooncake-store-rs-admin migrate ...` operator commands
 - a task-executor model where admin submits control-plane RPC and the executor runtime performs the transfer
 - in-memory admin task queue with `pending`, `dispatching`, `running`, `retry_wait`, `succeeded`, and `failed` states
 - admin-side retry with configurable backoff and a default retry budget of `5`
@@ -167,7 +167,7 @@ What it provides:
 Design boundary:
 
 - the admin queue is runtime memory only and does not recover across admin restart
-- the CLI is only an HTTP client for this queue; `migrate ...` commands must talk to a long-lived `mooncake-store-admin server`
+- the CLI is only an HTTP client for this queue; `migrate ...` commands must talk to a long-lived `mooncake-store-rs-admin server`
 - the authoritative durable state remains the object route, not the admin task record
 - retry is for executor loss or transient RPC failure, not for preserving a persistent migration backlog
 
@@ -205,8 +205,8 @@ The admin plane now supports Redis-backed and etcd-backed stale-segment cleanup 
 
 What it provides:
 
-- explicit one-shot stale cleanup through `mooncake-store-admin cleanup-stale-segments`
-- continuous stateless cleanup through `mooncake-store-admin server`
+- explicit one-shot stale cleanup through `mooncake-store-rs-admin cleanup-stale-segments`
+- continuous stateless cleanup through `mooncake-store-rs-admin server`
 - optional tenant-quota reservation reconcile in that same admin server for an explicit tenant list
 - backend-native lease-expiry indexing for recoverable maintenance scheduling (`ZSET` in Redis, `by-runtime` + `by-time` keys in etcd)
 - owner-scoped cleanup through backend-native owner metadata instead of a hidden global segment scan in the steady-state worker
@@ -226,7 +226,7 @@ successful publishes without inferring result counts from histogram internals.
 
 Jaeger tracing can be controlled dynamically through the store metrics HTTP endpoint and through
 the admin server fanout layer. The per-node metrics endpoint still owns the actual tracing switch,
-while `mooncake-store-admin tracing ...` provides the cluster-level operator entry point. Admin
+while `mooncake-store-rs-admin tracing ...` provides the cluster-level operator entry point. Admin
 discovers live store nodes from metadata leases, derives the host from existing endpoint data, and
 uses the store-published `metrics_port` label for the metrics HTTP port.
 
@@ -501,7 +501,7 @@ What this means in practice:
 The compatibility layer exposes two integration modes:
 
 - real mode uses the native `StoreClient` directly from Python
-- dummy mode talks to a standalone `mooncake-store-client` process and exchanges shm buffer registrations over a side channel
+- dummy mode talks to a standalone `mooncake-store-rs-client` process and exchanges shm buffer registrations over a side channel
 
 Both paths are covered by repository validation scripts.
 

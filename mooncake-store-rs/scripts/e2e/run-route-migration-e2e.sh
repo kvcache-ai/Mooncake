@@ -297,8 +297,8 @@ mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
-BIN="${PYTHON_BIN%/*}/mooncake-store-client"
-ADMIN_BIN="${PYTHON_BIN%/*}/mooncake-store-admin"
+BIN="${PYTHON_BIN%/*}/mooncake-store-rs-client"
+ADMIN_BIN="${PYTHON_BIN%/*}/mooncake-store-rs-admin"
 ADMIN_CLI_BIN="${ADMIN_BIN}"
 
 if [[ ! -x "${BIN}" ]]; then
@@ -339,7 +339,7 @@ echo "==> starting source store client"
   >"${SOURCE_LOG}" 2>&1 &
 SOURCE_PID=$!
 PIDS+=("${SOURCE_PID}")
-wait_for_log "${SOURCE_LOG}" "mooncake-store-client started stable_id=${SOURCE_STABLE_ID}" 30
+wait_for_log "${SOURCE_LOG}" "mooncake-store-rs-client started stable_id=${SOURCE_STABLE_ID}" 30
 
 echo "==> starting target store client"
 "${BIN}" \
@@ -350,7 +350,7 @@ echo "==> starting target store client"
   >"${TARGET_LOG}" 2>&1 &
 TARGET_PID=$!
 PIDS+=("${TARGET_PID}")
-wait_for_log "${TARGET_LOG}" "mooncake-store-client started stable_id=${TARGET_STABLE_ID}" 30
+wait_for_log "${TARGET_LOG}" "mooncake-store-rs-client started stable_id=${TARGET_STABLE_ID}" 30
 
 if [[ "${MODE}" == "copy-multi" || -n "${SEQUENCE}" ]]; then
   echo "==> starting extra target store client"
@@ -362,7 +362,7 @@ if [[ "${MODE}" == "copy-multi" || -n "${SEQUENCE}" ]]; then
     >"${EXTRA_TARGET_LOG}" 2>&1 &
   EXTRA_TARGET_PID=$!
   PIDS+=("${EXTRA_TARGET_PID}")
-  wait_for_log "${EXTRA_TARGET_LOG}" "mooncake-store-client started stable_id=${EXTRA_TARGET_STABLE_ID}" 30
+  wait_for_log "${EXTRA_TARGET_LOG}" "mooncake-store-rs-client started stable_id=${EXTRA_TARGET_STABLE_ID}" 30
 fi
 
 if [[ "${DEDICATED_EXECUTOR_ENABLED}" == "1" ]]; then
@@ -388,7 +388,7 @@ if [[ "${DEDICATED_EXECUTOR_ENABLED}" == "1" ]]; then
     >"${EXECUTOR_LOG}" 2>&1 &
   EXECUTOR_PID=$!
   PIDS+=("${EXECUTOR_PID}")
-  wait_for_log "${EXECUTOR_LOG}" "mooncake-store-client started stable_id=${EXECUTOR_STABLE_ID}" 30
+  wait_for_log "${EXECUTOR_LOG}" "mooncake-store-rs-client started stable_id=${EXECUTOR_STABLE_ID}" 30
 fi
 
 echo "==> starting admin HTTP server"

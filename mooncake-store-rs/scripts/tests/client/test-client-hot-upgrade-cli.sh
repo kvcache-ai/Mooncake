@@ -11,7 +11,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/tests/client/test-client-hot-upgrade-cli.sh
 
-Build and directly execute the standalone mooncake-store-client binary, then
+Build and directly execute the standalone mooncake-store-rs-client binary, then
 verify hot-upgrade startup flags, SIGTERM-triggered promotion, and payload
 preservation with real processes.
 
@@ -110,7 +110,7 @@ mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
-BIN="${PYTHON_BIN%/*}/mooncake-store-client"
+BIN="${PYTHON_BIN%/*}/mooncake-store-rs-client"
 if [[ ! -x "${BIN}" ]]; then
   echo "installed root wheel did not provide ${BIN}" >&2
   exit 1
@@ -152,7 +152,7 @@ echo "==> starting active predecessor binary"
   >"${PREDECESSOR_LOG}" 2>&1 &
 PREDECESSOR_PID=$!
 PIDS+=("${PREDECESSOR_PID}")
-wait_for_log "${PREDECESSOR_LOG}" "mooncake-store-client started stable_id=${STABLE_ID} epoch=1 initial_state=active segment=${PREDECESSOR_SEGMENT}"
+wait_for_log "${PREDECESSOR_LOG}" "mooncake-store-rs-client started stable_id=${STABLE_ID} epoch=1 initial_state=active segment=${PREDECESSOR_SEGMENT}"
 
 echo "==> starting standby successor binary"
 "${BIN}" \
@@ -163,7 +163,7 @@ echo "==> starting standby successor binary"
   >"${SUCCESSOR_LOG}" 2>&1 &
 SUCCESSOR_PID=$!
 PIDS+=("${SUCCESSOR_PID}")
-wait_for_log "${SUCCESSOR_LOG}" "mooncake-store-client started stable_id=${STABLE_ID} epoch=2 initial_state=standby segment=${SUCCESSOR_SEGMENT}"
+wait_for_log "${SUCCESSOR_LOG}" "mooncake-store-rs-client started stable_id=${STABLE_ID} epoch=2 initial_state=standby segment=${SUCCESSOR_SEGMENT}"
 
 echo "==> writing payload through an external routed client and pinning it to predecessor"
 REDIS_URL="${REDIS_URL}" \
@@ -211,9 +211,9 @@ PY
 
 echo "==> sending SIGTERM to predecessor and verifying graceful hot-upgrade"
 kill -TERM "${PREDECESSOR_PID}"
-wait_for_log "${PREDECESSOR_LOG}" "mooncake-store-client handoff stable_id=${STABLE_ID} from_epoch=1 to_runtime=${STABLE_ID}:2"
-wait_for_log "${PREDECESSOR_LOG}" "mooncake-store-client upgraded stable_id=${STABLE_ID} from_epoch=1 to_epoch=2"
-wait_for_log "${SUCCESSOR_LOG}" "mooncake-store-client promoted stable_id=${STABLE_ID} epoch=2 from_epoch=1 kind=HotUpgrade"
+wait_for_log "${PREDECESSOR_LOG}" "mooncake-store-rs-client handoff stable_id=${STABLE_ID} from_epoch=1 to_runtime=${STABLE_ID}:2"
+wait_for_log "${PREDECESSOR_LOG}" "mooncake-store-rs-client upgraded stable_id=${STABLE_ID} from_epoch=1 to_epoch=2"
+wait_for_log "${SUCCESSOR_LOG}" "mooncake-store-rs-client promoted stable_id=${STABLE_ID} epoch=2 from_epoch=1 kind=HotUpgrade"
 wait_for_exit "${PREDECESSOR_PID}" "predecessor"
 
 echo "==> verifying payload is still intact on successor after hot-upgrade"

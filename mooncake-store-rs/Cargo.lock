@@ -1297,29 +1297,14 @@ dependencies = [
 name = "mooncake-store-py"
 version = "0.1.0"
 dependencies = [
- "clap",
- "ctrlc",
  "libc",
  "mooncake-store-client",
  "mooncake-store-core",
  "mooncake-store-rs-metadata",
+ "mooncake-store-rs-runtime",
  "mooncake-store-rs-tensor",
- "mooncake-store-rs-transport",
- "parking_lot",
- "prost 0.13.5",
- "protoc-bin-vendored",
  "pyo3",
- "redis",
- "serde",
- "serde_json",
- "shadow-rs",
- "tokio",
- "tokio-stream",
- "tonic 0.12.3",
- "tonic-build",
  "tracing",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -1330,6 +1315,41 @@ dependencies = [
  "mooncake-store-core",
  "parking_lot",
  "tracing",
+]
+
+[[package]]
+name = "mooncake-store-rs-admin"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ctrlc",
+ "mooncake-store-client",
+ "mooncake-store-core",
+ "mooncake-store-rs-metadata",
+ "parking_lot",
+ "redis",
+ "serde",
+ "serde_json",
+ "shadow-rs",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "mooncake-store-rs-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ctrlc",
+ "mooncake-store-client",
+ "mooncake-store-core",
+ "mooncake-store-rs-metadata",
+ "mooncake-store-rs-runtime",
+ "serde_json",
+ "shadow-rs",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -1344,6 +1364,27 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "mooncake-store-rs-runtime"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mooncake-store-client",
+ "mooncake-store-core",
+ "mooncake-store-rs-metadata",
+ "mooncake-store-rs-transport",
+ "parking_lot",
+ "prost 0.13.5",
+ "protoc-bin-vendored",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
+ "tonic-build",
+ "tracing",
+ "url",
 ]
 
 [[package]]

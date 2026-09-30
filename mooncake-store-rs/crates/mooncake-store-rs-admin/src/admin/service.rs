@@ -23,14 +23,12 @@ use mooncake_store_core::{
     DEFAULT_DOMAIN, DEFAULT_OBJECT_SET, METRICS_PORT_LABEL,
 };
 use mooncake_store_rs_metadata::{
-    ClientLeaseLiveness, EtcdMetadataBackend, EtcdMetadataConfig, MetadataKeyspace,
-    RedisMetadataBackend, RedisMetadataCleanupReport, RedisMetadataConfig,
+    build_store_metadata_backend, ClientLeaseLiveness, EtcdMetadataBackend, EtcdMetadataConfig,
+    MetadataKeyspace, RedisMetadataBackend, RedisMetadataCleanupReport, RedisMetadataConfig,
 };
 use parking_lot::Mutex;
 use tracing::{info, warn};
 use url::Url;
-
-use crate::config::build_store_metadata_backend;
 
 use super::models::{
     AdminCleanupReport, AdminMaintenanceReport, AdminOwnerCleanupReport, AdminOwnerCleanupState,

@@ -56,10 +56,24 @@ impl CompatNamespaceScope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CompatObjectScope {
-    pub(crate) tenant: String,
-    pub(crate) domain: String,
-    pub(crate) object_set: String,
+pub struct CompatObjectScope {
+    tenant: String,
+    domain: String,
+    object_set: String,
+}
+
+impl CompatObjectScope {
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn object_set(&self) -> &str {
+        &self.object_set
+    }
 }
 
 impl CompatObjectScope {
@@ -492,7 +506,7 @@ impl StoreDispatcher {
         })
     }
 
-    pub(crate) fn run<T, F>(&self, f: F) -> Result<T, StoreError>
+    pub fn run<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
@@ -788,17 +802,22 @@ impl StoreDispatcher {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn hot_cache_contains(&self, tenant: &str, key: &str) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hot_cache_contains_for_test(&self, tenant: &str, key: &str) -> bool {
         let scope = self.object_scope(Some(tenant.to_string()));
         self.hot_cache
             .as_ref()
             .is_some_and(|cache| cache.contains(&HotCacheKey::new(scope.cache_namespace(), key)))
     }
 
-    #[cfg(test)]
-    pub(crate) fn hot_cache_contains_in_scope(&self, scope: &str, tenant: &str, key: &str) -> bool {
-        scope == self.compat_scope && self.hot_cache_contains(tenant, key)
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hot_cache_contains_in_scope_for_test(
+        &self,
+        scope: &str,
+        tenant: &str,
+        key: &str,
+    ) -> bool {
+        scope == self.compat_scope && self.hot_cache_contains_for_test(tenant, key)
     }
 
     pub async fn put(&self, request: pb::PutRequest) -> Result<i32, StoreError> {
@@ -987,7 +1006,7 @@ impl StoreDispatcher {
         Ok(())
     }
 
-    pub(crate) fn object_scope(&self, tenant: Option<String>) -> CompatObjectScope {
+    pub fn object_scope(&self, tenant: Option<String>) -> CompatObjectScope {
         CompatObjectScope::from_defaults(&self.default_scope, tenant)
     }
 

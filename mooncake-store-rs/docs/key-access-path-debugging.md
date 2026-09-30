@@ -30,7 +30,7 @@ per-key traces.
 Start the daemon with a targeted trace filter:
 
 ```bash
-mooncake-store-client ... \
+mooncake-store-rs-client ... \
   --trace-filter 'info,mooncake_store_client::client=debug,mooncake_store_client::route_directory=debug,mooncake_store_client::control_plane=debug,mooncake_store_py::dummy_service=debug,hyper=warn,h2=warn,tower=warn,tonic=warn' \
   --metrics-addr 0.0.0.0:19101
 ```

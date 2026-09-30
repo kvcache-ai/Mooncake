@@ -511,7 +511,7 @@ That means:
 
 ### Dummy path
 
-`MooncakeDistributedStore.setup_dummy(...)` connects to a standalone `mooncake-store-client` process.
+`MooncakeDistributedStore.setup_dummy(...)` connects to a standalone `mooncake-store-rs-client` process.
 
 That path is split as follows:
 
@@ -542,11 +542,18 @@ This preserves compatibility for integrations that expect a dummy client / exter
 | `crates/mooncake-store-client/src/control_plane/server.rs` | protobuf RPC server and dispatch |
 | `crates/mooncake-store-client/src/memory.rs` | local memory and segment tracking |
 | `crates/mooncake-store-client/src/transport.rs` | transfer submission helpers |
-| `crates/mooncake-store-py/src/lib.rs` | Python bindings and top-level compatibility API |
-| `crates/mooncake-store-py/src/runtime.rs` | real runtime construction from Python setup args |
-| `crates/mooncake-store-py/src/dummy_client.rs` | dummy compatibility client and shm registration RPC |
-| `crates/mooncake-store-py/src/dummy_service.rs` | standalone dummy compatibility service |
-| `crates/mooncake-store-py/src/shm.rs` | shm region ownership, fd passing, shared mapping helpers |
+| `crates/mooncake-store-rs-runtime/src/config.rs` | compatibility setup configuration shared by the Python runtime and CLI |
+| `crates/mooncake-store-rs-runtime/src/runtime.rs` | real compatibility runtime construction |
+| `crates/mooncake-store-rs-runtime/src/dispatcher.rs` | Python-compatible operation dispatch |
+| `crates/mooncake-store-rs-runtime/src/dummy_client.rs` | dummy compatibility client and shm registration RPC |
+| `crates/mooncake-store-rs-runtime/src/dummy_service.rs` | standalone dummy compatibility service |
+| `crates/mooncake-store-rs-runtime/src/shm.rs` | shm region ownership, fd passing, shared mapping helpers |
+| `crates/mooncake-store-rs-admin/src/admin/` | admin service, HTTP surface, and maintenance operations |
+| `crates/mooncake-store-rs-admin/src/bin/mooncake-store-rs-admin.rs` | fixed Store-RS operator command |
+| `crates/mooncake-store-rs-cli/src/bin/mooncake-store-rs-client.rs` | fixed Store-RS standalone runtime command |
+| `crates/mooncake-store-rs-cli/src/bin/mooncake-store-rs-bench/` | Store-RS verification and benchmark command |
+| `crates/mooncake-store-py/src/lib.rs` | private `mooncake._store_rs` Python bindings |
+| top-level `mooncake-store-rs/CMakeLists.txt` | CMake-owned TE/TENT shim targets and Python component installation |
 | `crates/mooncake-store-e2e` | runnable system validation |
 | `crates/mooncake-store-test-utils` | test-only fixtures, counting / faulty backend decorators, `TestTransport` and `FaultyTransport` |
 

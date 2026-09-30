@@ -10,7 +10,12 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use _store_rs::admin::{
+use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use mooncake_store_client::init_tracing;
+use mooncake_store_core::{
+    RoutePolicy, TenantPolicy, TenantPolicySpec, TenantQuotaReservationState,
+};
+use mooncake_store_rs_admin::admin::{
     format_policy_scope, format_route_policy_domain, format_tenant_object_accounting_state,
     format_tenant_quota_reservation_state, redact_redis_url, route_policy_domain,
     AdminHttpServerHandle, AdminService, ErrorResponse, PolicyPatchInput, RouteMigrationMode,
@@ -18,12 +23,7 @@ use _store_rs::admin::{
     RouteMigrationTaskSubmitRequest, TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
     TracingClusterResponse, TracingUpdateRequest,
 };
-use _store_rs::build_info;
-use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use mooncake_store_client::init_tracing;
-use mooncake_store_core::{
-    RoutePolicy, TenantPolicy, TenantPolicySpec, TenantQuotaReservationState,
-};
+use mooncake_store_rs_admin::build_info;
 use mooncake_store_rs_metadata::MetadataKeyspace;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -31,7 +31,7 @@ use tracing::{info, warn};
 use url::Url;
 
 #[derive(Parser, Debug)]
-#[command(name = "mooncake-store-admin")]
+#[command(name = "mooncake-store-rs-admin")]
 #[command(about = "Run explicit Mooncake store metadata maintenance tasks")]
 #[command(version = build_info::build::PKG_VERSION, long_version = build_info::long_version_static())]
 struct Args {
@@ -565,7 +565,7 @@ fn spawn_stale_segment_maintenance_worker(
     let batch_size = server_args.cleanup_batch_size.max(1);
     Some(
         thread::Builder::new()
-            .name("mooncake-store-admin-stale-maintenance".to_string())
+            .name("mooncake-store-rs-admin-stale-maintenance".to_string())
             .spawn(move || run_maintenance_loop(service, interval, batch_size, shutdown))
             .expect("admin maintenance worker thread should spawn"),
     )
@@ -588,7 +588,7 @@ fn spawn_quota_reconcile_worker(
     let tenants = server_args.quota_reconcile_tenants.clone();
     Some(
         thread::Builder::new()
-            .name("mooncake-store-admin-quota-reconcile".to_string())
+            .name("mooncake-store-rs-admin-quota-reconcile".to_string())
             .spawn(move || run_quota_reconcile_loop(service, interval, tenants, shutdown))
             .expect("admin quota reconcile worker thread should spawn"),
     )
@@ -1414,7 +1414,7 @@ mod tests {
     fn server_subcommand_parses_bind_addr() {
         without_admin_server_env(|| {
             let args = Args::parse_from([
-                "mooncake-store-admin",
+                "mooncake-store-rs-admin",
                 "--metadata-url",
                 "redis://127.0.0.1:6379/0",
                 "server",
@@ -1438,7 +1438,7 @@ mod tests {
     fn serve_alias_parses_bind_addr() {
         without_admin_server_env(|| {
             let args = Args::parse_from([
-                "mooncake-store-admin",
+                "mooncake-store-rs-admin",
                 "--metadata-url",
                 "redis://127.0.0.1:6379/0",
                 "serve",
@@ -1476,7 +1476,7 @@ mod tests {
                 ),
             ],
             || {
-                let args = Args::parse_from(["mooncake-store-admin", "server"]);
+                let args = Args::parse_from(["mooncake-store-rs-admin", "server"]);
                 assert_eq!(args.metadata_url, "redis://127.0.0.1:6380/4");
                 assert_eq!(args.admin_url.as_deref(), Some("http://127.0.0.1:18080"));
                 assert_eq!(args.keyspace.as_deref(), Some("admin/env-keyspace"));
@@ -1531,7 +1531,7 @@ mod tests {
                 ("MC_STORE_ADMIN_UPDATED_BY", Some("env-user")),
             ],
             || {
-                let args = Args::parse_from(["mooncake-store-admin", "policy", "set"]);
+                let args = Args::parse_from(["mooncake-store-rs-admin", "policy", "set"]);
                 match args.command {
                     Command::Policy {
                         command:
@@ -1589,7 +1589,7 @@ mod tests {
                 ("MC_STORE_ADMIN_TASK_ID", Some("task-env")),
             ],
             || {
-                let args = Args::parse_from(["mooncake-store-admin", "migrate", "copy"]);
+                let args = Args::parse_from(["mooncake-store-rs-admin", "migrate", "copy"]);
                 match args.command {
                     Command::Migrate {
                         command:
@@ -1614,7 +1614,7 @@ mod tests {
                     other => panic!("unexpected command: {other:?}"),
                 }
 
-                let args = Args::parse_from(["mooncake-store-admin", "migrate", "task", "get"]);
+                let args = Args::parse_from(["mooncake-store-rs-admin", "migrate", "task", "get"]);
                 match args.command {
                     Command::Migrate {
                         command:
@@ -1642,7 +1642,7 @@ mod tests {
                 ("MC_STORE_ADMIN_DRY_RUN", Some("true")),
             ],
             || {
-                let args = Args::parse_from(["mooncake-store-admin", "quota", "reservations"]);
+                let args = Args::parse_from(["mooncake-store-rs-admin", "quota", "reservations"]);
                 match args.command {
                     Command::Quota {
                         command:
@@ -1659,7 +1659,7 @@ mod tests {
                     other => panic!("unexpected command: {other:?}"),
                 }
 
-                let args = Args::parse_from(["mooncake-store-admin", "quota", "object"]);
+                let args = Args::parse_from(["mooncake-store-rs-admin", "quota", "object"]);
                 match args.command {
                     Command::Quota {
                         command: QuotaCommand::Object { scope, key },
@@ -1670,7 +1670,7 @@ mod tests {
                     other => panic!("unexpected command: {other:?}"),
                 }
 
-                let args = Args::parse_from(["mooncake-store-admin", "quota", "abort"]);
+                let args = Args::parse_from(["mooncake-store-rs-admin", "quota", "abort"]);
                 match args.command {
                     Command::Quota {
                         command:
@@ -1704,7 +1704,7 @@ mod tests {
                 ("MC_STORE_ADMIN_TRACING_MAX_TARGETS", Some("16")),
             ],
             || {
-                let args = Args::parse_from(["mooncake-store-admin", "tracing", "on"]);
+                let args = Args::parse_from(["mooncake-store-rs-admin", "tracing", "on"]);
                 assert_eq!(args.admin_url.as_deref(), Some("http://127.0.0.1:39000"));
                 match args.command {
                     Command::Tracing {
@@ -1724,7 +1724,7 @@ mod tests {
     #[test]
     fn server_subcommand_parses_cleanup_flags() {
         let args = Args::parse_from([
-            "mooncake-store-admin",
+            "mooncake-store-rs-admin",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "server",
@@ -1756,7 +1756,7 @@ mod tests {
     #[test]
     fn policy_set_parses_expected_flags() {
         let args = Args::parse_from([
-            "mooncake-store-admin",
+            "mooncake-store-rs-admin",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "policy",
@@ -1808,7 +1808,7 @@ mod tests {
     #[test]
     fn quota_reservations_parses_state_filter() {
         let args = Args::parse_from([
-            "mooncake-store-admin",
+            "mooncake-store-rs-admin",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "quota",
@@ -1836,7 +1836,7 @@ mod tests {
     #[test]
     fn quota_abort_parses_reservation_id_and_dry_run() {
         let args = Args::parse_from([
-            "mooncake-store-admin",
+            "mooncake-store-rs-admin",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "quota",
@@ -1867,7 +1867,7 @@ mod tests {
     #[test]
     fn quota_reconcile_parses_dry_run() {
         let args = Args::parse_from([
-            "mooncake-store-admin",
+            "mooncake-store-rs-admin",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "quota",

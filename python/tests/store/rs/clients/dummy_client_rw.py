@@ -2,7 +2,7 @@
 """DummyClient read/write verification for the current Mooncake store-rs stack.
 
 This script validates dummy-mode put/get flows against a standalone
-`mooncake-store-client` daemon. It keeps the validation black-box:
+`mooncake-store-rs-client` daemon. It keeps the validation black-box:
 
 - `setup_dummy()` attaches to the daemon gRPC endpoint
 - single-item mode uses high-level `put` / `get`

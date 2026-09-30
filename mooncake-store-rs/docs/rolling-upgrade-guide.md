@@ -29,10 +29,10 @@ This document describes how to perform a rolling upgrade on a Mooncake Store clu
 redis-cli -p 6380 ping
 
 # Verify the new version binary is compiled
-ls -la target/debug/mooncake-store-client
+ls -la target/debug/mooncake-store-rs-client
 
 # Back up the old version binary (optional, for rollback)
-cp target/debug/mooncake-store-client target/debug/mooncake-store-client-v1
+cp target/debug/mooncake-store-rs-client target/debug/mooncake-store-rs-client-v1
 ```
 
 ### Step 1: Start the New Version Successor in Standby Mode
@@ -40,7 +40,7 @@ cp target/debug/mooncake-store-client target/debug/mooncake-store-client-v1
 Launch the new version binary with the **same `stable_id`** as the predecessor. The metadata backend allocates the next epoch automatically.
 
 ```bash
-./target/debug/mooncake-store-client \
+./target/debug/mooncake-store-rs-client \
   --local-hostname 127.0.0.1 \
   --metadata-url "redis://127.0.0.1:6380/0" \
   --storage-bytes 1048576 \
@@ -71,7 +71,7 @@ Launch the new version binary with the **same `stable_id`** as the predecessor. 
 Wait for the log to confirm successful startup (the assigned epoch is printed in the line):
 
 ```
-mooncake-store-client started stable_id=client-a epoch=2 initial_state=standby
+mooncake-store-rs-client started stable_id=client-a epoch=2 initial_state=standby
 ```
 
 If you need to observe the per-stable-id epoch high-water mark, query it directly:
@@ -93,7 +93,7 @@ Send a SIGTERM signal to the old version predecessor:
 ```bash
 # Find the predecessor's PID (match by stable_id and segment, not epoch, since
 # the epoch is server-assigned)
-pgrep -f "mooncake-store-client.*--stable-id client-a"
+pgrep -f "mooncake-store-rs-client.*--stable-id client-a"
 
 # Send SIGTERM
 kill -TERM <predecessor_pid>
@@ -103,13 +103,13 @@ Monitor the logs to confirm the hot-upgrade is complete:
 
 **Predecessor log** (should appear in order):
 ```
-mooncake-store-client handoff stable_id=client-a from_epoch=1 to_runtime=client-a:2
-mooncake-store-client upgraded stable_id=client-a from_epoch=1 to_epoch=2
+mooncake-store-rs-client handoff stable_id=client-a from_epoch=1 to_runtime=client-a:2
+mooncake-store-rs-client upgraded stable_id=client-a from_epoch=1 to_epoch=2
 ```
 
 **Successor log** (should appear):
 ```
-mooncake-store-client promoted stable_id=client-a epoch=2 from_epoch=1 kind=HotUpgrade
+mooncake-store-rs-client promoted stable_id=client-a epoch=2 from_epoch=1 kind=HotUpgrade
 ```
 
 ### Step 3: Verify Data Integrity
@@ -169,7 +169,7 @@ If the new version encounters issues, you can roll back using the same mechanism
 ```bash
 # Roll back client-a using the V1 binary — the successor gets the next epoch
 # from the metadata backend (epoch=3 in a 1 -> 2 -> 3 rollout sequence).
-./target/debug/mooncake-store-client-v1 \
+./target/debug/mooncake-store-rs-client-v1 \
   --local-hostname 127.0.0.1 \
   --metadata-url "redis://127.0.0.1:6380/0" \
   --storage-bytes 1048576 \

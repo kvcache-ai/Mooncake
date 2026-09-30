@@ -59,7 +59,7 @@ impl AdminHttpServerHandle {
         let auth_token = auth_token.map(Arc::new);
         let (shutdown, shutdown_rx) = mpsc::channel();
         let thread = thread::Builder::new()
-            .name(format!("mooncake-store-admin-{address}"))
+            .name(format!("mooncake-store-rs-admin-{address}"))
             .spawn(move || run_admin_http_server(listener, shutdown_rx, service, auth_token))
             .map_err(|error| {
                 StoreError::Transport(format!(

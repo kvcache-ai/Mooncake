@@ -9,8 +9,11 @@ This document explains the repository by module and by runtime role.
 | Store model | `mooncake-store-core` | Shared types, traits, lifecycle, and route model |
 | Metadata | `mooncake-store-rs-metadata` | Persistent leases, segments, route policy, handoff, and `MetadataOnly` route state |
 | Runtime | `mooncake-store-client` | User-facing API and all runtime decisions |
+| Python compatibility runtime | `mooncake-store-rs-runtime` | Python-facing setup, dispatcher, dummy service, and shm compatibility path |
+| Admin | `mooncake-store-rs-admin` | Admin service and standalone `mooncake-store-rs-admin` command |
+| CLI | `mooncake-store-rs-cli` | Standalone `mooncake-store-rs-client` and `mooncake-store-rs-bench` commands |
 | Transport binding | `mooncake-store-rs-transport-sys`, `mooncake-store-rs-transport` | Native TE/TENT linkage and Rust wrappers |
-| Compatibility | `mooncake-store-py` | Python binding and compatibility API |
+| Python binding | `mooncake-store-py` | Private `mooncake._store_rs` extension and PyO3 bindings |
 | Validation | `mooncake-store-e2e` | End-to-end correctness and benchmark runs |
 
 ## Core Model
@@ -110,19 +113,24 @@ on top of.
 
 ## Transport Layer
 
+The top-level CMake project owns the native shim targets
+`mooncake_store_rs_classic_shim` and `mooncake_store_rs_tent_shim`. CMake links
+them to the existing `transfer_engine` and `tent_shared` targets, passes their
+target-file paths into Cargo, and installs the shim libraries with the Python
+component. The Rust sys crate owns the FFI surface and validates those explicit
+paths; it does not configure or build CMake targets.
+
 ### `mooncake-store-rs-transport-sys`
 
 Purpose:
 
-- link Rust against upstream Mooncake native libraries
-- build upstream TE/TENT when native artifacts are missing
+- expose Rust FFI over the classic-TE and TENT shims built by the top-level CMake project
 
 What it does:
 
-- locates the Mooncake submodule
-- configures `cmake`
-- links `libtransfer_engine.so` and `libtent_shared.so`
-- exports FFI for classic TE and TENT
+- validates the explicit Mooncake source, CMake build, and shim-library paths passed by CMake
+- binds Rust transport code to the CMake-owned classic-TE and TENT shim libraries
+- leaves upstream TE/TENT targets and both shim implementations under CMake ownership
 
 ### `mooncake-store-rs-transport`
 
@@ -141,6 +149,16 @@ Main objects:
 
 ## Python Compatibility
 
+### `mooncake-store-rs-runtime`
+
+Purpose:
+
+- provide the Rust compatibility runtime used by Python's real and dummy modes
+
+It owns setup configuration, dispatcher and hot-cache state, shared-memory
+registration, and the dummy client/service protocol. The Python bindings and
+CLI use this runtime; the admin crate owns its separate operator layer.
+
 ### `mooncake-store-py`
 
 Purpose:
@@ -149,13 +167,25 @@ Purpose:
 
 What it contains:
 
-- `MooncakeDistributedStore`
-- compatibility-style `setup(...)`
-- `setup_dummy(...)` for the standalone compatibility path
-- `MooncakeHostMemAllocator` for shm-backed host buffers
-- Python-facing replication config handling
-- metadata URL parsing for Redis and etcd
-- shm registration helpers and dummy compatibility RPC client
+- PyO3 bindings for the Python-facing Store classes and allocator wrappers
+- the private `mooncake._store_rs` extension module
+- binding-specific tensor and buffer wrappers
+
+The root Python package exposes the selected backend through `mooncake.store`;
+this crate provides the Store-RS native module consumed by that facade.
+
+## Admin and CLI
+
+### `mooncake-store-rs-admin`
+
+This crate owns the admin HTTP/service layer and the fixed-backend
+`mooncake-store-rs-admin` operator command.
+
+### `mooncake-store-rs-cli`
+
+This crate provides the fixed-backend `mooncake-store-rs-client` command and
+`mooncake-store-rs-bench` benchmark command. These commands launch Store-RS
+directly; `MOONCAKE_STORE_BACKEND` selects the Python facade only.
 
 ### `python/mooncake/store/rs`
 
@@ -185,7 +215,7 @@ The e2e binary validates:
 - dynamic membership and elastic segment changes
 - hot-upgrade handoff flows
 
-### `mooncake-store-bench`
+### `mooncake-store-rs-bench`
 
 Purpose:
 

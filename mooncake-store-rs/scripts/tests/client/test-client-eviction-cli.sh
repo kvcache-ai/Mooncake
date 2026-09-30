@@ -14,7 +14,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/tests/client/test-client-eviction-cli.sh
 
-Build and directly execute the standalone mooncake-store-client binary, then
+Build and directly execute the standalone mooncake-store-rs-client binary, then
 verify background storage-owner eviction through a real routed writer, JSON
 stats, and tracing logs.
 
@@ -328,7 +328,7 @@ mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
 cd "${REPO_ROOT}"
 
-BIN="${PYTHON_BIN%/*}/mooncake-store-client"
+BIN="${PYTHON_BIN%/*}/mooncake-store-rs-client"
 if [[ ! -x "${BIN}" ]]; then
   echo "installed root wheel did not provide ${BIN}" >&2
   exit 1
@@ -372,7 +372,7 @@ STORAGE_PID=$!
 PIDS+=("${STORAGE_PID}")
 wait_for_log \
   "${STORAGE_LOG}" \
-  "mooncake-store-client started stable_id=${STABLE_ID} epoch=1 initial_state=active segment=${SEGMENT_NAME}" \
+  "mooncake-store-rs-client started stable_id=${STABLE_ID} epoch=1 initial_state=active segment=${SEGMENT_NAME}" \
   "${STARTUP_TIMEOUT_SECONDS}" \
   "${STORAGE_PID}"
 

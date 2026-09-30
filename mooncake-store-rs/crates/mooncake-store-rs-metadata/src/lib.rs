@@ -4,6 +4,7 @@ mod in_memory;
 mod keyspace;
 mod redis_backend;
 mod segment_state;
+mod store_backend;
 
 pub use etcd_backend::{EtcdMetadataBackend, EtcdMetadataConfig};
 pub use in_memory::InMemoryMetadataBackend;
@@ -12,3 +13,4 @@ pub use redis_backend::{
     is_legacy_redis_auth_arity_error, resolve_redis_auth, ClientLeaseLiveness,
     RedisMetadataBackend, RedisMetadataCleanupReport, RedisMetadataConfig, ResolvedRedisAuth,
 };
+pub use store_backend::build_store_metadata_backend;

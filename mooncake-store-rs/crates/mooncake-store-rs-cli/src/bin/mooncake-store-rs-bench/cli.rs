@@ -1,13 +1,13 @@
 use std::error::Error;
 
-use _store_rs::build_info;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use mooncake_store_rs_cli::build_info;
 
 pub const DEFAULT_STORAGE_BYTES: usize = 0;
 pub const COMBINED_INTERFACE_ENV: &str = "MC_BENCH_INTERFACES";
 
 #[derive(Parser)]
-#[command(name = "mooncake-store-bench")]
+#[command(name = "mooncake-store-rs-bench")]
 #[command(about = "Benchmark and verification tool for mooncake store")]
 #[command(version = build_info::build::PKG_VERSION, long_version = build_info::long_version_static())]
 #[command(arg_required_else_help = true)]
@@ -509,7 +509,7 @@ mod tests {
     #[test]
     fn global_cli_metadata_url_accepts_underscore_alias() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata_url",
             "redis://127.0.0.1:6379/0",
             "bench",
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn global_cli_transport_metadata_url_accepts_underscore_alias() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "--transport_metadata_url",
@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn parse_bench_supports_explicit_interface_selection() {
         let parsed = Cli::try_parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "bench",
@@ -559,7 +559,7 @@ mod tests {
     #[test]
     fn parse_bench_defaults() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "bench",
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn parse_global_defaults_include_local_storage() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "bench",
@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn parse_global_supports_explicit_transport_metadata_url() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "--transport-metadata-url",
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn parse_transport_backend_aliases() {
         let classic = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "--transport-backend",
@@ -626,7 +626,7 @@ mod tests {
         ));
 
         let tent = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "--transport-backend",
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn parse_verify_subcommand() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://localhost/0",
             "verify",
@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn parse_verify_supports_explicit_interface_selection() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://localhost/0",
             "verify",
@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn parse_soak_with_faults() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://localhost/0",
             "soak",
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn parse_soak_supports_explicit_interface_selection() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://localhost/0",
             "soak",
@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn combined_interface_env_overrides_defaults_for_bench() {
         let raw_args = vec![
-            OsString::from("mooncake-store-bench"),
+            OsString::from("mooncake-store-rs-bench"),
             OsString::from("--metadata-url"),
             OsString::from("redis://127.0.0.1:6379/0"),
             OsString::from("bench"),
@@ -844,7 +844,7 @@ mod tests {
     #[test]
     fn combined_interface_env_respects_explicit_cli_overrides() {
         let raw_args = vec![
-            OsString::from("mooncake-store-bench"),
+            OsString::from("mooncake-store-rs-bench"),
             OsString::from("--metadata-url"),
             OsString::from("redis://127.0.0.1:6379/0"),
             OsString::from("soak"),
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn combined_interface_env_overrides_defaults_for_verify() {
         let raw_args = vec![
-            OsString::from("mooncake-store-bench"),
+            OsString::from("mooncake-store-rs-bench"),
             OsString::from("--metadata-url"),
             OsString::from("redis://127.0.0.1:6379/0"),
             OsString::from("verify"),
@@ -916,7 +916,7 @@ mod tests {
     #[test]
     fn bench_cleanup_flag_defaults_to_false() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "bench",
@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn bench_cleanup_flag_can_be_enabled() {
         let cli = Cli::parse_from([
-            "mooncake-store-bench",
+            "mooncake-store-rs-bench",
             "--metadata-url",
             "redis://127.0.0.1:6379/0",
             "bench",

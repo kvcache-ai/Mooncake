@@ -1,0 +1,34 @@
+[package]
+name = "mooncake-store-rs-admin"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "mooncake_store_rs_admin"
+
+[[bin]]
+name = "mooncake-store-rs-admin"
+path = "src/bin/mooncake-store-rs-admin.rs"
+
+[dependencies]
+clap.workspace = true
+ctrlc.workspace = true
+mooncake-store-rs-metadata = { path = "../mooncake-store-rs-metadata" }
+mooncake-store-client = { path = "../mooncake-store-client" }
+mooncake-store-core = { path = "../mooncake-store-core" }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shadow-rs.workspace = true
+tracing.workspace = true
+url = "2"
+
+[build-dependencies]
+shadow-rs.workspace = true
+
+[dev-dependencies]
+redis = "0.27"
+
+[lints]
+workspace = true

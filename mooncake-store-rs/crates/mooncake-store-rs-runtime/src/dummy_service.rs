@@ -23,7 +23,7 @@ use crate::shm::{
 };
 use crate::DEFAULT_COMPAT_WORKER_SCOPE;
 
-pub mod pb {
+pub(crate) mod pb {
     tonic::include_proto!("mooncake.store.dummy");
 }
 

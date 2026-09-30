@@ -4,7 +4,7 @@ This guide explains how to use Store-RS multi-tenant isolation as an operator or
 
 The current implementation follows one principle:
 
-- author tenant-scoped policy through `mooncake-store-admin`
+- author tenant-scoped policy through `mooncake-store-rs-admin`
 - let Store-RS runtimes enforce that policy on bootstrap and on request paths
 
 Runtime-local builder, Python, CLI, and environment knobs still exist as compatibility fallbacks, but they are no longer the preferred place to author tenant policy.
@@ -37,7 +37,7 @@ In Phase 1 strict quota rollout, mutable quota state is still tenant-root metada
 
 Use this split of responsibilities:
 
-- `mooncake-store-admin` writes tenant policy and runs explicit inspection / repair
+- `mooncake-store-rs-admin` writes tenant policy and runs explicit inspection / repair
 - Store-RS runtimes enforce routing, quota, placement, and request-path isolation
 - `tenant` remains the default namespace selector used for startup policy lookup and request builders
 
@@ -81,7 +81,7 @@ Practical takeaway:
 Set tenant-scoped routing, quota, and QoS policy through admin:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy set \
   --tenant tenant-a \
@@ -98,11 +98,11 @@ mooncake-store-admin \
 Common related commands:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy list
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy get \
   --tenant tenant-a
@@ -125,7 +125,7 @@ A runtime should still declare its tenant identity even when policy lives in met
 Standalone client example:
 
 ```bash
-mooncake-store-client \
+mooncake-store-rs-client \
   --metadata-url redis://127.0.0.1:6380/0 \
   --stable-id tenant-a-store-1 \
   --tenant tenant-a \
@@ -196,7 +196,7 @@ store.setup_dummy(
 )
 ```
 
-Use dummy mode when Python should attach to a standalone `mooncake-store-client` daemon. In dummy mode, clients only share shm-backed hot-cache hits and side channels when they intentionally use the same worker-scoped dummy server boundary.
+Use dummy mode when Python should attach to a standalone `mooncake-store-rs-client` daemon. In dummy mode, clients only share shm-backed hot-cache hits and side channels when they intentionally use the same worker-scoped dummy server boundary.
 
 ## Placement policy notes
 
@@ -248,18 +248,18 @@ If you inspect tenant policy through admin, these values should appear as metada
 Inspect strict quota and object-accounting state through admin:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota state \
   --tenant tenant-a
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota object \
   --tenant tenant-a \
   --key object-a
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reservations \
   --tenant tenant-a \
@@ -278,7 +278,7 @@ Interpretation notes:
 When operators suspect an interrupted write left visible pending reservations, inspect the repair plan first:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reconcile \
   --tenant tenant-a \
@@ -328,7 +328,7 @@ Backend behavior:
 
 ## Operational Tips
 
-- Prefer `mooncake-store-admin policy ...` over embedding tenant route/quota settings into every runtime startup path
+- Prefer `mooncake-store-rs-admin policy ...` over embedding tenant route/quota settings into every runtime startup path
 - Keep `tenant` explicit on runtime startup so policy lookup and request builders use the intended namespace
 - Treat local route/resource knobs as bootstrap or compatibility fallbacks only
 - For Redis ACL deployments, prefer `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD` when passwords contain URL-reserved characters

@@ -102,7 +102,7 @@ This guide uses TENT for the concrete examples because it is the default reposit
 Runtime backend selection is implemented by the compatibility layer, not by `StoreClientBuilder` itself:
 
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
-- `mooncake-store-client --transport-backend tent|classic-te`
+- `mooncake-store-rs-client --transport-backend tent|classic-te`
 - `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
 
 For `classic_te` with `P2PHANDSHAKE` metadata, Store-RS separates the logical segment identity from
@@ -115,10 +115,13 @@ Redis authentication can come from URL-embedded credentials or from `MC_REDIS_US
 
 ## Check Without Native Build
 
-`mooncake-store-rs-transport-sys` compiles native shims against TE/TENT artifacts from an existing
-Mooncake CMake build tree. `MOONCAKE_ROOT_DIR` and `MOONCAKE_BUILD_DIR` come from the enclosing
-CMake build or must be set to absolute paths for direct Cargo builds. The build script never
-configures another Mooncake build.
+The top-level Mooncake CMake project owns the classic-TE and TENT shim targets
+and links them to its existing `transfer_engine` and `tent_shared` targets.
+`mooncake-store-rs-transport-sys` provides Rust FFI for those shims. Its build
+script validates `MOONCAKE_ROOT_DIR`, `MOONCAKE_BUILD_DIR`, and the explicit
+`MOONCAKE_CLASSIC_SHIM_LIB_PATH` / `MOONCAKE_TENT_SHIM_LIB_PATH` artifacts; it
+does not configure or compile CMake targets. The enclosing CMake build passes
+these paths, or direct Cargo users must provide absolute paths explicitly.
 
 The enclosing CMake target builds the required native targets before Rust:
 
@@ -129,16 +132,15 @@ cmake -S /path/to/Mooncake -B /path/to/Mooncake-build \
 cmake --build /path/to/Mooncake-build --target build_store_rs
 ```
 
-Developer machines that only need Rust type analysis can skip native shim compilation:
+Developer machines that only need Rust type analysis can skip native artifact validation:
 
 ```bash
 MOONCAKE_SKIP_NATIVE_BUILD=1 cargo check
 ```
 
-This is intended for IDE analysis and for build environments that provide native artifacts through
-`MOONCAKE_BUILD_DIR` and the explicit shim library path variables. Runtime builds require
-an existing CMake build tree with the TE, TENT, and yalantinglibs artifacts; the enclosing CMake
-targets establish that dependency before Cargo compiles the shims.
+This is intended for IDE analysis. Runtime builds require an existing CMake
+build tree with the TE, TENT, yalantinglibs, and shim artifacts; the enclosing
+CMake targets build and install those dependencies before Cargo compiles Rust.
 
 ## Enable Routed Writes
 
@@ -347,25 +349,25 @@ It covers:
 
 ## Benchmarking
 
-Use `mooncake-store-bench` for throughput measurement, correctness verification, and long-duration stability testing. It is built from `crates/mooncake-store-py/src/bin/mooncake_store_bench/` as part of the Rust workspace.
+Use `mooncake-store-rs-bench` for throughput measurement, correctness verification, and long-duration stability testing. Its sources live under `crates/mooncake-store-rs-cli/src/bin/mooncake-store-rs-bench/` in the Rust workspace.
 
 Quick start:
 
 ```bash
 # Correctness check
 # Defaults use batch_put + batch_get; override interfaces when needed.
-mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 verify
+mooncake-store-rs-bench --metadata-url redis://127.0.0.1:6379/0 verify
 
 # 30-second mixed benchmark, 8 concurrent workers
 # Defaults measure batch_put + batch_get; override interfaces when needed.
 # Start storage=true daemons first, and pass the same --keyspace they use
 # when you are not using the default `mc/store-rs/v1` namespace.
-mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 bench \
+mooncake-store-rs-bench --metadata-url redis://127.0.0.1:6379/0 bench \
   --keyspace mc/store-rs/bench-prod \
   --mode mixed --concurrency 8 --duration 30
 
 # 1-hour soak test with Redis jitter fault injection
-mooncake-store-bench --metadata-url redis://127.0.0.1:6379/0 soak \
+mooncake-store-rs-bench --metadata-url redis://127.0.0.1:6379/0 soak \
   --duration 3600 --fault redis-jitter:5:50 --verify-reads
 ```
 

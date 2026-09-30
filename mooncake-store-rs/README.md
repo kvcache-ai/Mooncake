@@ -17,7 +17,7 @@ Use the document that matches what you are doing.
 | If You Want To | Read |
 |----------------|------|
 | run the project locally | `README.md`, `docs/deployment.md` |
-| run `mooncake-store-bench` for verify / benchmark / soak | `README.md`, `docs/bench.md`, `docs/deployment.md` |
+| run `mooncake-store-rs-bench` for verify / benchmark / soak | `README.md`, `docs/bench.md`, `docs/deployment.md` |
 | run the multi-client stress benchmark | `README.md`, `docs/deployment.md` |
 | integrate the client into a Rust service | `docs/rust.md` |
 | configure routing, memory, placement, or observability | `docs/configuration.md` |
@@ -36,9 +36,12 @@ The repository is organized by clear runtime responsibilities.
 | `mooncake-store-core` | Shared store model | Defines identities, leases, routes, segments, lifecycle, and traits |
 | `mooncake-store-rs-metadata` | Metadata backends | Stores leases, segments, and route state in Redis, etcd, or memory |
 | `mooncake-store-client` | Main runtime | Implements store APIs, routing, allocation, reclaim, control-plane RPC, and observability |
+| `mooncake-store-rs-runtime` | Python compatibility runtime | Provides setup, dispatcher, dummy service, and shared-memory compatibility paths |
+| `mooncake-store-rs-admin` | Admin service and command | Hosts operator HTTP/API behavior and the standalone admin binary |
+| `mooncake-store-rs-cli` | Client and benchmark commands | Builds the standalone Store-RS client and benchmark binaries |
 | `mooncake-store-rs-transport-sys` | Native FFI | Links Rust to upstream Mooncake native libraries |
 | `mooncake-store-rs-transport` | Safe transport wrapper | Exposes TE/TENT as Rust-friendly transport abstractions |
-| `mooncake-store-py` | Python bindings | Exposes the Rust client as a native Python module |
+| `mooncake-store-py` | Python bindings | Builds the private `mooncake._store_rs` native module |
 | `mooncake-store-e2e` | Validation binary | Runs end-to-end checks and benchmark loops |
 
 If you want a deeper module-by-module explanation, read `docs/components.md`.
@@ -127,7 +130,7 @@ The `/metrics` surface is now split by metric family instead of one flat operati
 - dummy and real HiCache-compatible execution paths
 - daemon-local hot read cache for the Python compatibility runtime, with optional shm-backed payload sharing for dummy clients attached to the same standalone daemon
 - source-checkout Python compatibility API backed by the Rust runtime
-- standalone `mooncake-store-client`, `mooncake-store-admin`, and `mooncake-store-bench` Rust binaries
+- standalone `mooncake-store-rs-client`, `mooncake-store-rs-admin`, and `mooncake-store-rs-bench` Rust binaries
 - hugepage-aware allocator options
 - `ReplicateConfig` request policy mapping
 - batch APIs, route query, metrics helpers, lifecycle helpers
@@ -140,7 +143,7 @@ Store-RS now treats tenant isolation as a control-plane feature authored in meta
 
 The intended operator flow is:
 
-1. write tenant policy through `mooncake-store-admin policy ...`
+1. write tenant policy through `mooncake-store-rs-admin policy ...`
 2. launch runtimes with a tenant identity plus transport and memory configuration
 3. let Store-RS resolve and enforce effective tenant policy from metadata during bootstrap and on write paths
 
@@ -154,7 +157,7 @@ What tenant policy covers:
 
 Important boundary:
 
-- `mooncake-store-admin` is the preferred management surface for tenant policy and explicit repair
+- `mooncake-store-rs-admin` is the preferred management surface for tenant policy and explicit repair
 - request-path enforcement stays inside Store-RS clients and control-plane services
 - runtime-local builder / Python / CLI knobs remain compatibility fallbacks, not the preferred authoring path
 
@@ -176,7 +179,7 @@ Basic usage:
 1. write policy for one tenant:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy set \
   --tenant tenant-a \
@@ -189,7 +192,7 @@ mooncake-store-admin \
 2. start a runtime for that tenant:
 
 ```bash
-mooncake-store-client \
+mooncake-store-rs-client \
   --metadata-url redis://127.0.0.1:6380/0 \
   --stable-id tenant-a-store-1 \
   --tenant tenant-a \
@@ -203,12 +206,12 @@ For Rust clients, the equivalent scope selection is `.tenant("tenant-a")` on `St
 3. inspect quota state and pending reservations:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota state \
   --tenant tenant-a
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reservations \
   --tenant tenant-a \
@@ -218,7 +221,7 @@ mooncake-store-admin \
 4. run explicit repair when needed:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reconcile \
   --tenant tenant-a \
@@ -322,7 +325,7 @@ Native CLI hot-upgrade validation:
 
 This script:
 
-- builds the standalone `mooncake-store-client` binary
+- builds the standalone `mooncake-store-rs-client` binary
 - starts an active predecessor and a standby successor with the same `stable_id`
 - writes a real payload through an external routed client
 - sends `SIGTERM` to trigger graceful handoff
@@ -366,7 +369,7 @@ Use the explicit admin command when you want to remove segment metadata that bel
 to owners with no live lease:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   cleanup-stale-segments
 ```
@@ -389,7 +392,7 @@ Native CLI eviction validation:
 
 This script:
 
-- builds the standalone `mooncake-store-client` binary
+- builds the standalone `mooncake-store-rs-client` binary
 - starts a real storage client with `/metrics` enabled
 - drives `put`, `get`, and `batch_get` through an external routed Python client
 - waits for background storage-owner eviction to reclaim the cold replica
@@ -419,7 +422,7 @@ steady-state bandwidth:
 
 Treat this summary as the primary throughput signal. The per-phase `stress phase=...` lines remain in the log for latency breakdowns and setup debugging.
 
-### Run `mooncake-store-bench`
+### Run `mooncake-store-rs-bench`
 
 Use the Store-RS benchmark binary when you want a first-party verify / benchmark /
 soak surface against the Rust runtime.
@@ -427,7 +430,7 @@ soak surface against the Rust runtime.
 Correctness smoke check:
 
 ```bash
-mooncake-store-bench \
+mooncake-store-rs-bench \
   --metadata-url redis://127.0.0.1:6380/0 \
   verify \
   --write-interface batch-put-from \
@@ -437,7 +440,7 @@ mooncake-store-bench \
 Scratch-only remote-store benchmark:
 
 ```bash
-mooncake-store-bench \
+mooncake-store-rs-bench \
   --metadata-url redis://127.0.0.1:6380/0 \
   bench \
   --mode mixed \
@@ -451,7 +454,7 @@ from the CLI or env when needed:
 ```bash
 MC_BENCH_WRITE_INTERFACE=put \
 MC_BENCH_READ_INTERFACE=get \
-mooncake-store-bench \
+mooncake-store-rs-bench \
   --metadata-url redis://127.0.0.1:6380/0 \
   bench \
   --mode mixed \
@@ -463,7 +466,7 @@ Or use one combined env:
 
 ```bash
 MC_BENCH_INTERFACES=put,get \
-mooncake-store-bench \
+mooncake-store-rs-bench \
   --metadata-url redis://127.0.0.1:6380/0 \
   bench \
   --mode mixed
@@ -472,7 +475,7 @@ mooncake-store-bench \
 Longer soak run:
 
 ```bash
-mooncake-store-bench \
+mooncake-store-rs-bench \
   --metadata-url redis://127.0.0.1:6380/0 \
   soak \
   --duration 3600 \
@@ -507,7 +510,7 @@ See `docs/bench.md` for the full CLI reference.
 ./scripts/tests/client/test-client-rw-cli.sh
 ```
 
-This standard entry point builds the standalone `mooncake-store-client` binary,
+This standard entry point builds the standalone `mooncake-store-rs-client` binary,
 starts storage daemons against a temporary Redis metadata backend, and verifies:
 
 - dummy single-item read/write
@@ -611,7 +614,7 @@ Use these environment variables for SGLang real mode:
 - dummy-mode SGLang through a standalone routed gateway
 
 ```bash
-mooncake-store-client \
+mooncake-store-rs-client \
   --local-hostname 10.0.0.21 \
   --metadata-url redis://10.0.0.10:6379/0 \
   --storage-bytes 0 \
@@ -731,7 +734,7 @@ The low-level Rust API keeps transport selection explicit: applications construc
 
 The runtime transport switch belongs to the compatibility layer:
 
-- `mooncake-store-client --transport-backend tent|classic-te`
+- `mooncake-store-rs-client --transport-backend tent|classic-te`
 - `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
 
@@ -870,10 +873,10 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 ### Tracing
 
 - `MC_STORE_RS_TRACE=1`
-- `MC_STORE_RS_TRACE_FILTER=info` or any `tracing_subscriber` filter string; `mooncake-store-client --trace-filter ...` overrides the environment value
+- `MC_STORE_RS_TRACE_FILTER=info` or any `tracing_subscriber` filter string; `mooncake-store-rs-client --trace-filter ...` overrides the environment value
 - span close lines such as `close time.busy=...` are suppressed by default; set `MC_STORE_RS_TRACE_SPAN_EVENTS=close` only when you need synthetic span-close timing
 - Python real clients auto-initialize Rust tracing before `setup(...)` when `MC_STORE_RS_TRACE=1`
-- `mooncake-store-bench` uses its own tracing init, writes to `stderr` by default, and falls back to `info` when neither `--trace-filter`, `MC_STORE_RS_TRACE_FILTER`, nor `RUST_LOG` is set
+- `mooncake-store-rs-bench` uses its own tracing init, writes to `stderr` by default, and falls back to `info` when neither `--trace-filter`, `MC_STORE_RS_TRACE_FILTER`, nor `RUST_LOG` is set
 - use `MC_BENCH_TRACE_FILE=/path/to/bench.log` for bench logs; keep `MC_STORE_RS_TRACE_FILE` for standalone-client and Python real-client logging
 - bench disables tracing span-close events so hot-path `close time.busy=...` noise does not flood benchmark output
 - Jaeger profiling uses OTLP HTTP: set `MC_STORE_RS_OTLP_ENDPOINT=http://jaeger.observability.svc.cluster.local:4318`; keep `MC_STORE_RS_OTLP_TRACE` unset or `0` for a disabled startup

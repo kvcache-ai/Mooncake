@@ -6,7 +6,7 @@ This document explains how to run `mooncake-store-rs` locally and how to map the
 
 For tenant-scoped routing and resource policy, prefer this operator workflow:
 
-1. write tenant policy through `mooncake-store-admin policy ...`
+1. write tenant policy through `mooncake-store-rs-admin policy ...`
 2. launch runtimes with tenant identity plus transport/memory configuration
 3. let Store-RS resolve and enforce the effective policy from metadata at bootstrap and on request paths
 
@@ -23,8 +23,9 @@ Runtime-local CLI, Python, and environment route/resource knobs remain available
 ## Prepare the Repository
 
 Set the Store-RS source, Mooncake source, and CMake build paths explicitly. Each
-path must be absolute. Build Transfer Engine and TENT into the selected CMake
-build directory before running local scripts:
+path must be absolute. The top-level CMake project builds Transfer Engine,
+TENT, the Store-RS native shims, the Python extension, and the three command
+bins when `WITH_STORE_RS=ON`:
 
 ```bash
 export MOONCAKE_STORE_RS_DIR=/path/to/Mooncake/mooncake-store-rs
@@ -33,8 +34,12 @@ export MOONCAKE_BUILD_DIR=/path/to/Mooncake-build
 cmake -S "${MOONCAKE_ROOT_DIR}" -B "${MOONCAKE_BUILD_DIR}" \
   -DWITH_TE=ON -DUSE_TENT=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
   -DWITH_STORE_RS=ON
-cmake --build "${MOONCAKE_BUILD_DIR}" --target transfer_engine tent_shared
+cmake --build "${MOONCAKE_BUILD_DIR}" --target build_store_rs
 ```
+
+The default build leaves `WITH_STORE_RS=OFF` and does not require Cargo. CMake
+owns the TE/TENT shim targets; `mooncake-store-rs-transport-sys` validates and
+links to those explicit build-tree artifacts.
 
 ## Large-Memory Classic RDMA Bring-Up
 
@@ -155,7 +160,7 @@ Native CLI hot-upgrade validation:
 
 What the script does:
 
-- builds the standalone `mooncake-store-client` binary
+- builds the standalone `mooncake-store-rs-client` binary
 - starts an active predecessor and a standby successor with the same `stable_id`
 - writes a real payload through an external routed client
 - sends `SIGTERM` to trigger graceful handoff
@@ -182,7 +187,7 @@ Native CLI eviction validation:
 
 What the script does:
 
-- builds the standalone `mooncake-store-client` binary
+- builds the standalone `mooncake-store-rs-client` binary
 - starts a storage client with `/metrics` enabled
 - uses an external routed Python client to issue `put`, `get`, and `batch_get`
 - warms one key, then waits for background storage-owner eviction to reclaim the cold replica
@@ -270,7 +275,7 @@ These are compatibility bridges because current upstream SGLang does not forward
 - dummy-mode SGLang through a standalone routed gateway
 
 ```bash
-mooncake-store-client \
+mooncake-store-rs-client \
   --local-hostname 10.0.0.21 \
   --metadata-url redis://10.0.0.10:6379/0 \
   --storage-bytes 0 \
@@ -356,7 +361,7 @@ Important stress-benchmark inputs:
 | `MC_STORE_RS_STRESS_ROUTE_CONTROL` | `metadata_only` | route mode used by the benchmark |
 
 For the shipped operator-facing benchmark, correctness checker, and soak runner,
-use `mooncake-store-bench`; see `docs/bench.md`. Its default mode is scratch-only
+use `mooncake-store-rs-bench`; see `docs/bench.md`. Its default mode is scratch-only
 RW benchmarking (`MC_BENCH_STORAGE_BYTES=0`) against separate `storage=true`
 daemons, and it joins `mc/store-rs/v2` when no explicit keyspace is provided.
 
@@ -453,14 +458,14 @@ the state. Store-RS supports one-shot repair plus stateless background maintenan
 same admin binary:
 
 - a one-shot sweep through `cleanup-stale-segments`
-- a stateless background maintenance loop in `mooncake-store-admin server`
+- a stateless background maintenance loop in `mooncake-store-rs-admin server`
 - optional tenant quota reservation reconcile for an explicit tenant list in that same admin process
 
 Run the admin sweep when you want to remove dead-owner segment metadata. The same shape
 works with either `redis://...` or `etcd://...` metadata URLs:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   cleanup-stale-segments
 ```
@@ -468,7 +473,7 @@ mooncake-store-admin \
 Run the stateless admin container shape when cleanup should happen continuously:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   server \
   --bind-addr 0.0.0.0:8080 \
@@ -487,41 +492,41 @@ The background maintenance loop works like this:
 - each due owner is re-checked against the live lease key before cleanup
 - dead-owner segment deletion stays owner-scoped instead of falling back to a hidden full keyspace walk in the steady-state worker
 - if a lease key disappeared briefly, same-epoch reclaim is accepted as long as that epoch is still the stable-id HWM and no higher live epoch exists
-- tenant quota reconcile remains explicit: the worker only runs for tenants named on the command line, then internally reuses the same repair logic as `mooncake-store-admin quota reconcile`
+- tenant quota reconcile remains explicit: the worker only runs for tenants named on the command line, then internally reuses the same repair logic as `mooncake-store-rs-admin quota reconcile`
 
 This keeps the admin pod stateless. If the pod restarts, the next reconcile loop resumes from Redis or etcd metadata instead of relying on in-memory work queues.
 
 You can also manage tenant route policy and inspect strict-quota metadata through the same binary:
 
 ```bash
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy list
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy list \
   --tenant tenant-a
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   policy set \
   --tenant tenant-a \
   --route-topk 3 \
   --route-control embedded-wrh
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota state \
   --tenant tenant-a
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reservations \
   --tenant tenant-a \
   --state pending
 
-mooncake-store-admin \
+mooncake-store-rs-admin \
   --metadata-url redis://127.0.0.1:6380/0 \
   quota reconcile \
   --tenant tenant-a \
@@ -576,7 +581,7 @@ Current repository scripts and examples default to `classic_te`; set `MC_STORE_R
 Runtime selection:
 
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
-- `mooncake-store-client --transport-backend tent|classic-te`
+- `mooncake-store-rs-client --transport-backend tent|classic-te`
 - `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
 - `MC_STORE_RS_GID_INDEX=<n>` when `classic_te` over RDMA must pick a non-default RoCE GID index; Store-RS forwards it to upstream `MC_GID_INDEX`
 
