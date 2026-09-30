@@ -1,4 +1,3 @@
-#include <chrono>
 #include <string>
 
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.h"
@@ -26,8 +25,8 @@ PGResult<void> HostProxyRoute::initialize(int device_index) {
     return {};
 }
 
-HostProxyCommandSlot* HostProxyRoute::deviceCommandSlots() const noexcept {
-    return device_slots_;
+DeviceHostProxyContext HostProxyRoute::deviceContext() const noexcept {
+    return DeviceHostProxyContext{.command_slots = device_slots_};
 }
 
 std::string_view HostProxyRoute::routeKey() const noexcept { return kRouteKey; }
@@ -99,7 +98,9 @@ PGResult<void> HostProxyRoute::registerRegion(DeviceRegionKind kind, void* addr,
 
 PGResult<void> HostProxyRoute::unregisterRegion(DeviceRegionKind kind,
                                                 void* addr, size_t size) {
-    PG_VALIDATE_STATE(initialized_, "HostProxyRoute is not initialized");
+    PG_VALIDATE_STATE(initialized_ || shutdown_requested_,
+                      "HostProxyRoute cannot unregister regions before "
+                      "initialization");
     PG_VALIDATE_ARG(addr && size != 0, "host-proxy region is empty");
     switch (kind) {
         case DeviceRegionKind::PeerAccessible:
@@ -115,11 +116,6 @@ PGResult<void> HostProxyRoute::unregisterRegion(DeviceRegionKind kind,
                        "unknown host-proxy device region kind");
 }
 
-PGResult<void> HostProxyRoute::quiesce() {
-    PG_VALIDATE_STATE(initialized_, "HostProxyRoute is not initialized");
-    return proxy_->waitUntilIdle();
-}
-
 PGResult<void> HostProxyRoute::shutdown() {
     if (shutdown_requested_) return {};
     if (!initialized_) {
@@ -127,7 +123,6 @@ PGResult<void> HostProxyRoute::shutdown() {
         shutdown_requested_ = true;
         return {};
     }
-    PG_TRY(proxy_->waitUntilIdle(std::chrono::milliseconds(0)));
     PG_TRY(proxy_->shutdown());
     shutdown_requested_ = true;
     device_slots_ = nullptr;
