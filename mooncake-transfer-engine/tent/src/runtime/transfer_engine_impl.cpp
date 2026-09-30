@@ -790,6 +790,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = SHM;
         else if (transport_list_[RDMA])
             options.type = RDMA;
+        else if (transport_list_[FABRIC])
+            options.type = FABRIC;
         else if (transport_list_[TCP])
             options.type = TCP;
         else
@@ -799,6 +801,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = MNNVL;
         else if (transport_list_[RDMA])
             options.type = RDMA;
+        else if (transport_list_[FABRIC])
+            options.type = FABRIC;
         else if (transport_list_[TCP])
             options.type = TCP;
         else
@@ -818,6 +822,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = MNNVL;  // EGM: host memory NVLink peers can address
         else if (transport_list_[RDMA])
             options.type = RDMA;
+        else if (transport_list_[FABRIC])
+            options.type = FABRIC;
         else if (transport_list_[TCP])
             options.type = TCP;
         else if (transport_list_[HP_TCP])
@@ -902,6 +908,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     // not advertise host-to-host capability, so host network order is intact.
     if (transport_list_[XPU]) result.push_back(XPU);
     if (transport_list_[RDMA]) result.push_back(RDMA);
+    if (transport_list_[FABRIC]) result.push_back(FABRIC);
     if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
     if (transport_list_[SHM]) result.push_back(SHM);
@@ -1473,7 +1480,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                             buffer->transports.end(),
                                             type) != buffer->transports.end();
             };
-            for (auto type : {RDMA, TCP, HP_TCP}) {
+            for (auto type : {RDMA, FABRIC, TCP, HP_TCP}) {
                 if (transport_list_[type] && carries(local_entry, type) &&
                     carries(remote_entry, type)) {
                     staging_transports.push_back(type);
@@ -1918,8 +1925,8 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
     // An empty stage location means "no staging needed on that side".
     if (transport_list_[TPU] &&
-        (transport_list_[RDMA] || transport_list_[TCP] ||
-         transport_list_[HP_TCP])) {
+        (transport_list_[RDMA] || transport_list_[FABRIC] ||
+         transport_list_[TCP] || transport_list_[HP_TCP])) {
         if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
             policy.clear();
             policy.push_back(server_addr);
@@ -1951,8 +1958,8 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // than handing VRAM to a host-only transport.
     if ((local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU) &&
         transport_list_[XPU] &&
-        (transport_list_[RDMA] || transport_list_[TCP] ||
-         transport_list_[HP_TCP])) {
+        (transport_list_[RDMA] || transport_list_[FABRIC] ||
+         transport_list_[TCP] || transport_list_[HP_TCP])) {
         std::string local_stage, remote_stage;
         if (isGpuType(local_mtype)) {
             local_stage = topology_->findNearMem(local);
