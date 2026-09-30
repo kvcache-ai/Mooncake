@@ -13,47 +13,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# If git clone fails, you can place dependencies and the script in a directory for compilation and installation.
-# Define a function to handle the git clone operation
+# Install system dependencies for the Ascend transport build.
+# Debian/Ubuntu uses apt packages; openEuler/RHEL uses yum/dnf packages.
+#
+# NOTE: the former from-source builds of yaml-cpp and msgpack-c were removed.
+# No Mooncake target built on the Ascend path consumes them (mooncake-conductor
+# is WITH_CONDUCTOR=OFF by default and locates msgpack on its own when enabled),
+# and building msgpack-c with its default MSGPACK_USE_BOOST=ON forced an extra
+# Boost requirement that broke on newer CMake (>= 3.30) with older boost-devel.
 
 #!/bin/bash
 
-# Try git clone with GitHub mirror fallback via https://ghfast.top/
-git_with_github_mirror_fallback() {
-    local repo_dir="$1"
-    local repo_url="$2"
-    shift 2
-
-    if git clone "$repo_url" "$repo_dir" "$@"; then
-        return 0
-    fi
-
-    echo "Direct clone failed, retrying with mirror https://ghfast.top/"
-    rm -rf "$repo_dir"
-    local mirror_url="https://ghfast.top/${repo_url}"
-    git clone "$mirror_url" "$repo_dir" "$@"
+print_error() {
+    echo "[ERROR] $1"
+    exit 1
 }
 
-clone_repo_if_not_exists() {
-    local repo_dir="$1"
-    local repo_url="$2"
-    shift 2
-
-    if [ ! -d "$repo_dir" ]; then
-        git_with_github_mirror_fallback "$repo_dir" "$repo_url" "$@"
-    else
-        echo "Directory $repo_dir already exists, skipping clone."
-    fi
-}
-
-# Function to check command success
 check_success() {
     if [ $? -ne 0 ]; then
         print_error "$1"
     fi
 }
 
-set +e
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[WARN] Not running as root; system package installation will likely fail. Try: sudo bash $0"
+fi
 
 # System detection and dependency installation
 if command -v apt-get &> /dev/null; then
@@ -89,7 +75,9 @@ if command -v apt-get &> /dev/null; then
 elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
     yum makecache
+    # Required packages; keep in sync with scripts/ascend/dependencies_openeuler.sh.
     yum install -y cmake \
+            gcc gcc-c++ make git wget unzip \
             gflags-devel \
             glog-devel \
             libibverbs-devel \
@@ -99,31 +87,15 @@ elif command -v yum &> /dev/null; then
             hiredis-devel \
             libcurl-devel \
             jsoncpp-devel \
-            mpich \
-            mpich-devel \
             zstd-devel \
             xxhash-devel
-    # Install yaml-cpp
-    cd "$TARGET_DIR"
-    clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
-    cd yaml-cpp || exit
-    rm -rf build
-    mkdir -p build && cd build
-    cmake ..
-    make -j$(nproc)
-    make install
-    cd ../..
-
-    # Install msgpack-c
-    clone_repo_if_not_exists "msgpack-c" "https://github.com/msgpack/msgpack-c.git"
-    cd msgpack-c || exit
-    git checkout cpp-7.0.0
-    rm -rf build
-    mkdir -p build && cd build
-    cmake ..
-    make -j
-    make install
-    cd ../..
+    # Best-effort packages: provided by most openEuler releases but safe to skip.
+    yum install -y mpich mpich-devel 2>/dev/null \
+        || echo "[WARN] mpich not available from repo, skip."
+    yum install -y libunwind-devel python3-devel pkgconf pkgconf-pkg-config patchelf glibc glibc-common 2>/dev/null \
+        || echo "[WARN] some optional packages are not available from repo, skip."
+    # openEuler images may ship OpenMPI; remove it to avoid conflicts with MPICH.
+    yum remove -y openmpi openmpi-devel 2>/dev/null || true
 else
     echo "Unsupported package manager. Please install the dependencies manually."
     exit 1
@@ -132,4 +104,4 @@ fi
 check_success "Failed to install system packages"
 echo -e "system packages installed successfully."
 
-export CPLUS_INCLUDE_PATH=$(echo $CPLUS_INCLUDE_PATH | tr ':' '\n' | grep -v "/usr/local/Ascend" | paste -sd: -)
+export CPLUS_INCLUDE_PATH="$(echo "${CPLUS_INCLUDE_PATH:-}" | tr ':' '\n' | grep -v "/usr/local/Ascend" | paste -sd: - || true)"
