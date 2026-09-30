@@ -8494,8 +8494,9 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                         PublishKvRemovedAfterEvict(candidate.key, erased,
                                                    "disk", metadata, tenant_id);
                         if (!metadata.IsValid()) {
-                            EraseMetadata(tenant, entry, metadata, state,
-                                          tenant_id, QuotaEraseMode::kFull);
+                            (void)EraseMetadata(tenant, entry, metadata, state,
+                                                tenant_id,
+                                                QuotaEraseMode::kFull);
                         }
                     });
             }
