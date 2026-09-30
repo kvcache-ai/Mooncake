@@ -4360,6 +4360,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     // A failed restore leaves nothing behind: installed keys go back out
     // through the canonical removal, bookkeeping returns to its pre-restore
     // snapshots, and the new liveness records come out with their counters.
+    // The exported memory gauges are only swapped in once the restore can no
+    // longer fail, so rollback never has to undo a published metric delta.
     const auto rollback_restored_state = [&]() {
         for (const auto& [shard_idx, tenant, key] : installed_keys) {
             MetadataShardAccessorRW shard(this, shard_idx);
@@ -4387,14 +4389,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
     };
 
-    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
-        MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
-    }
-    for (const auto& [segment, bytes] : restored_accounted_memory_bytes) {
-        MasterMetricManager::instance().inc_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
-    }
     standby_accounted_memory_bytes_ =
         std::move(restored_accounted_memory_bytes);
     standby_memory_segments_ = std::move(restored_memory_segments);
@@ -4505,6 +4499,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
         LOG(INFO) << "RestoreFromStandbySnapshot: durable repair records="
                   << total;
+    }
+
+    // Publish the accounting swap only after nothing can fail anymore: the
+    // fail-closed paths above must stay a no-op for the exported gauges, and
+    // the client/snapshot mutexes held here mean no concurrent reader can see
+    // the gauge drift between the map swap and this commit.
+    for (const auto& [segment, bytes] : prev_standby_accounted_memory_bytes) {
+        MasterMetricManager::instance().dec_allocated_mem_size(
+            segment, static_cast<int64_t>(bytes));
+    }
+    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+        MasterMetricManager::instance().inc_allocated_mem_size(
+            segment, static_cast<int64_t>(bytes));
     }
 
     LOG(INFO) << "Restored from standby: " << restored_object_count

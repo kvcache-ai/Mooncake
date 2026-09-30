@@ -2483,6 +2483,11 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
 
+    // The gauge must not move on a failed restore: the failed attempt and the
+    // successful retry together should look like exactly one clean restore.
+    const auto metric_before =
+        MasterMetricManager::instance().get_allocated_mem_size();
+
     // Fail-closed: when the repair records cannot be made durable, the
     // restore must not complete with an index whose discards could replay.
     auto result = service.RestoreFromStandbySnapshot(
@@ -2490,6 +2495,8 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, result.error());
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before);
 
     // Rollback leaves nothing behind: no metadata, no liveness records. A
     // retry must see an empty index rather than already-existing objects.
@@ -2511,6 +2518,11 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_reject_lost"),
               0);
+    // Only the survivor's non-overlapping replica is accounted; its twin at
+    // the same address as the discarded object is conflict-dropped, and the
+    // discarded object contributes nothing.
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before + 1024);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
@@ -2544,10 +2556,17 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
 
+    const auto metric_before =
+        MasterMetricManager::instance().get_allocated_mem_size();
+
     auto result = service.RestoreFromStandbySnapshot(
         {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
 
     ASSERT_FALSE(result.has_value());
+    // A restore that failed closed must not have published any accounting:
+    // the exported gauge stays exactly where it was.
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_nowriter_survivor"),
               0);
@@ -2555,6 +2574,56 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
                                      "standby_repair_nowriter_lost"),
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+}
+
+TEST_F(MasterServiceHATest, FailedRepairRestoreKeepsReplicaIdCounterAdvanced) {
+    // The restore advances the process-wide replica id counter past the max
+    // restored id before the durable repair runs, and a failed repair must
+    // not roll it back: ids are never reused, so a replica created after the
+    // failure still lands above everything the snapshot carried.
+    const std::string cluster_id = "test_restore_repair_id_counter";
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build();
+    MasterService service(service_config);
+    // Same fail-closed setup as the no-writer case above.
+    ASSERT_FALSE(HasOpLogWriter(service));
+
+    const ReplicaID base_id = ReplicaID{1} << 40;
+    const std::string endpoint = "standby_repair_id_counter_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_id_counter_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_id_counter_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[0].id = base_id;
+    survivor.metadata.replicas[1].id = base_id + 1;
+    lost.metadata.replicas.front().id = base_id;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_FALSE(result.has_value());
+
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    PutObjectOnSegment(service, generate_uuid(),
+                       "standby_repair_id_counter_new", endpoint);
+    const auto fresh =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                     "standby_repair_id_counter_new");
+    ASSERT_EQ(fresh.size(), 1);
+    EXPECT_GE(fresh.front().id, base_id + 2);
 }
 
 TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
