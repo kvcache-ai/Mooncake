@@ -97,11 +97,41 @@ TEST(KvcsEfcTopologyTest, MissingTopologyFileIsRejected) {
     EXPECT_EQ(routes.error(), ErrorCode::INVALID_PARAMS);
 }
 
-TEST(KvcsEfcTopologyTest, ExplicitLocalBackendOverridesG35Default) {
+TEST(KvcsEfcTopologyTest, EmptyEnvironmentUsesBuiltInG35Target) {
+    ScopedEnv backend("KVCS_BACKEND");
+    ScopedEnv extra_backends("KVCS_EXTRA_BACKENDS");
+    ScopedEnv mountpoints("KVCS_MOUNTPOINTS_JSON");
+    backend.Set("");
+    extra_backends.Set("");
+    mountpoints.Set("");
+
+    auto routes = LoadKvcsEfcTopology({});
+    ASSERT_TRUE(routes);
+    ASSERT_EQ(routes->size(), 1);
+    EXPECT_EQ((*routes)[0].kind, KvcsEfcRouteKind::kKvCacheStore);
+    EXPECT_EQ((*routes)[0].mountpoint_index, 1);
+}
+
+TEST(KvcsEfcTopologyTest, ExplicitG35BackendDoesNotExposeLocalRoute) {
+    ScopedEnv backend("KVCS_BACKEND");
+    ScopedEnv extra_backends("KVCS_EXTRA_BACKENDS");
+    ScopedEnv mountpoints("KVCS_MOUNTPOINTS_JSON");
+    backend.Set("kvcachestore");
+    extra_backends.Set("");
+
+    auto routes = LoadKvcsEfcTopology({});
+    ASSERT_TRUE(routes);
+    ASSERT_EQ(routes->size(), 1);
+    EXPECT_EQ((*routes)[0].kind, KvcsEfcRouteKind::kKvCacheStore);
+    EXPECT_EQ((*routes)[0].mountpoint_index, 1);
+}
+
+TEST(KvcsEfcTopologyTest, ExplicitG3BackendOverridesG35Default) {
     ScopedEnv backend("KVCS_BACKEND");
     ScopedEnv extra_backends("KVCS_EXTRA_BACKENDS");
     ScopedEnv mountpoints("KVCS_MOUNTPOINTS_JSON");
     backend.Set("disk");
+    extra_backends.Set("");
 
     auto routes = LoadKvcsEfcTopology({});
     ASSERT_TRUE(routes);

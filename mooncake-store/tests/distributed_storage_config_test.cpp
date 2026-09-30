@@ -244,6 +244,7 @@ TEST_F(DistributedStorageConfigTest, AutoEnablesKvcsWhenEfcSocketExists) {
 
     EXPECT_EQ(config.fs_adapter_type, "kvcs-lowlevel");
     EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_TRUE(config.enable_health_check);
 }
 
 TEST_F(DistributedStorageConfigTest,
@@ -257,6 +258,7 @@ TEST_F(DistributedStorageConfigTest,
 
     EXPECT_EQ(config.fs_adapter_type, "posix");
     EXPECT_FALSE(config.UsesKvcs());
+    EXPECT_FALSE(config.enable_health_check);
 }
 
 TEST_F(DistributedStorageConfigTest,
@@ -269,6 +271,68 @@ TEST_F(DistributedStorageConfigTest,
     const auto config = DistributedStorageConfig::FromEnvironment();
 
     EXPECT_EQ(config.fs_adapter_type, "kvcs-standard");
+    EXPECT_TRUE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, ExplicitKvcsModesEnableHealthByDefault) {
+    for (const char* mode : {"standard", "low-level"}) {
+        SCOPED_TRACE(mode);
+        env.kvcs_mode.Set(mode);
+
+        const auto config = DistributedStorageConfig::FromEnvironment();
+
+        EXPECT_TRUE(config.UsesKvcs());
+        EXPECT_TRUE(config.enable_health_check);
+    }
+}
+
+TEST_F(DistributedStorageConfigTest, ExplicitKvcsAdaptersEnableHealthByDefault) {
+    for (const char* adapter : {"kvcs-standard", "kvcs-lowlevel"}) {
+        SCOPED_TRACE(adapter);
+        env.fs_adapter.Set(adapter);
+
+        const auto config = DistributedStorageConfig::FromEnvironment();
+
+        EXPECT_TRUE(config.UsesKvcs());
+        EXPECT_TRUE(config.enable_health_check);
+    }
+}
+
+TEST_F(DistributedStorageConfigTest, KvcsHealthCheckCanBeExplicitlyDisabled) {
+    env.health_check.Set("false");
+    for (const char* mode : {"standard", "low-level"}) {
+        SCOPED_TRACE(mode);
+        env.kvcs_mode.Set(mode);
+
+        const auto config = DistributedStorageConfig::FromEnvironment();
+
+        EXPECT_TRUE(config.UsesKvcs());
+        EXPECT_FALSE(config.enable_health_check);
+    }
+}
+
+TEST_F(DistributedStorageConfigTest, AutoDetectedKvcsHealthCanBeDisabled) {
+    UnixSocketFixture socket;
+    ASSERT_TRUE(socket.Create());
+    env.kvcs_socket.Set(socket.path().c_str());
+    env.health_check.Set("false");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_FALSE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, NonKvcsAdaptersKeepHealthDisabledByDefault) {
+    for (const char* adapter : {"hf3fs", "posix", "oss"}) {
+        SCOPED_TRACE(adapter);
+        env.fs_adapter.Set(adapter);
+
+        const auto config = DistributedStorageConfig::FromEnvironment();
+
+        EXPECT_FALSE(config.UsesKvcs());
+        EXPECT_FALSE(config.enable_health_check);
+    }
 }
 
 TEST_F(DistributedStorageConfigTest, MissingEfcSocketKeepsDefaultAdapter) {

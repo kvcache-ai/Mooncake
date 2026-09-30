@@ -213,7 +213,7 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     }
     config.enable_health_check =
         Environ::ReadOr(Variables::MOONCAKE_DISTRIBUTED_HEALTH_CHECK,
-                        config.enable_health_check);
+                        config.UsesKvcs() || config.enable_health_check);
     config.shard_count = Environ::ReadOr(Variables::MOONCAKE_DFS_SHARD_COUNT,
                                          config.shard_count);
     config.shard_capacity = Environ::ReadOr(

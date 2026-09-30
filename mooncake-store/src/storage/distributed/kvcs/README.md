@@ -47,8 +47,21 @@ The Mooncake master and clients resolve the same adapter from the shared
 startup environment. The legacy `kvcs` value is accepted and canonicalized
 from `MOONCAKE_KVCS_MODE`, but new deployments should not use it. KVCS has no
 dedicated health endpoint.
-KVCS startup health probing is disabled in this first integration version;
-individual provider read/write failures are logged and returned to the caller.
+Startup health checking follows the common
+`MOONCAKE_DISTRIBUTED_HEALTH_CHECK` setting. It defaults to `true` when KVCS is
+selected, including through socket auto-detection, and remains `false` for
+other adapters. Set it to `false` to opt out. The check queries a reserved
+probe key on every KVCS target in either Standard or Low Level mode.
+A missing probe key is healthy; other provider errors fail backend
+initialization. Individual provider read/write failures are logged and returned
+to the caller.
+
+Low Level health queries use `MOONCAKE_KVCS_QUERY_TIMEOUT_MS` (default: 50 ms).
+Standard mode uses the SDK's query API, which exposes no per-call deadline.
+KVCS SDK 0.4.7 bounds Redis connection/socket/pool waits, but its G3.5 query
+fallback calls `GetStat` and `QueryMeta` without gRPC deadlines. Standard
+startup health therefore has no guaranteed end-to-end timeout if that RPC
+server stops responding; SDK support is needed to bound or cancel these calls.
 
 ### Standard
 
@@ -80,6 +93,43 @@ restriction: explicit local index-0 and mixed G3/G3.5 topologies retain their
 existing routing behavior. The default index must match the EFC deployment.
 KVCS remains responsible for watermarks and space reclamation inside each
 backend.
+
+#### G3 and G3.5 configuration
+
+Set the following variables in the environment of every Mooncake client that
+accesses KVCS, before starting it. These are Low Level routing settings, not
+commands that reconfigure EFC.
+
+| Storage path | `KVCS_BACKEND` | `KVCS_EXTRA_BACKENDS` | Mooncake routes |
+| --- | --- | --- | --- |
+| G3 (EFC local disk) | `disk` | Empty string | Local target, `mountpoint_index=0` |
+| G3.5 (KVCacheStore) | `kvcachestore` (built-in default) | Empty string (built-in default) | KVCacheStore target, `mountpoint_index=1` by default |
+
+G3.5 needs no extra topology environment variables for a single index-1
+mountpoint. To select G3 instead, use:
+
+```bash
+export KVCS_BACKEND=disk
+export KVCS_EXTRA_BACKENDS=''
+```
+
+To explicitly select G3.5, including when replacing an inherited G3 setting:
+
+```bash
+export KVCS_BACKEND=kvcachestore
+export KVCS_EXTRA_BACKENDS=''
+```
+
+An inherited `KVCS_EXTRA_BACKENDS=kvcachestore` combined with `KVCS_BACKEND=disk`
+exposes both G3 and G3.5 routes; it does not select only G3.5. Explicit
+environment values override the built-in defaults. An explicit topology YAML
+file takes precedence over these variables.
+
+EFC must actually provide the selected backend and mountpoint. The default
+does not create a KVCacheStore mountpoint or validate its storage generation.
+For multiple remote mountpoints, pass the actual `KVCS_MOUNTPOINTS_JSON`;
+Mooncake assigns indices starting at 1 in its `mountPoints` array order, which
+must match EFC. The built-in `kvcachestore-default` ID is only a routing label.
 
 For a G3/G3.5 deployment, Mooncake uses a stable hash of the tenant-qualified
 key. Each object is written to exactly one target: there is no Mooncake-side
@@ -140,8 +190,8 @@ exists.
 The official SDK does not provide a Mooncake-facing capacity or bandwidth
 contract that would make a local load model authoritative. Capacity, watermarks,
 space reclamation, and provider-side health remain KVCS/EFC responsibilities;
-Mooncake reacts to the result of each operation. Startup health probing is not
-performed for KVCS in this integration version.
+Mooncake reacts to the result of each operation. Startup health probing is
+enabled by default for KVCS and honors the common health-check setting.
 
 Mooncake keeps tenant isolation in the provider key. The adapter encodes
 `tenant_id` and the logical key as the printable, injective raw key
