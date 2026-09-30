@@ -165,8 +165,8 @@ surviving and removed objects.
 
 Set `--failpoint-dir` to verify the same launcher environment path used by
 crash tests. The script requires `mooncake_master`, `oplog_ha_client`,
-`oplog_batch_inspector`, `hot_standby_snapshot_bootstrap_test`, `etcd`,
-`etcdctl`, `curl`, `setsid`, and Python `aiohttp`. It is a manual real-etcd
+`oplog_batch_inspector`, `etcd`, `etcdctl`, `curl`, `setsid`, and Python
+`aiohttp`. It is a manual real-etcd
 check and is not registered in CI/nightly.
 
 The run directory must be new. The script stores configurations, master and

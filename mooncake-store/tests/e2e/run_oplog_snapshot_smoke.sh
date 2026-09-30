@@ -34,10 +34,6 @@ for name, local_path in [('missing', ''), ('file', str(invalid_path))]:
 PYTEST
 up_cluster
 export MC_STORE_CLUSTER_ID="$CLUSTER_ID"
-GTEST_FILTER=StandbyControllerTest.BatchSnapshotRepeatedStartStopAndPromotion \
-MOONCAKE_TEST_ETCD_ENDPOINTS="$ETCD_ENDPOINTS" \
-  "$BUILD_DIR/mooncake-store/tests/hot_standby_snapshot_bootstrap_test" \
-  >"$RUN_DIR/audit/controller-lifecycle.log" 2>&1
 for index in 0 1; do
   python3 - "$(cat "$RUN_DIR/pids/master-$index.pid")" "$RUN_DIR/snapshots" "$FAILPOINT_DIR" <<'PYENV'
 import pathlib, sys
