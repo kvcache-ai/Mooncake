@@ -1789,6 +1789,11 @@ WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
     return master_service_.QuerySegmentStatusById(segment_id);
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::SetSegmentStatus(
+    const std::string& segment_name, SegmentStatus status) {
+    return master_service_.SetSegmentStatus(segment_name, status);
+}
+
 bool WrappedMasterService::KvEventsEnabled() const {
     return master_service_.KvEventsEnabled();
 }

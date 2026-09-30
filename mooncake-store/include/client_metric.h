@@ -15,7 +15,6 @@
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
 #include "allocator_metric.h"
-#include "environ.h"
 #include "hybrid_metric.h"
 #include "master_heartbeat_metric.h"
 #include "common/byte_size.h"
@@ -36,18 +35,9 @@ const std::vector<double> kLatencyBucket = {
 // In production mode, more labels are needed for monitoring and troubleshooting
 // Static labels include but are not limited to machine address, cluster name,
 // etc. These labels remain constant during the lifetime of the application
-const std::string kClusterID = Environ::GetString("MC_STORE_CLUSTER_ID", "");
-
 // Merge static labels with dynamic labels
-const inline std::map<std::string, std::string> merge_labels(
-    const std::map<std::string, std::string>& labels) {
-    std::map<std::string, std::string> merged_labels;
-    if (!kClusterID.empty()) {
-        merged_labels["cluster_id"] = kClusterID;
-    }
-    merged_labels.insert(labels.begin(), labels.end());
-    return merged_labels;
-}
+const std::map<std::string, std::string> merge_labels(
+    const std::map<std::string, std::string>& labels);
 
 inline std::string format_metric_rate(double value, const char* suffix) {
     const double KB = 1024.0;
