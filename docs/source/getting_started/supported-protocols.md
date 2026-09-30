@@ -72,6 +72,7 @@ export MOONCAKE_PROTOCOL="tcp"
 - Non-NVIDAI GPUDirect RDMA (e.g., Intel E810 RDMA NIC)
 - Cambricon MLU memory via Neuware (`-DUSE_MLU=ON`)
 - Biren GPU memory via SUPA (`-DUSE_SUPA=ON`)
+- Intel XPU memory via dma-buf (`-DUSE_XPU=ON -DUSE_TENT=ON`)
 
 **Use When:**
 - High-performance networking is required
@@ -81,6 +82,8 @@ export MOONCAKE_PROTOCOL="tcp"
 **Note:** If no RDMA HCA (Host Channel Adapter) is detected on the system, the Transfer Engine will automatically fall back to TCP protocol for compatibility.
 
 **MLU Note:** Cambricon MLU support uses the standard `rdma` data path. There is no separate `mlu` protocol string. To enable MLU memory detection, topology discovery, and DMA-BUF based registration, build Transfer Engine with `-DUSE_MLU=ON` and make Neuware available through `NEUWARE_HOME` or `NEUWARE_ROOT`.
+
+**Intel XPU Note:** Intel XPU support lives in TENT (`-DUSE_XPU=ON -DUSE_TENT=ON`, run with `MC_USE_TENT=1`). On registration, VRAM is exported through Level Zero as a dma-buf and registered with `ibv_reg_dmabuf_mr`, so RDMA reads and writes go to VRAM directly. The direct path is per buffer, not guaranteed: when the NIC or rdma-core lacks dma-buf support, when the export fails for an allocation (for example small foreign USM allocations pooled by the Intel compute runtime, see the build guide), or when `transports/rdma/disable_gpu_direct_rdma` is `true`, the engine transparently stages that VRAM through pinned host memory over the same RDMA or TCP transport. A request hinted to another transport (e.g. `tcp`), or one whose selector policy only admits a DRAM-only transport (e.g. `hp_tcp`), is staged as well. Within one process, VRAM-to-VRAM copies between two XPUs on the same node go directly over PCIe (or Xe Link) when the devices have peer access, and are bounced through host memory otherwise. Across processes on the same node (for example a prefill and a decode worker), registered VRAM is also published with a Level Zero IPC handle; the peer maps it into its own context and the copy runs as a local XPU copy instead of going through the network transport. Opening a peer's handle fetches its dma-buf descriptor with `pidfd_getfd(2)`, which needs ptrace permission over the exporting process (Yama `ptrace_scope` 0/1 with a parent-child relationship, or `CAP_SYS_PTRACE`); when that is refused, or when `transports/xpu/disable_ipc` is `true`, the engine falls back to the network path.
 
 **Configuration:**
 ```python

@@ -17,6 +17,7 @@
 // server. The same-host peer has a non-local segment ID, just like another
 // process; the test never shares the peer's device address with a local copy.
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "tent/common/config.h"
+#include "tent/platform/xpu.h"
 #include "tent/runtime/transfer_engine_impl.h"
 
 namespace mooncake {
@@ -82,11 +84,19 @@ class TransferEngineImplTestPeer {
         return engine.resolveTransport(request, 0);
     }
     static bool hasXpuTag(tent::TransferEngineImpl& engine, void* address) {
+        return hasTag(engine, address, tent::XPU);
+    }
+    static bool hasTag(tent::TransferEngineImpl& engine, void* address,
+                       tent::TransportType type) {
         auto desc = engine.metadata_->segmentManager().getLocal();
         auto* buffer = desc->findBuffer(reinterpret_cast<uint64_t>(address), 1);
         return buffer &&
                std::find(buffer->transports.begin(), buffer->transports.end(),
-                         tent::XPU) != buffer->transports.end();
+                         type) != buffer->transports.end();
+    }
+    static bool rdmaGpuDirect(tent::TransferEngineImpl& engine) {
+        auto& rdma = engine.transport_list_[tent::RDMA];
+        return rdma && rdma->capabilities().gpu_to_gpu;
     }
     static std::shared_ptr<FailOnceXpuTransport> failNextCopy(
         tent::TransferEngineImpl& engine) {
@@ -117,6 +127,10 @@ class XpuEngineTest : public ::testing::TestWithParam<Params> {
         c->set("transports/io_uring/enable", false);
         c->set("transports/mpcomm/enable", false);
         c->set("transports/xpu/enable", true);
+        // Both engines live in this process, so the peer's VRAM would be
+        // reachable over the XPU IPC route; these tests cover the staged
+        // path, which is what a remote-host or IPC-less peer gets.
+        c->set("transports/xpu/disable_ipc", true);
         c->set("use_legacy_transport_selection", std::get<1>(GetParam()));
         c->set("enable_runtime_queue", std::get<2>(GetParam()));
         c->set("max_failover_attempts", 1);
@@ -224,6 +238,64 @@ TEST_P(XpuEngineTest, DefaultRegistrationSelectsLocalXpuCopy) {
     EXPECT_TRUE(route.staging_params.empty());
 }
 
+// A process-local VRAM->VRAM request routes to XpuTransport (gpu_to_gpu) with
+// no staging and lands the bytes: same device, and PCIe P2P across two XPUs
+// when the host has them.
+class XpuLocalDeviceCopyTest : public XpuEngineTest {
+   protected:
+    bool hasDevice(const char* location) {
+        MemoryOptions opts;
+        opts.location = location;
+        void* probe = nullptr;
+        auto& platform = Platform::getLoader();
+        if (!platform.allocate(&probe, 4096, opts).ok()) return false;
+        EXPECT_TRUE(platform.free(probe, 4096).ok());
+        return true;
+    }
+    void localTransfer(const char* dst_location) {
+        void *src = nullptr, *dst = nullptr;
+        ASSERT_NO_FATAL_FAILURE(allocate(*a_, "xpu:0", &src));
+        ASSERT_NO_FATAL_FAILURE(allocate(*a_, dst_location, &dst));
+        std::vector<uint8_t> seed(kLength), zero(kLength, 0), readback(kLength);
+        for (size_t i = 0; i < seed.size(); ++i) seed[i] = i % 253;
+        auto& platform = Platform::getLoader();
+        ASSERT_TRUE(platform.copy(src, seed.data(), kLength).ok());
+        ASSERT_TRUE(platform.copy(dst, zero.data(), kLength).ok());
+        Request request{};
+        request.opcode = Request::WRITE;
+        request.source = src;
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(dst);
+        request.length = kLength;
+        auto route = TransferEngineImplTestPeer::route(*a_, request);
+        ASSERT_EQ(route.transport, XPU);
+        EXPECT_TRUE(route.staging_params.empty());
+        auto batch = a_->allocateBatch(1);
+        ASSERT_NE(batch, 0u);
+        batches_.push_back({a_.get(), batch});
+        ASSERT_TRUE(a_->submitTransfer(batch, {request}).ok());
+        auto status = wait(batch);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kLength);
+        ASSERT_TRUE(platform.copy(readback.data(), dst, kLength).ok());
+        EXPECT_EQ(readback, seed);
+    }
+};
+
+TEST_P(XpuLocalDeviceCopyTest, SameDevice) {
+    ASSERT_NO_FATAL_FAILURE(localTransfer("xpu:0"));
+}
+
+TEST_P(XpuLocalDeviceCopyTest, AcrossDevices) {
+    if (!hasDevice("xpu:1")) GTEST_SKIP() << "needs two XPU devices";
+    ASSERT_NO_FATAL_FAILURE(localTransfer("xpu:1"));
+}
+
+INSTANTIATE_TEST_SUITE_P(NetworkAndDispatchModes, XpuLocalDeviceCopyTest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Bool(),
+                                            ::testing::Bool()));
+
 TEST_P(XpuEngineTest, StagesDeviceToDeviceReadAndWrite) {
     ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::WRITE, true));
     ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::READ, true));
@@ -278,6 +350,430 @@ INSTANTIATE_TEST_SUITE_P(NetworkAndDispatchModes, XpuEngineTest,
                          ::testing::Combine(::testing::Bool(),
                                             ::testing::Bool(),
                                             ::testing::Bool()));
+
+// Same-node cross-segment PCIe P2P: the peer's XPU buffer advertises its
+// Level Zero IPC handle in the segment descriptor, the initiator maps it and
+// XpuTransport copies straight into the mapping, no host stage and no
+// network. Both engines live in this process, so the handle resolves against
+// our own descriptors; the cross-process hand-over (pidfd_getfd) is covered
+// by tent_xpu_ipc_process_test. Skips when the SYCL backend cannot export or
+// import IPC handles (e.g. the OpenCL CPU fallback).
+class XpuIpcEngineTest
+    : public ::testing::TestWithParam<std::tuple<bool, bool>> {
+   protected:
+    std::shared_ptr<Config> config(bool ipc = true) {
+        auto c = std::make_shared<Config>();
+        c->set("metadata_type", "p2p");
+        c->set("metadata_servers", "");
+        c->set("rpc_server_hostname", "127.0.0.1");
+        c->set("rpc_server_port", "0");
+        c->set("log_level", "warning");
+        c->set("transports/tcp/enable", true);
+        c->set("transports/hp_tcp/enable", false);
+        c->set("transports/rdma/enable", false);
+        c->set("transports/shm/enable", false);
+        c->set("transports/io_uring/enable", false);
+        c->set("transports/mpcomm/enable", false);
+        c->set("transports/xpu/enable", true);
+        c->set("transports/xpu/disable_ipc", !ipc);
+        c->set("use_legacy_transport_selection", std::get<0>(GetParam()));
+        c->set("enable_runtime_queue", std::get<1>(GetParam()));
+        c->set("max_failover_attempts", 1);
+        return c;
+    }
+    void SetUp() override {
+        auto& platform = Platform::getLoader(config());
+        MemoryOptions opts;
+        opts.location = "xpu:0";
+        void* probe = nullptr;
+        if (!platform.allocate(&probe, 4096, opts).ok())
+            GTEST_SKIP() << "No SYCL device available";
+        auto* xpu = dynamic_cast<XpuPlatform*>(&platform);
+        ASSERT_NE(xpu, nullptr);
+        XpuPlatform::IpcExport exported;
+        auto s = xpu->exportIpc(probe, 4096, exported);
+        void* mapped = nullptr;
+        if (s.ok()) {
+            s = xpu->importIpc(exported.handle, getpid(), exported.size, 0,
+                               &mapped);
+            if (mapped) EXPECT_TRUE(xpu->closeImport(mapped).ok());
+        }
+        ASSERT_TRUE(platform.free(probe, 4096).ok());
+        if (!s.ok()) GTEST_SKIP() << "No Level Zero IPC: " << s;
+        a_ = std::make_unique<TransferEngineImpl>(config());
+        b_ = std::make_unique<TransferEngineImpl>(config());
+        ASSERT_TRUE(a_->available());
+        ASSERT_TRUE(b_->available());
+    }
+    void TearDown() override {
+        for (auto [engine, batch] : batches_)
+            EXPECT_TRUE(engine->freeBatch(batch).ok());
+        // The initiator holds mappings into the peer's VRAM; drop it first so
+        // the imports are closed before the exporting allocations go away.
+        a_.reset();
+        b_.reset();
+    }
+    void allocate(TransferEngineImpl& engine, const char* location,
+                  void** out) {
+        MemoryOptions opts;
+        opts.location = location;
+        ASSERT_TRUE(engine.allocateLocalMemory(out, kLength, opts).ok());
+        ASSERT_NE(*out, nullptr);
+        // allocateLocalMemory picks a concrete transport in opts.type; register
+        // with every transport so the buffer carries the XPU tag and handle.
+        opts.type = UNSPEC;
+        ASSERT_TRUE(engine.registerLocalMemory({*out}, {kLength}, opts).ok());
+        EXPECT_TRUE(TransferEngineImplTestPeer::hasXpuTag(engine, *out));
+    }
+    TransferStatus wait(BatchID batch) {
+        TransferStatus status{};
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        do {
+            auto s = a_->progressBatch(batch, status);
+            EXPECT_TRUE(s.ok()) << s.ToString();
+            if (!s.ok() || status.s != PENDING) break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        return status;
+    }
+    // local (on a_) <-> peer (on b_); the route must be the unstaged XPU
+    // copy and the payload must land in the peer's real allocation.
+    void transfer(const char* local_location, const char* peer_location,
+                  Request::OpCode opcode, TransportType hint = UNSPEC) {
+        void *local = nullptr, *peer = nullptr;
+        ASSERT_NO_FATAL_FAILURE(allocate(*a_, local_location, &local));
+        ASSERT_NO_FATAL_FAILURE(allocate(*b_, peer_location, &peer));
+        std::vector<uint8_t> seed(kLength), zero(kLength, 0), readback(kLength);
+        for (size_t i = 0; i < seed.size(); ++i) seed[i] = (i * 3) % 251;
+        auto& platform = Platform::getLoader();
+        void* source = opcode == Request::WRITE ? local : peer;
+        void* dest = opcode == Request::WRITE ? peer : local;
+        ASSERT_TRUE(platform.copy(source, seed.data(), kLength).ok());
+        ASSERT_TRUE(platform.copy(dest, zero.data(), kLength).ok());
+        Request request{};
+        request.opcode = opcode;
+        request.source = local;
+        request.target_offset = reinterpret_cast<uint64_t>(peer);
+        request.length = kLength;
+        request.transport_hint = hint;
+        ASSERT_TRUE(
+            a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+        ASSERT_NE(request.target_id, LOCAL_SEGMENT_ID);
+        auto route = TransferEngineImplTestPeer::route(*a_, request);
+        ASSERT_EQ(route.transport, XPU);
+        EXPECT_TRUE(route.staging_params.empty());
+        auto batch = a_->allocateBatch(1);
+        ASSERT_NE(batch, 0u);
+        batches_.push_back({a_.get(), batch});
+        ASSERT_TRUE(a_->submitTransfer(batch, {request}).ok());
+        auto status = wait(batch);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kLength);
+        ASSERT_TRUE(platform.copy(readback.data(), dest, kLength).ok());
+        EXPECT_EQ(readback, seed);
+    }
+    std::unique_ptr<TransferEngineImpl> a_, b_;
+    std::vector<std::pair<TransferEngineImpl*, BatchID>> batches_;
+};
+
+TEST_P(XpuIpcEngineTest, DeviceToPeerDeviceReadAndWrite) {
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::READ));
+}
+
+TEST_P(XpuIpcEngineTest, HostToPeerDeviceReadAndWrite) {
+    ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "xpu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "xpu:0", Request::READ));
+}
+
+// An explicit XPU hint for a peer segment is honoured once the peer buffer is
+// reachable over IPC (contrast XpuEngineTest.RejectsXpuHintForPeerSegment).
+TEST_P(XpuIpcEngineTest, XpuHintForPeerSegmentIsHonoured) {
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::WRITE, XPU));
+}
+
+// Interior offsets: the request covers a slice of both registrations, so the
+// relocation must add the offset inside the imported mapping, not copy from
+// its base.
+TEST_P(XpuIpcEngineTest, InteriorOffsetsRelocateInsideMapping) {
+    void *local = nullptr, *peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "xpu:0", &local));
+    ASSERT_NO_FATAL_FAILURE(allocate(*b_, "xpu:0", &peer));
+    const size_t kOffset = 1 << 20, kLen = kLength - 2 * kOffset;
+    std::vector<uint8_t> seed(kLength), zero(kLength, 0), readback(kLength);
+    for (size_t i = 0; i < seed.size(); ++i) seed[i] = (i * 5) % 251;
+    auto& platform = Platform::getLoader();
+    ASSERT_TRUE(platform.copy(local, seed.data(), kLength).ok());
+    ASSERT_TRUE(platform.copy(peer, zero.data(), kLength).ok());
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = static_cast<uint8_t*>(local) + kOffset;
+    request.target_offset = reinterpret_cast<uint64_t>(peer) + kOffset;
+    request.length = kLen;
+    ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+    auto route = TransferEngineImplTestPeer::route(*a_, request);
+    ASSERT_EQ(route.transport, XPU);
+    auto batch = a_->allocateBatch(1);
+    ASSERT_NE(batch, 0u);
+    batches_.push_back({a_.get(), batch});
+    ASSERT_TRUE(a_->submitTransfer(batch, {request}).ok());
+    auto status = wait(batch);
+    ASSERT_EQ(status.s, COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, kLen);
+    ASSERT_TRUE(platform.copy(readback.data(), peer, kLength).ok());
+    EXPECT_TRUE(std::equal(readback.begin() + kOffset,
+                           readback.begin() + kOffset + kLen,
+                           seed.begin() + kOffset));
+    // Outside the slice the peer buffer is untouched.
+    EXPECT_TRUE(std::all_of(readback.begin(), readback.begin() + kOffset,
+                            [](uint8_t b) { return b == 0; }));
+    EXPECT_TRUE(std::all_of(readback.begin() + kOffset + kLen, readback.end(),
+                            [](uint8_t b) { return b == 0; }));
+}
+
+// A peer host buffer has nothing to import: the request stays on the staged
+// network route exactly as without IPC.
+TEST_P(XpuIpcEngineTest, PeerHostBufferStaysStaged) {
+    void *local = nullptr, *peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "xpu:0", &local));
+    ASSERT_NO_FATAL_FAILURE(allocate(*b_, "cpu:0", &peer));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = local;
+    request.target_offset = reinterpret_cast<uint64_t>(peer);
+    request.length = kLength;
+    ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+    auto route = TransferEngineImplTestPeer::route(*a_, request);
+    EXPECT_EQ(route.transport, TCP);
+    ASSERT_EQ(route.staging_params.size(), 3u);
+    EXPECT_FALSE(route.staging_params[1].empty());
+    EXPECT_TRUE(route.staging_params[2].empty());
+}
+
+// A peer that opted out of IPC publishes no dma-buf; its XPU buffers are
+// staged like a remote host's, and the initiator does not try to import.
+TEST_P(XpuIpcEngineTest, PeerWithoutIpcStaysStaged) {
+    auto peer_engine = std::make_unique<TransferEngineImpl>(config(false));
+    ASSERT_TRUE(peer_engine->available());
+    void *local = nullptr, *peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "xpu:0", &local));
+    ASSERT_NO_FATAL_FAILURE(allocate(*peer_engine, "xpu:0", &peer));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = local;
+    request.target_offset = reinterpret_cast<uint64_t>(peer);
+    request.length = kLength;
+    ASSERT_TRUE(
+        a_->openSegment(request.target_id, peer_engine->getSegmentName()).ok());
+    auto route = TransferEngineImplTestPeer::route(*a_, request);
+    EXPECT_EQ(route.transport, TCP);
+    ASSERT_EQ(route.staging_params.size(), 3u);
+    EXPECT_FALSE(route.staging_params[1].empty());
+    EXPECT_FALSE(route.staging_params[2].empty());
+    // The initiator's mappings are released before the peer's allocations.
+    a_.reset();
+}
+
+INSTANTIATE_TEST_SUITE_P(DispatchModes, XpuIpcEngineTest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Bool()));
+
+// GPUDirect-style path: with an RNIC whose verbs provide ibv_reg_dmabuf_mr,
+// XPU buffers are registered through dma-buf export, carry RDMA, and route
+// directly without staging. Requires real hardware; skips otherwise.
+class XpuDirectRdmaTest : public ::testing::TestWithParam<bool> {
+   protected:
+    std::shared_ptr<Config> config() {
+        auto c = std::make_shared<Config>();
+        c->set("metadata_type", "p2p");
+        c->set("metadata_servers", "");
+        c->set("rpc_server_hostname", "127.0.0.1");
+        c->set("rpc_server_port", "0");
+        c->set("log_level", "warning");
+        c->set("transports/tcp/enable", true);
+        c->set("transports/hp_tcp/enable", false);
+        c->set("transports/rdma/enable", true);
+        c->set("transports/shm/enable", false);
+        c->set("transports/io_uring/enable", false);
+        c->set("transports/mpcomm/enable", false);
+        c->set("transports/xpu/enable", true);
+        // XPU precedes RDMA in the candidate order; keep the same-process
+        // peer off the IPC route so the dma-buf RDMA route is what is tested.
+        c->set("transports/xpu/disable_ipc", true);
+        c->set("use_legacy_transport_selection", GetParam());
+        return c;
+    }
+    void SetUp() override {
+        auto& platform = Platform::getLoader(config());
+        MemoryOptions opts;
+        opts.location = "xpu:0";
+        void* probe = nullptr;
+        if (!platform.allocate(&probe, 4096, opts).ok())
+            GTEST_SKIP() << "No SYCL device available";
+        DmabufExport exported;
+        auto s = platform.exportDmabuf(probe, 4096, exported);
+        ASSERT_TRUE(platform.free(probe, 4096).ok());
+        if (!s.ok()) GTEST_SKIP() << "No dma-buf export: " << s;
+        a_ = std::make_unique<TransferEngineImpl>(config());
+        b_ = std::make_unique<TransferEngineImpl>(config());
+        ASSERT_TRUE(a_->available());
+        ASSERT_TRUE(b_->available());
+        if (!TransferEngineImplTestPeer::rdmaGpuDirect(*a_))
+            GTEST_SKIP() << "No RDMA device with ibv_reg_dmabuf_mr";
+    }
+    void TearDown() override {
+        for (auto [engine, batch] : batches_)
+            EXPECT_TRUE(engine->freeBatch(batch).ok());
+        a_.reset();
+        b_.reset();
+    }
+    void allocate(TransferEngineImpl& engine, const char* location,
+                  void** out) {
+        MemoryOptions opts;
+        opts.location = location;
+        ASSERT_TRUE(engine.allocateLocalMemory(out, kLength, opts).ok());
+        ASSERT_NE(*out, nullptr);
+        ASSERT_TRUE(engine.registerLocalMemory({*out}, {kLength}, opts).ok());
+        EXPECT_TRUE(TransferEngineImplTestPeer::hasTag(engine, *out, RDMA))
+            << location << " buffer was not registered on RDMA";
+    }
+    TransferStatus wait(TransferEngineImpl& engine, BatchID batch) {
+        TransferStatus status{};
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        do {
+            auto s = engine.progressBatch(batch, status);
+            EXPECT_TRUE(s.ok()) << s.ToString();
+            if (!s.ok() || status.s != PENDING) break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        return status;
+    }
+    void transfer(const char* local_location, const char* peer_location,
+                  Request::OpCode opcode) {
+        void *local = nullptr, *peer = nullptr;
+        ASSERT_NO_FATAL_FAILURE(allocate(*a_, local_location, &local));
+        ASSERT_NO_FATAL_FAILURE(allocate(*b_, peer_location, &peer));
+        Request request{};
+        request.opcode = opcode;
+        request.source = local;
+        request.target_offset = reinterpret_cast<uint64_t>(peer);
+        request.length = kLength;
+        ASSERT_TRUE(
+            a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+        auto route = TransferEngineImplTestPeer::route(*a_, request);
+        // Direct: RDMA on the device address, no host stage on either side.
+        ASSERT_EQ(route.transport, RDMA);
+        EXPECT_TRUE(route.staging_params.empty());
+        ASSERT_NO_FATAL_FAILURE(run(*a_, request, local, peer));
+    }
+    // Submit `request` (local -> peer for WRITE, peer -> local for READ) on
+    // `engine` and verify the payload landed intact.
+    void run(TransferEngineImpl& engine, const Request& request, void* local,
+             void* peer) {
+        std::vector<uint8_t> seed(kLength), zero(kLength, 0), readback(kLength);
+        for (size_t i = 0; i < seed.size(); ++i) seed[i] = (i * 13) % 251;
+        auto& platform = Platform::getLoader();
+        void* source = request.opcode == Request::WRITE ? local : peer;
+        void* dest = request.opcode == Request::WRITE ? peer : local;
+        ASSERT_TRUE(platform.copy(source, seed.data(), kLength).ok());
+        ASSERT_TRUE(platform.copy(dest, zero.data(), kLength).ok());
+        auto batch = engine.allocateBatch(1);
+        ASSERT_NE(batch, 0u);
+        batches_.push_back({&engine, batch});
+        ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+        auto status = wait(engine, batch);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kLength);
+        ASSERT_TRUE(platform.copy(readback.data(), dest, kLength).ok());
+        EXPECT_EQ(readback, seed);
+    }
+    std::unique_ptr<TransferEngineImpl> a_, b_;
+    std::vector<std::pair<TransferEngineImpl*, BatchID>> batches_;
+};
+
+TEST_P(XpuDirectRdmaTest, DeviceToDeviceReadAndWrite) {
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::READ));
+}
+
+TEST_P(XpuDirectRdmaTest, OneDeviceSideReadAndWrite) {
+    ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "xpu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "cpu:0", Request::READ));
+}
+
+// The dma-buf direct route exists on RDMA alone. A request hinted to another
+// transport must not lose staging just because both buffers could have gone
+// over RDMA directly.
+TEST_P(XpuDirectRdmaTest, HostTransportHintKeepsStaging) {
+    void *local = nullptr, *peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "xpu:0", &local));
+    ASSERT_NO_FATAL_FAILURE(allocate(*b_, "xpu:0", &peer));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = local;
+    request.target_offset = reinterpret_cast<uint64_t>(peer);
+    request.length = kLength;
+    request.transport_hint = TCP;
+    ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+    auto route = TransferEngineImplTestPeer::route(*a_, request);
+    ASSERT_EQ(route.transport, TCP);
+    ASSERT_EQ(route.staging_params.size(), 3u);
+    EXPECT_FALSE(route.staging_params[1].empty());
+    EXPECT_FALSE(route.staging_params[2].empty());
+    ASSERT_NO_FATAL_FAILURE(run(*a_, request, local, peer));
+}
+
+// Same with a selector policy that only authorizes a DRAM-only host transport
+// (HP TCP advertises no device capability, unlike TCP which copies device
+// memory itself): the direct plan yields no route, so selection falls back to
+// the staged plan. Both ends run HP TCP so the staged hop can execute.
+TEST_P(XpuDirectRdmaTest, HostOnlyPolicyKeepsStaging) {
+    if (GetParam()) GTEST_SKIP() << "Policies apply to selector mode only";
+    auto peer_config = config();
+    peer_config->set("transports/tcp/enable", false);
+    peer_config->set("transports/hp_tcp/enable", true);
+    auto target = std::make_unique<TransferEngineImpl>(peer_config);
+    ASSERT_TRUE(target->available());
+    auto c = config();
+    c->set("transports/tcp/enable", false);
+    c->set("transports/hp_tcp/enable", true);
+    // The peer hop may only use HP TCP (XPU is local-segment only); the local
+    // stage hop still needs the XPU copy transport.
+    c->set("policy", json::parse(R"([{"name":"host_only",
+        "segment_type":"memory","transports":["hp_tcp","xpu"]}])"));
+    auto initiator = std::make_unique<TransferEngineImpl>(c);
+    ASSERT_TRUE(initiator->available());
+    void *local = nullptr, *peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*initiator, "xpu:0", &local));
+    ASSERT_NO_FATAL_FAILURE(allocate(*target, "xpu:0", &peer));
+    Request request{};
+    request.opcode = Request::READ;
+    request.source = local;
+    request.target_offset = reinterpret_cast<uint64_t>(peer);
+    request.length = kLength;
+    ASSERT_TRUE(
+        initiator->openSegment(request.target_id, target->getSegmentName())
+            .ok());
+    auto route = TransferEngineImplTestPeer::route(*initiator, request);
+    ASSERT_EQ(route.transport, HP_TCP);
+    ASSERT_EQ(route.staging_params.size(), 3u);
+    EXPECT_FALSE(route.staging_params[1].empty());
+    EXPECT_FALSE(route.staging_params[2].empty());
+    ASSERT_NO_FATAL_FAILURE(run(*initiator, request, local, peer));
+    // Drain before the engines go away with their batches still tracked.
+    for (auto it = batches_.begin(); it != batches_.end();) {
+        if (it->first == initiator.get() || it->first == target.get()) {
+            EXPECT_TRUE(it->first->freeBatch(it->second).ok());
+            it = batches_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(SelectionModes, XpuDirectRdmaTest, ::testing::Bool());
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

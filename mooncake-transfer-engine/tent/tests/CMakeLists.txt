@@ -756,6 +756,17 @@ if(USE_XPU)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_xpu_engine_test COMMAND tent_xpu_engine_test)
   set_tests_properties(tent_xpu_engine_test PROPERTIES TIMEOUT 300)
+
+  # Cross-process PCIe P2P over Level Zero IPC: the peer engine is this binary
+  # re-executed in peer mode, so it has its own main() (no gtest_main). Needs a
+  # real Intel GPU and Yama ptrace_scope <= 1 (or CAP_SYS_PTRACE); skips
+  # otherwise.
+  add_executable(tent_xpu_ipc_process_test xpu/xpu_ipc_process_test.cpp)
+  target_link_libraries(tent_xpu_ipc_process_test PRIVATE gtest tent_link_group)
+  target_include_directories(tent_xpu_ipc_process_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_xpu_ipc_process_test COMMAND tent_xpu_ipc_process_test)
+  set_tests_properties(tent_xpu_ipc_process_test PROPERTIES TIMEOUT 300)
 endif()
 
 # NOT registered via add_test: the test needs a real CUDA device (it exports a

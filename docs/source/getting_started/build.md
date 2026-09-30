@@ -122,6 +122,7 @@ environment setup must be prepared separately.
 | Moore Threads MUSA | `-DUSE_MUSA=ON` | Install MUSA SDK and `mthreads-peermem` for GPUDirect RDMA. | Add `/usr/local/musa/lib` to `LIBRARY_PATH` and `LD_LIBRARY_PATH`. |
 | Cambricon MLU | `-DUSE_MLU=ON` | Install Cambricon Neuware SDK. | Set `NEUWARE_HOME`, or pass `-DNEUWARE_ROOT=/path/to/neuware`. Use `-DMLU_INCLUDE_DIR` and `-DMLU_LIB_DIR` for custom layouts. |
 | MetaX MACA | `-DUSE_MACA=ON` | Install MACA SDK. | Set `MACA_HOME`, or pass `-DMACA_ROOT=/path/to/maca`. Use `-DMACA_INCLUDE_DIR`, `-DMACA_LIB_DIR`, and `-DMACA_RUNTIME_LIBS` for custom layouts. |
+| Intel XPU (Arc / Data Center GPU) | `-DUSE_XPU=ON -DUSE_TENT=ON` | Install the oneAPI DPC++ compiler and Level Zero runtime (`libze_loader`), and build with `-DCMAKE_CXX_COMPILER=icpx`. | Source `/opt/intel/oneapi/setvars.sh` before configuring CMake and run with `MC_USE_TENT=1`. VRAM is transferred directly over RDMA when the NIC driver supports dma-buf registration (`ibv_reg_dmabuf_mr`, rdma-core 34+); otherwise it is staged through pinned host memory. |
 | Huawei Ascend Direct | `-DUSE_ASCEND_DIRECT=ON` | Install Ascend CANN Toolkit and ADXL dependencies. | Source `/usr/local/Ascend/cann/set_env.sh` before configuring CMake. This is the recommended Ascend path. |
 | Huawei Ascend UBSHMEM | `-DUSE_UBSHMEM=ON` | Install Ascend CANN Toolkit. Requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5. | Source the CANN `set_env.sh` before configuring CMake. |
 | AMD HIP / ROCm | `-DUSE_HIP=ON` | Install ROCm/HIP SDK. | Ensure HIP compiler, headers, and runtime libraries are visible to CMake. |
@@ -169,6 +170,35 @@ modules with the inbox RDMA stack and no MLNX_OFED), GPU memory registration
 then fails with `Failed to register memory 0x...: Bad address [14]`; set
 `WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA open kernel modules and
 Linux 5.12 or later.
+
+Intel XPU builds (`-DUSE_XPU=ON`) use DMA-BUF for direct RDMA: when a USM
+device allocation is registered, TENT asks the Level Zero runtime to export it
+as a dma-buf and registers that with `ibv_reg_dmabuf_mr`, so the NIC reads and
+writes VRAM directly with no host copy. This needs rdma-core 34+ and a NIC
+driver with dma-buf support (for example `mlx5`). The direct path is attempted
+per buffer and is not guaranteed: when the verb or driver support is missing,
+when the export fails for a given allocation (see the pooling caveat below), or
+when `transports/rdma/disable_gpu_direct_rdma` is set to `true` in the TENT
+configuration, transfers touching that buffer fall back to staging through
+pinned host memory.
+
+Memory allocated through the Transfer Engine is exportable. For device memory
+allocated elsewhere (for example PyTorch XPU tensors), note that the Intel
+compute runtime pools small USM allocations (below a few MB) into shared
+buffers whose dma-buf cannot be registered per allocation; such buffers are
+staged through host memory. Run with `NEOReadDebugKeys=1
+EnableDeviceUsmAllocationPool=0` to disable pooling if direct RDMA on small
+foreign allocations is required.
+
+On the same node, registered XPU memory is also shared between processes with
+Level Zero IPC handles, so VRAM-to-VRAM transfers between two local engines
+(for example prefill and decode workers) are local XPU copies rather than
+network transfers. Importing a handle uses `pidfd_getfd(2)` on the exporting
+process and therefore needs ptrace permission over it: Yama `ptrace_scope` 0,
+`ptrace_scope` 1 when the importer is an ancestor of the exporter, or
+`CAP_SYS_PTRACE` (in Kubernetes, `securityContext.capabilities.add:
+[SYS_PTRACE]`). Without it, or with `transports/xpu/disable_ipc: true` in the
+TENT configuration, those transfers use the RDMA or TCP transport instead.
 ```
 
 ## Use Mooncake in Docker Containers
@@ -248,6 +278,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
 | `-DUSE_SUPA=ON/OFF` | `OFF` | Enable Biren GPU support via the SUPA SDK. Uses a CUDA-compatible runtime. Set `BIREN_HOME` to the SDK root. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
+| `-DUSE_XPU=ON/OFF` | `OFF` | Enable Intel XPU memory support in TENT via SYCL/Level Zero: memory detection, host staging, intra-node PCIe P2P copies between XPUs, and dma-buf GPUDirect RDMA registration. Requires `-DUSE_TENT=ON` and the `icpx` compiler. |
 | `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
 | `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
