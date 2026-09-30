@@ -1126,6 +1126,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::string seg_location = kWildcardLocation;
+            bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
 
             if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
@@ -1149,6 +1150,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ptr = allocate_buffer_mmap_memory(mapped_size,
                                                   get_hugepage_size_from_env(),
                                                   parallel_hugetlb_population);
+#ifndef USE_VRAM_SEGMENT
+            } else if (protocol == "efa") {
+                // EFA host segments must be THP backed and must not pile up
+                // on one NUMA node; see allocate_buffer_thp_interleaved().
+                mapped_size = align_up(segment_size, SZ_2MB);
+                ptr = allocate_buffer_thp_interleaved(mapped_size);
+                use_mmap_segment = true;
+#endif
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -1184,9 +1193,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
-            } else if (!seg_numa_nodes.empty() || use_hugepage_) {
-                // NUMA-segmented or hugepage: track as mmap allocation for
-                // munmap cleanup
+            } else if (use_mmap_segment) {
+                // NUMA-segmented, hugepage or EFA THP: track as mmap
+                // allocation for munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
             } else {
