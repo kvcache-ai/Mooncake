@@ -73,6 +73,8 @@ void tcpTransportSetSessionProgressHookForTest(
     int (*hook)(int, bool) noexcept) noexcept;
 void tcpTransportSetStartTransferMetadataHookForTest(
     void (*hook)() noexcept) noexcept;
+void tcpTransportSetTerminalActionPreQuiesceHookForTest(
+    void (*hook)() noexcept) noexcept;
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept;
 }  // namespace mooncake
 #endif
@@ -4487,4 +4489,72 @@ TEST(TcpWriteVisibilityTest, RpcMetadataRefreshInvalidatesCachedHost) {
         << initial_rpc.ip_or_host_name;
 }
 
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+namespace {
+std::mutex g_free_batch_pre_quiesce_mutex;
+std::condition_variable g_free_batch_pre_quiesce_entered;
+std::condition_variable g_free_batch_pre_quiesce_release_cv;
+bool g_free_batch_pre_quiesce_in = false;
+bool g_free_batch_pre_quiesce_release = false;
+
+void freeBatchPreQuiesceHookForTest() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(g_free_batch_pre_quiesce_mutex);
+        g_free_batch_pre_quiesce_in = true;
+    }
+    g_free_batch_pre_quiesce_entered.notify_all();
+    std::unique_lock<std::mutex> lock(g_free_batch_pre_quiesce_mutex);
+    g_free_batch_pre_quiesce_release_cv.wait(
+        lock, []() { return g_free_batch_pre_quiesce_release; });
+}
+}  // namespace
+
+TEST(TcpWriteVisibilityTest, FreeBatchDefersUntilSliceCompletionUnwinds) {
+    constexpr size_t pool_size = 4ull << 20;
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:17960", pool_size);
+    ASSERT_TRUE(h.ok);
+
+    {
+        std::lock_guard<std::mutex> lock(g_free_batch_pre_quiesce_mutex);
+        g_free_batch_pre_quiesce_in = false;
+        g_free_batch_pre_quiesce_release = false;
+    }
+    tcpTransportSetTerminalActionPreQuiesceHookForTest(
+        freeBatchPreQuiesceHookForTest);
+
+    auto batch_id = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(batch_id, {makeWriteRequest(h, kSmallLength)})
+            .ok());
+
+    {
+        std::unique_lock<std::mutex> lock(g_free_batch_pre_quiesce_mutex);
+        ASSERT_TRUE(g_free_batch_pre_quiesce_entered.wait_for(
+            lock, std::chrono::seconds(15),
+            [&]() { return g_free_batch_pre_quiesce_in; }));
+    }
+
+    auto& batch = Transport::toBatchDesc(batch_id);
+    EXPECT_EQ(__atomic_load_n(&batch.task_list[0].outstanding_slice_completions,
+                              __ATOMIC_ACQUIRE),
+              1u);
+
+    // While the terminal callback is paused before its final decrement, a
+    // concurrent free must not retire the batch; it must be deferred instead.
+    Status free_status = h.engine->freeBatchID(batch_id);
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
+
+    {
+        std::lock_guard<std::mutex> lock(g_free_batch_pre_quiesce_mutex);
+        g_free_batch_pre_quiesce_release = true;
+    }
+    g_free_batch_pre_quiesce_release_cv.notify_all();
+
+    tcpTransportSetTerminalActionPreQuiesceHookForTest(nullptr);
+
+    // Give the deferred cleanup worker a chance to retire the batch safely.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+}
+#endif
 #endif

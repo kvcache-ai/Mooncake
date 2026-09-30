@@ -157,7 +157,13 @@ Status MultiTransport::tryFreeBatchID(
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto& task = batch_desc.task_list[task_id];
-        if (task.is_finished) {
+        if (__atomic_load_n(&task.outstanding_slice_completions,
+                            __ATOMIC_ACQUIRE) != 0) {
+            return Status::BatchBusy(
+                "BatchID cannot be freed until slice completion callbacks are "
+                "quiescent");
+        }
+        if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE)) {
             continue;
         }
         if (task.slice_count == 0) {
@@ -170,10 +176,9 @@ Status MultiTransport::tryFreeBatchID(
         if (!query_status.ok()) {
             return query_status;
         }
-        // A terminal transfer status only means the task published completion;
-        // event-driven completion callbacks may still be unwinding while
-        // holding raw BatchDesc access. Keep the batch alive until the explicit
-        // quiescence counter reaches zero below.
+        // A terminal transfer status only means the task published completion.
+        // The per-task slice-completion counter checked above keeps the batch
+        // alive until event-driven completion callbacks are quiescent.
         if (status.s != Transport::TransferStatusEnum::COMPLETED &&
             status.s != Transport::TransferStatusEnum::FAILED) {
             return Status::BatchBusy(

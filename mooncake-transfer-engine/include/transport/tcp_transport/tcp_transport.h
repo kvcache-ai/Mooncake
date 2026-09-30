@@ -254,20 +254,29 @@ class TcpTransport : public Transport {
         Slice *slice = nullptr;
         bool use_v2 = false;
         std::function<void()> continuation;
+        TransferTask *task = nullptr;
+        size_t length = 0;
         std::chrono::steady_clock::time_point admission_deadline;
 
         TcpWorkItem() = default;
         TcpWorkItem(Slice *slice_arg, bool use_v2_arg,
-                    std::function<void()> continuation_arg = nullptr)
+                    std::function<void()> continuation_arg = nullptr,
+                    TransferTask *task_arg = nullptr, size_t length_arg = 0)
             : slice(slice_arg),
               use_v2(use_v2_arg),
-              continuation(std::move(continuation_arg)) {}
+              continuation(std::move(continuation_arg)),
+              task(task_arg),
+              length(length_arg) {}
         TcpWorkItem(TcpWorkItem &&other) noexcept
             : slice(other.slice),
               use_v2(other.use_v2),
               continuation(std::move(other.continuation)),
+              task(other.task),
+              length(other.length),
               admission_deadline(other.admission_deadline) {
             other.slice = nullptr;
+            other.task = nullptr;
+            other.length = 0;
         }
         TcpWorkItem &operator=(TcpWorkItem &&) = delete;
         TcpWorkItem(const TcpWorkItem &) = delete;

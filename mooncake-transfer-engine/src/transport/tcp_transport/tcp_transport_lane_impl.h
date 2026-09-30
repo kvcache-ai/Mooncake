@@ -1377,11 +1377,24 @@ void TcpTransport::handleLaneTerminal(
 
 void TcpTransport::completeTerminalAction(TerminalAction action) noexcept {
     auto continuation = std::move(action.work.continuation);
+    TransferTask* owner = action.work.task;
+    if (!owner && action.work.slice)
+        owner = __atomic_load_n(&action.work.slice->task, __ATOMIC_ACQUIRE);
+
     try {
-        if (action.status == TransferStatusEnum::COMPLETED)
-            action.work.slice->markSuccess();
-        else
-            action.work.slice->markFailed();
+        if (action.work.slice) {
+            if (action.status == TransferStatusEnum::COMPLETED)
+                action.work.slice->markSuccess(owner, action.work.length);
+            else
+                action.work.slice->markFailed(owner);
+        } else if (owner) {
+            if (action.status == TransferStatusEnum::COMPLETED)
+                __atomic_fetch_add(&owner->success_slice_count, 1,
+                                   __ATOMIC_ACQ_REL);
+            else
+                __atomic_fetch_add(&owner->failed_slice_count, 1,
+                                   __ATOMIC_ACQ_REL);
+        }
     } catch (const std::exception& e) {
         LOG(ERROR) << "TCP Slice terminal completion threw: " << e.what();
     } catch (...) {
@@ -1396,6 +1409,16 @@ void TcpTransport::completeTerminalAction(TerminalAction action) noexcept {
         } catch (...) {
             LOG(ERROR) << "TCP Slice continuation threw";
         }
+    }
+
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    invokeTerminalActionPreQuiesceHook();
+#endif
+#endif
+    if (owner) {
+        __atomic_fetch_sub(&owner->outstanding_slice_completions, 1,
+                           __ATOMIC_RELEASE);
     }
 }
 

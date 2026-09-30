@@ -227,23 +227,34 @@ class Transport {
         static constexpr uint64_t kCompletionDoneMask = kCompletionSealBit - 1;
 
         void markSuccess() {
+            TransferTask *owner = __atomic_load_n(&task, __ATOMIC_ACQUIRE);
+            markSuccess(owner, length);
+        }
+
+        void markSuccess(TransferTask *owner, size_t len) {
             status = Slice::SUCCESS;
-            __atomic_fetch_add(&task->transferred_bytes, length,
+            __atomic_fetch_add(&owner->transferred_bytes, len,
                                __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
+            __atomic_fetch_add(&owner->success_slice_count, 1,
+                               __ATOMIC_ACQ_REL);
             // Second CQ RMW: handshake word. success_slice_count stays for
             // getTransferStatus; packing both into one word is a follow-up.
-            const uint64_t state = __atomic_add_fetch(&task->completion_state,
+            const uint64_t state = __atomic_add_fetch(&owner->completion_state,
                                                       1, __ATOMIC_ACQ_REL);
-            finishIfComplete(task, state, false);
+            finishIfComplete(owner, state, false);
         }
 
         void markFailed() {
+            TransferTask *owner = __atomic_load_n(&task, __ATOMIC_ACQUIRE);
+            markFailed(owner);
+        }
+
+        void markFailed(TransferTask *owner) {
             status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
-            const uint64_t state = __atomic_add_fetch(&task->completion_state,
+            __atomic_fetch_add(&owner->failed_slice_count, 1, __ATOMIC_ACQ_REL);
+            const uint64_t state = __atomic_add_fetch(&owner->completion_state,
                                                       1, __ATOMIC_ACQ_REL);
-            finishIfComplete(task, state, true);
+            finishIfComplete(owner, state, true);
         }
 
         static void unsealTaskSubmission(TransferTask *task) {
@@ -415,6 +426,12 @@ class Transport {
         const TransferRequest *request = nullptr;
 #endif
         size_t request_count = 1;
+        // Number of TCP slice terminal actions that have been handed
+        // out and have not fully returned yet. A transfer is only considered
+        // finished after this count reaches zero so a pooled Slice is never
+        // recycled while an I/O thread still reads it.
+        volatile uint64_t outstanding_slice_completions = 0;
+
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {
