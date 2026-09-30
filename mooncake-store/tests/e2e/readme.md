@@ -216,3 +216,27 @@ A 30-second soak is only a smoke test; report the actual measured duration.
 maintenance status before/after compact and defrag, `soak-result.json`, and
 `audits.log`. Process logs and acknowledgement manifests are in `logs/` and
 `workload/`. Batch-specific helpers are in `tests/ha/snapshot/batch_oplog/`.
+
+### ReadPlan TCP integration tests
+
+From the repository root, using the Python version used to build the extension:
+
+```bash
+cmake --build build --target mooncake_master store read_plan_test read_plan_pipeline_test -j 4
+ctest --test-dir build -R '^read_plan(_pipeline)?_test$' --output-on-failure
+BUILD_DIR="$PWD/build" bash mooncake-store/tests/e2e/run_read_plan_tcp_e2e.sh
+```
+
+The runner starts and cleans up an isolated local master, loads the built Python
+extension, disables Store memcpy optimization, and runs sequential and
+pipeline-enabled configurations. It checks data, errors, close behavior,
+caller-owned buffers, and client lifetimes. These integration checks exercise
+the real Store/TE path; the C++ pipeline test separately verifies the two-read
+window and failure draining with controlled blocking. Passing the TCP matrix
+alone does not prove that two
+transport requests were simultaneously in flight or validate other transports.
+
+`BUILD_DIR` selects the build tree and `PYTHON` selects the interpreter used to
+build the extension. `LOG_DIR` optionally selects a directory for the master and
+per-configuration client logs; otherwise the runner creates a unique directory
+under `/tmp`. It terminates only the master it starts and retains logs on exit.
