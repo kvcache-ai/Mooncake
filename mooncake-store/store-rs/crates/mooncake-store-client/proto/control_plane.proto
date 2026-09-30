@@ -1,0 +1,613 @@
+syntax = "proto3";
+
+package mooncake.store.control;
+
+service ControlPlaneService {
+  rpc GetRoute(GetRouteRequest) returns (GetRouteReply);
+  rpc BatchGetRoutes(BatchGetRoutesRequest) returns (BatchGetRoutesReply);
+  rpc BatchContainsRoutes(BatchContainsRoutesRequest) returns (BatchContainsRoutesReply);
+  rpc CompareAndSwapRoute(CompareAndSwapRouteRequest) returns (CompareAndSwapRouteReply);
+  rpc BatchCompareAndSwapRoutes(BatchCompareAndSwapRoutesRequest) returns (BatchCompareAndSwapRoutesReply);
+  rpc ReplaceRoute(ReplaceRouteRequest) returns (ReplaceRouteReply);
+  rpc BatchReplaceRoutes(BatchReplaceRoutesRequest) returns (BatchReplaceRoutesReply);
+  rpc ReserveAny(ReserveAnyRequest) returns (ReserveAnyReply);
+  rpc BatchReserveAny(BatchReserveAnyRequest) returns (BatchReserveAnyReply);
+  rpc ReserveSpecific(ReserveSpecificRequest) returns (ReserveSpecificReply);
+  rpc BatchReserveSpecific(BatchReserveSpecificRequest) returns (BatchReserveSpecificReply);
+  rpc Release(ReleaseRequest) returns (ReleaseReply);
+  rpc BatchRelease(BatchReleaseRequest) returns (BatchReleaseReply);
+  rpc ListRoutesByReplicaOwner(ListRoutesByReplicaOwnerRequest) returns (ListRoutesByReplicaOwnerReply);
+  rpc BatchReportRouteHits(BatchReportRouteHitsRequest) returns (BatchReportRouteHitsReply);
+  rpc BatchTrackReplicaRoutes(BatchTrackReplicaRoutesRequest) returns (BatchTrackReplicaRoutesReply);
+  rpc SubmitMigrationTask(SubmitMigrationTaskRequest) returns (SubmitMigrationTaskReply);
+  rpc GetMigrationExecutionStatus(GetMigrationExecutionStatusRequest) returns (GetMigrationExecutionStatusReply);
+  rpc TriggerColdTierOffload(TriggerColdTierOffloadRequest) returns (TriggerColdTierOffloadReply);
+  rpc ManualColdTierGc(ManualColdTierGcRequest) returns (ManualColdTierGcReply);
+  rpc ManualColdTierFree(ManualColdTierFreeRequest) returns (ManualColdTierFreeReply);
+  rpc ProbeColdTierDevice(ProbeColdTierDeviceRequest) returns (ProbeColdTierDeviceReply);
+  rpc ReadFromCold(ReadFromColdRequest) returns (ReadFromColdReply);
+  rpc BatchReadFromCold(BatchReadFromColdRequest) returns (BatchReadFromColdReply);
+  rpc AckColdReadComplete(AckColdReadCompleteRequest) returns (AckColdReadCompleteReply);
+  rpc BatchReclaimColdBackings(BatchReclaimColdBackingsRequest) returns (BatchReclaimColdBackingsReply);
+  rpc TransferNofOwnerSnapshot(TransferNofOwnerSnapshotRequest) returns (TransferNofOwnerSnapshotReply);
+  rpc ManageNofBacking(ManageNofBackingRequest) returns (ManageNofBackingReply);
+  rpc PinForRead(PinForReadRequest) returns (PinForReadReply);
+  rpc ControlStream(stream ControlStreamRequest) returns (stream ControlStreamReply);
+}
+
+enum ErrorKind {
+  ERROR_KIND_UNSPECIFIED = 0;
+  ERROR_KIND_NOT_FOUND = 1;
+  ERROR_KIND_CONFLICT = 2;
+  ERROR_KIND_INVALID_STATE = 3;
+  ERROR_KIND_STALE_EPOCH = 4;
+  ERROR_KIND_UNSUPPORTED = 5;
+  ERROR_KIND_ALLOCATOR = 6;
+  ERROR_KIND_METADATA = 7;
+  ERROR_KIND_TRANSPORT = 8;
+}
+
+message ErrorDetail {
+  ErrorKind kind = 1;
+  string message = 2;
+}
+
+message ClientRuntimeId {
+  string stable_id = 1;
+  uint64 epoch = 2;
+}
+
+message CompatibilityDescriptor {
+  uint32 store_api_version = 1;
+  uint32 metadata_schema_version = 2;
+  uint32 transport_api_version = 3;
+  repeated string capabilities = 4;
+  uint32 store_api_minor_version = 5;
+}
+
+enum RouteState {
+  ROUTE_STATE_UNSPECIFIED = 0;
+  ROUTE_STATE_ACTIVE = 1;
+  ROUTE_STATE_DELETING = 2;
+  ROUTE_STATE_TOMBSTONE = 3;
+}
+
+enum ReplicaTier {
+  REPLICA_TIER_UNSPECIFIED = 0;
+  REPLICA_TIER_DRAM = 1;
+  REPLICA_TIER_NVME = 2;
+  REPLICA_TIER_FILE = 3;
+  REPLICA_TIER_UNKNOWN = 4;
+}
+
+enum MigrationMode {
+  MIGRATION_MODE_UNSPECIFIED = 0;
+  MIGRATION_MODE_COPY = 1;
+  MIGRATION_MODE_MOVE = 2;
+}
+
+enum MigrationExecutionState {
+  MIGRATION_EXECUTION_STATE_UNSPECIFIED = 0;
+  // Executor-local queue state before the worker dequeues the task.
+  MIGRATION_EXECUTION_STATE_PENDING = 1;
+  // Executor worker accepted the task and is preparing the helper runtime.
+  MIGRATION_EXECUTION_STATE_DISPATCHING = 2;
+  // Executor helper runtime is actively executing migration work.
+  MIGRATION_EXECUTION_STATE_RUNNING = 3;
+  // Reserved for future executor-local retry support. P1 retries are admin-owned.
+  MIGRATION_EXECUTION_STATE_RETRY_WAIT = 4;
+  MIGRATION_EXECUTION_STATE_SUCCEEDED = 5;
+  MIGRATION_EXECUTION_STATE_FAILED = 6;
+  // Reserved for future cancellation support. P1 does not expose cancel.
+  MIGRATION_EXECUTION_STATE_CANCELLED = 7;
+}
+
+enum ColdBackingState {
+  COLD_BACKING_STATE_UNSPECIFIED = 0;
+  COLD_BACKING_STATE_PENDING_OFFLOAD = 1;
+  COLD_BACKING_STATE_MATERIALIZED = 2;
+  COLD_BACKING_STATE_PENDING_DELETE = 3;
+}
+
+message ReplicaRoute {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  optional uint64 offset = 3;
+  uint64 segment_offset = 4;
+  uint64 length = 5;
+  optional uint64 checksum = 6;
+  ReplicaTier tier = 7;
+  uint32 priority = 8;
+}
+
+message ColdBackingRoute {
+  ClientRuntimeId owner = 1;
+  string cold_tier_id = 2;
+  string object_locator = 3;
+  uint64 length = 4;
+  optional uint64 checksum = 5;
+  ColdBackingState state = 6;
+  repeated ColdBackingReplica replicas = 7;
+}
+
+message ColdBackingReplica {
+  ClientRuntimeId owner = 1;
+  string cold_tier_id = 2;
+  string object_locator = 3;
+}
+
+message NofBackingRoute {
+  ClientRuntimeId owner = 1;
+  string target_id = 2;
+  string object_locator = 3;
+  uint64 length = 4;
+  optional uint64 checksum = 5;
+  ColdBackingState state = 6;
+  repeated NofBackingReplica replicas = 7;
+}
+
+message NofBackingReplica {
+  ClientRuntimeId owner = 1;
+  string target_id = 2;
+  string object_locator = 3;
+}
+
+message ObjectRoute {
+  string key = 1;
+  uint64 version = 2;
+  RouteState state = 3;
+  CompatibilityDescriptor compatibility = 4;
+  repeated ReplicaRoute replicas = 5;
+  string tenant = 6;
+  string domain = 7;
+  string object_set = 8;
+  string logical_key = 9;
+  string canonical_key = 10;
+  string sharing_scope = 11;
+  string qos_tier = 12;
+  ColdBackingRoute cold_backing = 13;
+  reserved 14;
+  NofBackingRoute nof_backing = 15;
+}
+
+message CasResult {
+  bool applied = 1;
+  ObjectRoute current = 2;
+  optional uint64 version_floor = 3;
+}
+
+message SegmentReservation {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  uint64 offset_bytes = 3;
+  uint64 length_bytes = 4;
+}
+
+message GetRouteRequest {
+  string namespace = 1;
+  string authority = 2;
+  string key = 3;
+}
+
+message GetRouteReply {
+  ObjectRoute route = 1;
+  ErrorDetail error = 2;
+}
+
+message BatchGetRoutesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated string keys = 3;
+}
+
+message BatchGetRoutesReply {
+  repeated GetRouteReply replies = 1;
+}
+
+message ContainsRouteReply {
+  bool exists = 1;
+  ErrorDetail error = 2;
+}
+
+message BatchContainsRoutesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated string keys = 3;
+}
+
+message BatchContainsRoutesReply {
+  repeated ContainsRouteReply replies = 1;
+}
+
+message CompareAndSwapRouteRequest {
+  string namespace = 1;
+  string authority = 2;
+  string key = 3;
+  optional uint64 expected_version = 4;
+  ObjectRoute next = 5;
+}
+
+message CompareAndSwapRouteReply {
+  CasResult result = 1;
+  ErrorDetail error = 2;
+}
+
+message RouteCasEntry {
+  string key = 1;
+  optional uint64 expected_version = 2;
+  ObjectRoute next = 3;
+}
+
+message BatchCompareAndSwapRoutesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated RouteCasEntry entries = 3;
+}
+
+message BatchCompareAndSwapRoutesReply {
+  repeated CompareAndSwapRouteReply replies = 1;
+}
+
+message ReplaceRouteRequest {
+  string namespace = 1;
+  string authority = 2;
+  string key = 3;
+  ObjectRoute next = 4;
+}
+
+message ReplaceRouteReply {
+  ErrorDetail error = 1;
+}
+
+message RouteReplaceEntry {
+  string key = 1;
+  ObjectRoute next = 2;
+}
+
+message BatchReplaceRoutesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated RouteReplaceEntry entries = 3;
+}
+
+message BatchReplaceRoutesReply {
+  repeated ReplaceRouteReply replies = 1;
+}
+
+message ReserveAnyRequest {
+  ClientRuntimeId owner = 1;
+  uint64 length_bytes = 2;
+}
+
+message ReserveAnyReply {
+  SegmentReservation reservation = 1;
+  ErrorDetail error = 2;
+}
+
+message BatchReserveAnyRequest {
+  ClientRuntimeId owner = 1;
+  repeated uint64 length_bytes = 2;
+}
+
+message BatchReserveAnyReply {
+  repeated ReserveAnyReply replies = 1;
+}
+
+message ReserveSpecificRequest {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  uint64 length_bytes = 3;
+}
+
+message ReserveSpecificReply {
+  SegmentReservation reservation = 1;
+  ErrorDetail error = 2;
+}
+
+message ReserveSpecificEntry {
+  string segment_name = 1;
+  uint64 length_bytes = 2;
+}
+
+message BatchReserveSpecificRequest {
+  ClientRuntimeId owner = 1;
+  repeated ReserveSpecificEntry entries = 2;
+}
+
+message BatchReserveSpecificReply {
+  repeated ReserveSpecificReply replies = 1;
+}
+
+message ReleaseRequest {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  uint64 offset_bytes = 3;
+  uint64 length_bytes = 4;
+}
+
+message ReleaseReply {
+  ErrorDetail error = 1;
+}
+
+message ReleaseEntry {
+  string segment_name = 1;
+  uint64 offset_bytes = 2;
+  uint64 length_bytes = 3;
+}
+
+message BatchReleaseRequest {
+  ClientRuntimeId owner = 1;
+  repeated ReleaseEntry entries = 2;
+}
+
+message BatchReleaseReply {
+  repeated ReleaseReply replies = 1;
+}
+
+message ListRoutesByReplicaOwnerRequest {
+  string namespace = 1;
+  string authority = 2;
+  ClientRuntimeId owner = 3;
+  optional string cursor = 4;
+  uint32 limit = 5;
+}
+
+message ListRoutesByReplicaOwnerReply {
+  repeated ObjectRoute routes = 1;
+  ErrorDetail error = 2;
+  optional string next_cursor = 3;
+}
+
+message BatchReportRouteHitsRequest {
+  repeated string keys = 1;
+}
+
+message BatchReportRouteHitsReply {
+  uint64 accepted = 1;
+  ErrorDetail error = 2;
+}
+
+message BatchTrackReplicaRoutesRequest {
+  repeated ObjectRoute routes = 1;
+}
+
+message BatchTrackReplicaRoutesReply {
+  uint64 accepted = 1;
+  ErrorDetail error = 2;
+}
+
+message SubmitMigrationTaskRequest {
+  string namespace = 1;
+  string authority = 2;
+  string tenant = 3;
+  string key = 4;
+  MigrationMode mode = 5;
+  string source_segment = 6;
+  repeated string target_segments = 7;
+  string task_executor = 8;
+  // Admin-owned retry budget. P1 executor implementations do not retry a submitted execution.
+  uint64 max_retries = 9;
+  // Optional domain scope. Empty means the default domain.
+  string domain = 10;
+  // Optional object-set scope. Empty means the default object set.
+  string object_set = 11;
+}
+
+message SubmitMigrationTaskReply {
+  string execution_id = 1;
+  ErrorDetail error = 2;
+}
+
+message GetMigrationExecutionStatusRequest {
+  string namespace = 1;
+  string authority = 2;
+  string execution_id = 3;
+}
+
+message GetMigrationExecutionStatusReply {
+  string execution_id = 1;
+  MigrationExecutionState state = 2;
+  // Executor-local attempt count. P1 reports 0 before dispatch and 1 after dispatch.
+  uint32 attempts = 3;
+  string last_error = 4;
+  ErrorDetail error = 5;
+}
+
+message SegmentTargetChunk {
+  uint64 logical_offset = 1;
+  uint64 target_offset = 2;
+  uint64 length_bytes = 3;
+}
+
+message TriggerColdTierOffloadRequest {
+  // Server treats 0 as 1 and rejects values above 1024.
+  uint64 max_tasks = 1;
+}
+
+message TriggerColdTierOffloadReply {
+  uint64 materialized = 1;
+  ErrorDetail error = 2;
+}
+
+message ManualColdTierGcRequest {
+  string device_id = 1;
+  // Server treats 0 as 1 and rejects values above 1024.
+  uint64 max_backings = 2;
+}
+
+message ManualColdTierGcReply {
+  uint64 collected = 1;
+  ErrorDetail error = 2;
+}
+
+message ManualColdTierFreeRequest {
+  string device_id = 1;
+  // Server treats 0 as 1 and rejects values above 1024.
+  uint64 max_victims = 2;
+}
+
+message ManualColdTierFreeReply {
+  uint64 attempted_victims = 1;
+  uint64 freed_backings = 2;
+  uint64 skipped_backings = 3;
+  bool reached_low_watermark = 4;
+  ErrorDetail error = 5;
+  uint64 collected_backings = 6;
+}
+
+message ProbeColdTierDeviceRequest {
+  string device_id = 1;
+}
+
+message ProbeColdTierDeviceReply {
+  string device_id = 1;
+  uint64 capacity_bytes = 2;
+  uint64 used_bytes = 3;
+  uint64 reserved_bytes = 4;
+  bool schedulable = 5;
+  string state = 6;
+  string last_error = 7;
+  ErrorDetail error = 8;
+}
+
+message ReadFromColdRequest {
+  string namespace = 1;
+  string authority = 2;
+  string tenant = 3;
+  string key = 4;
+  string domain = 5;
+  string object_set = 6;
+}
+
+message ReadFromColdReply {
+  string segment_name = 1;
+  uint64 segment_offset = 2;
+  uint64 length = 3;
+  optional uint64 checksum = 4;
+  repeated SegmentTargetChunk target_chunks = 5;
+  optional string transport_endpoint = 6;
+  optional string transport_segment_descriptor = 7;
+  ErrorDetail error = 8;
+  uint64 admission_wait_us = 9;
+  uint64 ssd_read_us = 10;
+  uint64 memcpy_us = 11;
+  uint64 route_update_us = 12;
+  uint64 total_promote_us = 13;
+  bool backpressure = 14;
+}
+
+message ColdReadTarget {
+  string tenant = 1;
+  string key = 2;
+  string domain = 3;
+  string object_set = 4;
+}
+
+message BatchReadFromColdRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated ColdReadTarget targets = 3;
+}
+
+message BatchReadFromColdReply {
+  repeated ReadFromColdReply results = 1;
+}
+
+message AckColdReadCompleteRequest {
+  repeated string segment_names = 1;
+  repeated uint64 segment_offsets = 2;
+}
+
+message AckColdReadCompleteReply {}
+
+message BatchReclaimColdBackingsRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated ColdBackingRoute cold_backings = 3;
+  string route_key = 4;
+}
+
+message ReclaimColdBackingReply {
+  bool removed_cold_payload = 1;
+  bool removed_pending_source = 2;
+  bool skipped_still_referenced = 3;
+  ErrorDetail error = 4;
+}
+
+message BatchReclaimColdBackingsReply {
+  repeated ReclaimColdBackingReply results = 1;
+}
+
+message TransferNofOwnerSnapshotRequest {
+  string target_id = 1;
+  ClientRuntimeId from = 2;
+  ClientRuntimeId to = 3;
+  repeated ObjectRoute routes = 4;
+}
+
+message TransferNofOwnerSnapshotReply {
+  uint64 route_count = 1;
+  ErrorDetail error = 2;
+}
+
+enum ManagedNofRouteAction {
+  MANAGED_NOF_ROUTE_ACTION_UNSPECIFIED = 0;
+  MANAGED_NOF_ROUTE_ACTION_PREPARE = 1;
+  MANAGED_NOF_ROUTE_ACTION_PUBLISH = 2;
+  MANAGED_NOF_ROUTE_ACTION_RELEASE = 3;
+}
+
+message ManageNofBackingRequest {
+  string target_id = 1;
+  ObjectRoute route = 2;
+  ManagedNofRouteAction action = 3;
+  uint64 length = 4;
+  optional uint64 checksum = 5;
+}
+
+message ManageNofBackingReply {
+  ObjectRoute route = 1;
+  ErrorDetail error = 2;
+}
+
+message PinForReadRequest {
+  repeated string segment_names = 1;
+  repeated uint64 segment_offsets = 2;
+}
+
+message PinForReadReply {
+  uint64 pinned = 1;
+}
+
+message ControlStreamRequest {
+  uint64 request_id = 1;
+  oneof body {
+    BatchGetRoutesRequest route_get = 2;
+    BatchCompareAndSwapRoutesRequest route_cas = 3;
+    BatchReplaceRoutesRequest route_replace = 4;
+    BatchReserveAnyRequest allocator_reserve_any = 5;
+    BatchReserveSpecificRequest allocator_reserve_specific = 6;
+    BatchReleaseRequest allocator_release = 7;
+    ListRoutesByReplicaOwnerRequest route_list_by_replica_owner = 8;
+    BatchReportRouteHitsRequest eviction_report_route_hits = 9;
+    BatchTrackReplicaRoutesRequest eviction_track_replica_routes = 10;
+    BatchContainsRoutesRequest route_contains = 12;
+  }
+}
+
+message ControlStreamReply {
+  uint64 request_id = 1;
+  oneof body {
+    BatchGetRoutesReply route_get = 2;
+    BatchCompareAndSwapRoutesReply route_cas = 3;
+    BatchReplaceRoutesReply route_replace = 4;
+    BatchReserveAnyReply allocator_reserve_any = 5;
+    BatchReserveSpecificReply allocator_reserve_specific = 6;
+    BatchReleaseReply allocator_release = 7;
+    ListRoutesByReplicaOwnerReply route_list_by_replica_owner = 8;
+    BatchReportRouteHitsReply eviction_report_route_hits = 9;
+    BatchTrackReplicaRoutesReply eviction_track_replica_routes = 10;
+    BatchContainsRoutesReply route_contains = 12;
+  }
+  ErrorDetail error = 11;
+}
