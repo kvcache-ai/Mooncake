@@ -1133,9 +1133,11 @@ int TransferEnginePy::batchUnregisterMemory(
 }
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
-                                     const std::string& location) {
+                                     const std::string& location,
+                                     bool remote_accessible) {
     char* buffer = reinterpret_cast<char*>(buffer_addr);
-    return engine_->registerLocalMemory(buffer, capacity, location);
+    return engine_->registerLocalMemory(buffer, capacity, location,
+                                        remote_accessible);
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
@@ -1633,7 +1635,8 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::readBytesFromBuffer)
             .def("register_memory", &TransferEnginePy::registerMemory,
                  py::arg("buffer_addr"), py::arg("capacity"),
-                 py::arg("location") = kWildcardLocation)
+                 py::arg("location") = kWildcardLocation,
+                 py::arg("remote_accessible") = true)
             .def("unregister_memory", &TransferEnginePy::unregisterMemory)
             .def("batch_register_memory",
                  &TransferEnginePy::batchRegisterMemory,

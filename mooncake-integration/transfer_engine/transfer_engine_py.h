@@ -205,7 +205,8 @@ class TransferEnginePy {
 
     // FOR EXPERIMENT ONLY
     int registerMemory(uintptr_t buffer_addr, size_t capacity,
-                       const std::string &location = kWildcardLocation);
+                       const std::string &location = kWildcardLocation,
+                       bool remote_accessible = true);
 
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
