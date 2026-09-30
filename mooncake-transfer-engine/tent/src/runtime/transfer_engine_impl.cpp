@@ -43,6 +43,9 @@
 #include "tent/metrics/tent_metrics.h"
 #include "tent/metrics/config_loader.h"
 #include "tent/transport/hp_tcp/hp_tcp_protocol.h"
+#ifdef USE_XPU
+#include "tent/transport/xpu/xpu_transport.h"
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -1554,14 +1557,16 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     const TransportType hint = request.transport_hint;
 
     // Plan XPU/MLU staging before selecting a host-only network transport.
-    // XPU can bypass staging only with registered dma-buf buffers and RDMA
-    // device capability. Other transport hints or a policy rejecting direct
-    // RDMA require staging; MLU always requires it. XPU staging needs the
-    // local XpuTransport; without it, selection is left to transport
+    // XPU can bypass staging through verified dma-buf RDMA or a same-host
+    // peer's IPC mapping. XPU IPC precedes RDMA in the candidate order, with
+    // RDMA available for failover. Other transport hints or a policy rejecting
+    // direct access require staging; MLU always requires it. XPU staging needs
+    // the local XpuTransport; without it, selection is left to transport
     // capabilities (e.g. TCP copies device memory itself). Keep the original
     // memory types for policy matching.
     std::vector<std::string> host_staging_params;
     std::vector<TransportType> staging_transports;
+    bool xpu_ipc = false;
     if (desc->type == SegmentType::Memory &&
         request.target_id != LOCAL_SEGMENT_ID) {
         auto* entry = desc->findBuffer(request.target_offset, request.length);
@@ -1575,8 +1580,12 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
             xpu_side && !mlu_side && allow_xpu_direct &&
             (hint == UNSPEC || hint == RDMA) &&
             xpuDirectRdmaReady(request, entry, local_mtype, remote_mtype);
-        if (xpu_direct) *xpu_direct = direct;
-        if ((xpu_side && !direct && transport_list_[XPU]) || mlu_side) {
+        xpu_ipc = xpu_side && !mlu_side && allow_xpu_direct &&
+                  (hint == UNSPEC || hint == XPU) &&
+                  xpuIpcReady(request, desc.get(), entry);
+        if (xpu_direct) *xpu_direct = direct || xpu_ipc;
+        if ((xpu_side && !direct && !xpu_ipc && transport_list_[XPU]) ||
+            mlu_side) {
             findStagingPolicy(request, host_staging_params);
             if (host_staging_params.empty()) return SelectionResult{};
             // A staged side is replaced by a freshly registered host stage
@@ -1633,10 +1642,13 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
                 const auto& candidates =
                     host_staging ? staging_transports : entry->transports;
                 for (auto type : candidates) {
-                    // XPU/MLU require the local segment. NVLINK/SHM/TPU
-                    // require both segments to be on the same machine.
-                    if ((type == XPU || type == MLU) &&
-                        request.target_id != LOCAL_SEGMENT_ID)
+                    // MLU requires the local segment. XPU additionally allows
+                    // a same-host peer's mapped IPC buffer. NVLINK/SHM/TPU
+                    // require machine locality.
+                    if (type == MLU && request.target_id != LOCAL_SEGMENT_ID)
+                        continue;
+                    if (type == XPU && request.target_id != LOCAL_SEGMENT_ID &&
+                        !xpu_ipc)
                         continue;
                     if ((type == NVLINK || type == SHM || type == TPU) &&
                         !same_machine)
@@ -1673,6 +1685,7 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     ctx.intent_type = request.intent_type;  // Business intent policy filter
     ctx.local_segment = request.target_id == LOCAL_SEGMENT_ID;
     ctx.host_staging = host_staging;
+    ctx.xpu_ipc = xpu_ipc;
 
     if (desc->type == SegmentType::File) {
         // File segment: use selector with empty buffer_transports
@@ -1995,6 +2008,22 @@ bool TransferEngineImpl::xpuDirectRdmaReady(const Request& request,
     if (!local_desc) return false;
     return carries_rdma(
         local_desc->findBuffer((uint64_t)request.source, request.length));
+}
+
+bool TransferEngineImpl::xpuIpcReady(const Request& request,
+                                     const SegmentDesc* desc,
+                                     const BufferDesc* remote_entry) {
+#ifdef USE_XPU
+    if (!desc || !remote_entry) return false;
+    auto* xpu = dynamic_cast<XpuTransport*>(transport_list_[XPU].get());
+    return xpu && xpu->prepareRemoteBuffer(request.target_id, *desc,
+                                           *remote_entry, request.source);
+#else
+    (void)request;
+    (void)desc;
+    (void)remote_entry;
+    return false;
+#endif
 }
 
 void TransferEngineImpl::findStagingPolicy(const Request& request,

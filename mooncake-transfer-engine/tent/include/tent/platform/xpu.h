@@ -15,6 +15,12 @@
 #ifndef TENT_PLATFORM_XPU_H_
 #define TENT_PLATFORM_XPU_H_
 
+#include <sys/types.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+
 #include "tent/common/config.h"
 #include "tent/platform/cpu.h"
 #include "tent/runtime/platform.h"
@@ -31,15 +37,22 @@ namespace tent {
 // dependency is confined to platform_xpu and never leaks into this header.
 //
 // This platform provides the device-side building blocks: USM allocation
-// ("xpu:N"), pointer classification, the VRAM<->host copy() primitive, and
-// dma-buf export of device allocations. When the RNIC supports
-// ibv_reg_dmabuf_mr, RdmaContext registers exported XPU buffers directly and
-// the engine moves VRAM<->VRAM / VRAM<->DRAM data over RDMA without a host
-// bounce (GPUDirect-style). Buffers that cannot be exported, or hosts without
-// dma-buf capable verbs, keep using the staging path: getTypeEnum / isGpuType /
-// findStagingPolicy let ProxyManager chain the VRAM<->host hop (executed by
-// XpuTransport via copy()) and the host<->host hop end-to-end over the
-// network. PCIe P2P between XPUs is future work.
+// ("xpu:N"), pointer classification, the copy() primitive (VRAM<->host and
+// VRAM<->VRAM), and dma-buf export of device allocations. When the RNIC
+// supports ibv_reg_dmabuf_mr, RdmaContext registers exported XPU buffers
+// directly and the engine moves VRAM<->VRAM / VRAM<->DRAM data over RDMA
+// without a host bounce (GPUDirect-style). Buffers that cannot be exported, or
+// hosts without dma-buf capable verbs, keep using the staging path: getTypeEnum
+// / isGpuType / findStagingPolicy let ProxyManager chain the VRAM<->host hop
+// (executed by XpuTransport via copy()) and the host<->host hop end-to-end over
+// the network. Within one process, VRAM<->VRAM copies between two XPUs run
+// directly over PCIe (or Xe Link) when the devices have peer access
+// (sycl_ext_oneapi_peer_access), and are bounced through host memory
+// otherwise. Across processes on one host, XpuTransport publishes each
+// registered XPU buffer's Level Zero IPC handle (exportIpc) in the segment
+// descriptor and the peer maps it into its own device address space
+// (importIpc), so the same PCIe P2P copy serves a same-node prefill/decode
+// pair.
 class XpuPlatform : public CpuPlatform {
    public:
     explicit XpuPlatform(std::shared_ptr<Config> config)
@@ -60,7 +73,8 @@ class XpuPlatform : public CpuPlatform {
     // inherited host deallocator.
     Status free(void *ptr, size_t size) override;
 
-    // VRAM<->host copy via the SYCL backend when either side is XPU memory;
+    // VRAM<->host copy via the SYCL backend when either side is XPU memory,
+    // VRAM<->VRAM (same device, PCIe P2P, or host bounce) when both are;
     // otherwise the inherited host memcpy.
     Status copy(void *dst, void *src, size_t length) override;
 
@@ -75,6 +89,42 @@ class XpuPlatform : public CpuPlatform {
     // when a foreign allocation sits in a runtime-managed USM pool (its
     // dma-buf is shared, so the allocation cannot be registered on its own).
     Status exportDmabuf(void *addr, size_t length, DmabufExport &out) override;
+
+    // Same-host, cross-process sharing of XPU allocations (used by
+    // XpuTransport, not part of the generic Platform interface).
+    //
+    // exportIpc describes the whole USM allocation containing
+    // [addr, addr+length): its Level Zero IPC handle (zeMemGetIpcHandle; an
+    // opaque blob that names the allocation's dma-buf by a descriptor of this
+    // process, so it is only meaningful together with this process's pid),
+    // its base address in this process and its size. Fails for host memory
+    // and for ranges that span more than one allocation; reported without
+    // logging so a registration that also failed dma-buf export does not warn
+    // twice.
+    static constexpr size_t kIpcHandleSize = 64;  // ZE_MAX_IPC_HANDLE_SIZE
+    using IpcHandle = std::array<uint8_t, kIpcHandleSize>;
+    struct IpcExport {
+        IpcHandle handle{};
+        uint64_t base = 0;
+        uint64_t size = 0;
+    };
+    Status exportIpc(void *addr, size_t length, IpcExport &out);
+
+    // importIpc maps the allocation behind `handle`, exported by process
+    // `exporter_pid` (possibly this one) and `size` bytes long, as device
+    // memory addressable from local device `device_index`, returning the
+    // local pointer in *pptr; copy() then treats it like any other XPU
+    // allocation. Fetching the exporter's descriptor needs ptrace permission
+    // over `exporter_pid` (Yama ptrace_scope / CAP_SYS_PTRACE) unless it is
+    // this process; errno is EPERM when that is refused. closeImport unmaps
+    // the range.
+    Status importIpc(const IpcHandle &handle, pid_t exporter_pid, size_t size,
+                     int device_index, void **pptr);
+    Status closeImport(void *ptr);
+
+    // Local ordinal N of the "xpu:N" device owning `addr`, or -1 for host
+    // memory.
+    int deviceIndex(void *addr);
 
     const std::string type() const override { return "xpu"; }
 };
