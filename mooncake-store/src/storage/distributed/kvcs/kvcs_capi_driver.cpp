@@ -145,11 +145,13 @@ inline std::optional<KvcsManifestPayload> DecodeManifest(
 struct LowLevelConfig {
     std::string efc_socket;
     uint32_t mountpoint_index = 0;
-    uint64_t max_value_size = 0;
-    int max_keys_per_batch = 0;
-    int get_workers = 4;
-    int set_workers = 4;
-    int simple_workers = 2;
+    // Safe defaults for a 4 MiB value limit: about 96 MiB of ring/shm
+    // capacity with one worker per operation class and eight keys per batch.
+    uint64_t max_value_size = kStandardDefaultMaxValueSize;
+    int max_keys_per_batch = 8;
+    int get_workers = 1;
+    int set_workers = 1;
+    int simple_workers = 1;
     uint32_t max_key_size = kKvcsDefaultMaxKeySize;
     uint64_t operation_timeout_ms = kDefaultOperationTimeoutMs;
     uint64_t query_operation_timeout_ms = kDefaultQueryOperationTimeoutMs;
@@ -184,7 +186,7 @@ tl::expected<CommonConfig, ErrorCode> ParseCommonConfig(
     }
 
     if (const char* value = std::getenv("MOONCAKE_KVCS_MAX_KEY_SIZE");
-        value != nullptr) {
+        value != nullptr && *value != '\0') {
         auto parsed = TryParseInteger<uint64_t>(value);
         if (!parsed || *parsed == 0 || *parsed > kKvcsMaxKeySize) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -193,7 +195,7 @@ tl::expected<CommonConfig, ErrorCode> ParseCommonConfig(
     }
 
     if (const char* value = std::getenv("MOONCAKE_KVCS_MAX_VALUE_SIZE");
-        value != nullptr) {
+        value != nullptr && *value != '\0') {
         auto parsed = TryParseInteger<uint64_t>(value);
         if (!parsed || *parsed == 0 ||
             *parsed >
@@ -214,7 +216,7 @@ tl::expected<CommonConfig, ErrorCode> ParseCommonConfig(
 tl::expected<int, ErrorCode> ParseNonnegativeIntEnvironment(const char* name,
                                                             int default_value) {
     const char* value = std::getenv(name);
-    if (value == nullptr) return default_value;
+    if (value == nullptr || *value == '\0') return default_value;
     auto parsed = TryParseInteger<uint64_t>(value);
     if (!parsed || *parsed > static_cast<uint64_t>(INT_MAX)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -223,7 +225,7 @@ tl::expected<int, ErrorCode> ParseNonnegativeIntEnvironment(const char* name,
 }
 
 tl::expected<LowLevelConfig, ErrorCode> ParseLowLevelConfig() {
-    auto common = ParseCommonConfig(std::nullopt);
+    auto common = ParseCommonConfig(kStandardDefaultMaxValueSize);
     if (!common) {
         return tl::make_unexpected(common.error());
     }
@@ -233,7 +235,7 @@ tl::expected<LowLevelConfig, ErrorCode> ParseLowLevelConfig() {
     config.max_key_size = common->max_key_size;
     config.max_value_size = common->max_value_size;
     if (config.max_value_size < kManifestPayloadSize) {
-        LOG(ERROR) << "KVCS Low Level requires MOONCAKE_KVCS_MAX_VALUE_SIZE >= "
+        LOG(ERROR) << "KVCS Low Level max value size must be >= "
                    << kManifestPayloadSize << " for its manifest";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -248,7 +250,7 @@ tl::expected<LowLevelConfig, ErrorCode> ParseLowLevelConfig() {
         "MOONCAKE_KVCS_SIMPLE_WORKERS", config.simple_workers);
     const char* timeout_value =
         std::getenv("MOONCAKE_KVCS_OPERATION_TIMEOUT_MS");
-    if (timeout_value != nullptr) {
+    if (timeout_value != nullptr && *timeout_value != '\0') {
         auto parsed = TryParseInteger<uint64_t>(timeout_value);
         if (!parsed || *parsed == 0 ||
             *parsed > static_cast<uint64_t>(
@@ -259,7 +261,7 @@ tl::expected<LowLevelConfig, ErrorCode> ParseLowLevelConfig() {
     }
     const char* query_timeout_value =
         std::getenv("MOONCAKE_KVCS_QUERY_TIMEOUT_MS");
-    if (query_timeout_value != nullptr) {
+    if (query_timeout_value != nullptr && *query_timeout_value != '\0') {
         auto parsed = TryParseInteger<uint64_t>(query_timeout_value);
         if (!parsed || *parsed == 0 ||
             *parsed > static_cast<uint64_t>(

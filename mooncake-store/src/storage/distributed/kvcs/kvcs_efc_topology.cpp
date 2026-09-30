@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <set>
 #include <string_view>
+#include <sys/stat.h>
 
 #include <glog/logging.h>
 #include <yaml-cpp/yaml.h>
@@ -43,45 +45,58 @@ std::vector<std::string> ParseYamlStrings(const YAML::Node& values) {
     return result;
 }
 
-tl::expected<KvcsEfcDeployment, ErrorCode> LoadFromEnvironment() {
-    const char* backend = std::getenv("KVCS_BACKEND");
-    if (backend == nullptr || *backend == '\0') {
-        LOG(ERROR) << "KVCS_BACKEND is required for Low Level topology "
-                      "discovery";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
+constexpr std::string_view kDefaultKvcsBackend = "kvcachestore";
+constexpr std::string_view kDefaultKvcsMountpointId = "kvcachestore-default";
+constexpr uint32_t kDefaultKvcsMountpointIndex = 1;
 
+tl::expected<KvcsEfcDeployment, ErrorCode> LoadFromEnvironment() {
+    // The EFC deployment owns the real backend configuration.  Mooncake only
+    // needs a stable low-level target index, so missing deployment variables
+    // fall back to the single default KVCacheStore mountpoint used by the
+    // official EFC chart.  Explicit variables remain supported for mixed or
+    // multi-mountpoint deployments.
+    const char* backend = std::getenv("KVCS_BACKEND");
+    const auto backend_name =
+        backend == nullptr ? std::string_view{}
+                           : TrimAsciiWhitespace(std::string_view(backend));
     KvcsEfcDeployment deployment;
-    deployment.backend = backend;
+    deployment.backend = backend_name.empty()
+                              ? std::string(kDefaultKvcsBackend)
+                              : std::string(backend_name);
     deployment.extra_backends = ParseCsv(std::getenv("KVCS_EXTRA_BACKENDS"));
 
     const bool needs_mountpoints =
-        deployment.backend == "kvcachestore" ||
-        Contains(deployment.extra_backends, "kvcachestore");
+        deployment.backend == kDefaultKvcsBackend ||
+        Contains(deployment.extra_backends, kDefaultKvcsBackend);
     if (!needs_mountpoints) return deployment;
 
     const char* json = std::getenv("KVCS_MOUNTPOINTS_JSON");
-    if (json == nullptr || *json == '\0') {
-        LOG(ERROR) << "KVCS_MOUNTPOINTS_JSON is required for direct "
-                      "KVCacheStore access";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    const auto root = YAML::Load(json);
-    const auto mountpoints = root["mountPoints"];
-    if (!mountpoints || !mountpoints.IsSequence())
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    deployment.mountpoints.reserve(mountpoints.size());
-    for (size_t i = 0; i < mountpoints.size(); ++i) {
-        if (i + 1 > std::numeric_limits<uint32_t>::max())
+    if (json && *json) {
+        const auto root = YAML::Load(json);
+        const auto mountpoints = root["mountPoints"];
+        if (!mountpoints || !mountpoints.IsSequence())
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        const auto mountpoint_id =
-            mountpoints[i]["mountPointID"].as<std::string>();
-        const auto subpath = mountpoints[i]["subpath"]
-                                 ? mountpoints[i]["subpath"].as<std::string>()
-                                 : std::string{};
+        deployment.mountpoints.reserve(mountpoints.size());
+        for (size_t i = 0; i < mountpoints.size(); ++i) {
+            if (i + 1 > std::numeric_limits<uint32_t>::max())
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            const auto mountpoint_id =
+                mountpoints[i]["mountPointID"].as<std::string>();
+            const auto subpath = mountpoints[i]["subpath"]
+                                     ? mountpoints[i]["subpath"].as<std::string>()
+                                     : std::string{};
+            deployment.mountpoints.push_back(
+                {.id = mountpoint_id + subpath,
+                 .index = static_cast<uint32_t>(i + 1)});
+        }
+    } else {
         deployment.mountpoints.push_back(
-            {.id = mountpoint_id + subpath,
-             .index = static_cast<uint32_t>(i + 1)});
+            {.id = std::string(kDefaultKvcsMountpointId),
+             .index = kDefaultKvcsMountpointIndex,
+             .is_default = true});
+        LOG(INFO) << "KVCS topology variables are absent; using built-in "
+                     "KVCacheStore mountpoint index "
+                  << kDefaultKvcsMountpointIndex;
     }
     return deployment;
 }
@@ -178,8 +193,35 @@ tl::expected<std::vector<KvcsEfcRoute>, ErrorCode> ResolveKvcsEfcTopology(
 tl::expected<std::vector<KvcsEfcRoute>, ErrorCode> LoadKvcsEfcTopology(
     const std::string& path) {
     try {
-        auto deployment =
-            path.empty() ? LoadFromEnvironment() : LoadFromYaml(path);
+        tl::expected<KvcsEfcDeployment, ErrorCode> deployment =
+            tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        if (path.empty()) {
+            deployment = LoadFromEnvironment();
+        } else {
+            // MOONCAKE_KVCS_EFC_CONFIG is a legacy YAML hook.  Older launchers
+            // also put the EFC UDS path in this variable; never try to parse a
+            // socket (or another non-file) as YAML.  Low-level operation can
+            // proceed with the built-in topology in that case.
+            std::error_code fs_error;
+            if (std::filesystem::is_regular_file(path, fs_error)) {
+                deployment = LoadFromYaml(path);
+            } else {
+                struct stat path_stat {};
+                const bool is_socket =
+                    ::stat(path.c_str(), &path_stat) == 0 &&
+                    S_ISSOCK(path_stat.st_mode);
+                if (!is_socket) {
+                    LOG(ERROR) << "KVCS EFC topology config must be a regular "
+                                   "YAML file or the legacy EFC socket path: "
+                                << path;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                LOG(INFO) << "Ignoring legacy socket path " << path
+                          << " as KVCS topology config; using built-in "
+                             "topology";
+                deployment = LoadFromEnvironment();
+            }
+        }
         if (!deployment) return tl::make_unexpected(deployment.error());
         return ResolveKvcsEfcTopology(*deployment);
     } catch (const std::exception& error) {

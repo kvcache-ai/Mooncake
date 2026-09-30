@@ -200,7 +200,12 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     if (UsesObjectStorage()) {
         auto init_result = object_storage_adapter_->Init();
         if (!init_result) return init_result;
-        if (distributed_config_.enable_health_check) {
+        // KVCS health probing is intentionally disabled in the first
+        // integration version.  A failed probe must not prevent Mooncake from
+        // starting; individual reads/writes already return their provider
+        // errors and are logged by the adapter.
+        if (distributed_config_.enable_health_check &&
+            !distributed_config_.UsesKvcs()) {
             auto health_result = object_storage_adapter_->CheckHealth();
             if (!health_result) {
                 LOG(ERROR) << "Object storage health check failed, adapter="
@@ -208,6 +213,10 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
                            << static_cast<int>(health_result.error());
                 return health_result;
             }
+        } else if (distributed_config_.enable_health_check &&
+                   distributed_config_.UsesKvcs()) {
+            LOG(INFO) << "KVCS startup health check is disabled; provider "
+                         "errors will be returned by individual I/O calls";
         }
         initialized_ = true;
         LOG(INFO) << "DistributedStorageBackend initialized, object adapter="

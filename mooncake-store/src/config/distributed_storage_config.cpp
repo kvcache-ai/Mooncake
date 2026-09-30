@@ -6,6 +6,7 @@
 #include <limits>
 #include <sstream>
 #include <string_view>
+#include <sys/stat.h>
 
 #include "environ.h"
 #include "environment_variables.h"
@@ -28,6 +29,36 @@ const char* ToString(DfsAllocatorType type) {
     }
     return "unknown";
 }
+
+namespace {
+
+constexpr std::string_view kDefaultKvcsEfcSocket =
+    "/var/run/kvcs/efc-grpc.sock";
+
+bool IsUnixSocket(std::string_view path) {
+    if (path.empty()) return false;
+    struct stat path_stat {};
+    const std::string path_string(path);
+    return ::stat(path_string.c_str(), &path_stat) == 0 &&
+           S_ISSOCK(path_stat.st_mode);
+}
+
+bool HasExplicitFilesystemAdapter() {
+    return std::getenv("MOONCAKE_DFS_FS_ADAPTER") != nullptr ||
+           std::getenv("MOONCAKE_DISTRIBUTED_FS_TYPE") != nullptr;
+}
+
+bool ShouldAutoEnableKvcs() {
+    if (HasExplicitFilesystemAdapter()) return false;
+    const char* configured_socket = std::getenv("MOONCAKE_KVCS_EFC_SOCKET");
+    const std::string_view socket =
+        configured_socket == nullptr || *configured_socket == '\0'
+            ? kDefaultKvcsEfcSocket
+            : std::string_view(configured_socket);
+    return IsUnixSocket(socket);
+}
+
+}  // namespace
 
 bool DistributedStorageConfig::Validate() const {
     if (UsesKvcs()) {
@@ -162,6 +193,10 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         config.fs_adapter_type = "kvcs-lowlevel";
     } else if (!kvcs_mode.empty()) {
         config.fs_adapter_type = kvcs_mode;
+    } else if (ShouldAutoEnableKvcs()) {
+        config.fs_adapter_type = "kvcs-lowlevel";
+        LOG(INFO) << "KVCS EFC socket detected; enabling KVCS low-level "
+                     "distributed storage automatically";
     }
     config.object_storage_config_path = Environ::GetString(
         "MOONCAKE_KVCS_EFC_CONFIG", config.object_storage_config_path);

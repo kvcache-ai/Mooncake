@@ -72,6 +72,13 @@ std::string EscapeLabel(std::string_view value) {
     return escaped;
 }
 
+void LogKvcsIoError(std::string_view operation, std::string_view target,
+                    uint32_t mountpoint_index, ErrorCode error) {
+    LOG(WARNING) << "KVCS " << operation << " failed, target=" << target
+                 << ", mountpoint_index=" << mountpoint_index
+                 << ", error=" << toString(error);
+}
+
 bool ShouldTryNextTarget(ErrorCode error) {
     return error == ErrorCode::OBJECT_NOT_FOUND ||
            error == ErrorCode::KVCS_INCOMPLETE || IsKvcsTransientError(error);
@@ -537,11 +544,9 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
                 const ErrorCode error = batch.results[i].error();
                 impl_->Observe("put", batch.target, "error", 0,
                                batch.latency_us);
-                LOG(WARNING)
-                    << "KVCS target put failed, target="
-                    << impl_->targets[batch.target]->id << ", mountpoint_index="
-                    << impl_->targets[batch.target]->mountpoint_index
-                    << ", error=" << toString(error);
+                LogKvcsIoError("put", impl_->targets[batch.target]->id,
+                               impl_->targets[batch.target]->mountpoint_index,
+                               error);
                 if (IsKvcsTransientError(error)) {
                     if (!first_errors[request_index]) {
                         first_errors[request_index] = error;
@@ -625,6 +630,9 @@ KvcsManifestResults KvcsObjectStorageAdapter::BatchQueryKvcs(
                 } else {
                     impl_->Observe("query", batch.target, "error", 0,
                                    batch.latency_us);
+                    LogKvcsIoError("query", impl_->targets[batch.target]->id,
+                                   impl_->targets[batch.target]->mountpoint_index,
+                                   query.error());
                 }
             }
             impl_->ObserveBatch(
@@ -813,6 +821,9 @@ KvcsGetResults KvcsObjectStorageAdapter::BatchGetKvcsWithManifests(
                     const ErrorCode error = batch.results[i].error();
                     impl_->Observe("get", batch.target, "error", 0,
                                    batch.latency_us);
+                    LogKvcsIoError("get", impl_->targets[batch.target]->id,
+                                   impl_->targets[batch.target]->mountpoint_index,
+                                   error);
                     if (error != ErrorCode::OBJECT_NOT_FOUND &&
                         !first_errors[request_index]) {
                         first_errors[request_index] = error;
@@ -1003,6 +1014,9 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchDelete(
                 }
                 impl_->Observe("delete", batch.target, "error", 0,
                                batch.latency_us);
+                LogKvcsIoError("delete", impl_->targets[batch.target]->id,
+                               impl_->targets[batch.target]->mountpoint_index,
+                               batch.results[i].error());
                 if (results[i])
                     results[i] =
                         tl::make_unexpected(batch.results[i].error());

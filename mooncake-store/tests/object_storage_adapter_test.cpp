@@ -283,6 +283,23 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRejectsDfsRequests) {
     EXPECT_EQ(read_results.front().error(), ErrorCode::NOT_SUPPORTED);
 }
 
+TEST_F(ObjectStorageAdapterTest, KvcsModeSkipsEnabledHealthCheck) {
+    FileStorageConfig file_config;
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = root_dir_.string();
+    distributed_config.fs_adapter_type = "kvcs-lowlevel";
+    distributed_config.enable_health_check = true;
+    auto owned_adapter = std::make_unique<FakeObjectStorageAdapter>();
+    auto* adapter = owned_adapter.get();
+    adapter->fail_health_check = true;
+    DistributedStorageBackend backend(file_config, distributed_config, nullptr,
+                                      std::move(owned_adapter));
+
+    ASSERT_TRUE(backend.Init());
+    EXPECT_EQ(adapter->init_calls, 1);
+    EXPECT_EQ(adapter->health_check_calls, 0);
+}
+
 TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRunsEnabledHealthCheck) {
     FakeObjectStorageAdapter* adapter = nullptr;
     auto backend = MakeObjectStorageBackend(adapter, {}, true);

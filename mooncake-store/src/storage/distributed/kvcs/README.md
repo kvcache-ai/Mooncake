@@ -25,7 +25,12 @@ disk registration, capacity, health, and mountpoints belong to that deployment
 configuration; they must not be duplicated in Mooncake flags.
 
 All Mooncake processes that access KVCS need the EFC socket and shared-memory
-volume mounted at the paths configured for KVCS:
+volume mounted at the paths configured for KVCS. When the default EFC socket
+`/var/run/kvcs/efc-grpc.sock` exists, Mooncake detects it during startup and
+automatically enables the Low Level KVCS adapter. No KVCS mode or socket
+environment variable is required for this path. An explicit
+`MOONCAKE_KVCS_MODE` or filesystem adapter setting still takes precedence, so
+existing non-KVCS deployments are not changed accidentally.
 
 ```yaml
 volumeMounts:
@@ -38,11 +43,12 @@ volumes:
     hostPath: {path: /dev/shm, type: Directory}
 ```
 
-The Mooncake master and clients must use the same explicit adapter name. The
-legacy `kvcs` value is accepted and canonicalized from `MOONCAKE_KVCS_MODE`,
-but new deployments should not use it. KVCS has no dedicated health endpoint.
-When `MOONCAKE_DISTRIBUTED_HEALTH_CHECK` is enabled, Mooncake performs a query
-probe during initialization and treats `OBJECT_NOT_FOUND` as a healthy result.
+The Mooncake master and clients resolve the same adapter from the shared
+startup environment. The legacy `kvcs` value is accepted and canonicalized
+from `MOONCAKE_KVCS_MODE`, but new deployments should not use it. KVCS has no
+dedicated health endpoint.
+KVCS startup health probing is disabled in this first integration version;
+individual provider read/write failures are logged and returned to the caller.
 
 ### Standard
 
@@ -66,13 +72,14 @@ replica selection are provider-owned.
 
 ### Low Level
 
-Low Level talks directly to EFC and has no Redis metadata plane. Mooncake reads
-the official EFC deployment configuration instead of accepting a separate
-mountpoint selector. A local primary backend with
-`extra_backends: [kvcachestore]` exposes the main backend as target index 0 and
-every configured KVCacheStore mountpoint as a target with index greater than
-0. Low Level batches therefore use EFC's native routing contract. KVCS remains
-responsible for watermarks and space reclamation inside each backend.
+Low Level talks directly to EFC and has no Redis metadata plane. Mooncake
+accepts the official EFC deployment variables when they are available, but
+does not require them. If they are absent, it uses the built-in single
+KVCacheStore (G3.5) target at `mountpoint_index=1`. This is a default, not a
+restriction: explicit local index-0 and mixed G3/G3.5 topologies retain their
+existing routing behavior. The default index must match the EFC deployment.
+KVCS remains responsible for watermarks and space reclamation inside each
+backend.
 
 For a G3/G3.5 deployment, Mooncake uses a stable hash of the tenant-qualified
 key. Each object is written to exactly one target: there is no Mooncake-side
@@ -86,17 +93,16 @@ the following remote delete.
 
 ```yaml
 env:
-  - {name: MOONCAKE_KVCS_MODE, value: low-level}
-  - {name: MOONCAKE_KVCS_EFC_SOCKET, value: /var/run/kvcs/efc-grpc.sock}
+  # Mode and socket are auto-detected from /var/run/kvcs/efc-grpc.sock.
   - {name: MOONCAKE_KVCS_SINGLE_TENANT, value: "true"}
-  # Inject the same official EFC deployment values into Mooncake.
-  - {name: KVCS_BACKEND, value: disk}
-  - {name: KVCS_EXTRA_BACKENDS, value: kvcachestore}
-  - {name: KVCS_MOUNTPOINTS_JSON, value: '{"mountPoints":[{"mountPointID":"kvcs-xxx.example.com"}]}' }
+  # KVCS_BACKEND / KVCS_EXTRA_BACKENDS / KVCS_MOUNTPOINTS_JSON are optional.
+  # If omitted, Mooncake uses one built-in KVCacheStore target (index 1).
 ```
 
-Bare-metal deployments may point `MOONCAKE_KVCS_EFC_CONFIG` at the actual EFC
-configuration file instead of injecting the three `KVCS_*` values:
+Bare-metal deployments may optionally point `MOONCAKE_KVCS_EFC_CONFIG` at an
+actual EFC YAML configuration file. A legacy EFC socket path is ignored as a
+topology file and falls back to the built-in defaults. A missing path, directory,
+or other non-socket non-file path is rejected:
 
 ```yaml
 backend: kvcachestore
@@ -105,8 +111,9 @@ mountpoints:
   - {mountpoint_id: efc-b, mountpoint_index: 2, default: false}
 ```
 
-There is no Mooncake mountpoint-index flag or fallback. Missing or inconsistent
-deployment discovery is an initialization error. Multiple discovered targets
+There is no Mooncake mountpoint-index flag. Missing deployment variables use
+the built-in index-1 target; explicit YAML or `KVCS_MOUNTPOINTS_JSON` values
+still support multiple targets. Multiple configured targets
 are used for stable-hash routing and failure fallback, not for Mooncake-side
 replication.
 
@@ -133,8 +140,8 @@ exists.
 The official SDK does not provide a Mooncake-facing capacity or bandwidth
 contract that would make a local load model authoritative. Capacity, watermarks,
 space reclamation, and provider-side health remain KVCS/EFC responsibilities;
-Mooncake reacts to the result of each operation and optionally uses an
-inexpensive query probe as its startup health check.
+Mooncake reacts to the result of each operation. Startup health probing is not
+performed for KVCS in this integration version.
 
 Mooncake keeps tenant isolation in the provider key. The adapter encodes
 `tenant_id` and the logical key as the printable, injective raw key
@@ -142,10 +149,12 @@ Mooncake keeps tenant isolation in the provider key. The adapter encodes
 configured KVCS raw-key limit before any SDK call. `MOONCAKE_KVCS_MAX_KEY_SIZE`
 defaults to 256 bytes and may be raised up to the SDK maximum of 1024 bytes.
 
-Low Level requires `MOONCAKE_KVCS_MAX_VALUE_SIZE`. A practical starting value
-is `4194304` (4 MiB); tune it against the deployed EFC and shared-memory
-capacity. The SDK supports values up to 4 GiB, but that is an upper bound, not
-a production default. Values up to and including the configured limit use the
+Low Level defaults `MOONCAKE_KVCS_MAX_VALUE_SIZE` to `4194304` (4 MiB),
+`MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` to `8`, and each worker class to `1`. These
+safe defaults use about 96 MiB of ring/shared memory; override them only when
+the container has more shared memory and a higher concurrency target. The SDK
+supports values up to 4 GiB, but that is an upper bound, not a production
+default. Values up to and including the configured limit use the
 inline fast path: the logical object is stored under one Mooncake-owned
 physical root key. Larger objects use chunks of at most the configured size
 plus a Mooncake-owned manifest. The manifest has a versioned, fixed 32-byte

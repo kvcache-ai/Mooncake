@@ -14,6 +14,18 @@ HOLDER_PID_FILE=/tmp/mooncake-holder.pid
 MASTER_ADDR=127.0.0.1:50051
 METADATA_URL=http://127.0.0.1:8080/metadata
 CLIENT_HOST=${MOONCAKE_CLIENT_HOST:-}
+EFC_SOCKET=${MOONCAKE_KVCS_EFC_SOCKET:-/var/run/kvcs/efc-grpc.sock}
+OBJECT_COUNT=${OBJECT_COUNT:-8}
+VALUE_BYTES=${VALUE_BYTES:-65536}
+STALE_WAIT_SECONDS=${STALE_WAIT_SECONDS:-35}
+
+# The inner test is self-contained.  Mooncake auto-enables KVCS when the
+# configured/default EFC socket is present; its low-level topology code supplies
+# KVCS backend/mountpoint defaults.  Keep SDK socket handling unchanged.
+export MOONCAKE_KVCS_MAX_VALUE_SIZE=${MOONCAKE_KVCS_MAX_VALUE_SIZE:-4194304}
+export OBJECT_COUNT VALUE_BYTES STALE_WAIT_SECONDS
+
+mkdir -p "$ROOT"
 
 if [[ -z "$CLIENT_HOST" ]]; then
     CLIENT_HOST=$(hostname -I 2>/dev/null | tr ' ' '\n' |
@@ -108,7 +120,7 @@ cleanup_inner() {
 }
 trap cleanup_inner EXIT
 
-test -S "$MOONCAKE_KVCS_EFC_SOCKET"
+test -S "$EFC_SOCKET"
 python3 - <<'PY'
 import kvcs
 import mooncake.engine
