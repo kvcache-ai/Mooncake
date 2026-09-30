@@ -39,14 +39,6 @@ TEST(RdmaSelectionMetricsTest, WritesSnapshotDeltaAsJsonl) {
 
     const auto report = calculateRdmaSelectionMetrics(2 * kMiB, 32, 4, "tent",
                                                       "write", start, end);
-    EXPECT_EQ(report.selection.allocations, 5u);
-    EXPECT_EQ(report.selection.single_path_allocations, 2u);
-    EXPECT_EQ(report.selection.multi_path_allocations, 3u);
-    EXPECT_EQ(report.selection.probe_allocations, 1u);
-    ASSERT_EQ(report.selection.devices.size(), 2u);
-    EXPECT_EQ(report.selection.devices[0].selected_bytes, 6 * kMiB);
-    EXPECT_EQ(report.selection.devices[1].selected_slices, 4u);
-
     const std::string path = "tebench_selection_metrics_test.jsonl";
     std::remove(path.c_str());
     std::string error;
@@ -58,12 +50,19 @@ TEST(RdmaSelectionMetricsTest, WritesSnapshotDeltaAsJsonl) {
     EXPECT_EQ(record["schema_version"], 1);
     EXPECT_EQ(record["record_type"], "rdma_selection_metrics");
     EXPECT_EQ(record["measurement_window"], "snapshot_delta");
-    EXPECT_EQ(record["selection"]["allocations"], 5);
-    EXPECT_EQ(record["selection"]["devices"][0]["dev_id"], 0);
-    EXPECT_EQ(record["selection"]["devices"][0]["device_name"], "mlx5_0");
-    EXPECT_EQ(record["selection"]["devices"][0]["numa_node"], 0);
-    EXPECT_EQ(record["selection"]["devices"][1]["numa_node"], 1);
-    EXPECT_EQ(record["selection"]["devices"][1]["selected_bytes"], 4 * kMiB);
+    const auto& selection = record["selection"];
+    EXPECT_EQ(selection["allocations"], 5);
+    EXPECT_EQ(selection["single_path_allocations"], 2);
+    EXPECT_EQ(selection["multi_path_allocations"], 3);
+    EXPECT_EQ(selection["probe_allocations"], 1);
+    ASSERT_EQ(selection["devices"].size(), 2u);
+    EXPECT_EQ(selection["devices"][0]["dev_id"], 0);
+    EXPECT_EQ(selection["devices"][0]["device_name"], "mlx5_0");
+    EXPECT_EQ(selection["devices"][0]["numa_node"], 0);
+    EXPECT_EQ(selection["devices"][0]["selected_bytes"], 6 * kMiB);
+    EXPECT_EQ(selection["devices"][1]["numa_node"], 1);
+    EXPECT_EQ(selection["devices"][1]["selected_bytes"], 4 * kMiB);
+    EXPECT_EQ(selection["devices"][1]["selected_slices"], 4);
     std::remove(path.c_str());
 }
 

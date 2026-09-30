@@ -932,63 +932,51 @@ TEST(DeviceSelectorTransmitTest, PostedBytesTrackTheHardwareBacklog) {
 }
 
 TEST(DeviceSelectorSelectionStatsTest, RecordsSingleAndMultiPathAllocations) {
-    auto sel = makeTwoNicSelector();
-    int chosen = -1;
-    ASSERT_TRUE(sel->allocate(kMiB, "cpu:0", chosen).ok());
-    ASSERT_TRUE(sel->release(chosen, kMiB, 0.0).ok());
-
     constexpr uint64_t kTotal = 3 * kMiB + 17;
-    constexpr uint32_t kSlices = 4;
-    std::vector<int> selected;
-    ASSERT_TRUE(sel->allocate(kTotal, kSlices, kMiB, "cpu:0", selected).ok());
-    ASSERT_EQ(selected.size(), kSlices);
+    // Exercise both a folded tail and a separate short tail.
+    for (uint32_t num_slices : {3u, 4u}) {
+        SCOPED_TRACE(num_slices);
+        auto sel = makeTwoNicSelector();
+        int chosen = -1;
+        ASSERT_TRUE(sel->allocate(kMiB, "cpu:0", chosen).ok());
+        ASSERT_TRUE(sel->release(chosen, kMiB, 0.0).ok());
 
-    const auto stats = sel->getSelectionStats();
-    EXPECT_EQ(stats.allocations, 2u);
-    EXPECT_EQ(stats.single_path_allocations, 1u);
-    EXPECT_EQ(stats.multi_path_allocations, 1u);
-    uint64_t selected_bytes = 0;
-    for (const auto& device : stats.devices)
-        selected_bytes += device.selected_bytes;
-    EXPECT_EQ(selected_bytes, kMiB + kTotal);
+        std::vector<int> selected;
+        ASSERT_TRUE(
+            sel->allocate(kTotal, num_slices, kMiB, "cpu:0", selected).ok());
+        ASSERT_EQ(selected.size(), num_slices);
 
-    for (uint32_t i = 0; i < kSlices; ++i) {
-        const uint64_t bytes = (i + 1 == kSlices) ? kTotal - i * kMiB : kMiB;
-        ASSERT_TRUE(sel->release(selected[i], bytes, 0.0).ok());
+        const auto stats = sel->getSelectionStats();
+        EXPECT_EQ(stats.allocations, 2u);
+        EXPECT_EQ(stats.single_path_allocations, 1u);
+        EXPECT_EQ(stats.multi_path_allocations, 1u);
+        uint64_t selected_bytes = 0;
+        for (const auto& device : stats.devices)
+            selected_bytes += device.selected_bytes;
+        EXPECT_EQ(selected_bytes, kMiB + kTotal);
     }
 }
 
 TEST(DeviceSelectorSelectionStatsTest, UnavailableDeviceKeepsHistoricalStats) {
     auto sel = makeTwoNicSelector();
-    constexpr uint64_t kTotal = 3 * kMiB + 17;
-    std::vector<int> selected;
-    ASSERT_TRUE(sel->allocate(kTotal, 4, kMiB, "cpu:0", selected).ok());
-    for (uint32_t i = 0; i < selected.size(); ++i) {
-        const uint64_t bytes =
-            (i + 1 == selected.size()) ? kTotal - i * kMiB : kMiB;
-        ASSERT_TRUE(sel->release(selected[i], bytes, 0.0).ok());
-    }
-
-    const auto before = sel->getSelectionStats();
-    const auto previous =
-        std::find_if(before.devices.begin(), before.devices.end(),
-                     [](const auto& device) { return device.dev_id == kDev1; });
-    ASSERT_NE(previous, before.devices.end());
-    ASSERT_GT(previous->selected_bytes, 0u);
+    int chosen = -1;
+    ASSERT_TRUE(
+        sel->allocate(kMiB, "cpu:0", chosen, PRIO_HIGH, 1ULL << kDev1).ok());
+    ASSERT_EQ(chosen, kDev1);
+    ASSERT_TRUE(sel->release(chosen, kMiB, 0.0).ok());
     ASSERT_TRUE(sel->setDeviceAvailable(kDev1, false).ok());
 
-    int chosen = -1;
     ASSERT_TRUE(sel->allocate(kMiB, "cpu:0", chosen).ok());
     EXPECT_EQ(chosen, kDev0);
     ASSERT_TRUE(sel->release(chosen, kMiB, 0.0).ok());
 
-    const auto after = sel->getSelectionStats();
-    const auto failed =
-        std::find_if(after.devices.begin(), after.devices.end(),
-                     [](const auto& device) { return device.dev_id == kDev1; });
-    ASSERT_NE(failed, after.devices.end());
-    EXPECT_FALSE(failed->available);
-    EXPECT_EQ(failed->selected_bytes, previous->selected_bytes);
+    const auto stats = sel->getSelectionStats();
+    ASSERT_EQ(stats.devices.size(), 2u);
+    EXPECT_EQ(stats.devices[0].dev_id, kDev0);
+    EXPECT_EQ(stats.devices[1].dev_id, kDev1);
+    EXPECT_FALSE(stats.devices[1].available);
+    EXPECT_EQ(stats.devices[1].selected_slices, 1u);
+    EXPECT_EQ(stats.devices[1].selected_bytes, kMiB);
 }
 
 TEST(DeviceSelectorSelectionStatsTest, ResetPreservesSchedulingState) {
@@ -1093,7 +1081,7 @@ TEST(DeviceSelectorSelectionStatsTest, ConcurrentSnapshotsRemainReadable) {
                                    }));
     } while (!done.load(std::memory_order_acquire));
     allocator.join();
-    EXPECT_GT(sel->getSelectionStats().allocations, 0u);
+    EXPECT_EQ(sel->getSelectionStats().allocations, 1000u);
 }
 
 }  // namespace
