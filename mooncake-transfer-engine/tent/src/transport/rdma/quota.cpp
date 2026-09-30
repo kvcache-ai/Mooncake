@@ -237,13 +237,18 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
             static_cast<double>(inflight + slice_bytes) / ewma_bw;
         double rank_penalty = sched_params_.numa_tier_weights[rank];
         double score = predicted_time * rank_penalty;
-        score +=
-            (SimpleRandom::Get().next(10) * sched_params_.score_jitter_range);
+        const double jitter =
+            SimpleRandom::Get().next(10) * sched_params_.score_jitter_range;
+        score += jitter;
         bool is_cross_numa = (rank > 0);
         Candidate c;
         c.dev_id = dev_id;
         c.score = score;
         c.is_cross_numa = is_cross_numa;
+        c.inflight_bytes = inflight;
+        c.bandwidth_bps = ewma_bw;
+        c.numa_penalty = rank_penalty;
+        c.jitter = jitter;
         candidates.push_back(c);
     };
 
@@ -321,6 +326,39 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
         for (uint32_t i = 0; i < num_slices; ++i) {
             const Candidate& c = candidates[i % candidates.size()];
             slice_dev_ids.push_back(c.dev_id);
+        }
+    } else if (sched_params_.batch_allocation_policy ==
+               BatchAllocationPolicy::VirtualLoad) {
+        std::vector<uint64_t> assigned_bytes(candidates.size(), 0);
+        uint64_t offset = 0;
+        for (uint32_t s = 0; s < num_slices; ++s) {
+            uint64_t length =
+                s + 1 == num_slices
+                    ? total_length - offset
+                    : std::min(slice_bytes, total_length - offset);
+            auto score = [&](size_t i) {
+                const auto& c = candidates[i];
+                return c.numa_penalty *
+                           (static_cast<double>(c.inflight_bytes) +
+                            assigned_bytes[i] + length) /
+                           c.bandwidth_bps +
+                       c.jitter;
+            };
+            size_t best = 0;
+            double best_score = score(0);
+            for (size_t i = 1; i < candidates.size(); ++i) {
+                double next_score = score(i);
+                if (std::abs(next_score - best_score) >
+                            sched_params_.score_jitter_range
+                        ? next_score < best_score
+                        : candidates[i].dev_id < candidates[best].dev_id) {
+                    best = i;
+                    best_score = next_score;
+                }
+            }
+            slice_dev_ids.push_back(candidates[best].dev_id);
+            assigned_bytes[best] += length;
+            offset += length;
         }
     } else {
         // Normal mode: weighted distribution based on inverse score

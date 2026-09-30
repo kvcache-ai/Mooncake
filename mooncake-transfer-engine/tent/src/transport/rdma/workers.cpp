@@ -101,6 +101,16 @@ Workers::Workers(RdmaTransport* transport)
     // Format: [local_numa, remote_numa1, remote_numa2, ...]
     // ============================================================
     DeviceSelector::SchedulingParams params;
+    const auto batch_policy =
+        conf->get("transports/rdma/batch_allocation_policy",
+                  std::string("inverse_score"));
+    if (batch_policy == "virtual_load") {
+        params.batch_allocation_policy =
+            DeviceSelector::BatchAllocationPolicy::VirtualLoad;
+    } else if (batch_policy != "inverse_score") {
+        LOG(WARNING) << "Unknown RDMA batch_allocation_policy: " << batch_policy
+                     << "; using inverse_score";
+    }
 
     auto numa_penalties =
         conf->get("transports/rdma/numa_penalties", std::vector<double>{});
