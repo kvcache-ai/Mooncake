@@ -323,8 +323,14 @@ std::optional<QueryResult> SsdPrefetcher::WaitIfPromotionInFlight(
     auto throttle = throttle_;
 
     // Returns the refreshed QueryResult iff a COMPLETE MEMORY replica shows.
-    auto requery_memory = [&]() -> std::optional<QueryResult> {
-        auto qr = client->QueryReadOnly(key);
+    // The caller starts a data transfer from the returned descriptor, and
+    // BatchGet rejects transfers whose read lease has expired — a
+    // QueryReadOnly result (lease_ttl_ms forced to 0 by design) would
+    // deterministically turn a successful wait into LEASE_EXPIRED (see the
+    // warning on QueryReadOnly). So the result handed back must come from a
+    // lease-granting Query().
+    auto requery_memory_leased = [&]() -> std::optional<QueryResult> {
+        auto qr = client->Query(key);
         if (!qr) {
             return std::nullopt;
         }
@@ -346,13 +352,13 @@ std::optional<QueryResult> SsdPrefetcher::WaitIfPromotionInFlight(
         // budget and is what produced the 70s+ p99 in v2.
         const auto st = throttle->stateOf(key);
         if (st == PrefetchThrottle::State::kCompleted) {
-            return requery_memory();
+            return requery_memory_leased();
         }
         if (st == PrefetchThrottle::State::kInFlight) {
             throttle->waitForCompletion(key, budget_ms, /*poll_ms=*/1);
-            return requery_memory();
+            return requery_memory_leased();
         }
-        return requery_memory();
+        return requery_memory_leased();
     }
 
     // The key is unknown to the local throttle: no live local promotion, so
