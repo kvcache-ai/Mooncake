@@ -155,17 +155,20 @@ Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints`
 
 ### High-Availability (Redis) — Alternative HA Backend
 
-Same HA semantics but using Redis instead of etcd for leader election:
+Same HA semantics as etcd, using Redis for leader election and batch OpLog:
 
 ```bash
 mooncake_master \
   --enable_ha=true \
   --ha_backend_type=redis \
   --ha_backend_connstring="redis://127.0.0.1:6379" \
+  --enable_oplog=true \
   --rpc_address=10.0.0.1
 ```
 
-**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. Redis is used only for leader election here. OpLog replication currently requires `ha_backend_type=etcd`.
+**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`.
+
+**OpLog:** the same Redis stores batch OpLog when the build has `STORE_USE_REDIS` and `--enable_oplog=true`. Enable AOF (`appendfsync everysec` or `always`) so a Redis restart does not drop acknowledged batches. Batch OpLog snapshots still require `ha_backend_type=etcd`.
 
 
 ---
@@ -351,12 +354,12 @@ The master resolves the current IPv4 address of `eth0` at startup and uses it as
 
 ## High Availability (HA)
 
-Mooncake Store supports a Primary-Standby HA model with batch-record OpLog replication. The active Primary serves traffic and writes ordered batches to etcd. Standby nodes poll the durable batch prefix and apply each entry in strict sequence order.
+Mooncake Store supports a Primary-Standby HA model with batch-record OpLog replication. The active Primary serves traffic and writes ordered batches to the selected HA backend, etcd or Redis. Standby nodes poll the durable batch prefix and apply each entry in strict sequence order.
 
 ### HA Architecture
 
 ```
-+------------------+     etcd batch records     +---------------+
++------------------+  etcd or Redis batches   +---------------+
 | Primary          | --------------------------> | Standby       |
 | OrderedOpLogWriter|     durable_prefix         | OpLogApplier  |
 | MasterService    |                              | MetadataStore |
@@ -371,7 +374,7 @@ Mooncake Store supports a Primary-Standby HA model with batch-record OpLog repli
 HA leadership and metadata replication are configured separately:
 
 - The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
-- The optional batch-record OpLog persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and requires `ha_backend_type=etcd` and a build with `STORE_USE_ETCD`.
+- The optional batch-record OpLog persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default. `ha_backend_type=etcd` requires a build with `STORE_USE_ETCD`. `ha_backend_type=redis` requires a build with `STORE_USE_REDIS` and AOF on the Redis server. `k8s` does not store OpLog.
 - The optional standby-generated batch OpLog snapshot path is enabled with `--enable_oplog_snapshot=true` together with `--enable_oplog=true`. It uses the batch snapshot provider/coordinator and does not use the legacy catalog snapshot manager. Startup fails when the required etcd, cluster ID, object-store, or chunk configuration is invalid; a temporary upload failure leaves OpLog apply running for a later attempt.
 
 
@@ -760,7 +763,7 @@ mooncake_master \
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
-| `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; currently requires `enable_ha=true` and `ha_backend_type=etcd` |
+| `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis` |
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
