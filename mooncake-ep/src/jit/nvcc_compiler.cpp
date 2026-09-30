@@ -214,6 +214,10 @@ std::vector<std::string> NvccCompiler::compile_options(
     }
     // Macros that change host/device struct layout must be forwarded here or
     // the JIT-compiled kernel silently disagrees with the host-packed args.
+    options.push_back("-DUSE_CUDA=1");
+#ifdef USE_NCCL_DEVICE
+    options.push_back("-DUSE_NCCL_DEVICE=1");
+#endif
 #ifdef NDEBUG
     options.push_back("-DNDEBUG=1");
 #endif

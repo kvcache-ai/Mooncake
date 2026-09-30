@@ -59,11 +59,19 @@ if(USE_CUDA)
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/nvcc_compiler.cpp")
 
   # The JIT engine runs nvcc at runtime, so the kernel headers the generated
-  # source #includes have to exist as files then. Bake their paths into the
-  # engine via jit_config.h.
-  set(MOONCAKE_EP_JIT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../include")
-  # jit_config.h is only used to build this library, so keep it in the binary
-  # dir rather than next to any headers that get installed.
+  # source #includes have to exist as files then. Stage a copy into the build
+  # tree and bake its path into the engine via jit_config.h.
+  #
+  # configure_file tracks each explicitly listed header, so edits refresh the
+  # staged copy and invalidate the JIT cache fingerprint.
+  set(MOONCAKE_EP_JIT_STAGE_ROOT "${CMAKE_BINARY_DIR}/mooncake_ep_jit")
+  set(MOONCAKE_EP_JIT_SOURCE_DIR
+      "${MOONCAKE_EP_JIT_STAGE_ROOT}/include/mooncake_ep")
+  set(MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine")
+
+  # Do not put jit_config.h under mooncake_ep_jit/: everything there goes into
+  # the wheel, but this header is only used to build this library.
   set(MOONCAKE_EP_JIT_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/jit_generated")
 
   set(MOONCAKE_EP_JIT_CUDA_INCLUDE_DIR "")
@@ -77,6 +85,35 @@ if(USE_CUDA)
   if(USE_NCCL_DEVICE AND NCCL_DEVICE_INCLUDE_DIR)
     set(MOONCAKE_EP_JIT_BUILD_INCLUDE_DIR "${NCCL_DEVICE_INCLUDE_DIR}")
   endif()
+
+  set(MOONCAKE_EP_JIT_HEADERS
+      mooncake_ep_configs.cuh
+      mooncake_ep_device.h
+      mooncake_ep_utils.cuh)
+
+  set(MOONCAKE_EP_JIT_TRANSFER_HEADERS
+      include/cuda_alike.h
+      include/cuda_fabric_compat.h
+      include/transport/device/comm_device.cuh
+      include/transport/device/cuda/cuda_ops.cuh
+      include/transport/device/device_ops.cuh
+      include/transport/device/ibgda/mlx5gda.h
+      include/transport/device/ibgda_device.cuh
+      include/transport/device/p2p_device.cuh
+      tent/include/tent/common/cuda_fabric_compat.h)
+
+  file(MAKE_DIRECTORY "${MOONCAKE_EP_JIT_SOURCE_DIR}")
+  foreach(header IN LISTS MOONCAKE_EP_JIT_HEADERS)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../include/${header}"
+                   "${MOONCAKE_EP_JIT_SOURCE_DIR}/${header}" COPYONLY)
+  endforeach()
+  foreach(header IN LISTS MOONCAKE_EP_JIT_TRANSFER_HEADERS)
+    get_filename_component(header_dir "${header}" DIRECTORY)
+    file(MAKE_DIRECTORY "${MOONCAKE_EP_JIT_STAGE_ROOT}/${header_dir}")
+    configure_file(
+      "${MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR}/${header}"
+      "${MOONCAKE_EP_JIT_STAGE_ROOT}/${header}" COPYONLY)
+  endforeach()
 
   configure_file("${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_config.h.in"
                  "${MOONCAKE_EP_JIT_GENERATED_DIR}/jit/jit_config.h" @ONLY)

@@ -256,7 +256,9 @@ const SmEnvInfo& get_sm_env_info(int sm, std::string_view target_arch) {
     std::vector<std::string> env_parts = {
         info.compiler_id,
     };
-    append_header_tree_fingerprint(&env_parts, info.source_dir);
+    append_header_tree_fingerprint(&env_parts, info.source_dir.parent_path());
+    append_header_tree_fingerprint(
+        &env_parts, info.source_dir.parent_path().parent_path() / "tent");
     append_header_tree_fingerprint(&env_parts, info.build_include_dir);
     env_parts.insert(env_parts.end(), info.options.begin(), info.options.end());
     info.env_hash = fnv1a_digest(env_parts);
