@@ -66,11 +66,18 @@ else()
 endif()
 set_target_properties(
   tebench
-  PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-             INSTALL_RPATH
+  PROPERTIES INSTALL_RPATH
              "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
 
 if(BUILD_UNIT_TESTS)
+  add_test(NAME tebench_build_tree_help
+           COMMAND ${CMAKE_COMMAND} -E env --unset=LD_LIBRARY_PATH
+                   $<TARGET_FILE:tebench> --help)
+  set_tests_properties(
+    tebench_build_tree_help
+    PROPERTIES PASS_REGULAR_EXPRESSION
+               "Mooncake Transfer Engine Benchmarking Tool" TIMEOUT 10)
+
   if(USE_TENT)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(
