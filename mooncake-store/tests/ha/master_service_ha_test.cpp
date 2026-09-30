@@ -199,6 +199,30 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
             });
     }
 
+    tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
+        Reservation&& reservation, std::vector<OpLogEntry> entries,
+        DurableCallback callback) override {
+        return OrderedOpLogWriter::CommitBatch(
+            std::move(reservation), std::move(entries),
+            [this, callback = std::move(callback)](const OpLogEntry& durable) {
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    cv_.wait(lock, [&] {
+                        return stopping_ ||
+                               durable.sequence_id <= released_through_;
+                    });
+                }
+                if (callback) {
+                    callback(durable);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    completed_through_ = durable.sequence_id;
+                }
+                cv_.notify_all();
+            });
+    }
+
     bool PauseCallbacksAfter(
         uint64_t sequence_id,
         std::chrono::milliseconds timeout = std::chrono::seconds(1)) {
@@ -260,6 +284,17 @@ class RejectingOrderedOpLogWriter : public OrderedOpLogWriter {
             std::move(reservation), std::move(entry), std::move(callback));
     }
 
+    tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
+        Reservation&& reservation, std::vector<OpLogEntry> entries,
+        DurableCallback callback) override {
+        if (commit_error_ != ErrorCode::OK) {
+            ++rejected_commits_;
+            return tl::make_unexpected(commit_error_);
+        }
+        return OrderedOpLogWriter::CommitBatch(
+            std::move(reservation), std::move(entries), std::move(callback));
+    }
+
     void RejectCommitsWith(ErrorCode error) { commit_error_ = error; }
 
     size_t rejected_commits() const { return rejected_commits_; }
@@ -293,6 +328,16 @@ class RejectOnceOrderedOpLogWriter : public OrderedOpLogWriter {
         }
         return OrderedOpLogWriter::Commit(
             std::move(reservation), std::move(entry), std::move(callback));
+    }
+
+    tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
+        Reservation&& reservation, std::vector<OpLogEntry> entries,
+        DurableCallback callback) override {
+        if (reject_next_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        return OrderedOpLogWriter::CommitBatch(
+            std::move(reservation), std::move(entries), std::move(callback));
     }
 
    private:
@@ -2412,7 +2457,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
                               .set_cluster_id(cluster_id)
-                              .set_oplog_batch_max_entries(1)
+                              .set_oplog_batch_max_entries(2)
                               .build();
     MasterService service(service_config);
     ASSERT_EQ(
@@ -2441,16 +2486,24 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
 
     // The dropped object must leave a durable REMOVE so a later promotion
     // cannot replay its discarded descriptor; the partial survivor gets a
-    // canonical PUT_END. One record per batch (max_entries=1): REMOVE first,
-    // then the canonical rewrite.
+    // canonical PUT_END. Both land in ONE batch record: the repair set is an
+    // indivisible group, so no durable prefix can capture a proper subset
+    // and leave one side of the conflict able to survive a replay alone.
     OpLogBatchStorage storage(cluster_id, *backend);
-    OpLogBatchRecord remove_batch;
-    ReadRemoveBatchEventually(storage, 1, "standby_repair_lost", remove_batch);
-    OpLogBatchRecord canonical_batch;
-    ReadBatchEventually(storage, 2, canonical_batch);
-    ASSERT_EQ(1u, canonical_batch.entries.size());
-    EXPECT_EQ(OpType::PUT_END, canonical_batch.entries[0].op_type);
-    EXPECT_EQ("standby_repair_survivor", canonical_batch.entries[0].object_key);
+    OpLogBatchRecord repair_batch;
+    ReadBatchEventually(storage, 1, repair_batch);
+    ASSERT_EQ(2u, repair_batch.entries.size());
+    EXPECT_EQ(OpType::REMOVE, repair_batch.entries[0].op_type);
+    EXPECT_EQ("standby_repair_lost", repair_batch.entries[0].object_key);
+    EXPECT_EQ(1u, repair_batch.entries[0].sequence_id);
+    EXPECT_EQ(OpType::PUT_END, repair_batch.entries[1].op_type);
+    EXPECT_EQ("standby_repair_survivor", repair_batch.entries[1].object_key);
+    EXPECT_EQ(2u, repair_batch.entries[1].sequence_id);
+
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(1u, prefix.batch_id);
+    EXPECT_EQ(2u, prefix.last_seq);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
@@ -2461,7 +2514,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
                               .set_cluster_id(cluster_id)
-                              .set_oplog_batch_max_entries(1)
+                              .set_oplog_batch_max_entries(2)
                               .build();
     MasterService service(service_config);
     auto* writer = InstallRejectOnceWriter(service, backend);
@@ -2619,11 +2672,207 @@ TEST_F(MasterServiceHATest, FailedRepairRestoreKeepsReplicaIdCounterAdvanced) {
                     .has_value());
     PutObjectOnSegment(service, generate_uuid(),
                        "standby_repair_id_counter_new", endpoint);
-    const auto fresh =
-        ReplicaDescriptorsForTesting(service, kDefaultTenant,
-                                     "standby_repair_id_counter_new");
+    const auto fresh = ReplicaDescriptorsForTesting(
+        service, kDefaultTenant, "standby_repair_id_counter_new");
     ASSERT_EQ(fresh.size(), 1);
     EXPECT_GE(fresh.front().id, base_id + 2);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       RestoreRepairSecondPromotionDoesNotResurrect) {
+    const std::string cluster_id = "test_restore_repair_replay_no_revive";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string endpoint = "standby_repair_replay_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_replay_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_replay_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(result.has_value());
+
+    // A standby that trusted the unfiltered snapshot still carries both
+    // conflicting objects. Replaying the durable suffix into it must remove
+    // the discard and leave only the survivor's canonical replica. The
+    // repair went out as one batch record, so no durable prefix can replay
+    // a proper subset that keeps one side of the conflict alive.
+    MockMetadataStore standby_metadata;
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_repair_replay_survivor",
+                                 survivor.metadata);
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_repair_replay_lost", lost.metadata);
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    ASSERT_EQ(2u, prefix.last_seq);
+
+    size_t applied = 0;
+    for (int i = 0; i < 50 && applied < prefix.last_seq; ++i) {
+        auto poll = reader.PollOnce();
+        ASSERT_EQ(ErrorCode::OK, poll.error);
+        applied += poll.applied_entries;
+        if (applied < prefix.last_seq) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(prefix.last_seq, applied);
+
+    EXPECT_FALSE(standby_metadata.Exists(kDefaultTenant.value(),
+                                         "standby_repair_replay_lost"));
+    auto canonical = standby_metadata.GetMetadata(kDefaultTenant.value(),
+                                                  "standby_repair_replay_"
+                                                  "survivor");
+    ASSERT_TRUE(canonical.has_value());
+    ASSERT_EQ(1u, canonical->replicas.size());
+    EXPECT_EQ(kDefaultSegmentBase + 8192,
+              canonical->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       RestoreRepairAddressReuseDoesNotServeOldKey) {
+    const std::string cluster_id = "test_restore_repair_addr_reuse";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string endpoint = "standby_repair_reuse_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_reuse_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_reuse_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(result.has_value());
+
+    // Both descriptors at the conflicting address were dropped, so the
+    // block is free again; the next allocation on the remounted segment
+    // reuses it for a new object.
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    PutObjectOnSegment(service, generate_uuid(), "standby_repair_reuse_new",
+                       endpoint);
+    const auto fresh = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                    "standby_repair_reuse_"
+                                                    "new");
+    ASSERT_EQ(1u, fresh.size());
+    const uint64_t reused_address =
+        fresh.front().get_memory_descriptor().buffer_descriptor.buffer_address_;
+    EXPECT_EQ(kDefaultSegmentBase, reused_address);
+
+    // Replay the whole log into a standby that trusted the snapshot. The
+    // old key must stay gone, so a stale read can never resolve to the
+    // address the new object now owns. PutEnd returns before its record is
+    // durable, so wait until the new object's PUT_END is inside the durable
+    // prefix before replaying.
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    bool new_key_durable = false;
+    for (int i = 0; i < 50 && !new_key_durable; ++i) {
+        if (storage.ReadDurablePrefix(prefix) == ErrorCode::OK) {
+            for (uint64_t batch_id = 1;
+                 batch_id <= prefix.batch_id && !new_key_durable; ++batch_id) {
+                OpLogBatchRecord batch;
+                if (storage.ReadBatch(batch_id, batch) != ErrorCode::OK) {
+                    continue;
+                }
+                for (const auto& entry : batch.entries) {
+                    if (entry.op_type == OpType::PUT_END &&
+                        entry.object_key == "standby_repair_reuse_new") {
+                        new_key_durable = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!new_key_durable) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_TRUE(new_key_durable);
+
+    MockMetadataStore standby_metadata;
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_repair_reuse_survivor",
+                                 survivor.metadata);
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_repair_reuse_lost", lost.metadata);
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+
+    size_t applied = 0;
+    for (int i = 0; i < 50 && applied < prefix.last_seq; ++i) {
+        auto poll = reader.PollOnce();
+        ASSERT_EQ(ErrorCode::OK, poll.error);
+        applied += poll.applied_entries;
+        if (applied < prefix.last_seq) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(prefix.last_seq, applied);
+
+    EXPECT_FALSE(standby_metadata.Exists(kDefaultTenant.value(),
+                                         "standby_repair_reuse_lost"));
+    auto reused = standby_metadata.GetMetadata(kDefaultTenant.value(),
+                                               "standby_repair_reuse_new");
+    ASSERT_TRUE(reused.has_value());
+    ASSERT_EQ(1u, reused->replicas.size());
+    EXPECT_EQ(reused_address, reused->replicas.front()
+                                  .get_memory_descriptor()
+                                  .buffer_descriptor.buffer_address_);
+    auto canonical = standby_metadata.GetMetadata(kDefaultTenant.value(),
+                                                  "standby_repair_reuse_"
+                                                  "survivor");
+    ASSERT_TRUE(canonical.has_value());
+    EXPECT_EQ(1u, canonical->replicas.size());
 }
 
 TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
