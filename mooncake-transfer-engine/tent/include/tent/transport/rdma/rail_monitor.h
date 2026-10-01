@@ -76,7 +76,7 @@ class RailMonitor {
     // admit() can probe recovery; this query never arms or consumes a probe.
     // Same-host same-NIC loopback remains legal, as in worker fallback.
     uint64_t localDeviceMask(const Topology::MemEntry &remote_memory,
-                            bool same_machine = false) const;
+                             bool same_machine = false) const;
 
     // Mutating admit: the ONLY path that arms a probe/trial. Returns true when
     // a transfer may use this rail -- Closed (no-op), or an exploratory probe /

@@ -109,8 +109,8 @@ bool RailMonitor::isAvailable(int local_nic, int remote_nic) const {
     return !it->second.paused();
 }
 
-uint64_t RailMonitor::localDeviceMask(
-    const Topology::MemEntry& remote_memory, bool same_machine) const {
+uint64_t RailMonitor::localDeviceMask(const Topology::MemEntry& remote_memory,
+                                      bool same_machine) const {
     uint64_t mask = 0;
     if (!ready_) return mask;
     for (const auto& devices : remote_memory.device_list) {
@@ -123,7 +123,8 @@ uint64_t RailMonitor::localDeviceMask(
                  ++local_nic) {
                 const auto* local_entry = local_->getNicEntry(local_nic);
                 if (local_entry && local_entry->type == Topology::NIC_RDMA &&
-                    ((same_machine && static_cast<int>(local_nic) == remote_nic) ||
+                    ((same_machine &&
+                      static_cast<int>(local_nic) == remote_nic) ||
                      rail_states_.count(
                          {static_cast<int>(local_nic), remote_nic})))
                     mask |= 1ULL << local_nic;

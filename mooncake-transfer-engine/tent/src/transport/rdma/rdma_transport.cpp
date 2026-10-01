@@ -543,8 +543,8 @@ Status RdmaTransport::submitTransferTasks(
                 request, static_cast<uint32_t>(num_slices), block_size,
                 task->device_mask, slice_dev_ids);
             if (!status.ok()) {
-                LOG(WARNING) << "Device quota allocation failed: "
-                             << status.message();
+                LOG(WARNING)
+                    << "Device quota allocation failed: " << status.message();
             }
         }
 
