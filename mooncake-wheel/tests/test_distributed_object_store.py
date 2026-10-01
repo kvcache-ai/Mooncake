@@ -215,6 +215,31 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.store.upsert_parts("test_parts_strided_upsert", view)
 
+    def test_extent1_dim_stride_accepted(self):
+        """Strides of extent-0/1 dims are unspecified by the buffer protocol,
+        so buffers like a (1, N) broadcast view are C-contiguous and must be
+        accepted and stored in full."""
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy not installed")
+
+        base = np.arange(4, dtype=np.uint8)
+        view = np.broadcast_to(base, (1, 4))
+        self.assertEqual(view.strides, (0, 1))
+
+        self.assertEqual(self.store.put("test_extent1_stride_key", view), 0)
+        self.assertEqual(self.store.get_size("test_extent1_stride_key"), 4)
+        self.assertEqual(self.store.get("test_extent1_stride_key"), base.tobytes())
+
+        typed = np.broadcast_to(np.array([1.5, 2.5], dtype=np.float32), (1, 2))
+        self.assertEqual(typed.strides, (0, 4))
+        self.assertEqual(self.store.put("test_extent1_typed_key", typed), 0)
+        self.assertEqual(
+            self.store.get("test_extent1_typed_key"),
+            np.array([1.5, 2.5], dtype=np.float32).tobytes(),
+        )
+
     def test_soft_pin_config_forwarding(self):
         """Test soft-pin action and TTL forwarding through Store operations."""
         from mooncake.store import ReplicateConfig
