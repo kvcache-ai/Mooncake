@@ -4539,6 +4539,54 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     assert result["non_tensor_batch"]["nullable_int"].tolist() == [1, None, 3, 4]
 
 
+def test_dataproto_helper_int_list_rows_with_empty_row_keep_int_dtype() -> None:
+    _store, transfer = make_transfer()
+    big = 2**53 + 1
+    rows = np.empty(3, dtype=object)
+    rows[:] = [[1, 2], [], [big]]
+    data = SimpleDataProto(non_tensor_batch={"token_ids": rows})
+
+    ref = transfer.put_dataproto(data)
+    result = transfer.get_dataproto(ref)
+
+    # An empty Python list has no element dtype; it must not promote the
+    # integer rows to float64 (which changes the row type and loses precision).
+    values = result["non_tensor_batch"]["token_ids"].tolist()
+    assert values == [[1, 2], [], [big]]
+    assert all(isinstance(item, int) for row in values for item in row)
+    assert ref.encoded_non_tensor["token_ids"]["metadata"]["dtype"] == "int64"
+
+
+def test_choose_leaf_codec_ignores_empty_list_rows_for_dtype() -> None:
+    decision = sos._choose_leaf_codec([[1, 2], [], [2**53 + 1]])
+    assert decision.codec == "typed_ragged"
+    assert decision.metadata["dtype"] == "int64"
+
+    decision = sos._choose_leaf_codec([(1, 2), ()])
+    assert decision.codec == "typed_ragged"
+    assert decision.metadata["dtype"] == "int64"
+
+    # Bool rows are not numeric, so the empty row must not turn them into
+    # float64 typed_ragged rows; they take the same codec as without it.
+    assert sos._choose_leaf_codec([[True, False], []]).codec == "msgpack_ragged"
+    assert sos._choose_leaf_codec([[True, False]]).codec == "msgpack_ragged"
+
+
+def test_dataproto_helper_bool_list_rows_with_empty_row_keep_bool_values() -> None:
+    _store, transfer = make_transfer()
+    rows = np.empty(2, dtype=object)
+    rows[:] = [[True, False], []]
+    data = SimpleDataProto(non_tensor_batch={"flags": rows})
+
+    ref = transfer.put_dataproto(data)
+    result = transfer.get_dataproto(ref)
+
+    assert ref.encoded_non_tensor["flags"]["codec"] == "msgpack_ragged"
+    values = result["non_tensor_batch"]["flags"].tolist()
+    assert values == [[True, False], []]
+    assert all(isinstance(item, bool) for row in values for item in row)
+
+
 def test_msgpack_ragged_decode_validates_row_count() -> None:
     payload, _metadata = sos._encode_msgpack_ragged_values("json", [{"a": 1}, {"b": 2}])
 
