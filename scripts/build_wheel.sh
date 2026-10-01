@@ -69,6 +69,14 @@ else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
 
+# Copy _conductor.so to mooncake directory (client API for mooncake.conductor)
+if compgen -G "${BUILD_DIR}/mooncake-integration/_conductor.*.so" >/dev/null; then
+    echo "Copying _conductor.so..."
+    cp ${BUILD_DIR}/mooncake-integration/_conductor.*.so mooncake-wheel/mooncake/_conductor.so
+else
+    echo "Skipping _conductor.so (not built - likely WITH_CONDUCTOR is set to OFF)"
+fi
+
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
 if [ -f ${BUILD_DIR}/mooncake-store/src/libmooncake_store.so ]; then
     echo "Copying libmooncake_store.so..."
@@ -190,6 +198,7 @@ MIGRATED_PYTHON_MODULES=(
     cli.py
     cli_bench.py
     cli_client.py
+    conductor.py
     transfer_engine_topology_dump.py
     buffer_pool.py
     mooncake_config.py
