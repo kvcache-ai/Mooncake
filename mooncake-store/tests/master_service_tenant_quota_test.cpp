@@ -664,7 +664,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       NotifyOffloadSuccessDoesNotCountAddReplicaUpdateAsNewDiskUsage) {
+       NotifyOffloadSuccessChargesSecondOwnerDiskReplica) {
     const std::string policy = WritePolicyFile({{TenantId("tenant-a"), 1000}});
     auto config = MasterServiceConfig::builder()
                       .set_enable_multi_tenants(true)
@@ -695,8 +695,28 @@ TEST_F(MasterServiceTenantQuotaTest,
         service.NotifyOffloadSuccess(client_b, tasks, {second_metadata});
 
     ASSERT_TRUE(result.has_value()) << toString(result.error());
+    // Per-owner physical accounting: client_b stored the same logical key on
+    // its own disk (disk-endpoint-b), so it is charged for its own copy
+    // instead of being treated as a no-op "update" of client_a's replica.
+    // LocalSsdManager tracks used_bytes per owner (it also feeds the
+    // ssd_free_ratio_first capacity-aware placement), so leaving client_b at 0
+    // would misreport its disk as empty. Both LOCAL_DISK replicas stay visible
+    // -- previously the second owner's report was silently dropped.
     EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
-    EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 0);
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 128);
+    auto replicas = service.GetReplicaList("cold", TenantId("tenant-a"));
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(replicas->replicas.size(), 2);
+    bool has_client_a = false;
+    bool has_client_b = false;
+    for (const auto& rep : replicas->replicas) {
+        ASSERT_TRUE(rep.is_local_disk_replica());
+        const auto& owner = rep.get_local_disk_descriptor().client_id;
+        has_client_a = has_client_a || (owner == client_a);
+        has_client_b = has_client_b || (owner == client_b);
+    }
+    EXPECT_TRUE(has_client_a);
+    EXPECT_TRUE(has_client_b);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
