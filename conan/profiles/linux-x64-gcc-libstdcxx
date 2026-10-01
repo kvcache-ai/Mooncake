@@ -5,4 +5,6 @@ compiler=gcc
 compiler.version=13
 compiler.libcxx=libstdc++11
 compiler.cppstd=20
-build_type=Release
+
+[conf]
+tools.cmake.cmake_layout:build_folder_vars=["settings.os", "settings.arch", "settings.compiler", "settings.compiler.libcxx", "settings.build_type"]

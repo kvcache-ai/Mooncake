@@ -5,7 +5,7 @@ compiler=clang
 compiler.version=18
 compiler.libcxx=libc++
 compiler.cppstd=20
-build_type=Release
 
 [conf]
 tools.build:compiler_executables={"cpp":"clang++", "c":"clang"}
+tools.cmake.cmake_layout:build_folder_vars=["settings.os", "settings.arch", "settings.compiler", "settings.compiler.libcxx", "settings.build_type"]
