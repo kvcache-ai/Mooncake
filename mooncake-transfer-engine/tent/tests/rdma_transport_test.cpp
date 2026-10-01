@@ -46,15 +46,17 @@
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint.h"
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/ibv_loader.h"
 #include "tent/transport/rdma/params.h"
 #include "tent/transport/rdma/quota.h"
 #include "tent/transport/rdma/rdma_transport.h"
 #include "tent/transport/rdma/slice.h"
-#include "tent/transport/rdma/ibv_loader.h"
 #include "tent/transport/rdma/workers.h"
 
 namespace mooncake {
 namespace tent {
+
+extern thread_local int tl_wid;
 
 // Friend accessor for driving initializeContexts() without a full install().
 class RdmaTransportTestPeer {
@@ -133,6 +135,32 @@ class RdmaTransportTestPeer {
 
     static void setNumWorkers(RdmaTransport& transport, int num_workers) {
         transport.params_->workers.num_workers = num_workers;
+    }
+
+    static Workers& prepareAllocation(RdmaTransport& transport,
+                                      const std::string& rails) {
+        transport.params_->workers.num_workers = 1;
+        transport.params_->workers.block_size = 4096;
+        transport.workers_ = std::make_unique<Workers>(&transport);
+        auto& workers = *transport.workers_;
+        workers.rail_topo_json_ = rails;
+        makeWorkerContexts(workers, 1);
+        workers.getDeviceSelector()->setSmartSelection(false);
+        return workers;
+    }
+
+    static Status selectInitial(Workers& workers, RdmaSlice& slice) {
+        Workers::RouteHint source, target;
+        CHECK_STATUS(workers.getRouteHint(source, LOCAL_SEGMENT_ID,
+                                          (uint64_t)slice.source_addr,
+                                          slice.length));
+        CHECK_STATUS(workers.getRouteHint(target, slice.task->request.target_id,
+                                          slice.target_addr, slice.length));
+        const int previous = tl_wid;
+        tl_wid = 0;
+        auto status = workers.selectOptimalDevice(source, target, &slice);
+        tl_wid = previous;
+        return status;
     }
 
     static void addInflight(Workers& workers, size_t worker_id, int64_t delta) {
@@ -491,6 +519,245 @@ TEST(DeviceSelectorTest, PerSliceAllocationHonorsPolicy) {
         EXPECT_EQ(chosen_device, 2);
     }
 }
+
+class RdmaPeerRailAllocationTest : public ::testing::TestWithParam<bool> {
+   protected:
+    void SetUp() override {
+        topology_ = topologyWithRdmaNics(2);
+        auto second_memory = *topology_->getMemEntry(0);
+        second_memory.name = "cpu:1";
+        second_memory.device_list[0] = {0};
+        topology_->mem_list_.push_back(second_memory);
+        auto wildcard = *topology_->getMemEntry(0);
+        wildcard.name = kWildcardLocation;
+        topology_->mem_list_.push_back(wildcard);
+        RdmaTransportTestPeer::bindTopology(transport_, topology_);
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata_);
+        uint16_t local_port = 0;
+        ASSERT_TRUE(metadata_->start(local_port).ok());
+        ASSERT_TRUE(metadata_->segmentManager()
+                        .updateLocal([&](SegmentDesc& segment) {
+                            segment.type = SegmentType::Memory;
+                            segment.machine_id = "allocation-test";
+                            segment.rpc_server_addr =
+                                "127.0.0.1:" + std::to_string(local_port);
+                            auto& memory =
+                                std::get<MemorySegmentDesc>(segment.detail);
+                            memory.topology = *topology_;
+                            BufferDesc buffer;
+                            buffer.addr =
+                                reinterpret_cast<uint64_t>(buffer_.data());
+                            buffer.length = buffer_.size();
+                            buffer.location = "cpu:0";
+                            memory.buffers = {buffer};
+                            return Status::OK();
+                        })
+                        .ok());
+        workers_ = &RdmaTransportTestPeer::prepareAllocation(
+            transport_,
+            R"({"all":[{"local":"mlx5_1","remote":"mlx5_1"}],
+                "direct":[{"local":"mlx5_1","remote":"mlx5_1"}]})");
+        workers_->getDeviceSelector()->setSmartSelection(GetParam());
+        ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+        request_.opcode = Request::WRITE;
+        request_.source = buffer_.data();
+        request_.target_offset = reinterpret_cast<uint64_t>(buffer_.data());
+        request_.length = buffer_.size();
+        peer_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        uint16_t port = 0;
+        ASSERT_TRUE(peer_->start(port).ok());
+        peer_name_ = "127.0.0.1:" + std::to_string(port);
+        publishPeer();
+        ASSERT_TRUE(metadata_->segmentManager()
+                        .openRemote(request_.target_id, peer_name_)
+                        .ok());
+    }
+
+    void TearDown() override {
+        if (batch_) {
+            for (auto* first :
+                 static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+                for (auto* slice = first; slice; slice = slice->next) {
+                    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice,
+                                                             0, 0);
+                    slice->task->deref();
+                }
+            }
+            EXPECT_TRUE(transport_.freeSubBatch(batch_).ok());
+        }
+        if (workers_) {
+            std::vector<NicLoadStats> stats;
+            EXPECT_TRUE(
+                workers_->getDeviceSelector()->getNicLoadStats(stats).ok());
+            for (const auto& nic : stats) EXPECT_EQ(nic.inflight_bytes, 0u);
+            RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+        }
+    }
+
+    void publishPeer() {
+        ASSERT_TRUE(peer_->segmentManager()
+                        .updateLocal([&](SegmentDesc& segment) {
+                            segment = *metadata_->segmentManager().getLocal();
+                            segment.name = peer_name_;
+                            segment.rpc_server_addr = peer_name_;
+                            segment.machine_id = "different-machine";
+                            return Status::OK();
+                        })
+                        .ok());
+        metadata_->segmentManager().invalidateRemote(request_.target_id);
+    }
+
+    RdmaTransport transport_;
+    std::shared_ptr<Topology> topology_;
+    std::shared_ptr<ControlService> metadata_;
+    std::shared_ptr<ControlService> peer_;
+    std::string peer_name_;
+    Workers* workers_ = nullptr;
+    Transport::SubBatchRef batch_ = nullptr;
+    Request request_{};
+    std::vector<char> buffer_ = std::vector<char>(16 * 4096);
+};
+
+TEST_P(RdmaPeerRailAllocationTest, AggregateExcludesUnpairedLocalNic) {
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    size_t count = 0;
+    for (auto* first : static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+        for (auto* slice = first; slice; slice = slice->next) {
+            EXPECT_EQ(slice->source_dev_id, 1);
+            ++count;
+        }
+    }
+    EXPECT_EQ(count, 16u);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, LazyAllocationDoesNotNeedRailFallback) {
+    request_.length = 4096;
+    // Baseline round-robin must attempt each NIC without peer filtering.
+    for (int i = 0; i < 2; ++i) {
+        RdmaTask task;
+        task.request = request_;
+        RdmaSlice slice;
+        slice.task = &task;
+        slice.source_addr = request_.source;
+        slice.target_addr = request_.target_offset;
+        slice.length = request_.length;
+        EXPECT_TRUE(
+            RdmaTransportTestPeer::selectInitial(*workers_, slice).ok());
+        EXPECT_EQ(slice.source_dev_id, 1);
+        EXPECT_EQ(slice.last_fallback_idx, -1);
+        RdmaTransportTestPeer::releaseSliceQuota(*workers_, &slice, 0, 0);
+    }
+}
+
+TEST_P(RdmaPeerRailAllocationTest, EmptyPolicyIntersectionNeverAllocates) {
+    batch_->device_mask = 1ULL;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    for (auto* first : static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+        for (auto* slice = first; slice; slice = slice->next) {
+            EXPECT_EQ(slice->source_dev_id, -1);
+            EXPECT_FALSE(
+                RdmaTransportTestPeer::selectInitial(*workers_, *slice).ok());
+            EXPECT_EQ(slice->charged_dev, -1);
+        }
+    }
+}
+
+TEST_P(RdmaPeerRailAllocationTest, CoalescedRegionsUseSliceSpecificCandidates) {
+    ASSERT_TRUE(
+        metadata_->segmentManager()
+            .updateLocal([&](SegmentDesc& segment) {
+                auto& buffer =
+                    std::get<MemorySegmentDesc>(segment.detail).buffers[0];
+                buffer.regions = {{buffer_.size() / 2, "cpu:0"},
+                                  {buffer_.size() / 2, "cpu:1"}};
+                return Status::OK();
+            })
+            .ok());
+    publishPeer();
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    size_t index = 0;
+    for (auto* first : static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+        for (auto* slice = first; slice; slice = slice->next, ++index) {
+            EXPECT_EQ(slice->source_dev_id, -1);
+            auto status =
+                RdmaTransportTestPeer::selectInitial(*workers_, *slice);
+            if (index < 8) {
+                EXPECT_TRUE(status.ok());
+                EXPECT_EQ(slice->source_dev_id, 1);
+                EXPECT_EQ(slice->last_fallback_idx, -1);
+            } else {
+                EXPECT_FALSE(status.ok());
+                EXPECT_EQ(slice->charged_dev, -1);
+            }
+        }
+    }
+    EXPECT_EQ(index, 16u);
+}
+
+TEST_P(RdmaPeerRailAllocationTest, AggregateCacheRefreshesChangedTopology) {
+    // Populate the static cache, then publish a new snapshot that removes the
+    // only configured remote NIC. The selector itself remains unchanged.
+    std::vector<int> devices;
+    ASSERT_TRUE(workers_->allocateDevices(request_, 16, 4096, 0, devices)
+                    .IsDeviceNotFound());
+    ASSERT_TRUE(
+        metadata_->segmentManager()
+            .updateLocal([](SegmentDesc& segment) {
+                auto& topology =
+                    std::get<MemorySegmentDesc>(segment.detail).topology;
+                topology.nic_list_[1].name = "replacement-nic";
+                return Status::OK();
+            })
+            .ok());
+    publishPeer();
+    EXPECT_FALSE(
+        workers_->allocateDevices(request_, 16, 4096, ~0ULL, devices).ok());
+    EXPECT_TRUE(devices.empty());
+}
+
+TEST_P(RdmaPeerRailAllocationTest, SameHostLoopbackRemainsEligible) {
+    request_.target_id = LOCAL_SEGMENT_ID;
+    batch_->device_mask = 1ULL;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    for (auto* first : static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+        for (auto* slice = first; slice; slice = slice->next) {
+            EXPECT_EQ(slice->source_dev_id, 0);
+            EXPECT_TRUE(
+                RdmaTransportTestPeer::selectInitial(*workers_, *slice).ok());
+            EXPECT_EQ(slice->source_dev_id, 0);
+            EXPECT_EQ(slice->target_dev_id, 0);
+        }
+    }
+}
+
+TEST_P(RdmaPeerRailAllocationTest, UnknownRegionKeepsWildcardTopologyFallback) {
+    ASSERT_TRUE(
+        metadata_->segmentManager()
+            .updateLocal([&](SegmentDesc& segment) {
+                auto& buffer =
+                    std::get<MemorySegmentDesc>(segment.detail).buffers[0];
+                buffer.regions = {{buffer_.size(), "cpu:99"}};
+                return Status::OK();
+            })
+            .ok());
+    publishPeer();
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    for (auto* first : static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+        for (auto* slice = first; slice; slice = slice->next) {
+            EXPECT_EQ(slice->source_dev_id, 1);
+            // Also check lazy allocation uses the same resolved wildcard.
+            RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice, 0, 0);
+            slice->source_dev_id = -1;
+            EXPECT_TRUE(
+                RdmaTransportTestPeer::selectInitial(*workers_, *slice).ok());
+            EXPECT_EQ(slice->source_dev_id, 1);
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(SchedulingModes, RdmaPeerRailAllocationTest,
+                         ::testing::Bool());
 
 // Retiring an endpoint moves its data QPs to ERR and flushes in-flight
 // transfers, so a notify completion error may only do that when it can mean the
