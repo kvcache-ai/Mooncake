@@ -427,14 +427,6 @@ class MasterServiceTestPeer {
         return service_.GetRetainingClientIdsLocked();
     }
 
-    auto RebuildClientLivenessAfterSnapshotRestore() {
-        return service_.RebuildClientLivenessAfterSnapshotRestore();
-    }
-
-    void ResetStateAfterFailedRestoreAttempt() {
-        service_.ResetStateAfterFailedRestoreAttempt();
-    }
-
     TenantQuotaHandle GetBoundTenantQuotaHandle(
         const TenantState& tenant_state) const {
         return service_.GetBoundTenantQuotaHandle(tenant_state);

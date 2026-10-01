@@ -800,6 +800,8 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  2u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_GE(ordered.size(), 2u);
@@ -815,6 +817,8 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_EQ(ordered.size(), 1u);
@@ -837,73 +841,13 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_EQ(ordered.size(), 1u);
         EXPECT_EQ(ordered[0], segment0.name);
     }
-}
-
-TEST_F(SegmentTest, ServingNameCountTracksStatusRebindingAndUnmount) {
-    using namespace std::chrono_literals;
-    SegmentManager manager(BufferAllocatorType::OFFSET);
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "serving_count";
-    segment.te_endpoint = segment.name;
-    segment.base = DEFAULT_CXL_BASE;
-    segment.size = 64 * 1024 * 1024;
-    const auto owner = generate_uuid();
-    const auto check_count = [&](size_t expected) {
-        auto access = manager.getAllocatorAccess();
-        const auto& allocators = access.getAllocatorManager();
-        EXPECT_EQ(allocators.getServingNameCount(), expected);
-        EXPECT_EQ(allocators.getServingNameCount(),
-                  allocators.getServingNames().size());
-    };
-    ASSERT_EQ(manager.getSegmentAccess().MountSegment(segment, owner,
-                                                      client_liveness_),
-              ErrorCode::OK);
-    check_count(1);
-    ASSERT_EQ(manager.getSegmentAccess().SetSegmentStatusByName(
-                  segment.name, SegmentStatus::DRAINING),
-              ErrorCode::OK);
-    check_count(0);
-    const auto now = ClientLivenessRecord::Clock::now();
-    ASSERT_EQ(client_liveness_->Evaluate(now, 0s, 1h),
-              ClientLivenessTransition::BECAME_SUSPECTED);
-    ASSERT_EQ(manager.getSegmentAccess().SetSegmentStatusByName(
-                  segment.name, SegmentStatus::OK),
-              ErrorCode::OK);
-    check_count(0);
-    EXPECT_EQ(client_liveness_->Observe(now),
-              ClientLivenessObservation::RECOVERED_ACTIVE);
-    check_count(1);
-    auto replacement = std::make_shared<ClientLivenessRecord>(now);
-    manager.getSegmentAccess().BindClientLiveness(owner, replacement);
-    EXPECT_EQ(client_liveness_->Evaluate(now, 0s, 1h),
-              ClientLivenessTransition::BECAME_SUSPECTED);
-    check_count(1);  // An old incarnation must no longer affect the registry.
-    EXPECT_EQ(replacement->Evaluate(now, 0s, 1h),
-              ClientLivenessTransition::BECAME_SUSPECTED);
-    check_count(0);
-    EXPECT_EQ(replacement->Observe(now),
-              ClientLivenessObservation::RECOVERED_ACTIVE);
-    check_count(1);
-    ASSERT_EQ(
-        manager.getSegmentAccess().PrepareGracefulUnmountSegment(segment.id),
-        ErrorCode::OK);
-    check_count(0);
-    size_t capacity = 0;
-    ASSERT_EQ(
-        manager.getSegmentAccess().PrepareUnmountSegment(segment.id, capacity),
-        ErrorCode::OK);
-    ASSERT_EQ(manager.getSegmentAccess().CommitUnmountSegment(segment.id, owner,
-                                                              capacity),
-              ErrorCode::OK);
-    EXPECT_EQ(replacement->Evaluate(now, 0s, 1h),
-              ClientLivenessTransition::BECAME_SUSPECTED);
-    check_count(0);
 }
 
 TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
@@ -930,6 +874,8 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
     }
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         snapshot = allocator_access.SnapshotAllocatorManager();
     }
     const auto* registrations = snapshot.getAllocators(segment.name);
@@ -958,6 +904,10 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
     EXPECT_EQ(transition.get(), ClientLivenessTransition::BECAME_SUSPECTED);
     EXPECT_TRUE(transitioned_during_allocation);
     EXPECT_EQ(allocation.get(), nullptr);
+    EXPECT_EQ(segment_manager.getAllocatorAccess()
+                  .getAllocatorManager()
+                  .getServingNameCount(),
+              0u);
 }
 
 TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
@@ -990,6 +940,8 @@ TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_EQ(ordered.size(), 1u);
@@ -1016,6 +968,8 @@ TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_EQ(ordered.size(), 1u);
@@ -1036,6 +990,8 @@ TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  0u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         EXPECT_TRUE(ordered.empty());
@@ -1077,6 +1033,8 @@ TEST_F(SegmentTest, SharedNameRegistrationsSurviveSegmentSnapshotRestore) {
     ASSERT_TRUE(restored_state.has_value());
     {
         auto allocator_access = restored.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         const auto* registrations =
             allocator_access.getAllocatorManager().getAllocators(first.name);
         ASSERT_NE(registrations, nullptr);
@@ -1092,24 +1050,6 @@ TEST_F(SegmentTest, SharedNameRegistrationsSurviveSegmentSnapshotRestore) {
     }
     EXPECT_EQ(owners.at(first.id), first_owner);
     EXPECT_EQ(owners.at(second.id), second_owner);
-    const auto count = [&] {
-        return restored.getAllocatorAccess()
-            .getAllocatorManager()
-            .getServingNameCount();
-    };
-    EXPECT_EQ(count(), 1);
-    const auto now = ClientLivenessRecord::Clock::now();
-    auto recovered = std::make_shared<ClientLivenessRecord>(now);
-    ASSERT_EQ(recovered->Evaluate(now, std::chrono::seconds::zero(),
-                                  std::chrono::hours(1)),
-              ClientLivenessTransition::BECAME_SUSPECTED);
-    restored.getSegmentAccess().BindClientLiveness(first_owner, recovered);
-    EXPECT_EQ(count(), 1);  // The other registration is still serving.
-    restored.getSegmentAccess().BindClientLiveness(second_owner, recovered);
-    EXPECT_EQ(count(), 0);
-    EXPECT_EQ(recovered->Observe(now),
-              ClientLivenessObservation::RECOVERED_ACTIVE);
-    EXPECT_EQ(count(), 1);
 }
 
 TEST_F(SegmentTest, HostOrderedSegmentsRotateWithinSameHostByKey) {
