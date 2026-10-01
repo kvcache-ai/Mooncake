@@ -790,7 +790,8 @@ class AscendDirectTransportTest : public ::testing::Test {
     };
 
     TransferWaitResult runLocalCopy(AscendDirectTransport* transport, void* src,
-                                    void* dst, size_t len) {
+                                    void* dst, size_t len,
+                                    int32_t device_id = -1) {
         auto batch_id = transport->allocateBatchID(1);
         if (batch_id == 0) {
             return {false, false, {}};
@@ -802,6 +803,7 @@ class AscendDirectTransportTest : public ::testing::Test {
         req.target_id = 0;
         req.target_offset = reinterpret_cast<uint64_t>(dst);
         req.length = len;
+        req.device_id = device_id;
         requests.push_back(req);
         Status s = transport->submitTransfer(batch_id, requests);
         if (!s.ok()) {
@@ -1118,7 +1120,8 @@ TEST_F(AscendDirectTransportTest, DummyReal_RemoteTransfer_Async_Success) {
     globalConfig().ascend_agent_mode = false;
 }
 
-TEST_F(AscendDirectTransportTest, DummyReal_SubmitTransfer_UsesDeviceId) {
+TEST_F(AscendDirectTransportTest,
+       DummyReal_LegacyRequestUsesThreadContextDeviceId) {
     globalConfig().ascend_agent_mode = true;
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
     auto transport = createTransport();
@@ -1136,8 +1139,40 @@ TEST_F(AscendDirectTransportTest, DummyReal_SubmitTransfer_UsesDeviceId) {
                                test_buffer_dst_, kTransferBufSize);
     ASSERT_TRUE(result.finished);
     EXPECT_GE(mock_acl::get_get_device_call_count(), 1)
-        << "submitTransfer in dummy-real mode must call aclrtGetDevice to get "
-           "current device_id for slice dispatch";
+        << "legacy requests without a device id must retain context-based "
+           "routing";
+
+    globalConfig().ascend_agent_mode = false;
+}
+
+TEST_F(AscendDirectTransportTest,
+       DummyReal_ExplicitDeviceIdDoesNotReadThreadContext) {
+    globalConfig().ascend_agent_mode = true;
+    ContextManager::getInstance().finalize();
+    constexpr int kEngineCount = 4;
+    constexpr int kPhysicalDeviceId = 2;
+    mock_acl::set_device_count(kEngineCount);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    initTestData(kTransferBufSize);
+
+    const int get_device_calls_before = mock_acl::get_get_device_call_count();
+    auto result =
+        runLocalCopy(transport.get(), test_buffer_src_, test_buffer_dst_,
+                     kTransferBufSize, kPhysicalDeviceId);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_EQ(mock_acl::get_get_device_call_count(), get_device_calls_before)
+        << "explicit request device id must replace thread-local ACL routing";
 
     globalConfig().ascend_agent_mode = false;
 }
@@ -1287,6 +1322,20 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterAndUnregister) {
                                              "cpu:0", true, true),
               0);
     EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest,
+       Config_AsyncTransferZeroKeepsBufferPoolCompatible) {
+    setenv("ASCEND_USE_ASYNC_TRANSFER", "0", 1);
+    setenv("ASCEND_BUFFER_POOL", "4:8", 1);
+
+    TransferExecutorBase::InitParams params;
+    TransferExecutorBase::ParseExecutorEnvIntoInitParams(params);
+
+    EXPECT_FALSE(params.use_async_transfer);
+    EXPECT_TRUE(params.use_buffer_pool);
+    unsetenv("ASCEND_USE_ASYNC_TRANSFER");
+    unsetenv("ASCEND_BUFFER_POOL");
 }
 
 TEST_F(AscendDirectTransportTest, Memory_RegisterStampsBufferDeviceId) {
