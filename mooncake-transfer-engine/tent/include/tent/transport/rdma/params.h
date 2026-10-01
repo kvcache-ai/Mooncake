@@ -84,6 +84,7 @@ struct EndPointParams {
     uint8_t send_retry_count = 7;
     uint8_t send_rnr_count = 7;
     uint8_t max_rd_atomic = 16;
+    int notify_proto = 1;  // notification/proto, advertised in bootstrap
 };
 
 // Result of resolving the QP-pool layout: the concrete per-pool segments (each

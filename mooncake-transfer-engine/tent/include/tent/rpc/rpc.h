@@ -16,6 +16,7 @@
 #define TENT_YLT_RPC_H
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <functional>
@@ -53,6 +54,15 @@ enum RpcFuncID {
 
 class ClientPool;
 
+// timeout bounds both the connect and the request; non-positive keeps the
+// coro_rpc defaults. peer_unreachable is set only when the peer did not
+// answer, not for an error reply or a stale idle pooled connection.
+struct RpcCallOptions {
+    std::chrono::milliseconds timeout{-1};
+    bool *peer_unreachable = nullptr;
+    bool *peer_answered = nullptr;  // on a failure: the peer replied
+};
+
 class CoroRpcAgent {
    public:
     CoroRpcAgent();
@@ -89,7 +99,8 @@ class CoroRpcAgent {
     Status stop();
 
     Status call(const std::string &server_addr, int func_id,
-                const std::string_view &request, std::string &response);
+                const std::string_view &request, std::string &response,
+                const RpcCallOptions &options = {});
 
     // Same as call(), but moves the request into the coroutine instead of
     // copying it, for large payloads.
@@ -101,7 +112,8 @@ class CoroRpcAgent {
                    const std::string &request, AsyncCallback callback);
 
     async_simple::coro::Lazy<std::pair<Status, std::string>> callCoroutine(
-        std::string server_addr, int func_id, std::string request);
+        std::string server_addr, int func_id, std::string request,
+        RpcCallOptions options = {});
 
    private:
     async_simple::coro::Lazy<void> process(int func_id);

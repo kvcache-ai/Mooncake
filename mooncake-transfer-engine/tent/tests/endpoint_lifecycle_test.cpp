@@ -14,8 +14,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -53,6 +56,19 @@ class EndpointTestAccess {
     // completions the worker has not polled yet.
     static void setNotifyInflight(RdmaEndPoint& endpoint, uint32_t count) {
         endpoint.notify_inflight_.store(count, std::memory_order_release);
+    }
+
+    static void setNotifyPendingCount(RdmaEndPoint& endpoint, size_t count) {
+        std::lock_guard<std::mutex> lock(endpoint.notify_send_mutex_);
+        endpoint.notify_pending_count_ = count;
+    }
+
+    static std::chrono::milliseconds notifySendStallTimeout() {
+        return RdmaEndPoint::kNotifySendStallTimeout;
+    }
+
+    static std::mutex& notifyResourceMutex(RdmaEndPoint& endpoint) {
+        return endpoint.notify_resource_mutex_;
     }
 
     static bool notifyConnected(const RdmaEndPoint& endpoint) {
@@ -262,6 +278,58 @@ TEST(EndpointLifecycleTest, NotifyQpAttrsDefaultsMatchDataQp) {
     EXPECT_EQ(rts.timeout, 14);
     EXPECT_EQ(rts.retry_cnt, 7);
     EXPECT_EQ(rts.rnr_retry, 7);
+}
+
+// Full send queue: one bounded wait, then immediate failures until a
+// completion re-arms the wait.
+TEST(EndpointLifecycleTest, NotificationSendGivesUpWhenPeerStopsCompleting) {
+    using Clock = std::chrono::steady_clock;
+    using std::chrono::milliseconds;
+    const auto stall = EndpointTestAccess::notifySendStallTimeout();
+
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+    EndpointTestAccess::setNotifyPendingCount(
+        endpoint, EndpointTestAccess::notifyMaxPendingSends());
+
+    // A send that never gives up is unblocked by a completion, so a
+    // regression fails here instead of hanging; holding the resource mutex
+    // shows giving up does not go on to post.
+    auto send = [&](bool hold_resource) {
+        std::unique_lock<std::mutex> held(
+            EndpointTestAccess::notifyResourceMutex(endpoint), std::defer_lock);
+        if (hold_resource) held.lock();
+        const auto started = Clock::now();
+        auto result = std::async(std::launch::async, [&] {
+            return endpoint.sendNotification("name", "message");
+        });
+        const bool returned =
+            result.wait_for(stall * 4) == std::future_status::ready;
+        if (held.owns_lock()) held.unlock();
+        if (!returned) endpoint.handleNotifySendComplete(0);
+        EXPECT_TRUE(returned);
+        EXPECT_FALSE(result.get());
+        return std::chrono::duration_cast<milliseconds>(Clock::now() - started);
+    };
+    EXPECT_GE(send(true), stall - milliseconds(100));
+    EXPECT_LT(send(false), stall / 2);  // stalled: no second wait
+
+    endpoint.handleNotifySendComplete(0);  // re-arms the wait
+    EndpointTestAccess::setNotifyPendingCount(
+        endpoint, EndpointTestAccess::notifyMaxPendingSends());
+    EXPECT_GE(send(false), stall - milliseconds(100));
+}
+
+// Typed frames only for stamped notifications to peers that advertised them.
+TEST(EndpointLifecycleTest, TypedFrameOnlyToPeersThatAdvertiseIt) {
+    EXPECT_FALSE(RdmaEndPoint::useTypedNotifyFrame(0, 5));
+    EXPECT_FALSE(RdmaEndPoint::useTypedNotifyFrame(1, 0));
+    EXPECT_TRUE(RdmaEndPoint::useTypedNotifyFrame(1, 5));
+    EXPECT_TRUE(RdmaEndPoint::useTypedNotifyFrame(2, 5));
+    RdmaEndPoint endpoint;
+    EXPECT_EQ(endpoint.peerNotifyProto(), 0u);
 }
 
 TEST(EndpointLifecycleTest, NotifyLocalFaultKeepsEndpointServingData) {

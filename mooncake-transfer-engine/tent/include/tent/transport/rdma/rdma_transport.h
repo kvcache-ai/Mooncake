@@ -19,11 +19,14 @@
 
 #include <atomic>
 #include <cassert>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -45,6 +48,16 @@ class EndpointStore;
 class LocalBuffers;
 
 using RdmaContextSet = std::vector<std::shared_ptr<RdmaContext>>;
+
+// A stamped notification posted on a notify QP and not yet completed.
+// last_path indexes (enabled local context, remote NIC) pairs, local-major;
+// 0 is the pair sendNotification() uses.
+struct PendingNotify {
+    SegmentID target = LOCAL_SEGMENT_ID;
+    Notification notifi{};
+    int attempts = 0;  // resend rounds so far
+    int last_path = 0;
+};
 
 struct RdmaSubBatch : public Transport::SubBatch {
     std::vector<RdmaTask*> task_list;
@@ -114,8 +127,7 @@ class RdmaTransport : public Transport {
 
     // Add notification directly to queue (called from endpoint
     // handleNotifyRecv)
-    void addNotificationToQueue(const std::string& name,
-                                const std::string& msg);
+    void addNotificationToQueue(const Notification& notifi);
 
    public:
     int onSetupRdmaConnections(const BootstrapDesc& peer_desc,
@@ -218,6 +230,23 @@ class RdmaTransport : public Transport {
     std::shared_ptr<RdmaEndPoint> getEndpoint(SegmentID target_id,
                                               int device_id,
                                               Status* failure = nullptr);
+    // Same, on a given local context instead of the first enabled one.
+    std::shared_ptr<RdmaEndPoint> getEndpointOn(size_t local_ctx,
+                                                SegmentID target_id,
+                                                int device_id, Status* failure);
+
+    void requeueNotifications(std::vector<PendingNotify>&& drained);
+    static constexpr int kMaxNotifyResendAttempts = 3;
+    Status sendNotificationOnAnyPath(const PendingNotify& pending);
+    bool resendOne(PendingNotify& pending);
+    void notifyResendThread();
+
+    std::mutex notify_resend_mutex_;
+    std::condition_variable notify_resend_cv_;
+    std::deque<PendingNotify> notify_resend_queue_;
+    std::thread notify_resend_worker_;
+    bool notify_resend_running_ = false;
+    bool notify_rpc_fallback_ = true;
 
     // Maps the reason getEndpoint() could not hand out a notify-capable
     // endpoint to what sendNotification() reports. A bootstrap RPC that

@@ -15,6 +15,7 @@
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
 
+#include <algorithm>
 #include <cassert>
 #include <exception>
 #include <set>
@@ -44,6 +45,8 @@ class CallbackInvocationGuard {
     Fn on_exit_;
 };
 
+std::atomic<int64_t> g_request_timeout_ms{-1};
+
 }  // namespace
 
 thread_local const ControlService* ControlService::active_bootstrap_service_ =
@@ -52,16 +55,130 @@ thread_local const ControlService* ControlService::active_notify_service_ =
     nullptr;
 thread_local CoroRpcAgent tl_rpc_agent;
 
+PeerHealth& PeerHealth::instance() {
+    // Leaked: workers and probers may still use it during static destruction.
+    static auto* health = new PeerHealth;
+    return *health;
+}
+
+void PeerHealth::configure(const Config& config) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    config_ = config;
+    if (config_.cooldown.count() <= 0) config_.cooldown = Config().cooldown;
+    config_.cooldown = std::min(config_.cooldown, kMaxCooldown);
+    if (!config_.enabled) entries_.clear();
+}
+
+PeerHealth::Config PeerHealth::config() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return config_;
+}
+
+bool PeerHealth::shouldFailFast(const std::string& addr,
+                                Clock::time_point now) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!config_.enabled) return false;
+    auto it = entries_.find(addr);
+    return it != entries_.end() && now < it->second.dead_until;
+}
+
+void PeerHealth::markUnreachable(const std::string& addr,
+                                 Clock::time_point now) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!config_.enabled) return;
+    auto it = entries_.find(addr);
+    if (it == entries_.end()) {
+        forgetOldNoLock(now);
+        entries_.emplace(addr,
+                         Entry{now, now + config_.cooldown, config_.cooldown});
+        LOG(WARNING) << "Peer control plane " << addr
+                     << " marked unreachable for " << config_.cooldown.count()
+                     << " ms";
+        return;
+    }
+    Entry& entry = it->second;
+    entry.cooldown = std::min(entry.cooldown * 2, kMaxCooldown);
+    entry.dead_until = now + entry.cooldown;
+}
+
+void PeerHealth::markReachable(const std::string& addr) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (entries_.erase(addr)) {
+        LOG(INFO) << "Peer control plane " << addr << " reachable again";
+    }
+}
+
+std::vector<std::string> PeerHealth::unreachablePeers(Clock::time_point now) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    forgetOldNoLock(now);
+    std::vector<std::string> peers;
+    for (const auto& entry : entries_) peers.push_back(entry.first);
+    return peers;
+}
+
+void PeerHealth::forgetOldNoLock(Clock::time_point now) {
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        if (now - it->second.first_failure > kMaxAge) {
+            it = entries_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void PeerHealth::clear() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    entries_.clear();
+}
+
+void ControlClient::setRequestTimeout(std::chrono::milliseconds timeout) {
+    g_request_timeout_ms = timeout.count();
+}
+
+std::chrono::milliseconds ControlClient::requestTimeout() {
+    return std::chrono::milliseconds(g_request_timeout_ms.load());
+}
+
+Status ControlClient::callGuarded(const std::string& server_addr, int func_id,
+                                  const std::string_view& request,
+                                  std::string& response,
+                                  std::chrono::milliseconds timeout,
+                                  bool bypass_peer_health,
+                                  bool* peer_unreachable, bool* peer_answered) {
+    auto& health = PeerHealth::instance();
+    if (!bypass_peer_health && health.shouldFailFast(server_addr)) {
+        if (peer_unreachable) *peer_unreachable = true;
+        return Status::RpcConnectionError("Peer control plane " + server_addr +
+                                          " marked unreachable, not dialing" +
+                                          LOC_MARK);
+    }
+    bool unreachable = false;
+    RpcCallOptions options;
+    options.timeout = timeout;
+    options.peer_unreachable = &unreachable;
+    options.peer_answered = peer_answered;
+    Status status =
+        tl_rpc_agent.call(server_addr, func_id, request, response, options);
+    if (peer_unreachable) *peer_unreachable = unreachable;
+    if (unreachable) {
+        health.markUnreachable(server_addr);
+    } else if (status.ok()) {
+        health.markReachable(server_addr);
+    }
+    return status;
+}
+
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
                                      std::string& response) {
     std::string request;
+    const auto timeout = requestTimeout();
     auto status =
-        tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+        callGuarded(server_addr, GetSegmentDesc, request, response, timeout);
     if (status.IsRpcServiceError()) {
         // A failed stale connection is discarded by the RPC agent. Retry this
         // read-only operation once; other control RPCs may have side effects.
-        return tl_rpc_agent.call(server_addr, GetSegmentDesc, request,
-                                 response);
+        return callGuarded(server_addr, GetSegmentDesc, request, response,
+                           timeout);
     }
     return status;
 }
@@ -75,7 +192,9 @@ Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
             std::string("Invalid bootstrap response: ") + e.what() + LOC_MARK);
     }
     if (!response.reply_msg.empty()) {
-        return Status::RpcServiceError(response.reply_msg);
+        // A refusal is an answer: keep it off the RpcServiceError paths.
+        return Status::InternalError(
+            "Peer refused the bootstrap: " + response.reply_msg + LOC_MARK);
     }
     if (response.local_gid.empty()) {
         return Status::InvalidArgument(
@@ -90,8 +209,8 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     std::string request_raw, response_raw;
     json j = request;
     request_raw = j.dump();
-    CHECK_STATUS(tl_rpc_agent.call(server_addr, BootstrapRdma, request_raw,
-                                   response_raw));
+    CHECK_STATUS(callGuarded(server_addr, BootstrapRdma, request_raw,
+                             response_raw, requestTimeout()));
     return decodeBootstrapResponse(response_raw, response);
 }
 
@@ -162,12 +281,18 @@ Status ControlClient::recvData(const std::string& server_addr,
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {
-    j = nlohmann::json{{"name", n.name}, {"msg", n.msg}};
+    j = nlohmann::json{{"name", n.name},
+                       {"msg", n.msg},
+                       {"session", n.session},
+                       {"seq", n.seq}};
 }
 
+// session/seq are absent from older senders and ignored by older receivers.
 inline void from_json(const nlohmann::json& j, Notification& n) {
     j.at("name").get_to(n.name);
     j.at("msg").get_to(n.msg);
+    n.session = j.value("session", uint64_t{0});
+    n.seq = j.value("seq", uint64_t{0});
 }
 
 Status ControlClient::notify(const std::string& server_addr,
@@ -175,12 +300,32 @@ Status ControlClient::notify(const std::string& server_addr,
     json j = message;
     std::string request = j.dump();
     std::string response;
-    return tl_rpc_agent.call(server_addr, Notify, request, response);
+    bool unreachable = false, answered = false;
+    auto status =
+        callGuarded(server_addr, Notify, request, response, requestTimeout(),
+                    /*bypass_peer_health=*/false, &unreachable, &answered);
+    // A local error on an idle pooled connection says nothing about the peer
+    // (a stale pool, or a lost reply): once more, as before this change.
+    if (status.IsRpcServiceError() && !unreachable && !answered) {
+        status = callGuarded(server_addr, Notify, request, response,
+                             requestTimeout());
+    }
+    return status;
 }
 
-Status ControlClient::probe(const std::string& server_addr) {
+Status ControlClient::probe(const std::string& server_addr,
+                            std::chrono::milliseconds timeout) {
     std::string request, response;
-    return tl_rpc_agent.call(server_addr, Probe, request, response);
+    if (timeout.count() <= 0) timeout = requestTimeout();
+    bool unreachable = false;
+    auto status = callGuarded(server_addr, Probe, request, response, timeout,
+                              /*bypass_peer_health=*/true, &unreachable);
+    // Read-only: retry a failure that says nothing about the peer (stale pool).
+    if (status.IsRpcServiceError() && !unreachable) {
+        status = callGuarded(server_addr, Probe, request, response, timeout,
+                             /*bypass_peer_health=*/true);
+    }
+    return status;
 }
 
 inline void to_json(json& j, const Request& r) {
@@ -365,6 +510,36 @@ ControlService::~ControlService() {
         ub_bootstrap_callback_ = {};
     }
     rpc_server_.reset();
+    // Only now: a dial in progress must not keep the server dispatching.
+    {
+        std::lock_guard<std::mutex> guard(prober_mutex_);
+        prober_stop_ = true;
+    }
+    prober_cv_.notify_all();
+    if (peer_prober_.joinable()) peer_prober_.join();
+}
+
+void ControlService::peerProberLoop() {
+    auto& health = PeerHealth::instance();
+    while (true) {
+        auto interval = health.config().probe_interval;
+        // Switched off after start (a later engine's config): idle, and look
+        // again in a second.
+        const bool off = interval.count() <= 0;
+        if (off) interval = std::chrono::seconds(1);
+        {
+            std::unique_lock<std::mutex> guard(prober_mutex_);
+            if (prober_cv_.wait_for(guard, interval,
+                                    [this] { return prober_stop_; }))
+                return;
+        }
+        if (off) continue;
+        for (const auto& addr : health.unreachablePeers()) {
+            (void)ControlClient::probe(addr, health.config().probe_timeout);
+            std::lock_guard<std::mutex> guard(prober_mutex_);
+            if (prober_stop_) return;
+        }
+    }
 }
 
 void ControlService::setBootstrapRdmaCallback(
@@ -419,7 +594,11 @@ void ControlService::finishNotifyCallback() {
 }
 
 Status ControlService::start(uint16_t& port, bool ipv6_, size_t threads) {
-    return rpc_server_->start(port, ipv6_, threads);
+    CHECK_STATUS(rpc_server_->start(port, ipv6_, threads));
+    const auto config = PeerHealth::instance().config();
+    if (config.enabled && config.probe_interval.count() > 0)
+        peer_prober_ = std::thread([this] { peerProberLoop(); });
+    return Status::OK();
 }
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,

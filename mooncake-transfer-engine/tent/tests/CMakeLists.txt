@@ -808,3 +808,30 @@ target_include_directories(tent_segment_desc_retry_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
+
+add_executable(tent_rpc_timeout_test rpc_timeout_test.cpp)
+target_link_libraries(tent_rpc_timeout_test PRIVATE gtest gtest_main
+                                                    tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_rpc_timeout_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_rpc_timeout_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rpc_timeout_test COMMAND tent_rpc_timeout_test)
+
+add_executable(tent_peer_health_test peer_health_test.cpp)
+target_link_libraries(tent_peer_health_test PRIVATE gtest gtest_main
+                                                    tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_peer_health_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_peer_health_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_peer_health_test COMMAND tent_peer_health_test)
+
+add_executable(tent_notify_frame_test notify_frame_test.cpp)
+target_link_libraries(tent_notify_frame_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+target_include_directories(tent_notify_frame_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_notify_frame_test COMMAND tent_notify_frame_test)

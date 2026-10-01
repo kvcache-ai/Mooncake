@@ -16,7 +16,9 @@
 #define TENT_ENDPOINT_H
 
 #include <atomic>
+#include <chrono>
 #include <functional>
+#include <map>
 #include <memory>
 #include <queue>
 #include <unordered_set>
@@ -136,6 +138,19 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     bool sendNotification(const std::string& name, const std::string& msg);
 
+    // A typed frame carrying session/seq if the peer advertised it and
+    // notifi is stamped; otherwise the raw payload older peers understand.
+    // With `track` (target and tries so far), a typed send is kept until it
+    // completes: a notify QP that dies with it in flight hands it back.
+    bool sendNotification(const Notification& notifi,
+                          const PendingNotify* track = nullptr);
+
+    static bool useTypedNotifyFrame(uint32_t peer_notify_proto, uint64_t seq) {
+        return peer_notify_proto >= 1 && seq != 0;
+    }
+
+    uint32_t peerNotifyProto() const { return peer_notify_proto_; }
+
     // Whether the notify QP is connected and not disabled after a fault.
     bool notifyConnected() const {
         return notify_connected_.load(std::memory_order_acquire);
@@ -180,7 +195,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // directly
     bool handleNotifyRecv(size_t buffer_idx, size_t byte_len);
 
-    // Process SEND completion: cleanup pending send
+    // Process SEND completion: cleanup pending send. Successful ones only: a
+    // failed send stays tracked for the hand-back.
     void handleNotifySendComplete(uint64_t wr_id);
 
    public:
@@ -253,6 +269,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     void rearmNotifyRecv(size_t idx);
     void repostAllNotifyRecvs();
 
+    std::vector<PendingNotify> takeResendableNoLock();
+    void requeueDrained(std::vector<PendingNotify>&& drained);
+
     static char* notifySlotPtr(char* base, size_t idx);
     static bool encodeNotifyPayload(char* slot, const std::string& name,
                                     const std::string& msg, uint32_t* out_len);
@@ -295,6 +314,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::string peer_server_name_;
     std::string peer_nic_name_;
     std::vector<uint32_t> peer_qp_num_list_;
+    uint32_t peer_notify_proto_ = 0;  // BootstrapDesc::notify_proto
     // Notification QP (one per endpoint for control plane operations)
     ibv_qp* notify_qp_ = nullptr;
 
@@ -312,12 +332,19 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::condition_variable notify_send_cv_;
     size_t notify_pending_count_ = 0;  // Number of pending sends
     uint64_t notify_send_wr_id_ = 0;   // Circular counter for wr_id
+    // A peer that stops consuming keeps every slot in flight for good (RNR
+    // NAKs retry without bound), so the wait for a slot has to be bounded.
+    static constexpr std::chrono::milliseconds kNotifySendStallTimeout{1000};
+    bool notify_send_stalled_ = false;
     std::atomic<bool> notify_connected_{false};
     // Notification WRs posted on the notify QP whose completion has not been
     // polled yet. finishDestroy() waits for it: the QP must not be destroyed
     // while completions the peer already saw acknowledged are still in the CQ,
     // because the provider drops them with the QP.
     std::atomic<uint32_t> notify_inflight_{0};
+    // Tracked typed sends by wr_id (posting order) until their completion;
+    // guarded by notify_send_mutex_.
+    std::map<uint64_t, PendingNotify> notify_resendable_;
 
     // Two-phase destruction constants (matching TE)
     static constexpr double kFinishDestroyTimeoutSec = 30.0;
