@@ -781,10 +781,19 @@ void MasterService::StopBatchOpLogWriter() {
 }
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
-    return {
+    TieredStorageUsageSnapshot snapshot{
         .memory = segment_manager_.GetMemoryUsageSnapshot(),
         .nof = nof_segment_manager_.GetUsageSnapshot(),
     };
+    if (enable_dfs_ && dfs_allocator_ && dfs_allocator_->IsInitialized()) {
+        snapshot.dfs = {
+            .enabled = true,
+            .used_bytes = dfs_allocator_->GetUsedBytes(),
+            .capacity_bytes = dfs_allocator_->GetTotalCapacity(),
+            .file_count = dfs_allocator_->GetFileCount(),
+        };
+    }
+    return snapshot;
 }
 
 bool MasterService::IsTenantQuotaEnabled() const {
@@ -3494,6 +3503,44 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
     return status;
 }
 
+tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
+    const std::string& segment_name, SegmentStatus status) {
+    if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    for (const auto& [_, job] : drain_jobs_) {
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        if (job->status == JobStatus::SUCCEEDED ||
+            job->status == JobStatus::FAILED ||
+            job->status == JobStatus::CANCELED) {
+            continue;
+        }
+        const auto& sources = job->request.segments;
+        if (std::find(sources.begin(), sources.end(), segment_name) !=
+            sources.end()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentStatus current = SegmentStatus::UNDEFINED;
+    auto err = segment_access.GetSegmentStatusByName(segment_name, current);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    if (current != SegmentStatus::OK && current != SegmentStatus::DRAINING) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    err = segment_access.SetSegmentStatusByName(segment_name, status);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
@@ -4531,6 +4578,15 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
                 const auto& metadata = metadata_it->second;
                 auto replica_list = GetReadableReplicaDescriptors(metadata);
+
+                if (dfs_allocator_) {
+                    for (const auto& replica : replica_list) {
+                        if (replica.is_dfs_replica()) {
+                            const auto& desc = replica.get_dfs_descriptor();
+                            dfs_allocator_->UpdateAccess(key, desc);
+                        }
+                    }
+                }
 
                 if (replica_list.empty()) {
                     if (metadata.AllReplicas([](const Replica& replica) {
@@ -14011,6 +14067,9 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
+    // Held until the job is registered so SetSegmentStatus never sees a
+    // segment this job has marked DRAINING without also seeing the job.
+    std::lock_guard<std::mutex> lock(job_mutex_);
     std::vector<std::string> draining_segments;
     {
         ScopedSegmentAccess segment_access =
@@ -14042,12 +14101,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     job->last_updated_at = job->created_at;
     job->status = JobStatus::CREATED;
     job->message = "Drain job created";
-
-    {
-        std::lock_guard<std::mutex> lock(job_mutex_);
-        drain_jobs_.emplace(job->id, job);
-    }
-
+    drain_jobs_.emplace(job->id, job);
     return job->id;
 }
 

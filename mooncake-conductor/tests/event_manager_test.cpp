@@ -2936,7 +2936,9 @@ TEST(ParseConfig, MissingFileReturnsEmptyList) {
     ConfigEnvGuard guard;
     guard.SetPath("/nonexistent/conductor_config.json");
     int port = 13333;
-    const auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    const auto services =
+        mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     EXPECT_TRUE(services.empty());
     EXPECT_EQ(port, 13333);
 }
@@ -2987,7 +2989,8 @@ TEST(ParseConfig, LoadsProfilesAndSkipsInvalidEntries) {
     guard.SetPath(path);
 
     int port = 13333;
-    auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    auto services = mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     EXPECT_EQ(port, 14444);
     ASSERT_EQ(services.size(), 2u);
     std::sort(services.begin(), services.end(),
@@ -3054,7 +3057,9 @@ TEST(ParseConfig, RejectsLegacyMissingMalformedAndUnknownProfiles) {
     guard.SetPath(path);
 
     int port = 13333;
-    const auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    const auto services =
+        mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     ASSERT_EQ(services.size(), 1u);
     EXPECT_EQ(services[0].instance_id, "valid");
     EXPECT_EQ(services[0].hash_profile, TestProfile("00"));
@@ -3094,7 +3099,9 @@ TEST(ParseConfig, AcceptsPickleAlgorithmAndRejectsUnsupportedAlgorithms) {
     guard.SetPath(path);
 
     int port = 13333;
-    const auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    const auto services =
+        mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     ASSERT_EQ(services.size(), 1u);
     EXPECT_EQ(services[0].instance_id, "pickle");
     // Static configuration and HTTP registration must resolve identical
@@ -3134,7 +3141,8 @@ TEST(ParseConfig, ExplicitInstanceIdSupportsMultipleStaticRanks) {
     guard.SetPath(path);
 
     int port = 13333;
-    auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    auto services = mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     ASSERT_EQ(services.size(), 2u);
     std::sort(services.begin(), services.end(),
               [](const auto& left, const auto& right) {
@@ -3170,7 +3178,9 @@ TEST(ParseConfig, SglangSeedMayBeOmittedWithoutWeakeningVllm) {
     }
     guard.SetPath(path);
     int port = 0;
-    const auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    const auto services =
+        mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     std::remove(path.c_str());
     ASSERT_EQ(services.size(), 2u);
     for (const auto& service : services) {
@@ -3188,7 +3198,8 @@ TEST(ParseConfig, MissingPortFieldZeroesPort) {
     }
     guard.SetPath(path);
     int port = 13333;
-    mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     EXPECT_EQ(port, 0);
     std::remove(path.c_str());
 }
@@ -3203,7 +3214,8 @@ TEST(ParseConfigDeathTest, MalformedJsonExits) {
     }
     guard.SetPath(path);
     int port = 0;
-    EXPECT_EXIT(mooncake::conductor::kvevent::ParseConfig(&port),
+    int rpc_port = 0;
+    EXPECT_EXIT(mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port),
                 ::testing::ExitedWithCode(1), "");
     std::remove(path.c_str());
 }

@@ -66,8 +66,7 @@ else()
 endif()
 set_target_properties(
   tebench
-  PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-             INSTALL_RPATH
+  PROPERTIES INSTALL_RPATH
              "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
 
 if(BUILD_UNIT_TESTS)
@@ -89,6 +88,14 @@ if(BUILD_UNIT_TESTS)
     set_tests_properties(tebench_metrics_integration_test
                          PROPERTIES TIMEOUT 60 LABELS integration)
   endif()
+
+  add_test(NAME tebench_build_tree_help
+           COMMAND ${CMAKE_COMMAND} -E env --unset=LD_LIBRARY_PATH
+                   $<TARGET_FILE:tebench> --help)
+  set_tests_properties(
+    tebench_build_tree_help
+    PROPERTIES PASS_REGULAR_EXPRESSION
+               "Mooncake Transfer Engine Benchmarking Tool" TIMEOUT 10)
 
   add_executable(
     tebench_qos_metrics_test tests/qos_metrics_test.cpp qos_metrics_adapter.cpp
