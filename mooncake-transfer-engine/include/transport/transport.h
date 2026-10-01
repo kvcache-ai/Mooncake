@@ -359,7 +359,14 @@ class Transport {
         Transport *transport_ = nullptr;
 
 #ifdef WITH_METRICS
+        // Stamped once at submit and never cleared; zero means not stamped.
         std::chrono::steady_clock::time_point start_time;
+        TransferRequest::OpCode metrics_opcode = TransferRequest::READ;
+        // Separate flags until export and log collection are unified.
+        // Accessed with __atomic builtins like is_finished (std::atomic would
+        // make the task non-movable).
+        volatile bool export_metrics_recorded = false;
+        volatile bool log_metrics_recorded = false;
 #endif
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION

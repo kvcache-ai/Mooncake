@@ -2,6 +2,12 @@ file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
 set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
 list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
+set(TRANSFER_ENGINE_METRICS_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/metrics_exporter.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/transfer_engine_metrics.cpp")
+if(NOT WITH_METRICS)
+  list(REMOVE_ITEM ENGINE_SOURCES ${TRANSFER_ENGINE_METRICS_SOURCES})
+endif()
 # ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
 # newer rdma-core adds active_speed_ex to carry it. TENT probes the same cache
 # variable in tent/src; this definition covers the classic RdmaContext under
