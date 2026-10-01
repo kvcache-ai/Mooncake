@@ -157,7 +157,8 @@ TEST_F(BenchMetricsIntegrationTest, ExportedMetricsMatchCompletedTransfers) {
                         payload.data(), bytes),
             0);
         (opcode == mooncake::tent::READ ? read_bytes : write_bytes) += bytes;
-        ASSERT_NO_FATAL_FAILURE(checkMetrics(read_bytes, write_bytes, block_size));
+        ASSERT_NO_FATAL_FAILURE(
+            checkMetrics(read_bytes, write_bytes, block_size));
     }
 }
 

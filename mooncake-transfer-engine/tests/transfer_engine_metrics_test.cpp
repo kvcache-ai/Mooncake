@@ -78,8 +78,7 @@ class FakeTransport : public Transport {
 
     Status submitTransferTask(
         const std::vector<TransferTask*>& tasks) override {
-        for (auto* task : tasks)
-            __sync_fetch_and_add(&task->slice_count, 1);
+        for (auto* task : tasks) __sync_fetch_and_add(&task->slice_count, 1);
         return Status::OK();
     }
 
@@ -154,7 +153,7 @@ TEST(EngineMetricsDeathTest, DisabledCollectionDoesNotRecordTransfers) {
                 desc->name = "fake-segment";
                 desc->protocol = "fake";
                 engine.getMetadata()->addLocalSegment(42, "fake-segment",
-                                                       std::move(desc));
+                                                      std::move(desc));
                 auto request = makeRequest(TransferRequest::READ, 8192);
                 request.target_id = 42;
                 std::vector<TransferRequest> entries{request};
