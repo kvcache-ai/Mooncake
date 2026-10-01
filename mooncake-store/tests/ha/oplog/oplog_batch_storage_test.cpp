@@ -16,6 +16,7 @@
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
 #include "ha/kv/ha_kv_backend.h"
+#include "ha/oplog/oplog_batch_binary_codec.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
@@ -1138,5 +1139,248 @@ TEST(EtcdHaKvBackendDeleteTest, RealEtcdDeleteWhileAppending) {
     }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// P02 mixed-format history through the production storage entry points.
+//
+// These tests seed the backend with raw wire bytes; nothing on the read path is
+// allowed to transcode back to JSON before decode.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr char kBinaryMagic[] = "\x89MCOPLG\n";
+
+void SeedDurablePrefix(FakeHaKvBackend& backend, const std::string& cluster,
+                       uint64_t batch_id, uint64_t last_seq) {
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey(cluster),
+                          EncodeDurablePrefix(
+                              {.batch_id = batch_id, .last_seq = last_seq})));
+}
+
+}  // namespace
+
+TEST(OpLogBatchStorageDualFormatTest,
+     ReadsRawBinaryValueThroughProductionRead) {
+    const std::string cluster = "clusterA";
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage(cluster, backend);
+
+    const auto expected =
+        MakeBatch(/*batch_id=*/1, /*first_seq=*/1, /*count=*/2);
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1),
+                          EncodeOpLogBatchRecordBinaryForTest(expected)));
+
+    OpLogBatchRecord record;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(1, record)) << "read failed";
+    EXPECT_EQ(expected.batch_id, record.batch_id);
+    ASSERT_EQ(expected.entries.size(), record.entries.size());
+    for (size_t i = 0; i < expected.entries.size(); ++i) {
+        EXPECT_EQ(expected.entries[i].object_key, record.entries[i].object_key);
+        EXPECT_EQ(expected.entries[i].payload, record.entries[i].payload);
+    }
+}
+
+TEST(OpLogBatchStorageDualFormatTest, RejectsBinaryRecordUnderMismatchedKey) {
+    const std::string cluster = "clusterA";
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage(cluster, backend);
+
+    // The body claims batch 1 while the etcd key encodes batch 2.
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 2),
+                          EncodeOpLogBatchRecordBinaryForTest(
+                              MakeBatch(/*batch_id=*/1, /*first_seq=*/1,
+                                        /*count=*/1))));
+
+    OpLogBatchRecord record;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.ReadBatch(2, record));
+}
+
+TEST(OpLogBatchStorageDualFormatTest, ReadsMixedJsonAndBinaryHistory) {
+    const std::string cluster = "clusterA";
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage(cluster, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(BuildBatchRecordKey(cluster, 2),
+                    EncodeOpLogBatchRecordBinaryForTest(MakeBatch(2, 3, 1))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 3),
+                          EncodeOpLogBatchRecord(MakeBatch(3, 4, 1))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(BuildBatchRecordKey(cluster, 4),
+                    EncodeOpLogBatchRecordBinaryForTest(MakeBatch(4, 5, 2))));
+    SeedDurablePrefix(backend, cluster, 4, 6);
+
+    // Single-record reads agree with the format each key was written in.
+    for (uint64_t batch_id = 1; batch_id <= 4; ++batch_id) {
+        OpLogBatchRecord record;
+        ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(batch_id, record))
+            << "batch_id=" << batch_id;
+        EXPECT_EQ(batch_id, record.batch_id);
+    }
+
+    // Range reads return the whole mixed history in order.
+    std::vector<OpLogBatchRecord> batches;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadBatchesAfter(0, 0, batches));
+    ASSERT_EQ(4u, batches.size());
+    for (size_t i = 0; i < batches.size(); ++i) {
+        EXPECT_EQ(static_cast<uint64_t>(i) + 1, batches[i].batch_id);
+    }
+
+    // Pagination with a bounded limit must walk the same mixed history across
+    // format boundaries without skipping or reordering records.
+    for (size_t page = 1; page <= 3; ++page) {
+        std::vector<OpLogBatchRecord> walked;
+        uint64_t cursor = 0;
+        while (true) {
+            std::vector<OpLogBatchRecord> paged;
+            ASSERT_EQ(ErrorCode::OK,
+                      storage.ReadBatchesAfter(cursor, page, paged))
+                << "page=" << page;
+            if (paged.empty()) {
+                break;
+            }
+            EXPECT_LE(paged.size(), page) << "page=" << page;
+            for (auto& record : paged) {
+                cursor = record.batch_id;
+                walked.push_back(std::move(record));
+            }
+            if (walked.size() >= batches.size()) {
+                break;
+            }
+        }
+        ASSERT_EQ(batches.size(), walked.size()) << "page=" << page;
+        for (size_t i = 0; i < batches.size(); ++i) {
+            EXPECT_EQ(batches[i].batch_id, walked[i].batch_id)
+                << "page=" << page;
+            EXPECT_EQ(batches[i].entries.front().object_key,
+                      walked[i].entries.front().object_key)
+                << "page=" << page;
+        }
+    }
+}
+
+TEST(OpLogBatchStorageDualFormatTest, StartupValidationAcceptsBinaryTerminal) {
+    const std::string cluster = "clusterA";
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage(cluster, backend);
+
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(BuildBatchRecordKey(cluster, 1),
+                    EncodeOpLogBatchRecordBinaryForTest(MakeBatch(1, 1, 3))));
+    SeedDurablePrefix(backend, cluster, 1, 3);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    // InitDurablePrefix runs the same private startup validation; a healthy
+    // binary terminal must let startup proceed.
+    EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+    EXPECT_EQ(1u, prefix.batch_id);
+    EXPECT_EQ(3u, prefix.last_seq);
+}
+
+TEST(OpLogBatchStorageDualFormatTest, StartupValidationRejectsCorruptTerminal) {
+    const std::string cluster = "clusterA";
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage(cluster, backend);
+
+    auto wire = EncodeOpLogBatchRecordBinaryForTest(MakeBatch(1, 1, 1));
+    // Flip the envelope version so the terminal batch is unreadable.
+    wire[8] = 9;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1), wire));
+    SeedDurablePrefix(backend, cluster, 1, 1);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageDualFormatTest,
+     RangeReadFailsClosedOnCorruptBinaryBatch) {
+    const std::string cluster = "clusterA";
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage(cluster, backend);
+
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(BuildBatchRecordKey(cluster, 1),
+                    EncodeOpLogBatchRecordBinaryForTest(MakeBatch(1, 1, 1))));
+    // The corrupt batch keeps a readable frame with an unknown codec so the
+    // reader cannot dismiss it as unrelated junk; it must fail the range read.
+    auto corrupt = EncodeOpLogBatchRecordBinaryForTest(MakeBatch(2, 2, 2));
+    ASSERT_GE(corrupt.size(), 16u);
+    corrupt[9] = 7;  // unknown codec_id
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 2), corrupt));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(BuildBatchRecordKey(cluster, 3),
+                    EncodeOpLogBatchRecordBinaryForTest(MakeBatch(3, 4, 1))));
+    SeedDurablePrefix(backend, cluster, 3, 4);
+
+    std::vector<OpLogBatchRecord> batches;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR,
+              storage.ReadBatchesAfter(0, 0, batches));
+
+    // The reader is not allowed to advance past the corrupt record: a range
+    // starting after the last good batch still fails on the same record.
+    batches.clear();
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR,
+              storage.ReadBatchesAfter(1, 0, batches));
+}
+
+TEST(OpLogBatchStorageDualFormatTest, TruncatedBinaryEnvelopeFailsClosed) {
+    const std::string cluster = "clusterA";
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage(cluster, backend);
+
+    auto wire = EncodeOpLogBatchRecordBinaryForTest(MakeBatch(1, 1, 1));
+    wire.resize(wire.size() / 2);
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1), wire));
+
+    OpLogBatchRecord record;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.ReadBatch(1, record));
+}
+
+TEST(OpLogBatchStorageDualFormatTest, BinaryTerminalStillAllowsJsonAppend) {
+    const std::string cluster = "clusterA";
+    FakeHaKvBackend backend;
+    OpLogBatchStorage storage(cluster, backend);
+
+    // History ends with a binary terminal batch...
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(BuildBatchRecordKey(cluster, 1),
+                    EncodeOpLogBatchRecordBinaryForTest(MakeBatch(1, 1, 2))));
+    SeedDurablePrefix(backend, cluster, 1, 2);
+
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    ASSERT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+
+    // ...and the unchanged production writer keeps appending JSON.
+    ASSERT_EQ(ErrorCode::OK,
+              storage.WriteBatchAndAdvancePrefix(MakeBatch(2, 3, 1), prefix));
+
+    std::string stored;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Get(BuildBatchRecordKey(cluster, 2), stored));
+    EXPECT_EQ(std::string::npos, stored.find(kBinaryMagic));
+    EXPECT_EQ(stored, EncodeOpLogBatchRecord(MakeBatch(2, 3, 1)));
+
+    OpLogBatchRecord record;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(2, record));
+    EXPECT_EQ(2u, record.batch_id);
+}
 
 }  // namespace mooncake::test
