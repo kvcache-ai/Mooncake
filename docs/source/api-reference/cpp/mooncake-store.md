@@ -222,3 +222,43 @@ tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
 ```
 
 Used to delete all objects from the store whose keys match the specified regular expression. This provides a powerful way to perform bulk deletions. The command returns the number of objects that were successfully removed.
+
+## MasterClient drain jobs
+
+`MasterClient` in `master_client.h` exposes the master's segment-drain control
+plane over the normal Store RPC connection:
+
+```cpp
+tl::expected<UUID, ErrorCode> CreateDrainJob(
+    const CreateDrainJobRequest& request);
+tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
+    const std::string& segment_name);
+```
+
+Connect the `MasterClient` to a master that supports these RPCs, then pass a
+nonempty, unique list of mounted memory segment names in `request.segments`.
+`request.target_segments` optionally restricts destinations; an empty list lets
+the master select destinations. `request.max_concurrency` must be positive and
+defaults to 4. Source and destination lists must not overlap.
+
+`CreateDrainJob` returns a job ID after marking the source segments `DRAINING`;
+it does not wait for migration. Source Store clients must remain running to
+execute the generated move tasks. Use `QueryDrainJob` to poll the status,
+active/succeeded/failed/blocked unit counts, and migrated bytes. A successful
+memory drain moves the source segments to `DRAINED`. Leased or hard-pinned
+objects can block progress. Job scope is cluster-wide, independent of the
+`MasterClient` tenant setting.
+
+`CancelDrainJob` restores the source segments to `OK` only if the job is
+nonterminal and has no active move tasks. Otherwise it returns
+`UNAVAILABLE_IN_CURRENT_STATUS`. Querying or canceling an unknown job returns
+`JOB_NOT_FOUND`. Invalid requests retain the master's validation errors, such
+as `INVALID_PARAMS` or `SEGMENT_NOT_FOUND`.
+
+These methods use the existing RPC connection and error handling. A master
+version without the drain handlers returns an RPC error. Drain jobs are
+currently in-memory and do not survive master failover; this API does not add
+HA recovery or LOCAL_DISK replica migration. See the
+[master admin HTTP reference](../http/http-service.md) for the HTTP surface.

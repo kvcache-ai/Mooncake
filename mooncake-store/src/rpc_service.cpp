@@ -1951,6 +1951,12 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CreateDrainJob>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::QueryDrainJob>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CancelDrainJob>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::FetchTasks>(
         &wrapped_master_service);
     server
