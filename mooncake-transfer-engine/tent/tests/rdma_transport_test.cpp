@@ -347,6 +347,14 @@ class RdmaEndPointTestPeer {
                               int qp_index) {
         return endpoint->queue_lock_list_[qp_index];
     }
+    static void markNotifyConnected(
+        const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        endpoint->notify_connected_.store(true);
+    }
+    static uint64_t notifySendWrId(
+        const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        return endpoint->notify_send_wr_id_;
+    }
 };
 
 namespace {
@@ -3199,6 +3207,41 @@ TEST_F(RdmaSliceOrphanTest, ALingeringOrphanIsReportedOnceAndStillHeld) {
     completeWith(slice, IBV_WC_SUCCESS);
     RdmaTransportTestPeer::reapOrphanSlices(transport_);
     EXPECT_EQ(RdmaTransportTestPeer::orphanSliceCount(transport_), 0u);
+}
+
+// A notification picks its send slot from its wr_id, and the slot is only
+// free while every lower wr_id was posted. The fixture is borrowed for its
+// fake verbs; its post_send is swapped for one that can refuse a post.
+class RdmaNotifySendSlotTest : public RdmaWorkersSharedQpTest {
+   protected:
+    static std::vector<uint64_t> posted;
+    static bool refuse;
+    static int postNotify(ibv_qp*, ibv_send_wr* wr, ibv_send_wr** bad_wr) {
+        posted.push_back(wr->wr_id);
+        *bad_wr = refuse ? wr : nullptr;
+        return refuse ? EINVAL : 0;
+    }
+    void SetUp() override {
+        RdmaWorkersSharedQpTest::SetUp();
+        posted.clear();
+        refuse = false;
+        fake.native.ops.post_send = postNotify;
+    }
+};
+std::vector<uint64_t> RdmaNotifySendSlotTest::posted;
+bool RdmaNotifySendSlotTest::refuse = false;
+
+TEST_F(RdmaNotifySendSlotTest, AFailedPostDoesNotTakeASendSlot) {
+    RdmaEndPointTestPeer::markNotifyConnected(endpoint_);
+    for (int i = 0; i < 255; ++i)  // wr_id 0..254, none completed
+        ASSERT_TRUE(endpoint_->sendNotification("n", "m"));
+    refuse = true;
+    EXPECT_FALSE(endpoint_->sendNotification("n", "m"));
+    EXPECT_EQ(RdmaEndPointTestPeer::notifySendWrId(endpoint_), 255u);
+    refuse = false;
+    ASSERT_TRUE(endpoint_->sendNotification("n", "m"));
+    // 256 would reuse slot 0, whose wr_id 0 is still in flight.
+    EXPECT_EQ(posted.back(), 255u);
 }
 
 // The handler reads the slice well past acknowledge(), which is what
