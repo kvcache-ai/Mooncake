@@ -1247,7 +1247,7 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     return tl::expected<QueryResult, ErrorCode>(
         tl::in_place, std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
-        result.value().object_checksum);
+        result.value().object_checksum, result.value().resolved_tenant_id);
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1281,7 +1281,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 tl::in_place, std::move(response[i].value().replicas),
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().object_checksum);
+                response[i].value().object_checksum,
+                response[i].value().resolved_tenant_id);
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }

@@ -460,7 +460,8 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      bool include_object_checksum = true) {
     return QueryResult(
         {replica}, qr.lease_timeout,
-        include_object_checksum ? qr.object_checksum : std::nullopt);
+        include_object_checksum ? qr.object_checksum : std::nullopt,
+        qr.resolved_tenant_id);
 }
 
 // Shared object-byte range overflow check (same semantics as
@@ -3464,7 +3465,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
 }
 
 RealClient::DiskReadHealResult RealClient::heal_disk_replica_for_read(
-    const std::string &key, const Replica::Descriptor &local_disk_replica) {
+    const std::string &key, const Replica::Descriptor &local_disk_replica,
+    const std::optional<std::string> &resolved_tenant_id) {
     // The failed replica lives on a possibly remote owner: ask the owner over
     // the offload RPC to verify the backing file and, when it is proven gone,
     // evict its own replica (the master scopes LOCAL_DISK eviction to the
@@ -3478,10 +3480,15 @@ RealClient::DiskReadHealResult RealClient::heal_disk_replica_for_read(
     }
     const auto &endpoint =
         local_disk_replica.get_local_disk_descriptor().transport_endpoint;
-    // Ship this reader's tenant: the owner probes and evicts under it, and it
-    // matches the tenant the write path scoped the file with.
-    auto verify = client_requester_->verify_disk_replica(
-        endpoint, {std::string(client_->tenant_id()), {key}});
+    // Ship this reader's tenant plus the tenant scope the master resolved for
+    // the query that produced this replica. The resolved scope is the one the
+    // write path used, so an owner that understands the field probes and
+    // evicts under it exactly; older owners fall back to the reader's tenant.
+    VerifyDiskReplicaRequest request{std::string(client_->tenant_id()), {key}};
+    if (resolved_tenant_id && !resolved_tenant_id->empty()) {
+        request.resolved_tenant_id = *resolved_tenant_id;
+    }
+    auto verify = client_requester_->verify_disk_replica(endpoint, request);
     if (!verify) {
         return DiskReadHealResult::kUnknown;
     }
@@ -3574,8 +3581,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
             // gone (evict + re-query) or present (retry the same replica
             // once). kUnknown surfaces the plain miss.
             if (heal_dangling_disk_replica) {
-                const auto heal =
-                    heal_disk_replica_for_read(key, *best_replica);
+                const auto heal = heal_disk_replica_for_read(
+                    key, *best_replica,
+                    query_result.value().resolved_tenant_id);
                 if (heal != DiskReadHealResult::kUnknown) {
                     return get_buffer_internal(key, client_buffer_allocator,
                                                /*heal_dangling_disk_replica=*/
@@ -4157,10 +4165,12 @@ RealClient::batch_get_buffer_internal(
                                 }
                             }
                         }
-                        const auto heal = failed_replica
-                                              ? heal_disk_replica_for_read(
-                                                    key, *failed_replica)
-                                              : DiskReadHealResult::kUnknown;
+                        const auto heal =
+                            failed_replica
+                                ? heal_disk_replica_for_read(
+                                      key, *failed_replica,
+                                      op.query_result.resolved_tenant_id)
+                                : DiskReadHealResult::kUnknown;
                         if (heal == DiskReadHealResult::kEvicted ||
                             heal == DiskReadHealResult::kPresent) {
                             auto healed = batch_get_buffer_internal(
@@ -8473,17 +8483,20 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
         co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     // The write path scopes offload files by the object's recorded tenant,
-    // which is the tenant the master resolved for it. The reader reached this
-    // replica through its own tenant's master records, so the request tenant
-    // matches the write scope when tenant isolation is on. With isolation off
-    // the master resolves every request to "default", and the write scope is
-    // always "default" regardless of the reader's configured tenant: a scoped
-    // probe would report a healthy default-scoped file missing, and the
-    // master would then normalize the follow-up eviction to "default" and
-    // delete that healthy replica. So on a scoped miss we probe the default
-    // scope too and refuse to evict on the ambiguity.
+    // which is the tenant the master resolved for it. When the request carries
+    // that resolved tenant, it IS the write scope: probe it alone, and a miss
+    // there proves the backing file gone no matter what other scopes hold.
+    // Older readers only ship their own configured tenant, which matches the
+    // write scope when tenant isolation is on. With isolation off the master
+    // resolves every request to "default", and the write scope is always
+    // "default" regardless of the reader's configured tenant: a scoped probe
+    // would report a healthy default-scoped file missing, and the master would
+    // then normalize the follow-up eviction to "default" and delete that
+    // healthy replica. So without a resolved tenant we probe the default scope
+    // on a scoped miss and refuse to evict on the ambiguity.
     struct CallState {
-        std::string tenant_id;
+        std::string tenant_id;  // scope probed and evicted under
+        bool exact_scope;       // resolved tenant known: skip the default probe
         std::vector<std::string> raw_keys;
         std::vector<std::string> scoped_keys;
         std::vector<std::string> default_scoped_keys;
@@ -8491,8 +8504,14 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
         std::shared_ptr<Client> client;
     };
     auto state = std::make_unique<CallState>();
-    state->tenant_id = request.tenant_id;
-    const TenantId scoped_tenant(request.tenant_id);
+    if (request.resolved_tenant_id && !request.resolved_tenant_id->empty()) {
+        state->tenant_id = *request.resolved_tenant_id;
+        state->exact_scope = true;
+    } else {
+        state->tenant_id = request.tenant_id;
+        state->exact_scope = false;
+    }
+    const TenantId scoped_tenant(state->tenant_id);
     state->raw_keys = request.keys;
     state->scoped_keys.reserve(request.keys.size());
     state->default_scoped_keys.reserve(request.keys.size());
@@ -8520,15 +8539,17 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
                 states.push_back(1);
                 continue;
             }
-            // A scoped miss is not proof of absence. When the request tenant
-            // is not "default", the file may sit under the default scope
-            // instead: with tenant isolation off every write lands there no
-            // matter what tenant the reader configured, and under isolation a
-            // different tenant's object can share the raw key. Either way the
-            // object the reader meant is indistinguishable from the one we
-            // would find, so report undetermined rather than evict a possibly
-            // healthy replica.
-            if (s->tenant_id != TenantId::Default().value()) {
+            // A scoped miss is not proof of absence unless the probed scope
+            // is known to be the write scope (exact_scope). Otherwise, when
+            // the probe tenant is not "default", the file may sit under the
+            // default scope instead: with tenant isolation off every write
+            // lands there no matter what tenant the reader configured, and
+            // under isolation a different tenant's object can share the raw
+            // key. Either way the object the reader meant is indistinguishable
+            // from the one we would find, so report undetermined rather than
+            // evict a possibly healthy replica.
+            if (!s->exact_scope &&
+                s->tenant_id != TenantId::Default().value()) {
                 auto default_exists =
                     s->file_storage->Exists(s->default_scoped_keys[i]);
                 if (!default_exists || *default_exists) {
@@ -8538,9 +8559,10 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
             }
             // The backing file is gone for good. The master scopes LOCAL_DISK
             // eviction to the owning client, so the eviction has to happen on
-            // this side of the RPC, and it goes out under the request tenant
-            // to hit the same master record the reader saw. OBJECT_NOT_FOUND
-            // is the goal state too: the metadata is already gone.
+            // this side of the RPC, and it goes out under the probed tenant
+            // scope to hit the same master record the reader saw.
+            // OBJECT_NOT_FOUND is the goal state too: the metadata is already
+            // gone.
             auto evicted = s->client->EvictDiskReplica(
                 s->raw_keys[i], s->tenant_id, ReplicaType::LOCAL_DISK);
             if (!evicted && evicted.error() != ErrorCode::OBJECT_NOT_FOUND) {

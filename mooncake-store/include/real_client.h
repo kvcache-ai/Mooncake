@@ -813,9 +813,12 @@ class RealClient : public PyClient {
     // replica owner over the offload RPC to verify the backing file; the
     // owner evicts its own replica when the file is proven gone (the master
     // scopes LOCAL_DISK eviction to the owning client). A present or
-    // undetermined answer never evicts.
+    // undetermined answer never evicts. resolved_tenant_id is the tenant scope
+    // the master resolved for the query that produced this replica, forwarded
+    // to the owner so it probes and evicts under the exact write scope.
     DiskReadHealResult heal_disk_replica_for_read(
-        const std::string &key, const Replica::Descriptor &local_disk_replica);
+        const std::string &key, const Replica::Descriptor &local_disk_replica,
+        const std::optional<std::string> &resolved_tenant_id = std::nullopt);
 
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,

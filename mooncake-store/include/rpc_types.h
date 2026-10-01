@@ -78,6 +78,12 @@ struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
     std::optional<uint64_t> object_checksum;
+    // The tenant the master resolved the query to: the requesting tenant when
+    // tenant isolation is on, "default" otherwise. Readers forward it in
+    // VerifyDiskReplicaRequest so the replica owner probes and evicts under
+    // the exact scope the write path used. Empty when the master predates
+    // this field.
+    struct_pack::compatible<std::string, 1> resolved_tenant_id;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -88,7 +94,8 @@ struct GetReplicaListResponse {
           lease_ttl_ms(lease_ttl_ms_param),
           object_checksum(object_checksum_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
+         resolved_tenant_id);
 
 struct CachedQueryResultResponse {
     bool success;
@@ -327,16 +334,26 @@ YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
 // own tenant, so the reader ships its own tenant along: the master only ever
 // shows a reader replicas of its own tenant's objects, which makes the
 // reader's tenant the same scope the write path used.
+//
+// resolved_tenant_id carries the tenant the master resolved for the reader's
+// query, forwarded verbatim from GetReplicaListResponse. That is the exact
+// scope the write path used, so an owner that sees it probes and evicts under
+// it alone and skips the default-scope ambiguity probe entirely; with tenant
+// isolation on, a same-named healthy object under the default scope no longer
+// shields a dangling tenant-scoped replica from eviction. Empty when the
+// reader or the master predates the field: the owner keeps the old
+// probe-both-scopes behavior.
 struct VerifyDiskReplicaRequest {
     std::string tenant_id;
     std::vector<std::string> keys;
+    struct_pack::compatible<std::string, 1> resolved_tenant_id;
 
     VerifyDiskReplicaRequest() = default;
     VerifyDiskReplicaRequest(std::string tenant_id_param,
                              std::vector<std::string> keys_param)
         : tenant_id(std::move(tenant_id_param)), keys(std::move(keys_param)) {}
 };
-YLT_REFL(VerifyDiskReplicaRequest, tenant_id, keys);
+YLT_REFL(VerifyDiskReplicaRequest, tenant_id, keys, resolved_tenant_id);
 
 // Answer to a replica verify on the offload RPC server: per-key what the
 // owner found and did. 1 = backing file present (reader retries the same

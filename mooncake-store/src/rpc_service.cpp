@@ -310,13 +310,22 @@ WrappedMasterService::GetReplicaList(const std::string& key,
     return execute_rpc(
         "GetReplicaList",
         [&] {
-            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
-                                         ? std::string_view(tenant_id)
-                                         : TenantId::kDefaultValue,
-                                     [&](const TenantId& resolved_tenant_id) {
-                                         return master_service_.GetReplicaList(
-                                             key, resolved_tenant_id);
-                                     });
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    auto result =
+                        master_service_.GetReplicaList(key, resolved_tenant_id);
+                    // Tell the reader which scope the
+                    // object actually lives in, so its
+                    // disk-replica verify requests can
+                    // name the write scope exactly.
+                    if (result) {
+                        result->resolved_tenant_id = resolved_tenant_id.value();
+                    }
+                    return result;
+                });
         },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
@@ -341,8 +350,14 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchGetReplicaList(keys,
-                                                       resolved_tenant_id);
+            auto batch =
+                master_service_.BatchGetReplicaList(keys, resolved_tenant_id);
+            for (auto& result : batch) {
+                if (result) {
+                    result->resolved_tenant_id = resolved_tenant_id.value();
+                }
+            }
+            return batch;
         });
 
     size_t failure_count = 0;

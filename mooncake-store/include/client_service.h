@@ -49,13 +49,19 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    /** @brief Tenant scope the master resolved the query to, when the master
+     * reports it; readers forward it to disk-replica verify requests */
+    const std::optional<std::string> resolved_tenant_id;
 
-    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> object_checksum_param = std::nullopt)
+    QueryResult(
+        std::vector<Replica::Descriptor>&& replicas_param,
+        std::chrono::steady_clock::time_point lease_timeout_param,
+        std::optional<uint64_t> object_checksum_param = std::nullopt,
+        std::optional<std::string> resolved_tenant_id_param = std::nullopt)
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          resolved_tenant_id(std::move(resolved_tenant_id_param)) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;

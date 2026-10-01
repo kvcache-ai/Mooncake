@@ -3892,6 +3892,124 @@ TEST_F(RealClientTest,
     reader->tearDownAll();
 }
 
+// fcczzz's review on #3889 (second round): with tenant isolation on, a
+// tenant-scoped object whose backing file is gone must still be evicted even
+// when a healthy same-named object sits under the default scope on the same
+// owner. Probing the default scope on a tenant-scoped miss made the healthy
+// default object shield the dangling tenant one: the verify answered
+// undetermined forever and the dangling replica kept being advertised. The
+// master now stamps the query's resolved tenant on GetReplicaListResponse,
+// the reader forwards it in the verify request, and the owner probes and
+// evicts under that exact scope instead of guessing.
+TEST_F(RealClientTest,
+       GetBufferHealEvictsTenantReplicaDespiteHealthyDefaultScope) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_tenant_scope_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    char quota_path[] = "/tmp/mooncake_tenant_quota_scope_heal_XXXXXX.yaml";
+    const int quota_fd = mkstemps(quota_path, 5);
+    ASSERT_NE(quota_fd, -1);
+    const char quota_yaml[] =
+        "version: 1\n\ntenants:\n"
+        "  - name: \"default\"\n    quota: 1073741824\n"
+        "  - name: \"tenant-a\"\n    quota: 1073741824\n";
+    ASSERT_EQ(::write(quota_fd, quota_yaml, sizeof(quota_yaml) - 1),
+              (ssize_t)(sizeof(quota_yaml) - 1));
+    ::close(quota_fd);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .set_enable_multi_tenants(true)
+                                  .set_tenant_quota_connector_uri(quota_path)
+                                  .build()));
+    master_address_ = master_.master_address();
+    // One SSD owner holds both scopes: it runs on tenant-a, and both the
+    // tenant-a object and the default object offload onto its disk.
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_, nullptr, "", true,
+                                     ssd_path_, "tenant-a"),
+              0);
+
+    auto tenant_caller = RealClient::create();
+    ASSERT_EQ(tenant_caller->setup_real(
+                  "localhost:17814", "P2PHANDSHAKE", 0, 16 * 1024 * 1024, "tcp",
+                  "", master_address_, nullptr, "", false, "", "tenant-a"),
+              0);
+    auto default_caller = RealClient::create();
+    ASSERT_EQ(default_caller->setup_real("localhost:17815", "P2PHANDSHAKE", 0,
+                                         16 * 1024 * 1024, "tcp", "",
+                                         master_address_),
+              0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "tenant_scope_heal";
+
+    auto wait_disk_ready = [&](RealClient* c) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : c->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    auto clear_memory = [&](RealClient* c) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (c->batch_replica_clear({key}, "localhost:17813").size() == 1) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    };
+
+    // tenant-a's object first, then wipe the disk so its backing file is
+    // gone while the master still advertises the replica.
+    ASSERT_EQ(tenant_caller->put(key, source), 0);
+    ASSERT_TRUE(wait_disk_ready(tenant_caller.get()));
+    ASSERT_TRUE(clear_memory(tenant_caller.get()));
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    // A healthy same-named object under the default scope on the same owner.
+    ASSERT_EQ(default_caller->put(key, source), 0);
+    ASSERT_TRUE(wait_disk_ready(default_caller.get()));
+    ASSERT_TRUE(clear_memory(default_caller.get()));
+
+    // The tenant-a read misses on disk, the verify must probe the tenant-a
+    // scope alone (the master resolved the query to tenant-a), prove the file
+    // gone, and evict the dangling replica. The healthy default-scoped object
+    // must not shield it and must not be touched.
+    EXPECT_EQ(tenant_caller->get_buffer(key), nullptr);
+    EXPECT_TRUE(tenant_caller->get_replica_desc(key).empty());
+    EXPECT_NE(default_caller->get_buffer(key), nullptr);
+
+    tenant_caller->tearDownAll();
+    default_caller->tearDownAll();
+    std::remove(quota_path);
+}
+
 }  // namespace testing
 
 }  // namespace mooncake
