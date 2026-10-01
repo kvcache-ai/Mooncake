@@ -46,6 +46,7 @@
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint.h"
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/gdr_reachability.h"
 #include "tent/transport/rdma/params.h"
 #include "tent/transport/rdma/quota.h"
 #include "tent/transport/rdma/rdma_transport.h"
@@ -56,9 +57,20 @@
 namespace mooncake {
 namespace tent {
 
+extern thread_local int tl_wid;
+constexpr size_t kMetadataLifetimeBlockSize = 4096;
+
 // Friend accessor for driving initializeContexts() without a full install().
 class RdmaTransportTestPeer {
    public:
+    static Status generatePostPath(Workers& workers, RdmaSlice* slice) {
+        const int previous = tl_wid;
+        tl_wid = 0;
+        auto status = workers.generatePostPath(slice);
+        tl_wid = previous;
+        return status;
+    }
+
     static void bindTopology(RdmaTransport& transport,
                              std::shared_ptr<Topology> topology) {
         transport.local_topology_ = topology;
@@ -133,6 +145,16 @@ class RdmaTransportTestPeer {
 
     static void setNumWorkers(RdmaTransport& transport, int num_workers) {
         transport.params_->workers.num_workers = num_workers;
+    }
+
+    static Workers& prepareMetadataLifetime(RdmaTransport& transport) {
+        transport.params_->workers.num_workers = 1;
+        transport.params_->workers.block_size = kMetadataLifetimeBlockSize;
+        transport.workers_ = std::make_unique<Workers>(&transport);
+        auto& workers = *transport.workers_;
+        makeWorkerContexts(workers, 1);
+        workers.getDeviceSelector()->setSmartSelection(false);
+        return workers;
     }
 
     static void addInflight(Workers& workers, size_t worker_id, int64_t delta) {
@@ -423,6 +445,183 @@ std::shared_ptr<Topology> topologyWithRdmaNics(size_t count) {
     }
     topology->mem_list_.push_back(std::move(memory));
     return topology;
+}
+
+class RdmaSliceMetadataLifetimeTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        topology_ = topologyWithRdmaNics(2);
+        Topology::MemEntry gpu_memory;
+        gpu_memory.name = "cuda:0";
+        gpu_memory.type = Topology::MEM_CUDA;
+        gpu_memory.numa_node = 0;
+        gpu_memory.device_list[0] = {0, 1};
+        topology_->mem_list_.push_back(std::move(gpu_memory));
+        RdmaTransportTestPeer::bindTopology(transport_, topology_);
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata_);
+        uint16_t local_port = 0;
+        ASSERT_TRUE(metadata_->start(local_port).ok());
+        ASSERT_TRUE(metadata_->segmentManager()
+                        .updateLocal([&](SegmentDesc& segment) {
+                            segment.type = SegmentType::Memory;
+                            segment.machine_id = "metadata-lifetime-test";
+                            segment.rpc_server_addr =
+                                "127.0.0.1:" + std::to_string(local_port);
+                            auto& memory =
+                                std::get<MemorySegmentDesc>(segment.detail);
+                            memory.topology = *topology_;
+                            BufferDesc buffer;
+                            buffer.addr =
+                                reinterpret_cast<uint64_t>(buffer_.data());
+                            buffer.length = buffer_.size();
+                            buffer.location = "cuda:0";
+                            buffer.lkey = {101, 102};
+                            buffer.rkey = {201, 202};
+                            memory.buffers = {buffer};
+                            return Status::OK();
+                        })
+                        .ok());
+        workers_ = &RdmaTransportTestPeer::prepareMetadataLifetime(transport_);
+        ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+        request_.opcode = Request::WRITE;
+        request_.source = buffer_.data();
+        request_.target_offset = reinterpret_cast<uint64_t>(buffer_.data());
+        request_.length = buffer_.size();
+        peer_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        uint16_t port = 0;
+        ASSERT_TRUE(peer_->start(port).ok());
+        peer_name_ = "127.0.0.1:" + std::to_string(port);
+        publishPeer();
+        ASSERT_TRUE(metadata_->segmentManager()
+                        .openRemote(request_.target_id, peer_name_)
+                        .ok());
+    }
+
+    void TearDown() override {
+        if (batch_) {
+            for (auto* first :
+                 static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+                for (auto* slice = first; slice; slice = slice->next) {
+                    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice,
+                                                             0, 0);
+                    slice->task->deref();
+                }
+            }
+            EXPECT_TRUE(transport_.freeSubBatch(batch_).ok());
+        }
+        if (workers_) {
+            std::vector<NicLoadStats> stats;
+            EXPECT_TRUE(
+                workers_->getDeviceSelector()->getNicLoadStats(stats).ok());
+            for (const auto& nic : stats) EXPECT_EQ(nic.inflight_bytes, 0u);
+            RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+        }
+    }
+
+    void publishPeer() {
+        ASSERT_TRUE(peer_->segmentManager()
+                        .updateLocal([&](SegmentDesc& segment) {
+                            segment = *metadata_->segmentManager().getLocal();
+                            segment.name = peer_name_;
+                            segment.rpc_server_addr = peer_name_;
+                            segment.machine_id = "different-machine";
+                            return Status::OK();
+                        })
+                        .ok());
+        metadata_->segmentManager().invalidateRemote(request_.target_id);
+    }
+
+    RdmaTransport transport_;
+    std::shared_ptr<Topology> topology_;
+    std::shared_ptr<ControlService> metadata_;
+    std::shared_ptr<ControlService> peer_;
+    std::string peer_name_;
+    Workers* workers_ = nullptr;
+    Transport::SubBatchRef batch_ = nullptr;
+    Request request_{};
+    std::vector<char> buffer_ = std::vector<char>(kMetadataLifetimeBlockSize);
+};
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       GdrCompletionUsesSliceMetadataAfterTopologyRefresh) {
+    constexpr int kSelectedNicId = 1;
+    batch_->device_mask = 1ULL << kSelectedNicId;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    auto* first = static_cast<RdmaSubBatch*>(batch_)->slice_chain[0];
+    ASSERT_NE(first, nullptr);
+    const auto first_path =
+        RdmaTransportTestPeer::generatePostPath(*workers_, first);
+    ASSERT_TRUE(first_path.ok()) << first_path.ToString();
+    ASSERT_EQ(first->source_gpu_ordinal, 0);
+    ASSERT_EQ(first->target_gpu_ordinal, 0);
+    ASSERT_EQ(first->source_dev_id, kSelectedNicId);
+    ASSERT_EQ(first->target_dev_id, kSelectedNicId);
+    const auto* selected_nic = topology_->getNicEntry(kSelectedNicId);
+    ASSERT_NE(selected_nic, nullptr);
+    const std::string expected_nic_name = selected_nic->name;
+
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    first->ep_weak_ptr = endpoint;
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    RdmaTransportTestPeer::markPosted(*workers_, worker, first, 1000);
+    std::weak_ptr<const SegmentDesc> old_local =
+        metadata_->segmentManager().getLocal();
+    SegmentDescRef remote_pin;
+    ASSERT_TRUE(metadata_->segmentManager()
+                    .getRemoteCached(remote_pin, request_.target_id)
+                    .ok());
+    const std::string expected_machine_id = remote_pin->machine_id;
+    std::weak_ptr<const SegmentDesc> old_remote = remote_pin;
+    remote_pin.reset();
+    // updateLocal publishes a new immutable snapshot even without mutations.
+    ASSERT_TRUE(metadata_->segmentManager()
+                    .updateLocal([](SegmentDesc&) { return Status::OK(); })
+                    .ok());
+    publishPeer();
+    {
+        RdmaTask task;
+        task.request = request_;
+        RdmaSlice second;
+        second.task = &task;
+        second.source_addr = request_.source;
+        second.target_addr = request_.target_offset;
+        second.length = request_.length;
+        ASSERT_TRUE(
+            RdmaTransportTestPeer::generatePostPath(*workers_, &second).ok());
+        RdmaTransportTestPeer::releaseSliceQuota(*workers_, &second, 0, 0);
+    }
+    EXPECT_TRUE(old_local.expired());
+    EXPECT_TRUE(old_remote.expired());
+    EXPECT_EQ(first->source_nic_name, expected_nic_name);
+    EXPECT_EQ(first->target_nic_name, expected_nic_name);
+    EXPECT_EQ(first->target_machine_id, expected_machine_id);
+
+    auto& gdr = GdrReachability::instance();
+    const int source_gpu = first->source_gpu_ordinal;
+    const int target_gpu = first->target_gpu_ordinal;
+    constexpr int kGdrFailureThreshold = 2;
+    for (int i = 0; i < kGdrFailureThreshold; ++i) {
+        gdr.reportLocalFailure(expected_nic_name, source_gpu);
+        gdr.reportRemoteFailure(expected_machine_id, expected_nic_name,
+                                target_gpu);
+    }
+    EXPECT_FALSE(gdr.localReachable(expected_nic_name, source_gpu));
+    EXPECT_FALSE(gdr.remoteReachable(expected_machine_id, expected_nic_name,
+                                     target_gpu));
+    ibv_wc completion{};
+    completion.wr_id = reinterpret_cast<uint64_t>(first);
+    completion.status = IBV_WC_SUCCESS;
+    RdmaContext context(transport_);
+    // A synthetic successful WR owes one completion but is not enqueued on
+    // the endpoint; this exercises only the GDR recovery path.
+    first->completions_owed.fetch_add(1, std::memory_order_acq_rel);
+    RdmaTransportTestPeer::handleCompletion(*workers_, worker, context,
+                                            completion, 2000);
+    EXPECT_EQ(first->completions_owed.load(std::memory_order_acquire), 0);
+    EXPECT_TRUE(gdr.localReachable(expected_nic_name, source_gpu));
+    EXPECT_TRUE(gdr.remoteReachable(expected_machine_id, expected_nic_name,
+                                    target_gpu));
 }
 
 bool waitBatchDone(TransferEngine& engine, BatchID batch) {
