@@ -16,6 +16,7 @@
 #define TENT_ENDPOINT_H
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -135,6 +136,16 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     uint32_t notifyQpNum() const { return notify_qp_ ? notify_qp_->qp_num : 0; }
 
     bool sendNotification(const std::string& name, const std::string& msg);
+
+    // A typed frame carrying session/seq if the peer advertised it and
+    // notifi is stamped; otherwise the raw payload older peers understand.
+    bool sendNotification(const Notification& notifi);
+
+    static bool useTypedNotifyFrame(uint32_t peer_notify_proto, uint64_t seq) {
+        return peer_notify_proto >= 1 && seq != 0;
+    }
+
+    uint32_t peerNotifyProto() const { return peer_notify_proto_; }
 
     // Whether the notify QP is connected and not disabled after a fault.
     bool notifyConnected() const {
@@ -295,6 +306,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::string peer_server_name_;
     std::string peer_nic_name_;
     std::vector<uint32_t> peer_qp_num_list_;
+    uint32_t peer_notify_proto_ = 0;  // BootstrapDesc::notify_proto
     // Notification QP (one per endpoint for control plane operations)
     ibv_qp* notify_qp_ = nullptr;
 
@@ -312,6 +324,10 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::condition_variable notify_send_cv_;
     size_t notify_pending_count_ = 0;  // Number of pending sends
     uint64_t notify_send_wr_id_ = 0;   // Circular counter for wr_id
+    // A peer that stops consuming keeps every slot in flight for good (RNR
+    // NAKs retry without bound), so the wait for a slot has to be bounded.
+    static constexpr std::chrono::milliseconds kNotifySendStallTimeout{1000};
+    bool notify_send_stalled_ = false;
     std::atomic<bool> notify_connected_{false};
     // Notification WRs posted on the notify QP whose completion has not been
     // polled yet. finishDestroy() waits for it: the QP must not be destroyed

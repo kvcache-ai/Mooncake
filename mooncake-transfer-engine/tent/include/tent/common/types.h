@@ -37,6 +37,9 @@ static constexpr uint8_t PRIO_LOW = 2;
 struct Notification {
     std::string name;
     std::string msg;
+    // Stamped by the sending engine (NotifySequencer); 0 means unstamped.
+    uint64_t session = 0;
+    uint64_t seq = 0;
 };
 
 #ifndef LOCAL_SEGMENT_ID

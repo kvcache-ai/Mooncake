@@ -30,6 +30,7 @@
 #include <sstream>
 #include <string_view>
 
+#include "tent/common/notify_frame.h"
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/common/utils/os.h"
@@ -449,6 +450,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         qp_num = qpNum();
         local_desc.qp_num = qp_num;
         local_desc.notify_qp_num = notifyQpNum();
+        local_desc.notify_proto = params_->notify_proto;
         local_desc.local_lid = local_address.lid;
         local_desc.local_gid = local_address.gid;
 
@@ -574,6 +576,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                 "Failed to configure RDMA endpoint" LOC_MARK);
         }
         peer_qp_num_list_ = qp_num;
+        peer_notify_proto_ = peer_desc.notify_proto;
 
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -628,6 +631,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             local_desc.local_lid = local_address_.lid;
             local_desc.local_gid = local_address_.gid;
             local_desc.notify_qp_num = notifyQpNum();
+            local_desc.notify_proto = params_->notify_proto;
             return mooncake::tent::Status::OK();
         }
         // The bootstrap does not match the established connection: the peer
@@ -664,6 +668,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     local_desc.local_lid = local_address_.lid;
     local_desc.local_gid = local_address_.gid;
     local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
+    local_desc.notify_proto = params_->notify_proto;
     if (peer_desc.local_gid.empty()) {
         return mooncake::tent::Status::InvalidArgument(
             "Missing peer GID in bootstrap" LOC_MARK);
@@ -678,6 +683,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             "Failed to configure RDMA endpoint" LOC_MARK);
     }
     peer_qp_num_list_ = peer_desc.qp_num;
+    peer_notify_proto_ = peer_desc.notify_proto;
 
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -1076,38 +1082,13 @@ char* RdmaEndPoint::notifySlotPtr(char* base, size_t idx) {
 bool RdmaEndPoint::encodeNotifyPayload(char* slot, const std::string& name,
                                        const std::string& msg,
                                        uint32_t* out_len) {
-    if (!slot || !out_len) return false;
-    if (name.size() > UINT32_MAX || msg.size() > UINT32_MAX) return false;
-    uint32_t name_len = static_cast<uint32_t>(name.size());
-    uint32_t msg_len = static_cast<uint32_t>(msg.size());
-    const size_t total_size =
-        sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
-    if (total_size > kNotifyBufferSize) return false;
-
-    auto* ptr = slot;
-    std::memcpy(ptr, &name_len, sizeof(name_len));
-    ptr += sizeof(name_len);
-    std::memcpy(ptr, name.data(), name_len);
-    ptr += name_len;
-    std::memcpy(ptr, &msg_len, sizeof(msg_len));
-    ptr += sizeof(msg_len);
-    std::memcpy(ptr, msg.data(), msg_len);
-    *out_len = static_cast<uint32_t>(total_size);
-    return true;
+    return mooncake::tent::encodeNotifyPayload(name, msg, slot,
+                                               kNotifyBufferSize, out_len);
 }
 
 bool RdmaEndPoint::decodeNotifyPayload(const char* data, size_t byte_len,
                                        std::string* name, std::string* msg) {
-    if (!data || !name || !msg || byte_len < 8) return false;
-    uint32_t name_len = 0;
-    std::memcpy(&name_len, data, sizeof(name_len));
-    if (name_len > byte_len - 8) return false;
-    uint32_t msg_len = 0;
-    std::memcpy(&msg_len, data + 4 + name_len, sizeof(msg_len));
-    if (msg_len > byte_len - 8 - name_len) return false;
-    name->assign(data + 4, name_len);
-    msg->assign(data + 4 + name_len + 4, msg_len);
-    return true;
+    return mooncake::tent::decodeNotifyPayload(data, byte_len, name, msg);
 }
 
 void RdmaEndPoint::postNotifyRecv(size_t idx) {
@@ -1247,12 +1228,27 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
 
 bool RdmaEndPoint::sendNotification(const std::string& name,
                                     const std::string& msg) {
+    Notification notifi;
+    notifi.name = name;
+    notifi.msg = msg;
+    return sendNotification(notifi);
+}
+
+bool RdmaEndPoint::sendNotification(const Notification& notifi) {
     // Flow control: wait for pending sends to complete
     std::unique_lock<std::mutex> lock(notify_send_mutex_);
-    notify_send_cv_.wait(lock, [this] {
+    auto slot_free = [this] {
         return !notify_connected_ ||
                notify_pending_count_ < kNotifyMaxPendingSends;
-    });
+    };
+    if (notify_send_stalled_ && !slot_free()) return false;
+    if (!notify_send_cv_.wait_for(lock, kNotifySendStallTimeout, slot_free)) {
+        notify_send_stalled_ = true;
+        LOG(WARNING) << "Notification send queue stalled on endpoint "
+                     << endpoint_name_ << ": " << notify_pending_count_
+                     << " sends unacknowledged";
+        return false;
+    }
     if (!notify_connected_) {
         // Every send on this endpoint fails the same way until it is
         // rebuilt, and the caller has a fallback path; one line per hundred
@@ -1269,7 +1265,16 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     size_t slot = notify_send_wr_id_ % kNotifyMaxPendingSends;
     char* slot_ptr = notifySlotPtr(notify_send_buffer_.data(), slot);
     uint32_t total_size = 0;
-    if (!encodeNotifyPayload(slot_ptr, name, msg, &total_size)) {
+    NotifyFrameHeader header;
+    header.session = notifi.session;
+    header.seq = notifi.seq;
+    // Too big for the frame header as well: send it raw, without dedup.
+    const bool encoded =
+        (useTypedNotifyFrame(peer_notify_proto_, notifi.seq) &&
+         encodeNotifyFrame(header, notifi.name, notifi.msg, slot_ptr,
+                           kNotifyBufferSize, &total_size)) ||
+        encodeNotifyPayload(slot_ptr, notifi.name, notifi.msg, &total_size);
+    if (!encoded) {
         LOG(ERROR) << "Failed to encode notification payload";
         return false;
     }
@@ -1326,9 +1331,21 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     }
 
     char* data = notifySlotPtr(notify_recv_buffer_.data(), buffer_idx);
-    std::string name;
-    std::string msg;
-    if (!decodeNotifyPayload(data, byte_len, &name, &msg)) {
+    Notification notifi;
+    bool decoded;
+    if (isNotifyFrameMagic(data, byte_len)) {
+        NotifyFrameHeader header;
+        decoded = decodeNotifyFrame(data, byte_len, &header, &notifi.name,
+                                    &notifi.msg);
+        if (decoded) {
+            notifi.session = header.session;
+            notifi.seq = header.seq;
+        }
+    } else {
+        decoded =
+            decodeNotifyPayload(data, byte_len, &notifi.name, &notifi.msg);
+    }
+    if (!decoded) {
         LOG(ERROR) << "Invalid notification message size or format: "
                    << byte_len;
         rearmNotifyRecv(buffer_idx);
@@ -1336,7 +1353,7 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     }
 
     // Add directly to transport queue (skip endpoint queue for lower latency)
-    context_->transport_.addNotificationToQueue(name, msg);
+    context_->transport_.addNotificationToQueue(notifi);
 
     // Repost recv buffer
     rearmNotifyRecv(buffer_idx);
@@ -1347,6 +1364,7 @@ void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
     std::lock_guard<std::mutex> lock(notify_send_mutex_);
     if (notify_pending_count_ > 0) {
         notify_pending_count_--;
+        notify_send_stalled_ = false;
         notify_send_cv_.notify_one();
     }
 }

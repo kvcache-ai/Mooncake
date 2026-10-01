@@ -30,6 +30,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 #include <limits>
 
 #include "tent/runtime/metastore.h"
@@ -52,11 +53,15 @@ struct BootstrapDesc {
     std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
+    // Formats this side's notify QP accepts: 0 = raw payload only (what an
+    // older peer's missing field decodes to), 1 = typed frames as well.
+    uint32_t notify_proto = 0;
 
    public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
-                                   qp_num, local_lid, local_gid, reply_msg,
-                                   notify_qp_num);
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(BootstrapDesc, local_nic_path,
+                                                peer_nic_path, qp_num,
+                                                local_lid, local_gid, reply_msg,
+                                                notify_qp_num, notify_proto);
 };
 
 // UB/URMA has Jetty, JFC and EID concepts that are not wire-compatible with
@@ -141,6 +146,56 @@ using OnReceiveUbBootstrap = std::function<int(const UbBootstrapDesc& request,
 
 using OnNotify = std::function<int(const Notification&)>;
 
+// Peers whose control plane did not answer, by rpc_server_addr, so finding a
+// dead peer costs one RPC timeout rather than one per call. Process-wide.
+class PeerHealth {
+   public:
+    using Clock = std::chrono::steady_clock;
+
+    static constexpr std::chrono::milliseconds kMaxCooldown{60000};
+    static constexpr std::chrono::milliseconds kMaxAge{600000};
+
+    struct Config {
+        bool enabled = true;
+        std::chrono::milliseconds cooldown{5000};
+        std::chrono::milliseconds probe_interval{1000};  // <= 0: no prober
+        std::chrono::milliseconds probe_timeout{2000};   // the prober's dials
+    };
+
+    static PeerHealth& instance();
+
+    void configure(const Config& config);
+    Config config() const;
+
+    bool shouldFailFast(const std::string& addr,
+                        Clock::time_point now = Clock::now());
+
+    void markUnreachable(const std::string& addr,
+                         Clock::time_point now = Clock::now());
+
+    void markReachable(const std::string& addr);
+
+    // Entries older than kMaxAge, an address gone for good, are forgotten
+    // here and whenever a new one is added.
+    std::vector<std::string> unreachablePeers(
+        Clock::time_point now = Clock::now());
+
+    void clear();
+
+   private:
+    struct Entry {
+        Clock::time_point first_failure;
+        Clock::time_point dead_until;
+        std::chrono::milliseconds cooldown;
+    };
+
+    void forgetOldNoLock(Clock::time_point now);
+
+    mutable std::mutex mutex_;
+    Config config_;
+    std::unordered_map<std::string, Entry> entries_;
+};
+
 class ControlClient {
    public:
     ControlClient() {}
@@ -148,6 +203,10 @@ class ControlClient {
     ~ControlClient() {}
 
    public:
+    // Process-wide, like ControlClient itself: the last engine set it wins.
+    static void setRequestTimeout(std::chrono::milliseconds timeout);
+    static std::chrono::milliseconds requestTimeout();
+
     static Status getSegmentDesc(const std::string& server_addr,
                                  std::string& response);
 
@@ -175,7 +234,11 @@ class ControlClient {
     static Status notify(const std::string& server_addr,
                          const Notification& message);
 
-    static Status probe(const std::string& server_addr);
+    // Always dials, even a marked peer; a non-positive timeout means the
+    // request timeout.
+    static Status probe(
+        const std::string& server_addr,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(-1));
 
     static Status delegate(const std::string& server_addr,
                            const Request& request);
@@ -203,6 +266,15 @@ class ControlClient {
     static void notifySegmentUpdatedAsync(
         const std::string& server_addr, const std::string& segment_name,
         const onNotifySegmentUpdateFailure& on_failure);
+
+   private:
+    static Status callGuarded(const std::string& server_addr, int func_id,
+                              const std::string_view& request,
+                              std::string& response,
+                              std::chrono::milliseconds timeout,
+                              bool bypass_peer_health = false,
+                              bool* peer_unreachable = nullptr,
+                              bool* peer_answered = nullptr);
 };
 
 class ControlService {
@@ -263,9 +335,16 @@ class ControlService {
 
     void finishNotifyCallback();
 
+    void peerProberLoop();
+
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
+
+    std::thread peer_prober_;
+    std::mutex prober_mutex_;
+    std::condition_variable prober_cv_;
+    bool prober_stop_ = false;
 
     std::mutex bootstrap_cb_mutex_;
     std::condition_variable bootstrap_cb_cv_;

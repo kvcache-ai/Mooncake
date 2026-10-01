@@ -150,6 +150,7 @@ TEST(LocalNotificationTest, WorksWithoutAnyNotificationTransport) {
 class LocalSendFailsTransport : public Transport {
    public:
     int send_attempts = 0;
+    std::vector<uint64_t> seqs;
     // Lets a test stop failing, standing in for a peer that comes back.
     bool fail_sends = true;
 
@@ -161,8 +162,9 @@ class LocalSendFailsTransport : public Transport {
 
     bool supportNotification() const override { return true; }
 
-    Status sendNotification(SegmentID, const Notification&) override {
+    Status sendNotification(SegmentID, const Notification& notifi) override {
         ++send_attempts;
+        seqs.push_back(notifi.seq);
         if (!fail_sends) return Status::OK();
         return Status::InternalError("Notification QP not connected");
     }
@@ -339,6 +341,10 @@ TEST(LocalNotificationTest, NotifiedTargetIsNotRedeliveredWhileAPeerFails) {
     // The peer really was retried while it was down, so the guard above comes
     // from per-target progress and not from the hook giving up.
     EXPECT_GT(probe->send_attempts, 1);
+    // Every retry of the remote leg carries the stamp of its first attempt.
+    ASSERT_FALSE(probe->seqs.empty());
+    EXPECT_NE(probe->seqs.front(), 0u);
+    for (uint64_t seq : probe->seqs) EXPECT_EQ(seq, probe->seqs.front());
 
     (void)engine.freeBatch(batch);
     (void)engine.unregisterLocalMemory(source.data(), kBufLen);
