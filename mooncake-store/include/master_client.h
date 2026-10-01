@@ -442,6 +442,10 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::string, ErrorCode> GetFsdir();
 
+    /** @brief Query the status of a mounted segment by name. */
+    [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
+        const std::string& segment_name);
+
     [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
 
@@ -666,6 +670,26 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
         const UUID& task_id);
+
+    /**
+     * @brief Start a cluster-wide drain of the requested memory segments.
+     * The master schedules replica moves; source clients execute them.
+     * Drain jobs are not persisted across master failover.
+     */
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+
+    /** @brief Query drain progress, including terminal state and counters. */
+    [[nodiscard]] tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(
+        const UUID& job_id);
+
+    /**
+     * @brief Cancel a nonterminal drain job with no active move tasks.
+     * Restores its source segments to OK. Otherwise returns
+     * UNAVAILABLE_IN_CURRENT_STATUS; unknown jobs return JOB_NOT_FOUND.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CancelDrainJob(
+        const UUID& job_id);
 
     /**
      * @brief Fetch tasks assigned to a client
