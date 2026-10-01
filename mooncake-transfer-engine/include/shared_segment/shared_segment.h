@@ -58,12 +58,17 @@ struct SharedSegmentOptions {
     int32_t device_id = 0;
     // true: unnamed memfd + mmap. Prefer THP (MADV_HUGEPAGE) so the kernel
     // can back the span with 2MiB pages; 4KiB pages if THP cannot allocate.
-    // Does not use the HugeTLB pool. Ranks share the pages through the memfd.
-    // false: platform VMM with a fabric shareable handle.
+    // Does not use the HugeTLB pool unless `hugetlb` is also true. Ranks share
+    // the pages through the memfd. false: platform VMM with a fabric shareable
+    // handle.
     bool mmap = true;
     // When mmap is true: HostRegister the pages for device_id (Ascend).
     // Needed for TE location=npu ROCE D2rH; off by default.
     bool host_register = false;
+    // When mmap is true: unnamed memfd with MFD_HUGETLB. Requires a HugeTLB
+    // pool (`vm.nr_hugepages`); Create fails if the pool cannot back the span.
+    // Default false keeps the THP path.
+    bool hugetlb = false;
 };
 
 class SharedSegmentBackend;
@@ -84,8 +89,10 @@ class SharedSegment {
 
     // Whether this build can share memory across processes. mmap uses an
     // anonymous memfd (always available). host_register additionally needs
-    // Ascend. VMM (mmap=false) needs a platform fabric backend.
-    static bool Supported(bool mmap = true, bool host_register = false);
+    // Ascend. hugetlb additionally needs mmap. VMM (mmap=false) needs a
+    // platform fabric backend. Runtime HugeTLB pool capacity is not probed.
+    static bool Supported(bool mmap = true, bool host_register = false,
+                          bool hugetlb = false);
 
     // Phase two. `blobs` is indexed by rank. After success, `ready()` is true
     // and `base_addr()` is valid.
