@@ -74,12 +74,61 @@ AllocatedBuffer::~AllocatedBuffer() {
     }
 }
 
+AllocatedBuffer::AllocatedBuffer(AllocatedBuffer&& other) noexcept
+    : allocator_(std::move(other.allocator_)),
+      segment_lifetime_(std::move(other.segment_lifetime_)),
+      client_liveness_(std::move(other.client_liveness_)),
+      segment_name_(std::move(other.segment_name_)),
+      buffer_ptr_(other.buffer_ptr_),
+      size_(other.size_),
+      reserved_size_(other.reserved_size_),
+      protocol(std::move(other.protocol)),
+      offset_handle_(std::move(other.offset_handle_)) {
+    // The moved-from object no longer owns the allocation, so its destructor
+    // must neither release the chunk nor decrement the usage counters again.
+    other.allocator_.reset();
+    other.buffer_ptr_ = nullptr;
+    other.size_ = 0;
+    other.reserved_size_ = std::nullopt;
+    other.offset_handle_.reset();
+}
+
+AllocatedBuffer& AllocatedBuffer::operator=(AllocatedBuffer&& other) noexcept {
+    if (this != &other) {
+        // Release the destination's previous allocation exactly once before
+        // adopting the source. size_/buffer_ptr_ are still the old values.
+        if (auto alloc = allocator_.lock()) {
+            alloc->deallocate(this);
+        }
+        allocator_ = std::move(other.allocator_);
+        segment_lifetime_ = std::move(other.segment_lifetime_);
+        client_liveness_ = std::move(other.client_liveness_);
+        segment_name_ = std::move(other.segment_name_);
+        buffer_ptr_ = other.buffer_ptr_;
+        size_ = other.size_;
+        reserved_size_ = other.reserved_size_;
+        protocol = std::move(other.protocol);
+        // Releasing the previous offset handle is handled by its own move
+        // assignment; the destination must not free the source's node twice.
+        offset_handle_ = std::move(other.offset_handle_);
+
+        other.allocator_.reset();
+        other.buffer_ptr_ = nullptr;
+        other.size_ = 0;
+        other.reserved_size_ = std::nullopt;
+        other.offset_handle_.reset();
+    }
+    return *this;
+}
+
 AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                                  const AllocatedBuffer::Descriptor& descriptor)
     : allocator_(std::move(allocator)),
       buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
       size_(descriptor.size_),
       protocol(descriptor.protocol_) {
+    // A descriptor carries only the requested transfer length. reserved_size_
+    // stays nullopt (unknown) until a real allocation is bound to this buffer.
     if (protocol == "cxl") {
         segment_name_ = descriptor.transport_endpoint_;
     }
@@ -248,8 +297,32 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         LOG(ERROR) << "allocation_unknown_exception";
         return nullptr;
     }
+    // The requested length is rounded up to a CacheLib allocation class. Read
+    // the class size of the chunk that was actually handed out instead of
+    // re-deriving it from padding_size, which is only the allocation input.
+    const std::optional<std::size_t> reserved_size = lookupReservedSize(buffer);
+    if (!reserved_size.has_value() || *reserved_size < size) {
+        // A raw chunk whose extent cannot be attributed, or that is somehow
+        // reported smaller than the request, must be returned to the allocator
+        // instead of being recorded as a live allocation.
+        LOG(ERROR) << "allocation_reserved_lookup_failed size=" << size
+                   << " reserved="
+                   << (reserved_size.has_value()
+                           ? std::to_string(*reserved_size)
+                           : std::string("unknown"))
+                   << " segment=" << segment_name_ << " address=" << buffer;
+        try {
+            memory_allocator_->free(buffer);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "allocation_rollback_exception error=" << e.what();
+        } catch (...) {
+            LOG(ERROR) << "allocation_rollback_unknown_exception";
+        }
+        return nullptr;
+    }
     VLOG(1) << "allocation_succeeded size=" << size
-            << " segment=" << segment_name_ << " address=" << buffer;
+            << " reserved=" << *reserved_size << " segment=" << segment_name_
+            << " address=" << buffer;
     RecordAllocation(size);
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
@@ -258,7 +331,30 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
     }
-    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
+    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size,
+                                             reserved_size);
+}
+
+std::optional<std::size_t> CachelibBufferAllocator::lookupReservedSize(
+    const void* buffer) const {
+    if (buffer == nullptr || !memory_allocator_) {
+        return std::nullopt;
+    }
+    try {
+        // getAllocInfo reads this chunk's slab header and reports the
+        // allocation class size configured for it. Addresses that this
+        // allocator cannot attribute (for example a CXL offset) are rejected
+        // by SlabAllocator::isValidSlab and surface as an exception here.
+        return static_cast<std::size_t>(
+            memory_allocator_->getAllocInfo(buffer).allocSize);
+    } catch (const std::exception& e) {
+        VLOG(1) << "reserved_lookup_failed segment=" << segment_name_
+                << " error=" << e.what();
+        return std::nullopt;
+    } catch (...) {
+        VLOG(1) << "reserved_lookup_unknown_failure segment=" << segment_name_;
+        return std::nullopt;
+    }
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
@@ -288,7 +384,7 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 }
 
 std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
-    const LiveAllocation& allocation) {
+    const LiveAllocation& allocation, std::size_t reserved_size) {
     RecordAllocation(allocation.requested_size);
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_allocated_mem_size(
@@ -300,7 +396,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
     return std::make_unique<AllocatedBuffer>(
         shared_from_this(),
         reinterpret_cast<void*>(base_ + allocation.offset_from_base),
-        allocation.requested_size);
+        allocation.requested_size, reserved_size);
 }
 
 std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
@@ -335,10 +431,30 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
         return std::nullopt;
     }
 
+    // Resolve every recovered chunk's real class extent before recording any
+    // usage, so a partially adopted import can never publish accounting.
+    std::vector<std::size_t> reserved_sizes;
+    reserved_sizes.reserve(allocations.size());
+    for (const auto& allocation : allocations) {
+        const void* address =
+            reinterpret_cast<const void*>(base + allocation.offset_from_base);
+        const std::optional<std::size_t> reserved =
+            allocator->lookupReservedSize(address);
+        if (!reserved.has_value() || *reserved < allocation.requested_size) {
+            LOG(ERROR) << "import_reserved_lookup_failed offset="
+                       << allocation.offset_from_base
+                       << " requested=" << allocation.requested_size
+                       << " segment=" << segment_name;
+            return std::nullopt;
+        }
+        reserved_sizes.push_back(*reserved);
+    }
+
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
     buffers.reserve(allocations.size());
-    for (const auto& allocation : allocations) {
-        buffers.push_back(allocator->adoptImportedBuffer(allocation));
+    for (size_t i = 0; i < allocations.size(); ++i) {
+        buffers.push_back(
+            allocator->adoptImportedBuffer(allocations[i], reserved_sizes[i]));
     }
     return RestoredCachelibBufferAllocator{std::move(allocator),
                                            std::move(buffers)};
@@ -493,10 +609,26 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create AllocatedBuffer with the allocated memory
         void* buffer_ptr = allocation_handle->ptr();
 
+        // The handle already carries the real node extent read under the
+        // allocator lock; no rounding is re-derived here. A live allocation
+        // that cannot report its extent fails here: returning nullptr destroys
+        // the handle, which releases the node, so nothing leaks and no usage is
+        // recorded. `nullopt` is reserved for buffers that own no allocation.
+        const auto handle_reserved = allocation_handle->reserved_size();
+        if (!handle_reserved.has_value() ||
+            static_cast<std::size_t>(*handle_reserved) < size) {
+            LOG(ERROR) << "allocation_reserved_unavailable size=" << size
+                       << " segment=" << segment_name_;
+            return nullptr;
+        }
+        const std::optional<std::size_t> reserved_size =
+            static_cast<std::size_t>(*handle_reserved);
+
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
+            shared_from_this(), buffer_ptr, size, reserved_size,
+            std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {

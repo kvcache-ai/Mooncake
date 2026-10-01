@@ -73,12 +73,16 @@ class OffsetAllocationHandle {
     OffsetAllocationHandle()
         : m_allocation(OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE),
           real_base(0),
-          requested_size(0) {}
+          requested_size(0),
+          reserved_size_(std::nullopt) {}
 
-    // Constructor for valid allocation
+    // Constructor for valid allocation. `reserved_size` is the node extent the
+    // allocator actually consumed for this allocation; nullopt means the
+    // extent cannot be attributed to a live node.
     OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
                            OffsetAllocation allocation, uint64_t base,
-                           uint64_t size);
+                           uint64_t size,
+                           std::optional<uint64_t> reserved_size);
 
     // Move constructor
     OffsetAllocationHandle(OffsetAllocationHandle&& other) noexcept;
@@ -104,6 +108,10 @@ class OffsetAllocationHandle {
     // Get size
     uint64_t size() const { return requested_size; }
 
+    // Node extent this allocator reserved for the allocation, or nullopt when
+    // it cannot be attributed to a live node. Never serialized.
+    std::optional<uint64_t> reserved_size() const { return reserved_size_; }
+
    private:
     std::weak_ptr<OffsetAllocator> m_allocator;
     // The offset in m_allocation may not be equal to the real offset.
@@ -111,6 +119,8 @@ class OffsetAllocationHandle {
     // The real base and requested size of the allocated memory.
     uint64_t real_base;
     uint64_t requested_size;
+    // Runtime-only reserved extent; reconstructed from the node after restore.
+    std::optional<uint64_t> reserved_size_;
 
     friend class OffsetAllocatorTest;  // for unit tests
     friend class Serializer<OffsetAllocationHandle>;
@@ -170,6 +180,13 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
     [[nodiscard]] std::optional<OffsetAllocationHandle> createHandleAtNode(
         uint32_t node_index, uint64_t real_offset, uint64_t requested_size);
+
+    // Node extent reserved for an allocation this allocator previously handed
+    // out, or nullopt when it cannot be attributed to a live node. Used to
+    // rebuild the runtime reserved field for handles restored from persisted
+    // state; it never re-derives the extent from current rounding rules.
+    [[nodiscard]] std::optional<uint64_t> allocationReservedSize(
+        const OffsetAllocation& allocation) const;
 
     // Returns the actual region size consumed by allocate(size), or zero when
     // the request cannot be represented by this allocator.
