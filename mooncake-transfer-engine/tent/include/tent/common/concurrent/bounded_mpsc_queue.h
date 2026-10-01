@@ -96,6 +96,25 @@ struct BoundedMPSCQueue {
         }
     }
 
+    // A canceled reservation publishes an empty entry, which still needs to
+    // be consumed to release its slot. Check publication rather than T's
+    // contents, and do not report entries behind an uncommitted head as ready.
+    bool has_ready() const {
+        uint64_t pos = head.load(std::memory_order_relaxed);
+        const Cell *cell = &buffer[pos % Capacity];
+        return cell->sequence.load(std::memory_order_acquire) == pos + 1;
+    }
+
+    // Consumer-only: empty canceled entries do not require send quota. Stop
+    // at a real entry or an unpublished head so FIFO publication is preserved.
+    void discard_empty_entries() {
+        while (has_ready()) {
+            uint64_t pos = head.load(std::memory_order_relaxed);
+            if (buffer[pos % Capacity].data.num_slices != 0) break;
+            pop();
+        }
+    }
+
     T pop() {
         uint64_t pos = head.load(std::memory_order_relaxed);
         Cell *cell = &buffer[pos % Capacity];

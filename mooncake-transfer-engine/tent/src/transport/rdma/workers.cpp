@@ -398,9 +398,13 @@ Status Workers::admitBatch(std::vector<RdmaSliceList>& slice_lists) {
         auto& queue = worker_context_[i].queues[priority];
         if (!queue.try_reserve(admission.reservation)) {
             for (auto& reserved : pending) {
-                worker_context_[reserved.worker_id]
-                    .queues[reserved.priority]
-                    .cancel_reservation(reserved.reservation);
+                auto& worker = worker_context_[reserved.worker_id];
+                worker.queues[reserved.priority].cancel_reservation(
+                    reserved.reservation);
+                // Empty reservations do not count as inflight slices, but an
+                // idle consumer must wake to drain them and return queue slots.
+                std::lock_guard<std::mutex> lock(worker.mutex);
+                if (worker.in_suspend) worker.cv.notify_all();
             }
             return Status::TooManyRequests(
                 "Worker submit queue is full; batch was not "
@@ -766,6 +770,9 @@ void Workers::asyncPostSend() {
     // behind producers that keep refilling freed slots (issue #3637).
     auto& overflow = worker.requeue_overflow;
     for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
+        // Return canceled reservation slots even when this priority cannot
+        // send. Real entries and the local overflow remain quota-controlled.
+        worker.queues[prio].discard_empty_entries();
         if (shared_quota && !shared_quota->canSend(prio)) continue;
         for (auto it = overflow.begin(); it != overflow.end();) {
             if (it->first == prio) {
@@ -1219,13 +1226,20 @@ void Workers::workerThread(int thread_id) {
     tl_wid = thread_id;
     auto& worker = worker_context_[thread_id];
 
+    auto has_queued_entries = [&worker]() {
+        for (const auto& queue : worker.queues) {
+            if (queue.has_ready()) return true;
+        }
+        return false;
+    };
+
     uint64_t grace_ts = 0;
     uint64_t last_perf_logging_ts = 0;
     while (running_) {
         auto current_ts = getCurrentTimeInNano();
         auto inflight_slices =
             worker.inflight_slices.load(std::memory_order_relaxed);
-        if (inflight_slices ||
+        if (inflight_slices || has_queued_entries() ||
             current_ts - grace_ts <
                 transport_->params_->workers.grace_period_ns) {
             asyncPostSend();
@@ -1241,8 +1255,10 @@ void Workers::workerThread(int thread_id) {
             std::unique_lock<std::mutex> lock(worker.mutex);
             worker.in_suspend = true;
             worker.cv.wait(lock, [&]() -> bool {
-                return !running_ || worker.inflight_slices.load(
-                                        std::memory_order_acquire) > 0;
+                return !running_ ||
+                       worker.inflight_slices.load(std::memory_order_acquire) >
+                           0 ||
+                       has_queued_entries();
             });
             worker.in_suspend = false;
         }
