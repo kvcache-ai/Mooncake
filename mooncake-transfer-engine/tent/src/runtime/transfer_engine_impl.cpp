@@ -389,6 +389,21 @@ Status TransferEngineImpl::construct() {
             : 1;
     CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, rpc_threads_default,
                                                rpc_server_threads));
+    {
+        using std::chrono::milliseconds;
+        ControlClient::setRequestTimeout(
+            milliseconds(conf_->get("rpc/request_timeout_ms", int64_t{-1})));
+
+        PeerHealth::Config peer_health;
+        peer_health.enabled = conf_->get("peer_health/enable", true);
+        peer_health.cooldown =
+            milliseconds(conf_->get("peer_health/cooldown_ms", int64_t{5000}));
+        peer_health.probe_interval = milliseconds(
+            conf_->get("peer_health/probe_interval_ms", int64_t{1000}));
+        peer_health.probe_timeout =
+            milliseconds(conf_->get("rpc/probe_timeout_ms", int64_t{2000}));
+        PeerHealth::instance().configure(peer_health);
+    }
     merge_requests_ = conf_->get("merge_requests", true);
     notify_rpc_fallback_ = conf_->get("notification/rpc_fallback", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
@@ -3079,40 +3094,16 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
 
 Status TransferEngineImpl::sendNotificationViaRpc(SegmentID target_id,
                                                   const Notification& notifi) {
-    return metadata_->segmentManager().withCachedSegment(
-        target_id, [&](SegmentDesc* segment) {
-            auto rpc_server_addr = segment->rpc_server_addr;
-            if (rpc_server_addr.empty()) {
-                return Status::NeedsRefreshCache(
-                    "Empty RPC server addr" LOC_MARK);
-            }
-            auto status = ControlClient::notify(rpc_server_addr, notifi);
-            if (status.IsRpcServiceError()) {
-                // Perhaps rpc_server_addr can be updated in the future
-                return Status::NeedsRefreshCache(
-                    "RPC service error: " + std::string{status.message()} +
-                    LOC_MARK);
-            }
-            return status;
+    return metadata_->segmentManager().withPeerRpcAddr(
+        target_id, [&](const std::string& rpc_server_addr) {
+            return ControlClient::notify(rpc_server_addr, notifi);
         });
 }
 
 Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
-    return metadata_->segmentManager().withCachedSegment(
-        target_id, [&](SegmentDesc* segment) {
-            auto rpc_server_addr = segment->rpc_server_addr;
-            if (rpc_server_addr.empty()) {
-                return Status::NeedsRefreshCache(
-                    "Empty RPC server addr" LOC_MARK);
-            }
-            auto status = ControlClient::probe(rpc_server_addr);
-            if (status.IsRpcServiceError()) {
-                // Perhaps rpc_server_addr can be updated in the future
-                return Status::NeedsRefreshCache(
-                    "RPC service error: " + std::string{status.message()} +
-                    LOC_MARK);
-            }
-            return status;
+    return metadata_->segmentManager().withPeerRpcAddr(
+        target_id, [&](const std::string& rpc_server_addr) {
+            return ControlClient::probe(rpc_server_addr);
         });
 }
 

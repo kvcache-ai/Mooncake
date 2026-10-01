@@ -389,5 +389,84 @@ TEST(NotificationFallbackTest, RpcNotifyLandsWithoutTcpTransport) {
     EXPECT_TRUE(received.empty());
 }
 
+// A dead control plane is reported as such and the cached desc survives.
+TEST(NotificationFallbackTest, ControlPlaneFailureKeepsTheCachedSegment) {
+    TransferEngineImpl sender(makeConfig());
+    ASSERT_TRUE(sender.available());
+    installStub(sender, RDMA, "<sender-rdma-unavailable>",
+                Status::RdmaError("RDMA notification channel unavailable"));
+    SegmentID remote = ~0ull;
+    SegmentInfo info;
+    {
+        TransferEngineImpl receiver(makeConfig());
+        ASSERT_TRUE(receiver.available());
+        ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+        ASSERT_TRUE(sender.getSegmentInfo(remote, info).ok());  // now cached
+    }
+
+    const Status status =
+        sender.sendNotification(remote, makeNotification("dead"));
+    EXPECT_TRUE(status.IsRpcServiceError()) << status.ToString();
+    EXPECT_TRUE(sender.getSegmentInfo(remote, info).ok())
+        << "the cached desc was dropped by a refetch";
+
+    const Status probe = sender.probePeerAliveByID(remote);
+    EXPECT_TRUE(probe.IsRpcServiceError()) << probe.ToString();
+    EXPECT_TRUE(sender.getSegmentInfo(remote, info).ok());
+    PeerHealth::instance().clear();
+}
+
+// A peer back on the same address answers the first probe after its restart.
+TEST(NotificationFallbackTest, RestartedPeerAnswersTheFirstProbe) {
+    TransferEngineImpl sender(makeConfig());
+    ASSERT_TRUE(sender.available());
+    SegmentID remote = ~0ull;
+    std::string name;
+    {
+        TransferEngineImpl first(makeConfig());
+        ASSERT_TRUE(first.available());
+        name = first.getSegmentName();
+        ASSERT_TRUE(sender.openSegment(remote, name).ok());
+        ASSERT_TRUE(sender.probePeerAliveByID(remote).ok());
+    }
+    auto config = makeConfig();
+    config->set("rpc_server_port", name.substr(name.rfind(':') + 1));
+    TransferEngineImpl second(config);
+    ASSERT_EQ(second.getSegmentName(), name);
+    const Status status = sender.probePeerAliveByID(remote);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+}
+
+// The same for the first notification after the restart, delivered once.
+TEST(NotificationFallbackTest, RestartedPeerAnswersTheFirstNotify) {
+    TransferEngineImpl sender(makeConfig());
+    ASSERT_TRUE(sender.available());
+    installStub(sender, RDMA, "<sender-rdma-unavailable>",
+                Status::RdmaError("RDMA notification channel unavailable"));
+    SegmentID remote = ~0ull;
+    std::string name;
+    std::vector<Notification> received;
+    {
+        TransferEngineImpl first(makeConfig());
+        ASSERT_TRUE(first.available());
+        name = first.getSegmentName();
+        ASSERT_TRUE(sender.openSegment(remote, name).ok());
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotification("before")).ok());
+        ASSERT_TRUE(first.receiveNotification(received).ok());
+        ASSERT_EQ(received.size(), 1u);
+    }
+    auto config = makeConfig();
+    config->set("rpc_server_port", name.substr(name.rfind(':') + 1));
+    TransferEngineImpl second(config);
+    ASSERT_EQ(second.getSegmentName(), name);
+    const Status status =
+        sender.sendNotification(remote, makeNotification("after"));
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    ASSERT_TRUE(second.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0].msg, "after");
+}
+
 }  // namespace tent
 }  // namespace mooncake
