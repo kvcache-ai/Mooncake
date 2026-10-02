@@ -2153,6 +2153,8 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_readwrite("avoid_replicas_on_same_host",
+                       &ReplicateConfig::avoid_replicas_on_same_host)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
         .def("__str__", [](const ReplicateConfig &config) {

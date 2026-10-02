@@ -117,6 +117,12 @@ struct ReplicateConfig {
     std::vector<std::string>
         preferred_nof_segments{};  // Preferred NoF segments for allocation
     bool prefer_alloc_in_same_node{false};
+    // When true (default), an object's replicas are placed on different hosts,
+    // so losing one host cannot take down more than one replica. Set false to
+    // fall back to distinct-segment isolation only. Best-effort: if the
+    // replicas cannot all land on different hosts, as many as possible are
+    // still placed (the replica count is never reduced by this).
+    bool avoid_replicas_on_same_host{true};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
     // Optional per-key group IDs. Empty string keeps that key
@@ -165,6 +171,8 @@ struct ReplicateConfig {
         os << "]";
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node
+           << ", avoid_replicas_on_same_host: "
+           << config.avoid_replicas_on_same_host
            << ", data_type: " << config.data_type;
         if (!config.host_id.empty()) {
             os << ", host_id: " << config.host_id;
