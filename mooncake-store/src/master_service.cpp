@@ -13571,19 +13571,19 @@ MasterService::MetadataSerializer::Serialize(
               [](const auto& lhs, const auto& rhs) {
                   return lhs.first.value() < rhs.first.value();
               });
-    const size_t slots = std::min(tenants_with_metadata.size(), shard_slots_);
+    const size_t slots =
+        std::min(tenants_with_metadata.size(), ha::kSnapshotShardSlots);
     packer.pack_map(slots);
 
     for (size_t slot = 0; slot < slots; ++slot) {
         packer.pack(static_cast<uint32_t>(slot));
-        // One tenant per slot, except the last, which carries every tenant the
-        // slots before it did not.
-        const size_t begin = slot;
-        const size_t end =
-            slot + 1 < slots ? slot + 1 : tenants_with_metadata.size();
+        // One tenant per slot while the payload has no more tenants than slots.
+        // Beyond that they are spread over the slots, so no single entry
+        // carries the whole overflow and one entry's decompressed size stays
+        // bounded.
         std::vector<std::pair<TenantId, const metadata::Tenant*>> members;
-        members.reserve(end - begin);
-        for (size_t index = begin; index < end; ++index) {
+        for (size_t index = slot; index < tenants_with_metadata.size();
+             index += slots) {
             members.emplace_back(tenants_with_metadata[index].first,
                                  tenants_with_metadata[index].second.get());
         }

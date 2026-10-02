@@ -1760,14 +1760,7 @@ class MasterService {
 
     class MetadataSerializer {
        public:
-        // `shard_slots` is the format's, not a choice: a master that predates
-        // the tenant model reads each entry key as one of its shards, so a
-        // payload keeps its keys inside them. A test can pass a small count and
-        // exercise the boundary with few tenants.
-        explicit MetadataSerializer(
-            MasterService* service,
-            size_t shard_slots = ha::kSnapshotShardSlots)
-            : service_(service), shard_slots_(shard_slots) {}
+        MetadataSerializer(MasterService* service) : service_(service) {}
 
         // Serialize the metadata of every tenant that holds objects, together
         // with the frozen weight metadata when the caller supplies it.
@@ -1784,7 +1777,6 @@ class MasterService {
 
        private:
         MasterService* service_;
-        size_t shard_slots_;
 
         // Serialize a single ObjectMetadata
         tl::expected<void, SerializationError> SerializeMetadata(
