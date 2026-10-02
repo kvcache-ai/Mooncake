@@ -1764,9 +1764,9 @@ class MasterService {
         // the tenant model reads each entry key as one of its shards, so a
         // payload keeps its keys inside them. A test can pass a small count and
         // exercise the boundary with few tenants.
-        explicit MetadataSerializer(MasterService* service,
-                                    size_t shard_slots =
-                                        ha::kSnapshotShardSlots)
+        explicit MetadataSerializer(
+            MasterService* service,
+            size_t shard_slots = ha::kSnapshotShardSlots)
             : service_(service), shard_slots_(shard_slots) {}
 
         // Serialize the metadata of every tenant that holds objects, together

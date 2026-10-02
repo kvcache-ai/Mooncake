@@ -4659,6 +4659,15 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                         }
                         auto replica_list =
                             GetReadableReplicaDescriptors(metadata);
+                        if (dfs_allocator_) {
+                            for (const auto& replica : replica_list) {
+                                if (replica.is_dfs_replica()) {
+                                    const auto& desc =
+                                        replica.get_dfs_descriptor();
+                                    dfs_allocator_->UpdateAccess(key, desc);
+                                }
+                            }
+                        }
 
                         if (replica_list.empty()) {
                             if (metadata.AllReplicas(
@@ -13562,8 +13571,7 @@ MasterService::MetadataSerializer::Serialize(
               [](const auto& lhs, const auto& rhs) {
                   return lhs.first.value() < rhs.first.value();
               });
-    const size_t slots =
-        std::min(tenants_with_metadata.size(), shard_slots_);
+    const size_t slots = std::min(tenants_with_metadata.size(), shard_slots_);
     packer.pack_map(slots);
 
     for (size_t slot = 0; slot < slots; ++slot) {

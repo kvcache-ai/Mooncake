@@ -1411,8 +1411,8 @@ TEST_F(MasterServiceTest, SnapshotPacksMoreTenantsThanShardSlots) {
                            TenantId(tenant_ids[i]), put_config);
     }
 
-    MasterServiceTestPeer::MetadataSerializer serializer(
-        &service, /*shard_slots=*/2);
+    MasterServiceTestPeer::MetadataSerializer serializer(&service,
+                                                         /*shard_slots=*/2);
     auto payload = serializer.Serialize();
     ASSERT_TRUE(payload.has_value());
 
