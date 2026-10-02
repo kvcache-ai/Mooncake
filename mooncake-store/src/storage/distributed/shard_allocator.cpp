@@ -370,6 +370,10 @@ uint64_t ShardAllocator::GetTotalCapacity() const {
     return total;
 }
 
+uint64_t ShardAllocator::GetFileCount() const {
+    return static_cast<uint64_t>(GetShardCount());
+}
+
 void ShardAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
                           int shard_idx, const std::string& key) {
     if (!initialized_.load(std::memory_order_acquire)) return;

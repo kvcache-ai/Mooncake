@@ -31,6 +31,8 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "common/network.h"
+#include "config/dfs_enablement_config.h"
+#include "config/master_metadata_config.h"
 #include "environ.h"
 #include "segment.h"
 #include "segment/region_driver.h"
@@ -256,16 +258,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument("Invalid soft-pin TTL configuration");
     }
 
-    // Initialize HTTP metadata key prefix (read env var once at startup)
-    const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
-    if (custom_prefix && std::strlen(custom_prefix) > 0) {
-        http_metadata_prefix_ = "mooncake/" + std::string(custom_prefix);
-        if (http_metadata_prefix_.back() != '/') {
-            http_metadata_prefix_ += '/';
-        }
-    } else {
-        http_metadata_prefix_ = "mooncake/";
-    }
+    // Initialize the HTTP metadata key prefix from its component-owned
+    // startup configuration.
+    http_metadata_prefix_ =
+        MasterMetadataConfig::FromEnvironment().HttpMetadataPrefix();
     if (allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST) {
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
@@ -612,8 +608,7 @@ tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
 
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
-    enable_dfs_ = Environ::GetBool(
-        "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
+    enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled;
     if (!enable_dfs_) return;
 
     if (config.enable_snapshot || config.enable_snapshot_restore ||
@@ -792,10 +787,19 @@ void MasterService::StopBatchOpLogWriter() {
 }
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
-    return {
+    TieredStorageUsageSnapshot snapshot{
         .memory = segment_manager_.GetMemoryUsageSnapshot(),
         .nof = nof_segment_manager_.GetUsageSnapshot(),
     };
+    if (enable_dfs_ && dfs_allocator_ && dfs_allocator_->IsInitialized()) {
+        snapshot.dfs = {
+            .enabled = true,
+            .used_bytes = dfs_allocator_->GetUsedBytes(),
+            .capacity_bytes = dfs_allocator_->GetTotalCapacity(),
+            .file_count = dfs_allocator_->GetFileCount(),
+        };
+    }
+    return snapshot;
 }
 
 bool MasterService::IsTenantQuotaEnabled() const {
@@ -3572,6 +3576,44 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
         return tl::make_unexpected(err);
     }
     return status;
+}
+
+tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
+    const std::string& segment_name, SegmentStatus status) {
+    if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    for (const auto& [_, job] : drain_jobs_) {
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        if (job->status == JobStatus::SUCCEEDED ||
+            job->status == JobStatus::FAILED ||
+            job->status == JobStatus::CANCELED) {
+            continue;
+        }
+        const auto& sources = job->request.segments;
+        if (std::find(sources.begin(), sources.end(), segment_name) !=
+            sources.end()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentStatus current = SegmentStatus::UNDEFINED;
+    auto err = segment_access.GetSegmentStatusByName(segment_name, current);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    if (current != SegmentStatus::OK && current != SegmentStatus::DRAINING) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    err = segment_access.SetSegmentStatusByName(segment_name, status);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
@@ -14615,6 +14657,9 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
+    // Held until the job is registered so SetSegmentStatus never sees a
+    // segment this job has marked DRAINING without also seeing the job.
+    std::lock_guard<std::mutex> lock(job_mutex_);
     std::vector<std::string> draining_segments;
     {
         ScopedSegmentAccess segment_access =
@@ -14646,12 +14691,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     job->last_updated_at = job->created_at;
     job->status = JobStatus::CREATED;
     job->message = "Drain job created";
-
-    {
-        std::lock_guard<std::mutex> lock(job_mutex_);
-        drain_jobs_.emplace(job->id, job);
-    }
-
+    drain_jobs_.emplace(job->id, job);
     return job->id;
 }
 

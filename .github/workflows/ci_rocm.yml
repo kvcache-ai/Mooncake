@@ -39,6 +39,9 @@ jobs:
     env:
       HIP_BUILD: "1"
       SCCACHE_GHA_ENABLED: "true"
+      # Only push/schedule builds write: PR-scoped entries are invisible to
+      # other PRs and would evict the main entries every PR reads.
+      SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
 
     steps:
     # git must exist BEFORE checkout so actions/checkout does a real clone
