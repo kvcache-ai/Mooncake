@@ -1065,15 +1065,14 @@ TEST(HandshakeFrameTest, WriteToSilentPeerFailsWithinSendTimeout) {
     // stalls the writer. With SO_SNDTIMEO the write has to fail fast instead
     // of blocking (or spinning on EAGAIN) forever.
     int sndbuf = 4096;
-    ASSERT_EQ(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf,
-                         sizeof(sndbuf)),
-              0);
+    ASSERT_EQ(
+        setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
     struct timeval timeout;
     timeout.tv_sec = 1;
     timeout.tv_usec = 0;
-    ASSERT_EQ(setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &timeout,
-                         sizeof(timeout)),
-              0);
+    ASSERT_EQ(
+        setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)),
+        0);
 
     const std::string payload(8 << 20, 'x');
     const auto start = std::chrono::steady_clock::now();
