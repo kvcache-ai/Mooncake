@@ -402,6 +402,17 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     RWSpinlock::WriteGuard guard(notify_lock_);
     TransferMetadata::NotifyDesc peer_notify, local_reply;
     TransferNotifyUtil::decode(peer_json, peer_notify);
+    const size_t max_entries = getHandshakeMaxNotifyEntries();
+    if (notifys.size() >= max_entries) {
+        // The daemon accepts notify frames from any peer, so an unbounded
+        // vector lets a flood grow RSS without limit (#4445). Evict the
+        // oldest undrained entry: a flood degrades pending notifications
+        // instead of the process.
+        notifys.erase(notifys.begin());
+        LOG_EVERY_N(WARNING, 1000)
+            << "pending notify queue is full (" << max_entries
+            << " entries); evicting the oldest entry";
+    }
     notifys.push_back(peer_notify);
     // reply
     local_reply.name = "";
