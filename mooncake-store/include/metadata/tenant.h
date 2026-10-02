@@ -10,9 +10,9 @@
 // its group membership with the slot. Mutating a published object goes through
 // `WithPublishedObject`, which re-checks that identity under the entry lock.
 //
-// Every method synchronizes internally. Lock order: entry lock, route lock,
-// then the group table. Only `RemoveObject` holds the route lock across the
-// group table, and nothing takes the route lock while holding a group stripe.
+// Every method synchronizes internally. Lock order: entry lock, route stripe,
+// then the group table. Only `RemoveObject` holds a route stripe across the
+// group table, and nothing takes a route stripe while holding a group stripe.
 
 #include <algorithm>
 #include <cassert>
@@ -69,8 +69,8 @@ class Tenant {
 
     // Removes a torn-down object: its route slot and its group membership,
     // only while the slot still holds `entry`; false, touching nothing,
-    // otherwise. Both go under one hold of the route lock, because membership
-    // is keyed by the object key: once the slot is released, a newer
+    // otherwise. Both go under one hold of the key's route stripe, because
+    // membership is keyed by the object key: once the slot is released, a newer
     // publication of the same key can register the membership this teardown
     // would drop. Callers hold the entry's own lock, so a publication still
     // wiring its state cannot be torn down half-registered.
@@ -78,7 +78,7 @@ class Tenant {
         if (entry == nullptr) {
             return false;
         }
-        return object_index_.WithExclusiveRoute([&](auto& route) {
+        return object_index_.WithExclusiveRoute(entry->key(), [&](auto& route) {
             const auto it = route.find(entry->key());
             if (it == route.end() || it->second != entry) {
                 return false;
