@@ -1057,6 +1057,35 @@ TEST(HandshakeFrameTest, RejectsInvalidLength) {
     close(fds[1]);
 }
 
+TEST(HandshakeFrameTest, WriteToSilentPeerFailsWithinSendTimeout) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    // Nobody reads fds[1], so a payload far larger than the send buffer
+    // stalls the writer. With SO_SNDTIMEO the write has to fail fast instead
+    // of blocking (or spinning on EAGAIN) forever.
+    int sndbuf = 4096;
+    ASSERT_EQ(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf,
+                         sizeof(sndbuf)),
+              0);
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    ASSERT_EQ(setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                         sizeof(timeout)),
+              0);
+
+    const std::string payload(8 << 20, 'x');
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(writeString(fds[0], HandShakeRequestType::Metadata, payload),
+              ERR_SOCKET);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(elapsed, std::chrono::seconds(30));
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
 namespace {
 
 // Hardware-free in-memory MetadataStoragePlugin. get() returns false for keys
