@@ -1092,9 +1092,13 @@ TEST(HandshakeNotifyTest, BoundedQueueEvictsOldestUnderFlood) {
                               Json::FastWriter{}.write(body)),
                   0);
         // The daemon answers each accepted frame before half-closing, so
-        // reading the reply orders frame i before frame i+1.
-        char reply[128];
-        ASSERT_GT(read(fd, reply, sizeof(reply)), 0);
+        // reading the reply orders frame i before frame i+1. Read the whole
+        // frame: a bare read() can return after the header alone, and closing
+        // while the daemon is still writing the payload resets the socket
+        // and kills the process with SIGPIPE on its next write.
+        auto [rtype, rjson] = readString(fd);
+        ASSERT_EQ(rtype, HandShakeRequestType::Notify);
+        ASSERT_FALSE(rjson.empty());
         close(fd);
     }
 
