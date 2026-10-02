@@ -300,6 +300,60 @@ class RejectOnceOrderedOpLogWriter : public OrderedOpLogWriter {
     std::atomic<bool> reject_next_segment_unmount_{false};
 };
 
+// Holds the caller inside Commit, so a test can keep a path inside the entry
+// lock it took and observe which locks that path holds with it.
+class BlockingCommitOrderedOpLogWriter : public OrderedOpLogWriter {
+   public:
+    BlockingCommitOrderedOpLogWriter(OrderedOpLogWriterConfig config,
+                                     WriteBatchFn write_batch)
+        : OrderedOpLogWriter(std::move(config), std::move(write_batch)) {}
+
+    ~BlockingCommitOrderedOpLogWriter() override {
+        ReleaseCommits();
+        Stop();
+    }
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            committing_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [&] { return !block_commits_ || stopping_; });
+            committing_ = false;
+        }
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry), std::move(callback));
+    }
+
+    void BlockCommits() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        block_commits_ = true;
+    }
+
+    bool WaitForCommit(
+        std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return committing_; });
+    }
+
+    void ReleaseCommits() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            block_commits_ = false;
+        }
+        cv_.notify_all();
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool block_commits_{false};
+    bool committing_{false};
+    bool stopping_{false};
+};
+
 class MasterServiceHATest : public ::testing::Test {
    protected:
     static void EnableDfsForTesting(MasterService& service) {
@@ -530,6 +584,21 @@ class MasterServiceHATest : public ::testing::Test {
                   MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
                       std::move(backend)));
         return static_cast<RejectOnceOrderedOpLogWriter*>(
+            MasterServiceTestPeer::OrderedOplogWriter(service).get());
+    }
+
+    static BlockingCommitOrderedOpLogWriter* InstallBlockingCommitWriter(
+        MasterService& service, std::shared_ptr<HaKvBackend> backend) {
+        MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+            [](OrderedOpLogWriterConfig config,
+               OrderedOpLogWriter::WriteBatchFn write_batch) {
+                return std::make_unique<BlockingCommitOrderedOpLogWriter>(
+                    std::move(config), std::move(write_batch));
+            });
+        EXPECT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      std::move(backend)));
+        return static_cast<BlockingCommitOrderedOpLogWriter*>(
             MasterServiceTestPeer::OrderedOplogWriter(service).get());
     }
 
@@ -5511,6 +5580,120 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaReleasesLocalDiskAfterDurable) {
     EXPECT_EQ(1024, GetLocalDiskUsedBytesForTesting(service, segment_name));
     ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
     EXPECT_EQ(0, GetLocalDiskUsedBytesForTesting(service, segment_name));
+}
+
+// The eviction holds the entry's lock for its whole read-modify-write. Every
+// path that holds an entry lock also holds the snapshot lock, because the
+// snapshot child is forked while the parent holds that lock exclusively: a lock
+// held by another thread at that instant is inherited locked, with no thread
+// left in the child to release it, and the child waits on it forever.
+TEST_F(MasterServiceHATest, DiskReplicaEvictionHoldsTheSnapshotBarrier) {
+    const std::string cluster_id = "test_disk_evict_barrier_cluster";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_enable_offload(true)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallBlockingCommitWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+
+    const std::string segment_name = "disk_evict_barrier_segment";
+    auto mounted = PrepareSimpleSegment(service, segment_name);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
+
+    const std::string key = "disk_evict_barrier_key";
+    PutObjectOnSegment(service, mounted.client_id, key, segment_name);
+
+    Replica local_disk_replica(mounted.client_id, 1024, "local_disk_endpoint",
+                               ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service
+                    .AddReplica(mounted.client_id, key, kDefaultTenant,
+                                local_disk_replica)
+                    .has_value());
+
+    // The eviction is held inside its own log append, and so inside the entry's
+    // own lock, until the writer is let go.
+    writer->BlockCommits();
+    std::optional<tl::expected<void, ErrorCode>> evict_result;
+    std::thread evicting([&] {
+        evict_result = service.EvictDiskReplica(
+            mounted.client_id, key, kDefaultTenant, ReplicaType::LOCAL_DISK);
+    });
+    ASSERT_TRUE(writer->WaitForCommit());
+    if (MasterServiceTestPeer::SnapshotMutex(service).try_lock()) {
+        MasterServiceTestPeer::SnapshotMutex(service).unlock();
+        ADD_FAILURE() << "the eviction held an entry lock without the snapshot "
+                         "barrier, so a snapshot child forked here would wait "
+                         "on it forever";
+    }
+    writer->ReleaseCommits();
+    evicting.join();
+    ASSERT_TRUE(evict_result.has_value());
+    EXPECT_TRUE(evict_result->has_value());
+}
+
+// An offload completion for a key nothing publishes creates the object, and the
+// record is appended before the object is routed. A log that refuses the
+// append therefore leaves the key unrouted and answers the error, so the master
+// and the standby agree that the object does not exist; the completion that is
+// accepted afterwards is what publishes it.
+TEST_F(MasterServiceHATest, AddReplicaRefusedByTheOpLogPublishesNothing) {
+    const std::string cluster_id = "test_add_replica_refused_cluster";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_enable_offload(true)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallRejectingWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+
+    const std::string segment_name = "add_replica_refused_segment";
+    auto mounted = PrepareSimpleSegment(service, segment_name);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
+
+    const std::string key = "add_replica_refused_key";
+    writer->RejectCommitsWith(ErrorCode::INTERNAL_ERROR);
+    Replica refused_replica(mounted.client_id, 1024, "local_disk_endpoint",
+                            ReplicaStatus::COMPLETE);
+    auto refused = service.AddReplica(mounted.client_id, key, kDefaultTenant,
+                                      refused_replica);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, refused.error());
+    EXPECT_EQ(1u, writer->rejected_commits());
+
+    EXPECT_FALSE(service.ExistKey(key, kDefaultTenant).value_or(true))
+        << "a completion the log refused must not leave a readable object";
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+    EXPECT_EQ(nullptr,
+              MasterServiceTestPeer::FindObject(
+                  service,
+                  MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, key}))
+        << "the route must not hold a publication the standby never recorded";
+
+    writer->RejectCommitsWith(ErrorCode::OK);
+    Replica accepted_replica(mounted.client_id, 1024, "local_disk_endpoint",
+                             ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service
+                    .AddReplica(mounted.client_id, key, kDefaultTenant,
+                                accepted_replica)
+                    .has_value());
+    EXPECT_TRUE(service.ExistKey(key, kDefaultTenant).value());
 }
 
 #ifdef USE_NOF

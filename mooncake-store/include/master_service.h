@@ -35,6 +35,7 @@
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "dynamic_replication_lease_table.h"
+#include "ha/snapshot/snapshot_constants.h"
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "metadata/tenant.h"
@@ -95,10 +96,11 @@ class MasterServiceTestPeer;
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
- * 1. object_operation_locks_[stripe], held by PutStart and UpsertStart for the
- *    whole request. It is per key rather than per operation so that no other
- *    writer can enter the window where UpsertStart has dropped the object it
- *    replaces and has not yet published the replacement.
+ * 1. object_operation_locks_[stripe], held by PutStart, UpsertStart and
+ *    AddReplicaForRetainedClient for the whole request. It is per key rather
+ *    than per operation so that no other writer can enter the window where
+ *    UpsertStart has dropped the object it replaces and has not yet published
+ *    the replacement.
  * 2. client_mutex_
  * 3. tenant_quota_policy_mutex_
  * 4. snapshot_mutex_
@@ -116,6 +118,11 @@ class MasterServiceTestPeer;
  * The tenant's object route lock nests inside an entry lock, because
  * publishing and tearing down an entry holds that entry across the route
  * change; the reverse nesting is forbidden.
+ *
+ * Every path that takes an entry lock holds snapshot_mutex_ shared for as long
+ * as it holds one. The snapshot child is forked while the parent holds that
+ * lock exclusively, so a lock another thread holds at that instant is inherited
+ * locked, with no thread left in the child to release it.
  *
  * The OpLog writer hands durability back on its own callback thread without
  * holding its mutex, so a durable finalizer there re-resolves its object
@@ -1214,6 +1221,19 @@ class MasterService {
 
     std::array<std::mutex, kObjectOperationLockStripes> object_operation_locks_;
 
+    // The object a completion brings back for a key nothing publishes: the
+    // record that names it is ordered before the object is reachable, its bytes
+    // are accounted for under the entry's own lock, and its media are announced
+    // once the route holds it. `key_lock` is the proof that the caller holds
+    // the key's operation lock, which every publisher of a key takes, so a
+    // completion that found the key absent is the only publication that can
+    // take it and a refused record publishes nothing. Caller holds the snapshot
+    // lock.
+    auto PublishCompletionObject(const ObjectIdentity& object_id,
+                                 const UUID& client_id, Replica& replica,
+                                 const ObjectOperationLock& key_lock)
+        -> tl::expected<bool, ErrorCode>;
+
     // What an access through one publication produced: nothing when the route
     // no longer publishes the entry the caller resolved, or when that entry was
     // torn down. A void callback has no result to carry, so its report is a
@@ -1529,7 +1549,8 @@ class MasterService {
                           bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
-    auto InsertMetadata(metadata::Tenant& tenant, const UUID& client_id,
+    auto InsertMetadata(const ObjectOperationLock& key_lock,
+                        metadata::Tenant& tenant, const UUID& client_id,
                         const std::string& key, uint64_t value_length,
                         const ReplicateConfig& config,
                         const std::string& group_id, const TenantId& tenant_id,
@@ -1546,8 +1567,8 @@ class MasterService {
     // UpsertStart. The tenant is created once this call is about to publish, so
     // a request that fails before that leaves the registry as it was.
     auto AllocateAndInsertMetadata(
-        const TenantId& tenant_id, const UUID& client_id,
-        const std::string& key, uint64_t value_length,
+        const ObjectOperationLock& key_lock, const TenantId& tenant_id,
+        const UUID& client_id, const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& writer_host_id,
         const std::string& group_id,
         const std::chrono::system_clock::time_point& now,
@@ -1730,7 +1751,14 @@ class MasterService {
 
     class MetadataSerializer {
        public:
-        MetadataSerializer(MasterService* service) : service_(service) {}
+        // `shard_slots` is the format's, not a choice: a master that predates
+        // the tenant model reads each entry key as one of its shards, so a
+        // payload keeps its keys inside them. A test can pass a small count and
+        // exercise the boundary with few tenants.
+        explicit MetadataSerializer(MasterService* service,
+                                    size_t shard_slots =
+                                        ha::kSnapshotShardSlots)
+            : service_(service), shard_slots_(shard_slots) {}
 
         // Serialize the metadata of every tenant that holds objects, together
         // with the frozen weight metadata when the caller supplies it.
@@ -1747,6 +1775,7 @@ class MasterService {
 
        private:
         MasterService* service_;
+        size_t shard_slots_;
 
         // Serialize a single ObjectMetadata
         tl::expected<void, SerializationError> SerializeMetadata(
@@ -1757,9 +1786,13 @@ class MasterService {
                                    SerializationError>
         DeserializeMetadata(const msgpack::object& obj) const;
 
-        // Serialize one tenant's metadata, which is one entry of the payload.
-        tl::expected<void, SerializationError> SerializeTenant(
-            const TenantId& tenant_id, const metadata::Tenant& tenant,
+        // Serialize one entry of the payload: the objects of one tenant, or of
+        // several when the payload holds more tenants than the format has shard
+        // slots. Each object carries its own tenant id, so a reader routes it
+        // without the entry naming a tenant.
+        tl::expected<void, SerializationError> SerializeTenantSlot(
+            const std::vector<std::pair<TenantId, const metadata::Tenant*>>&
+                members,
             MsgpackPacker& packer) const;
 
         // Deserialize one tenant's entry of the payload into the registry.

@@ -1,3 +1,4 @@
+#include "ha/snapshot/snapshot_constants.h"
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
@@ -1389,6 +1390,59 @@ TEST_F(MasterServiceTest, MissDoesNotRegisterTenant) {
                   MasterServiceTestPeer::ObjectIdentity{
                       tenant, "published_key"}) != nullptr,
               true);
+}
+
+// A payload's entry keys are the shard slots a master that predates the tenant
+// model reads them as, so a state with more tenants than slots packs the extra
+// tenants into the last entry instead of numbering past the slots. Every object
+// still carries its own tenant id, so the decode restores all of them. The
+// serializer takes the slot count, so the boundary needs two tenants and one
+// more.
+TEST_F(MasterServiceTest, SnapshotPacksMoreTenantsThanShardSlots) {
+    const std::vector<std::string> tenant_ids{"slot_tenant_a", "slot_tenant_b",
+                                              "slot_tenant_c"};
+    MasterService service(MakeStrictTenantConfig(tenant_ids));
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    for (size_t i = 0; i < tenant_ids.size(); ++i) {
+        PutCompletedObject(service, context.client_id,
+                           "slot_key_" + std::to_string(i),
+                           TenantId(tenant_ids[i]), put_config);
+    }
+
+    MasterServiceTestPeer::MetadataSerializer serializer(
+        &service, /*shard_slots=*/2);
+    auto payload = serializer.Serialize();
+    ASSERT_TRUE(payload.has_value());
+
+    auto handle = msgpack::unpack(
+        reinterpret_cast<const char*>(payload->data()), payload->size());
+    const msgpack::object& root = handle.get();
+    const msgpack::object* shards = nullptr;
+    for (uint32_t i = 0; i < root.via.map.size; ++i) {
+        const auto& key = root.via.map.ptr[i].key;
+        if (key.type == msgpack::type::STR &&
+            std::string(key.via.str.ptr, key.via.str.size) == "shards") {
+            shards = &root.via.map.ptr[i].val;
+        }
+    }
+    ASSERT_NE(shards, nullptr);
+    ASSERT_EQ(2u, shards->via.map.size);
+    EXPECT_EQ(0u, shards->via.map.ptr[0].key.as<uint32_t>());
+    EXPECT_EQ(1u, shards->via.map.ptr[1].key.as<uint32_t>());
+
+    // The decode replaces the state this service holds, and its segments stay
+    // mounted, so the memory replicas the payload names resolve.
+    MasterServiceTestPeer::MetadataSerializer reader(&service);
+    ASSERT_TRUE(reader.Deserialize(*payload).has_value());
+    for (size_t i = 0; i < tenant_ids.size(); ++i) {
+        EXPECT_TRUE(service
+                        .ExistKey("slot_key_" + std::to_string(i),
+                                  TenantId(tenant_ids[i]))
+                        .value_or(false))
+            << "tenant " << tenant_ids[i] << " lost its object";
+    }
 }
 
 // Decoding a snapshot replaces the metadata the routes hold: a payload that

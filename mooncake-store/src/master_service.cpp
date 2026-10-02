@@ -4518,12 +4518,16 @@ auto MasterService::GetReplicaList(const std::string& key,
     if (!outcome->has_value()) {
         return tl::make_unexpected(outcome->error());
     }
-    // The read is released. Safe to take a fresh write access now.
-    if (promotion_eligible) {
-        TryPushPromotionQueue(ObjectIdentity{tenant, key});
-    }
-    if (dynamic_replication_observed) {
-        MaybeQueueDynamicReplicaProposal(ObjectIdentity{tenant, key});
+    // Re-taken for the queues below, which take entry locks, so the snapshot
+    // child never finds one held.
+    {
+        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        if (promotion_eligible) {
+            TryPushPromotionQueue(ObjectIdentity{tenant, key});
+        }
+        if (dynamic_replication_observed) {
+            MaybeQueueDynamicReplicaProposal(ObjectIdentity{tenant, key});
+        }
     }
     return std::move(*outcome);
 }
@@ -4695,12 +4699,16 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
-    // The reads are released. Safe to take fresh write accesses now.
-    for (const auto& object_id : promotion_candidates) {
-        TryPushPromotionQueue(object_id);
-    }
-    for (const auto& object_id : dynamic_replication_candidates) {
-        MaybeQueueDynamicReplicaProposal(object_id);
+    // Re-taken for the queues below, which take entry locks, so the snapshot
+    // child never finds one held.
+    {
+        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        for (const auto& object_id : promotion_candidates) {
+            TryPushPromotionQueue(object_id);
+        }
+        for (const auto& object_id : dynamic_replication_candidates) {
+            MaybeQueueDynamicReplicaProposal(object_id);
+        }
     }
 
     return results;
@@ -4941,15 +4949,18 @@ auto MasterService::AllocateReplicas(const std::string& key,
 }
 
 auto MasterService::InsertMetadata(
-    metadata::Tenant& tenant, const UUID& client_id, const std::string& key,
-    uint64_t value_length, const ReplicateConfig& config,
-    const std::string& group_id, const TenantId& tenant_id,
-    const std::chrono::system_clock::time_point& now,
+    const ObjectOperationLock& key_lock, metadata::Tenant& tenant,
+    const UUID& client_id, const std::string& key, uint64_t value_length,
+    const ReplicateConfig& config, const std::string& group_id,
+    const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     std::vector<Replica>&& replicas, uint64_t pending_quota_charge,
     std::optional<std::chrono::system_clock::time_point>
         committed_soft_pin_timeout)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    // Publishing a key is what the key's operation lock covers, so the caller
+    // holds it for the whole request and passes it here as the proof.
+    assert(key_lock.lock.owns_lock());
     const auto deadline_to_index = committed_soft_pin_timeout;
     if (tenant.Get(key) != nullptr) {
         FreeDfsReplicas(key, replicas);
@@ -5044,9 +5055,10 @@ auto MasterService::InsertMetadata(
 }
 
 auto MasterService::AllocateAndInsertMetadata(
-    const TenantId& tenant_id, const UUID& client_id, const std::string& key,
-    uint64_t value_length, const ReplicateConfig& config,
-    const std::string& writer_host_id, const std::string& group_id,
+    const ObjectOperationLock& key_lock, const TenantId& tenant_id,
+    const UUID& client_id, const std::string& key, uint64_t value_length,
+    const ReplicateConfig& config, const std::string& writer_host_id,
+    const std::string& group_id,
     const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     std::optional<std::chrono::system_clock::time_point>
@@ -5056,6 +5068,7 @@ auto MasterService::AllocateAndInsertMetadata(
     // A key this tenant already publishes is not this path's to replace. The
     // caller holds the key's own operation lock, so no other publisher can slip
     // an object in between this check and the insert below.
+    assert(key_lock.lock.owns_lock());
     const auto existing_tenant = tenants_.Lookup(tenant_id);
     if (existing_tenant != nullptr && existing_tenant->Get(key) != nullptr) {
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -5080,8 +5093,8 @@ auto MasterService::AllocateAndInsertMetadata(
     // a request that fails above leaves the registry as it was.
     const auto tenant = tenants_.GetOrCreateTenant(tenant_id);
     auto insert_result = InsertMetadata(
-        *tenant, client_id, key, value_length, config, group_id, tenant_id, now,
-        soft_pin_request, std::move(allocation_result.value()),
+        key_lock, *tenant, client_id, key, value_length, config, group_id,
+        tenant_id, now, soft_pin_request, std::move(allocation_result.value()),
         pending_quota_charge, std::move(committed_soft_pin_timeout));
     if (!insert_result) {
         ReleaseTenantQuota(quota_account, pending_quota_charge);
@@ -5271,9 +5284,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 return tl::make_unexpected(*refused);
             }
             return AllocateAndInsertMetadata(
-                object_id.tenant_id, client_id, key, slice_length, config,
-                writer_host_id, group_id, now, *soft_pin_request, std::nullopt,
-                &dfs_allocation_failed);
+                object_operation_lock, object_id.tenant_id, client_id, key,
+                slice_length, config, writer_host_id, group_id, now,
+                *soft_pin_request, std::nullopt, &dfs_allocation_failed);
         }
     };
 
@@ -5524,6 +5537,13 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
                                                 Replica& replica)
     -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
+    // The key's operation lock comes first in the lock order, and every
+    // publisher of a key takes it: a completion that finds the key absent is
+    // then the only publication that can take it, so the record it appends
+    // cannot outlive an object another publisher routed.
+    const auto lock_identity = MakeObjectIdentityForRequest(key, tenant_id);
+    [[maybe_unused]] auto object_operation_lock = AcquireObjectOperationLock(
+        lock_identity.tenant_id, lock_identity.user_key);
     TenantId normalized_tenant;
     std::unique_lock<std::mutex> policy_lock(tenant_quota_policy_mutex_,
                                              std::defer_lock);
@@ -5536,6 +5556,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         }
         normalized_tenant = std::move(normalized_tenant_result.value());
     }
+    const ObjectIdentity object_id{std::move(normalized_tenant), key};
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Same admission rule as NotifyOffloadSuccess's existing-object path,
     // checked inside the same shared-lock section as the write below: a disk
@@ -5549,7 +5570,6 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     if (enable_offload_ && !HasMountedLocalDiskSegment(client_id)) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
-    const ObjectIdentity object_id{std::move(normalized_tenant), key};
     const auto outcome = WithObjectMetadataForWriteAndCleanup(
         object_id,
         [&](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
@@ -5637,10 +5657,24 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     if (outcome.has_value()) {
         return *outcome;
     }
-    // Nothing is published for this key, so this offload completion is what
-    // brings the object back. The envelope is built with its replica already
-    // attached and published once, fully set up, so a reader that reaches the
-    // object finds the disk replica that names it.
+    // Nothing publishes this key, so this completion is what creates the
+    // object.
+    return PublishCompletionObject(object_id, client_id, replica,
+                                   object_operation_lock);
+}
+
+auto MasterService::PublishCompletionObject(const ObjectIdentity& object_id,
+                                            const UUID& client_id,
+                                            Replica& replica,
+                                            const ObjectOperationLock& key_lock)
+    -> tl::expected<bool, ErrorCode> {
+    // The key's operation lock is what keeps the key unrouted between the
+    // record this appends and the publication below.
+    assert(key_lock.lock.owns_lock());
+    const std::string& key = object_id.user_key;
+    // The envelope is built with its replica already attached and published
+    // once, fully set up, so a reader that reaches the object finds the disk
+    // replica that names it.
     if (replica.type() != ReplicaType::LOCAL_DISK) {
         LOG(ERROR) << "Invalid replica type: " << replica.type()
                    << ". Expected ReplicaType::LOCAL_DISK.";
@@ -5655,30 +5689,13 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         std::move(replicas), std::nullopt, false, ObjectDataType::UNKNOWN,
         std::string(), object_id.tenant_id, object_id.user_key);
     auto entry = std::make_shared<ObjectEntry>(std::move(envelope));
-    entry->WithExclusiveAccess(
-        [&](ObjectMetadata& metadata, ObjectEntry::State&) {
-            // The one replica is already in the envelope, so the medium and
-            // the cache total are accounted for under the entry's own lock
-            // before the publish makes the object reachable.
-            SyncCacheTotalAccounting(metadata);
-            SyncKvObjectState(key, metadata, object_id.tenant_id);
-        });
-    const auto tenant = tenants_.GetOrCreateTenant(object_id.tenant_id);
-    if (!tenant->InsertObject(entry)) {
-        // A concurrent publish took the key: its own registration stands and
-        // this replica was registered nowhere, so the accounting added here is
-        // given back and the caller learns the object is not there.
-        entry->WithExclusiveAccess(
-            [](ObjectMetadata& metadata, ObjectEntry::State&) {
-                AccountCacheTotalRemoval(metadata);
-            });
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    // The record is appended while the object is still unreachable, so a record
+    // the log refuses publishes nothing and answers the error.
     if (enable_oplog_ && ordered_oplog_writer_) {
-        // The object this completion created carries exactly this replica, so
-        // the record lists the object's own replicas.
         const auto persist_result = entry->WithExclusiveAccess(
             [&](ObjectMetadata& metadata, ObjectEntry::State&) {
+                // The object this completion creates carries exactly this
+                // replica, so the record lists the object's own replicas.
                 std::vector<Replica::Descriptor> post;
                 const auto& stored_replicas = metadata.GetAllReplicas();
                 post.reserve(stored_replicas.size());
@@ -5694,6 +5711,29 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             return tl::make_unexpected(persist_result.error());
         }
     }
+    entry->WithExclusiveAccess(
+        [&](ObjectMetadata& metadata, ObjectEntry::State&) {
+            // The one replica is already in the envelope, so the medium and
+            // the cache total are accounted for under the entry's own lock
+            // before the publish makes the object reachable.
+            SyncCacheTotalAccounting(metadata);
+        });
+    const auto tenant = tenants_.GetOrCreateTenant(object_id.tenant_id);
+    if (!tenant->InsertObject(entry)) {
+        // Another publication holds the key: this replica was registered
+        // nowhere, so the accounting added here is given back and the caller
+        // learns the object is not there.
+        entry->WithExclusiveAccess(
+            [](ObjectMetadata& metadata, ObjectEntry::State&) {
+                AccountCacheTotalRemoval(metadata);
+            });
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    entry->WithExclusiveAccess(
+        [&](ObjectMetadata& metadata, ObjectEntry::State&) {
+            // The object is routed now, so its medium is announced from here.
+            SyncKvObjectState(key, metadata, object_id.tenant_id);
+        });
     return true;
 }
 
@@ -6371,18 +6411,19 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
                     allocate_result =
                         replacement_replicas.has_value()
-                            ? InsertMetadata(
-                                  *tenant, client_id, key, slice_length,
-                                  merged_config, existing_group_id,
-                                  object_id.tenant_id, now, *soft_pin_request,
-                                  std::move(*replacement_replicas),
-                                  replacement_pending_quota_charge,
-                                  committed_soft_pin_timeout)
+                            ? InsertMetadata(object_operation_lock, *tenant,
+                                             client_id, key, slice_length,
+                                             merged_config, existing_group_id,
+                                             object_id.tenant_id, now,
+                                             *soft_pin_request,
+                                             std::move(*replacement_replicas),
+                                             replacement_pending_quota_charge,
+                                             committed_soft_pin_timeout)
                             : AllocateAndInsertMetadata(
-                                  object_id.tenant_id, client_id, key,
-                                  slice_length, merged_config, writer_host_id,
-                                  existing_group_id, now, *soft_pin_request,
-                                  committed_soft_pin_timeout,
+                                  object_operation_lock, object_id.tenant_id,
+                                  client_id, key, slice_length, merged_config,
+                                  writer_host_id, existing_group_id, now,
+                                  *soft_pin_request, committed_soft_pin_timeout,
                                   &dfs_allocation_failed);
                 if (!allocate_result) {
                     if (replacement_replicas.has_value()) {
@@ -6456,9 +6497,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // indexed by.
             VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
             return AllocateAndInsertMetadata(
-                object_id.tenant_id, client_id, key, slice_length, config,
-                writer_host_id, group_id, now, *soft_pin_request,
-                std::move(case_a_committed_soft_pin_timeout),
+                object_operation_lock, object_id.tenant_id, client_id, key,
+                slice_length, config, writer_host_id, group_id, now,
+                *soft_pin_request, std::move(case_a_committed_soft_pin_timeout),
                 &dfs_allocation_failed);
         }
     };
@@ -6569,7 +6610,9 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     // One read-modify-write under the entry's own lock: the replicas it drops,
     // the accounting it releases and the removal it publishes cannot interleave
-    // with another point operation on the key.
+    // with another point operation on the key. Held with the snapshot lock,
+    // which every path that takes an entry lock holds.
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     const auto outcome = WithObjectMetadataForWriteAndCleanup(
         object_id,
         [&](metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
@@ -13454,10 +13497,13 @@ MasterService::MetadataSerializer::Serialize(
     // management remain valid.
     packer.pack_map(4);
 
-    // 1. Serialize the metadata, one entry per tenant that holds objects. The
-    // "shards" key and numeric entry keys stay so a snapshot written by an
-    // older master still loads; each object is routed by the tenant id in its
-    // own payload, not by the entry key.
+    // 1. Serialize the metadata, one entry per tenant that holds objects, or
+    // fewer entries when the tenant count passes the shard slots the format
+    // has: the last entry then carries the remaining tenants. The "shards" key
+    // and numeric entry keys stay so a snapshot written by an older master
+    // still loads, and an older master reads each key as a shard index, which
+    // is why the key count stays inside the slots. Each object is routed by the
+    // tenant id in its own payload, not by the entry key.
     packer.pack("shards");
 
     std::vector<std::pair<TenantId, std::shared_ptr<metadata::Tenant>>>
@@ -13474,22 +13520,34 @@ MasterService::MetadataSerializer::Serialize(
               [](const auto& lhs, const auto& rhs) {
                   return lhs.first.value() < rhs.first.value();
               });
-    packer.pack_map(tenants_with_metadata.size());
+    const size_t slots =
+        std::min(tenants_with_metadata.size(), shard_slots_);
+    packer.pack_map(slots);
 
-    uint32_t tenant_index = 0;
-    for (const auto& [tenant_id, tenant] : tenants_with_metadata) {
-        packer.pack(tenant_index++);
+    for (size_t slot = 0; slot < slots; ++slot) {
+        packer.pack(static_cast<uint32_t>(slot));
+        // One tenant per slot, except the last, which carries every tenant the
+        // slots before it did not.
+        const size_t begin = slot;
+        const size_t end =
+            slot + 1 < slots ? slot + 1 : tenants_with_metadata.size();
+        std::vector<std::pair<TenantId, const metadata::Tenant*>> members;
+        members.reserve(end - begin);
+        for (size_t index = begin; index < end; ++index) {
+            members.emplace_back(tenants_with_metadata[index].first,
+                                 tenants_with_metadata[index].second.get());
+        }
 
-        // Independent buffer per tenant, compressed on its own.
+        // Independent buffer per entry, compressed on its own.
         msgpack::sbuffer tenant_buffer;
         msgpack::packer<msgpack::sbuffer> tenant_packer(&tenant_buffer);
 
-        auto result = SerializeTenant(tenant_id, *tenant, tenant_packer);
+        auto result = SerializeTenantSlot(members, tenant_packer);
         if (!result) {
             return tl::make_unexpected(SerializationError(
                 result.error().code,
-                fmt::format("Failed to serialize tenant entry #{}: {}",
-                            tenant_index, result.error().message)));
+                fmt::format("Failed to serialize tenant entry #{}: {}", slot,
+                            result.error().message)));
         }
 
         std::vector<uint8_t> compressed_data = zstd_compress(
@@ -13722,44 +13780,58 @@ void MasterService::MetadataSerializer::Reset() {
 }
 
 tl::expected<void, SerializationError>
-MasterService::MetadataSerializer::SerializeTenant(
-    const TenantId& tenant_id, const metadata::Tenant& tenant,
+MasterService::MetadataSerializer::SerializeTenantSlot(
+    const std::vector<std::pair<TenantId, const metadata::Tenant*>>& members,
     MsgpackPacker& packer) const {
-    // Tenant payload: a map with one "metadata" field, whose items keep the
+    // Entry payload: a map with one "metadata" field, whose items keep the
     // per-object layout [tenant_id, key, metadata_object].
     packer.pack_map(1);
 
     packer.pack("metadata");
-    // Sorted by key, so the same tenant state serializes to the same bytes.
+    // The objects of every tenant of this entry, sorted by key so the same
+    // state serializes to the same bytes.
     // NOTE: the sort may be slow for a tenant that holds many objects.
-    auto entries = tenant.SnapshotObjects();
-    std::sort(entries.begin(), entries.end(),
-              [](const auto& lhs, const auto& rhs) {
-                  return lhs->key() < rhs->key();
-              });
-    packer.pack_array(entries.size());
+    std::vector<
+        std::pair<const TenantId*, std::vector<std::shared_ptr<ObjectEntry>>>>
+        collected;
+    collected.reserve(members.size());
+    size_t item_count = 0;
+    for (const auto& [tenant_id, tenant] : members) {
+        auto entries = tenant->SnapshotObjects();
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      return lhs->key() < rhs->key();
+                  });
+        item_count += entries.size();
+        collected.emplace_back(&tenant_id, std::move(entries));
+    }
+    packer.pack_array(item_count);
 
-    for (const auto& entry : entries) {
-        auto result = entry->WithSharedAccess(
-            [&](const ObjectMetadata& metadata, const ObjectEntry::State&)
-                -> tl::expected<void, SerializationError> {
-                // Each metadata item format: [tenant_id, key, metadata_object].
-                packer.pack_array(3);
-                packer.pack(tenant_id.value());
-                packer.pack(entry->key());
+    for (const auto& [tenant_id, entries] : collected) {
+        for (const auto& entry : entries) {
+            auto result = entry->WithSharedAccess(
+                [&](const ObjectMetadata& metadata, const ObjectEntry::State&)
+                    -> tl::expected<void, SerializationError> {
+                    // Each metadata item format:
+                    // [tenant_id, key, metadata_object].
+                    packer.pack_array(3);
+                    packer.pack(tenant_id->value());
+                    packer.pack(entry->key());
 
-                auto serialized = SerializeMetadata(metadata, packer);
-                if (!serialized) {
-                    return tl::make_unexpected(SerializationError(
-                        serialized.error().code,
-                        fmt::format("Failed to serialize metadata for key "
-                                    "'{}': {}",
-                                    entry->key(), serialized.error().message)));
-                }
-                return {};
-            });
-        if (!result) {
-            return result;
+                    auto serialized = SerializeMetadata(metadata, packer);
+                    if (!serialized) {
+                        return tl::make_unexpected(SerializationError(
+                            serialized.error().code,
+                            fmt::format("Failed to serialize metadata for key "
+                                        "'{}': {}",
+                                        entry->key(),
+                                        serialized.error().message)));
+                    }
+                    return {};
+                });
+            if (!result) {
+                return result;
+            }
         }
     }
 
