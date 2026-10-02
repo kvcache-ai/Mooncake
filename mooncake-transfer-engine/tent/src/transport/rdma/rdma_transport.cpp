@@ -224,6 +224,18 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
         }
         seg.service_level = pool_json.value("service_level", -1);
         seg.traffic_class = pool_json.value("traffic_class", -1);
+        auto validate_qos = [&](int value, int max_value,
+                                const char* field) -> Status {
+            if (isValidQpPoolQosValue(value, max_value)) return Status::OK();
+            std::stringstream ss;
+            ss << "Invalid RDMA qp_pool '" << seg.name << "' " << field << "="
+               << value << ", expected -1 or 0.." << max_value;
+            return Status::InvalidArgument(ss.str() + LOC_MARK);
+        };
+        status = validate_qos(seg.service_level, 15, "service_level");
+        if (!status.ok()) return status;
+        status = validate_qos(seg.traffic_class, 255, "traffic_class");
+        if (!status.ok()) return status;
         params->endpoint.qp_pools.push_back(std::move(seg));
     }
     if (!params->endpoint.qp_pools.empty()) {
