@@ -276,6 +276,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int max_wr_depth_;
     size_t max_sge_per_wr_;
     size_t max_inline_bytes_;
+    // Largest RDMA write posted inline: max_inline_bytes_, capped by the
+    // grant and the BlueFlame fit of every QP in qp_list_.
+    size_t max_inline_write_bytes_ = 0;
 
     std::atomic<bool> active_;
     ibv_cq *cq_;
