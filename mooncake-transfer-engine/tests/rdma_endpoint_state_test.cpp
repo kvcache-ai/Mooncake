@@ -149,6 +149,16 @@ class WorkerPoolTestPeer {
         pool.performPostSend(thread_id);
     }
 
+    static void pauseRail(WorkerPool &pool, const std::string &peer_nic_path) {
+        pool.markRailFailed(peer_nic_path, true);
+    }
+
+    static void redispatch(WorkerPool &pool,
+                           std::vector<Transport::Slice *> &slice_list,
+                           int thread_id) {
+        pool.redispatch(slice_list, thread_id);
+    }
+
     static void clearQueuedSlices(WorkerPool &pool) {
         for (auto &queue : pool.collective_slice_queue_) queue.clear();
         for (auto &queue : pool.worker_slice_queue_) queue.clear();
@@ -610,6 +620,153 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
     active.get();
 
     WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
+}
+
+// Restores the rail flags even when an ASSERT returns early.
+class RailConfigGuard {
+   public:
+    RailConfigGuard()
+        : old_dest_affinity_(globalConfig().enable_dest_device_affinity),
+          old_keep_paused_(globalConfig().enable_keep_paused_rail) {}
+    ~RailConfigGuard() {
+        globalConfig().enable_dest_device_affinity = old_dest_affinity_;
+        globalConfig().enable_keep_paused_rail = old_keep_paused_;
+    }
+
+   private:
+    const bool old_dest_affinity_;
+    const bool old_keep_paused_;
+};
+
+// Peer segment with two rails, mlx5_0 and mlx5_1, sharing one buffer.
+void addTwoRailPeerSegment(FakeRdmaPeer &peer, const std::string &peer_server) {
+    auto peer_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    peer_desc->name = peer_server;
+    peer_desc->protocol = "rdma";
+    peer_desc->devices.resize(2);
+    peer_desc->devices[0].name = "mlx5_0";
+    peer_desc->devices[1].name = "mlx5_1";
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = 4096;
+    buffer.length = 8192;
+    buffer.lkey = {1, 2};
+    buffer.rkey = {3, 4};
+    peer_desc->buffers.push_back(buffer);
+    peer_desc->rebuildBufferRangeIndex();
+    ASSERT_EQ(
+        peer_desc->topology.parse(R"({"cpu:0": [["mlx5_0", "mlx5_1"], []]})"),
+        0);
+    ASSERT_EQ(peer.metadata->addLocalSegment(LOCAL_SEGMENT_ID, peer_server,
+                                             std::move(peer_desc)),
+              0);
+}
+
+void resetRailSlice(Transport::Slice &slice, Transport::TransferTask &task,
+                    Transport::BatchID batch_id) {
+    slice = Transport::Slice();
+    task = Transport::TransferTask();
+    task.batch_id = batch_id;
+    slice.task = &task;
+    slice.status = Transport::Slice::PENDING;
+    slice.target_id = LOCAL_SEGMENT_ID;
+    slice.length = 64;
+    slice.rdma.dest_addr = 4096;
+    slice.rdma.retry_cnt = 1;
+    slice.rdma.max_retry_cnt = 8;
+}
+
+TEST(RdmaWorkerPoolRailTest, KeepPausedRailFailsInsteadOfPeerHop) {
+    RailConfigGuard config_guard;
+    auto &config = globalConfig();
+    config.enable_dest_device_affinity = true;
+
+    auto barrier = std::make_shared<InProcessRdmaTransport::Barrier>();
+    FakeRdmaPeer peer;
+    ASSERT_NO_FATAL_FAILURE(
+        initFakePeer(peer, "rdma-keep-a:10000", "mlx5_0", barrier));
+
+    // The same-name rail mlx5_0 is paused.
+    const std::string peer_server = "rdma-keep-b:10000";
+    ASSERT_NO_FATAL_FAILURE(addTwoRailPeerSegment(peer, peer_server));
+
+    const std::string matched_path = MakeNicPath(peer_server, "mlx5_0");
+    const std::string other_path = MakeNicPath(peer_server, "mlx5_1");
+    WorkerPoolTestPeer::pauseRail(*peer.worker_pool, matched_path);
+
+    // markFailed() dereferences the batch under USE_EVENT_DRIVEN_COMPLETION.
+    const auto batch_id = peer.transport->allocateBatchID(1);
+
+    auto run_redispatch = [&](Transport::Slice &slice,
+                              Transport::TransferTask &task) {
+        resetRailSlice(slice, task, batch_id);
+        std::vector<Transport::Slice *> slice_list{&slice};
+        WorkerPoolTestPeer::redispatch(*peer.worker_pool, slice_list, 0);
+    };
+
+    Transport::Slice slice;
+    Transport::TransferTask task;
+
+    config.enable_keep_paused_rail = false;
+    run_redispatch(slice, task);
+    EXPECT_EQ(slice.status, Transport::Slice::PENDING);
+    EXPECT_EQ(slice.peer_nic_path, other_path);
+    WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
+
+    config.enable_keep_paused_rail = true;
+    run_redispatch(slice, task);
+    EXPECT_EQ(slice.status, Transport::Slice::FAILED);
+    EXPECT_NE(slice.peer_nic_path, other_path);
+    WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
+    EXPECT_TRUE(peer.transport->freeBatchID(batch_id).ok());
+}
+
+TEST(RdmaWorkerPoolRailTest, KeepPausedRailFailsOnFirstSubmit) {
+    RailConfigGuard config_guard;
+    auto &config = globalConfig();
+    config.enable_dest_device_affinity = true;
+
+    auto barrier = std::make_shared<InProcessRdmaTransport::Barrier>();
+    FakeRdmaPeer peer;
+    ASSERT_NO_FATAL_FAILURE(
+        initFakePeer(peer, "rdma-submit-a:10000", "mlx5_0", barrier));
+
+    // The same-name rail mlx5_0 is paused.
+    const std::string peer_server = "rdma-submit-b:10000";
+    ASSERT_NO_FATAL_FAILURE(addTwoRailPeerSegment(peer, peer_server));
+
+    const std::string matched_path = MakeNicPath(peer_server, "mlx5_0");
+    const std::string other_path = MakeNicPath(peer_server, "mlx5_1");
+    WorkerPoolTestPeer::pauseRail(*peer.worker_pool, matched_path);
+
+    // markFailed() dereferences the batch under USE_EVENT_DRIVEN_COMPLETION.
+    const auto batch_id = peer.transport->allocateBatchID(1);
+
+    // submitPostSend() only selects the peer rail and enqueues; workers are
+    // stopped, so no CQ or endpoint is touched.
+    auto run_submit = [&](Transport::Slice &slice,
+                          Transport::TransferTask &task) {
+        resetRailSlice(slice, task, batch_id);
+        slice.rdma.retry_cnt = 0;
+        std::vector<Transport::Slice *> slice_list{&slice};
+        return peer.worker_pool->submitPostSend(slice_list);
+    };
+
+    Transport::Slice slice;
+    Transport::TransferTask task;
+
+    config.enable_keep_paused_rail = false;
+    EXPECT_EQ(run_submit(slice, task), 0);
+    EXPECT_EQ(slice.status, Transport::Slice::PENDING);
+    EXPECT_EQ(slice.peer_nic_path, other_path);
+    WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
+
+    config.enable_keep_paused_rail = true;
+    EXPECT_EQ(run_submit(slice, task), 0);
+    EXPECT_EQ(slice.status, Transport::Slice::FAILED);
+    EXPECT_NE(slice.peer_nic_path, other_path);
+    WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
+    EXPECT_TRUE(peer.transport->freeBatchID(batch_id).ok());
 }
 
 }  // namespace

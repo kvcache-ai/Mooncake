@@ -189,10 +189,7 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
             peer_segment_desc, offset, length, local_hca, buffer_id, device_id,
             retry_count, hint_buffer_id, hint_device_id);
     } else {
-        // Soft dest affinity prefers the same name then may fall back.
-        // Strict dest affinity also passes the name hint; Topology then
-        // hard-fails instead of falling back to a mismatched peer HCA.
-        auto hint = destDeviceNameHintEnabled(config)
+        auto hint = config.enable_dest_device_affinity
                         ? std::string_view(local_hca)
                         : std::string_view();
         ret = RdmaTransport::selectDevice(
@@ -401,10 +398,10 @@ int WorkerPool::submitPostSend(
             MakeNicPath(peer_segment_desc->nicPathServerName(),
                         peer_segment_desc->devices[device_id].name);
 
-        // If selected rail is paused, try alternative devices. Strict
-        // same-name pairing must not hop onto a different peer HCA.
+        // If selected rail is paused, try alternative devices unless the
+        // selected path must be kept (MC_ENABLE_KEEP_PAUSED_RAIL).
         if (!isRailAvailable(peer_nic_path)) {
-            if (globalConfig().enable_strict_dest_device_affinity) {
+            if (globalConfig().enable_keep_paused_rail) {
                 slice->markFailed();
                 continue;
             }
@@ -729,6 +726,7 @@ void WorkerPool::performPostSend(int thread_id) {
                 context_.deleteEndpointByPtr(endpoint.get());
                 for (auto &slice : entry.second) {
                     if (!has_peer_alternative && local_context_inactive &&
+                        !globalConfig().enable_keep_paused_rail &&
                         tryHandoffToAnotherLocalWorker(slice)) {
                         processed_slice_count_++;
                     } else {
@@ -1019,7 +1017,11 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             processed_slice_count_++;
         } else {
             if (handoff_to_local_worker) {
-                if (tryHandoffToAnotherLocalWorker(slice)) {
+                // Local-only handoff keeps the peer RNIC and switches only
+                // the local RNIC, which leaves the selected rail pair. With
+                // MC_ENABLE_KEEP_PAUSED_RAIL the slice fails instead.
+                if (!globalConfig().enable_keep_paused_rail &&
+                    tryHandoffToAnotherLocalWorker(slice)) {
                     processed_slice_count_++;
                     continue;
                 }
@@ -1055,9 +1057,10 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 MakeNicPath(peer_segment_desc->nicPathServerName(),
                             peer_segment_desc->devices[device_id].name);
             if (!isRailAvailable(peer_nic_path)) {
-                if (globalConfig().enable_strict_dest_device_affinity) {
-                    LOG(ERROR) << "Worker: Cannot redispatch slice because the "
-                                  "matched peer rail is paused for target "
+                if (globalConfig().enable_keep_paused_rail) {
+                    LOG(ERROR) << "Worker: Cannot redispatch slice because "
+                                  "the selected peer rail is paused for "
+                                  "target "
                                << slice->target_id
                                << ", selected peer=" << peer_nic_path
                                << ", retry_cnt=" << slice->rdma.retry_cnt;

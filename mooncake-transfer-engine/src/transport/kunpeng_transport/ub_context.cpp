@@ -233,7 +233,7 @@ int UbWorkerPool::submitPostSend(
         }
         auto& peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
-        auto hint = destDeviceNameHintEnabled(globalConfig())
+        auto hint = globalConfig().enable_dest_device_affinity
                         ? context_.deviceName()
                         : "";
         if (UbTransport::selectDevice(peer_segment_desc.get(),
