@@ -214,7 +214,10 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.TESTPYPI_API_TOKEN }}
         run: |
-          twine upload --repository testpypi --skip-existing dist-publish/*.whl
+          # --verbose: on failure warehouse's response body (the actual
+          # rejection reason, e.g. the project quota message) reaches the
+          # log; plain output is just the HTTP reason phrase.
+          twine upload --verbose --repository testpypi --skip-existing dist-publish/*.whl
 
   nightly-test:
     needs: version-stamp
