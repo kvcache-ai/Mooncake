@@ -242,6 +242,77 @@ static std::shared_ptr<GpuIpcTransportPolicy> makeDefaultNvlinkPolicy() {
     return policy;
 }
 
+// An IPC handle exports a whole allocation, and cudaIpcOpenMemHandle maps it
+// at its base, so a buffer carved out of a larger allocation (as by a caching
+// allocator) sits `offset` bytes into the peer's mapping. The published
+// BufferDesc keeps the buffer's own range, so lookup and unregister still work
+// per buffer; the offset travels with the handle. Wire format of shm_name:
+//   cudaIpcMemHandle_t                      buffer starts its allocation
+//   cudaIpcMemHandle_t + uint64_t offset    buffer starts `offset` bytes in
+// The offset is in host byte order (IPC peers share a host). The short form
+// is what this transport has always published, so buffers that start their
+// allocation stay compatible with older peers; an older peer rejects the long
+// form ("Mismatched NVLink data transfer method") instead of writing to the
+// wrong address.
+constexpr size_t kIpcHandleBytes = sizeof(cudaIpcMemHandle_t);
+constexpr size_t kIpcHandleWithOffsetBytes =
+    sizeof(cudaIpcMemHandle_t) + sizeof(uint64_t);
+
+// Finds the allocation holding [addr, addr + length) and addr's offset in it.
+// Uses pointer attributes rather than cuMemGetAddressRange, which can fail
+// unless the allocation's context is current on the calling thread.
+bool findIpcAllocation(void *addr, size_t length, void **base,
+                       uint64_t *offset) {
+    CUdeviceptr alloc_base = 0;
+    size_t alloc_size = 0;
+#ifdef USE_SUPA
+    // supa.h has no alias for the range start attribute.
+    auto result =
+        cuMemGetAddressRange(&alloc_base, &alloc_size, (CUdeviceptr)addr);
+#else
+    auto result = cuPointerGetAttribute(
+        &alloc_base, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (CUdeviceptr)addr);
+    if (result == CUDA_SUCCESS)
+        result = cuPointerGetAttribute(
+            &alloc_size, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
+#endif
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: allocation lookup failed: " << result;
+        return false;
+    }
+    *base = (void *)alloc_base;
+    *offset = (uint64_t)addr - (uint64_t)alloc_base;
+    if (*offset > alloc_size || length > alloc_size - *offset) {
+        LOG(ERROR) << "NvlinkTransport: buffer " << addr << " + " << length
+                   << " extends past its allocation " << *base << " + "
+                   << alloc_size;
+        return false;
+    }
+    return true;
+}
+
+std::string serializeIpcHandle(const cudaIpcMemHandle_t &handle,
+                               uint64_t offset) {
+    if (offset == 0) return serializeBinaryData(&handle, kIpcHandleBytes);
+    unsigned char payload[kIpcHandleWithOffsetBytes];
+    memcpy(payload, &handle, kIpcHandleBytes);
+    memcpy(payload + kIpcHandleBytes, &offset, sizeof(offset));
+    return serializeBinaryData(payload, sizeof(payload));
+}
+
+bool isIpcPayload(const std::vector<unsigned char> &buffer) {
+    return buffer.size() == kIpcHandleBytes ||
+           buffer.size() == kIpcHandleWithOffsetBytes;
+}
+
+uint64_t ipcPayloadOffset(const std::vector<unsigned char> &buffer) {
+    uint64_t offset = 0;
+    if (buffer.size() == kIpcHandleWithOffsetBytes) {
+        memcpy(&offset, buffer.data() + kIpcHandleBytes, sizeof(offset));
+    }
+    return offset;
+}
+
 }  // anonymous namespace
 
 using Slice = Transport::Slice;
@@ -999,8 +1070,15 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             return -1;
         }
 
+        // Export the handle from the allocation base, so the handle itself
+        // carries no offset and ipc_offset is the only one the peer applies.
+        void *alloc_base = nullptr;
+        uint64_t ipc_offset = 0;
+        if (!findIpcAllocation(addr, length, &alloc_base, &ipc_offset)) {
+            return -1;
+        }
         cudaIpcMemHandle_t handle;
-        err = cudaIpcGetMemHandle(&handle, addr);
+        err = cudaIpcGetMemHandle(&handle, alloc_base);
         if (err != cudaSuccess) {
             LOG(ERROR) << "NvlinkTransport: cudaIpcGetMemHandle failed";
             return -1;
@@ -1011,8 +1089,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = policy_->normalizeMemoryLocation(addr, location);
-        desc.shm_name =
-            serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
+        desc.shm_name = serializeIpcHandle(handle, ipc_offset);
 #ifdef ENABLE_MULTI_PROTOCOL
         if (policy_->preserveExistingMetadata())
             desc.protocol = policy_->protocol();
@@ -1324,13 +1401,14 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     for (auto &entry : desc->buffers) {
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
+            auto relocate = [&](const OpenedShmEntry &opened) {
+                dest_addr = dest_addr - entry.addr +
+                            ((uint64_t)opened.shm_addr) + opened.offset;
+            };
             remap_lock_.lockShared();
             if (remap_entries_.count(std::make_pair(target_id, entry.addr))) {
-                auto shm_addr =
-                    remap_entries_[std::make_pair(target_id, entry.addr)]
-                        .shm_addr;
+                relocate(remap_entries_[std::make_pair(target_id, entry.addr)]);
                 remap_lock_.unlockShared();
-                dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
                 return 0;
             }
             remap_lock_.unlockShared();
@@ -1338,8 +1416,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             if (!remap_entries_.count(std::make_pair(target_id, entry.addr))) {
                 std::vector<unsigned char> output_buffer;
                 deserializeBinaryData(entry.shm_name, output_buffer);
-                if (output_buffer.size() == sizeof(cudaIpcMemHandle_t) &&
-                    !use_fabric_mem_) {
+                if (isIpcPayload(output_buffer) && !use_fabric_mem_) {
                     cudaIpcMemHandle_t handle;
                     memcpy(&handle, output_buffer.data(), sizeof(handle));
                     void *shm_addr = nullptr;
@@ -1355,6 +1432,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = entry.length;
+                    shm_entry.offset = ipcPayloadOffset(output_buffer);
 #ifdef USE_MUSA
                     shm_entry.device_id = ipc_device;
 #endif
@@ -1419,9 +1497,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     return -1;
                 }
             }
-            auto shm_addr =
-                remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
-            dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
+            relocate(remap_entries_[std::make_pair(target_id, entry.addr)]);
             return 0;
         }
         index++;
