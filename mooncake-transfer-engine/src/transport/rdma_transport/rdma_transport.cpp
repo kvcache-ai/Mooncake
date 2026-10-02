@@ -1038,6 +1038,10 @@ Status RdmaTransport::submitTransferTask(
                 }
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
+                const std::string &source_location_name =
+                    local_segment_desc->buffers[buffer_id].name;
+                slice->rdma.source_on_host =
+                    source_location_name.rfind("cpu", 0) == 0;
                 if (globalConfig().log_rdma_slice_affinity) {
                     slice->source_location = resolveBufferLocation(
                         local_segment_desc->buffers[buffer_id],
