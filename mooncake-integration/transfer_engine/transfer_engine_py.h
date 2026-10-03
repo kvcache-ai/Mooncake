@@ -238,6 +238,8 @@ class TransferEnginePy {
         const std::vector<std::vector<size_t>> &lengths, TransferOpcode opcode);
 
     char *allocateRawBuffer(size_t capacity);
+    void releaseRawBuffer(void *buffer);
+    size_t buddySlabCapacity() const;
 
     int findClassId(size_t size);
 
@@ -253,6 +255,7 @@ class TransferEnginePy {
     std::unordered_set<char *> large_buffer_list_;
     std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
     bool auto_discovery_;
+    bool use_shm_alloc_ = false;
 
     uint64_t transfer_timeout_nsec_;
 };
