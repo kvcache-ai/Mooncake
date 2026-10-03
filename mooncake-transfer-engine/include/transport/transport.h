@@ -209,19 +209,30 @@ class Transport {
 
        public:
         void markSuccess() {
-            status = Slice::SUCCESS;
-            __atomic_fetch_add(&task->transferred_bytes, length,
-                               __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
+            TransferTask *owner = __atomic_load_n(&task, __ATOMIC_ACQUIRE);
+            markSuccess(owner, length);
+        }
 
-            check_batch_completion(task, false);
+        void markSuccess(TransferTask *owner, size_t len) {
+            status = Slice::SUCCESS;
+            __atomic_fetch_add(&owner->transferred_bytes, len,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&owner->success_slice_count, 1,
+                               __ATOMIC_ACQ_REL);
+
+            check_batch_completion(owner, false);
         }
 
         void markFailed() {
-            status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
+            TransferTask *owner = __atomic_load_n(&task, __ATOMIC_ACQUIRE);
+            markFailed(owner);
+        }
 
-            check_batch_completion(task, true);
+        void markFailed(TransferTask *owner) {
+            status = Slice::FAILED;
+            __atomic_fetch_add(&owner->failed_slice_count, 1, __ATOMIC_ACQ_REL);
+
+            check_batch_completion(owner, true);
         }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
@@ -377,6 +388,12 @@ class Transport {
         const TransferRequest *request = nullptr;
 #endif
         size_t request_count = 1;
+        // Number of TCP slice terminal actions that have been handed
+        // out and have not fully returned yet. A transfer is only considered
+        // finished after this count reaches zero so a pooled Slice is never
+        // recycled while an I/O thread still reads it.
+        volatile uint64_t outstanding_slice_completions = 0;
+
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {
