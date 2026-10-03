@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-name", default="")
     parser.add_argument("--global-segment-size", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--local-buffer-size", type=int, default=32 * 1024 * 1024)
+    parser.add_argument("--enable-ssd-offload", action="store_true")
     parser.add_argument(
         "--io-api",
         choices=["plain", "zcopy"],
@@ -98,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--memory-replica-num", type=int, default=1)
     parser.add_argument("--nof-replica-num", type=int, default=0)
+    parser.add_argument("--dfs-replica-num", type=int, default=0)
 
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--pattern", default="")
@@ -401,6 +403,7 @@ class StoreSession:
         self.config = ReplicateConfig()
         self.config.replica_num = args.memory_replica_num
         self.config.nof_replica_num = args.nof_replica_num
+        self.config.dfs_replica_num = args.dfs_replica_num
         self._zcopy = zcopy
 
     def close(self) -> None:
@@ -681,6 +684,7 @@ class StoreRuntime:
             args.protocol,
             args.device_name,
             args.master_server,
+            enable_ssd_offload=args.enable_ssd_offload,
         )
         if setup_ret != 0:
             raise RuntimeError(f"setup failed: {setup_ret}")
@@ -1374,7 +1378,7 @@ class BenchmarkRunner:
 
     def run(self) -> List[PhaseStats]:
         LOG.info(
-            "scenario=%s io_api=%s numjobs=%d iodepth=%d lanes=%d batch_size=%d value_size=%d nr_objects=%d prepare_objects=%d write_objects=%d memory_replica_num=%d nof_replica_num=%d verify=%s",
+            "scenario=%s io_api=%s numjobs=%d iodepth=%d lanes=%d batch_size=%d value_size=%d nr_objects=%d prepare_objects=%d write_objects=%d memory_replica_num=%d nof_replica_num=%d dfs_replica_num=%d verify=%s",
             self.args.scenario,
             self.args.io_api,
             self.args.numjobs,
@@ -1387,6 +1391,7 @@ class BenchmarkRunner:
             self.args.write_objects,
             self.args.memory_replica_num,
             self.args.nof_replica_num,
+            self.args.dfs_replica_num,
             self.args.verify,
         )
 
