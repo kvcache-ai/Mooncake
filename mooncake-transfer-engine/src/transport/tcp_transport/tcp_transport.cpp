@@ -738,6 +738,9 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
 void TcpTransport::startTransfer(Slice* slice,
                                  std::function<void()> continuation,
                                  bool reuse_connection) {
+    // RELAXED is sufficient here: prepareTransfer stores slice->task with
+    // RELEASE before publishing the slice through the work queue, and that
+    // publication orders this load against the store.
     TransferTask* owner = __atomic_load_n(&slice->task, __ATOMIC_RELAXED);
     size_t slice_length = slice->length;
 

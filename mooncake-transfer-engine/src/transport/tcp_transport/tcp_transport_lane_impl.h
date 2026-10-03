@@ -1375,6 +1375,10 @@ void TcpTransport::completeTerminalAction(TerminalAction action) noexcept {
             else
                 action.work.slice->markFailed(owner);
         } else if (owner) {
+            // Defensive: no caller currently builds a slice-less terminal
+            // action. Unlike the mark* paths, this arm does not funnel
+            // through check_batch_completion; it only guards the counters
+            // in case such an action ever appears.
             if (action.status == TransferStatusEnum::COMPLETED)
                 __atomic_fetch_add(&owner->success_slice_count, 1,
                                    __ATOMIC_ACQ_REL);
