@@ -59,6 +59,7 @@ namespace tent {
 
 extern thread_local int tl_wid;
 constexpr size_t kMetadataLifetimeBlockSize = 4096;
+constexpr int kGdrFailureThreshold = 2;
 
 // Friend accessor for driving initializeContexts() without a full install().
 class RdmaTransportTestPeer {
@@ -150,6 +151,8 @@ class RdmaTransportTestPeer {
     static Workers& prepareMetadataLifetime(RdmaTransport& transport) {
         transport.params_->workers.num_workers = 1;
         transport.params_->workers.block_size = kMetadataLifetimeBlockSize;
+        transport.conf_->set("transports/rdma/gdr_error_threshold",
+                             kGdrFailureThreshold);
         transport.workers_ = std::make_unique<Workers>(&transport);
         auto& workers = *transport.workers_;
         makeWorkerContexts(workers, 1);
@@ -600,7 +603,6 @@ TEST_F(RdmaSliceMetadataLifetimeTest,
     auto& gdr = GdrReachability::instance();
     const int source_gpu = first->source_gpu_ordinal;
     const int target_gpu = first->target_gpu_ordinal;
-    constexpr int kGdrFailureThreshold = 2;
     for (int i = 0; i < kGdrFailureThreshold; ++i) {
         gdr.reportLocalFailure(expected_nic_name, source_gpu);
         gdr.reportRemoteFailure(expected_machine_id, expected_nic_name,
