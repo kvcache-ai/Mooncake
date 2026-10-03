@@ -1384,19 +1384,17 @@ std::shared_ptr<ClientLivenessRecord> MasterService::FindLocalDiskClientRecord(
     return it->second;
 }
 
-void MasterService::RetainingClientIndex::Update(const UUID& client_id,
-                                                 bool retaining) {
+void RetainingClientIndex::Update(const UUID& client_id, bool retaining) {
     std::lock_guard lock(mutex);
     const bool changed = retaining ? clients.insert(client_id).second
                                    : clients.erase(client_id) != 0;
     if (changed) {
-        std::atomic_store(&snapshot,
-                          std::shared_ptr<const RetainingClientIds>{});
+        std::atomic_store(&snapshot, std::shared_ptr<const ClientIds>{});
     }
 }
 
-std::shared_ptr<const MasterService::RetainingClientIds>
-MasterService::RetainingClientIndex::Snapshot() {
+std::shared_ptr<const RetainingClientIndex::ClientIds>
+RetainingClientIndex::Snapshot() {
     auto current = std::atomic_load(&snapshot);
     if (current) {
         return current;
@@ -1404,7 +1402,7 @@ MasterService::RetainingClientIndex::Snapshot() {
     std::lock_guard lock(mutex);
     current = std::atomic_load(&snapshot);
     if (!current) {
-        current = std::make_shared<const RetainingClientIds>(clients);
+        current = std::make_shared<const ClientIds>(clients);
         std::atomic_store(&snapshot, current);
     }
     return current;
@@ -1414,26 +1412,21 @@ void MasterService::TrackLocalDiskClientLocked(
     const UUID& client_id,
     const std::shared_ptr<ClientLivenessRecord>& record) {
     if (local_disk_client_records_.emplace(client_id, record).second) {
-        record->AddResourceObserver(
-            retaining_client_index_.get(),
-            ClientLivenessRecord::ResourceRequirement::RETAINING,
-            [index = retaining_client_index_, client_id](bool retaining) {
-                index->Update(client_id, retaining);
-            });
+        record->BindRetainingClient(client_id, retaining_client_index_);
     }
 }
 
 void MasterService::UntrackLocalDiskClientLocked(const UUID& client_id) {
     const auto it = local_disk_client_records_.find(client_id);
     if (it != local_disk_client_records_.end()) {
-        it->second->RemoveResourceObserver(retaining_client_index_.get());
+        it->second->UnbindRetainingClient();
         local_disk_client_records_.erase(it);
     }
 }
 
 void MasterService::ClearLocalDiskClientsLocked() {
     for (const auto& [client_id, record] : local_disk_client_records_) {
-        record->RemoveResourceObserver(retaining_client_index_.get());
+        record->UnbindRetainingClient();
     }
     local_disk_client_records_.clear();
 }

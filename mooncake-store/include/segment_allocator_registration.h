@@ -10,20 +10,6 @@
 
 namespace mooncake {
 
-// One counter per distinct segment name. Multiple registrations of the same
-// name contribute only once to the live AllocatorManager's aggregate.
-class ServingNameCounter {
-   public:
-    explicit ServingNameCounter(std::shared_ptr<std::atomic<size_t>> total)
-        : total_(std::move(total)) {}
-    void Update(bool serving);
-
-   private:
-    std::mutex mutex_;
-    size_t serving_registrations_ = 0;
-    std::shared_ptr<std::atomic<size_t>> total_;
-};
-
 class ScopedNoFSegmentAccess;
 class ScopedSegmentAccess;
 class SegmentSerializer;
@@ -32,7 +18,7 @@ class Serializer;
 class SegmentAllocatorRegistration {
    public:
     ~SegmentAllocatorRegistration();
-    // The registration address identifies its liveness subscription.
+    // Each registration owns one serving-count contribution.
     SegmentAllocatorRegistration(const SegmentAllocatorRegistration&) = delete;
     SegmentAllocatorRegistration& operator=(
         const SegmentAllocatorRegistration&) = delete;
@@ -53,14 +39,14 @@ class SegmentAllocatorRegistration {
     void Invalidate();
     void TrackServingName(std::shared_ptr<ServingNameCounter> counter);
     void UntrackServingName();
-    void SubscribeServingCount();
-    void UnsubscribeServingCount();
+    void AddServingCount();
+    void RemoveServingCount();
     std::shared_ptr<BufferAllocatorBase> allocator_;
     SegmentLifetime allocation_lifetime_;
     SegmentLifetime buffer_lifetime_;
     std::shared_ptr<ClientLivenessRecord> client_liveness_;
-    // Updated under the owning SegmentManager's segment_mutex_. Client state
-    // callbacks capture only the counter, never this registration or manager.
+    // Updated under the owning SegmentManager's segment_mutex_. Liveness
+    // records hold only the counter, never this registration or manager.
     std::shared_ptr<ServingNameCounter> serving_name_counter_;
     friend class AllocatorManager;
     friend class ScopedNoFSegmentAccess;

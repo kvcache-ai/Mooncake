@@ -174,7 +174,7 @@ class AllocatorManager {
 
     // O(1) for the live registry. Placement snapshots share registrations but
     // freeze membership, so they retain a scan if explicitly asked to count.
-    // No subscriptions are created on the per-allocation Snapshot path.
+    // No counter bindings are created on the per-allocation Snapshot path.
     // Liveness can change concurrently, as with getServingNames(); allocation
     // still rechecks each registration rather than relying on this hint.
     [[nodiscard]] size_t getServingNameCount() const {

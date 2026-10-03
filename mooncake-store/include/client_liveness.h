@@ -1,14 +1,49 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
-#include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
-#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
+
+#include <boost/functional/hash.hpp>
+
+#include "types.h"
 
 namespace mooncake {
+
+// One counter per distinct segment name. Multiple registrations of the same
+// name contribute only once to the live AllocatorManager's aggregate.
+class ServingNameCounter {
+   public:
+    explicit ServingNameCounter(std::shared_ptr<std::atomic<size_t>> total)
+        : total_(std::move(total)) {}
+    void Update(bool serving);
+
+   private:
+    std::mutex mutex_;
+    size_t serving_registrations_ = 0;
+    std::shared_ptr<std::atomic<size_t>> total_;
+};
+
+struct RetainingClientIndex {
+    using ClientIds = std::unordered_set<UUID, boost::hash<UUID>>;
+    void Update(const UUID& client_id, bool retaining);
+    std::shared_ptr<const ClientIds> Snapshot();
+
+    // Leaf lock: updates must not acquire client, segment, or metadata locks.
+    std::mutex mutex;
+    ClientIds clients;
+    // Invalidate on membership changes; the next reader publishes one copy.
+    // In-flight RPCs retain their immutable view after releasing client_mutex_.
+    std::shared_ptr<const ClientIds> snapshot =
+        std::make_shared<const ClientIds>();
+};
 
 enum class ClientLivenessState {
     ACTIVE,
@@ -177,54 +212,67 @@ class ClientLivenessRecord {
     friend class SegmentAllocatorRegistration;
     friend class MasterService;
 
-    enum class ResourceRequirement { SERVING, RETAINING };
-    struct ResourceObserver {
-        ResourceRequirement requirement;
-        std::function<void(bool)> notify;
-
-        bool Matches(ClientLivenessState state) const {
-            return requirement == ResourceRequirement::SERVING
-                       ? state == ClientLivenessState::ACTIVE
-                       : state != ClientLivenessState::OFFLINE;
-        }
-    };
-
-    // These callbacks only update derived resource indexes. They must not
-    // acquire transition_mutex_ or any client, segment, or metadata lock. A
-    // separate mutex allows mounting to subscribe inside ObserveAndRun's
-    // operation.
-    void AddResourceObserver(const void* owner, ResourceRequirement requirement,
-                             std::function<void(bool)> observer) {
-        std::lock_guard lock(resource_observers_mutex_);
-        const auto [it, inserted] = resource_observers_.emplace(
-            owner, ResourceObserver{requirement, std::move(observer)});
-        if (inserted && it->second.Matches(state())) {
-            it->second.notify(true);
+    // Mounts can attach counters inside ObserveAndRun while transition_mutex_
+    // is held. This separate lock serializes bindings with state publication.
+    // Index/counter updates take only leaf locks, never registry locks.
+    void AddServingCounter(std::shared_ptr<ServingNameCounter> counter) {
+        std::lock_guard lock(resource_mutex_);
+        serving_counters_.push_back(counter);
+        if (IsServing()) {
+            counter->Update(true);
         }
     }
 
-    void RemoveResourceObserver(const void* owner) {
-        std::lock_guard lock(resource_observers_mutex_);
-        const auto it = resource_observers_.find(owner);
-        if (it != resource_observers_.end()) {
-            if (it->second.Matches(state())) {
-                it->second.notify(false);
+    void RemoveServingCounter(
+        const std::shared_ptr<ServingNameCounter>& counter) {
+        std::lock_guard lock(resource_mutex_);
+        const auto it = std::find(serving_counters_.begin(),
+                                  serving_counters_.end(), counter);
+        if (it != serving_counters_.end()) {
+            if (IsServing()) {
+                counter->Update(false);
             }
-            resource_observers_.erase(it);
+            serving_counters_.erase(it);
+        }
+    }
+
+    void BindRetainingClient(const UUID& client_id,
+                             std::shared_ptr<RetainingClientIndex> index) {
+        std::lock_guard lock(resource_mutex_);
+        assert(!retaining_client_index_);
+        retaining_client_id_ = client_id;
+        retaining_client_index_ = std::move(index);
+        if (ShouldRetainResources()) {
+            retaining_client_index_->Update(client_id, true);
+        }
+    }
+
+    void UnbindRetainingClient() {
+        std::lock_guard lock(resource_mutex_);
+        if (retaining_client_index_) {
+            if (ShouldRetainResources()) {
+                retaining_client_index_->Update(retaining_client_id_, false);
+            }
+            retaining_client_index_.reset();
         }
     }
 
     // Caller holds transition_mutex_. Ordinary ACTIVE heartbeats never enter
-    // this path; each observer runs only when its predicate changes.
+    // this path. Update only the resource condition that actually changed.
     void PublishStateLocked(ClientLivenessState next) {
-        std::lock_guard lock(resource_observers_mutex_);
+        std::lock_guard lock(resource_mutex_);
         const auto previous = state();
         state_.store(next, std::memory_order_release);
-        for (const auto& [owner, observer] : resource_observers_) {
-            const bool matches = observer.Matches(next);
-            if (observer.Matches(previous) != matches) {
-                observer.notify(matches);
+        const bool serving = next == ClientLivenessState::ACTIVE;
+        if ((previous == ClientLivenessState::ACTIVE) != serving) {
+            for (const auto& counter : serving_counters_) {
+                counter->Update(serving);
             }
+        }
+        const bool retaining = next != ClientLivenessState::OFFLINE;
+        if (retaining_client_index_ &&
+            (previous != ClientLivenessState::OFFLINE) != retaining) {
+            retaining_client_index_->Update(retaining_client_id_, retaining);
         }
     }
 
@@ -240,8 +288,11 @@ class ClientLivenessRecord {
 
     std::atomic<ClientLivenessState> state_{ClientLivenessState::ACTIVE};
     std::mutex transition_mutex_;
-    std::mutex resource_observers_mutex_;
-    std::unordered_map<const void*, ResourceObserver> resource_observers_;
+    std::mutex resource_mutex_;
+    // One entry per allocatable registration; same-name entries may repeat.
+    std::vector<std::shared_ptr<ServingNameCounter>> serving_counters_;
+    std::shared_ptr<RetainingClientIndex> retaining_client_index_;
+    UUID retaining_client_id_{};
     TimePoint last_liveness_at_;
     TimePoint suspected_since_{};
 };

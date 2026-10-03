@@ -35,39 +35,35 @@ void SegmentAllocatorRegistration::TrackServingName(
     std::shared_ptr<ServingNameCounter> counter) {
     assert(!serving_name_counter_);
     serving_name_counter_ = std::move(counter);
-    SubscribeServingCount();
+    AddServingCount();
 }
 
 void SegmentAllocatorRegistration::UntrackServingName() {
-    UnsubscribeServingCount();
+    RemoveServingCount();
     serving_name_counter_.reset();
 }
 
-void SegmentAllocatorRegistration::SubscribeServingCount() {
+void SegmentAllocatorRegistration::AddServingCount() {
     if (!serving_name_counter_ || !allocation_lifetime_.isAvailable()) {
         return;
     }
     const auto record =
         std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
     if (record) {
-        record->AddResourceObserver(
-            this, ClientLivenessRecord::ResourceRequirement::SERVING,
-            [counter = serving_name_counter_](bool serving) {
-                counter->Update(serving);
-            });
+        record->AddServingCounter(serving_name_counter_);
     } else {
         serving_name_counter_->Update(true);
     }
 }
 
-void SegmentAllocatorRegistration::UnsubscribeServingCount() {
+void SegmentAllocatorRegistration::RemoveServingCount() {
     if (!serving_name_counter_ || !allocation_lifetime_.isAvailable()) {
         return;
     }
     const auto record =
         std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
     if (record) {
-        record->RemoveResourceObserver(this);
+        record->RemoveServingCounter(serving_name_counter_);
     } else {
         serving_name_counter_->Update(false);
     }
@@ -120,10 +116,10 @@ void SegmentAllocatorRegistration::BindAllocator(
 
 void SegmentAllocatorRegistration::BindClientLiveness(
     std::shared_ptr<ClientLivenessRecord> record) {
-    UnsubscribeServingCount();
+    RemoveServingCount();
     std::atomic_store_explicit(&client_liveness_, std::move(record),
                                std::memory_order_release);
-    SubscribeServingCount();
+    AddServingCount();
 }
 
 void SegmentAllocatorRegistration::BindBuffer(AllocatedBuffer& buffer) const {
@@ -141,9 +137,9 @@ void SegmentAllocatorRegistration::SetAllocatable(bool allocatable) {
     if (allocatable == allocation_lifetime_.isAvailable()) {
         return;
     }
-    UnsubscribeServingCount();
+    RemoveServingCount();
     allocation_lifetime_.setAvailable(allocatable);
-    SubscribeServingCount();
+    AddServingCount();
 }
 
 void SegmentAllocatorRegistration::Invalidate() {
