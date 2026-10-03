@@ -489,6 +489,10 @@ MasterMetricManager::MasterMetricManager()
       snapshot_fail_("master_snapshot_fail",
                      "Total number of failed snapshot operations"),
 
+      orphaned_draining_restore_(
+          "master_orphaned_draining_restore_total",
+          "Orphaned draining segments found during restore"),
+
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
       copy_start_requests_("master_copy_start_requests_total",
@@ -1460,6 +1464,10 @@ void MasterMetricManager::inc_snapshot_success() { snapshot_success_.inc(); }
 
 void MasterMetricManager::inc_snapshot_fail() { snapshot_fail_.inc(); }
 
+void MasterMetricManager::inc_orphaned_draining_restore() {
+    orphaned_draining_restore_.inc();
+}
+
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
@@ -2241,6 +2249,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(snapshot_duration_ms_);
     serialize_metric(snapshot_success_);
     serialize_metric(snapshot_fail_);
+    serialize_metric(orphaned_draining_restore_);
 
     return ss.str();
 }

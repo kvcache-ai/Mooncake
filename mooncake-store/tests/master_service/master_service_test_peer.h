@@ -15,6 +15,33 @@ class MasterServiceTestPeer {
     explicit MasterServiceTestPeer(MasterService& service)
         : service_(service) {}
 
+    static void StopDrainDispatcher(MasterService& service) {
+        service.job_dispatch_running_ = false;
+        if (service.job_dispatch_thread_.joinable()) {
+            service.job_dispatch_thread_.join();
+        }
+    }
+
+    static auto& DrainSnapshotMutex(MasterService& service) {
+        return service.drain_snapshot_mutex_;
+    }
+
+    static auto& DrainJobs(MasterService& service) {
+        return service.drain_jobs_;
+    }
+
+    static auto RebuildSnapshotLiveness(MasterService& service) {
+        return service.RebuildClientLivenessAfterSnapshotRestore();
+    }
+
+    static void ResetSnapshotState(MasterService& service) {
+        service.ResetStateAfterFailedRestoreAttempt();
+    }
+
+    static void ProcessDrainJobs(MasterService& service) {
+        service.ProcessDrainJobs();
+    }
+
     using GroupDomainAccessorRO = MasterService::GroupDomainAccessorRO;
     using GroupDomainAccessorRW = MasterService::GroupDomainAccessorRW;
     using MetadataAccessorRO = MasterService::MetadataAccessorRO;

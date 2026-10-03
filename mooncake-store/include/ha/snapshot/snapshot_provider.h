@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -8,6 +9,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "metadata_store.h"
+#include "ha/snapshot/master_snapshot_codec.h"
 #include "weight_metadata_store.h"
 
 namespace mooncake {
@@ -18,6 +20,9 @@ struct LoadedSnapshot {
     std::vector<StandbyObjectEntry> metadata;
     std::vector<StandbySegmentInfo> segments;
     WeightMetadataSnapshot weight_metadata;
+    // Preserve the complete master state for snapshot-only promotion. The
+    // object-only standby view cannot represent tasks or draining allocators.
+    std::shared_ptr<const ha::MasterSnapshotPayloads> master_snapshot_payloads;
 };
 
 /**

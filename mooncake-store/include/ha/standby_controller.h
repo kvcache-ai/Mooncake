@@ -31,6 +31,7 @@ struct PromotionContext {
     std::vector<StandbyObjectEntry> objects;
     std::vector<StandbySegmentInfo> segments;
     WeightMetadataSnapshot weight_metadata;
+    std::shared_ptr<const MasterSnapshotPayloads> master_snapshot_payloads;
     std::unique_ptr<StandbyMetadataStore> metadata_store;
     DurablePrefix applied_cursor;
     ViewVersionId producer_view_version{0};

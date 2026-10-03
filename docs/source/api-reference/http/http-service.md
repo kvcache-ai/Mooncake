@@ -577,6 +577,55 @@ Drain jobs migrate all objects away from one or more segments so they can be
 unmounted safely. Job states follow `CREATED -> PLANNING -> RUNNING ->
 SUCCEEDED | FAILED | CANCELED`.
 
+#### Snapshot recovery
+
+With master snapshots enabled, format `1.1.0` stores DrainJob identity, request,
+status, progress, retry budgets and active task associations in the required
+`drain_jobs` payload (`[jobs, replication_records]` in MessagePack). Per-object
+COPY/MOVE runtime is stored separately for retained draining objects, including
+copies started before a drain could schedule a task. The master publishes a snapshot only after every required
+payload has uploaded. Cold restart and the existing snapshot-only standby
+promotion path restore snapshotted jobs and continue unfinished work.
+Running tasks keep their IDs and state; completed work is accounted once.
+Clients complete the normal heartbeat/remount handshake. An exact owner and
+segment-registration match preserves `DRAINING` or `DRAINED` on remount.
+Missing task history is treated as an unrecoverable unit, not replayed blindly.
+
+This is snapshot-only recovery: jobs and progress after the snapshot can be
+lost. It does not provide Job OpLog persistence or lossless recovery with an
+OpLog suffix. Standby recovery with OpLog following still restores its existing
+object view and does not recover DrainJobs. Batch-generated standby snapshots
+(`enable_oplog_snapshot`) are also outside this recovery path. The configured snapshot backend
+must be reachable by the replacement master; the local-file backend's existing
+write/close durability is unchanged (no new power-loss/fsync guarantee).
+
+Legacy `1.0.0` snapshots remain readable. A missing or corrupt job file in a
+`1.1.0` snapshot fails that candidate. Cold restart tries older candidates;
+the existing standby provider selects the latest snapshot and fails closed
+instead of falling back. Invalid job records also reject promotion before
+workers or serving start. Older binaries cannot read the new format.
+
+During cold restore and full-payload `1.1.0` promotion, an orphaned `DRAINING`
+segment (for example, from a legacy cold-restore snapshot) stays
+non-allocatable, with existing readable replicas retained. Recovery logs the
+segment and increments `master_orphaned_draining_restore_total`. No target list
+is guessed and the segment is not automatically reopened. Interrupted moves
+without recoverable runtime state may require operator cleanup; their allocated
+target buffers are retained rather than reused while a transfer may still be
+writing. After verifying that outstanding transfers have stopped and resolving
+any incomplete replicas, an operator can explicitly reopen the segment, then
+create a new drain job if needed:
+
+```bash
+curl -X PUT "http://localhost:9003/api/v1/segments/status?segment=segment_0" \
+  -H "Content-Type: application/json" -d '{"status": "OK"}'
+```
+
+Reopening is rejected while a live drain job owns the source or an unfinished
+move task still references it. Completed drain jobs remain queryable after
+recovery and are not restarted. Legacy standby bootstrap retains its previous
+object-view behavior; it does not provide full orphan recovery.
+
 #### `POST /api/v1/drain_jobs`
 Create a drain job for the given segments.
 

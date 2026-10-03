@@ -22,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <condition_variable>
 #include <filesystem>
 #include <future>
@@ -556,6 +557,10 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     tl::expected<void, SerializationError> CallPersistState(
         const std::string& snapshot_id) {
+        std::unique_lock drain_lock(
+            MasterServiceTestPeer::DrainSnapshotMutex(*service_));
+        std::unique_lock snapshot_lock(
+            MasterServiceTestPeer::SnapshotMutex(*service_));
         if (MasterServiceTestPeer::SnapshotManager(*service_)) {
             return MasterServiceTestPeer::SnapshotManager(*service_)
                 ->PersistState(snapshot_id);
@@ -567,6 +572,10 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     tl::expected<void, SerializationError> CallPersistState(
         const ha::SnapshotDescriptor& descriptor) {
+        std::unique_lock drain_lock(
+            MasterServiceTestPeer::DrainSnapshotMutex(*service_));
+        std::unique_lock snapshot_lock(
+            MasterServiceTestPeer::SnapshotMutex(*service_));
         if (MasterServiceTestPeer::SnapshotManager(*service_)) {
             return MasterServiceTestPeer::SnapshotManager(*service_)
                 ->PersistState(descriptor);
@@ -644,7 +653,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return key + "_group";
     }
 
-   private:
+   protected:
     // Helper to create a temporary snapshot manager for tests
     std::unique_ptr<MasterSnapshotManager> CreateTempSnapshotManager() {
         EnsureSnapshotStores();
@@ -1860,6 +1869,321 @@ TEST_F(SnapshotChildProcessTest, UploadFail_WithBackupDir_SavesAllFiles) {
 
     // Remove the blocking file for cleanup
     fs::remove(snapshot_root);
+}
+
+TEST_F(SnapshotChildProcessTest,
+       DrainJobsPersistAcrossLocalRestartsAndContinue) {
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_object_store_type("local")
+                      .set_snapshot_retention_count(5)
+                      .set_default_kv_lease_ttl(0)
+                      .set_eviction_ratio(0)
+                      .set_put_start_release_timeout_sec(3600)
+                      .build();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    std::vector<uint8_t> source_memory(16 * 1024 * 1024);
+    std::vector<uint8_t> target_memory(16 * 1024 * 1024);
+    const auto client = generate_uuid();
+    std::vector<Segment> registrations;
+    auto mount = [&](const std::string& name, std::vector<uint8_t>& memory) {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = name;
+        segment.te_endpoint = name;
+        segment.base = reinterpret_cast<uintptr_t>(memory.data());
+        segment.size = memory.size();
+        ASSERT_TRUE(service_->MountSegment(segment, client));
+        registrations.push_back(segment);
+    };
+    mount("drain_source", source_memory);
+    for (int i = 0; i < 3; ++i) {
+        const auto key = "drain_" + std::to_string(i);
+        auto put = service_->PutStart(client, key, TenantId::Default(), 1024,
+                                      ReplicateConfig{.replica_num = 1});
+        ASSERT_TRUE(put);
+        auto address = put->front()
+                           .get_memory_descriptor()
+                           .buffer_descriptor.buffer_address_;
+        std::memset(reinterpret_cast<void*>(address), i + 1, 1024);
+        ASSERT_TRUE(service_->PutEnd(client, key, TenantId::Default(),
+                                     ReplicaType::MEMORY));
+    }
+    mount("drain_target", target_memory);
+    auto id = service_->CreateDrainJob({{"drain_source"}, {"drain_target"}, 1});
+    ASSERT_TRUE(id);
+    MasterServiceTestPeer::ProcessDrainJobs(*service_);
+    auto fetched = service_->FetchTasks(client, 10);
+    ASSERT_TRUE(fetched);
+    ASSERT_EQ(1u, fetched->size());
+    const auto task_id = fetched->front().id;
+    ReplicaMovePayload moving;
+    struct_json::from_json(moving, fetched->front().payload);
+    auto started = service_->MoveStart(client, moving.key, TenantId::Default(),
+                                       moving.source, moving.target);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(started->target);
+    const auto from = started->source.get_memory_descriptor()
+                          .buffer_descriptor.buffer_address_;
+    const auto to = started->target->get_memory_descriptor()
+                        .buffer_descriptor.buffer_address_;
+    std::memcpy(reinterpret_cast<void*>(to), reinterpret_cast<void*>(from),
+                1024);
+    ASSERT_TRUE(CallPersistState("20261002_120000_000"));
+    service_.reset();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    EXPECT_EQ(ClientStatus::NEED_REMOUNT,
+              service_->Ping(client)->client_status);
+    EXPECT_FALSE(service_->ReMountSegment(registrations, generate_uuid()));
+    auto mismatched = registrations;
+    mismatched.front().base += 64;
+    EXPECT_FALSE(service_->ReMountSegment(mismatched, client));
+    ASSERT_TRUE(service_->ReMountSegment(registrations, client));
+    EXPECT_EQ(ClientStatus::OK, service_->Ping(client)->client_status);
+    EXPECT_EQ(SegmentStatus::DRAINING,
+              *service_->QuerySegmentStatus("drain_source"));
+    auto restored = service_->QueryDrainJob(*id);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(1u, restored->active_units);
+    EXPECT_EQ(TaskStatus::PROCESSING, service_->QueryTask(task_id)->status);
+    EXPECT_TRUE(service_->FetchTasks(client, 10)->empty());
+    // MoveStart's runtime record must survive so the existing client can
+    // finish.
+    ASSERT_TRUE(service_->MoveEnd(client, moving.key, TenantId::Default()));
+    TaskCompleteRequest complete;
+    complete.id = task_id;
+    complete.status = TaskStatus::SUCCESS;
+    ASSERT_TRUE(service_->MarkTaskToComplete(client, complete));
+    // Snapshot a finished task before the job has accounted for it.
+    ASSERT_TRUE(CallPersistState("20261002_120001_000"));
+    service_.reset();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    ASSERT_TRUE(service_->ReMountSegment(registrations, client));
+    EXPECT_EQ(ClientStatus::OK, service_->Ping(client)->client_status);
+    for (int i = 0; i < 4; ++i) {
+        MasterServiceTestPeer::ProcessDrainJobs(*service_);
+        auto assignments = service_->FetchTasks(client, 10);
+        ASSERT_TRUE(assignments);
+        for (const auto& assignment : *assignments) {
+            ReplicaMovePayload move;
+            struct_json::from_json(move, assignment.payload);
+            auto start =
+                service_->MoveStart(client, move.key, TenantId::Default(),
+                                    move.source, move.target);
+            ASSERT_TRUE(start);
+            if (start->target) {
+                std::memcpy(reinterpret_cast<void*>(
+                                start->target->get_memory_descriptor()
+                                    .buffer_descriptor.buffer_address_),
+                            reinterpret_cast<void*>(
+                                start->source.get_memory_descriptor()
+                                    .buffer_descriptor.buffer_address_),
+                            1024);
+            }
+            ASSERT_TRUE(
+                service_->MoveEnd(client, move.key, TenantId::Default()));
+            complete.id = assignment.id;
+            ASSERT_TRUE(service_->MarkTaskToComplete(client, complete));
+        }
+    }
+    auto done = service_->QueryDrainJob(*id);
+    ASSERT_TRUE(done);
+    EXPECT_EQ(JobStatus::SUCCEEDED, done->status);
+    EXPECT_EQ(3u, done->succeeded_units);
+    EXPECT_EQ(3072u, done->migrated_bytes);
+    EXPECT_EQ(0u, done->failed_units);
+    EXPECT_EQ(SegmentStatus::DRAINED,
+              *service_->QuerySegmentStatus("drain_source"));
+    for (int i = 0; i < 3; ++i) {
+        auto replicas = service_->GetReplicaList("drain_" + std::to_string(i),
+                                                 TenantId::Default());
+        ASSERT_TRUE(replicas);
+        ASSERT_EQ(1u, replicas->replicas.size());
+        const auto& descriptor = replicas->replicas.front()
+                                     .get_memory_descriptor()
+                                     .buffer_descriptor;
+        EXPECT_EQ("drain_target", descriptor.transport_endpoint_);
+        const auto* bytes =
+            reinterpret_cast<const uint8_t*>(descriptor.buffer_address_);
+        EXPECT_TRUE(std::all_of(bytes, bytes + 1024,
+                                [i](uint8_t value) { return value == i + 1; }));
+    }
+    MasterServiceTestPeer::ProcessDrainJobs(*service_);
+    EXPECT_EQ(3u, service_->QueryDrainJob(*id)->succeeded_units);
+    ASSERT_TRUE(CallPersistState("20261002_120002_000"));
+    service_.reset();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    ASSERT_TRUE(service_->ReMountSegment(registrations, client));
+    EXPECT_EQ(ClientStatus::OK, service_->Ping(client)->client_status);
+    EXPECT_EQ(SegmentStatus::DRAINED,
+              *service_->QuerySegmentStatus("drain_source"));
+    EXPECT_EQ(JobStatus::SUCCEEDED, service_->QueryDrainJob(*id)->status);
+    EXPECT_EQ(3u, service_->QueryDrainJob(*id)->succeeded_units);
+    service_.reset();
+}
+
+TEST_F(SnapshotChildProcessTest,
+       DrainPayloadRequiredAndFallbackClearsCandidateState) {
+    CreateDefaultService();
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "fallback_source";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    ASSERT_TRUE(service_->MountSegment(segment, generate_uuid()));
+    auto first = service_->CreateDrainJob({{segment.name}, {}, 1});
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(CallPersistState("20261002_120000_000"));
+    ASSERT_TRUE(service_->CancelDrainJob(*first));
+    auto second = service_->CreateDrainJob({{segment.name}, {}, 1});
+    ASSERT_TRUE(second);
+    ASSERT_TRUE(CallPersistState("20261002_120001_000"));
+    const auto newer = default_snapshot_root() + "20261002_120001_000/";
+    // A new-format file that exists but is corrupt must fail, never become
+    // legacy.
+    ASSERT_TRUE(
+        GetSnapshotObjectStore()->UploadBuffer(newer + "drain_jobs", {0xc1}));
+    auto config = service_config_;
+    service_.reset();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    EXPECT_TRUE(service_->QueryDrainJob(*first));
+    EXPECT_FALSE(service_->QueryDrainJob(*second));
+    // A missing required file follows the same fallback path.
+    ASSERT_TRUE(fs::remove(fs::path(tmp_dir()) / newer / "drain_jobs"));
+    service_.reset();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    EXPECT_TRUE(service_->QueryDrainJob(*first));
+    EXPECT_FALSE(service_->QueryDrainJob(*second));
+}
+
+TEST_F(SnapshotChildProcessTest,
+       LegacyOrphanKeepsDataAndRequiresExplicitReopening) {
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_object_store_type("local")
+                      .set_snapshot_retention_count(3)
+                      .set_default_kv_lease_ttl(0)
+                      .build();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "orphan_source";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    const auto client = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client));
+    ASSERT_TRUE(service_->PutStart(client, "orphan_key", TenantId::Default(),
+                                   1024, ReplicateConfig{.replica_num = 1}));
+    ASSERT_TRUE(service_->PutEnd(client, "orphan_key", TenantId::Default(),
+                                 ReplicaType::MEMORY));
+    auto id = service_->CreateDrainJob({{segment.name}, {}, 1});
+    ASSERT_TRUE(id);
+    EXPECT_FALSE(service_->SetSegmentStatus(segment.name, SegmentStatus::OK));
+    const std::string snapshot = "20261002_120000_000";
+    ASSERT_TRUE(CallPersistState(snapshot));
+    const auto prefix = default_snapshot_root() + snapshot + "/";
+    ASSERT_TRUE(GetSnapshotObjectStore()->UploadString(
+        prefix + "manifest.txt", "messagepack|1.0.0|" + snapshot));
+    ASSERT_TRUE(fs::remove(fs::path(tmp_dir()) / prefix / "drain_jobs"));
+    service_.reset();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    EXPECT_FALSE(service_->QueryDrainJob(*id));
+    EXPECT_EQ(SegmentStatus::DRAINING,
+              *service_->QuerySegmentStatus(segment.name));
+    EXPECT_TRUE(service_->GetReplicaList("orphan_key", TenantId::Default()));
+    EXPECT_FALSE(MasterServiceTestPeer::SegmentManager(*service_)
+                     .getSegmentAccess()
+                     .IsSegmentAllocatable(segment.name));
+    ASSERT_TRUE(service_->SetSegmentStatus(segment.name, SegmentStatus::OK));
+    EXPECT_EQ(SegmentStatus::OK, *service_->QuerySegmentStatus(segment.name));
+}
+
+TEST_F(SnapshotChildProcessTest, DrainPayloadUploadFailureDoesNotPublish) {
+    CreateDefaultService();
+    const std::string snapshot = "20261002_120000_000";
+    const auto directory =
+        fs::path(tmp_dir()) / default_snapshot_root() / snapshot / "drain_jobs";
+    fs::create_directories(directory);
+    auto persisted = CallPersistState(snapshot);
+    ASSERT_FALSE(persisted);
+    auto latest = GetSnapshotCatalogStore()->GetLatest();
+    ASSERT_TRUE(latest);
+    EXPECT_FALSE(latest->has_value());
+}
+
+TEST_F(SnapshotChildProcessTest, ForkSnapshotCapturesDrainWhileQueriesRun) {
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_object_store_type("local")
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_interval_seconds(1)
+                      .set_default_kv_lease_ttl(0)
+                      .set_snapshot_child_timeout_seconds(10)
+                      .build();
+    CreateService(config);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "fork_source";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    const auto client = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client));
+    ASSERT_TRUE(service_->PutStart(client, "fork_key", TenantId::Default(),
+                                   1024, ReplicateConfig{.replica_num = 1}));
+    ASSERT_TRUE(service_->PutEnd(client, "fork_key", TenantId::Default(),
+                                 ReplicaType::MEMORY));
+    Segment target = segment;
+    target.id = generate_uuid();
+    target.name = "fork_target";
+    target.te_endpoint = target.name;
+    target.base = 0x400000000;
+    ASSERT_TRUE(service_->MountSegment(target, client));
+    auto id = service_->CreateDrainJob({{segment.name}, {target.name}, 1});
+    ASSERT_TRUE(id);
+    auto manager = CreateTempSnapshotManager();
+    std::atomic<bool> stop{false};
+    std::thread reader([&] {
+        while (!stop.load()) {
+            service_->QueryDrainJob(*id);
+            std::this_thread::yield();
+        }
+    });
+    manager->Start();
+    bool published = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!published && std::chrono::steady_clock::now() < deadline) {
+        auto latest = GetSnapshotCatalogStore()->GetLatest();
+        published = latest && latest->has_value();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    stop = true;
+    reader.join();
+    manager.reset();
+    ASSERT_TRUE(published);
+    service_.reset();
+    CreateService(config);
+    auto restored = service_->QueryDrainJob(*id);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(1u, restored->active_units);
+    EXPECT_EQ(SegmentStatus::DRAINING,
+              *service_->QuerySegmentStatus(segment.name));
+    EXPECT_TRUE(service_->GetReplicaList("fork_key", TenantId::Default()));
 }
 
 }  // namespace mooncake::test

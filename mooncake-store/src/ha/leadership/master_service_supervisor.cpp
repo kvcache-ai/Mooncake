@@ -423,43 +423,69 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // In HA serving-primary mode, snapshot bootstrap belongs to standby.
         // The new primary must restore from PromotionContext only.
         wrapped_config.enable_snapshot_restore = false;
+        const bool has_master_snapshot =
+            promotion_ctx->master_snapshot_payloads != nullptr;
+        wrapped_config.initial_snapshot_payloads =
+            promotion_ctx->master_snapshot_payloads;
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
         // Keep the gate alive until after the service is destroyed because the
         // OpLog writer owned by the service invokes a callback that uses it.
         detail::ServingStateGate serving_state;
-        auto wrapped_master_service = std::make_shared<WrappedMasterService>(
-            wrapped_config, config.http_metadata_server,
-            config.http_metadata_remote_url);
-        wrapped_master_service->SetBatchOpLogTerminalCallback(
-            [&](const OrderedOpLogWriterTerminalState& state) {
-                serving_state.RequestShutdown([&]() {
-                    LOG(ERROR) << "Batch OpLog writer terminal: "
-                               << toString(state.error);
-                    DeactivateServingState(admin_server, label_reconciler);
-                    SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
-                    server.stop();
-                });
-            });
-
         // Restore is the serving gate: do not register or expose a candidate
         // service until the complete promotion context has been applied.
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
-        auto restore_result =
-            promotion_ctx->metadata_store
-                ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
-                      BatchOpLogPromotionHandoff{
-                          .metadata_store =
-                              std::move(promotion_ctx->metadata_store),
-                          .segments = std::move(promotion_ctx->segments),
-                          .applied_cursor = promotion_ctx->applied_cursor,
-                          .producer_view_version =
-                              promotion_ctx->producer_view_version,
-                          .max_replica_id = promotion_ctx->max_replica_id,
-                      })
-                : wrapped_master_service->RestoreFromStandby(
-                      promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                      promotion_ctx->segments, promotion_ctx->weight_metadata);
+        std::shared_ptr<WrappedMasterService> wrapped_master_service;
+        tl::expected<void, ErrorCode> restore_result;
+        try {
+            wrapped_master_service = std::make_shared<WrappedMasterService>(
+                wrapped_config, config.http_metadata_server,
+                config.http_metadata_remote_url);
+        } catch (const MasterSnapshotRestoreError& error) {
+            LOG(ERROR) << "Snapshot-only promotion restore failed: "
+                       << error.what();
+            restore_result = tl::make_unexpected(error.code);
+        }
+        // The constructor has consumed the immutable state. Do not retain a
+        // second serialized snapshot throughout the serving lifetime.
+        wrapped_config.initial_snapshot_payloads.reset();
+        promotion_ctx->master_snapshot_payloads.reset();
+        if (wrapped_master_service) {
+            wrapped_master_service->SetBatchOpLogTerminalCallback(
+                [&](const OrderedOpLogWriterTerminalState& state) {
+                    serving_state.RequestShutdown([&]() {
+                        LOG(ERROR) << "Batch OpLog writer terminal: "
+                                   << toString(state.error);
+                        DeactivateServingState(admin_server, label_reconciler);
+                        SetRuntimeState(admin_server,
+                                        MasterRuntimeState::kStandby);
+                        server.stop();
+                    });
+                });
+            if (!has_master_snapshot) {
+                restore_result =
+                    promotion_ctx->metadata_store
+                        ? wrapped_master_service
+                              ->RestoreFromBatchOpLogPromotion(
+                                  BatchOpLogPromotionHandoff{
+                                      .metadata_store = std::move(
+                                          promotion_ctx->metadata_store),
+                                      .segments =
+                                          std::move(promotion_ctx->segments),
+                                      .applied_cursor =
+                                          promotion_ctx->applied_cursor,
+                                      .producer_view_version =
+                                          promotion_ctx->producer_view_version,
+                                      .max_replica_id =
+                                          promotion_ctx->max_replica_id,
+                                  })
+                        : wrapped_master_service->RestoreFromStandby(
+                              promotion_ctx->objects,
+                              promotion_ctx->applied_seq_id,
+                              promotion_ctx->segments,
+                              promotion_ctx->weight_metadata);
+            }
+        }
         if (!restore_result) {
             LOG(ERROR) << "Standby restore failed: "
                        << toString(restore_result.error());
