@@ -92,6 +92,17 @@ static inline int getAccessFlags(Permission perm,
     return access;
 }
 
+static void rollbackMemRegistrations(
+    const std::vector<RdmaContext*>& contexts,
+    const std::vector<RdmaContext::MemReg>& registrations) {
+    for (size_t id = 0; id < contexts.size(); ++id) {
+        if (registrations[id] &&
+            contexts[id]->unregisterMemReg(registrations[id])) {
+            LOG(ERROR) << "Failed to roll back RDMA registration";
+        }
+    }
+}
+
 Status LocalBufferManager::addBuffer(BufferDesc& desc,
                                      const MemoryOptions& options) {
     return addBufferInternal(desc, options, false);
@@ -100,6 +111,7 @@ Status LocalBufferManager::addBuffer(BufferDesc& desc,
 Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                                              const MemoryOptions& options,
                                              bool force_sequential) {
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     AddressRange range((void*)desc.addr, desc.length);
     BufferEntryForRdma staging;
     assert(desc.rkey.empty());
@@ -141,6 +153,14 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                 context->registerMemReg((void*)desc.addr, desc.length, access);
         }
     }
+    // If one rail fails, release every MR created for this buffer.
+    for (size_t id = 0; id < context_list_.size(); ++id) {
+        if (context_list_[id] && !mem_reg_list[id]) {
+            rollbackMemRegistrations(context_list_, mem_reg_list);
+            return Status::RdmaError(
+                "Unable to register buffer of local memory segment" LOC_MARK);
+        }
+    }
     // NicID-keyed like context_list_, not compacted: slice dispatch subscripts
     // these with a dev_id from the topology, so gaps must stay in place.
     // Devices with no context contribute a zero key that is never selected.
@@ -148,19 +168,23 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     desc.rkey.assign(context_list_.size(), 0);
     for (size_t id = 0; id < context_list_.size(); ++id) {
         if (!context_list_[id]) continue;
-        if (!mem_reg_list[id]) {
-            return Status::RdmaError(
-                "Unable to register buffer of local memory segment" LOC_MARK);
-        }
         staging.mem_reg_map[context_list_[id]] = mem_reg_list[id];
         auto keys = context_list_[id]->queryMemRegKey(mem_reg_list[id]);
         desc.lkey[id] = keys.first;
         desc.rkey[id] = keys.second;
     }
     staging.options = options;
-    RWSpinlock::WriteGuard guard(lock_);
-    buffer_list_[range] = staging;
-    return Status::OK();
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (buffer_list_.try_emplace(range, std::move(staging)).second)
+            return Status::OK();
+    }
+
+    rollbackMemRegistrations(context_list_, mem_reg_list);
+    desc.lkey.clear();
+    desc.rkey.clear();
+    return Status::InvalidArgument(
+        "Address region already registered" LOC_MARK);
 }
 
 Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
@@ -179,27 +203,70 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
                 return addBufferInternal(*desc_ptr, options, true);
             }));
     }
-    for (auto& task : tasks) {
-        auto status = task.get();
-        if (!status.ok()) return status;
+    Status result = Status::OK();
+    std::vector<bool> registered(tasks.size(), false);
+    // Wait for every worker before rolling back successful registrations.
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        auto status = tasks[i].get();
+        registered[i] = status.ok();
+        if (!status.ok() && result.ok()) result = status;
     }
-    return Status::OK();
+    if (!result.ok()) {
+        for (size_t i = 0; i < desc_list.size(); ++i) {
+            if (!registered[i]) continue;
+            auto status = removeBuffer(desc_list[i]);
+            if (!status.ok())
+                LOG(ERROR) << "Failed to roll back RDMA buffer: "
+                           << status.ToString();
+        }
+    }
+    return result;
 }
 
 Status LocalBufferManager::removeBuffer(BufferDesc& desc) {
-    RWSpinlock::WriteGuard guard(lock_);
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     AddressRange range((void*)desc.addr, desc.length);
-    auto& item = buffer_list_[range];
-    for (auto& elem : item.mem_reg_map) {
-        elem.first->unregisterMemReg(elem.second);
+    decltype(BufferEntryForRdma::mem_reg_map) registrations;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        auto buffer = buffer_list_.find(range);
+        if (buffer == buffer_list_.end()) return Status::OK();
+        if (buffer->second.removing)
+            return Status::InvalidArgument(
+                "Address region is being unregistered" LOC_MARK);
+        buffer->second.removing = true;
+        registrations.swap(buffer->second.mem_reg_map);
     }
+    Status result = Status::OK();
+    for (auto it = registrations.begin(); it != registrations.end();) {
+        if (it->first->unregisterMemReg(it->second)) {
+            if (result.ok())
+                result = Status::RdmaError(
+                    "Unable to unregister buffer of local memory "
+                    "segment" LOC_MARK);
+            ++it;
+        } else {
+            it = registrations.erase(it);
+        }
+    }
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        auto buffer = buffer_list_.find(range);
+        if (!result.ok()) {
+            registrations.swap(buffer->second.mem_reg_map);
+            buffer->second.removing = false;
+            return result;
+        }
+        buffer_list_.erase(buffer);
+    }
+
+    desc.lkey.clear();
     desc.rkey.clear();
-    buffer_list_.erase(range);
     return Status::OK();
 }
 
 Status LocalBufferManager::addDevice(RdmaContext* context) {
-    RWSpinlock::WriteGuard guard(lock_);
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     assert(topology_ && context);
     int index = topology_->getNicId(context->name());
     if (index < 0) {
@@ -231,14 +298,16 @@ Status LocalBufferManager::addDevice(RdmaContext* context) {
 }
 
 Status LocalBufferManager::removeDevice(RdmaContext* context, bool do_unreg) {
-    RWSpinlock::WriteGuard guard(lock_);
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     assert(topology_ && context);
     auto iter = std::find(context_list_.begin(), context_list_.end(), context);
     if (iter == context_list_.end()) return Status::OK();
     for (auto& buffer : buffer_list_) {
         if (!buffer.second.mem_reg_map.count(context)) continue;
-        if (do_unreg)
-            context->unregisterMemReg(buffer.second.mem_reg_map[context]);
+        if (do_unreg &&
+            context->unregisterMemReg(buffer.second.mem_reg_map[context]))
+            return Status::RdmaError(
+                "Unable to unregister device buffer" LOC_MARK);
         buffer.second.mem_reg_map.erase(context);
     }
     *iter = nullptr;
@@ -246,11 +315,22 @@ Status LocalBufferManager::removeDevice(RdmaContext* context, bool do_unreg) {
 }
 
 Status LocalBufferManager::clear() {
-    RWSpinlock::WriteGuard guard(lock_);
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+    Status result = Status::OK();
     for (auto& buffer : buffer_list_) {
-        for (auto& elem : buffer.second.mem_reg_map)
-            elem.first->unregisterMemReg(elem.second);
+        auto& registrations = buffer.second.mem_reg_map;
+        for (auto it = registrations.begin(); it != registrations.end();) {
+            if (it->first->unregisterMemReg(it->second)) {
+                if (result.ok())
+                    result = Status::RdmaError(
+                        "Unable to unregister buffer during cleanup" LOC_MARK);
+                ++it;
+            } else {
+                it = registrations.erase(it);
+            }
+        }
     }
+    if (!result.ok()) return result;
     buffer_list_.clear();
     context_list_.clear();
     return Status::OK();

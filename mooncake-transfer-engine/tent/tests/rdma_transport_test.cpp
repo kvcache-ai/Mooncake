@@ -28,14 +28,17 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -295,7 +298,400 @@ class RdmaContextTestPeer {
     static size_t cqCount(const RdmaContext& context) {
         return context.cq_list_.size();
     }
+
+    static void configureMemoryRegistration(RdmaContext& context,
+                                            const std::string& name, ibv_pd* pd,
+                                            const IbvSymbols& verbs) {
+        context.device_name_ = name;
+        context.native_pd_ = pd;
+        context.verbs_ = verbs;
+        context.status_ = RdmaContext::DEVICE_ENABLED;
+    }
+
+    static size_t trackedRegistrations(RdmaContext& context) {
+        std::lock_guard<std::mutex> lock(context.mr_set_mutex_);
+        return context.mr_set_.size();
+    }
+
+    static void resetMemoryRegistration(RdmaContext& context) {
+        context.native_pd_ = nullptr;
+        context.cleanupResources();
+        context.status_ = RdmaContext::DEVICE_UNINIT;
+    }
+
+    static int cleanupMemoryRegistration(RdmaContext& context) {
+        return context.cleanupResources();
+    }
 };
+
+namespace {
+struct RegistrationVerbs {
+    std::mutex mutex;
+    std::unordered_set<ibv_mr*> live;
+    void* fail_addr = nullptr;
+    ibv_pd* fail_pd = nullptr;
+    int deregister_failures = 0;
+    std::condition_variable cv;
+    void* blocked_addr = nullptr;
+    bool deregister_entered = false;
+    bool release_deregister = false;
+    std::atomic<int> deallocated_pds{0};
+} registration_verbs;
+
+ibv_mr* registerMemory(ibv_pd* pd, void* addr, size_t size, int) {
+    std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+    if (addr == registration_verbs.fail_addr &&
+        (!registration_verbs.fail_pd || pd == registration_verbs.fail_pd))
+        return nullptr;
+    auto* mr = new ibv_mr{};
+    mr->addr = addr;
+    mr->length = size;
+    mr->lkey = 17;
+    mr->rkey = 23;
+    registration_verbs.live.insert(mr);
+    return mr;
+}
+
+int deregisterMemory(ibv_mr* mr) {
+    std::unique_lock<std::mutex> lock(registration_verbs.mutex);
+    if (mr->addr == registration_verbs.blocked_addr &&
+        !registration_verbs.deregister_entered) {
+        registration_verbs.deregister_entered = true;
+        registration_verbs.cv.notify_all();
+        registration_verbs.cv.wait(
+            lock, [] { return registration_verbs.release_deregister; });
+    }
+    if (registration_verbs.deregister_failures > 0) {
+        --registration_verbs.deregister_failures;
+        errno = EIO;
+        return EIO;
+    }
+    EXPECT_EQ(registration_verbs.live.erase(mr), 1u);
+    delete mr;
+    return 0;
+}
+
+int deallocateRegistrationPd(ibv_pd*) {
+    ++registration_verbs.deallocated_pds;
+    return 0;
+}
+
+// 必须先放行 mock，再回收异步任务，断言失败时也不会卡住测试。
+class BlockedDeregistration {
+   public:
+    explicit BlockedDeregistration(void* addr) {
+        std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+        registration_verbs.blocked_addr = addr;
+    }
+
+    ~BlockedDeregistration() { release(); }
+
+    bool wait() {
+        std::unique_lock<std::mutex> lock(registration_verbs.mutex);
+        return registration_verbs.cv.wait_for(
+            lock, std::chrono::seconds(2),
+            [] { return registration_verbs.deregister_entered; });
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+        registration_verbs.release_deregister = true;
+        registration_verbs.cv.notify_all();
+    }
+};
+
+size_t liveRegistrations() {
+    std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+    return registration_verbs.live.size();
+}
+
+class RdmaRegistrationRollbackTest : public testing::Test {
+   protected:
+    void SetUp() override {
+        ASSERT_EQ(liveRegistrations(), 0u);
+        registration_verbs.fail_addr = nullptr;
+        registration_verbs.fail_pd = nullptr;
+        registration_verbs.deregister_failures = 0;
+        registration_verbs.blocked_addr = nullptr;
+        registration_verbs.deregister_entered = false;
+        registration_verbs.release_deregister = false;
+        registration_verbs.deallocated_pds = 0;
+
+        auto topology = std::make_shared<Topology>();
+        ASSERT_TRUE(topology
+                        ->parse(R"({"nics":[
+            {"name":"test-rdma-0","type":0,"numa_node":0},
+            {"name":"test-rdma-1","type":0,"numa_node":0}]})")
+                        .ok());
+        buffers_.setTopology(topology);
+
+        IbvSymbols verbs{};
+        verbs.ibv_reg_mr_default = registerMemory;
+        verbs.ibv_dereg_mr = deregisterMemory;
+        verbs.ibv_dealloc_pd = deallocateRegistrationPd;
+        for (size_t i = 0; i < contexts_.size(); ++i) {
+            contexts_[i] = std::make_unique<RdmaContext>(transport_);
+            RdmaContextTestPeer::configureMemoryRegistration(
+                *contexts_[i], "test-rdma-" + std::to_string(i), &pds_[i],
+                verbs);
+            ASSERT_TRUE(buffers_.addDevice(contexts_[i].get()).ok());
+        }
+    }
+
+    void TearDown() override {
+        EXPECT_TRUE(buffers_.clear().ok());
+        for (auto& context : contexts_)
+            if (context) RdmaContextTestPeer::resetMemoryRegistration(*context);
+        EXPECT_EQ(liveRegistrations(), 0u);
+    }
+
+    BufferDesc descriptor(size_t page) {
+        BufferDesc desc;
+        desc.addr =
+            reinterpret_cast<uint64_t>(memory_.data() + page * kPageSize);
+        desc.length = kPageSize;
+        return desc;
+    }
+
+    static constexpr size_t kPageSize = 4096;
+    RdmaTransport transport_;
+    LocalBufferManager buffers_;
+    std::array<ibv_pd, 2> pds_{};
+    std::array<std::unique_ptr<RdmaContext>, 2> contexts_;
+    alignas(kPageSize) std::array<char, 4 * kPageSize> memory_{};
+    MemoryOptions options_;
+};
+
+TEST_F(RdmaRegistrationRollbackTest, FailedRailReleasesSuccessfulMr) {
+    for (size_t rail = 0; rail < pds_.size(); ++rail) {
+        SCOPED_TRACE(rail);
+        auto desc = descriptor(0);
+        registration_verbs.fail_addr = memory_.data();
+        registration_verbs.fail_pd = &pds_[rail];
+        ASSERT_FALSE(buffers_.addBuffer(desc, options_).ok());
+        ASSERT_EQ(liveRegistrations(), 0u);
+        EXPECT_TRUE(desc.lkey.empty());
+        EXPECT_TRUE(desc.rkey.empty());
+
+        registration_verbs.fail_addr = nullptr;
+        ASSERT_TRUE(buffers_.addBuffer(desc, options_).ok());
+        EXPECT_EQ(liveRegistrations(), 2u);
+        ASSERT_TRUE(buffers_.removeBuffer(desc).ok());
+        EXPECT_EQ(liveRegistrations(), 0u);
+    }
+}
+
+TEST_F(RdmaRegistrationRollbackTest, FailedBatchReleasesSuccessfulBuffers) {
+    auto existing = descriptor(3);
+    ASSERT_TRUE(buffers_.addBuffer(existing, options_).ok());
+    for (size_t failed = 0; failed < 3; ++failed) {
+        SCOPED_TRACE(failed);
+        std::vector<BufferDesc> batch{descriptor(0), descriptor(1),
+                                      descriptor(2)};
+        registration_verbs.fail_addr = memory_.data() + failed * kPageSize;
+        ASSERT_FALSE(buffers_.addBuffer(batch, options_).ok());
+        ASSERT_EQ(liveRegistrations(), 2u);
+        for (auto& desc : batch) {
+            EXPECT_TRUE(desc.lkey.empty());
+            EXPECT_TRUE(desc.rkey.empty());
+        }
+
+        registration_verbs.fail_addr = nullptr;
+        ASSERT_TRUE(buffers_.addBuffer(batch, options_).ok());
+        EXPECT_EQ(liveRegistrations(), 8u);
+        for (auto& desc : batch) ASSERT_TRUE(buffers_.removeBuffer(desc).ok());
+        EXPECT_EQ(liveRegistrations(), 2u);
+    }
+    ASSERT_TRUE(buffers_.removeBuffer(existing).ok());
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, RejectsDuplicateRangesWithoutLeaking) {
+    std::vector<BufferDesc> batch{descriptor(0), descriptor(0), descriptor(1)};
+    ASSERT_FALSE(buffers_.addBuffer(batch, options_).ok());
+    EXPECT_EQ(liveRegistrations(), 0u);
+    for (auto& desc : batch) {
+        EXPECT_TRUE(desc.lkey.empty());
+        EXPECT_TRUE(desc.rkey.empty());
+    }
+}
+
+TEST_F(RdmaRegistrationRollbackTest, FailedDeregistrationCanBeRetried) {
+    auto desc = descriptor(0);
+    ASSERT_TRUE(buffers_.addBuffer(desc, options_).ok());
+    ASSERT_EQ(liveRegistrations(), 2u);
+
+    registration_verbs.deregister_failures = 1;
+    EXPECT_FALSE(buffers_.removeBuffer(desc).ok());
+    EXPECT_EQ(liveRegistrations(), 1u);
+    EXPECT_EQ(RdmaContextTestPeer::trackedRegistrations(*contexts_[0]) +
+                  RdmaContextTestPeer::trackedRegistrations(*contexts_[1]),
+              1u);
+
+    EXPECT_TRUE(buffers_.removeBuffer(desc).ok());
+    EXPECT_EQ(liveRegistrations(), 0u);
+    EXPECT_TRUE(desc.lkey.empty());
+    EXPECT_TRUE(desc.rkey.empty());
+}
+
+TEST_F(RdmaRegistrationRollbackTest,
+       SlowDeregistrationAllowsOtherMrOperations) {
+    auto& context = *contexts_[0];
+    auto mr = context.registerMemReg(memory_.data(), kPageSize,
+                                     IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_NE(mr, nullptr);
+    std::future<int> slow;
+    std::future<int> other;
+    std::future<int> repeated;
+    BlockedDeregistration blocked(memory_.data());
+    slow = std::async(std::launch::async,
+                      [&] { return context.unregisterMemReg(mr); });
+    ASSERT_TRUE(blocked.wait());
+    other = std::async(std::launch::async, [&] {
+        auto next = context.registerMemReg(memory_.data() + kPageSize,
+                                           kPageSize, IBV_ACCESS_LOCAL_WRITE);
+        return next ? context.unregisterMemReg(next) : -1;
+    });
+    EXPECT_EQ(other.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    repeated = std::async(std::launch::async,
+                          [&] { return context.unregisterMemReg(mr); });
+    EXPECT_EQ(repeated.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    blocked.release();
+    EXPECT_EQ(slow.get(), 0);
+    EXPECT_EQ(other.get(), 0);
+    EXPECT_NE(repeated.get(), 0);
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, SlowBufferRemovalPreservesRangeAndRetry) {
+    auto desc = descriptor(0);
+    ASSERT_TRUE(buffers_.addBuffer(desc, options_).ok());
+    std::future<Status> slow;
+    std::future<Status> other;
+    std::future<Status> duplicate;
+    std::future<Status> repeated;
+    BlockedDeregistration blocked(memory_.data());
+    slow = std::async(std::launch::async,
+                      [&] { return buffers_.removeBuffer(desc); });
+    ASSERT_TRUE(blocked.wait());
+    other = std::async(std::launch::async, [&] {
+        auto next = descriptor(1);
+        auto status = buffers_.addBuffer(next, options_);
+        return status.ok() ? buffers_.removeBuffer(next) : status;
+    });
+    EXPECT_EQ(other.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    duplicate = std::async(std::launch::async, [&] {
+        auto copy = descriptor(0);
+        return buffers_.addBuffer(copy, options_);
+    });
+    repeated = std::async(std::launch::async, [&] {
+        auto copy = descriptor(0);
+        return buffers_.removeBuffer(copy);
+    });
+    EXPECT_EQ(duplicate.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(repeated.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    {
+        std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+        registration_verbs.deregister_failures = 1;
+    }
+    blocked.release();
+    EXPECT_FALSE(slow.get().ok());
+    EXPECT_TRUE(other.get().ok());
+    EXPECT_FALSE(duplicate.get().ok());
+    EXPECT_FALSE(repeated.get().ok());
+    EXPECT_EQ(liveRegistrations(), 1u);
+    EXPECT_TRUE(buffers_.removeBuffer(desc).ok());
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, CleanupWaitsForInFlightDeregistration) {
+    auto& context = *contexts_[0];
+    auto mr = context.registerMemReg(memory_.data(), kPageSize,
+                                     IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_NE(mr, nullptr);
+    std::future<int> slow;
+    std::future<int> cleanup;
+    BlockedDeregistration blocked(memory_.data());
+    slow = std::async(std::launch::async,
+                      [&] { return context.unregisterMemReg(mr); });
+    ASSERT_TRUE(blocked.wait());
+    std::promise<void> started;
+    cleanup = std::async(std::launch::async, [&] {
+        started.set_value();
+        return RdmaContextTestPeer::cleanupMemoryRegistration(context);
+    });
+    started.get_future().wait();
+    EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    EXPECT_EQ(registration_verbs.deallocated_pds.load(), 0);
+    blocked.release();
+    EXPECT_EQ(slow.get(), 0);
+    EXPECT_EQ(cleanup.get(), 0);
+    EXPECT_EQ(registration_verbs.deallocated_pds.load(), 1);
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, CleanupFailurePreservesPdAndMrForRetry) {
+    auto& context = *contexts_[0];
+    ASSERT_NE(context.registerMemReg(memory_.data(), kPageSize,
+                                     IBV_ACCESS_LOCAL_WRITE),
+              nullptr);
+    registration_verbs.deregister_failures = 1;
+    EXPECT_NE(RdmaContextTestPeer::cleanupMemoryRegistration(context), 0);
+    EXPECT_EQ(registration_verbs.deallocated_pds.load(), 0);
+    EXPECT_EQ(RdmaContextTestPeer::trackedRegistrations(context), 1u);
+    EXPECT_EQ(RdmaContextTestPeer::cleanupMemoryRegistration(context), 0);
+    EXPECT_EQ(registration_verbs.deallocated_pds.load(), 1);
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, BufferClearWaitsForRemovalRollback) {
+    auto desc = descriptor(0);
+    ASSERT_TRUE(buffers_.addBuffer(desc, options_).ok());
+    std::future<Status> slow;
+    std::future<Status> cleanup;
+    BlockedDeregistration blocked(memory_.data());
+    slow = std::async(std::launch::async,
+                      [&] { return buffers_.removeBuffer(desc); });
+    ASSERT_TRUE(blocked.wait());
+    std::promise<void> started;
+    cleanup = std::async(std::launch::async, [&] {
+        started.set_value();
+        return buffers_.clear();
+    });
+    started.get_future().wait();
+    EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(registration_verbs.mutex);
+        registration_verbs.deregister_failures = 1;
+    }
+    blocked.release();
+    EXPECT_FALSE(slow.get().ok());
+    EXPECT_TRUE(cleanup.get().ok());
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+
+TEST_F(RdmaRegistrationRollbackTest, DeviceRemovalAndClearCanRetryFailures) {
+    auto desc = descriptor(0);
+    ASSERT_TRUE(buffers_.addBuffer(desc, options_).ok());
+    registration_verbs.deregister_failures = 1;
+    EXPECT_FALSE(buffers_.removeDevice(contexts_[0].get()).ok());
+    EXPECT_EQ(liveRegistrations(), 2u);
+    EXPECT_TRUE(buffers_.removeDevice(contexts_[0].get()).ok());
+    EXPECT_EQ(liveRegistrations(), 1u);
+    registration_verbs.deregister_failures = 1;
+    EXPECT_FALSE(buffers_.clear().ok());
+    EXPECT_EQ(liveRegistrations(), 1u);
+    EXPECT_TRUE(buffers_.clear().ok());
+    EXPECT_EQ(liveRegistrations(), 0u);
+}
+}  // namespace
 
 // Friend accessor for RdmaEndPoint. Posting is the one step in the data
 // path that does not go through the injectable verbs table (ibv_post_send is

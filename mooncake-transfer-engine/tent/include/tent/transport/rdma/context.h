@@ -25,6 +25,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -198,7 +199,7 @@ class RdmaContext {
     // Release every resource currently owned by this context. This is
     // intentionally state-independent so it can clean up a partially completed
     // enable() and can safely be retried.
-    void cleanupResources();
+    int cleanupResources();
 
    private:
     // initialized during ctor, will never be changed during the context's
@@ -235,6 +236,8 @@ class RdmaContext {
     int gid_index_ = -1;
     ibv_gid gid_;
 
+    // 普通 MR 操作共享持有，资源清理独占持有，防止 PD 提前释放。
+    std::shared_mutex mr_lifecycle_mutex_;
     std::mutex mr_set_mutex_;
     std::unordered_set<ibv_mr *> mr_set_;
 
