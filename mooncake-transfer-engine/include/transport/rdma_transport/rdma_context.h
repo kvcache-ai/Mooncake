@@ -190,7 +190,11 @@ class RdmaContext {
         const RdmaEndPoint *endpoint_ptr);
 
     int deleteEndpoint(const std::string &peer_nic_path);
-    int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr);
+    // pause_connect=false skips the active-connect pause. A failed keepalive
+    // retires an idle endpoint; if its peer is in fact alive, the next
+    // transfer should reconnect at once instead of failing for the pause.
+    int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr,
+                            bool pause_connect = true);
 
     // Active-connect circuit-breaker. After deleteEndpointByPtr tears an
     // endpoint down, active reconnection to that peer's address is paused for
