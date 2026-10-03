@@ -477,7 +477,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_NUM_QP_PER_EP` The number of QPs per EndPoint, the more the number, the better the fine-grained I/O performance, default value 2
 - `MC_MAX_SGE` The maximum number of SGEs supported per QP, default value 4 (or the highest value supported by the platform)
 - `MC_MAX_WR` The maximum number of Work Request supported per QP, default value 256 (or the highest value supported by the platform). **On EFA this should be left unset:** the transport derives the depth from the libfabric provider's transmit queue (a per-device attribute, so no fixed value is right on every instance type), and an override that exceeds it is clamped. See the EFA transport page.
-- `MC_MAX_INLINE` The maximum Inline write data volume (bytes) supported per QP, default value 64 (or the highest value supported by the platform)
+- `MC_MAX_INLINE` The maximum Inline write data volume (bytes) supported per QP, default value 64 (or the highest value supported by the platform). A single RDMA write from host memory is posted inline when it fits this size, the inline size the QP was granted, and the NIC's BlueFlame buffer (220 bytes on current mlx5 NICs); writes posted in a chain are always posted by reference. Set it to 0 to disable inline writes.
 - `MC_MTU` The MTU length used per device instance, can be 512, 1024, 2048, 4096, default value 4096 (or the maximum length supported by the platform)
 - `MC_WORKERS_PER_CTX` The number of asynchronous worker threads corresponding to each device instance
 - `MC_SLICE_SIZE` The segmentation granularity of user requests in Transfer Engine
