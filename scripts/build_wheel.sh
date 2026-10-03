@@ -14,7 +14,13 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # under ${BUILD_DIR}/ep_pg_staging. Host extensions are copied directly from
 # their normal CMake output paths before auditwheel, like the PG core library.
 BUILD_DIR="${BUILD_DIR:-build}"
-BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+BUILD_DIR_ABS="$(cd "$BUILD_DIR" && pwd)"
+# Release wheels expose mooncake.conductor in every supported variant. Fail
+# before touching staging files if the native API was not built.
+if ! compgen -G "${BUILD_DIR}/mooncake-integration/_conductor.*.so" >/dev/null; then
+    echo "Error: missing _conductor extension; configure with -DWITH_CONDUCTOR=ON and build it" >&2
+    exit 1
+fi
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
@@ -72,9 +78,10 @@ fi
 # Copy _conductor.so to mooncake directory (client API for mooncake.conductor)
 if compgen -G "${BUILD_DIR}/mooncake-integration/_conductor.*.so" >/dev/null; then
     echo "Copying _conductor.so..."
-    cp ${BUILD_DIR}/mooncake-integration/_conductor.*.so mooncake-wheel/mooncake/_conductor.so
+    cp ${BUILD_DIR}/mooncake-integration/_conductor.*.so mooncake-wheel/mooncake/
 else
-    echo "Skipping _conductor.so (not built - likely WITH_CONDUCTOR is set to OFF)"
+    echo "Error: required _conductor extension disappeared during staging" >&2
+    exit 1
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
@@ -641,6 +648,10 @@ fi
 rm -f ${OUTPUT_DIR}/*.whl
 mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
 
+WHEEL_OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 cd ..
+
+# Validate the final repaired artifact, not the build tree.
+python${PYTHON_VERSION} scripts/smoke_conductor_wheel.py "${WHEEL_OUTPUT_DIR}"/*.whl
 
 echo "Wheel package built and repaired successfully!"

@@ -30,6 +30,7 @@ jobs:
       python-versions: ${{ format('["{0}"]', matrix.python-version) }}
       build-profile: ci
       cmake-args: >-
+        -DWITH_CONDUCTOR=ON
         -DUSE_ETCD=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_METRICS=ON
         -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=ON -DBUILD_BENCHMARK=ON
         -DENABLE_DEBUG_SYMBOLS=OFF
