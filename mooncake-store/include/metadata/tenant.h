@@ -125,10 +125,25 @@ class Tenant {
 
     // Strong handles to what is routed right now, for a scan that acts on them
     // after it ends: resolve each key again before mutating anything, since an
-    // entry can be replaced under the same key in between.
+    // entry can be replaced under the same key in between. Every handle of the
+    // tenant is alive while the result is, so a scan that acts on each object
+    // on its own walks the stripes below instead.
     [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects()
         const {
         return object_index_.SnapshotObjects();
+    }
+
+    // The stripes the route is striped into: a walk that takes one stripe at a
+    // time holds a stripe's worth of handles rather than the tenant's whole
+    // population.
+    static constexpr size_t kObjectStripeCount = ObjectIndex::kStripeCount;
+
+    // Strong handles to the objects of one route stripe, with the same
+    // contract as SnapshotObjects for those keys: resolve each entry again
+    // before mutating anything.
+    [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotStripe(
+        size_t stripe_index) const {
+        return object_index_.SnapshotStripe(stripe_index);
     }
 
     // True when the tenant holds no object and no group membership.

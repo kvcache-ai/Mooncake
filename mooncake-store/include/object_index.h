@@ -140,6 +140,12 @@ class ObjectIndex {
     // can take each entry's own mutex without holding a route lock, and the
     // walk is per stripe rather than one point in time: callers use the result
     // as the keys to resolve again.
+    //
+    // The handles of every stripe are alive together for as long as the result
+    // is, so this is for a caller that needs the whole population at once. A
+    // caller that walks the route to act on each object on its own takes
+    // SnapshotStripe per stripe instead, which bounds what it holds by a stripe
+    // rather than by the route.
     [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects()
         const {
         // The stripes are counted first so the handles are copied into one
@@ -157,6 +163,28 @@ class ObjectIndex {
             for (const auto& entry : stripe.route) {
                 entries.push_back(entry.second);
             }
+        }
+        return entries;
+    }
+
+    // Collect strong handles to the objects of one stripe, copied into one
+    // allocation sized under that stripe's own lock, which is released before
+    // the result is returned: a caller takes each entry's own mutex with no
+    // route lock held, the same as after SnapshotObjects. A stripe names the
+    // same objects a whole-route snapshot would name for those keys, and the
+    // stripe count bounds what a walk that goes one stripe at a time holds, so
+    // the population of a route does not decide the memory such a walk needs.
+    // An empty stripe yields an empty result, so a caller can walk every stripe
+    // of a sparse route without special casing.
+    [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotStripe(
+        size_t stripe_index) const {
+        assert(stripe_index < kStripeCount);
+        const Stripe& stripe = stripes_[stripe_index];
+        std::shared_lock<std::shared_mutex> lock(stripe.lock);
+        std::vector<std::shared_ptr<ObjectEntry>> entries;
+        entries.reserve(stripe.route.size());
+        for (const auto& entry : stripe.route) {
+            entries.push_back(entry.second);
         }
         return entries;
     }

@@ -11997,36 +11997,47 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
 
     auto pass = [&](bool allow_soft_pinned) {
-        // One snapshot covers the tenant's whole population. The snapshot only
-        // names the keys to consider: each is resolved and re-validated under
-        // its own lock inside try_evict_group_or_object, and the pass stops as
-        // soon as the target is met.
-        std::vector<std::string> candidate_keys;
-        for (const auto& entry : tenant.SnapshotObjects()) {
-            entry->WithSharedAccess([&](const ObjectMetadata& metadata,
-                                        const ObjectEntry::State&) {
-                if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
-                    (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
-                    !can_evict_replicas(metadata)) {
-                    return;
-                }
-                candidate_keys.push_back(entry->key());
-            });
-        }
-
+        // One route stripe at a time, in stripe order: a stripe's handles only
+        // name the keys to consider, each key is resolved and re-validated
+        // under its own lock inside try_evict_group_or_object, and the pass
+        // stops as soon as the target is met, so a tenant's whole population is
+        // never held at once. The order is the one a whole-tenant snapshot
+        // yielded the same keys in, stripe by stripe, and a stripe's keys are
+        // collected when the walk reaches that stripe: an object whose state
+        // changes while the pass runs is judged at the stripe it is taken in,
+        // which is the metadata the eviction re-validates anyway.
+        //
         // The popped replicas are held only until the key that owned them has
         // been torn down, so a quota-driven pass returns the freed space to the
         // allocator as each key completes.
         std::vector<std::vector<Replica>> deferred_replicas;
-        for (const auto& key : candidate_keys) {
-            if (total.freed_bytes >= target_bytes) {
-                break;
+        for (size_t stripe = 0; stripe < metadata::Tenant::kObjectStripeCount &&
+                                total.freed_bytes < target_bytes;
+             ++stripe) {
+            std::vector<std::string> candidate_keys;
+            for (const auto& entry : tenant.SnapshotStripe(stripe)) {
+                entry->WithSharedAccess([&](const ObjectMetadata& metadata,
+                                            const ObjectEntry::State&) {
+                    if (metadata.IsHardPinned() ||
+                        !metadata.IsLeaseExpired(now) ||
+                        (!allow_soft_pinned &&
+                         IsSoftPinActive(metadata, now)) ||
+                        !can_evict_replicas(metadata)) {
+                        return;
+                    }
+                    candidate_keys.push_back(entry->key());
+                });
             }
-            auto evict_result = try_evict_group_or_object(
-                key, allow_soft_pinned, deferred_replicas);
-            total.freed_bytes += evict_result.freed_bytes;
-            total.evicted_objects += evict_result.evicted_objects;
-            deferred_replicas.clear();
+            for (const auto& key : candidate_keys) {
+                if (total.freed_bytes >= target_bytes) {
+                    break;
+                }
+                auto evict_result = try_evict_group_or_object(
+                    key, allow_soft_pinned, deferred_replicas);
+                total.freed_bytes += evict_result.freed_bytes;
+                total.evicted_objects += evict_result.evicted_objects;
+                deferred_replicas.clear();
+            }
         }
     };
 
@@ -12431,57 +12442,94 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
     // ===== Phase 1: Parallel candidate census =====
-    // Work is handed out per object chunk, so a deployment with one tenant
-    // still scans its objects on several threads. Each tenant's object table is
-    // collected once — a pointer copy under the route's shared lock, released
-    // before any entry lock is taken — and split into chunks. A chunk settles
-    // the in-flight state of its own objects before counting them, so an object
-    // is walked once. For selective ratios only the lease timestamps are
-    // collected here; full tenant/key identities are materialized afterwards
-    // for a bounded frontier around the eviction cutoff. High ratios collect
-    // full Candidates directly, because a census followed by a second scan
-    // would cost more than the identities it saves.
-    struct TenantCensus {
+    // Work is handed out per route stripe, so a deployment with one tenant
+    // still scans its objects on several threads. A stripe's handles are copied
+    // under that stripe's lock, released before any entry lock is taken, and
+    // dropped when the walker that took them is done with them, so the census
+    // holds a stripe per walker rather than every route's whole population. A
+    // stripe is settled in chunks before it is counted, so an object is walked
+    // once. For selective ratios only the lease timestamps are collected here;
+    // full tenant/key identities are materialized afterwards for a bounded
+    // frontier around the eviction cutoff. High ratios collect full Candidates
+    // directly, because a census followed by a second scan would cost more than
+    // the identities it saves.
+    struct CensusTenant {
         TenantId tenant_id;
         std::shared_ptr<metadata::Tenant> tenant;
-        std::vector<std::shared_ptr<ObjectEntry>> objects;
-    };
-    // The handles are strong, so a tenant created or removed while the census
-    // runs leaves no dangling tenant. `Visit` runs its callback after it has
-    // released the registry lock, so each snapshot is taken from the callback.
-    std::vector<TenantCensus> census_inputs;
-    tenants_.Visit([&](const TenantId& tenant_id,
-                       const std::shared_ptr<metadata::Tenant>& tenant) {
-        census_inputs.push_back(
-            TenantCensus{tenant_id, tenant, tenant->SnapshotObjects()});
-    });
-
-    struct CensusUnit {
-        size_t tenant_index;
-        size_t begin;
-        size_t end;
     };
     constexpr size_t kCensusChunkObjects = 4096;
     constexpr size_t kMaxCensusThreads = 16;
-    std::vector<CensusUnit> units;
-    // Diagnostic population of this pass: what the snapshots hold, so this
-    // count and the eviction base counted from the same snapshots agree. A
-    // route that gains or loses objects while the census runs is seen at the
-    // snapshot of its own tenant, and its change shows in the next pass.
-    long object_count = 0;
-    for (size_t i = 0; i < census_inputs.size(); ++i) {
-        const auto& input = census_inputs[i];
-        object_count += static_cast<long>(input.objects.size());
-        for (size_t begin = 0; begin < input.objects.size();
-             begin += kCensusChunkObjects) {
-            units.push_back(CensusUnit{
-                i, begin,
-                std::min(begin + kCensusChunkObjects, input.objects.size())});
+    // The tenants are held by strong handles for the whole walk, so a tenant
+    // created or removed while it runs leaves no dangling tenant, and `Visit`
+    // runs its callback after it has released the registry lock, so each handle
+    // is taken from the callback. The population decides how many walkers the
+    // stripes are shared out over, as it decided the number of chunk units
+    // before: a walk of a small population must not start a thread per stripe.
+    std::vector<CensusTenant> census_tenants;
+    size_t census_population = 0;
+    tenants_.Visit([&](const TenantId& tenant_id,
+                       const std::shared_ptr<metadata::Tenant>& tenant) {
+        census_tenants.push_back(CensusTenant{tenant_id, tenant});
+        census_population += tenant->ObjectCount();
+    });
+
+    struct CensusStripe {
+        size_t tenant_index;
+        size_t stripe_index;
+    };
+    std::vector<CensusStripe> census_stripes;
+    census_stripes.reserve(census_tenants.size() *
+                           metadata::Tenant::kObjectStripeCount);
+    for (size_t tenant_index = 0; tenant_index < census_tenants.size();
+         ++tenant_index) {
+        for (size_t stripe_index = 0;
+             stripe_index < metadata::Tenant::kObjectStripeCount;
+             ++stripe_index) {
+            census_stripes.push_back(CensusStripe{tenant_index, stripe_index});
         }
     }
+    const size_t census_chunks =
+        (census_population + kCensusChunkObjects - 1) / kCensusChunkObjects;
     const size_t num_threads =
-        std::min(units.size(), static_cast<size_t>(kMaxCensusThreads));
+        census_tenants.empty()
+            ? 0
+            : std::clamp(census_chunks, size_t{1},
+                         static_cast<size_t>(kMaxCensusThreads));
 
+    // Hands route stripes to `fn(walker, tenant_id, tenant, objects)` on
+    // `num_threads` walkers: a walker copies the handles of the stripe it took
+    // under that stripe's lock, hands them over, and holds nothing of the route
+    // before it takes its next stripe. An empty stripe is skipped, so a sparse
+    // route costs one lock and no allocation per stripe.
+    const auto for_each_stripe = [&](auto&& fn) {
+        std::atomic<size_t> next_stripe{0};
+        std::vector<std::thread> walkers;
+        walkers.reserve(num_threads);
+        for (size_t walker = 0; walker < num_threads; ++walker) {
+            walkers.emplace_back([&, walker] {
+                while (true) {
+                    const size_t index =
+                        next_stripe.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= census_stripes.size()) {
+                        break;
+                    }
+                    const CensusStripe& work = census_stripes[index];
+                    const CensusTenant& census_tenant =
+                        census_tenants[work.tenant_index];
+                    auto objects =
+                        census_tenant.tenant->SnapshotStripe(work.stripe_index);
+                    if (objects.empty()) {
+                        continue;
+                    }
+                    fn(walker, census_tenant.tenant_id, *census_tenant.tenant,
+                       objects);
+                }
+            });
+        }
+        for (auto& walker : walkers) {
+            walker.join();
+        }
+    };
     constexpr size_t kMinReserveSlack = 1024;
     constexpr size_t kMinFrontierLimit = 64 * 1024;
     constexpr size_t kReserveSlackDivisor = 10;
@@ -12501,28 +12549,29 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<std::vector<std::chrono::system_clock::time_point>>
         local_soft_pin(num_threads);
+    // Diagnostic population of this pass: what the walk held, so this count and
+    // the eviction base counted from the same stripes agree. A route that gains
+    // or loses objects while the census runs is seen at the stripe it is taken
+    // in, and its change shows in the next pass.
+    std::atomic<long> object_count{0};
 
-    std::atomic<size_t> next_unit{0};
-    std::vector<std::thread> threads;
-    for (size_t t = 0; t < num_threads; t++) {
-        threads.emplace_back([&, t] {
-            while (true) {
-                const size_t unit_index =
-                    next_unit.fetch_add(1, std::memory_order_relaxed);
-                if (unit_index >= units.size()) {
-                    break;
-                }
-                const CensusUnit& unit = units[unit_index];
-                const TenantCensus& input = census_inputs[unit.tenant_index];
-                const TenantId& tenant_id = input.tenant_id;
+    for_each_stripe(
+        [&](size_t walker, const TenantId& tenant_id,
+            metadata::Tenant& stripe_tenant,
+            const std::vector<std::shared_ptr<ObjectEntry>>& objects) {
+            object_count.fetch_add(static_cast<long>(objects.size()),
+                                   std::memory_order_relaxed);
+            for (size_t begin = 0; begin < objects.size();
+                 begin += kCensusChunkObjects) {
+                const size_t end =
+                    std::min(begin + kCensusChunkObjects, objects.size());
                 // This chunk is settled before it is counted, so an object
                 // whose in-flight state expired is read once, already settled.
-                DiscardExpiredInFlightState(*input.tenant, tenant_id,
-                                            input.objects, unit.begin, unit.end,
-                                            now);
-                for (size_t i = unit.begin; i < unit.end; ++i) {
-                    const auto& entry = input.objects[i];
-                    // The snapshot only names the keys to consider: every
+                DiscardExpiredInFlightState(stripe_tenant, tenant_id, objects,
+                                            begin, end, now);
+                for (size_t i = begin; i < end; ++i) {
+                    const auto& entry = objects[i];
+                    // The stripe only names the keys to consider: every
                     // eviction re-resolves its candidate under that object's
                     // own lock.
                     entry->WithSharedAccess([&](const ObjectMetadata& metadata,
@@ -12532,7 +12581,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         }
                         const bool has_evictable = can_evict_replicas(metadata);
                         if (has_evictable) {
-                            local_eviction_base[t]++;
+                            local_eviction_base[walker]++;
                         }
                         // Grouped objects are evicted all-or-none, so rank them
                         // by the shared group TTL instead of each member's own
@@ -12544,20 +12593,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         }
                         if (!IsSoftPinActive(metadata, now)) {
                             if (compact_frontier_prebypass) {
-                                local_candidates[t].push_back(
+                                local_candidates[walker].push_back(
                                     {tenant_id, entry->key(), deadline});
                             } else {
-                                local_no_pin[t].push_back(deadline);
+                                local_no_pin[walker].push_back(deadline);
                             }
                         } else if (allow_evict_soft_pinned_objects_) {
-                            local_soft_pin[t].push_back(deadline);
+                            local_soft_pin[walker].push_back(deadline);
                         }
                     });
                 }
             }
         });
-    }
-    for (auto& t : threads) t.join();
 
     // Merge per-thread results
     long total_eviction_base = 0;
@@ -12599,8 +12646,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 std::make_move_iterator(v.end()));
     }
 
+    const long census_object_count =
+        object_count.load(std::memory_order_relaxed);
     if (total_eviction_base == 0) {
-        VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
+        VLOG(1) << "[EVICT-DIAG] object_count=" << census_object_count
                 << " eviction_base=0 (no evictable memory objects)";
         return;
     }
@@ -12612,63 +12661,49 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const long primary_no_pin_num =
         std::min(ideal_evict_num, static_cast<long>(no_pin_count));
 
-    // Re-scan metadata and copy full identities only for objects inside the
+    // Re-scan the stripes and copy full identities only for objects inside the
     // requested timestamp range. The eligibility conditions are identical to
-    // the census above, so the selected set matches what the census counted.
+    // the census above, so an object the census counted is selected on the same
+    // conditions, and one the route gained or lost since is selected on the
+    // metadata it carries now, which is what the eviction re-validates anyway.
+    // The re-scan goes one stripe at a time again, so it holds no more of the
+    // route than the census did.
     auto collect_candidates = [&](bool use_cutoff,
                                   std::chrono::system_clock::time_point cutoff,
                                   bool collect_older_or_equal) {
         std::vector<std::vector<Candidate>> local_frontier(num_threads);
-        std::vector<std::thread> collectors;
-        collectors.reserve(num_threads);
-        std::atomic<size_t> next_frontier_unit{0};
 
-        for (size_t t = 0; t < num_threads; t++) {
-            collectors.emplace_back([&, t] {
-                while (true) {
-                    const size_t unit_index = next_frontier_unit.fetch_add(
-                        1, std::memory_order_relaxed);
-                    if (unit_index >= units.size()) {
-                        break;
-                    }
-                    const CensusUnit& unit = units[unit_index];
-                    const TenantCensus& input =
-                        census_inputs[unit.tenant_index];
-                    for (size_t i = unit.begin; i < unit.end; ++i) {
-                        const auto& entry = input.objects[i];
-                        entry->WithSharedAccess(
-                            [&](const ObjectMetadata& metadata,
-                                const ObjectEntry::State&) {
-                                if (metadata.IsHardPinned() ||
-                                    IsSoftPinActive(metadata, now) ||
-                                    !can_evict_replicas(metadata)) {
-                                    return;
-                                }
-                                // Group-aware eviction deadline (shared group
-                                // TTL for grouped objects) so the cutoff
-                                // matches eviction.
-                                const auto deadline =
-                                    metadata.EvictionDeadline();
-                                if (now < deadline) {
-                                    return;
-                                }
-                                if (use_cutoff) {
-                                    const bool in_range =
-                                        collect_older_or_equal
-                                            ? deadline <= cutoff
-                                            : deadline > cutoff;
-                                    if (!in_range) {
-                                        return;
-                                    }
-                                }
-                                local_frontier[t].push_back(
-                                    {input.tenant_id, entry->key(), deadline});
-                            });
-                    }
+        for_each_stripe(
+            [&](size_t walker, const TenantId& tenant_id, metadata::Tenant&,
+                const std::vector<std::shared_ptr<ObjectEntry>>& objects) {
+                for (const auto& entry : objects) {
+                    entry->WithSharedAccess([&](const ObjectMetadata& metadata,
+                                                const ObjectEntry::State&) {
+                        if (metadata.IsHardPinned() ||
+                            IsSoftPinActive(metadata, now) ||
+                            !can_evict_replicas(metadata)) {
+                            return;
+                        }
+                        // Group-aware eviction deadline (shared group TTL
+                        // for grouped objects) so the cutoff matches
+                        // eviction.
+                        const auto deadline = metadata.EvictionDeadline();
+                        if (now < deadline) {
+                            return;
+                        }
+                        if (use_cutoff) {
+                            const bool in_range = collect_older_or_equal
+                                                      ? deadline <= cutoff
+                                                      : deadline > cutoff;
+                            if (!in_range) {
+                                return;
+                            }
+                        }
+                        local_frontier[walker].push_back(
+                            {tenant_id, entry->key(), deadline});
+                    });
                 }
             });
-        }
-        for (auto& collector : collectors) collector.join();
 
         size_t total = 0;
         for (const auto& v : local_frontier) total += v.size();
@@ -12941,15 +12976,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     ? (double)evicted_count / total_eviction_base
                     : 0.0)
             << ", target_evict_ratio=" << evict_ratio_target;
-    VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
-            << " disk_object_count=" << (object_count - total_eviction_base)
+    VLOG(1) << "[EVICT-DIAG] object_count=" << census_object_count
+            << " disk_object_count="
+            << (census_object_count - total_eviction_base)
             << " eviction_base=" << total_eviction_base << " disk_ratio="
-            << (object_count > 0
-                    ? (double)(object_count - total_eviction_base) /
-                          object_count
+            << (census_object_count > 0
+                    ? (double)(census_object_count - total_eviction_base) /
+                          census_object_count
                     : 0.0)
             << " ideal_evict_num_inflated="
-            << (long)std::ceil(object_count * evict_ratio_target)
+            << (long)std::ceil(census_object_count * evict_ratio_target)
             << " ideal_evict_num_correct="
             << (long)std::ceil(total_eviction_base * evict_ratio_target);
     LOG(INFO) << "[EVICT-RESULT] evicted_count=" << evicted_count
