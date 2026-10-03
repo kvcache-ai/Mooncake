@@ -60,6 +60,11 @@ with `register_buffer`.
 - `verify` currently requires `pattern`
 - Any write-involved scenario requires `value-size` to be 512-byte aligned
 - `memory-replica-num` and `nof-replica-num` cannot both be `0`
+- `dfs-replica-num` adds a DFS replica; it may be `0` or `1`, and `1` requires
+  `memory-replica-num >= 1`
+- Any process that writes or reads DFS replicas must pass `--enable-ssd-offload`,
+  which maps to `setup(enable_ssd_offload=True)`; without it DFS puts fail with
+  `-1601` (`DFS_SERVICE_UNAVAILABLE`)
 - `prepare-objects`
   - Controls how many objects are written by the prepare phase
   - `0` means reuse `nr-objects`
