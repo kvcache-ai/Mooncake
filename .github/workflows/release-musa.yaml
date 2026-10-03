@@ -116,6 +116,7 @@ jobs:
           mkdir build
           cd build
           cmake_args=(
+            -DWITH_CONDUCTOR=ON
             -DUSE_MUSA=ON
             -DUSE_HTTP=ON
             -DUSE_ETCD=ON

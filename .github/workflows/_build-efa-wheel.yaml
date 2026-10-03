@@ -149,7 +149,8 @@ jobs:
             -DENABLE_SCCACHE=ON \
             -DCMAKE_BUILD_TYPE=Release \
             "${profile_args[@]}" \
-            "${cuda_args[@]}"
+            "${cuda_args[@]}" \
+            -DWITH_CONDUCTOR=ON
         shell: bash
 
       - name: Build project
