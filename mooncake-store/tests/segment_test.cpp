@@ -522,6 +522,69 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
     EXPECT_EQ(segment_manager.GetUsage().capacity_bytes, 0u);
 }
 
+TEST_F(SegmentTest, NoFEndpointRemainsReservedUntilUnmountCommits) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    NoFSegment old_segment;
+    old_segment.id = generate_uuid();
+    old_segment.name = "nof_unmount_endpoint";
+    old_segment.te_endpoint = old_segment.name;
+    old_segment.base = 0;
+    old_segment.size = kSegmentSize;
+    const UUID old_client = generate_uuid();
+    const UUID new_client = generate_uuid();
+
+    NoFSegment replacement = old_segment;
+    replacement.id = generate_uuid();
+    size_t old_capacity = 0;
+    {
+        auto access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(access.MountSegment(old_segment, old_client), ErrorCode::OK);
+        EXPECT_EQ(access.MountSegment(replacement, new_client),
+                  ErrorCode::SEGMENT_ALREADY_EXISTS);
+        ASSERT_EQ(access.PrepareUnmountSegment(old_segment.id, old_capacity),
+                  ErrorCode::OK);
+    }
+
+    {
+        auto access = segment_manager.getNoFSegmentAccess();
+        EXPECT_EQ(access.MountSegment(replacement, new_client),
+                  ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        EXPECT_EQ(access.ReMountSegment({replacement}, new_client),
+                  ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        std::vector<NoFSegment> client_segments;
+        EXPECT_EQ(access.GetClientSegments(new_client, client_segments),
+                  ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    EXPECT_EQ(segment_manager.getMountedSegmentCount(), 1);
+
+    {
+        auto access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(access.CommitUnmountSegment(old_segment.id, old_client,
+                                              old_capacity),
+                  ErrorCode::OK);
+    }
+
+    {
+        auto access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(access.ReMountSegment({replacement}, new_client),
+                  ErrorCode::OK);
+        std::vector<NoFSegment> client_segments;
+        ASSERT_EQ(access.GetClientSegments(new_client, client_segments),
+                  ErrorCode::OK);
+        ASSERT_EQ(client_segments.size(), 1u);
+        EXPECT_EQ(client_segments.front().id, replacement.id);
+    }
+    EXPECT_EQ(segment_manager.getMountedSegmentCount(), 1);
+
+    auto access = segment_manager.getNoFSegmentAccess();
+    size_t capacity = 0;
+    ASSERT_EQ(access.PrepareUnmountSegment(replacement.id, capacity),
+              ErrorCode::OK);
+    ASSERT_EQ(access.CommitUnmountSegment(replacement.id, new_client, capacity),
+              ErrorCode::OK);
+}
+
 // MountSegmentDuplicate Tests:
 // 1. MountSegment with the same segment id. The second mount operation return
 // SEGMENT_ALREADY_EXISTS.
