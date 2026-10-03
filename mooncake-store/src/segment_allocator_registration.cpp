@@ -1,14 +1,73 @@
 #include "segment_allocator_registration.h"
 
 #include <utility>
+#include <cassert>
 
 namespace mooncake {
+
+void ServingNameCounter::Update(bool serving) {
+    // Serialize a name's 0 <-> 1 transitions so a concurrent removal cannot
+    // decrement the aggregate before the matching addition has incremented it.
+    std::lock_guard lock(mutex_);
+    if (serving) {
+        if (serving_registrations_++ == 0) {
+            total_->fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        assert(serving_registrations_ > 0);
+        if (--serving_registrations_ == 0) {
+            total_->fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+}
 
 SegmentAllocatorRegistration::SegmentAllocatorRegistration(
     std::shared_ptr<BufferAllocatorBase> allocator,
     std::shared_ptr<ClientLivenessRecord> client_liveness)
     : allocator_(std::move(allocator)),
       client_liveness_(std::move(client_liveness)) {}
+
+SegmentAllocatorRegistration::~SegmentAllocatorRegistration() {
+    UntrackServingName();
+}
+
+void SegmentAllocatorRegistration::TrackServingName(
+    std::shared_ptr<ServingNameCounter> counter) {
+    assert(!serving_name_counter_);
+    serving_name_counter_ = std::move(counter);
+    AddServingCount();
+}
+
+void SegmentAllocatorRegistration::UntrackServingName() {
+    RemoveServingCount();
+    serving_name_counter_.reset();
+}
+
+void SegmentAllocatorRegistration::AddServingCount() {
+    if (!serving_name_counter_ || !allocation_lifetime_.isAvailable()) {
+        return;
+    }
+    const auto record =
+        std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
+    if (record) {
+        record->AddServingCounter(serving_name_counter_);
+    } else {
+        serving_name_counter_->Update(true);
+    }
+}
+
+void SegmentAllocatorRegistration::RemoveServingCount() {
+    if (!serving_name_counter_ || !allocation_lifetime_.isAvailable()) {
+        return;
+    }
+    const auto record =
+        std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
+    if (record) {
+        record->RemoveServingCounter(serving_name_counter_);
+    } else {
+        serving_name_counter_->Update(false);
+    }
+}
 
 bool SegmentAllocatorRegistration::IsServing() const {
     if (!allocation_lifetime_.isAvailable()) {
@@ -57,8 +116,10 @@ void SegmentAllocatorRegistration::BindAllocator(
 
 void SegmentAllocatorRegistration::BindClientLiveness(
     std::shared_ptr<ClientLivenessRecord> record) {
+    RemoveServingCount();
     std::atomic_store_explicit(&client_liveness_, std::move(record),
                                std::memory_order_release);
+    AddServingCount();
 }
 
 void SegmentAllocatorRegistration::BindBuffer(AllocatedBuffer& buffer) const {
@@ -73,11 +134,16 @@ bool SegmentAllocatorRegistration::OwnsBuffer(
 }
 
 void SegmentAllocatorRegistration::SetAllocatable(bool allocatable) {
+    if (allocatable == allocation_lifetime_.isAvailable()) {
+        return;
+    }
+    RemoveServingCount();
     allocation_lifetime_.setAvailable(allocatable);
+    AddServingCount();
 }
 
 void SegmentAllocatorRegistration::Invalidate() {
-    allocation_lifetime_.setAvailable(false);
+    SetAllocatable(false);
     buffer_lifetime_.setAvailable(false);
 }
 

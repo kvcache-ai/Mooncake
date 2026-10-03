@@ -800,6 +800,8 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  2u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_GE(ordered.size(), 2u);
@@ -815,6 +817,8 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_EQ(ordered.size(), 1u);
@@ -837,6 +841,8 @@ TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_EQ(ordered.size(), 1u);
@@ -868,6 +874,8 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
     }
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         snapshot = allocator_access.SnapshotAllocatorManager();
     }
     const auto* registrations = snapshot.getAllocators(segment.name);
@@ -896,6 +904,10 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
     EXPECT_EQ(transition.get(), ClientLivenessTransition::BECAME_SUSPECTED);
     EXPECT_TRUE(transitioned_during_allocation);
     EXPECT_EQ(allocation.get(), nullptr);
+    EXPECT_EQ(segment_manager.getAllocatorAccess()
+                  .getAllocatorManager()
+                  .getServingNameCount(),
+              0u);
 }
 
 TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
@@ -928,6 +940,8 @@ TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_EQ(ordered.size(), 1u);
@@ -954,6 +968,8 @@ TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         ASSERT_EQ(ordered.size(), 1u);
@@ -974,6 +990,8 @@ TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {
 
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  0u);
         auto ordered =
             allocator_access.GetHostOrderedSegments("host1", "test_key");
         EXPECT_TRUE(ordered.empty());
@@ -1015,6 +1033,8 @@ TEST_F(SegmentTest, SharedNameRegistrationsSurviveSegmentSnapshotRestore) {
     ASSERT_TRUE(restored_state.has_value());
     {
         auto allocator_access = restored.getAllocatorAccess();
+        EXPECT_EQ(allocator_access.getAllocatorManager().getServingNameCount(),
+                  1u);
         const auto* registrations =
             allocator_access.getAllocatorManager().getAllocators(first.name);
         ASSERT_NE(registrations, nullptr);

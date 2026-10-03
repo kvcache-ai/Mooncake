@@ -103,6 +103,7 @@ INSTANTIATE_TEST_SUITE_P(
 // Test basic functionality with empty allocators map (non-parameterized)
 TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
     AllocatorManager allocator_manager;
+    EXPECT_EQ(allocator_manager.getServingNameCount(), 0u);
 
     size_t slice_length = 100;
     auto result =
@@ -138,7 +139,9 @@ TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
         "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active");
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("shared", suspected_allocator, suspected);
+    EXPECT_EQ(allocator_manager.getServingNameCount(), 0u);
     allocator_manager.addAllocator("shared", active_allocator, active);
+    EXPECT_EQ(allocator_manager.getServingNameCount(), 1u);
 
     // No SSD usage is registered: the SSD strategy still picks the serving
     // registration.

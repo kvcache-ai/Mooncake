@@ -1026,8 +1026,18 @@ class MasterService {
                                      const TenantId& tenant_id,
                                      Replica& replica)
         -> tl::expected<bool, ErrorCode>;
-    // Caller must hold client_mutex_.
-    std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
+    std::shared_ptr<ClientLivenessRecord> FindLocalDiskClientRecord(
+        const UUID& client_id);
+    using RetainingClientIds = RetainingClientIndex::ClientIds;
+    // Caller holds client_mutex_ exclusively for index binding changes.
+    void TrackLocalDiskClientLocked(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record);
+    void UntrackLocalDiskClientLocked(const UUID& client_id);
+    void ClearLocalDiskClientsLocked();
+    // Clients whose LOCAL_DISK replicas must be retained. Caller must hold
+    // client_mutex_; memory replica validity is tracked by segment lifetime.
+    std::shared_ptr<const RetainingClientIds> GetRetainingClientIdsLocked()
         const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
@@ -2018,6 +2028,16 @@ class MasterService {
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>
         client_liveness_records_;
+    // Subset of client_liveness_records_, protected by client_mutex_. Include
+    // owners recovered from LOCAL_DISK replicas even before they remount.
+    // Keep candidates until client offboarding: disk unmount alone must not
+    // change the liveness-based stale-replica predicate during cleanup.
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        local_disk_client_records_;
+    // Liveness records bind directly to this index, never the MasterService.
+    std::shared_ptr<RetainingClientIndex> retaining_client_index_ =
+        std::make_shared<RetainingClientIndex>();
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;

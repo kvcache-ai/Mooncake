@@ -478,10 +478,15 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     MountMemoryAndLocalDisk(*service, leaving, leaving_segment, 0x1300000000);
     PutAndOffload(*service, leaving, "ssd_interleave_leaving_key", 1024,
                   leaving_segment);
+    MasterServiceTestPeer peer(*service);
+    const auto before_mount = peer.GetRetainingClientIds();
+    ASSERT_EQ(before_mount->size(), 1u);
+    EXPECT_TRUE(before_mount->contains(leaving));
 
     // First half of UnmountLocalDiskSegment(leaving): the client is
     // deregistered; the sweep has not run.
     DeregisterHalf(*service, leaving);
+    EXPECT_TRUE(peer.GetRetainingClientIds()->contains(leaving));
 
     // The interleaving under test: another store mounts and registers a
     // replica before the sweep reaches its shard. Whether the client monitor
@@ -490,6 +495,13 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     // this mount would classify the replica stale and erase it, and with it
     // the key, since this disk replica is the key's only one.
     MountMemoryAndLocalDisk(*service, late, late_segment, 0x1400000000);
+    const auto after_mount = peer.GetRetainingClientIds();
+    EXPECT_EQ(after_mount->size(), 2u);
+    EXPECT_TRUE(after_mount->contains(leaving));
+    EXPECT_TRUE(after_mount->contains(late));
+    // A cleanup already in progress must keep its original membership view.
+    EXPECT_EQ(before_mount->size(), 1u);
+    EXPECT_FALSE(before_mount->contains(late));
     StorageObjectMetadata late_metadata;
     late_metadata.data_size = 1024;
     late_metadata.transport_endpoint = late_segment;
