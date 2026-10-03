@@ -1,6 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <type_traits>
+
 #include "conductor/client/conductor_client.h"
 
 namespace py = pybind11;
@@ -65,6 +67,37 @@ py::dict ServiceToDict(const mooncake::conductor::common::ServiceConfig& svc) {
     return d;
 }
 
+// Validate before casting so pybind conversion errors follow the public API's
+// ValueError convention, including integer overflow and nested field types.
+template <typename T>
+T RegisterValue(py::handle value, const std::string& field) {
+    if constexpr (std::is_integral_v<T>) {
+        if (!py::isinstance<py::int_>(value) ||
+            py::isinstance<py::bool_>(value))
+            throw py::value_error(field + " must be an integer");
+    } else {
+        if (!py::isinstance<py::str>(value))
+            throw py::value_error(field + " must be a string");
+    }
+    try {
+        return py::cast<T>(value);
+    } catch (const py::cast_error&) {
+        throw py::value_error("invalid type or value for register " + field);
+    }
+}
+
+void ValidateKeys(const py::dict& config,
+                  const std::set<std::string>& known_keys,
+                  const std::string& field) {
+    for (auto item : config) {
+        if (!py::isinstance<py::str>(item.first))
+            throw py::value_error(field + " keys must be strings");
+        const auto key = py::cast<std::string>(item.first);
+        if (!known_keys.count(key))
+            throw py::value_error("unknown " + field + " key: " + key);
+    }
+}
+
 }  // namespace
 
 class PyConductorClient {
@@ -115,7 +148,10 @@ class PyConductorClient {
         out["hits"] = std::move(hits);
         return out;
     }
-    int register_service(const py::dict& config) {
+    int register_service(py::object value) {
+        if (!py::isinstance<py::dict>(value))
+            throw py::value_error("register config must be a dict");
+        const auto config = py::reinterpret_borrow<py::dict>(value);
         // Key names follow the Python API convention
         // (model_name/publisher_type, unlike the HTTP /register msgpack
         // fields modelname/type); unknown keys or wrong types raise
@@ -128,15 +164,10 @@ class PyConductorClient {
             "instance_id", "endpoint",    "replay_endpoint", "publisher_type",
             "model_name",  "lora_name",   "tenant_id",       "block_size",
             "dp_rank",     "cache_group", "hash_profile"};
-        for (auto item : config) {
-            const std::string key = py::str(item.first);
-            if (!kKnownKeys.count(key)) {
-                throw py::value_error("unknown register config key: " + key);
-            }
-        }
+        ValidateKeys(config, kKnownKeys, "register config");
         auto get_str = [&](const char* key, std::string* out) {
             if (!config.contains(key)) return;
-            *out = py::cast<std::string>(config[key]);
+            *out = RegisterValue<std::string>(config[key], key);
         };
         get_str("instance_id", &svc.instance_id);
         get_str("endpoint", &svc.endpoint);
@@ -145,31 +176,41 @@ class PyConductorClient {
         get_str("lora_name", &svc.lora_name);
         get_str("tenant_id", &svc.tenant_id);
         if (config.contains("block_size"))
-            svc.block_size = py::cast<int64_t>(config["block_size"]);
+            svc.block_size =
+                RegisterValue<int64_t>(config["block_size"], "block_size");
         if (config.contains("dp_rank"))
-            svc.dp_rank = py::cast<int>(config["dp_rank"]);
+            svc.dp_rank = RegisterValue<int>(config["dp_rank"], "dp_rank");
         if (config.contains("cache_group") && !config["cache_group"].is_none())
-            svc.cache_group = py::cast<int64_t>(config["cache_group"]);
+            svc.cache_group =
+                RegisterValue<int64_t>(config["cache_group"], "cache_group");
         if (config.contains("publisher_type")) {
-            auto kind = mc::common::ParsePublisherKind(
-                py::cast<std::string>(config["publisher_type"]));
+            auto kind =
+                mc::common::ParsePublisherKind(RegisterValue<std::string>(
+                    config["publisher_type"], "publisher_type"));
             if (!kind) throw py::value_error("invalid publisher_type");
             svc.publisher_kind = *kind;
         }
         if (config.contains("hash_profile")) {
-            const py::dict hp = config["hash_profile"].cast<py::dict>();
+            if (!py::isinstance<py::dict>(config["hash_profile"]))
+                throw py::value_error("register hash_profile must be a dict");
+            const auto hp =
+                py::reinterpret_borrow<py::dict>(config["hash_profile"]);
+            static const std::set<std::string> kHashKeys = {
+                "strategy", "algorithm", "python_hash_seed",
+                "index_projection"};
+            ValidateKeys(hp, kHashKeys, "hash_profile");
             if (hp.contains("strategy"))
-                svc.hash_profile.strategy =
-                    py::cast<std::string>(hp["strategy"]);
+                svc.hash_profile.strategy = RegisterValue<std::string>(
+                    hp["strategy"], "hash_profile.strategy");
             if (hp.contains("algorithm"))
-                svc.hash_profile.algorithm =
-                    py::cast<std::string>(hp["algorithm"]);
+                svc.hash_profile.algorithm = RegisterValue<std::string>(
+                    hp["algorithm"], "hash_profile.algorithm");
             if (hp.contains("python_hash_seed"))
-                svc.hash_profile.python_hash_seed =
-                    py::cast<std::string>(hp["python_hash_seed"]);
+                svc.hash_profile.python_hash_seed = RegisterValue<std::string>(
+                    hp["python_hash_seed"], "hash_profile.python_hash_seed");
             if (hp.contains("index_projection"))
-                svc.hash_profile.index_projection =
-                    py::cast<std::string>(hp["index_projection"]);
+                svc.hash_profile.index_projection = RegisterValue<std::string>(
+                    hp["index_projection"], "hash_profile.index_projection");
         }
         // root_digest is derived server-side from the recipe, not supplied
         // here.
