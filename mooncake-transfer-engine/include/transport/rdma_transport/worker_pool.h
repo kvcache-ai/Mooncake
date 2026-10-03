@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include "config.h"
+#include "endpoint_keepalive.h"
 #include "rdma_context.h"
 
 namespace mooncake {
@@ -43,6 +45,13 @@ class WorkerPool {
                            size_t first, size_t count);
     void untrackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
                              size_t first, size_t count);
+
+    // Schedules keepalives for an endpoint on its peer's posting thread
+    // (MC_ENDPOINT_IDLE_TIMEOUT; see endpoint_keepalive.h). Thread-safe;
+    // called once per endpoint when it is created.
+    void registerEndpointForKeepalive(
+        const std::shared_ptr<RdmaEndPoint> &endpoint,
+        const std::string &peer_nic_path);
 
    private:
     using SliceList = std::vector<Transport::Slice *>;
@@ -71,6 +80,12 @@ class WorkerPool {
                     bool defer_local_redispatch = false);
 
     void transferWorker(int thread_id);
+
+    // Posts keepalives for this posting thread's endpoints that have been
+    // idle for MC_ENDPOINT_IDLE_TIMEOUT. Called on every transferWorker loop,
+    // which runs at least once a second even when parked; costs one
+    // comparison when nothing is due.
+    void serviceKeepalives(int thread_id, uint64_t now_ns);
 
     bool hasOutstandingCq(int thread_id);
 
@@ -150,6 +165,13 @@ class WorkerPool {
         collective_slice_queue_;
     std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
     std::vector<std::mutex> worker_slice_queue_lock_;
+
+    // Endpoint keepalives, one schedule per posting thread and touched only by
+    // it. Endpoints created on other threads (passive setup) arrive through
+    // keepalive_inbox_, guarded by worker_slice_queue_lock_.
+    std::vector<KeepaliveSchedule<RdmaEndPoint>> keepalive_schedule_;
+    std::vector<std::vector<std::weak_ptr<RdmaEndPoint>>> keepalive_inbox_;
+    std::unique_ptr<std::atomic<bool>[]> keepalive_inbox_pending_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
     std::atomic<uint64_t> recovery_activate_after_ns_{0};
