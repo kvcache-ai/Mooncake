@@ -298,8 +298,8 @@ TEST_F(MasterServiceSSDTest, RemoveDecrementsCacheTotalMetrics) {
 }
 
 // Evicting a LOCAL_DISK replica via EvictDiskReplica must decrement
-// file_cache_nums_ even when the object still has a MEMORY replica (so
-// accessor.Erase() does not run). Without SyncCacheTotalAccounting in the
+// file_cache_nums_ even when the object still has a MEMORY replica (so the
+// object is not torn down). Without SyncCacheTotalAccounting in the
 // LOCAL_DISK eviction branch, the gauge would stay over-counted.
 TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsFileCacheNums) {
     auto& metrics = MasterMetricManager::instance();
@@ -484,7 +484,7 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     DeregisterHalf(*service, leaving);
 
     // The interleaving under test: another store mounts and registers a
-    // replica before the sweep reaches its shard. Whether the client monitor
+    // replica before the sweep runs. Whether the client monitor
     // has admitted `late` to the alive set yet does not matter to an
     // owner-targeted sweep -- while a liveness-complement sweep taken before
     // this mount would classify the replica stale and erase it, and with it
@@ -530,7 +530,7 @@ TEST_F(LocalDiskUnmountInterleavingTest,
 //      yields a single nullopt entry and the loop body is skipped for it.
 //
 // In both cases the caller's `if (result)` branch fired and executed
-// inc_refcnt() + offloading_tasks.emplace() for work that was never submitted,
+// inc_refcnt() + recorded an offloading task for work that was never submitted,
 // leaking the source replica's refcount until the 600s TTL reaper cleared the
 // phantom task. The fix returns UNABLE_OFFLOADING from both paths.
 //

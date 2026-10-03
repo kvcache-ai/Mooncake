@@ -1,3 +1,4 @@
+#include "ha/snapshot/snapshot_constants.h"
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
@@ -26,6 +27,8 @@
 
 #include <unistd.h>
 
+#include "common/zstd_util.h"
+#include "serialize/serializer.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
@@ -779,17 +782,15 @@ TEST_F(MasterServiceTest,
         constexpr size_t kObjectSize = 4096;
         constexpr size_t kConcurrentWrites = 8;
         constexpr size_t kOldKeyCount = 32;
-        const size_t old_shard =
-            MetadataShardIndex(service, "single_flight_old_seed");
         std::vector<std::string> old_keys;
         std::vector<std::string> new_keys;
         for (size_t i = 0; old_keys.size() < kOldKeyCount ||
                            new_keys.size() < kConcurrentWrites;
              ++i) {
             const std::string key = "single_flight_key_" + std::to_string(i);
-            if (MetadataShardIndex(service, key) == old_shard) {
-                if (old_keys.size() < kOldKeyCount) old_keys.push_back(key);
-            } else if (new_keys.size() < kConcurrentWrites) {
+            if (old_keys.size() < kOldKeyCount) {
+                old_keys.push_back(key);
+            } else {
                 new_keys.push_back(key);
             }
         }
@@ -805,7 +806,22 @@ TEST_F(MasterServiceTest,
                             .has_value());
         }
 
-        auto old_shard_lock = LockMetadataShardForTest(service, old_shard);
+        // Hold one seeded object's entry open: the bucket that holds it cannot
+        // be validated while this lock is held, so the writers below meet a
+        // full allocator the way a slow eviction validation leaves it.
+        const auto blocked_entry = MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{TenantId::Default(),
+                                                           old_keys.front()});
+        ASSERT_NE(blocked_entry, nullptr);
+        std::atomic<bool> release_blocked_entry{false};
+        std::thread blocker([&] {
+            blocked_entry->WithExclusiveAccess([&](ObjectMetadata&,
+                                                   ObjectEntry::State&) {
+                while (!release_blocked_entry.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            });
+        });
         std::barrier start_barrier(kConcurrentWrites + 1);
         std::vector<int> errors(kConcurrentWrites,
                                 static_cast<int>(ErrorCode::INTERNAL_ERROR));
@@ -840,9 +856,10 @@ TEST_F(MasterServiceTest,
         start_barrier.arrive_and_wait();
         // Keep eviction validation blocked long enough for all writers to
         // encounter the full allocator. Without single-flight recovery they
-        // freeze different LRU buckets while waiting on this shard.
+        // freeze different LRU buckets while waiting on this entry.
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        old_shard_lock.reset();
+        release_blocked_entry.store(true);
+        blocker.join();
         for (auto& writer : writers) writer.join();
 
         for (size_t i = 0; i < kConcurrentWrites; ++i) {
@@ -1025,11 +1042,10 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
         << "the object survived, so the tenant was never emptied";
 }
 
-// RemoveAll holds one shard lock at a time, so a commit can land in a shard the
-// scan already passed. The scan's own bookkeeping cannot see it, and publishing
-// `cleared` would order it after that commit's `stored` — telling subscribers
-// to drop an object that is live. Pause the scan right after the shard the new
-// key belongs to, commit there, and the clear must be withheld.
+// RemoveAll releases one tenant route at a time, so a commit can land in a
+// tenant the scan already finished. Publishing `cleared` then orders it after
+// that commit's `stored`, telling subscribers to drop a live object. The hook
+// parks the scan there so the commit is pinned into that window.
 TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
     MasterService service;
     MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
@@ -1046,13 +1062,13 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "racer_key");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](size_t) {
             // Commit exactly once, immediately after the scan releases the
-            // shard the new key hashes to, so the scan can never observe it.
-            if (shard != racer_shard || committed) {
+            // tenant route the new key belongs to, so the scan can never
+            // observe it.
+            if (committed) {
                 return;
             }
             committed = true;
@@ -1067,7 +1083,7 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
         });
 
     service.RemoveAll(true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     auto exists = service.ExistKey("racer_key", TenantId::Default());
@@ -1126,11 +1142,13 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            if (shard != racer_shard || committed) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](size_t) {
+            // The tenant-scoped overload releases the one route it scanned, so
+            // this fire is the last point at which a commit into that tenant
+            // can still escape the scan.
+            if (committed) {
                 return;
             }
             committed = true;
@@ -1145,7 +1163,7 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
         });
 
     service.RemoveAll(TenantId::Default(), true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     EXPECT_EQ(0u,
@@ -1177,6 +1195,532 @@ TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     EXPECT_TRUE(service.ExistKey(key, tenant_a).value_or(false));
     EXPECT_FALSE(service.ExistKey(key, tenant_b).value_or(true));
     EXPECT_FALSE(service.ExistKey(key, TenantId::Default()).value_or(true));
+}
+
+// A snapshot reload replaces every publication, so the replica-action records
+// the service keeps beside them, the promotion-candidate index and the
+// dynamic-replication leases, have to go with them: a key published again
+// after the reload must inherit none of them.
+TEST_F(MasterServiceTest, SnapshotReloadDropsReplicaActionState) {
+    const TenantId tenant("tenant_reload");
+    const std::string key = "reloaded_key";
+    const uint64_t slice_length = 1024;
+    const MasterServiceTestPeer::ObjectIdentity identity{tenant, key};
+
+    // promotion_on_hit binds only with the offload machinery on, and a zero
+    // pool watermark sends every admission down the watermark-rejection
+    // branch that records the retry candidate.
+    MasterServiceConfig config = MakeStrictTenantConfig({tenant.value()});
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.eviction_high_watermark_ratio = 0.0;
+    MasterService service(config);
+    const auto segment = PrepareSimpleSegment(service);
+    MasterServiceTestPeer peer(service);
+    // The eviction pass retries promotion candidates, and its retry loop
+    // unindexes a candidate whose object still carries a memory replica.
+    MasterServiceTestPeer::EvictionRunning(service) = false;
+    if (MasterServiceTestPeer::EvictionThread(service).joinable()) {
+        MasterServiceTestPeer::EvictionThread(service).join();
+    }
+
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    PutCompletedObject(service, segment.client_id, key, tenant, put_config,
+                       slice_length);
+
+    auto publication = MasterServiceTestPeer::FindObject(service, identity);
+    ASSERT_NE(publication, nullptr);
+    ASSERT_EQ(peer.TryPushPromotionQueue(identity, /*record_candidate=*/true),
+              MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected);
+
+    const UUID proposal_id = generate_uuid();
+    ReplicaActionLease lease;
+    lease.proposal_id = proposal_id;
+    lease.lease_id = proposal_id;
+    lease.tenant_id = tenant.value();
+    lease.key = key;
+    // An hour out: no sweep can retract it during the test.
+    lease.expire_at_ms_epoch =
+        MasterServiceTestPeer::DynamicReplicationNowMs() + 3600000;
+    peer.PutDynamicReplicationLeaseForTesting(tenant, publication, proposal_id,
+                                              lease);
+
+    // Both records name the key rather than the publication, so they are the
+    // service's own state and not the entry's.
+    const auto candidates =
+        MasterServiceTestPeer::PromotionCandidateKeys(service, tenant);
+    ASSERT_FALSE(candidates.empty());
+    ASSERT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                    service, tenant, proposal_id)
+                    .has_value());
+    ASSERT_TRUE(MasterServiceTestPeer::HasReplicaActionState(service, tenant));
+    EXPECT_NE(MasterServiceTestPeer::PromotionCandidateCount(service).load(
+                  std::memory_order_relaxed),
+              0u);
+    // The retry cursor and the in-flight counter move during a sweep, so a
+    // reset that dropped only the candidate index would leave them behind.
+    MasterServiceTestPeer::PromotionRetryCursor(service).store(7);
+    MasterServiceTestPeer::PromotionInFlight(service).store(3);
+
+    MasterServiceTestPeer::MetadataSerializer serializer(&service);
+    serializer.Reset();
+
+    EXPECT_EQ(MasterServiceTestPeer::Tenants(service).Lookup(tenant), nullptr);
+    EXPECT_EQ(MasterServiceTestPeer::FindObject(service, identity), nullptr);
+    EXPECT_TRUE(
+        MasterServiceTestPeer::PromotionCandidateKeys(service, tenant).empty());
+    EXPECT_EQ(MasterServiceTestPeer::PromotionCandidateCount(service).load(
+                  std::memory_order_relaxed),
+              0u);
+    EXPECT_EQ(MasterServiceTestPeer::PromotionRetryCursor(service).load(
+                  std::memory_order_relaxed),
+              0u);
+    EXPECT_EQ(MasterServiceTestPeer::PromotionInFlight(service).load(
+                  std::memory_order_relaxed),
+              0u);
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant, proposal_id)
+                     .has_value());
+    EXPECT_FALSE(MasterServiceTestPeer::HasReplicaActionState(service, tenant))
+        << "the record held both halves, so the reset drops it with them";
+
+    // The same tenant and key published again inherit nothing.
+    PutCompletedObject(service, segment.client_id, key, tenant, put_config,
+                       slice_length);
+    auto republished = MasterServiceTestPeer::FindObject(service, identity);
+    ASSERT_NE(republished, nullptr);
+    EXPECT_NE(republished, publication);
+    EXPECT_TRUE(
+        MasterServiceTestPeer::PromotionCandidateKeys(service, tenant).empty());
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant, proposal_id)
+                     .has_value());
+    // The new publication carries no ledger state of its own beyond the
+    // object just put.
+    const auto committed_quota = republished->WithSharedAccess(
+        [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+            return metadata.quota_ledger.CommittedBytes();
+        });
+    EXPECT_EQ(committed_quota, slice_length);
+}
+
+namespace {
+
+// The tenants the registry holds: one per tenant id a publish path created.
+size_t RegisteredTenantCount(MasterService& service) {
+    size_t count = 0;
+    MasterServiceTestPeer::Tenants(service).Visit(
+        [&](const TenantId&, const std::shared_ptr<metadata::Tenant>&) {
+            ++count;
+        });
+    return count;
+}
+
+}  // namespace
+
+// A request that publishes nothing must not register a tenant: a client naming
+// a tenant id this service never stored into would otherwise grow the registry
+// with an empty tenant per request.
+// A PutStart that fails before it stores anything leaves the registry as it
+// was: the tenant is created when the object is about to be published, not when
+// a request arrives, so a rejected write cannot leave an empty tenant behind.
+TEST_F(MasterServiceTest, FailedPutStartLeavesNoTenantBehind) {
+    const TenantId filling("tenant_put_fills_pool");
+    const TenantId failing("tenant_put_never_publishes");
+    MasterService service(
+        MakeStrictTenantConfig({filling.value(), failing.value()}));
+    constexpr size_t kSegmentSize = 8 * 1024 * 1024;
+    constexpr size_t kObjectSize = 4 * 1024 * 1024;
+    const auto context = PrepareSimpleSegment(
+        service, "put_failure_segment", kDefaultSegmentBase, kSegmentSize);
+    const size_t tenants_before = RegisteredTenantCount(service);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    PutCompletedObject(service, context.client_id, "fill_a", filling, config,
+                       kObjectSize);
+    ASSERT_EQ(RegisteredTenantCount(service), tenants_before + 1);
+
+    // `failing` has a quota of its own and an empty route, and the request
+    // exceeds that quota: the write is refused before anything is published.
+    auto failed = service.PutStart(context.client_id, "no_room", failing,
+                                   kObjectSize + 1, config);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(ErrorCode::TENANT_QUOTA_EXCEEDED, failed.error());
+    EXPECT_EQ(RegisteredTenantCount(service), tenants_before + 1)
+        << "a PutStart that never publishes must not register its tenant";
+    EXPECT_EQ(MasterServiceTestPeer::Tenants(service).Lookup(failing), nullptr);
+    EXPECT_FALSE(service.GetReplicaList("no_room", failing).has_value());
+
+    // The same tenant is registered by a write that does publish.
+    PutCompletedObject(service, context.client_id, "stored", failing, config,
+                       kObjectSize);
+    EXPECT_EQ(RegisteredTenantCount(service), tenants_before + 2);
+    EXPECT_NE(MasterServiceTestPeer::Tenants(service).Lookup(failing), nullptr);
+}
+
+TEST_F(MasterServiceTest, MissDoesNotRegisterTenant) {
+    const TenantId tenant("tenant_miss_scope");
+    auto service = std::make_unique<MasterService>(
+        MakeStrictTenantConfig({tenant.value()}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const size_t tenants_before = RegisteredTenantCount(*service);
+
+    // A remove for an unregistered tenant and for a key the registered tenant
+    // does not publish.
+    EXPECT_FALSE(service->Remove("missing_key", TenantId("tenant_never_used"))
+                     .has_value());
+    EXPECT_FALSE(service->Remove("missing_key", tenant).has_value());
+    EXPECT_FALSE(service
+                     ->PutRevoke(generate_uuid(), "missing_key", tenant,
+                                 ReplicaType::MEMORY)
+                     .has_value());
+    EXPECT_EQ(service->GetReplicaList("missing_key", tenant).has_value(),
+              false);
+    EXPECT_EQ(RegisteredTenantCount(*service), tenants_before);
+
+    // Publishing under a configured tenant registers it, and only it.
+    PutCompletedObject(*service, context.client_id, "published_key", tenant,
+                       ReplicateConfig{.replica_num = 1}, 1024);
+    EXPECT_EQ(RegisteredTenantCount(*service), tenants_before + 1);
+    EXPECT_EQ(MasterServiceTestPeer::FindObject(
+                  *service,
+                  MasterServiceTestPeer::ObjectIdentity{
+                      tenant, "published_key"}) != nullptr,
+              true);
+}
+
+// A payload's entry keys are the shard slots a master that predates the tenant
+// model reads them as, and that master rejects a key at or above its own shard
+// count. A state with more tenants than slots therefore spreads them over the
+// slots instead of numbering past the last one, and every object still carries
+// its own tenant id, so the decode restores all of them.
+TEST_F(MasterServiceTest, SnapshotPacksMoreTenantsThanShardSlots) {
+    const size_t tenant_count = ha::kSnapshotShardSlots + 1;
+    std::vector<std::string> tenant_ids;
+    tenant_ids.reserve(tenant_count);
+    const auto key_of = [](size_t index) {
+        return "slot_key_" + std::to_string(index);
+    };
+    for (size_t i = 0; i < tenant_count; ++i) {
+        tenant_ids.push_back("slot_tenant_" + std::to_string(i));
+    }
+
+    MasterService service(MakeStrictTenantConfig(tenant_ids));
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    for (size_t i = 0; i < tenant_count; ++i) {
+        PutCompletedObject(service, context.client_id, key_of(i),
+                           TenantId(tenant_ids[i]), put_config);
+    }
+
+    MasterServiceTestPeer::MetadataSerializer serializer(&service);
+    auto payload = serializer.Serialize();
+    ASSERT_TRUE(payload.has_value());
+
+    auto handle = msgpack::unpack(
+        reinterpret_cast<const char*>(payload->data()), payload->size());
+    const msgpack::object& root = handle.get();
+    const msgpack::object* shards = nullptr;
+    for (uint32_t i = 0; i < root.via.map.size; ++i) {
+        const auto& key = root.via.map.ptr[i].key;
+        if (key.type == msgpack::type::STR &&
+            std::string(key.via.str.ptr, key.via.str.size) == "shards") {
+            shards = &root.via.map.ptr[i].val;
+        }
+    }
+    ASSERT_NE(shards, nullptr);
+    ASSERT_EQ(ha::kSnapshotShardSlots, shards->via.map.size);
+    for (uint32_t i = 0; i < shards->via.map.size; ++i) {
+        EXPECT_LT(shards->via.map.ptr[i].key.as<uint32_t>(),
+                  ha::kSnapshotShardSlots)
+            << "an entry key at or above the slot count is one an older "
+               "master rejects";
+    }
+
+    // The decode replaces the state this service holds, and its segments stay
+    // mounted, so the memory replicas the payload names resolve.
+    MasterServiceTestPeer::MetadataSerializer reader(&service);
+    ASSERT_TRUE(reader.Deserialize(*payload).has_value());
+    for (const size_t index : {size_t{0}, tenant_count / 2, tenant_count - 1}) {
+        EXPECT_TRUE(service.ExistKey(key_of(index), TenantId(tenant_ids[index]))
+                        .value_or(false))
+            << "tenant " << tenant_ids[index] << " lost its object";
+    }
+}
+
+// Decoding a snapshot replaces the metadata the routes hold: a payload that
+// carries no objects leaves no object behind, so a key the payload does not
+// carry cannot survive from the state the service was in.
+TEST_F(MasterServiceTest, SnapshotDecodeReplacesPublishedMetadata) {
+    const TenantId tenant("tenant_snapshot_scope");
+    const std::string key = "snapshot_key";
+
+    MasterService service(MakeStrictTenantConfig({tenant.value()}));
+    const auto context = PrepareSimpleSegment(service);
+    PutCompletedObject(service, context.client_id, key, tenant,
+                       ReplicateConfig{.replica_num = 1}, 1024);
+    ASSERT_NE(MasterServiceTestPeer::FindObject(
+                  service, MasterServiceTestPeer::ObjectIdentity{tenant, key}),
+              nullptr);
+    ASSERT_EQ(RegisteredTenantCount(service), 1u);
+
+    // The payload of a service that holds no object, which for a snapshot of
+    // this one would mean the tenant's objects are gone.
+    std::vector<uint8_t> empty_payload;
+    {
+        MasterService empty(MakeStrictTenantConfig({tenant.value()}));
+        MasterServiceTestPeer::MetadataSerializer serializer(&empty);
+        auto encoded = serializer.Serialize();
+        ASSERT_TRUE(encoded.has_value());
+        empty_payload = std::move(*encoded);
+    }
+
+    MasterServiceTestPeer::MetadataSerializer reader(&service);
+    ASSERT_TRUE(reader.Deserialize(empty_payload).has_value());
+
+    EXPECT_EQ(MasterServiceTestPeer::FindObject(
+                  service, MasterServiceTestPeer::ObjectIdentity{tenant, key}),
+              nullptr)
+        << "a key the payload does not carry must not survive the decode";
+    EXPECT_EQ(RegisteredTenantCount(service), 0u);
+}
+
+namespace {
+
+// One object of a metadata payload: the tenant and key it routes, the group it
+// belongs to, and the lease deadline the payload records for it.
+struct SnapshotPayloadObject {
+    std::string tenant_id;
+    std::string key;
+    std::string group_id;
+    uint64_t lease_deadline_ms;
+    uint64_t replica_id;
+    uint64_t object_size{1024};
+};
+
+// A metadata payload shaped the way MetadataSerializer::Serialize writes one:
+// one compressed shard per list of objects, each object routed by the tenant id
+// in its own item, with an empty discarded-replicas list and a replica id base.
+// Building it by hand pins the deadline every item carries, which is what the
+// decode takes each group's shared lease from.
+std::vector<uint8_t> BuildSnapshotMetadataPayload(
+    const std::vector<std::vector<SnapshotPayloadObject>>& shards,
+    const UUID& client_id) {
+    constexpr uint64_t kPutStartTimeMs = 1700000000000ULL;
+    constexpr uint64_t kReplicaNextId = 1000000ULL;
+
+    msgpack::sbuffer root_buffer;
+    MsgpackPacker root_packer(&root_buffer);
+    root_packer.pack_map(3);
+
+    root_packer.pack(std::string("shards"));
+    root_packer.pack_map(shards.size());
+    for (size_t shard_index = 0; shard_index < shards.size(); ++shard_index) {
+        msgpack::sbuffer shard_buffer;
+        MsgpackPacker shard_packer(&shard_buffer);
+        shard_packer.pack_map(1);
+        shard_packer.pack(std::string("metadata"));
+        shard_packer.pack_array(shards[shard_index].size());
+        for (const auto& object : shards[shard_index]) {
+            shard_packer.pack_array(3);
+            shard_packer.pack(object.tenant_id);
+            shard_packer.pack(object.key);
+            // The layout SerializeMetadata writes: the seven leading fields,
+            // the replica count, the data type, one replica per count, then
+            // hard_pinned and group_id.
+            shard_packer.pack_array(11);
+            shard_packer.pack(UuidToString(client_id));
+            shard_packer.pack(kPutStartTimeMs);
+            shard_packer.pack(object.object_size);
+            shard_packer.pack(object.lease_deadline_ms);
+            shard_packer.pack(false);
+            shard_packer.pack(uint64_t{0});
+            shard_packer.pack(uint32_t{1});
+            shard_packer.pack(static_cast<uint8_t>(ObjectDataType::TENSOR));
+            // One DISK replica, as Serializer<Replica> packs one.
+            shard_packer.pack_array(4);
+            shard_packer.pack(object.replica_id);
+            shard_packer.pack(static_cast<int16_t>(ReplicaStatus::COMPLETE));
+            shard_packer.pack(static_cast<int8_t>(ReplicaType::DISK));
+            shard_packer.pack_array(2);
+            shard_packer.pack(std::string("/tmp/mooncake_decode_replica.data"));
+            shard_packer.pack(object.object_size);
+            shard_packer.pack(false);
+            shard_packer.pack(object.group_id);
+        }
+        const auto compressed =
+            zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
+                          shard_buffer.size(), 3);
+        root_packer.pack(std::to_string(shard_index));
+        root_packer.pack_bin(compressed.size());
+        root_packer.pack_bin_body(
+            reinterpret_cast<const char*>(compressed.data()),
+            compressed.size());
+    }
+
+    root_packer.pack(std::string("discarded_replicas"));
+    root_packer.pack_array(0);
+    root_packer.pack(std::string("replica_next_id"));
+    root_packer.pack(kReplicaNextId);
+
+    const auto* data = reinterpret_cast<const uint8_t*>(root_buffer.data());
+    return std::vector<uint8_t>(data, data + root_buffer.size());
+}
+
+}  // namespace
+
+// Decoding a snapshot wires what the payload carries: each object's group
+// membership, one shared group lease per tenant raised to the latest deadline
+// among that group's members, a same-named group in another tenant kept apart,
+// and no replica-action state inherited from before the decode. A payload whose
+// deadlines the test pins shows which of them the group ends on.
+TEST_F(MasterServiceTest, SnapshotDecodeWiresGroupsAndDropsActionState) {
+    const TenantId tenant_a("tenant_decode_groups_a");
+    const TenantId tenant_b("tenant_decode_groups_b");
+    const std::string group_id = "decode-shared-group";
+    const std::string staged_key = "decode_staged_key";
+    const std::string restored_key_a1 = "restored_group_a1";
+    const std::string restored_key_a2 = "restored_group_a2";
+    const std::string restored_key_b = "restored_group_b1";
+    const uint64_t base_deadline_ms = 4200000000000ULL;
+    // The member decoded first carries the latest deadline of its group, so a
+    // group lease that ends on the last member the decode saw, or that a later
+    // member of the same group lowers, fails the assertions below.
+    const uint64_t group_a_latest_deadline_ms = base_deadline_ms + 60000;
+    const uint64_t group_a_earlier_deadline_ms = base_deadline_ms;
+    const uint64_t group_b_deadline_ms = base_deadline_ms + 30000;
+
+    MasterServiceConfig config =
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()});
+    // Promotion on hit with the pool held over its watermark: offload is what
+    // gives promotion its LOCAL_DISK replicas, and the watermark gate is what
+    // records the candidate this test stages, which the decode has to clear
+    // along with the lease beside it.
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.eviction_high_watermark_ratio = 0.0;
+    MasterService service(config);
+    // Pool eviction is held over its watermark, so the periodic worker would
+    // evict what this test stages and its retry loop would unindex the staged
+    // candidate; the replica cleanup worker moves replicas. The serializer runs
+    // against the state those would move.
+    MasterServiceTestPeer::EvictionRunning(service) = false;
+    if (MasterServiceTestPeer::EvictionThread(service).joinable()) {
+        MasterServiceTestPeer::EvictionThread(service).join();
+    }
+    MasterServiceTestPeer::ReplicaCleanupWorker(service).Stop();
+    MasterServiceTestPeer peer(service);
+    const auto context = PrepareSimpleSegment(service);
+
+    // One publication of this service, so the decode below can be shown to
+    // replace what the routes held.
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    PutCompletedObject(service, context.client_id, staged_key, tenant_a,
+                       put_config);
+
+    const auto route_of = [&](const TenantId& tenant, const std::string& key) {
+        return MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+    };
+    // The lease a member holds: an entry's metadata borrows the lease of the
+    // group it belongs to, so two members of one group report one lease and two
+    // groups report their own.
+    const auto lease_of = [&](const TenantId& tenant, const std::string& key) {
+        auto lease = peer.WithStoredObjectForRead(
+            tenant, key,
+            [](const std::shared_ptr<ObjectEntry>&,
+               const ObjectMetadata& metadata,
+               const ObjectEntry::State&) { return metadata.lease_; });
+        return lease.has_value() ? *lease : nullptr;
+    };
+    const auto deadline_ms_of = [](const std::shared_ptr<Lease>& lease) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                lease->ExpiresAt().time_since_epoch())
+                .count());
+    };
+
+    // Replica-action state staged on the staged publication: a promotion
+    // candidate the retry loop would keep retrying, and a dynamic-replication
+    // lease a client could still act on. A decode has to drop both.
+    const MasterServiceTestPeer::ObjectIdentity staged{tenant_a, staged_key};
+    const auto staged_entry =
+        MasterServiceTestPeer::FindObject(service, staged);
+    ASSERT_NE(staged_entry, nullptr);
+    ASSERT_EQ(peer.TryPushPromotionQueue(staged, /*record_candidate=*/true),
+              MasterServiceTestPeer::PromotionQueueResult::kWatermarkRejected);
+    const UUID proposal_id = generate_uuid();
+    ReplicaActionLease lease;
+    lease.proposal_id = proposal_id;
+    lease.lease_id = proposal_id;
+    lease.tenant_id = tenant_a.value();
+    lease.key = staged_key;
+    lease.expire_at_ms_epoch =
+        MasterServiceTestPeer::DynamicReplicationNowMs() + 3600000;
+    peer.PutDynamicReplicationLeaseForTesting(tenant_a, staged_entry,
+                                              proposal_id, lease);
+    ASSERT_EQ(peer.CountCandidatesForTesting(tenant_a), 1u);
+    ASSERT_TRUE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                    service, tenant_a, proposal_id)
+                    .has_value());
+
+    // A payload whose deadlines are pinned: the member that comes first carries
+    // the latest deadline of its group. Its objects carry keys the service does
+    // not hold, so the decode replaces the staged publication with them, and
+    // they are DISK-backed, so decoding them is metadata alone rather than a
+    // second claim on a segment allocation.
+    const auto payload = BuildSnapshotMetadataPayload(
+        {{{tenant_a.value(), restored_key_a1, group_id,
+           group_a_latest_deadline_ms, 7001},
+          {tenant_a.value(), restored_key_a2, group_id,
+           group_a_earlier_deadline_ms, 7002}},
+         {{tenant_b.value(), restored_key_b, group_id, group_b_deadline_ms,
+           7003}}},
+        context.client_id);
+    {
+        MasterServiceTestPeer::MetadataSerializer serializer(&service);
+        ASSERT_TRUE(serializer.Deserialize(payload).has_value());
+    }
+
+    // The staged publication is gone, and so are the records that named it.
+    EXPECT_EQ(route_of(tenant_a, staged_key), nullptr);
+    EXPECT_EQ(peer.CountCandidatesForTesting(tenant_a), 0u);
+    EXPECT_FALSE(MasterServiceTestPeer::FindDynamicReplicationLease(
+                     service, tenant_a, proposal_id)
+                     .has_value());
+
+    // Membership is wired per tenant from the payload, and every member of one
+    // group borrows that group's single lease, which ends at the latest
+    // deadline among its members. A group with the same id in another tenant is
+    // another group, with a lease of its own and the deadline its own payload
+    // carries.
+    auto decoded_members_a =
+        GetGroupMemberKeysForTest(service, group_id, tenant_a.value());
+    std::sort(decoded_members_a.begin(), decoded_members_a.end());
+    EXPECT_EQ(decoded_members_a,
+              (std::vector<std::string>{restored_key_a1, restored_key_a2}));
+    EXPECT_EQ(GetGroupMemberKeysForTest(service, group_id, tenant_b.value()),
+              (std::vector<std::string>{restored_key_b}));
+    const auto decoded_lease_a1 = lease_of(tenant_a, restored_key_a1);
+    const auto decoded_lease_a2 = lease_of(tenant_a, restored_key_a2);
+    ASSERT_NE(decoded_lease_a1, nullptr);
+    ASSERT_NE(decoded_lease_a2, nullptr);
+    EXPECT_EQ(decoded_lease_a1.get(), decoded_lease_a2.get())
+        << "the members of one group share one lease";
+    EXPECT_EQ(deadline_ms_of(decoded_lease_a1), group_a_latest_deadline_ms)
+        << "the group lease ends at the latest deadline among its members";
+    const auto decoded_lease_b = lease_of(tenant_b, restored_key_b);
+    ASSERT_NE(decoded_lease_b, nullptr);
+    EXPECT_NE(decoded_lease_b.get(), decoded_lease_a1.get())
+        << "the same group id in another tenant is another group";
+    EXPECT_EQ(deadline_ms_of(decoded_lease_b), group_b_deadline_ms)
+        << "another tenant's group keeps the deadline its own payload carries";
 }
 
 TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
@@ -1617,39 +2161,29 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     EXPECT_EQ(2u, service_->GetKeyCount());
 }
 
-// A mass client expiry marks handles stale all over the metadata table, so
-// the sweep cleans a shard in bounded write-lock batches instead of holding
-// it exclusively for the whole walk. Dropping and retaking the lock mid-shard
-// must not cost coverage: every key of the departed segment is erased, and
-// every key of a live segment survives. The keys are forced onto one shard
-// because the batch bound is per shard.
-TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
+// A mass client expiry marks handles stale all over the metadata table, and the
+// sweep takes one object's lock at a time, so the unlinking of one visit must
+// not hide the objects behind it: every object whose only memory segment was
+// unmounted is erased, and every object on a live segment stays readable.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsUnmountedSegments) {
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
 
     constexpr size_t kSegmentSize = 1024 * 1024 * 128;
-    const std::string stale_segment_name = "batch_sweep_stale_segment";
-    const std::string live_segment_name = "batch_sweep_live_segment";
+    const std::string stale_segment_name = "sweep_stale_segment";
+    const std::string live_segment_name = "sweep_live_segment";
     const auto stale_segment = PrepareSimpleSegment(
         *service, stale_segment_name, 0x300000000, kSegmentSize);
     const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
                                                    0x400000000, kSegmentSize);
 
-    // Enough keys per segment that draining the shard takes several batches.
+    // Enough keys per segment that the walk covers many objects.
     constexpr size_t kKeysPerSegment = 100;
-    const size_t target_shard =
-        MetadataShardIndex(*service, "batch_sweep_seed");
 
     std::vector<std::string> stale_keys;
     std::vector<std::string> live_keys;
-    for (size_t i = 0;
-         stale_keys.size() + live_keys.size() < 2 * kKeysPerSegment; ++i) {
-        ASSERT_LT(i, 1000000u)
-            << "could not gather enough keys on shard " << target_shard;
-        const std::string key = "batch_sweep_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service, key) != target_shard) {
-            continue;
-        }
+    for (size_t i = 0; i < 2 * kKeysPerSegment; ++i) {
+        const std::string key = "sweep_key_" + std::to_string(i);
 
         const bool on_stale_segment = stale_keys.size() < kKeysPerSegment;
         const UUID& client_id =
@@ -1903,191 +2437,6 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
               << "Unmount time: " << unmount_duration.count() << "ms\n";
 }
 
-TEST_F(MasterServiceTest, ShrinkBucketsIfSparseThresholds) {
-    // Small containers stay untouched regardless of sparsity: their bucket
-    // memory is negligible and rehash churn is not worth it.
-    std::unordered_map<std::string, int> small;
-    small.emplace("small_key", 0);
-    const size_t small_buckets = small.bucket_count();
-    ASSERT_LE(small_buckets, kShrinkMinBucketCount);
-    ShrinkBucketsIfSparse(small);
-    EXPECT_EQ(small.bucket_count(), small_buckets);
-
-    // Grow a map well past the bucket floor, then erase most entries: the
-    // bucket array keeps its high-water size until explicitly shrunk.
-    std::unordered_map<std::string, int> map;
-    for (size_t i = 0; i < 4 * kShrinkMinBucketCount; ++i) {
-        map.emplace("key" + std::to_string(i), 0);
-    }
-    const size_t high_water = map.bucket_count();
-    ASSERT_GT(high_water, kShrinkMinBucketCount);
-
-    // At exactly a quarter full there is nothing to shrink yet.
-    while (map.size() > high_water / 4) {
-        map.erase(map.begin());
-    }
-    ShrinkBucketsIfSparse(map);
-    EXPECT_EQ(map.bucket_count(), high_water);
-
-    // One more erase crosses the threshold and triggers the shrink.
-    map.erase(map.begin());
-    ShrinkBucketsIfSparse(map);
-    EXPECT_LT(map.bucket_count(), high_water);
-    EXPECT_GE(map.bucket_count(), map.size());
-}
-
-TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
-    // Zero lease TTL so every committed object is immediately evictable.
-    auto service_config =
-        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    const UUID client_id = generate_uuid();
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t object_size = 1024;
-    constexpr size_t object_count = 2 * kShrinkMinBucketCount;
-    // Size the segment with ample headroom so the background eviction
-    // thread never fires; only the explicit call below evicts.
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(
-        *service_, "test_segment", buffer, object_size * object_count * 16);
-
-    // Pick keys that all hash to one shard so its metadata map grows past
-    // the shrink floor; random keys would spread these objects thinly
-    // across all 1024 shards.
-    const size_t target_shard = MetadataShardIndex(*service_, "shrink_key_0");
-    std::vector<std::string> keys;
-    for (size_t i = 0; keys.size() < object_count; ++i) {
-        std::string key = "shrink_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service_, key) != target_shard) continue;
-        keys.push_back(std::move(key));
-    }
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-    for (const auto& key : keys) {
-        // Hard-pin the first object: it is excluded from eviction, so the
-        // tenant (and its metadata map) deterministically survives the
-        // full eviction below and the shrunk bucket count stays
-        // observable.
-        config.with_hard_pin = (&key == &keys.front());
-        ASSERT_TRUE(service_
-                        ->PutStart(client_id, key, TenantId::Default(),
-                                   object_size, config)
-                        .has_value());
-        ASSERT_TRUE(service_
-                        ->PutEnd(client_id, key, TenantId::Default(),
-                                 ReplicaType::MEMORY)
-                        .has_value());
-    }
-
-    const size_t buckets_before = MetadataBucketCount(*service_, target_shard);
-    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
-
-    MasterServiceTestPeer(*service_).RunBatchEvictForTesting(1.0, 1.0);
-
-    const size_t buckets_after = MetadataBucketCount(*service_, target_shard);
-    ASSERT_GT(buckets_after, 0u);
-    // Without the post-eviction shrink the bucket array would still sit at
-    // its high-water mark and this assertion would fail.
-    EXPECT_LT(buckets_after, buckets_before / 2);
-}
-
-TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
-    // Regression for the lease-expire / client-offboarding delete path.
-    // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
-    // keys from a shared tenant; erase() never returns bucket memory, so a
-    // tenant that loses most (but not all) of its keys would keep its
-    // high-water bucket array forever and RSS would never drop. The shrink
-    // pass at the end of ClearStaleHandles mirrors the one in BatchEvict.
-    auto service = std::make_unique<MasterService>();
-    PauseReplicaCleanup(*service);
-
-    constexpr size_t kSegmentSize = 1024 * 1024 * 128;
-    const std::string stale_segment_name = "clear_shrink_stale_segment";
-    const std::string live_segment_name = "clear_shrink_live_segment";
-    const auto stale_segment = PrepareSimpleSegment(
-        *service, stale_segment_name, 0x300000000, kSegmentSize);
-    const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
-                                                   0x400000000, kSegmentSize);
-
-    // Gather keys on one shard so its metadata map grows past the shrink
-    // floor; spreading them across all 1024 shards would leave each map tiny.
-    const size_t target_shard =
-        MetadataShardIndex(*service, "clear_shrink_key_0");
-    // A few live keys keep the shared tenant alive after the sweep (partial
-    // drain, not full erase); the rest are swept and must trigger a shrink.
-    constexpr size_t kLiveKeys = 128;
-    constexpr size_t kTotalKeys = 2 * kShrinkMinBucketCount;
-
-    std::vector<std::string> stale_keys;
-    std::vector<std::string> live_keys;
-    for (size_t i = 0; stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
-        ASSERT_LT(i, 5000000u)
-            << "could not gather enough keys on shard " << target_shard;
-        const std::string key = "clear_shrink_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service, key) != target_shard) {
-            continue;
-        }
-
-        const bool on_live = live_keys.size() < kLiveKeys;
-        const UUID& client_id =
-            on_live ? live_segment.client_id : stale_segment.client_id;
-        const std::string& segment_name =
-            on_live ? live_segment_name : stale_segment_name;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        config.preferred_segments = {segment_name};
-
-        ASSERT_TRUE(
-            service->PutStart(client_id, key, TenantId::Default(), 1024, config)
-                .has_value())
-            << "key=" << key;
-        ASSERT_TRUE(service
-                        ->PutEnd(client_id, key, TenantId::Default(),
-                                 ReplicaType::MEMORY)
-                        .has_value())
-            << "key=" << key;
-        (on_live ? live_keys : stale_keys).push_back(key);
-    }
-    ASSERT_GT(stale_keys.size(), live_keys.size());
-
-    const size_t buckets_before = MetadataBucketCount(*service, target_shard);
-    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
-
-    // Unmount the stale segment, then sweep inline. The tenant survives
-    // because the live segment still holds keys, so the metadata map is only
-    // partially drained — exactly the case that leaks bucket memory without
-    // the shrink.
-    ASSERT_TRUE(
-        service
-            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
-            .has_value());
-    ClearInvalidHandlesForTest(*service);
-
-    // GetKeyCount counts physical metadata, so it distinguishes "swept" from
-    // "merely hidden by the unmount".
-    EXPECT_EQ(live_keys.size(), service->GetKeyCount());
-
-    const size_t buckets_after = MetadataBucketCount(*service, target_shard);
-    ASSERT_GT(buckets_after, 0u);
-    // Without the post-sweep shrink the bucket array would stay at its
-    // high-water mark and this assertion would fail.
-    EXPECT_LT(buckets_after, buckets_before / 2);
-    // The shrunk map must still be large enough to hold every live key.
-    EXPECT_GE(buckets_after, live_keys.size());
-
-    for (const auto& key : live_keys) {
-        auto get_result = service->GetReplicaList(key, TenantId::Default());
-        ASSERT_TRUE(get_result.has_value()) << "key=" << key << " was swept";
-        ASSERT_EQ(1u, get_result->replicas.size()) << "key=" << key;
-    }
-    for (const auto& key : stale_keys) {
-        auto get_result = service->GetReplicaList(key, TenantId::Default());
-        ASSERT_FALSE(get_result.has_value()) << "key=" << key;
-        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error())
-            << "key=" << key;
-    }
-}
-
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     const uint64_t kv_lease_ttl = 200;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
@@ -2238,8 +2587,8 @@ TEST_F(MasterServiceTest, SoftPinDeadlineIndexExpiresOnlyDueEntries) {
     PutCompletedObject(*service, client_id, "deadline_key", config);
 
     ReplicateConfig grouped_config = config;
-    grouped_config.group_ids = std::vector<std::string>{
-        FindGroupIdOnDifferentShard("grouped_deadline_key")};
+    grouped_config.group_ids =
+        std::vector<std::string>{UnrelatedGroupId("grouped_deadline_key")};
     PutCompletedObject(*service, client_id, "grouped_deadline_key",
                        grouped_config);
 
@@ -2355,8 +2704,7 @@ TEST_F(MasterServiceTest, SoftPinDeadlineHeapCompactsRepeatedUpdates) {
     constexpr size_t kUpdates = 5000;
     for (size_t i = 0; i < kUpdates; ++i) {
         UpsertSoftPinDeadlineIndexForTest(
-            service, "compaction_key", 0,
-            base + std::chrono::milliseconds(i + 1));
+            service, "compaction_key", base + std::chrono::milliseconds(i + 1));
     }
 
     EXPECT_EQ(SoftPinRegistrationCount(service), 1u);

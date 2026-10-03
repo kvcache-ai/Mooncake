@@ -10,7 +10,7 @@
 // CompareReplicaDescriptor (which compares LocalDiskDescriptor fields), and
 // LocalDiskSegmentState (offloading_objects map) is also captured. Anything
 // these tests put into those fields will round-trip; anything not captured
-// (e.g., per-shard PromotionTask map, per-segment promotion_objects map)
+// (e.g., the entry's PromotionTask, the per-segment promotion_objects map)
 // is, by design, transient — the master is allowed to drop it on restart
 // and let clients re-trigger via heartbeat.
 
@@ -179,7 +179,7 @@ TEST_F(MasterServicePromotionSnapshotTest, InFlightPromotionTaskSnapshotSafe) {
         InjectLocalDiskReplica(client_id, "k_cold", 1024, "seg_a_endpoint"));
 
     // Trigger promotion gate to enqueue a task. This pins the source
-    // replica's refcnt and adds a per-shard PromotionTask plus a per-
+    // replica's refcnt and adds a PromotionTask to the entry plus a per-
     // segment promotion_objects entry.
     auto get = service_->GetReplicaList("k_cold", TenantId::Default());
     ASSERT_TRUE(get.has_value());

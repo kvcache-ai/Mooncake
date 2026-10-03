@@ -153,7 +153,7 @@ class StandbySegmentRegistry {
  *
  * This interface provides basic operations for storing and managing object
  * metadata. In a full implementation, this would mirror MasterService's
- * metadata_shards_ structure.
+ * per-tenant object metadata.
  */
 class MetadataStore {
    public:
