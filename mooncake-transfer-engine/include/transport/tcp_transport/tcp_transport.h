@@ -112,7 +112,7 @@ class TcpTransport : public Transport {
     TcpContext *context_;
     std::atomic_bool running_;
     std::thread thread_;
-    bool enable_connection_pool_ = false;
+    bool enable_connection_pool_ = true;
 
     // Client-side bounded work queues and fixed connection lanes.
     struct ConnectionKey {

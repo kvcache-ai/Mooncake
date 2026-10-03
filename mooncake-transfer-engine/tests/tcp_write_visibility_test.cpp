@@ -411,7 +411,10 @@ class ScopedEnvVar {
             had_old_value_ = true;
             old_value_ = old;
         }
-        setenv(name_.c_str(), value, 1);
+        if (value)
+            setenv(name_.c_str(), value, 1);
+        else
+            unsetenv(name_.c_str());
     }
 
     ~ScopedEnvVar() {
@@ -914,10 +917,8 @@ struct EngineHandle {
 
     void init(const std::string& metadata_server,
               const std::string& server_name, size_t pool_size) {
-        // Exercise the pooled-connection path (default off): connection
-        // reuse vs. discard-on-unclean-exchange is part of the contract
-        // under test.
-        setenv("MC_TCP_ENABLE_CONNECTION_POOL", "1", 1);
+        // Connection reuse vs. discard-on-unclean-exchange is part of the
+        // contract under test.
         engine = std::make_unique<TransferEngine>(false);
         auto hp = parseHostNameWithPort(server_name);
         int rc = engine->init(metadata_server, server_name, hp.first.c_str(),
@@ -2285,10 +2286,11 @@ TEST(TcpWriteVisibilityTest, LaneTerminalTypesAreMoveOnly) {
 }
 #endif
 
-TEST(TcpWriteVisibilityTest, OneLaneReusesCleanSocketInFifoOrder) {
+TEST(TcpWriteVisibilityTest, DefaultConnectionPoolReusesCleanSocket) {
     constexpr int kRequestCount = 8;
     constexpr size_t kLength = 64 * 1024;
     constexpr size_t kPoolSize = kRequestCount * kLength;
+    ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", nullptr);
     ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
     ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "16");
     const char* env = std::getenv("MC_METADATA_SERVER");
