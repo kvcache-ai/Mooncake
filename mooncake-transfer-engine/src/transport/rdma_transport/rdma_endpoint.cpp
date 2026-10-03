@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <chrono>
+#include <limits>
 #include <thread>
 #include <sstream>
 
@@ -49,6 +50,8 @@ constexpr size_t kInlineWriteWqeOverhead = 16 + 16 + 4;
 constexpr size_t kAssumedBlueFlameSize = 256;
 
 // Largest RDMA write payload whose inline WQE fits the BlueFlame buffer of qp.
+// No limit if qp has no BlueFlame (bf.size 0): the NIC fetches the WQE either
+// way, and inlining still saves the separate payload read.
 static size_t maxBlueFlameInlineWrite(ibv_qp *qp) {
     size_t bf_size = kAssumedBlueFlameSize;
 #ifdef USE_MLX5DV
@@ -57,8 +60,10 @@ static size_t maxBlueFlameInlineWrite(ibv_qp *qp) {
         mlx5dv_obj obj{};
         obj.qp.in = qp;
         obj.qp.out = &dv_qp;
-        if (mlx5dv_init_obj(&obj, MLX5DV_OBJ_QP) == 0 && dv_qp.bf.size != 0)
+        if (mlx5dv_init_obj(&obj, MLX5DV_OBJ_QP) == 0) {
+            if (dv_qp.bf.size == 0) return std::numeric_limits<size_t>::max();
             bf_size = dv_qp.bf.size / 16 * 16;
+        }
     }
 #else
     (void)qp;
