@@ -71,6 +71,20 @@ TEST_F(FileUtilTest, SaveStringToFile_EmptyContent) {
     EXPECT_EQ(ReadFileContent(path), "");
 }
 
+#ifdef __linux__
+TEST_F(FileUtilTest, SaveStringToFile_WriteFailure_ReturnsError) {
+    const std::string path = "/dev/full";
+    if (!fs::is_character_file(path)) {
+        GTEST_SKIP() << path << " is unavailable";
+    }
+
+    // A small write stays buffered, so the error can occur during close.
+    auto result = FileUtil::SaveStringToFile("hello", path);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find(path), std::string::npos);
+}
+#endif
+
 // ========== SaveBinaryToFile ==========
 
 TEST_F(FileUtilTest, SaveBinaryToFile_Basic) {
@@ -94,6 +108,20 @@ TEST_F(FileUtilTest, SaveBinaryToFile_CreatesSubdirectories) {
     std::vector<uint8_t> read_back(raw.begin(), raw.end());
     EXPECT_EQ(read_back, data);
 }
+
+#ifdef __linux__
+TEST_F(FileUtilTest, SaveBinaryToFile_WriteFailure_ReturnsError) {
+    const std::string path = "/dev/full";
+    if (!fs::is_character_file(path)) {
+        GTEST_SKIP() << path << " is unavailable";
+    }
+
+    // A small write stays buffered, so the error can occur during close.
+    auto result = FileUtil::SaveBinaryToFile({1, 2, 3}, path);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_NE(result.error().find(path), std::string::npos);
+}
+#endif
 
 // ========== EnsureDirExists ==========
 
