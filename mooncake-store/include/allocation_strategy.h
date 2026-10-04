@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -41,18 +42,7 @@ class AllocatorManager {
 
     // Move-construct allowed.
     AllocatorManager(AllocatorManager&&) = default;
-    AllocatorManager& operator=(AllocatorManager&& other) noexcept {
-        if (this != &other) {
-            ClearServingTracking();
-            names_ = std::move(other.names_);
-            allocators_ = std::move(other.allocators_);
-            owner_by_name_ = std::move(other.owner_by_name_);
-            track_serving_names_ = other.track_serving_names_;
-            serving_name_count_ = std::move(other.serving_name_count_);
-            serving_names_ = std::move(other.serving_names_);
-        }
-        return *this;
-    }
+    AllocatorManager& operator=(AllocatorManager&&) = default;
 
     /**
      * @brief Add an allocator of segment `name` into the manager.
@@ -172,14 +162,15 @@ class AllocatorManager {
      */
     const std::vector<std::string>& getNames() const { return names_; }
 
-    // O(1) for the live registry. Placement snapshots share registrations but
-    // freeze membership, so they retain a scan if explicitly asked to count.
+    // O(1) for the live registry. Placement snapshots do not maintain this
+    // count; querying one is a programming error.
     // No counter bindings are created on the per-allocation Snapshot path.
     // Liveness can change concurrently, as with getServingNames(); allocation
     // still rechecks each registration rather than relying on this hint.
     [[nodiscard]] size_t getServingNameCount() const {
         if (!track_serving_names_) {
-            return getServingNames().size();
+            throw std::logic_error(
+                "getServingNameCount is unavailable on allocation snapshots");
         }
         return serving_name_count_
                    ? serving_name_count_->load(std::memory_order_relaxed)
@@ -219,6 +210,7 @@ class AllocatorManager {
     struct SnapshotTag {};
     explicit AllocatorManager(SnapshotTag) : track_serving_names_(false) {}
 
+    // Detach tracking explicitly before replacing a live registry.
     void ClearServingTracking() {
         if (serving_name_count_) {
             for (const auto& [name, registrations] : allocators_) {
