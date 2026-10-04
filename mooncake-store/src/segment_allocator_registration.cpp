@@ -52,6 +52,9 @@ void SegmentAllocatorRegistration::AddServingCount() {
     if (record) {
         record->AddServingCounter(serving_name_counter_);
     } else {
+        // Snapshot restore binds client records after rebuilding registrations,
+        // and NoF mounts do not use ClientLivenessRecord. Match IsServing():
+        // an allocatable registration without a record is serving.
         serving_name_counter_->Update(true);
     }
 }
