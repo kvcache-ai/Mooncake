@@ -158,6 +158,7 @@ class Transport {
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
                 RdmaEndPoint *endpoint;  // Endpoint used for this transfer
+                bool source_on_host;     // Source buffer is host (CPU) memory
             } rdma;
             struct {
                 uint64_t dest_addr;

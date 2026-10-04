@@ -1621,6 +1621,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
 
         updateGlobalConfig(device_attr);
+        vendor_id_ = device_attr.vendor_id;
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;
         if (gid_index < 0) {
