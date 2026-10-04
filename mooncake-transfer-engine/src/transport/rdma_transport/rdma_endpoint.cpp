@@ -72,6 +72,55 @@ static size_t maxBlueFlameInlineWrite(ibv_qp *qp) {
                                              : 0;
 }
 
+// The verbs API cannot report the inline data limit. Devices whose kernel
+// driver has a fixed limit try it first: Intel irdma 216, 101 or 48 depending
+// on the generation (101 on the E810, 48 on the X722;
+// drivers/infiniband/hw/irdma/ig3rdma_hw.h, user.h, i40iw_hw.h), Alibaba
+// erdma 96 (drivers/infiniband/hw/erdma/erdma_verbs.h). Other devices start
+// at the size asked for, and any refused size steps down by kInlineDataStep
+// until one is accepted. libfabric's verbs provider also probes the limit
+// (vrb_find_max_inline()).
+struct KnownInlineLimit {
+    uint32_t vendor_id;
+    uint32_t max_inline;
+};
+constexpr KnownInlineLimit kKnownInlineLimits[] = {
+    {0x8086, 216}, {0x8086, 101}, {0x8086, 48}, {0x1ded, 96}};
+constexpr uint32_t kInlineDataStep = 16;
+
+// Inline size to request: on the first try, size capped at the vendor's first
+// known limit; after a refusal, the vendor's next smaller known limit, else
+// one step smaller.
+static uint32_t inlineDataToRequest(uint32_t vendor_id, uint32_t size,
+                                    bool refused) {
+    for (const auto &known : kKnownInlineLimits) {
+        if (known.vendor_id == vendor_id &&
+            (!refused || known.max_inline < size)) {
+            return std::min(known.max_inline, size);
+        }
+    }
+    if (refused) {
+        size = size > kInlineDataStep ? size - kInlineDataStep : 0;
+    }
+    return size;
+}
+
+// ibv_create_qp() asking for attr->cap.max_inline_data bytes of inline data,
+// or less if the device refuses that size.
+static ibv_qp *createQpWithInline(ibv_pd *pd, ibv_qp_init_attr *attr,
+                                  uint32_t vendor_id) {
+    uint32_t inline_size =
+        inlineDataToRequest(vendor_id, attr->cap.max_inline_data, false);
+    attr->cap.max_inline_data = inline_size;
+    ibv_qp *qp = ibv_create_qp(pd, attr);
+    while (!qp && inline_size > 0) {
+        inline_size = inlineDataToRequest(vendor_id, inline_size, true);
+        attr->cap.max_inline_data = inline_size;
+        qp = ibv_create_qp(pd, attr);
+    }
+    return qp;
+}
+
 static GidSelectionSnapshot fillLocalHandshakeDesc(
     RdmaContext &context, const std::string &peer_nic,
     const std::vector<uint32_t> &qp_num,
@@ -188,7 +237,8 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         attr.cap.max_send_wr = attr.cap.max_recv_wr = max_wr_depth;
         attr.cap.max_send_sge = attr.cap.max_recv_sge = max_sge_per_wr;
         attr.cap.max_inline_data = max_inline_bytes;
-        qp_list_[i] = ibv_create_qp(context_.pd(), &attr);
+        qp_list_[i] =
+            createQpWithInline(context_.pd(), &attr, context_.vendorId());
         if (!qp_list_[i]) {
             PLOG(ERROR) << "Failed to create QP";
             return ERR_ENDPOINT;
@@ -487,7 +537,7 @@ int RdmaEndPoint::constructNotification() {
     init.cap.max_send_wr = init.cap.max_recv_wr = kNotifySlots;
     init.cap.max_send_sge = init.cap.max_recv_sge = 1;
     init.cap.max_inline_data = globalConfig().max_inline;
-    s.qp = ibv_create_qp(context_.pd(), &init);
+    s.qp = createQpWithInline(context_.pd(), &init, context_.vendorId());
     if (!s.qp) return s.fail(ERR_ENDPOINT);
     s.inline_bytes = init.cap.max_inline_data;
     ibv_qp_attr attr{};
