@@ -22,6 +22,7 @@ jobs:
       python-versions: '["3.10", "3.11", "3.12", "3.13"]'
       build-profile: release
       cmake-args: >-
+        -DWITH_CONDUCTOR=ON
         -DUSE_HTTP=ON -DUSE_ETCD=ON -DWITH_EP=OFF -DSTORE_USE_ETCD=ON
       artifact-prefix: mooncake-wheel-efa
 
