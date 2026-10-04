@@ -3948,6 +3948,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     const std::string cluster_id = "test_batch_record_e2e_partial_evict";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
+                              .set_enable_offload(true)
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
@@ -3960,6 +3961,10 @@ TEST_F(MasterServiceBatchRecordE2ETest,
         MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_partial_evict_seg");
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     ReadBatchEventually(storage, 1, batch);
@@ -4079,6 +4084,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     const std::string cluster_id = "test_batch_record_e2e_offload_promotion";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
+                              .set_enable_offload(true)
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
@@ -4092,6 +4098,10 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 
     auto mounted =
         PrepareSimpleSegment(service, "batch_e2e_offload_promotion_seg");
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     ReadBatchEventually(storage, 1, batch);
@@ -4554,6 +4564,7 @@ TEST_F(MasterServiceHATest,
     const std::string cluster_id = "test_batch_record_offload_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
+                              .set_enable_offload(true)
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
@@ -4566,6 +4577,10 @@ TEST_F(MasterServiceHATest,
         MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_offload_segment");
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
@@ -4627,6 +4642,7 @@ TEST_F(MasterServiceHATest,
     const std::string cluster_id = "test_batch_record_offload_visible";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
+                              .set_enable_offload(true)
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
@@ -4639,6 +4655,10 @@ TEST_F(MasterServiceHATest,
         MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_offload_visible_seg");
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     ReadBatchEventually(storage, 1, batch);
@@ -5344,6 +5364,7 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_disk_evict_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
+                              .set_enable_offload(true)
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
@@ -5356,6 +5377,10 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
         MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_disk_evict_segment");
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     ReadBatchEventually(storage, 1, batch);
@@ -5798,6 +5823,7 @@ TEST_F(MasterServiceHATest,
         "test_batch_record_discard_processing_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
+                              .set_enable_offload(true)
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
@@ -5813,6 +5839,10 @@ TEST_F(MasterServiceHATest,
 
     const auto mounted =
         PrepareSimpleSegment(service, "batch_discard_processing_segment");
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     ReadBatchEventually(storage, 1, batch);

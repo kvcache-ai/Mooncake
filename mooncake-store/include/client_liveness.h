@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cassert>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -239,7 +238,6 @@ class ClientLivenessRecord {
     void BindRetainingClient(const UUID& client_id,
                              std::shared_ptr<RetainingClientIndex> index) {
         std::lock_guard lock(resource_mutex_);
-        assert(!retaining_client_index_);
         retaining_client_id_ = client_id;
         retaining_client_index_ = std::move(index);
         if (ShouldRetainResources()) {

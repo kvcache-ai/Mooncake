@@ -1365,23 +1365,10 @@ std::shared_ptr<ClientLivenessRecord> MasterService::FindClientRecord(
 }
 
 std::shared_ptr<ClientLivenessRecord> MasterService::FindLocalDiskClientRecord(
-    const UUID& client_id) {
-    {
-        std::shared_lock lock(client_mutex_);
-        const auto it = local_disk_client_records_.find(client_id);
-        if (it != local_disk_client_records_.end()) {
-            return it->second;
-        }
-    }
-    // Legacy AddReplica/NotifyOffloadSuccess can register disk replicas with
-    // offloading disabled, when MountLocalDiskSegment is unavailable.
-    std::unique_lock lock(client_mutex_);
-    const auto it = client_liveness_records_.find(client_id);
-    if (it == client_liveness_records_.end()) {
-        return nullptr;
-    }
-    TrackLocalDiskClientLocked(client_id, it->second);
-    return it->second;
+    const UUID& client_id) const {
+    std::shared_lock lock(client_mutex_);
+    const auto it = local_disk_client_records_.find(client_id);
+    return it == local_disk_client_records_.end() ? nullptr : it->second;
 }
 
 void RetainingClientIndex::Update(const UUID& client_id, bool retaining) {

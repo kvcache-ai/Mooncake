@@ -1026,8 +1026,9 @@ class MasterService {
                                      const TenantId& tenant_id,
                                      Replica& replica)
         -> tl::expected<bool, ErrorCode>;
+    // Read-only lookup; disk mounts and restore paths populate the index.
     std::shared_ptr<ClientLivenessRecord> FindLocalDiskClientRecord(
-        const UUID& client_id);
+        const UUID& client_id) const;
     using RetainingClientIds = RetainingClientIndex::ClientIds;
     // Caller holds client_mutex_ exclusively for index binding changes.
     void TrackLocalDiskClientLocked(
