@@ -175,7 +175,8 @@ def save_results(filepath, results):
 def build_partition_map(endpoints):
     partition_map = defaultdict(list)
     for ep in endpoints:
-        if not np.isfinite(ep.get("latency", float("inf"))):
+        latency = ep.get("latency")
+        if latency is None or not np.isfinite(latency):
             continue
         key = f"{ep['src_numa']}-{ep['dst_numa']}"
         partition_map[key].append(ep)
