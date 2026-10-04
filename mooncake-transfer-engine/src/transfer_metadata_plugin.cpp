@@ -314,6 +314,25 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         return size * nmemb;
     }
 
+    // Optional shared-token authentication for the Python HTTP metadata
+    // server (#4444): both sides read MC_METADATA_HTTP_TOKEN, and a server
+    // with the token set rejects requests without it.
+    static const std::string &authToken() {
+        static const std::string token = [] {
+            const char *env = std::getenv("MC_METADATA_HTTP_TOKEN");
+            return env ? std::string(env) : std::string();
+        }();
+        return token;
+    }
+
+    static curl_slist *appendAuthHeader(curl_slist *headers) {
+        if (!authToken().empty()) {
+            const std::string h = "Authorization: Bearer " + authToken();
+            headers = curl_slist_append(headers, h.c_str());
+        }
+        return headers;
+    }
+
     std::string encodeUrl(const std::string &key) const {
         CURL *h = tl_easy();
         char *esc =
@@ -342,7 +361,12 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
         curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
 
+        struct curl_slist *headers = appendAuthHeader(nullptr);
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
+
         CURLcode rc = curl_easy_perform(h);
+        curl_slist_free_all(headers);
+
         if (rc != CURLE_OK) {
             LOG(ERROR) << "GET " << url << " curl: " << curl_easy_strerror(rc)
                        << " err: " << errbuf;
@@ -389,7 +413,12 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
         curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
 
+        struct curl_slist *headers = appendAuthHeader(nullptr);
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
+
         CURLcode rc = curl_easy_perform(h);
+        curl_slist_free_all(headers);
+
         if (rc != CURLE_OK) {
             LOG(ERROR) << "GET " << url << " curl: " << curl_easy_strerror(rc)
                        << " err: " << errbuf;
@@ -442,6 +471,7 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
         struct curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
+        headers = appendAuthHeader(headers);
         curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
 
         CURLcode rc = curl_easy_perform(h);
@@ -481,7 +511,12 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
         curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
 
+        struct curl_slist *headers = appendAuthHeader(nullptr);
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
+
         CURLcode rc = curl_easy_perform(h);
+        curl_slist_free_all(headers);
+
         if (rc != CURLE_OK) {
             LOG(ERROR) << "DELETE " << url
                        << " curl: " << curl_easy_strerror(rc)
