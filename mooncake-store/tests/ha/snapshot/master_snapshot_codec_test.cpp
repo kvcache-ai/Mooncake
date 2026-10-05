@@ -597,6 +597,87 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripPreservesDrainJob) {
               original_job->created_at_ms_epoch);
 }
 
+TEST_F(MasterSnapshotCodecTest, RestoresCompletedDrainWithEmptySourceName) {
+    MasterServiceTestPeer::StopDrainDispatcher(*master_service_);
+    Segment source;
+    source.id = generate_uuid();
+    source.name = "";
+    source.te_endpoint = "empty_source_transport";
+    source.base = 0x300000000;
+    source.size = 16 * 1024 * 1024;
+    ASSERT_TRUE(master_service_->MountSegment(source, generate_uuid()));
+    auto job = master_service_->CreateDrainJob({{source.name}, {}, 1});
+    ASSERT_TRUE(job);
+    MasterServiceTestPeer::ProcessDrainJobs(*master_service_);
+    ASSERT_EQ(JobStatus::SUCCEEDED,
+              master_service_->QueryDrainJob(*job)->status);
+
+    MasterSnapshotCodec codec;
+    auto view = MakeStateView(*master_service_);
+    auto saved = codec.Encode(view);
+    ASSERT_TRUE(saved);
+    auto recovered = MakeMasterService();
+    MasterServiceTestPeer::StopDrainDispatcher(*recovered);
+    auto restored = codec.Decode(recovered.get(), *saved);
+    ASSERT_TRUE(restored) << restored.error().message;
+    auto result = recovered->QueryDrainJob(*job);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(JobStatus::SUCCEEDED, result->status);
+    EXPECT_EQ(std::vector<std::string>{""}, result->segments);
+}
+
+TEST_F(MasterSnapshotCodecTest, RestoresPendingDrainWithEmptyTargetName) {
+    MasterServiceTestPeer::StopDrainDispatcher(*master_service_);
+    const auto client = generate_uuid();
+    Segment source;
+    source.id = generate_uuid();
+    source.name = "named_source";
+    source.te_endpoint = source.name;
+    source.base = 0x300000000;
+    source.size = 16 * 1024 * 1024;
+    ASSERT_TRUE(master_service_->MountSegment(source, client));
+    ASSERT_TRUE(master_service_->PutStart(client, "empty_target_key",
+                                          TenantId::Default(), 1024,
+                                          ReplicateConfig{.replica_num = 1}));
+    ASSERT_TRUE(master_service_->PutEnd(
+        client, "empty_target_key", TenantId::Default(), ReplicaType::MEMORY));
+    {
+        MasterServiceTestPeer::MetadataAccessorRW metadata(
+            master_service_.get(), {TenantId::Default(), "empty_target_key"});
+        metadata.Get().lease_->SetDeadline(
+            std::chrono::system_clock::time_point{});
+    }
+    Segment target = source;
+    target.id = generate_uuid();
+    target.name = "";
+    target.te_endpoint = "empty_target_transport";
+    target.base = 0x400000000;
+    ASSERT_TRUE(master_service_->MountSegment(target, client));
+    auto job =
+        master_service_->CreateDrainJob({{source.name}, {target.name}, 1});
+    ASSERT_TRUE(job);
+    MasterServiceTestPeer::ProcessDrainJobs(*master_service_);
+    ASSERT_EQ(1u, master_service_->QueryDrainJob(*job)->active_units);
+
+    MasterSnapshotCodec codec;
+    auto view = MakeStateView(*master_service_);
+    auto saved = codec.Encode(view);
+    ASSERT_TRUE(saved);
+    auto recovered = MakeMasterService();
+    MasterServiceTestPeer::StopDrainDispatcher(*recovered);
+    auto restored = codec.Decode(recovered.get(), *saved);
+    ASSERT_TRUE(restored) << restored.error().message;
+    ASSERT_TRUE(MasterServiceTestPeer::RebuildSnapshotLiveness(*recovered));
+    ASSERT_EQ(1u, recovered->QueryDrainJob(*job)->active_units);
+    auto tasks = recovered->FetchTasks(client, 1);
+    ASSERT_TRUE(tasks);
+    ASSERT_EQ(1u, tasks->size());
+    ReplicaMovePayload payload;
+    struct_json::from_json(payload, tasks->front().payload);
+    EXPECT_EQ(source.name, payload.source);
+    EXPECT_TRUE(payload.target.empty());
+}
+
 TEST_F(MasterSnapshotCodecTest, PopulatedDrainingSegmentSurvivesSnapshot) {
     MasterServiceTestPeer::StopDrainDispatcher(*master_service_);
     Segment segment;

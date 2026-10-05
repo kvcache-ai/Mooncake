@@ -177,10 +177,8 @@ struct DrainReplicationRecord {
     uint64_t pending_bytes;
     std::string dynamic_lease;
     uint64_t dynamic_version;
-    bool cleanup_pending;
     MSGPACK_DEFINE(tenant, key, type, client, started, source, targets,
-                   pending_bytes, dynamic_lease, dynamic_version,
-                   cleanup_pending);
+                   pending_bytes, dynamic_lease, dynamic_version);
 };
 struct DrainTaskRecord {
     std::string id, tenant, key, source, target;
@@ -298,8 +296,7 @@ std::vector<uint8_t> MasterSnapshotCodec::EncodeDrainJobs(
                      DrainTimeMs(runtime.start_time), runtime.source_id,
                      runtime.replica_ids, runtime.pending_quota_charge_bytes,
                      UuidToString(runtime.dynamic_replication_lease_id),
-                     runtime.dynamic_replication_version_epoch,
-                     runtime.durable_cleanup_pending});
+                     runtime.dynamic_replication_version_epoch});
             }
         }
     }
@@ -369,9 +366,9 @@ void MasterSnapshotCodec::DecodeDrainJobs(
                 record.sources.begin(), record.sources.end());
             RequireDrain(!sources.empty() &&
                          sources.size() == record.sources.size() &&
-                         !sources.contains("") && record.concurrency > 0);
+                         record.concurrency > 0);
             for (const auto& target : record.targets)
-                RequireDrain(!target.empty() && !sources.contains(target));
+                RequireDrain(!sources.contains(target));
             const bool terminal = job->status >= JobStatus::SUCCEEDED;
             if (!terminal) {
                 for (const auto& source : sources)
@@ -405,15 +402,15 @@ void MasterSnapshotCodec::DecodeDrainJobs(
                 const auto task_id = DrainUuid(active.id);
                 const TenantId tenant(active.tenant);
                 RequireDrain(tenant.IsValid());
-                RequireDrain(
-                    task_ids.insert(task_id).second &&
-                    units.insert(active.unit).second &&
-                    sources.contains(active.source) &&
-                    active.target != active.source && !active.target.empty() &&
-                    active.unit == service.MakeDrainUnitKey(tenant, active.key,
-                                                            active.source) &&
-                    !record.completed.contains(active.unit) &&
-                    !record.terminal.contains(active.unit));
+                RequireDrain(task_ids.insert(task_id).second &&
+                             units.insert(active.unit).second &&
+                             sources.contains(active.source) &&
+                             active.target != active.source &&
+                             active.unit ==
+                                 service.MakeDrainUnitKey(tenant, active.key,
+                                                          active.source) &&
+                             !record.completed.contains(active.unit) &&
+                             !record.terminal.contains(active.unit));
                 active_objects.insert(
                     service.MakeDrainUnitKey(tenant, active.key, ""));
                 RequireDrain(record.targets.empty() ||
@@ -446,7 +443,7 @@ void MasterSnapshotCodec::DecodeDrainJobs(
         for (const auto& object :
              sections[1].as<std::vector<msgpack::object>>()) {
             RequireDrain(object.type == msgpack::type::ARRAY &&
-                         object.via.array.size == 11);
+                         object.via.array.size == 10);
             const auto saved = object.as<DrainReplicationRecord>();
             const TenantId tenant(saved.tenant);
             RequireDrain(tenant.IsValid());
@@ -491,8 +488,8 @@ void MasterSnapshotCodec::DecodeDrainJobs(
                  {DrainUuid(saved.client, true), DrainTime(saved.started),
                   static_cast<ReplicationTask::Type>(saved.type), saved.source,
                   saved.targets, saved.pending_bytes,
-                  DrainUuid(saved.dynamic_lease, true), saved.dynamic_version,
-                  saved.cleanup_pending}});
+                  DrainUuid(saved.dynamic_lease, true),
+                  saved.dynamic_version}});
         }
     }
     // All records are validated before publication. Restore runs before

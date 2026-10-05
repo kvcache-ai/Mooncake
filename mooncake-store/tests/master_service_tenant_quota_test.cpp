@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "ha/snapshot/master_snapshot_codec.h"
 #include "master_service/master_service_test_peer.h"
 
 #include <atomic>
@@ -980,6 +981,81 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(move.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     auto snapshot = Snapshot(service, TenantId("tenant-a"));
     EXPECT_EQ(snapshot.charged_bytes, 100);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       SnapshotRestoresReplicationQuotaAndSourcePins) {
+    const TenantId tenant("tenant-a");
+    for (bool move : {false, true}) {
+        for (bool finish : {false, true}) {
+            SCOPED_TRACE(move ? "move" : "copy");
+            SCOPED_TRACE(finish ? "complete" : "revoke");
+            auto config = MakeConfig({{tenant, 300}});
+            MasterService service(config);
+            const auto client = MountSegment(service, 1024, "segment-a");
+            PutComplete(service, client, "key", tenant, 100);
+            MountSegment(service, 1024, "segment-b");
+            if (move) {
+                ASSERT_TRUE(service.MoveStart(client, "key", tenant,
+                                              "segment-a", "segment-b"));
+            } else {
+                ASSERT_TRUE(service.CopyStart(client, "key", tenant,
+                                              "segment-a", {"segment-b"}));
+            }
+            ASSERT_TRUE(
+                service.SetSegmentStatus("segment-a", SegmentStatus::DRAINING));
+            EXPECT_EQ(200u, Snapshot(service, tenant).charged_bytes);
+
+            ha::MasterSnapshotCodec codec;
+            ha::MasterSnapshotStateView view(
+                service, MasterServiceTestPeer::SegmentManager(service),
+                MasterServiceTestPeer::LocalSsdManager(service),
+                MasterServiceTestPeer::NofSegmentManager(service),
+                MasterServiceTestPeer::TaskManager(service));
+            ha::MasterSnapshotPayloads saved;
+            {
+                std::unique_lock drain_lock(
+                    MasterServiceTestPeer::DrainSnapshotMutex(service));
+                std::unique_lock snapshot_lock(
+                    MasterServiceTestPeer::SnapshotMutex(service));
+                auto encoded = codec.Encode(view);
+                ASSERT_TRUE(encoded);
+                saved = std::move(*encoded);
+            }
+            config.initial_snapshot_payloads =
+                std::make_shared<ha::MasterSnapshotPayloads>(std::move(saved));
+            MasterService recovered(config);
+            EXPECT_EQ(200u, Snapshot(recovered, tenant).charged_bytes);
+            {
+                MasterServiceTestPeer::MetadataAccessorRW metadata(
+                    &recovered, {tenant, "key"});
+                ASSERT_TRUE(metadata.Exists());
+                ASSERT_NE(nullptr,
+                          metadata.Get().GetReplicaBySegmentName("segment-a"));
+                EXPECT_EQ(1, metadata.Get()
+                                 .GetReplicaBySegmentName("segment-a")
+                                 ->get_refcnt());
+            }
+            auto result =
+                move ? (finish ? recovered.MoveEnd(client, "key", tenant)
+                               : recovered.MoveRevoke(client, "key", tenant))
+                     : (finish ? recovered.CopyEnd(client, "key", tenant)
+                               : recovered.CopyRevoke(client, "key", tenant));
+            ASSERT_TRUE(result) << toString(result.error());
+            EXPECT_EQ(!move && finish ? 200u : 100u,
+                      Snapshot(recovered, tenant).charged_bytes);
+            MasterServiceTestPeer::MetadataAccessorRW metadata(&recovered,
+                                                               {tenant, "key"});
+            ASSERT_TRUE(metadata.Exists());
+            EXPECT_FALSE(metadata.HasReplicationTask());
+            if (const auto* source =
+                    metadata.Get().GetReplicaBySegmentName("segment-a")) {
+                EXPECT_EQ(0, source->get_refcnt());
+            } else {
+                EXPECT_TRUE(move && finish);
+            }
+        }
+    }
 }
 
 TEST_F(MasterServiceTenantQuotaTest, MoveEndSettlesToFinalReplicaCharge) {

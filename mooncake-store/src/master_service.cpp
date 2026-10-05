@@ -3555,7 +3555,17 @@ tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
         }
     }
 
-    if (status == SegmentStatus::OK) {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentStatus current = SegmentStatus::UNDEFINED;
+    auto err = segment_access.GetSegmentStatusByName(segment_name, current);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    if (current != SegmentStatus::OK && current != SegmentStatus::DRAINING) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    if (current == SegmentStatus::DRAINING && status == SegmentStatus::OK) {
         auto tasks = task_manager_.get_read_access();
         for (const auto& [id, task] : tasks) {
             if (task.type != TaskType::REPLICA_MOVE || task.is_finished())
@@ -3574,15 +3584,6 @@ tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
         }
     }
 
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    SegmentStatus current = SegmentStatus::UNDEFINED;
-    auto err = segment_access.GetSegmentStatusByName(segment_name, current);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
-    }
-    if (current != SegmentStatus::OK && current != SegmentStatus::DRAINING) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    }
     err = segment_access.SetSegmentStatusByName(segment_name, status);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
