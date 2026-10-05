@@ -24,6 +24,13 @@ if(USE_TENT)
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+# Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
+# the device's advertised limits; no RDMA device required.
+add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
+target_link_libraries(rdma_atomic_cap_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+add_test(NAME rdma_atomic_cap_test COMMAND rdma_atomic_cap_test)
+
 # Hardware-free tests for FlagCX transport range and descriptor validation.
 add_executable(flagcx_transport_internal_test
                ${WORKSPACE}/flagcx_transport_internal_test.cpp)
