@@ -3,8 +3,10 @@
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
+import os
 import signal
 import time
 
@@ -16,6 +18,16 @@ from mooncake.mooncake_config import MooncakeConfig
 # (e.g. milliseconds passed where seconds are expected) blocks a preStop hook
 # for minutes rather than hours.
 _MAX_UNMOUNT_LOCAL_DISK_GRACE_PERIOD_SECONDS = 3600
+
+
+def _bearer_token_ok(headers, expected_token):
+    # Auth stays off unless a token is configured.
+    if not expected_token:
+        return True
+    auth = headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(auth[len("Bearer ") :], expected_token)
 
 
 def _timed_handler(operation_name, handler):
@@ -41,9 +53,7 @@ def _shm_name_to_path(name):
 
 def _unblock_shutdown_signals():
     try:
-        signal.pthread_sigmask(
-            signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM}
-        )
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
     except AttributeError:
         pass
 
@@ -93,6 +103,7 @@ class MooncakeStoreService:
     def __init__(self, config_path: str = None, cli_config: dict = None):
         self.store = None
         self.config = None
+        self.auth_token = None
         self._setup_logging()
 
         # State for /api/reconfigure (Prefill/Decode mode switch)
@@ -126,9 +137,7 @@ class MooncakeStoreService:
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
 
-    async def start_store_service(
-        self, max_wait_time: float = 60, shutdown_event=None
-    ):
+    async def start_store_service(self, max_wait_time: float = 60, shutdown_event=None):
         """
         Start the store service with retry mechanism.
 
@@ -191,9 +200,7 @@ class MooncakeStoreService:
                     # chance to publish a shutdown requested while it ran.
                     await asyncio.sleep(0)
                     if shutdown_event.is_set():
-                        logging.info(
-                            "Store startup cancelled by shutdown request"
-                        )
+                        logging.info("Store startup cancelled by shutdown request")
                         await self.stop()
                         return False
 
@@ -228,9 +235,7 @@ class MooncakeStoreService:
                                 shutdown_event.wait(),
                                 timeout=actual_sleep_time,
                             )
-                            logging.info(
-                                "Store startup cancelled by shutdown request"
-                            )
+                            logging.info("Store startup cancelled by shutdown request")
                             return False
                         except asyncio.TimeoutError:
                             pass
@@ -238,7 +243,23 @@ class MooncakeStoreService:
                         await asyncio.sleep(actual_sleep_time)
 
     async def start_http_service(self, port: int = 8080):
-        app = web.Application(client_max_size=1024 * 1024 * 100)  # 100MB limit
+        if not self.auth_token:
+            logging.warning(
+                "Store REST API is running without authentication; any host "
+                "that can reach port %d can read, write and delete this "
+                "client's objects. Set --auth-token or "
+                "MOONCAKE_STORE_REST_AUTH_TOKEN to require a bearer token.",
+                port,
+            )
+
+        # web.middleware cannot tag a bound method, so register through a closure
+        async def _auth(request, handler):
+            return await self._auth_middleware(request, handler)
+
+        app = web.Application(
+            client_max_size=1024 * 1024 * 100,  # 100MB limit
+            middlewares=[web.middleware(_auth)],
+        )
         app.add_routes(
             [
                 web.post(
@@ -280,6 +301,16 @@ class MooncakeStoreService:
         await site.start()
         logging.info(f"REST API started on port {port}")
         return True
+
+    async def _auth_middleware(self, request, handler):
+        if not _bearer_token_ok(request.headers, self.auth_token):
+            return web.Response(
+                status=401,
+                text=json.dumps({"error": "missing or invalid bearer token"}),
+                content_type="application/json",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await handler(request)
 
     # REST API handlers
     async def handle_reconfigure(self, request):
@@ -889,6 +920,15 @@ def parse_arguments():
         default=60,
         required=False,
     )
+    parser.add_argument(
+        "--auth-token",
+        type=str,
+        help="Bearer token required on every REST API request "
+        "(default: MOONCAKE_STORE_REST_AUTH_TOKEN env var; "
+        "when neither is set the API runs without authentication)",
+        default=os.environ.get("MOONCAKE_STORE_REST_AUTH_TOKEN"),
+        required=False,
+    )
     return parser.parse_args()
 
 
@@ -905,6 +945,7 @@ async def main():
             logging.warning(f"Ignoring invalid CLI config: {item}")
 
     service = MooncakeStoreService(args.config, cli_config)
+    service.auth_token = args.auth_token
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 

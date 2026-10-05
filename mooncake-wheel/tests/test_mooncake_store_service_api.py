@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 import tempfile
@@ -22,11 +23,14 @@ except ModuleNotFoundError:
     web_module = types.ModuleType("aiohttp.web")
 
     class Response:
-        def __init__(self, status=200, text="", body=None, content_type=None):
+        def __init__(
+            self, status=200, text="", body=None, content_type=None, headers=None
+        ):
             self.status = status
             self.text = text
             self.body = body
             self.content_type = content_type
+            self.headers = headers or {}
 
     web_module.Response = Response
     aiohttp_module.web = web_module
@@ -44,11 +48,15 @@ except ModuleNotFoundError:
     store_module.MooncakeDistributedStore = MooncakeDistributedStore
     sys.modules["mooncake.store"] = store_module
 
+from aiohttp import web
+
 from mooncake.mooncake_store_service import (
     MooncakeStoreService,
+    _bearer_token_ok,
     _install_shutdown_signal_handlers,
     _shm_name_to_path,
     main as store_service_main,
+    parse_arguments as store_service_parse_arguments,
 )
 
 
@@ -1107,6 +1115,7 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             define=[],
             max_wait_time=60,
             port=8080,
+            auth_token=None,
         )
         service = mock.Mock()
         service.start_store_service = mock.AsyncMock(return_value=False)
@@ -1146,6 +1155,97 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
         service.start_http_service.assert_not_awaited()
         service.stop.assert_awaited_once()
         self.assertEqual(startup_calls, ["install", "unblock"])
+
+
+class BearerTokenOkTest(unittest.TestCase):
+    def test_open_when_no_token_configured(self):
+        self.assertTrue(_bearer_token_ok({}, None))
+        self.assertTrue(_bearer_token_ok({}, ""))
+
+    def test_rejects_missing_header(self):
+        self.assertFalse(_bearer_token_ok({}, "secret"))
+
+    def test_rejects_wrong_scheme(self):
+        self.assertFalse(_bearer_token_ok({"Authorization": "Token secret"}, "secret"))
+
+    def test_rejects_wrong_token(self):
+        self.assertFalse(_bearer_token_ok({"Authorization": "Bearer wrong"}, "secret"))
+
+    def test_rejects_empty_token(self):
+        self.assertFalse(_bearer_token_ok({"Authorization": "Bearer "}, "secret"))
+
+    def test_rejects_superstring_token(self):
+        self.assertFalse(
+            _bearer_token_ok({"Authorization": "Bearer secret2"}, "secret")
+        )
+
+    def test_accepts_exact_token(self):
+        self.assertTrue(_bearer_token_ok({"Authorization": "Bearer secret"}, "secret"))
+
+
+class AuthMiddlewareTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.service = MooncakeStoreService.__new__(MooncakeStoreService)
+        self.service.auth_token = "secret"
+        self.handler_calls = 0
+
+        async def handler(request):
+            self.handler_calls += 1
+            return web.Response(status=200, text="ok")
+
+        self.handler = handler
+
+    async def test_rejects_request_without_header(self):
+        request = SimpleNamespace(headers={})
+        resp = await self.service._auth_middleware(request, self.handler)
+        self.assertEqual(resp.status, 401)
+        self.assertEqual(resp.headers["WWW-Authenticate"], "Bearer")
+        self.assertEqual(self.handler_calls, 0)
+
+    async def test_rejects_request_with_wrong_token(self):
+        request = SimpleNamespace(headers={"Authorization": "Bearer wrong"})
+        resp = await self.service._auth_middleware(request, self.handler)
+        self.assertEqual(resp.status, 401)
+        self.assertEqual(self.handler_calls, 0)
+
+    async def test_passes_request_with_token(self):
+        request = SimpleNamespace(headers={"Authorization": "Bearer secret"})
+        resp = await self.service._auth_middleware(request, self.handler)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.handler_calls, 1)
+
+    async def test_passes_everything_when_no_token_configured(self):
+        self.service.auth_token = None
+        request = SimpleNamespace(headers={})
+        resp = await self.service._auth_middleware(request, self.handler)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.handler_calls, 1)
+
+
+class AuthTokenArgTest(unittest.TestCase):
+    def test_env_var_supplies_default(self):
+        with (
+            mock.patch.dict(os.environ, {"MOONCAKE_STORE_REST_AUTH_TOKEN": "t0k3n"}),
+            mock.patch.object(sys, "argv", ["prog"]),
+        ):
+            args = store_service_parse_arguments()
+        self.assertEqual(args.auth_token, "t0k3n")
+
+    def test_cli_overrides_env(self):
+        with (
+            mock.patch.dict(os.environ, {"MOONCAKE_STORE_REST_AUTH_TOKEN": "from-env"}),
+            mock.patch.object(sys, "argv", ["prog", "--auth-token", "from-cli"]),
+        ):
+            args = store_service_parse_arguments()
+        self.assertEqual(args.auth_token, "from-cli")
+
+    def test_default_none_when_unset(self):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(sys, "argv", ["prog"]),
+        ):
+            args = store_service_parse_arguments()
+        self.assertIsNone(args.auth_token)
 
 
 class ShmNameToPathTest(unittest.TestCase):
