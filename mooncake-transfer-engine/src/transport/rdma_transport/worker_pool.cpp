@@ -1606,12 +1606,14 @@ void WorkerPool::monitorWorker() {
 
             const uint64_t outstanding_age_ns =
                 current_ts - outstanding_since_ns;
-            const uint64_t last_poll_ts =
-                last_poll_ts_ns_.load(std::memory_order_relaxed);
+            // An idle worker parks without polling, so its last poll can be
+            // minutes old when new work (a transfer or an endpoint keepalive)
+            // is posted. Count the gap only from when work became outstanding.
+            const uint64_t poll_ref_ts =
+                std::max(last_poll_ts_ns_.load(std::memory_order_relaxed),
+                         outstanding_since_ns);
             const uint64_t poll_gap_ns =
-                last_poll_ts > 0 && current_ts > last_poll_ts
-                    ? current_ts - last_poll_ts
-                    : 0;
+                current_ts > poll_ref_ts ? current_ts - poll_ref_ts : 0;
 
             // Log a stalled poller quickly, and also log at the same 30-second
             // boundary used by TransferEnginePy when polling continues.
