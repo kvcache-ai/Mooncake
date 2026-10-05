@@ -236,6 +236,12 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
       submitted_slice_count_(0),
       processed_slice_count_(0) {
     collective_slice_queue_.resize(worker_count_);
+    keepalive_schedule_.resize(worker_count_);
+    keepalive_inbox_.resize(worker_count_);
+    keepalive_inbox_pending_ =
+        std::make_unique<std::atomic<bool>[]>(worker_count_);
+    for (int i = 0; i < worker_count_; ++i)
+        keepalive_inbox_pending_[i].store(false, std::memory_order_relaxed);
     for (int i = 0; i < worker_count_; ++i)
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
@@ -815,6 +821,10 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
         }
     }
 
+    // Endpoints whose keepalive failed. Raw pointers, never dereferenced
+    // after the qp_depth release below: deleteEndpointByPtr() only compares
+    // them against its live map.
+    std::vector<RdmaEndPoint *> failed_keepalives;
     for (int i = 0; i < nr_poll; ++i) {
         Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
         assert(slice);
@@ -823,6 +833,29 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
             qp_depth_set[slice->rdma.qp_depth]++;
         else
             qp_depth_set[slice->rdma.qp_depth] = 1;
+        // A keepalive is owned by its endpoint, which may be freed once its
+        // qp_depth is released below, so handle it here, while it is still
+        // counted, and never pass it on. It completes no transfer: it is never
+        // finalized or retried and never charges rail or context health.
+        // Success means the peer's QP answered; a flush means the endpoint is
+        // already going away. Any other error means the peer's QP no longer
+        // answers (retry-exceeded after ~0.6 s for a peer that is gone), so
+        // retire the endpoint as a failed transfer would, without pausing
+        // reconnection: if the peer is in fact alive, its next transfer
+        // reconnects at once.
+        RdmaEndPoint *endpoint = slice->rdma.endpoint;
+        if (endpoint && endpoint->isKeepaliveSlice(slice)) {
+            if (wc[i].status != IBV_WC_SUCCESS &&
+                wc[i].status != IBV_WC_WR_FLUSH_ERR) {
+                LOG(WARNING) << "RDMA keepalive to " << slice->peer_nic_path
+                             << " on " << context_.deviceName()
+                             << " failed: " << ibv_wc_status_str(wc[i].status)
+                             << " (vendor_err " << wc[i].vendor_err
+                             << "); retiring idle endpoint";
+                failed_keepalives.push_back(endpoint);
+            }
+            continue;
+        }
         wc_list.push_back(wc[i]);
     }
     if (nr_poll)
@@ -831,6 +864,9 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
 
     for (auto &entry : qp_depth_set)
         entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
+
+    for (auto *endpoint : failed_keepalives)
+        context_.deleteEndpointByPtr(endpoint, /*pause_connect=*/false);
 
     if (!wc_list.empty())
         processCompletions(thread_id, wc_list, defer_local_redispatch);
@@ -1196,6 +1232,40 @@ bool WorkerPool::hasOutstandingCq(int thread_id) {
                std::memory_order_relaxed) > 0;
 }
 
+void WorkerPool::registerEndpointForKeepalive(
+    const std::shared_ptr<RdmaEndPoint> &endpoint,
+    const std::string &peer_nic_path) {
+    if (!endpoint || worker_count_ <= 0) return;
+    const int owner = postingThreadForPeer(peer_nic_path);
+    if (owner < 0 || owner >= worker_count_) return;
+    {
+        std::lock_guard<std::mutex> lock(worker_slice_queue_lock_[owner]);
+        keepalive_inbox_[owner].push_back(endpoint);
+    }
+    keepalive_inbox_pending_[owner].store(true, std::memory_order_release);
+}
+
+void WorkerPool::serviceKeepalives(int thread_id, uint64_t now_ns) {
+    const uint64_t idle_ns =
+        globalConfig().endpoint_idle_timeout_s * 1000000000ull;
+    if (!idle_ns) return;
+    auto &schedule = keepalive_schedule_[thread_id];
+    if (keepalive_inbox_pending_[thread_id].load(std::memory_order_acquire) &&
+        keepalive_inbox_pending_[thread_id].exchange(
+            false, std::memory_order_acq_rel)) {
+        std::vector<std::weak_ptr<RdmaEndPoint>> inbox;
+        {
+            std::lock_guard<std::mutex> lock(
+                worker_slice_queue_lock_[thread_id]);
+            inbox.swap(keepalive_inbox_[thread_id]);
+        }
+        for (auto &endpoint : inbox)
+            schedule.add(std::move(endpoint), now_ns + idle_ns);
+    }
+    schedule.service(now_ns, idle_ns,
+                     [](RdmaEndPoint &endpoint) { endpoint.postKeepalive(); });
+}
+
 void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     // Busy-poll this long after the pool goes idle before parking
@@ -1204,6 +1274,9 @@ void WorkerPool::transferWorker(int thread_id) {
         globalConfig().rdma_worker_idle_spin_us * 1000;
     uint64_t last_wait_ts = getCurrentTimeInNano();
     while (workers_running_.load(std::memory_order_relaxed)) {
+        // Before the idle check: a posted keepalive is an outstanding CQE, so
+        // the worker stays awake to poll its completion.
+        serviceKeepalives(thread_id, getCurrentTimeInNano());
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =
@@ -1533,12 +1606,14 @@ void WorkerPool::monitorWorker() {
 
             const uint64_t outstanding_age_ns =
                 current_ts - outstanding_since_ns;
-            const uint64_t last_poll_ts =
-                last_poll_ts_ns_.load(std::memory_order_relaxed);
+            // An idle worker parks without polling, so its last poll can be
+            // minutes old when new work (a transfer or an endpoint keepalive)
+            // is posted. Count the gap only from when work became outstanding.
+            const uint64_t poll_ref_ts =
+                std::max(last_poll_ts_ns_.load(std::memory_order_relaxed),
+                         outstanding_since_ns);
             const uint64_t poll_gap_ns =
-                last_poll_ts > 0 && current_ts > last_poll_ts
-                    ? current_ts - last_poll_ts
-                    : 0;
+                current_ts > poll_ref_ts ? current_ts - poll_ref_ts : 0;
 
             // Log a stalled poller quickly, and also log at the same 30-second
             // boundary used by TransferEnginePy when polling continues.

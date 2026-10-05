@@ -103,7 +103,14 @@ RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
       wr_depth_list_(nullptr),
       active_(true),
       cq_(nullptr),
-      cq_outstanding_(nullptr) {}
+      cq_outstanding_(nullptr),
+      last_used_ns_(getCurrentTimeInNano()),
+      keepalive_slice_(std::make_unique<Transport::Slice>()) {
+    keepalive_slice_->opcode = Transport::TransferRequest::WRITE;
+    keepalive_slice_->length = 0;
+    keepalive_slice_->task = nullptr;
+    keepalive_slice_->rdma.endpoint = this;
+}
 
 RdmaEndPoint::~RdmaEndPoint() {
     // In normal flow, beginDestroy()+finishDestroy() should have been
@@ -1270,6 +1277,41 @@ const std::string RdmaEndPoint::toString() const {
         return "EndPoint: local " + context_.nicPath() + " (unconnected)";
 }
 
+void RdmaEndPoint::postKeepalive() {
+    RWSpinlock::WriteGuard guard(lock_);
+    constexpr size_t kQp = 0;
+    if (!active_.load(std::memory_order_acquire) ||
+        status_.load(std::memory_order_relaxed) != CONNECTED ||
+        qp_list_.empty() ||
+        wr_depth_list_[kQp].load(std::memory_order_relaxed) >= max_wr_depth_ ||
+        cq_outstanding_->load(std::memory_order_relaxed) >=
+            int(globalConfig().max_cqe))
+        return;
+
+    auto *slice = keepalive_slice_.get();
+    // The completion path asserts the CQE arrived on the peer's posting
+    // thread, which it derives from the slice's peer NIC path.
+    if (slice->peer_nic_path != peer_nic_path_)
+        slice->peer_nic_path = peer_nic_path_;
+    slice->rdma.qp_depth = &wr_depth_list_[kQp];
+
+    ibv_send_wr wr{};
+    ibv_send_wr *bad_wr = nullptr;
+    wr.wr_id = reinterpret_cast<uint64_t>(slice);
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.num_sge = 0;  // zero-length: rkey 0 and remote_addr 0 are not checked
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    wr_depth_list_[kQp].fetch_add(1, std::memory_order_acq_rel);
+    cq_outstanding_->fetch_add(1, std::memory_order_acq_rel);
+    if (int rc = ibv_post_send(qp_list_[kQp], &wr, &bad_wr)) {
+        wr_depth_list_[kQp].fetch_sub(1, std::memory_order_acq_rel);
+        cq_outstanding_->fetch_sub(1, std::memory_order_acq_rel);
+        LOG(WARNING) << "Failed to post keepalive to " << peer_nic_path_ << ": "
+                     << strerror(rc);
+    }
+}
+
 int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
@@ -1342,6 +1384,7 @@ int RdmaEndPoint::submitPostSend(
         ibv_send_wr *bad_wr = nullptr;
         wr_depth_list_[qp_index].fetch_add(wr_count, std::memory_order_acq_rel);
         cq_outstanding_->fetch_add(wr_count, std::memory_order_acq_rel);
+        last_used_ns_.store(getCurrentTimeInNano(), std::memory_order_relaxed);
         // Register before ringing the doorbell. A fast completion may otherwise
         // be polled before the diagnostic registry sees the slice.
         context_.trackPostedSlices(slice_list, start, wr_count);

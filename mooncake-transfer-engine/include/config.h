@@ -125,6 +125,14 @@ struct GlobalConfig {
     EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
+    // MC_ENDPOINT_IDLE_TIMEOUT (seconds, default 0 = off). When > 0, an RDMA
+    // endpoint with no WR posted for this long gets a zero-length RDMA WRITE
+    // keepalive from its owning posting thread, once per timeout while it
+    // stays idle. If the peer's QP no longer answers, the keepalive fails with
+    // a retry-exceeded CQE and the endpoint is retired, so QPs to peers that
+    // went away (e.g. a restarted process that returns under a new peer NIC
+    // path) do not accumulate until max_ep_per_ctx.
+    uint64_t endpoint_idle_timeout_s = 0;
     int ib_traffic_class = -1;
     // InfiniBand Service Level (SL), 0-15. -1 = use default (0).
     // Maps to a Virtual Lane on the switch for QoS isolation, e.g. to

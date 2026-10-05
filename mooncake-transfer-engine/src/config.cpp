@@ -682,6 +682,19 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* endpoint_idle_timeout_env =
+        std::getenv("MC_ENDPOINT_IDLE_TIMEOUT");
+    if (endpoint_idle_timeout_env) {
+        char* end = nullptr;
+        unsigned long long val =
+            std::strtoull(endpoint_idle_timeout_env, &end, 10);
+        if (end != endpoint_idle_timeout_env && *end == '\0')
+            config.endpoint_idle_timeout_s = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_ENDPOINT_IDLE_TIMEOUT";
+    }
+
     const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
@@ -841,6 +854,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
+    LOG(INFO) << "endpoint_idle_timeout_s = " << config.endpoint_idle_timeout_s;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;

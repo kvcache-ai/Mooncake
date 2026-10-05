@@ -46,6 +46,12 @@ target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 
+# Hardware-free coverage for endpoint keepalives (MC_ENDPOINT_IDLE_TIMEOUT).
+add_executable(endpoint_keepalive_test ${WORKSPACE}/endpoint_keepalive_test.cpp)
+target_link_libraries(endpoint_keepalive_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME endpoint_keepalive_test COMMAND endpoint_keepalive_test)
+
 # Fingerprint, blob and option checks run without a VMM backend.
 add_executable(shared_segment_test ${WORKSPACE}/shared_segment_test.cpp)
 target_include_directories(

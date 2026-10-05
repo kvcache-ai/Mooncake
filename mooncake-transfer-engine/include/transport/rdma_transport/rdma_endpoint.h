@@ -181,6 +181,33 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int submitPostSend(std::vector<Transport::Slice *> &slice_list,
                        std::vector<Transport::Slice *> &failed_slice_list);
 
+    // Endpoint keepalive (MC_ENDPOINT_IDLE_TIMEOUT; see endpoint_keepalive.h).
+    // last_used_ns_ is the getCurrentTimeInNano() of the last transfer WR
+    // posted here, initialised at construction; keepalives do not update it.
+    uint64_t lastUsedNs() const {
+        return last_used_ns_.load(std::memory_order_relaxed);
+    }
+    void testOnlySetLastUsedNs(uint64_t ts) {
+        last_used_ns_.store(ts, std::memory_order_relaxed);
+    }
+    // Posts one signaled zero-length RDMA WRITE (no SGE, rkey 0, address 0;
+    // the responder checks neither for a zero-length WRITE) on QP 0, with
+    // this endpoint's keepalive slice as wr_id. A live peer NIC ACKs it; a
+    // QP that is gone leaves it unACKed until the QP's retry budget
+    // (timeout 14 x retry_cnt 7, ~0.6 s) yields IBV_WC_RETRY_EXC_ERR. Must be
+    // called from the peer's posting thread, whose CQ receives the
+    // completion. Skipped (until the next timeout) when the endpoint is not
+    // CONNECTED or QP 0's SQ or the CQ is full.
+    void postKeepalive();
+    // Valid only while the keepalive is posted (the endpoint is alive).
+    bool isKeepaliveSlice(const Transport::Slice *slice) const {
+        return slice == keepalive_slice_.get();
+    }
+    // True the first time it is called; the endpoint is then scheduled once.
+    bool claimKeepaliveRegistration() {
+        return !keepalive_registered_.exchange(true, std::memory_order_acq_rel);
+    }
+
     // Get the number of QPs in this endpoint
     size_t getQPNumber() const;
 
@@ -281,6 +308,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     ibv_cq *cq_;
     std::atomic<int> *cq_outstanding_;
     std::atomic<uint64_t> inactive_time_;
+    std::atomic<uint64_t> last_used_ns_;
+    // wr_id of every keepalive this endpoint posts. Always posted on QP 0, so
+    // the fields the completion path reads (rdma.endpoint, qp_depth) are the
+    // same for every outstanding keepalive.
+    std::unique_ptr<Transport::Slice> keepalive_slice_;
+    std::atomic<bool> keepalive_registered_{false};
     bool finish_destroy_timeout_logged_ = false;
     int finish_destroy_retries_ = 0;
 };

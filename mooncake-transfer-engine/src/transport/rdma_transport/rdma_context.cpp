@@ -958,6 +958,13 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     endpoint =
         endpoint_store_->insertEndpoint(peer_nic_path, this, cq(cq_index));
     endpoint_store_->reclaimEndpoint();
+    // Active endpoints are created here by the posting thread, passive ones
+    // by the handshake daemon; both are scheduled on the peer's posting
+    // thread, which also owns the CQ their keepalive completes on.
+    if (endpoint && worker_pool_ &&
+        globalConfig().endpoint_idle_timeout_s > 0 &&
+        endpoint->claimKeepaliveRegistration())
+        worker_pool_->registerEndpointForKeepalive(endpoint, peer_nic_path);
     return endpoint;
 }
 
@@ -980,7 +987,8 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
 }
 
-int RdmaContext::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+int RdmaContext::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr,
+                                     bool pause_connect) {
     // Tearing an endpoint down (path failure / QP fatal) means this peer is
     // failing; pause active reconnection to its address so the CQ poller isn't
     // blocked re-handshaking a likely-gone peer.
@@ -993,7 +1001,8 @@ int RdmaContext::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
     std::string deleted_peer_nic_path;
     int ret = endpoint_store_->deleteEndpointByPtr(endpoint_ptr,
                                                    &deleted_peer_nic_path);
-    if (!deleted_peer_nic_path.empty()) pauseConnect(deleted_peer_nic_path);
+    if (pause_connect && !deleted_peer_nic_path.empty())
+        pauseConnect(deleted_peer_nic_path);
     return ret;
 }
 
