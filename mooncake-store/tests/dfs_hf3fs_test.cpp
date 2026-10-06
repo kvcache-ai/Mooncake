@@ -171,6 +171,49 @@ TEST_F(Hf3fsAdapterTest, WriteAtReadAtThroughUsrbio) {
     EXPECT_TRUE(adapter.Shutdown().has_value());
 }
 
+TEST_F(Hf3fsAdapterTest, BatchIoAcrossRingAndSharedBufferCapacity) {
+    Hf3fsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(test_dir_->path()));
+    const Hf3fsConfig config;
+    const size_t count = config.ior_entries + 3;
+    std::vector<std::string> values(count);
+    std::vector<std::array<iovec, 3>> iovs(count);
+    std::vector<FdIoRequest> requests(count);
+    std::vector<int> fds;
+    // Two files, with multiple positional requests sharing each registered fd.
+    for (int i = 0; i < 2; ++i) {
+        auto fd =
+            adapter.OpenFile(test_dir_->file("batch_" + std::to_string(i)));
+        ASSERT_TRUE(fd);
+        fds.push_back(*fd);
+    }
+    int64_t offset = 7;
+    for (size_t i = 0; i < count; ++i) {
+        values[i].assign(i == 0 ? config.iov_size + 4097 : 4097, 'A' + i % 26);
+        iovs[i] = {{{values[i].data(), 31},
+                    {nullptr, 0},
+                    {values[i].data() + 31, values[i].size() - 31}}};
+        requests[i] = {fds[i % fds.size()], iovs[i].data(), 3, offset};
+        offset += values[i].size() + 13;
+    }
+    const auto writes = adapter.BatchWriteAt(requests);
+    ASSERT_EQ(writes.size(), count);
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT_TRUE(writes[i]);
+        EXPECT_EQ(*writes[i], values[i].size());
+        std::fill(values[i].begin(), values[i].end(), '?');
+    }
+    const auto reads = adapter.BatchReadAt(requests);
+    ASSERT_EQ(reads.size(), count);
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT_TRUE(reads[i]);
+        EXPECT_EQ(*reads[i], values[i].size());
+        EXPECT_EQ(values[i], std::string(values[i].size(), 'A' + i % 26));
+    }
+    for (int fd : fds) EXPECT_TRUE(adapter.CloseFile(fd));
+    EXPECT_TRUE(adapter.Shutdown());
+}
+
 TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
