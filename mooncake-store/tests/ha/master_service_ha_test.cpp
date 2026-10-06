@@ -658,6 +658,21 @@ class MasterServiceHATest : public ::testing::Test {
         return replica;
     }
 
+    Replica::Descriptor MakeStandbyLocalDiskReplica(
+        const UUID& owner, const std::string& endpoint,
+        size_t size = 1024) const {
+        Replica::Descriptor replica;
+        replica.id = 1;
+        replica.status = ReplicaStatus::COMPLETE;
+
+        LocalDiskDescriptor disk_desc;
+        disk_desc.client_id = owner;
+        disk_desc.object_size = size;
+        disk_desc.transport_endpoint = endpoint;
+        replica.descriptor_variant = std::move(disk_desc);
+        return replica;
+    }
+
     StandbyObjectEntry MakeStandbyObject(const std::string& key,
                                          const std::string& endpoint,
                                          size_t size = 1024) const {
@@ -2574,6 +2589,78 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
     // discarded object contributes nothing.
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
               metric_before + 1024);
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreDiscardRepairFailureWithLocalDiskReplicaRollsBack) {
+    const std::string cluster_id = "test_restore_repair_reject_local_disk";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallRejectOnceWriter(service, backend);
+    writer->RejectNextCommit();
+
+    const std::string endpoint = "standby_repair_reject_ld_segment";
+    // The survivor carries a local-disk replica owned by a client that never
+    // mounted, so construction registers a NEW liveness record for it. The
+    // memory replica at kDefaultSegmentBase overlaps the lost object's twin
+    // and is conflict-dropped, which is what puts the repair set on the
+    // durable path at all.
+    const UUID disk_owner = generate_uuid();
+    StandbyObjectMetadata survivor_meta;
+    survivor_meta.client_id = generate_uuid();
+    survivor_meta.size = 1024;
+    survivor_meta.replicas.push_back(
+        MakeStandbyLocalDiskReplica(disk_owner, endpoint));
+    auto survivor_conflict = MakeStandbyMemoryReplica(endpoint);
+    survivor_conflict.id = 2;
+    survivor_conflict.get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor_meta.replicas.push_back(std::move(survivor_conflict));
+    StandbyObjectEntry survivor{"default", "standby_repair_reject_ld_survivor",
+                                std::move(survivor_meta)};
+    auto lost = MakeStandbyObject("standby_repair_reject_ld_lost", endpoint);
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    // With the liveness record moved out before the repair commit, this
+    // rollback used to dereference the null shared_ptr instead of returning
+    // the error.
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, result.error());
+    // Rollback leaves nothing behind: no metadata, and the freshly created
+    // liveness record for the disk owner goes back out with its counter.
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_ld_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_ld_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+
+    // Retry with the writer accepting: the restore lands, and the disk
+    // owner's record is installed for real this time.
+    auto retry = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_ld_survivor"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_ld_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
+        disk_owner));
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {

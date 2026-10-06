@@ -4437,7 +4437,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     standby_allocator_keepalive_ = std::move(restored_allocators);
     invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
     for (auto& [client_id, record] : new_known_owner_records) {
-        client_liveness_records_.emplace(client_id, std::move(record));
+        // Copy, not move: rollback_restored_state() still needs a valid
+        // record (state() for the removal metric) when a later durable
+        // repair step fails the restore.
+        client_liveness_records_.emplace(client_id, record);
         MasterMetricManager::instance().client_liveness_record_created();
     }
 
@@ -4457,6 +4460,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     auto restored_weight_metadata =
         weight_manager_.RestoreSnapshot(weight_metadata);
     if (!restored_weight_metadata) {
+        // Same fail-closed contract as the repair paths below: leave nothing
+        // behind, including the freshly installed liveness records.
+        rollback_restored_state();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
