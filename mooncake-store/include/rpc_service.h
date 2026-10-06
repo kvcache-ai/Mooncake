@@ -351,6 +351,14 @@ class WrappedMasterService {
                                                    const std::string& tenant_id,
                                                    ReplicaType replica_type);
 
+    // Conditional variant: evicts only when the current record still carries
+    // the replica id the caller failed on. Returns false when the replica was
+    // replaced in the meantime; the replacement is left untouched.
+    tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, ReplicaType replica_type,
+        ReplicaID expected_replica_id);
+
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);

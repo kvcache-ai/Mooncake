@@ -697,6 +697,22 @@ class MasterClient {
         ReplicaType replica_type);
 
     /**
+     * @brief Evict a disk replica only if the master still records the
+     * replica the caller failed on. A master that predates this RPC answers
+     * with an unknown-handler error, so the caller can tell the precondition
+     * was never enforced.
+     * @param key The object key whose disk replica was evicted
+     * @param tenant_id The tenant scope of the object
+     * @param replica_type DISK or LOCAL_DISK
+     * @param expected_replica_id The replica id the caller failed on
+     * @return true if evicted, false if the current record is a different
+     * replica (left untouched)
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, ReplicaID expected_replica_id);
+
+    /**
      * @brief Batch notify master that disk replicas were evicted locally.
      * @param keys The evicted object keys
      * @param replica_type DISK or LOCAL_DISK

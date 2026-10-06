@@ -372,6 +372,13 @@ class Client {
                                                    const std::string& tenant_id,
                                                    ReplicaType replica_type);
 
+    // Conditional variant: the master evicts only when its current record is
+    // still the replica the caller failed on. See MasterClient for the
+    // mixed-version behavior.
+    tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, ReplicaID expected_replica_id);
+
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const std::vector<std::string>& keys, ReplicaType replica_type);
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(

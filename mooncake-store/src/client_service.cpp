@@ -3792,6 +3792,13 @@ tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     return master_client_.EvictDiskReplica(key, tenant_id, replica_type);
 }
 
+tl::expected<bool, ErrorCode> Client::EvictDiskReplicaIfCurrent(
+    const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type, ReplicaID expected_replica_id) {
+    return master_client_.EvictDiskReplicaIfCurrent(
+        key, tenant_id, replica_type, expected_replica_id);
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
     const std::vector<std::string>& keys, ReplicaType replica_type) {
     return master_client_.BatchEvictDiskReplica(keys, replica_type);

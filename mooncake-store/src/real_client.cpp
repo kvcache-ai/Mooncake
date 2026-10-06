@@ -3488,6 +3488,10 @@ RealClient::DiskReadHealResult RealClient::heal_disk_replica_for_read(
     if (resolved_tenant_id && !resolved_tenant_id->empty()) {
         request.resolved_tenant_id = *resolved_tenant_id;
     }
+    // Ship the id of the replica this read failed on: the owner forwards it
+    // as the eviction precondition, so a replica replaced between our query
+    // and the verify survives and the re-query discovers it.
+    request.replica_ids = std::vector<uint64_t>{local_disk_replica.id};
     auto verify = client_requester_->verify_disk_replica(endpoint, request);
     if (!verify) {
         return DiskReadHealResult::kUnknown;
@@ -8500,6 +8504,8 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
         std::vector<std::string> raw_keys;
         std::vector<std::string> scoped_keys;
         std::vector<std::string> default_scoped_keys;
+        // Parallel to raw_keys; empty when the reader predates the field.
+        std::vector<uint64_t> replica_ids;
         std::shared_ptr<FileStorage> file_storage;
         std::shared_ptr<Client> client;
     };
@@ -8522,11 +8528,16 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
     }
     state->file_storage = file_storage_;
     state->client = client_;
+    if (request.replica_ids) {
+        state->replica_ids = *request.replica_ids;
+    }
     auto *s = state.get();
     auto try_result = co_await coro_io::post([s]() {
-        // 1 = present, 0 = proven gone and this owner evicted its own
-        // replica, 2 = the storage layer could not answer or the eviction
-        // did not go through.
+        // 1 = present, 0 = the replica the reader failed on is no longer in
+        // the master's metadata (evicted here, or superseded by a
+        // replacement), 2 = the storage layer could not answer, the reader
+        // shipped no replica id to enforce, or the eviction did not go
+        // through.
         std::vector<uint8_t> states;
         states.reserve(s->raw_keys.size());
         for (size_t i = 0; i < s->raw_keys.size(); ++i) {
@@ -8560,24 +8571,48 @@ RealClient::verify_disk_replica(const VerifyDiskReplicaRequest &request) {
             // The backing file is gone for good. The master scopes LOCAL_DISK
             // eviction to the owning client, so the eviction has to happen on
             // this side of the RPC, and it goes out under the probed tenant
-            // scope to hit the same master record the reader saw.
-            // OBJECT_NOT_FOUND is the goal state too: the metadata is already
-            // gone.
-            auto evicted = s->client->EvictDiskReplica(
-                s->raw_keys[i], s->tenant_id, ReplicaType::LOCAL_DISK);
-            if (!evicted && evicted.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            // scope to hit the same master record the reader saw. The reader's
+            // replica id rides along as the precondition: the master evicts
+            // only if its current record is still that replica, so a
+            // replacement registered between the reader's query and this
+            // verify is left untouched (the reader re-queries and finds it).
+            // A reader that predates the id field gives us nothing to enforce,
+            // and a master that predates the conditional RPC answers with an
+            // unknown-handler error: both report undetermined rather than
+            // evict unconditionally. OBJECT_NOT_FOUND is the goal state too:
+            // the metadata is already gone.
+            if (s->replica_ids.size() <= i) {
+                states.push_back(2);
+                continue;
+            }
+            auto evicted = s->client->EvictDiskReplicaIfCurrent(
+                s->raw_keys[i], s->tenant_id, ReplicaType::LOCAL_DISK,
+                s->replica_ids[i]);
+            if (!evicted) {
+                if (evicted.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    states.push_back(0);
+                    continue;
+                }
                 LOG(WARNING)
-                    << "Owner-side eviction of dangling LOCAL_DISK "
-                       "replica failed for key="
+                    << "Owner-side conditional eviction of dangling "
+                       "LOCAL_DISK replica failed for key="
                     << s->raw_keys[i] << ": " << toString(evicted.error());
                 states.push_back(2);
                 continue;
             }
-            LOG(WARNING) << "Owner evicted its dangling LOCAL_DISK replica "
-                            "for key="
-                         << s->raw_keys[i]
-                         << " after a reader's verify request found the "
-                            "backing file gone";
+            if (*evicted) {
+                LOG(WARNING) << "Owner evicted its dangling LOCAL_DISK replica "
+                                "for key="
+                             << s->raw_keys[i]
+                             << " after a reader's verify request found the "
+                                "backing file gone";
+            } else {
+                LOG(INFO) << "Owner skipped the eviction of its LOCAL_DISK "
+                             "replica for key="
+                          << s->raw_keys[i]
+                          << ": the master's current record is a different "
+                             "replica, left untouched";
+            }
             states.push_back(0);
         }
         return states;

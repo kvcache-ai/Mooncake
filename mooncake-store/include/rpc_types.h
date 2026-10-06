@@ -343,24 +343,36 @@ YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
 // shields a dangling tenant-scoped replica from eviction. Empty when the
 // reader or the master predates the field: the owner keeps the old
 // probe-both-scopes behavior.
+//
+// replica_ids is parallel to keys and carries the id of the replica the
+// reader failed on, taken from the replica descriptor the master handed out.
+// The owner forwards it as an eviction precondition: the master evicts only
+// when its current record is still that replica, so a replica replaced
+// between the reader's query and the verify is left untouched and the reader
+// re-queries to discover the replacement. When the reader predates the field
+// the owner cannot enforce the precondition and reports undetermined for the
+// key rather than falling back to an unconditional eviction.
 struct VerifyDiskReplicaRequest {
     std::string tenant_id;
     std::vector<std::string> keys;
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
+    struct_pack::compatible<std::vector<uint64_t>, 2> replica_ids;
 
     VerifyDiskReplicaRequest() = default;
     VerifyDiskReplicaRequest(std::string tenant_id_param,
                              std::vector<std::string> keys_param)
         : tenant_id(std::move(tenant_id_param)), keys(std::move(keys_param)) {}
 };
-YLT_REFL(VerifyDiskReplicaRequest, tenant_id, keys, resolved_tenant_id);
+YLT_REFL(VerifyDiskReplicaRequest, tenant_id, keys, resolved_tenant_id,
+         replica_ids);
 
 // Answer to a replica verify on the offload RPC server: per-key what the
 // owner found and did. 1 = backing file present (reader retries the same
-// replica), 0 = file proven gone and the owner has evicted its own replica
-// (reader re-queries), 2 = the owner could not determine (storage layer
-// trouble or the eviction did not go through) — a reader must never treat an
-// undetermined answer as gone.
+// replica), 0 = the replica the reader failed on is no longer in the master's
+// metadata (the owner evicted it, or a replacement superseded it; the reader
+// re-queries), 2 = the owner could not determine (storage layer trouble, the
+// reader shipped no replica id to enforce, or the eviction did not go
+// through) — a reader must never treat an undetermined answer as gone.
 struct VerifyDiskReplicaResponse {
     std::vector<uint8_t> states;
 

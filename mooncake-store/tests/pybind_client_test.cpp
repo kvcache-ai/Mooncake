@@ -23,6 +23,7 @@
 
 #include "config.h"
 #include "real_client.h"
+#include "tenant_id.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -3235,6 +3236,138 @@ TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
     // The dead replica must be evicted: the master stops advertising the key
     // instead of letting every later read come back empty.
     EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
+}
+
+// fcczzz's race on #3889: a reader fails on replica R1, and before its verify
+// reaches the owner a remove + re-put replaces R1 with a fresh record on the
+// same owner. The conditional eviction must compare the reader's replica id
+// against the master's current record atomically under the shard write lock
+// and refuse when they differ, leaving the replacement untouched.
+TEST_F(RealClientTest, ConditionalEvictLeavesReplacedReplicaUntouched) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_conditional_evict_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "conditional_evict_replace_race";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    Replica::Descriptor r1;
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) {
+                    r1 = replica;
+                    break;
+                }
+            }
+            if (r1.is_local_disk_replica()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        ASSERT_TRUE(r1.is_local_disk_replica())
+            << "no local disk replica advertised";
+    }
+    const UUID owner_id = r1.get_local_disk_descriptor().client_id;
+
+    // The id the reader carries no longer matches the current record: the
+    // eviction is refused and R1 stays.
+    auto stale = master_.service()->EvictDiskReplicaIfCurrent(
+        owner_id, key, std::string(TenantId::kDefaultValue),
+        ReplicaType::LOCAL_DISK, r1.id + 1000);
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_FALSE(*stale) << "an id that is not current must not evict";
+    bool r1_survives = false;
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        if (replica.is_local_disk_replica() && replica.id == r1.id) {
+            r1_survives = true;
+        }
+    }
+    EXPECT_TRUE(r1_survives);
+
+    // The same call with the current id is the positive control: it evicts.
+    auto current = master_.service()->EvictDiskReplicaIfCurrent(
+        owner_id, key, std::string(TenantId::kDefaultValue),
+        ReplicaType::LOCAL_DISK, r1.id);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_TRUE(*current);
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        EXPECT_FALSE(replica.is_local_disk_replica());
+    }
+
+    // Now the remove + re-put half of the race. The fresh object comes back
+    // memory-only here: the bucket backend dedupes the re-offload against its
+    // persisted entry (a separate quirk, not what this test pins down). The
+    // stale verify carrying R1's id must still be refused and must not
+    // disturb the replacement.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto remove_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (py_client_->remove(key) != 0) {
+        ASSERT_LT(std::chrono::steady_clock::now(), remove_deadline)
+            << "remove never succeeded";
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    Replica::Descriptor fresh;
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_memory_replica() && replica.id != r1.id) {
+                    fresh = replica;
+                    break;
+                }
+            }
+            if (fresh.is_memory_replica()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        ASSERT_TRUE(fresh.is_memory_replica())
+            << "re-put did not advertise a fresh memory replica";
+    }
+
+    auto after_reput = master_.service()->EvictDiskReplicaIfCurrent(
+        owner_id, key, std::string(TenantId::kDefaultValue),
+        ReplicaType::LOCAL_DISK, r1.id);
+    ASSERT_TRUE(after_reput.has_value());
+    EXPECT_FALSE(*after_reput)
+        << "the replaced record must not answer a stale eviction";
+    bool fresh_survives = false;
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        if (replica.id == fresh.id) {
+            fresh_survives = true;
+        }
+    }
+    EXPECT_TRUE(fresh_survives);
 }
 
 // fcczzz's counterexample on #3889: two disk-only keys in separate bucket
