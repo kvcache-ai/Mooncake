@@ -166,6 +166,55 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     free(seg_ptr);
 }
 
+// A mount the master rejects must not leave its buffer registered: callers
+// free the buffer on failure, and a leftover registration made every later
+// mount at that address fail as an overlapped memory region.
+TEST(NonHAReconnectTest, FailedMountLeavesBufferUnregistered) {
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+
+    std::string local_hostname = "127.0.0.1:18013";
+    auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", "tcp",
+                                     std::nullopt, master.master_address());
+    ASSERT_TRUE(client_opt.has_value());
+    auto client = client_opt.value();
+
+    size_t ram_buffer_size = 16 * 1024 * 1024;
+    void* seg_ptr = allocate_buffer_allocator_memory(ram_buffer_size);
+    ASSERT_NE(seg_ptr, nullptr);
+
+    // With the master down, the buffer registers locally and the master's
+    // MountSegment then fails.
+    master.Stop();
+    auto failed_res = client->MountSegment(seg_ptr, ram_buffer_size);
+    ASSERT_FALSE(failed_res.has_value());
+
+    ASSERT_TRUE(
+        master.Start(InProcMasterConfigBuilder()
+                         .set_rpc_port(master.rpc_port())
+                         .set_http_metrics_port(master.http_metrics_port())
+                         .build()));
+
+    // The same buffer mounts once the master is back (retrying only while
+    // the client reconnects).
+    tl::expected<void, ErrorCode> mount_res =
+        tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    for (int i = 0; i < 20 && !mount_res.has_value(); ++i) {
+        mount_res = client->MountSegment(seg_ptr, ram_buffer_size);
+        if (!mount_res.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
+    ASSERT_TRUE(mount_res.has_value()) << toString(mount_res.error());
+    auto vis = CheckSegmentVisible(master, local_hostname);
+    ASSERT_TRUE(vis.has_value() && vis.value())
+        << "Remounted segment not found in master";
+
+    auto unmount_res = client->UnmountSegment(seg_ptr, ram_buffer_size);
+    ASSERT_TRUE(unmount_res.has_value()) << toString(unmount_res.error());
+    free(seg_ptr);
+}
+
 }  // namespace testing
 }  // namespace mooncake
 

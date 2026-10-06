@@ -3922,6 +3922,17 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             ErrorCode err = mount_result.error();
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
+            // Undo the registration above: callers free the buffer on failure,
+            // and a registration left behind keeps its pages pinned and makes
+            // every later buffer at the same address fail to register as an
+            // overlapped memory region.
+            int unregister_rc =
+                transfer_engine_->unregisterLocalMemory((void*)buffer);
+            if (unregister_rc != 0 &&
+                unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
+                LOG(ERROR) << "unregister_local_memory_failed base=" << buffer
+                           << " size=" << size << ", error=" << unregister_rc;
+            }
             return tl::unexpected(err);
         }
 
