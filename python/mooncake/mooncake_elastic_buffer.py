@@ -470,9 +470,10 @@ class ElasticBuffer:
 
     def _active_ranks_mask(self) -> list:
         # `mooncake.pg.get_active_ranks` is a Mooncake PG helper and performs a
-        # native static cast to MooncakeBackend. ElasticBuffer transport
-        # bootstrap can also be driven by a regular NCCL/Gloo ProcessGroup; in
-        # that case every rank in the supplied group is active by definition.
+        # native static cast to MooncakeBackend. PyTorch exposes custom process
+        # groups through its base ProcessGroup type, so query the registered
+        # backend name instead of relying on the Python wrapper's type name.
+        # Regular NCCL/Gloo groups treat every supplied rank as active.
         if "mooncake" not in str(dist.get_backend(self.backend)).lower():
             return [1] * self.num_ranks
 
