@@ -40,6 +40,7 @@
 #include "client_buffer.h"
 #include "common/network.h"
 #include "config/client_host_identity_config.h"
+#include "config/client_object_checksum_config.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "config/client_auto_discovery_config.h"
@@ -48,7 +49,6 @@
 #include "gpu_vendor/intra_nvlink.h"
 #endif
 #include "crc_checksum.h"
-#include "environ.h"
 #include "config/client_numa_config.h"
 #include "storage/distributed/distributed_storage_backend.h"
 
@@ -148,6 +148,18 @@ std::optional<ContiguousSliceRange> GetContiguousSliceRange(
 ErrorCode ScatterFragmentError(const Status& status) {
     return status.IsInvalidArgument() ? ErrorCode::INVALID_PARAMS
                                       : ErrorCode::TRANSFER_FAIL;
+}
+
+void MarkScatterOperationFailure(
+    std::vector<tl::expected<int64_t, ErrorCode>>& results,
+    const std::vector<std::optional<ErrorCode>>& entry_errors,
+    const Status& status) {
+    const auto error = ScatterFragmentError(status);
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value() && !entry_errors[i].has_value()) {
+            results[i] = tl::unexpected(error);
+        }
+    }
 }
 
 // Collects the fragments of many ranged entries into a single scatter submit.
@@ -438,7 +450,8 @@ Client::Client(const std::string& local_hostname,
           ClientHostIdentityConfig::FromEnvironment(local_hostname).host_id),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
-      object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
+      object_checksum_enabled_(
+          ClientObjectChecksumConfig::IsEnabledAtFirstUse()),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
@@ -1035,8 +1048,14 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
+    // must publish the engine's actual endpoint rather than the Store hostname.
+    const auto& resolved_metadata =
+        transfer_engine && metadata_connstring.empty()
+            ? transfer_engine->getMetadataConnectionString()
+            : metadata_connstring;
     auto client = std::shared_ptr<Client>(new Client(
-        local_hostname, metadata_connstring, protocol, labels, tenant_id));
+        local_hostname, resolved_metadata, protocol, labels, tenant_id));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -1474,12 +1493,26 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 }
 
 std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
-    const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    TransferIntent intent) {
+    if (!transfer_engine_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+    auto mutable_transfers = transfers;
+    for (auto& transfer : mutable_transfers)
+        transfer.intent_type = static_cast<int>(intent);
+    return transfer_engine_->submitScatter(mutable_transfers);
+}
+
+std::optional<StoreScatterTransferOperation> Client::SubmitScatterNative(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    TransferIntent intent) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
-    return transfer_submitter_->submitScatter(transfers);
+    return transfer_submitter_->submitNativeScatter(transfers, intent);
 }
 
 struct BatchGetOperation {
@@ -1543,7 +1576,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     for (auto& seg_to_op : seg_to_op_map) {
         auto& op = seg_to_op.second;
         auto future = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::READ);
+            op.replicas, op.batched_slices, TransferRequest::READ,
+            TransferIntent::kForegroundGet);
         if (!future) {
             for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
                 auto index = op.key_indexes[idx];
@@ -1731,10 +1765,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
             future = transfer_submitter_->submit(
                 replica, slices_it->second, TransferRequest::READ,
-                contiguous_range->ptr, contiguous_range->size);
+                contiguous_range->ptr, contiguous_range->size,
+                TransferIntent::kForegroundGet);
         } else {
-            future = transfer_submitter_->submit(replica, slices_it->second,
-                                                 TransferRequest::READ);
+            future = transfer_submitter_->submit(
+                replica, slices_it->second, TransferRequest::READ, nullptr, 0,
+                TransferIntent::kForegroundGet);
         }
         if (!future) {
             // Release cache block if submit failed
@@ -2809,10 +2845,12 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     }
                     submit_result = transfer_submitter_->submit(
                         replica, op.slices, TransferRequest::WRITE,
-                        contiguous_range->ptr, contiguous_range->size);
+                        contiguous_range->ptr, contiguous_range->size,
+                        TransferIntent::kUnspecified);
                 } else {
                     submit_result = transfer_submitter_->submit(
-                        replica, op.slices, TransferRequest::WRITE);
+                        replica, op.slices, TransferRequest::WRITE, nullptr, 0,
+                        TransferIntent::kUnspecified);
                 }
 
                 if (!submit_result) {
@@ -3507,7 +3545,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
         merged_op.replicas = op.replicas;
         merged_op.transfer_summary.allocated_memory_replicas = 1;
         auto submit_result = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::WRITE);
+            op.replicas, op.batched_slices, TransferRequest::WRITE,
+            TransferIntent::kUnspecified);
         if (!submit_result) {
             failure_context = "Failed to submit batch transfer";
             all_transfers_submitted = false;
@@ -4150,9 +4189,9 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_slices) {
-    return BatchGetOffloadObject(transfer_engine_addr, keys, pointers,
-                                 batch_slices,
-                                 OffloadBufferAccess::kTransferEngine);
+    return BatchGetOffloadObject(
+        transfer_engine_addr, keys, pointers, batch_slices,
+        OffloadBufferAccess::kTransferEngine, TransferIntent::kForegroundGet);
 }
 
 tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
@@ -4160,9 +4199,10 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
-    OffloadBufferAccess buffer_access) {
+    OffloadBufferAccess buffer_access, TransferIntent intent) {
     auto future = transfer_submitter_->submit_batch_get_offload_object(
-        transfer_engine_addr, keys, pointers, batch_slices, buffer_access);
+        transfer_engine_addr, keys, pointers, batch_slices, buffer_access,
+        intent);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
@@ -4311,7 +4351,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices) != ErrorCode::OK) {
+        if (TransferWrite(target, slices, TransferIntent::kMigration) !=
+            ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -4614,7 +4655,8 @@ void Client::PutToLocalFile(const std::string& key,
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code) {
+                               TransferRequest::OpCode op_code,
+                               TransferIntent intent) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
@@ -4629,10 +4671,10 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         }
         future = transfer_submitter_->submit(replica_descriptor, slices,
                                              op_code, contiguous_range->ptr,
-                                             contiguous_range->size);
+                                             contiguous_range->size, intent);
     } else {
-        future =
-            transfer_submitter_->submit(replica_descriptor, slices, op_code);
+        future = transfer_submitter_->submit(replica_descriptor, slices,
+                                             op_code, nullptr, 0, intent);
     }
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
@@ -4651,8 +4693,8 @@ std::optional<TransferFuture> Client::SubmitRangeRead(
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
-    return transfer_submitter_->submitRangeRead(replica_descriptor, slices,
-                                                src_offset);
+    return transfer_submitter_->submitRangeRead(
+        replica_descriptor, slices, src_offset, TransferIntent::kForegroundGet);
 }
 
 std::optional<TransferFuture> Client::SubmitRangeWrite(
@@ -4662,14 +4704,15 @@ std::optional<TransferFuture> Client::SubmitRangeWrite(
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
-    return transfer_submitter_->submitRangeWrite(replica_descriptor, slices,
-                                                 dst_offset);
+    return transfer_submitter_->submitRangeWrite(
+        replica_descriptor, slices, dst_offset, TransferIntent::kUnspecified);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
     const std::vector<Replica::Descriptor>& replicas,
     const std::vector<std::vector<Slice>>& slices,
-    const std::vector<std::vector<uint64_t>>& src_offsets) {
+    const std::vector<std::vector<uint64_t>>& src_offsets,
+    TransferIntent intent) {
     std::vector<tl::expected<int64_t, ErrorCode>> results(
         replicas.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (replicas.size() != slices.size() ||
@@ -4762,16 +4805,43 @@ Client::BatchTransferReadOffloadRanges(
         results[i] = transferred;  // optimistic; corrected on await
     }
 
-    CompleteScatterRanges(*this, builder, results, entry_errors,
-                          "Failed to submit batch offload range read",
-                          "Offload range read failed");
+    if (builder.empty()) {
+        return results;
+    }
+
+    auto operation = SubmitScatterNative(builder.ranges());
+    if (!operation) {
+        LOG(ERROR) << "Failed to submit batch offload range read";
+        for (auto& result : results) {
+            if (result.has_value()) {
+                result = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+        return results;
+    }
+    const auto status = operation->wait();
+    if (!status.ok()) {
+        LOG(ERROR) << "Batch offload range read scatter operation failed: "
+                   << status.ToString();
+        MarkScatterOperationFailure(results, entry_errors, status);
+    }
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value() || !entry_errors[i].has_value()) {
+            continue;
+        }
+        LOG(ERROR) << "Offload range read failed, entry=" << i
+                   << ", error=" << static_cast<int>(entry_errors[i].value());
+        results[i] = tl::unexpected(entry_errors[i].value());
+    }
     return results;
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
     const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
     const std::vector<std::vector<Slice>>& slices,
-    const std::vector<std::vector<uint64_t>>& dst_offsets) {
+    const std::vector<std::vector<uint64_t>>& dst_offsets,
+    TransferIntent intent) {
     std::vector<tl::expected<int64_t, ErrorCode>> results(
         replicas_per_entry.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (replicas_per_entry.size() != slices.size() ||
@@ -4829,9 +4899,35 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
         results[i] = transferred;  // optimistic; corrected on await
     }
 
-    CompleteScatterRanges(*this, builder, results, entry_errors,
-                          "Failed to submit batch range write",
-                          "Range write failed");
+    if (builder.empty()) {
+        return results;
+    }
+
+    auto operation = SubmitScatterNative(builder.ranges(), intent);
+    if (!operation) {
+        LOG(ERROR) << "Failed to submit batch range write";
+        for (auto& result : results) {
+            if (result.has_value()) {
+                result = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+        return results;
+    }
+    const auto status = operation->wait();
+    if (!status.ok()) {
+        LOG(ERROR) << "Batch range write scatter operation failed: "
+                   << status.ToString();
+        MarkScatterOperationFailure(results, entry_errors, status);
+    }
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value() || !entry_errors[i].has_value()) {
+            continue;
+        }
+        LOG(ERROR) << "Range write failed, entry=" << i
+                   << ", error=" << static_cast<int>(entry_errors[i].value());
+        results[i] = tl::unexpected(entry_errors[i].value());
+    }
     return results;
 }
 
@@ -4850,8 +4946,10 @@ ErrorCode Client::TransferReadInternal(
 }
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices) {
-    return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+                                std::vector<Slice>& slices,
+                                TransferIntent intent) {
+    return TransferData(replica_descriptor, slices, TransferRequest::WRITE,
+                        intent);
 }
 
 ErrorCode Client::TransferWriteRange(
@@ -4868,7 +4966,8 @@ ErrorCode Client::TransferWriteRange(
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices) {
+                               std::vector<Slice>& slices,
+                               TransferIntent intent) {
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
@@ -4898,7 +4997,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_REPLICA;
     }
 
-    return TransferData(replica_descriptor, slices, TransferRequest::READ);
+    return TransferData(replica_descriptor, slices, TransferRequest::READ,
+                        intent);
 }
 
 ErrorCode Client::ReadDfsReplica(const std::string& key,
@@ -5405,9 +5505,19 @@ ErrorCode Client::InitLocalHotCache() {
             return ErrorCode::INVALID_PARAMS;
         }
 
+        // For shm-backed (HugeTLB) hot caches, ShmHelper::allocate rounds the
+        // mapping up to hugepage granularity while GetTotalSize() reports the
+        // logical size, so registering the logical size could end an MR inside
+        // the last huge page (madvise MADV_DONTFORK then fails with EINVAL).
+        // Register the full segment instead, same rule as
+        // RealClient::register_buffer_internal.
+        size_t hot_cache_reg_size = hot_cache_->GetTotalSize();
+        if (auto shm_seg = hot_cache_->GetShmSegment()) {
+            hot_cache_reg_size = shm_seg->size;
+        }
         int rc = transfer_engine_->registerLocalMemory(
-            hot_cache_->GetBaseAddress(), hot_cache_->GetTotalSize(),
-            kWildcardLocation, true, true);
+            hot_cache_->GetBaseAddress(), hot_cache_reg_size, kWildcardLocation,
+            true, true);
         if (rc != 0) {
             LOG(ERROR)
                 << "Failed to register local hot cache memory with transfer "

@@ -101,7 +101,7 @@ static Mlx5RegDmabufMr dataDirectRegMr() {
 
 bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_start = reinterpret_cast<uintptr_t>(region.addr);
-    const auto region_length = static_cast<uintptr_t>(region.mr->length);
+    const auto region_length = static_cast<uintptr_t>(region.length);
     return region_start <= addr && addr - region_start < region_length;
 }
 
@@ -584,8 +584,16 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // resulting dma_buf, and ibv_reg_dmabuf_mr() below then fails with
         // EINVAL for every buffer larger than one chunk (Mooncake#2511).
         //
-        // When the reported allocation does not cover the range the caller is
-        // about to register, export exactly [addr, addr + length) instead.
+        // The opposite case matters too: when the allocation is LARGER than
+        // the range being registered (a sub-range of one big cudaMalloc, e.g.
+        // each pre-touch block of a KV cache in preTouchMemory(), or several
+        // buffers carved out of one allocation), exporting the whole
+        // allocation makes every ibv_reg_dmabuf_mr() import map the full
+        // allocation through BAR1. N concurrent imports of an N-way split then
+        // exhaust BAR1 and fail with ENOMEM, notably on MIG instances.
+        //
+        // So whenever the reported allocation is not exactly the range the
+        // caller is about to register, export exactly [addr, addr + length).
         // cuMemGetHandleForAddressRange() accepts a range spanning several
         // mappings as long as they are contiguously mapped, which is precisely
         // the expandable-segment layout. The export base is page-aligned so
@@ -594,7 +602,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         CUdeviceptr exportBase = allocBase;
         size_t exportSize = allocSize;
         uint64_t exportOffset = (uintptr_t)addr - (uintptr_t)allocBase;
-        if (exportOffset + length > allocSize) {
+        if (length > 0 && (exportOffset != 0 || length != allocSize)) {
             const size_t page = (size_t)sysconf(_SC_PAGESIZE);
             uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)(page - 1);
             if (aligned < (uintptr_t)allocBase) aligned = (uintptr_t)allocBase;
@@ -604,12 +612,13 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
                 (exportOffset + length + page - 1) & ~(size_t)(page - 1);
             VLOG(1) << "dma_buf: reported allocation for " << (uintptr_t)addr
                     << " (base=" << (uintptr_t)allocBase
-                    << " size=" << allocSize << ") does not cover length "
-                    << length << "; exporting the requested range instead"
-                    << " (base=" << (uintptr_t)exportBase
-                    << " size=" << exportSize
+                    << " size=" << allocSize << ") differs from the " << length
+                    << "-byte range being registered; exporting"
+                    << " the requested range instead (base="
+                    << (uintptr_t)exportBase << " size=" << exportSize
                     << "). Expected for CUDA VMM allocations such as PyTorch"
-                       " expandable_segments.";
+                       " expandable_segments, and for sub-ranges of a larger"
+                       " allocation.";
         }
 
         // Without Data Direct, flags must be 0: the PCIE-BAR1 mapping flag is
@@ -754,6 +763,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
     mrMeta.addr = addr;
+    mrMeta.length = length;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
@@ -765,8 +775,17 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         if (Environ::Get().GetRdmaDataDirect()) {
             auto reg_mr = dataDirectRegMr();
             if (!reg_mr) return ERR_CONTEXT;
-            mrMeta.mr = reg_mr(pd_, exp.offset, length, (uintptr_t)addr, exp.fd,
-                               access, MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+            const size_t prefix = (uintptr_t)addr % getpagesize();
+            if (exp.offset < prefix ||
+                prefix > (size_t)globalConfig().max_mr_size - length) {
+                LOG(ERROR) << "Cannot align Data Direct memory region at "
+                           << addr << " length " << length << " dmabuf_offset "
+                           << exp.offset;
+                return ERR_INVALID_ARGUMENT;
+            }
+            mrMeta.mr = reg_mr(pd_, exp.offset - prefix, length + prefix,
+                               (uintptr_t)addr - prefix, exp.fd, access,
+                               MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
         } else
 #endif
         {
@@ -829,8 +848,9 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     // reading mr->length (or the cached region length) afterwards is a use-
     // after-free. We restore fork state on the same range to undo the
     // MADV_DONTFORK applied at register time (see issue #3639).
-    void *region_addr = iter->second.addr;
     size_t region_length = iter->second.mr->length;
+    void *region_addr = static_cast<char *>(iter->second.addr) -
+                        (region_length - iter->second.length);
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
@@ -1612,6 +1632,19 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
 
         updateGlobalConfig(device_attr);
+        max_qp_rd_atom_ = clampRdAtomicDepth(device_attr.max_qp_rd_atom);
+        max_qp_init_rd_atom_ =
+            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom);
+        if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
+            max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+            LOG(WARNING)
+                << "Device " << device_name
+                << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
+                << max_qp_rd_atom_
+                << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
+                << "; QPs on this NIC will use those "
+                << "values instead of the default " << kIdealRdAtomicDepth;
+        }
         vendor_id_ = device_attr.vendor_id;
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;

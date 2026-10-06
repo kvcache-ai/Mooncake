@@ -42,7 +42,6 @@ struct ZMQClientConfig {
     std::string cache_pool_key;
     std::string endpoint;
     std::string replay_endpoint;
-    std::string model_name;
     common::PublisherKind publisher_kind = common::PublisherKind::kVllm;
     std::chrono::milliseconds poll_timeout{100};
     std::chrono::milliseconds replay_timeout{5000};
@@ -154,7 +153,6 @@ class ZMQClient {
     std::chrono::steady_clock::time_point recovery_deadline_{};
     bool stale_ = false;
     std::string stale_reason_;
-    std::chrono::milliseconds reconnect_delay_;
     // Counters updated when a transport sequence skips one or more events.
     std::atomic<int64_t> dropped_events_{0};
     std::atomic<int64_t> gap_count_{0};
