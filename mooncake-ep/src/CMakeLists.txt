@@ -48,6 +48,7 @@ if(USE_CUDA)
       mooncake_ep_configs.cuh
       mooncake_ep_device.h
       mooncake_ep_dispatch.cuh
+      mooncake_ep_exception.cuh
       mooncake_ep_utils.cuh)
 
   set(MOONCAKE_EP_JIT_TRANSFER_HEADERS
