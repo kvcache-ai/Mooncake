@@ -734,9 +734,11 @@ bool P2PProxy::stepRecvCopyOut(RecvTransferTask& task) {
 // timeout or inconsistent credit epochs within the op.
 P2PProxy::IssueResult P2PProxy::tryIssueSendTask(SendOpContext& op_ctx,
                                                  SendPeerLane& lane) {
-    // Check for timeout while waiting for the peer's CreditSlot.
+    // last_update_time_ is refreshed whenever a chunk is issued or advances,
+    // so this bounds inactivity without limiting total operation duration.
     if (isTimeout(op_ctx)) {
-        LOG(ERROR) << "P2P wait-for-credit timeout, peer=" << op_ctx.peer_rank_;
+        LOG(ERROR) << "P2P send no-progress timeout, peer="
+                   << op_ctx.peer_rank_;
         return IssueResult::kFailed;
     }
 
@@ -832,6 +834,7 @@ P2PProxy::IssueResult P2PProxy::tryIssueSendTask(SendOpContext& op_ctx,
     ++lane.credit_consume_seq_;
     op_ctx.bytes_staged_ += task.chunk_len_;
     task.last_update_time_ = std::chrono::steady_clock::now();
+    op_ctx.last_update_time_ = task.last_update_time_;
     return IssueResult::kIssued;
 }
 
@@ -1066,6 +1069,7 @@ bool P2PProxy::stepSend() {
         bool op_failed = false;
         for (auto it = op_ctx.tasks_.begin(); it != op_ctx.tasks_.end();) {
             if (stepSendTask(op_ctx, *it)) {
+                op_ctx.last_update_time_ = std::chrono::steady_clock::now();
                 did_work = true;
             }
             if (it->state_ == SendTaskState::kFinished) {

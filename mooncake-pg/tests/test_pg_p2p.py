@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 
 import torch
@@ -57,6 +58,32 @@ def _direct_and_batch_send_recv_worker(
         value = {"direct": int(direct.cpu().item()), "batch": int(batch.cpu().item())}
     ctx.synchronize()
     ctx.record_result(value)
+
+
+def _long_progress_send_recv_worker(ctx: MooncakePGWorkerContext) -> None:
+    if ctx.world_size != 2:
+        raise AssertionError("long progress P2P test expects world_size=2")
+    timeout_s = 0.05
+    os.environ["MOONCAKE_P2P_CHUNK_SIZE"] = str(1 << 16)
+    pg.set_p2p_timeout_us(50_000)
+    device = ctx.init_group()
+    payload = torch.full((1 << 28,), ctx.rank, dtype=torch.uint8, device=device)
+    started_at = time.monotonic()
+    if ctx.rank == 0:
+        dist.send(payload, dst=1)
+        value = "sent"
+    else:
+        dist.recv(payload, src=0)
+        if not torch.all(payload == 0).item():
+            raise AssertionError("long P2P payload was corrupted")
+        value = "received"
+    elapsed_s = time.monotonic() - started_at
+    if elapsed_s <= timeout_s:
+        raise AssertionError(
+            f"P2P transfer completed in {elapsed_s:.3f}s, not beyond its timeout"
+        )
+    ctx.synchronize()
+    ctx.record_result({"value": value, "elapsed_s": elapsed_s})
 
 
 def _ordering_worker(
@@ -263,6 +290,17 @@ class _P2PMixin:
         self.assertIn(200, rank1["value"])
         self.assertEqual(len(rank1["value"]), 2)
         self.assertEqual(rank2["value"], "ok")
+
+    def test_long_send_progress_does_not_time_out(self) -> None:
+        rows = self.spawn_backend_and_collect(
+            _long_progress_send_recv_worker,
+            world_size=2,
+            nprocs=2,
+            timeout_s=120.0,
+        )
+        self.assert_all_ok(rows)
+        self.assertEqual({row["value"] for row in rows}, {"sent", "received"})
+        self.assertTrue(all(row["elapsed_s"] > 0.05 for row in rows))
 
 
 class TestMooncakePGP2PCPU(_P2PMixin, MooncakePGCPUBackendTestCase):
