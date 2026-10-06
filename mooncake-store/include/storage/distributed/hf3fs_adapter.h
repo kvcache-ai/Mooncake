@@ -57,6 +57,12 @@ class Hf3fsAdapter : public FileSystemAdapter {
 
     bool SupportsBatchIo() const override { return true; }
 
+    std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        std::span<const FdIoRequest> requests) override;
+
+    std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::span<const FdIoRequest> requests) override;
+
     tl::expected<void, ErrorCode> Init(const std::string& mount_path) override;
 
     tl::expected<void, ErrorCode> Shutdown() override;
@@ -64,6 +70,9 @@ class Hf3fsAdapter : public FileSystemAdapter {
     const char* GetName() const override { return "hf3fs"; }
 
    private:
+    std::vector<tl::expected<size_t, ErrorCode>> BatchIo(
+        std::span<const FdIoRequest> requests, bool read);
+
     std::unique_ptr<USRBIOResourceManager> resource_manager_;
 };
 

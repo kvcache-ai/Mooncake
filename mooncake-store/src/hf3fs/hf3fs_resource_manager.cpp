@@ -65,7 +65,9 @@ struct ThreadUSRBIOResource *USRBIOResourceManager::getThreadResource(
         // Find if current thread already has resources
         auto it = thread_resources.find(thread_id);
         if (it != thread_resources.end()) {
-            return it->second;
+            // A failed completion wait retires the rings and staging buffer.
+            // Recreate them before allowing the next operation to reuse them.
+            return it->second->Initialize(config) ? it->second : nullptr;
         }
 
         // Create new thread resources
