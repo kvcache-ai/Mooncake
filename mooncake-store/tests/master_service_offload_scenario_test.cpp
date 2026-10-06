@@ -490,6 +490,32 @@ TEST(MasterServiceOffloadScenarioTest, CompleteOffloadAfterUnmountIsRefused) {
         .Then(Object("ssd_gate_orphan_key").DoesNotExist());
 }
 
+TEST(MasterServiceOffloadScenarioTest, CompleteOffloadByNonMirrorIsIgnored) {
+    // The offload is enqueued to "owner" only. A completion from another
+    // client must neither attach its disk replica nor consume the task, so
+    // the owner's own completion still lands afterwards.
+    MasterScenario("only the scheduled mirror can complete an offload",
+                   SsdAwareOffloadConfig())
+        .Given(MemoryNode("owner"))
+        .Given(MemoryNode("intruder"))
+        .When(MountLocalDisk("owner"))
+        .When(ReportSsdCapacity("owner", 1000))
+        .When(MountLocalDisk("intruder"))
+        .When(ReportSsdCapacity("intruder", 1000))
+        .When(PutStart("ssd_mirror_key", 1_KB)
+                  .By("owner")
+                  .OnNode("owner")
+                  .ExpectMemoryNodes({"owner"}))
+        .When(PutEnd("ssd_mirror_key").By("owner"))
+        .When(CompleteOffload({"ssd_mirror_key"})
+                  .By("intruder")
+                  .OnNode("intruder"))
+        .Then(Object("ssd_mirror_key").HasReplicas(1).HasMemoryReplicas(1))
+        .When(OffloadHeartbeat("owner").ExpectTasks({"ssd_mirror_key"}, 1024))
+        .When(CompleteOffload({"ssd_mirror_key"}).By("owner").OnNode("owner"))
+        .Then(Object("ssd_mirror_key").HasReplicas(2).HasLocalDiskReplicas(1));
+}
+
 // The four offload/eviction config combos, driven through the client-visible
 // pressure path: a failed allocation arms the background eviction thread, and
 // the observable outcomes are which writes eventually succeed, which objects

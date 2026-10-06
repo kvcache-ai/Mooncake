@@ -1584,6 +1584,11 @@ class MasterService {
                                  ObjectMetadata& metadata,
                                  const ObjectIdentity& object_id);
 
+    // Whether `client_id` is one of the clients the master enqueued `task`
+    // to, i.e. one whose offload completion or NACK may settle it.
+    static bool IsOffloadTaskMirror(const OffloadingTask& task,
+                                    const UUID& client_id);
+
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
         UUID client_id;
