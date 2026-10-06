@@ -658,9 +658,9 @@ class MasterServiceHATest : public ::testing::Test {
         return replica;
     }
 
-    Replica::Descriptor MakeStandbyLocalDiskReplica(
-        const UUID& owner, const std::string& endpoint,
-        size_t size = 1024) const {
+    Replica::Descriptor MakeStandbyLocalDiskReplica(const UUID& owner,
+                                                    const std::string& endpoint,
+                                                    size_t size = 1024) const {
         Replica::Descriptor replica;
         replica.id = 1;
         replica.status = ReplicaStatus::COMPLETE;
