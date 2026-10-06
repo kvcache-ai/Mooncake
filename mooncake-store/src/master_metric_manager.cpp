@@ -51,6 +51,15 @@ MasterMetricManager::MasterMetricManager()
           "Total bytes currently allocated for file storage in 3fs/nfs"),
       file_total_capacity_("master_total_file_capacity_bytes",
                            "Total capacity for file storage in 3fs/nfs"),
+      dfs_allocated_size_("master_dfs_allocated_bytes",
+                          "Total bytes currently allocated by the DFS "
+                          "allocator (shard/bucket mode)"),
+      dfs_total_capacity_("master_dfs_total_capacity_bytes",
+                          "Total capacity of the DFS allocator "
+                          "(shard/bucket mode)"),
+      dfs_file_count_("master_dfs_file_count",
+                      "Number of DFS backing files (shard files in shard "
+                      "mode, bucket files in bucket mode)"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
       soft_pin_key_count_(
@@ -559,6 +568,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     mem_total_capacity_.update(0);
     file_allocated_size_.update(0);
     file_total_capacity_.update(0);
+    dfs_allocated_size_.update(0);
+    dfs_total_capacity_.update(0);
+    dfs_file_count_.update(0);
     key_count_.update(0);
     soft_pin_key_count_.update(0);
     active_clients_.update(0);
@@ -868,6 +880,11 @@ void MasterMetricManager::project_storage_usage(
     project_tier(snapshot.nof, nof_allocated_size_, nof_total_capacity_,
                  nof_allocated_size_per_segment_,
                  nof_total_capacity_per_segment_, projected_nof_segments_);
+
+    dfs_allocated_size_.update(static_cast<int64_t>(snapshot.dfs.used_bytes));
+    dfs_total_capacity_.update(
+        static_cast<int64_t>(snapshot.dfs.capacity_bytes));
+    dfs_file_count_.update(static_cast<int64_t>(snapshot.dfs.file_count));
 }
 
 int64_t MasterMetricManager::get_segment_allocated_nof_size(
@@ -930,6 +947,18 @@ double MasterMetricManager::get_global_file_used_ratio(void) {
         return 0.0;
     }
     return allocated / capacity;
+}
+
+int64_t MasterMetricManager::get_dfs_allocated_bytes() {
+    return dfs_allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_dfs_total_capacity() {
+    return dfs_total_capacity_.value();
+}
+
+int64_t MasterMetricManager::get_dfs_file_count() {
+    return dfs_file_count_.value();
 }
 
 // Key/Value Metrics
@@ -2022,6 +2051,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
+    serialize_metric(dfs_allocated_size_);
+    serialize_metric(dfs_total_capacity_);
+    serialize_metric(dfs_file_count_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
@@ -2306,6 +2338,9 @@ std::string MasterMetricManager::get_summary_string(
     int64_t nof_capacity = nof_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     [[maybe_unused]] int64_t file_capacity = file_total_capacity_.value();
+    int64_t dfs_allocated = dfs_allocated_size_.value();
+    int64_t dfs_capacity = dfs_total_capacity_.value();
+    int64_t dfs_files = dfs_file_count_.value();
     int64_t keys = key_count_.value();
     int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();
@@ -2605,6 +2640,16 @@ std::string MasterMetricManager::get_summary_string(
     }
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_display_capacity);
+    if (dfs_capacity > 0 || dfs_allocated > 0 || dfs_files > 0) {
+        ss << " | DFS: " << byte_size_to_string(dfs_allocated) << " / "
+           << byte_size_to_string(dfs_capacity);
+        if (dfs_capacity > 0) {
+            ss << " (" << std::fixed << std::setprecision(1)
+               << ((double)dfs_allocated / (double)dfs_capacity * 100.0)
+               << "%)";
+        }
+        ss << " files=" << dfs_files;
+    }
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     ss << " | Clients: " << active_clients;
 

@@ -344,11 +344,6 @@ void UdsAcceptor::acceptLoop() {
         if (handler_) handler_(connection);
         active_client_fd_ = -1;
     }
-
-    if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-    }
 }
 
 void UdsAcceptor::wakeAccept() {

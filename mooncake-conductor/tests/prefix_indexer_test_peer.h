@@ -15,9 +15,10 @@
 namespace mooncake::conductor::prefixindex {
 
 struct BlockPresenceSnapshot {
-    std::set<EngineOwner> gpu_owners;
-    std::set<SharedObjectOwner> cpu_owners;
-    std::set<SharedObjectOwner> disk_owners;
+    std::set<EngineOwner> npu_owners;
+    std::set<EngineOwner> cpu_local_owners;
+    std::set<SharedObjectOwner> cpu_share_owners;
+    std::set<TierOwner> disk_owners;
 
     bool operator==(const BlockPresenceSnapshot&) const = default;
 };
@@ -59,9 +60,9 @@ class PrefixCacheTableTestPeer {
         std::shared_lock state_lock(state->mutex);
         const auto block = state->blocks.find(prefix);
         if (block == state->blocks.end()) return std::nullopt;
-        return BlockPresenceSnapshot{block->second.gpu_owners,
-                                     block->second.cpu_owners,
-                                     block->second.disk_owners};
+        return BlockPresenceSnapshot{
+            block->second.npu_owners, block->second.cpu_local_owners,
+            block->second.cpu_share_owners, block->second.disk_owners};
     }
 
     // Snapshot sizes for validating order metadata invariants.
@@ -83,6 +84,20 @@ class PrefixCacheTableTestPeer {
                 .evicted_by_capacity = state->evicted_by_capacity};
     }
 
+    // Test-only capacity seam.  The per-context block limit is copied into a
+    // ContextState by Register(), so it can only be changed before the first
+    // registration; the lock plus the emptiness check keep that invariant.
+    // Returns false when a context already exists.
+    static bool SetBlockLimitBeforeRegistration(PrefixCacheTable& table,
+                                                size_t block_limit) {
+        std::unique_lock map_lock(table.context_map_mutex_);
+        if (!table.contexts_.empty()) {
+            return false;
+        }
+        table.block_limit_ = block_limit;
+        return true;
+    }
+
     static PrefixCacheTableSnapshot Snapshot(const PrefixCacheTable& table) {
         PrefixCacheTableSnapshot snapshot;
         std::vector<std::pair<ContextKey, std::shared_ptr<ContextState>>>
@@ -102,8 +117,9 @@ class PrefixCacheTableTestPeer {
             state_snapshot.instance_ranks = state->instance_ranks;
             for (const auto& [prefix, presence] : state->blocks) {
                 state_snapshot.blocks.emplace(
-                    prefix, BlockPresenceSnapshot{presence.gpu_owners,
-                                                  presence.cpu_owners,
+                    prefix, BlockPresenceSnapshot{presence.npu_owners,
+                                                  presence.cpu_local_owners,
+                                                  presence.cpu_share_owners,
                                                   presence.disk_owners});
             }
             snapshot.contexts.emplace(context, std::move(state_snapshot));

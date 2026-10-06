@@ -365,4 +365,72 @@ void *allocate_buffer_numa_segments(size_t total_size,
     return ptr;
 }
 
+void *allocate_buffer_thp_interleaved(size_t total_size) {
+    constexpr size_t kThpSize = SZ_2MB;
+    if (total_size == 0 || total_size % kThpSize != 0) {
+        LOG(ERROR) << "Invalid THP segment size " << total_size
+                   << ", must be a non-zero multiple of " << kThpSize;
+        return nullptr;
+    }
+
+    // Over-reserve by one huge page and trim, so the returned range is
+    // 2MB-aligned and every PMD in it can be backed by a THP. The trimmed
+    // mapping is exactly [ptr, ptr + total_size), which is what
+    // free_buffer_mmap_memory() unmaps.
+    const size_t reserve_size = total_size + kThpSize;
+    void *raw = mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) {
+        LOG(ERROR) << "mmap failed, size=" << reserve_size
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        return nullptr;
+    }
+    const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
+    const uintptr_t addr = align_up(raw_addr, kThpSize);
+    if (addr > raw_addr) {
+        munmap(raw, addr - raw_addr);
+    }
+    const uintptr_t tail = addr + total_size;
+    if (raw_addr + reserve_size > tail) {
+        munmap(reinterpret_cast<void *>(tail), raw_addr + reserve_size - tail);
+    }
+    void *ptr = reinterpret_cast<void *>(addr);
+
+    // Request THP explicitly instead of relying on the system default or on
+    // GLIBC_TUNABLES=glibc.malloc.hugetlb=1. With THP enabled=madvise a 4KB
+    // backed segment needs 512x more NIC page-table entries, and EFA reg_mr
+    // runs out of them (ENOMEM) once several ranks register large segments.
+    if (madvise(ptr, total_size, MADV_HUGEPAGE) != 0) {
+        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, errno=" << errno << " ("
+                     << strerror(errno) << "); segment may be 4KB backed";
+    }
+
+    // Interleave across all allowed NUMA nodes. Under the default local
+    // policy one node fills first, and from then on every THP fault runs
+    // direct compaction on the full node (__GFP_THISNODE) before falling back
+    // to the other node. With several ranks registering hundreds of GB each,
+    // that turns registration from tens of seconds into tens of minutes.
+    // Interleaving also spreads the segment evenly across the NICs' nodes.
+    // An explicit task policy (e.g. numactl --membind) is left untouched.
+    int task_policy = MPOL_DEFAULT;
+    if (get_mempolicy(&task_policy, nullptr, 0, nullptr, 0) != 0) {
+        task_policy = MPOL_DEFAULT;
+    }
+    if (task_policy == MPOL_DEFAULT && numa_available() >= 0) {
+        struct bitmask *nodes = numa_get_mems_allowed();
+        if (nodes && numa_bitmask_weight(nodes) > 1) {
+            if (mbind(ptr, total_size, MPOL_INTERLEAVE, nodes->maskp,
+                      nodes->size + 1, 0) != 0) {
+                LOG(WARNING) << "mbind(MPOL_INTERLEAVE) failed, errno=" << errno
+                             << " (" << strerror(errno) << ")";
+            }
+        }
+        if (nodes) numa_bitmask_free(nodes);
+    }
+
+    LOG(INFO) << "Allocated THP-interleaved buffer: " << total_size
+              << " bytes at " << ptr;
+    return ptr;
+}
+
 }  // namespace mooncake

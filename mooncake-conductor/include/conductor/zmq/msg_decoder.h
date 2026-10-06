@@ -1,6 +1,6 @@
 #pragma once
 
-// Strict envelope and recognized-field decoding for the independent vLLM and
+// Strict envelope and recognized-field decoding for the vLLM, SGLang and
 // Mooncake map protocols. Event-local failures are materialized in the batch
 // so valid siblings can still be dispatched in source order.
 

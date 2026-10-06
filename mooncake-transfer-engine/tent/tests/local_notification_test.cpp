@@ -23,12 +23,16 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <utility>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "tent/common/config.h"
+#include "tent/transfer_engine.h"
 #include "tent/runtime/transfer_engine_impl.h"
 
 namespace mooncake {
@@ -467,6 +471,40 @@ TEST(LocalNotificationTest, SelfNotificationIsNotHeldBackByAnUnreachablePeer) {
     (void)engine.unregisterLocalMemory(local_target.data(), kBufLen);
     (void)peer_a.unregisterLocalMemory(a_target.data(), kBufLen);
     (void)peer_b.unregisterLocalMemory(b_target.data(), kBufLen);
+}
+
+// C callers require termination even when a field fills its truncation limit.
+TEST(LocalNotificationTest, CApiTerminatesFullLengthFields) {
+    TransferEngineImpl engine(makeConfig(/*enable_tcp=*/false));
+    ASSERT_TRUE(engine.available());
+    for (const auto [name_length, message_length] :
+         {std::pair<size_t, size_t>{0, 0},
+          {254, 4094},
+          {255, 4095},
+          {256, 4096}}) {
+        SCOPED_TRACE(name_length);
+        Notification notification;
+        notification.name.assign(name_length, 'n');
+        notification.msg.assign(message_length, 'm');
+        ASSERT_TRUE(
+            engine.sendNotification(LOCAL_SEGMENT_ID, notification).ok());
+        tent_notifi_info result{};
+        ASSERT_EQ(tent_recv_notifs(&engine, &result), 0);
+        std::unique_ptr<tent_notifi_record, decltype(&std::free)> records(
+            result.records, &std::free);
+        ASSERT_EQ(result.num_records, 1);
+        ASSERT_NE(records, nullptr);
+        const auto& record = *records;
+        const auto copied_name = std::min(name_length, sizeof(record.name) - 1);
+        const auto copied_message =
+            std::min(message_length, sizeof(record.msg) - 1);
+        EXPECT_EQ(std::string(record.name, copied_name),
+                  notification.name.substr(0, copied_name));
+        EXPECT_EQ(std::string(record.msg, copied_message),
+                  notification.msg.substr(0, copied_message));
+        EXPECT_EQ(record.name[copied_name], '\0');
+        EXPECT_EQ(record.msg[copied_message], '\0');
+    }
 }
 
 }  // namespace tent

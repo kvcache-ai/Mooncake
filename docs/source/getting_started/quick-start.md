@@ -274,6 +274,26 @@ sudo make install
 ```
 :::
 
+:::{tab-item} Biren GPU
+**Prerequisites**
+
+- Python 3.10 or later.
+- Biren SUPA SDK. Set `BIREN_HOME` to the SDK root containing `supa/include`
+  and `supa/lib`, or use the default `/usr/local/birensupa/all/latest`.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_SUPA=ON -DBIREN_HOME=/usr/local/birensupa/all/latest
+make -j
+sudo make install
+```
+:::
+
 ::::
 
 ## Start Mooncake Store

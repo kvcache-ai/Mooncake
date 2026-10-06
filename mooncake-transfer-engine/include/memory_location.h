@@ -38,6 +38,9 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          size_t len,
                                                          bool only_first_page);
 
+// Returns the kernel page size backing the VMA containing addr.
+size_t detectBufferPageSize(void *addr);
+
 const static std::string kWildcardLocation = "*";
 const static std::string kSegmentsLocationPrefix = "segments:";
 

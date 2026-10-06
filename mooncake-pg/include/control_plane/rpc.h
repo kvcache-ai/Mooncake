@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -26,6 +27,10 @@ struct RegisterAgentRequest {
     std::string te_server_name;
     uint64_t agent_session_id = 0;
     uint64_t warmup_recv_addr = 0;
+
+    std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
+    std::optional<DeviceCollectiveWorkspaceEndpoint>
+        collective_workspace_endpoint;
 };
 
 struct RankConnectionMetadata {
@@ -34,6 +39,9 @@ struct RankConnectionMetadata {
     std::string agent_addr;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
+    std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
+    std::optional<DeviceCollectiveWorkspaceEndpoint>
+        collective_workspace_endpoint;
 };
 
 struct RegisterAgentResponse {
@@ -94,6 +102,7 @@ struct RegisterGroupRequest {
     GroupBootstrapId group_bootstrap_id;
     int32_t max_group_size = 0;
     std::vector<GlobalRank> rank_order;
+    std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend;
     GroupBootstrapIdResolvePolicy resolve_policy =
         GroupBootstrapIdResolvePolicy::CreateOrAttach;
     bool auto_deactivate = true;
@@ -194,6 +203,9 @@ struct PeerJoinedPush {
     uint64_t rank_epoch = 0;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
+    std::optional<DeviceTransferEndpoint> transfer_service_endpoint;
+    std::optional<DeviceCollectiveWorkspaceEndpoint>
+        collective_workspace_endpoint;
 };
 
 struct RankStatePush {
@@ -247,6 +259,16 @@ using CoordinatorEffect =
 
 // Agent effects
 
+struct InstallDeviceTransferEndpoint {
+    GlobalRank rank = kInvalidGlobalRank;
+    DeviceTransferEndpoint endpoint;
+};
+
+struct InstallDeviceCollectiveWorkspaceEndpoint {
+    GlobalRank rank = kInvalidGlobalRank;
+    DeviceCollectiveWorkspaceEndpoint endpoint;
+};
+
 struct EnablePeerProbe {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t rank_epoch = 0;
@@ -274,11 +296,23 @@ struct DisconnectAllLinks {};
 
 struct ClearAllPeerMetadata {};
 
-struct ApplyViewToCommunicator {
+// Full communicator update. The GroupView and its derived rank-state snapshot
+// are applied together before group/rank waiters are notified.
+struct ApplyGroupStateToCommunicator {
     GroupView view;
     std::vector<RankState> rank_states;
     std::vector<uint64_t> rank_epochs;
     std::vector<bool> activatable;
+};
+
+// Incremental rank-state update that leaves the applied GroupView unchanged.
+struct ApplyRankStateToCommunicator {
+    GroupId group_id;
+    GlobalRank rank = kInvalidGlobalRank;
+    InGroupRank in_group_rank = kInvalidInGroupRank;
+    RankState state = RankState::Offline;
+    uint64_t rank_epoch = 0;
+    bool activatable = false;
 };
 
 struct ResetPeerState {
@@ -303,11 +337,13 @@ struct NotifyRanksActivated {
 };
 
 using AgentEffect =
-    std::variant<EnablePeerProbe, DisconnectLink, RequestLinkHealthCheck,
-                 SendLinkEventReport, StopReconnect, DisconnectAllLinks,
-                 ClearAllPeerMetadata, ApplyViewToCommunicator, ResetPeerState,
-                 RefreshPeerLink, NotifyLinkRefreshed, NotifyGroupReady,
-                 NotifyRanksActivated>;
+    std::variant<InstallDeviceTransferEndpoint,
+                 InstallDeviceCollectiveWorkspaceEndpoint, EnablePeerProbe,
+                 DisconnectLink, RequestLinkHealthCheck, SendLinkEventReport,
+                 StopReconnect, DisconnectAllLinks, ClearAllPeerMetadata,
+                 ApplyGroupStateToCommunicator, ApplyRankStateToCommunicator,
+                 ResetPeerState, RefreshPeerLink, NotifyLinkRefreshed,
+                 NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

@@ -70,27 +70,37 @@ std::string ValidateSharedOwner(const SharedObjectOwner& owner) {
     return "";
 }
 
-std::string ValidateGpuMutation(const GpuMutation& mutation) {
+std::string ValidateEngineMutation(const EngineMutation& mutation) {
     if (auto error =
             ValidateLayout(mutation.context, mutation.effective_block_size,
                            mutation.cache_group);
         !error.empty()) {
         return error;
     }
+    if (mutation.tier != StorageTier::kNpu &&
+        mutation.tier != StorageTier::kCpuLocal &&
+        mutation.tier != StorageTier::kDisk) {
+        return "engine mutation tier must be NPU, CPU_LOCAL, or DISK";
+    }
     return ValidateEngineOwner(mutation.owner);
 }
 
-std::string ValidateGpuClear(const GpuClear& clear) {
+std::string ValidateEngineClear(const EngineClear& clear) {
     if (auto error = ValidateLayout(clear.context, clear.effective_block_size,
                                     clear.cache_group);
         !error.empty()) {
         return error;
     }
+    if (clear.tier.has_value() && *clear.tier != StorageTier::kNpu &&
+        *clear.tier != StorageTier::kCpuLocal &&
+        *clear.tier != StorageTier::kDisk) {
+        return "engine clear tier must be NPU, CPU_LOCAL, DISK, or omitted";
+    }
     return ValidateEngineOwner(clear.owner);
 }
 
 bool IsSharedTier(StorageTier tier) {
-    return tier == StorageTier::kCpu || tier == StorageTier::kDisk;
+    return tier == StorageTier::kCpuShare || tier == StorageTier::kDisk;
 }
 
 std::string ValidateSharedMutation(const SharedMutation& mutation) {
@@ -101,7 +111,7 @@ std::string ValidateSharedMutation(const SharedMutation& mutation) {
         return error;
     }
     if (!IsSharedTier(mutation.tier)) {
-        return "shared mutation tier must be CPU or DISK";
+        return "shared mutation tier must be CPU_SHARE or DISK";
     }
     return ValidateSharedOwner(mutation.owner);
 }
@@ -113,15 +123,9 @@ std::string ValidateSharedClear(const SharedClear& clear) {
         return error;
     }
     if (clear.tier.has_value() && !IsSharedTier(*clear.tier)) {
-        return "shared clear tier must be CPU, DISK, or omitted";
+        return "shared clear tier must be CPU_SHARE, DISK, or omitted";
     }
     return ValidateSharedOwner(clear.owner);
-}
-
-std::set<SharedObjectOwner>& SharedOwners(BlockPresence& presence,
-                                          StorageTier tier) {
-    return tier == StorageTier::kCpu ? presence.cpu_owners
-                                     : presence.disk_owners;
 }
 
 // Remove empty blocks and their order metadata. The caller holds state.mutex.
@@ -181,7 +185,7 @@ void EvictIfOverCapacity(ContextState& state) {
         << "Prefix index hit the capacity limit; oldest entries dropped."
         << " limit=" << state.max_blocks << " now=" << state.blocks.size()
         << " cumulative_evicted=" << state.evicted_by_capacity
-        << " (non-zero means stored/removed events are out of sync)";
+        << " (capacity eviction can reduce reported cache coverage)";
 }
 
 int64_t TokensForBlocks(size_t block_count, int64_t block_size) {
@@ -321,16 +325,25 @@ std::string PrefixCacheTable::Unregister(const ContextKey& context,
 
     for (auto& [unused_prefix, presence] : state->blocks) {
         (void)unused_prefix;
-        std::erase_if(presence.gpu_owners, [&](const EngineOwner& owner) {
+        std::erase_if(presence.npu_owners, [&](const EngineOwner& owner) {
             return owner.instance_id == instance_id && owner.dp_rank == dp_rank;
         });
+        auto matches_engine = [&](const TierOwner& owner) {
+            const auto* engine = std::get_if<EngineOwner>(&owner);
+            return engine && engine->instance_id == instance_id &&
+                   engine->dp_rank == dp_rank;
+        };
+        std::erase_if(presence.cpu_local_owners, [&](const EngineOwner& owner) {
+            return owner.instance_id == instance_id && owner.dp_rank == dp_rank;
+        });
+        std::erase_if(presence.disk_owners, matches_engine);
     }
     EraseEmptyBlocks(*state);
     return "";
 }
 
-std::string PrefixCacheTable::StoreGpu(const GpuMutation& mutation) {
-    if (auto error = ValidateGpuMutation(mutation); !error.empty()) {
+std::string PrefixCacheTable::StoreEngine(const EngineMutation& mutation) {
+    if (auto error = ValidateEngineMutation(mutation); !error.empty()) {
         return error;
     }
     auto state = LoadContextState(mutation.context);
@@ -345,15 +358,22 @@ std::string PrefixCacheTable::StoreGpu(const GpuMutation& mutation) {
         return "engine owner instance/rank is not registered";
     }
     for (ProjectedPrefix prefix : mutation.prefixes) {
-        state->blocks[prefix].gpu_owners.insert(mutation.owner);
+        auto& presence = state->blocks[prefix];
+        if (mutation.tier == StorageTier::kNpu) {
+            presence.npu_owners.insert(mutation.owner);
+        } else if (mutation.tier == StorageTier::kCpuLocal) {
+            presence.cpu_local_owners.insert(mutation.owner);
+        } else {
+            presence.disk_owners.insert(mutation.owner);
+        }
         TouchOrder(*state, prefix);
     }
     EvictIfOverCapacity(*state);
     return "";
 }
 
-std::string PrefixCacheTable::RemoveGpu(const GpuMutation& mutation) {
-    if (auto error = ValidateGpuMutation(mutation); !error.empty()) {
+std::string PrefixCacheTable::RemoveEngine(const EngineMutation& mutation) {
+    if (auto error = ValidateEngineMutation(mutation); !error.empty()) {
         return error;
     }
     auto state = LoadContextState(mutation.context);
@@ -366,7 +386,13 @@ std::string PrefixCacheTable::RemoveGpu(const GpuMutation& mutation) {
     for (ProjectedPrefix prefix : mutation.prefixes) {
         auto block = state->blocks.find(prefix);
         if (block != state->blocks.end()) {
-            block->second.gpu_owners.erase(mutation.owner);
+            if (mutation.tier == StorageTier::kNpu) {
+                block->second.npu_owners.erase(mutation.owner);
+            } else if (mutation.tier == StorageTier::kCpuLocal) {
+                block->second.cpu_local_owners.erase(mutation.owner);
+            } else {
+                block->second.disk_owners.erase(mutation.owner);
+            }
             if (block->second.Empty()) {
                 state->blocks.erase(block);
                 ForgetOrder(*state, prefix);
@@ -376,8 +402,8 @@ std::string PrefixCacheTable::RemoveGpu(const GpuMutation& mutation) {
     return "";
 }
 
-std::string PrefixCacheTable::ClearGpu(const GpuClear& clear) {
-    if (auto error = ValidateGpuClear(clear); !error.empty()) {
+std::string PrefixCacheTable::ClearEngine(const EngineClear& clear) {
+    if (auto error = ValidateEngineClear(clear); !error.empty()) {
         return error;
     }
     auto state = LoadContextState(clear.context);
@@ -388,7 +414,15 @@ std::string PrefixCacheTable::ClearGpu(const GpuClear& clear) {
     std::unique_lock state_lock(state->mutex);
     for (auto& [unused_prefix, presence] : state->blocks) {
         (void)unused_prefix;
-        presence.gpu_owners.erase(clear.owner);
+        if (!clear.tier || *clear.tier == StorageTier::kNpu) {
+            presence.npu_owners.erase(clear.owner);
+        }
+        if (!clear.tier || *clear.tier == StorageTier::kCpuLocal) {
+            presence.cpu_local_owners.erase(clear.owner);
+        }
+        if (!clear.tier || *clear.tier == StorageTier::kDisk) {
+            presence.disk_owners.erase(clear.owner);
+        }
     }
     EraseEmptyBlocks(*state);
     return "";
@@ -405,8 +439,12 @@ std::string PrefixCacheTable::StoreShared(const SharedMutation& mutation) {
 
     std::unique_lock state_lock(state->mutex);
     for (ProjectedPrefix prefix : mutation.prefixes) {
-        SharedOwners(state->blocks[prefix], mutation.tier)
-            .insert(mutation.owner);
+        auto& presence = state->blocks[prefix];
+        if (mutation.tier == StorageTier::kCpuShare) {
+            presence.cpu_share_owners.insert(mutation.owner);
+        } else {
+            presence.disk_owners.insert(mutation.owner);
+        }
         TouchOrder(*state, prefix);
     }
     EvictIfOverCapacity(*state);
@@ -427,7 +465,11 @@ std::string PrefixCacheTable::RemoveShared(const SharedMutation& mutation) {
     for (ProjectedPrefix prefix : mutation.prefixes) {
         auto block = state->blocks.find(prefix);
         if (block != state->blocks.end()) {
-            SharedOwners(block->second, mutation.tier).erase(mutation.owner);
+            if (mutation.tier == StorageTier::kCpuShare) {
+                block->second.cpu_share_owners.erase(mutation.owner);
+            } else {
+                block->second.disk_owners.erase(mutation.owner);
+            }
             if (block->second.Empty()) {
                 state->blocks.erase(block);
                 ForgetOrder(*state, prefix);
@@ -449,8 +491,8 @@ std::string PrefixCacheTable::ClearShared(const SharedClear& clear) {
     std::unique_lock state_lock(state->mutex);
     for (auto& [unused_prefix, presence] : state->blocks) {
         (void)unused_prefix;
-        if (!clear.tier.has_value() || *clear.tier == StorageTier::kCpu) {
-            presence.cpu_owners.erase(clear.owner);
+        if (!clear.tier.has_value() || *clear.tier == StorageTier::kCpuShare) {
+            presence.cpu_share_owners.erase(clear.owner);
         }
         if (!clear.tier.has_value() || *clear.tier == StorageTier::kDisk) {
             presence.disk_owners.erase(clear.owner);
@@ -569,38 +611,61 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         CacheHitResult result;
 
         for (int64_t rank : ranks) {
-            auto gpu_present = [&](const BlockPresence& block) {
-                return std::any_of(
-                    block.gpu_owners.begin(), block.gpu_owners.end(),
-                    [&](const EngineOwner& owner) {
-                        return owner.instance_id == instance_id &&
-                               owner.dp_rank == rank;
-                    });
+            auto engine_present = [&](const std::set<EngineOwner>& owners) {
+                return std::any_of(owners.begin(), owners.end(),
+                                   [&](const EngineOwner& owner) {
+                                       return owner.instance_id ==
+                                                  instance_id &&
+                                              owner.dp_rank == rank;
+                                   });
+            };
+            auto npu_present = [&](const BlockPresence& block) {
+                return engine_present(block.npu_owners);
             };
 
             size_t cursor = 0;
-            advance_cursor(cursor, gpu_present);
+            advance_cursor(cursor, npu_present);
 
             RankCacheHitResult rank_match;
-            rank_match.gpu =
+            rank_match.npu =
                 MatchedTokens(cursor, context.block_size, queried_tokens);
 
-            advance_cursor(cursor, [](const BlockPresence& block) {
-                return !block.cpu_owners.empty();
-            });
-            rank_match.cpu =
+            auto accessible = [&](const std::set<TierOwner>& owners) {
+                return std::any_of(
+                    owners.begin(), owners.end(), [&](const TierOwner& owner) {
+                        const auto* engine = std::get_if<EngineOwner>(&owner);
+                        return !engine || (engine->instance_id == instance_id &&
+                                           engine->dp_rank == rank);
+                    });
+            };
+            auto local_present = [&](const BlockPresence& block) {
+                return npu_present(block) ||
+                       engine_present(block.cpu_local_owners);
+            };
+            // The allowed sets are nested; keep one cursor for all four tiers.
+            // Each successful prefix is visited once per rank, not per tier.
+            advance_cursor(cursor, local_present);
+            rank_match.cpu_local =
                 MatchedTokens(cursor, context.block_size, queried_tokens);
 
-            advance_cursor(cursor, [](const BlockPresence& block) {
-                return !block.disk_owners.empty();
+            auto shared_present = [&](const BlockPresence& block) {
+                return !block.cpu_share_owners.empty() || local_present(block);
+            };
+            advance_cursor(cursor, shared_present);
+            rank_match.cpu_share =
+                MatchedTokens(cursor, context.block_size, queried_tokens);
+
+            advance_cursor(cursor, [&](const BlockPresence& block) {
+                return shared_present(block) || accessible(block.disk_owners);
             });
             rank_match.disk =
                 MatchedTokens(cursor, context.block_size, queried_tokens);
 
-            result.dp.emplace(rank, rank_match.gpu);
+            result.dp.emplace(rank, rank_match.npu);
             result.rank_matches.emplace(rank, rank_match);
-            result.gpu = std::max(result.gpu, rank_match.gpu);
-            result.cpu = std::max(result.cpu, rank_match.cpu);
+            result.npu = std::max(result.npu, rank_match.npu);
+            result.cpu_local = std::max(result.cpu_local, rank_match.cpu_local);
+            result.cpu_share = std::max(result.cpu_share, rank_match.cpu_share);
             result.disk = std::max(result.disk, rank_match.disk);
         }
         result.longest_match_tokens = result.disk;

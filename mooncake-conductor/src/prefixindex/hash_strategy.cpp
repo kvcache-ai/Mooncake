@@ -569,27 +569,36 @@ int LowerHexValue(char value) {
 
 std::string ValidateProfileSelectors(std::string_view strategy,
                                      std::string_view algorithm,
-                                     std::string_view index_projection) {
+                                     std::string_view index_projection,
+                                     std::string* error_field = nullptr) {
+    const auto reject = [&](const char* field, std::string message) {
+        if (error_field != nullptr) *error_field = field;
+        return message;
+    };
     if (strategy != "vllm_v1" && strategy != "sglang" &&
         strategy != "sglang_bigram") {
-        return "unsupported hash strategy: " + std::string(strategy);
+        return reject("strategy",
+                      "unsupported hash strategy: " + std::string(strategy));
     }
     if (strategy == "sglang" || strategy == "sglang_bigram") {
         if (algorithm != "sha256_raw") {
-            return "unsupported SGLang hash algorithm: " +
-                   std::string(algorithm);
+            return reject("algorithm", "unsupported SGLang hash algorithm: " +
+                                           std::string(algorithm));
         }
         if (index_projection != "first64_be") {
-            return "unsupported SGLang index projection: " +
-                   std::string(index_projection);
+            return reject("index_projection",
+                          "unsupported SGLang index projection: " +
+                              std::string(index_projection));
         }
         return "";
     }
     if (algorithm != "sha256" && algorithm != "sha256_cbor") {
-        return "unsupported hash algorithm: " + std::string(algorithm);
+        return reject("algorithm",
+                      "unsupported hash algorithm: " + std::string(algorithm));
     }
     if (index_projection != "low64_be") {
-        return "unsupported index projection: " + std::string(index_projection);
+        return reject("index_projection", "unsupported index projection: " +
+                                              std::string(index_projection));
     }
     return "";
 }
@@ -939,27 +948,30 @@ class SglangHashChain final : public HashChain {
         }
         while (computed_.size() <= index) {
             const size_t block_index = computed_.size();
-            encoded_.clear();
             const size_t logical_length =
                 bigram_ ? token_ids_.size() - 1 : token_ids_.size();
             const size_t block_begin = block_index * block_size_;
             const size_t block_end =
                 std::min(block_begin + block_size_, logical_length);
+            // Size once, then write little-endian bytes directly instead of
+            // updating the vectors for each byte of every token.
+            encoded_.resize((block_end - block_begin) * (bigram_ ? 8 : 4));
+            uint8_t* output = encoded_.data();
             for (size_t token_index = block_begin; token_index < block_end;
                  ++token_index) {
                 const int32_t token = token_ids_[token_index];
                 const uint32_t value = static_cast<uint32_t>(token);
-                encoded_.push_back(static_cast<uint8_t>(value));
-                encoded_.push_back(static_cast<uint8_t>(value >> 8));
-                encoded_.push_back(static_cast<uint8_t>(value >> 16));
-                encoded_.push_back(static_cast<uint8_t>(value >> 24));
+                *output++ = static_cast<uint8_t>(value);
+                *output++ = static_cast<uint8_t>(value >> 8);
+                *output++ = static_cast<uint8_t>(value >> 16);
+                *output++ = static_cast<uint8_t>(value >> 24);
                 if (bigram_) {
                     const uint32_t next_value =
                         static_cast<uint32_t>(token_ids_[token_index + 1]);
-                    encoded_.push_back(static_cast<uint8_t>(next_value));
-                    encoded_.push_back(static_cast<uint8_t>(next_value >> 8));
-                    encoded_.push_back(static_cast<uint8_t>(next_value >> 16));
-                    encoded_.push_back(static_cast<uint8_t>(next_value >> 24));
+                    *output++ = static_cast<uint8_t>(next_value);
+                    *output++ = static_cast<uint8_t>(next_value >> 8);
+                    *output++ = static_cast<uint8_t>(next_value >> 16);
+                    *output++ = static_cast<uint8_t>(next_value >> 24);
                 }
             }
             std::vector<uint8_t> input;
@@ -1041,14 +1053,16 @@ class SglangHashStrategy final : public HashStrategy {
 }  // namespace
 
 std::string ResolveHashProfile(const common::HashProfileConfig& config,
-                               HashProfile* out) {
+                               HashProfile* out, std::string* error_field) {
+    if (error_field != nullptr) error_field->clear();
     if (out == nullptr) {
         return "resolved hash profile output must not be null";
     }
     *out = {};
 
-    if (auto error = ValidateProfileSelectors(config.strategy, config.algorithm,
-                                              config.index_projection);
+    if (auto error =
+            ValidateProfileSelectors(config.strategy, config.algorithm,
+                                     config.index_projection, error_field);
         !error.empty()) {
         return error;
     }
@@ -1059,7 +1073,7 @@ std::string ResolveHashProfile(const common::HashProfileConfig& config,
         // actual chain root at query time.
         *out = {.strategy = config.strategy,
                 .algorithm = config.algorithm,
-                .python_hash_seed = config.python_hash_seed,
+                .python_hash_seed = "0",
                 .root_digest = std::string(64, '0'),
                 .index_projection = config.index_projection};
         return "";
@@ -1067,6 +1081,7 @@ std::string ResolveHashProfile(const common::HashProfileConfig& config,
 
     if (auto error = ValidatePythonHashSeed(config.python_hash_seed);
         !error.empty()) {
+        if (error_field != nullptr) *error_field = "python_hash_seed";
         return error;
     }
 

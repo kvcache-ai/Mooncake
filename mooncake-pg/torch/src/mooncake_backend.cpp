@@ -358,6 +358,19 @@ MooncakeBackend::MooncakeBackend(
     config.globalRankCount = global_ranks.size();
     config.deviceIndex = isCpu_ ? -1 : at::cuda::current_device();
     config.deviceType = isCpu_ ? mooncakePgDeviceCpu : mooncakePgDeviceGpu;
+    if (!isCpu_) {
+        const auto preferred_backend =
+            c10::utils::get_env("MOONCAKE_PG_PREFERRED_GPU_COLLECTIVE_BACKEND")
+                .value_or("legacy");
+        TORCH_CHECK(
+            preferred_backend == "legacy" || preferred_backend == "new",
+            "MOONCAKE_PG_PREFERRED_GPU_COLLECTIVE_BACKEND must be unset, "
+            "'legacy', or 'new'; got '",
+            preferred_backend, "'");
+        config.preferredGpuCollectiveBackend =
+            preferred_backend == "new" ? mooncakePgGpuCollectiveBackendNew
+                                       : mooncakePgGpuCollectiveBackendLegacy;
+    }
     config.idResolvePolicy = options_ && options_->isExtension_
                                  ? mooncakePgIdResolveAttachOrExtend
                                  : mooncakePgIdResolveCreateOrAttach;
@@ -718,11 +731,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
 
 void MooncakeBackend::shutdown() {
     if (isShutdown_) return;
-    isShutdown_ = true;
-    auto comm = std::exchange(comm_, nullptr);
-    const auto result = comm ? mooncakePgCommDestroy(comm) : mooncakePgSuccess;
+    if (comm_) {
+        // A captured CUDA Graph may still reference the communicator. The C
+        // API leaves the handle valid on ResourceBusy, so do not discard it
+        // until destruction has actually succeeded.
+        checkResult(mooncakePgCommDestroy(comm_), "mooncakePgCommDestroy");
+        comm_ = nullptr;
+    }
     work_tracker_->shutdown();
-    checkResult(result, "mooncakePgCommDestroy");
+    isShutdown_ = true;
 }
 
 void MooncakeBackend::extendGroupSizeTo(int) {

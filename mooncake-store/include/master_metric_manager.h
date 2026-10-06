@@ -128,6 +128,13 @@ class MasterMetricManager {
     void set_dfs_capacity_unlimited(bool unlimited);
     bool is_dfs_capacity_unlimited() const;
 
+    // DFS Allocator Metrics (projected from the DFS allocator snapshot). These
+    // reflect the shard/bucket DFS allocator, distinct from the 3fs/nfs file
+    // storage gauges above.
+    int64_t get_dfs_allocated_bytes();
+    int64_t get_dfs_total_capacity();
+    int64_t get_dfs_file_count();
+
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
     void dec_key_count(int64_t val = 1);
@@ -600,6 +607,11 @@ class MasterMetricManager {
     ylt::metric::gauge_t file_allocated_size_;
     ylt::metric::gauge_t file_total_capacity_;
     std::atomic<bool> dfs_capacity_unlimited_{false};
+
+    // DFS Allocator Metrics
+    ylt::metric::gauge_t dfs_allocated_size_;
+    ylt::metric::gauge_t dfs_total_capacity_;
+    ylt::metric::gauge_t dfs_file_count_;
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;

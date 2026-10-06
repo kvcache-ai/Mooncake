@@ -67,7 +67,6 @@ class Environ {
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
     bool GetRdmaDataDirect() const { return rdma_data_direct_; }
     int GetEfaCqThreads() const { return efa_cq_threads_; }
-    bool GetStoreChecksumEnabled() const { return store_checksum_enabled_; }
 
     uint32_t GetRpcClientIoThreads() const { return rpc_client_io_threads_; }
     uint32_t GetStoreRpcClientIoThreads() const {
@@ -161,7 +160,6 @@ class Environ {
     bool with_nvidia_peermem_;
     bool rdma_data_direct_;
     int efa_cq_threads_;
-    bool store_checksum_enabled_;
     uint32_t rpc_client_io_threads_;
     uint32_t store_rpc_client_io_threads_;
     uint32_t transfer_engine_rpc_client_io_threads_;

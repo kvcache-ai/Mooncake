@@ -66,10 +66,9 @@ docker_launch(){
         else
             echo "sglang-router already installed, skipping"
         fi
-        # Reuse SGLang CI's single source of truth for the git-only evaluator
-        # pin instead of duplicating the commit here.
+        # Install the evaluator version required by tone tests.
         pip_cmd=$(append_str "${pip_cmd}" \
-            'source /sgl-workspace/sglang/scripts/ci/utils/sgl_eval_ref.sh && pip install "$SGL_EVAL_SPEC"')
+            'pip install sgl-eval==0.1.0')
     fi
 
     echo "Installing ERDMA drivers"
@@ -118,21 +117,51 @@ stop_container(){
 
     echo "Stopping ${location} Docker container: ${container_name}"
 
-    if [ "$location" == "remote" ]; then
+    if [ "$location" = "remote" ]; then
         local ssh_target=$remote_host
         ${SSH_CMD:-ssh -o StrictHostKeyChecking=no} "$ssh_target" \
-            "docker stop ${container_name} >/dev/null 2>&1"
+            "if docker container inspect ${container_name} >/dev/null 2>&1; then docker stop ${container_name} >/dev/null; fi"
     else
-        docker stop ${container_name} >/dev/null 2>&1
+        if docker container inspect "$container_name" >/dev/null 2>&1; then
+            docker stop "$container_name" >/dev/null
+        fi
     fi
 
     if [ $? -eq 0 ]; then
         echo "Successfully stopped ${location} container: ${container_name}"
         return 0
-    else
-        echo "Failed to stop ${location} container: ${container_name} (may not exist)"
+    fi
+
+    echo "Failed to stop ${location} container: ${container_name}" >&2
+    return 1
+}
+
+restart_container(){
+    local container_name=${1:-$CONTAINER_NAME}
+    local remote_host=${2:-}
+    local location="local"
+
+    if [ -z "$container_name" ]; then
+        echo "ERROR: No container name provided" >&2
         return 1
     fi
+
+    if [ -n "$remote_host" ]; then
+        location="remote"
+        ${SSH_CMD:-ssh -o StrictHostKeyChecking=no} "$remote_host" \
+            "docker container inspect ${container_name} >/dev/null 2>&1 && docker restart ${container_name} >/dev/null"
+    else
+        docker container inspect "$container_name" >/dev/null 2>&1 && \
+            docker restart "$container_name" >/dev/null
+    fi
+
+    if [ $? -eq 0 ]; then
+        echo "Successfully restarted ${location} container: ${container_name}"
+        return 0
+    fi
+
+    echo "ERROR: Failed to restart ${location} container: ${container_name}" >&2
+    return 1
 }
 
 cleanup_test_env() {
@@ -160,8 +189,20 @@ cleanup_test_env() {
     return 0
 }
 
-# TONE retains its existing between-case lifecycle.
+# Restarting preserves the container writable layer while stopping all test
+# services and releasing their GPU allocations before the next case.
 drain_gpu_between_tests() {
+    echo "===== Resetting shared test environment between cases ====="
+
+    if ! restart_container "${CONTAINER_NAME}"; then
+        return 1
+    fi
+
+    if [ -n "${REMOTE_IP:-}" ] && ! restart_container "${CONTAINER_NAME}" "$REMOTE_IP"; then
+        return 1
+    fi
+
+    sleep 5
     return 0
 }
 

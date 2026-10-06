@@ -180,6 +180,48 @@ TEST(LocalMemoryLifecycle, DefaultHostOptionsAllocateUsableSharedMemory) {
     EXPECT_TRUE(target.freeLocalMemory(source).ok());
 }
 
+TEST(LocalMemoryLifecycle, BasicShmAllocationsRegisterForReadAndWrite) {
+    auto config = makeConfig();
+    config->set("transports/shm/enable", true);
+    TransferEngineImpl target(config);
+    TransferEngineImpl initiator(config);
+    ASSERT_TRUE(target.available());
+    ASSERT_TRUE(initiator.available());
+
+    constexpr size_t kSize = 4096;
+    void* source = nullptr;
+    void* destination = nullptr;
+    ASSERT_TRUE(target.allocateLocalMemory(&source, kSize).ok());
+    ASSERT_TRUE(initiator.allocateLocalMemory(&destination, kSize).ok());
+    ASSERT_TRUE(target.registerLocalMemory(source, kSize).ok());
+    ASSERT_TRUE(initiator
+                    .registerLocalMemory(std::vector<void*>{destination},
+                                         std::vector<size_t>{kSize})
+                    .ok());
+
+    SegmentID peer;
+    ASSERT_TRUE(initiator.openSegment(peer, target.getSegmentName()).ok());
+    Request request;
+    request.source = destination;
+    request.target_id = peer;
+    request.target_offset = reinterpret_cast<uint64_t>(source);
+    request.length = kSize;
+    for (auto opcode : {Request::READ, Request::WRITE}) {
+        request.opcode = opcode;
+        std::memset(source, 0x6b, kSize);
+        std::memset(destination, 0x5a, kSize);
+        auto status = initiator.transferSync({request});
+        EXPECT_TRUE(status.ok()) << status.ToString();
+        EXPECT_EQ(std::memcmp(source, destination, kSize), 0);
+    }
+
+    EXPECT_TRUE(initiator.closeSegment(peer).ok());
+    EXPECT_TRUE(initiator.unregisterLocalMemory(destination).ok());
+    EXPECT_TRUE(target.unregisterLocalMemory(source).ok());
+    EXPECT_TRUE(initiator.freeLocalMemory(destination).ok());
+    EXPECT_TRUE(target.freeLocalMemory(source).ok());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

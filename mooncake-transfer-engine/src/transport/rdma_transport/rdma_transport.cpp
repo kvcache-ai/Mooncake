@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
@@ -279,27 +280,40 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
         return 0;
     }
 
-    auto hwc = std::thread::hardware_concurrency();
-    auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
+    const auto hwc = std::thread::hardware_concurrency();
+    size_t num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
     if (length > (size_t)globalConfig().max_mr_size) {
         length = (size_t)globalConfig().max_mr_size;
     }
-    size_t block_size = length / num_threads;
-    if (block_size == 0) {
+
+    const size_t page_size = detectBufferPageSize(addr);
+    const size_t page_count = length / page_size;
+    if (page_count == 0) {
         return 0;
     }
+    num_threads = std::min(num_threads, page_count);
+    const size_t pages_per_thread = page_count / num_threads;
+    const size_t extra_pages = page_count % num_threads;
+    size_t offset = 0;
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     std::vector<int> thread_results(num_threads, 0);
 
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
-        void *block_addr = static_cast<char *>(addr) + thread_i * block_size;
+        const size_t block_pages =
+            pages_per_thread + (thread_i < extra_pages ? 1 : 0);
+        size_t block_size = block_pages * page_size;
+        if (thread_i + 1 == num_threads) {
+            block_size += length % page_size;
+        }
+        void *block_addr = static_cast<char *>(addr) + offset;
         threads.emplace_back([this, thread_i, block_addr, block_size,
                               &thread_results]() {
             int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
             thread_results[thread_i] = ret;
         });
+        offset += block_size;
     }
 
     for (auto &thread : threads) {
@@ -335,40 +349,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
 
-    // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
-    // max_mr_size, but the metadata would still advertise the full BufferDesc
-    // length, so any remote RDMA op past the boundary fails with
-    // IBV_WC_REM_ACCESS_ERR (ionic CQE error 10). Split buffers larger than
-    // max_mr_size into chunks of <= max_mr_size, register each as its own MR,
-    // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
-    // are address-range based, so each chunk gets the correct key).
-    size_t chunk_limit = (size_t)globalConfig().max_mr_size;
-    std::vector<std::pair<void *, size_t>> chunks;
-    if (chunk_limit > 0 && length > chunk_limit) {
-        for (size_t offset = 0; offset < length;) {
-            size_t chunk_len = std::min(chunk_limit, length - offset);
-            chunks.emplace_back(static_cast<char *>(addr) + offset, chunk_len);
-            offset += chunk_len;
-        }
-        LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
-                     << " bytes) into " << chunks.size()
-                     << " chunks of <= " << chunk_limit
-                     << " bytes each (device max_mr_size; Mooncake#2017)";
-    } else {
-        chunks.emplace_back(addr, length);
-    }
-
-    // Resolve the location name once, from the original buffer.
-    std::string resolved_name;
-    if (name == kWildcardLocation) {
-        bool only_first_page = true;
-        const std::vector<MemoryLocationEntry> entries =
-            getMemoryLocation(addr, length, only_first_page);
-        if (entries.empty()) return -1;
-        resolved_name = entries[0].location;
-    } else {
-        resolved_name = name;
-    }
+    std::string resolved_name = name;
 
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
@@ -389,6 +370,97 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         DmabufExport &exp;
         ~DmabufCloser() { RdmaContext::closeDmabufExport(exp); }
     } dmabuf_closer{dmabuf_exp};
+
+    // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
+    // max_mr_size, but the metadata would still advertise the full BufferDesc
+    // length, so any remote RDMA op past the boundary fails with
+    // IBV_WC_REM_ACCESS_ERR (ionic CQE error 10). Split buffers larger than
+    // max_mr_size into chunks of <= max_mr_size, register each as its own MR,
+    // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
+    // are address-range based, so each chunk gets the correct key).
+    size_t chunk_limit = (size_t)globalConfig().max_mr_size;
+    // Round the chunk limit down to the buffer's page size before splitting,
+    // but ONLY for HugeTLB-backed buffers (page size larger than the base
+    // page). A non-page-aligned effective max_mr_size (e.g. a hand-set
+    // MC_MAX_MR_SIZE) would otherwise produce chunk boundaries that fall
+    // inside a HugeTLB page. ibv_fork_init() then makes ibv_reg_mr()/pre-touch
+    // run MADV_DONTFORK on that range, and the kernel refuses to split a
+    // hugetlb VMA at a non-hugepage-aligned boundary, failing with EINVAL.
+    // Aligning the limit down keeps every chunk (and thus every pre-touch
+    // block) page-aligned. A limit smaller than one huge page cannot yield a
+    // page-aligned chunk at all, so report the conflict instead of silently
+    // registering an oversized or misaligned MR.
+    //
+    // Regular base pages (and THP, which reports the base page in
+    // KernelPageSize) can be split at any boundary, so this alignment and the
+    // rejection must NOT run for them: the kernel splits ordinary VMAs freely,
+    // so a within-limit registration always succeeds on the hardware. Running
+    // the round-down there would (a) falsely reject a registration when
+    // MC_MAX_MR_SIZE is set below one base page and (b) force needless extra
+    // chunking when the limit is not a page multiple. Gating on the page size
+    // confines the fix to the HugeTLB case that actually needs it.
+    //
+    // Compare against the runtime base page size from sysconf(_SC_PAGESIZE)
+    // rather than a hardcoded 4 KiB: on a larger-base-page platform (e.g. an
+    // ARM64 kernel built with 64 KiB pages) every ordinary mapping reports that
+    // base page in KernelPageSize, so a fixed 4 KiB threshold would misclassify
+    // a regular buffer as HugeTLB and reintroduce the false rejection there.
+    const size_t buffer_page_size = detectBufferPageSize(addr);
+    static const size_t base_page_size =
+        static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    if (chunk_limit > 0 && buffer_page_size > base_page_size) {
+        const size_t aligned_limit =
+            chunk_limit / buffer_page_size * buffer_page_size;
+        if (aligned_limit == 0) {
+            LOG(ERROR) << "Effective max_mr_size " << chunk_limit
+                       << " is smaller than the HugeTLB page size "
+                       << buffer_page_size
+                       << "; cannot form a page-aligned MR chunk. Raise "
+                          "MC_MAX_MR_SIZE to at least one huge page, or check "
+                          "it against the device max_mr_size and the hugepage "
+                          "configuration.";
+            return ERR_INVALID_ARGUMENT;
+        }
+        chunk_limit = aligned_limit;
+    }
+    // Data Direct additionally requires a page-aligned IOVA, so
+    // registerMemoryRegionInternal() expands each chunk's MR down to the
+    // preceding page boundary. Reserve room for that prefix here so the
+    // expanded MR still fits inside chunk_limit. Orthogonal to the HugeTLB
+    // round-down above: that path only triggers for host memory, where
+    // alignment stays 1, while Data Direct only applies to device memory,
+    // whose mappings report the base page size.
+    size_t alignment = 1;
+#ifdef USE_CUDA
+    if (dmabuf_exp.method == DmabufExport::Method::kDmabufReg &&
+        Environ::Get().GetRdmaDataDirect()) {
+        alignment = getpagesize();
+    }
+#endif
+    std::vector<std::pair<void *, size_t>> chunks;
+    if (chunk_limit > 0) {
+        size_t offset = 0;
+        do {
+            auto *chunk_addr = static_cast<char *>(addr) + offset;
+            const size_t prefix = (uintptr_t)chunk_addr % alignment;
+            if (prefix >= chunk_limit) {
+                LOG(ERROR)
+                    << "Data Direct alignment prefix exceeds max_mr_size";
+                return ERR_INVALID_ARGUMENT;
+            }
+            size_t chunk_len = std::min(chunk_limit - prefix, length - offset);
+            chunks.emplace_back(chunk_addr, chunk_len);
+            offset += chunk_len;
+        } while (offset < length);
+        if (chunks.size() > 1) {
+            LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
+                         << " bytes) into " << chunks.size()
+                         << " chunks of <= " << chunk_limit
+                         << " bytes each (device max_mr_size; Mooncake#2017)";
+        }
+    } else {
+        chunks.emplace_back(addr, length);
+    }
 
     // Best-effort unregister of ONE chunk's MRs across all contexts. Used to
     // clean up a chunk whose registration failed part-way (some contexts
@@ -429,9 +501,15 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // which is capped at max_mr_size and would silently disable pre-touch for a
     // >=4GiB buffer). Compute once above the loop to avoid repeated
     // hardware_concurrency() OS queries per chunk.
-    const bool do_pre_touch = context_list_.size() > 0 &&
-                              std::thread::hardware_concurrency() >= 4 &&
-                              length >= (size_t)4 * 1024 * 1024 * 1024;
+    //
+    // Pre-touch faults host pages in before the real registration. It gains
+    // nothing for device memory registered through DMA-BUF, where each
+    // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
+    // block, so skip it there.
+    const bool do_pre_touch =
+        dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
+        context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
+        length >= (size_t)4 * 1024 * 1024 * 1024;
 
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void *chunk_addr = chunks[ci].first;
@@ -526,6 +604,14 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                       << ", contexts=" << context_list_.size()
                       << ", parallel=" << (use_parallel_reg ? "true" : "false")
                       << ", duration=" << reg_duration_ms << "ms";
+        }
+
+        // Registration faults in untouched host pages. Resolve the original
+        // buffer's first page only after it has been pinned, or NUMA discovery
+        // can retain "*" and select NICs on unrelated NUMA nodes.
+        if (ci == 0 && name == kWildcardLocation) {
+            const auto entries = getMemoryLocation(addr, length, true);
+            resolved_name = entries[0].location;
         }
 
         // Collect per-context keys for THIS chunk (address-range lookup).

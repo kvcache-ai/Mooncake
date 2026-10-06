@@ -205,6 +205,13 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
         echo -e "${GREEN}shca-tools package detected. Adjusting system packages accordingly; build with -DUSE_SHCA=ON to enable SHCA support.${NC}"
     fi
 
+    # Since Ubuntu 26.04, libmsgpack-dev is a transitional package for the C-only
+    # libmsgpack-c-dev, so msgpack.hpp needs libmsgpack-cxx-dev. Ubuntu 22.04 has no
+    # libmsgpack-cxx-dev and ships msgpack.hpp in libmsgpack-dev.
+    if apt-cache show libmsgpack-cxx-dev > /dev/null 2>&1; then
+        SYSTEM_PACKAGES="$SYSTEM_PACKAGES libmsgpack-cxx-dev"
+    fi
+
     apt-get install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
 
