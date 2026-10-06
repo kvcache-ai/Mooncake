@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "config.h"
+#include "common.h"
 #include "transfer_metadata.h"
 
 namespace mooncake {
@@ -22,6 +23,8 @@ void TransferMetadata::SegmentDesc::dump() const {
         LOG(INFO) << "  rdma server name: " << rdma_server_name;
     }
     LOG(INFO) << "  protocol: " << protocol;
+    LOG(INFO) << "  metadata version: " << metadata_version << " ("
+              << formatEpochMicroseconds(metadata_version) << ")";
     if (!tcp_data_host.empty()) {
         LOG(INFO) << "  tcp data endpoint: " << tcp_data_host << ":"
                   << tcp_data_port;
@@ -85,12 +88,20 @@ void TransferMetadata::dumpMetadataContentUnlocked() {
     }
     LOG(INFO) << "=== Local RPC Route ===";
     LOG(INFO) << "location: " << local_rpc_meta_.ip_or_host_name << ":"
-              << local_rpc_meta_.rpc_port;
+              << local_rpc_meta_.rpc_port
+              << ", metadata version: " << local_rpc_meta_.metadata_version
+              << " ("
+              << formatEpochMicroseconds(local_rpc_meta_.metadata_version)
+              << ")";
     LOG(INFO) << "=== Remote RPC Routes ===";
     for (auto& entry : rpc_meta_map_) {
         LOG(INFO) << "segment name: " << entry.first
                   << ", location: " << entry.second.ip_or_host_name << ":"
-                  << entry.second.rpc_port;
+                  << entry.second.rpc_port
+                  << ", metadata version: " << entry.second.metadata_version
+                  << " ("
+                  << formatEpochMicroseconds(entry.second.metadata_version)
+                  << ")";
     }
 }
 }  // namespace mooncake

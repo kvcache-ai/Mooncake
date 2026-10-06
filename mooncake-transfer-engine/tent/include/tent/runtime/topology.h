@@ -80,11 +80,7 @@ class Topology {
 
     void clear();
 
-    // Preserve the original one-argument symbol for source and binary
-    // compatibility with callers that do not opt into UB discovery.
     Status discover(const std::vector<Platform*>& platforms);
-
-    Status discover(const std::vector<Platform*>& platforms, bool discover_ub);
 
     Status parse(const std::string& json_content);
 
@@ -115,6 +111,10 @@ class Topology {
     const NicEntry* getNicEntry(const std::string& name) const;
 
     const MemEntry* getMemEntry(const std::string& name) const;
+
+    // True only when both NUMA ids are known and differ. Unknown (-1) is not
+    // treated as remote; rank is ignored because probes disagree on placement.
+    bool isCrossNuma(const MemEntry& mem, NicID nic_id) const;
 
     NicID getNicId(const std::string& name) const;
 
@@ -185,7 +185,7 @@ inline Topology::MemType memTypeFromLocation(const std::string& location) {
     if (type == "cpu") return Topology::MEM_HOST;
     if (type == "cuda" || type == "gpu") return Topology::MEM_CUDA;
     if (isAmdGpuLocationType(type)) return Topology::MEM_ROCM;
-    if (type == "ascend") return Topology::MEM_ASCEND;
+    if (type == "ascend" || type == "npu") return Topology::MEM_ASCEND;
     return Topology::MEM_UNKNOWN;
 }
 

@@ -4,7 +4,7 @@ from typing import Optional
 
 from ...contracts import ParticipantId
 from ..manifest import WeightPlacementManifest
-from ..storage_manifest import WeightManifest
+from ..storage_manifest import StoredWeightManifest
 from .contracts import LogicalTransferPlan, PlanningLimits
 from .core import (
     _collect_placements,
@@ -119,7 +119,7 @@ def plan_placement_transfer_to_local_target(
 
 
 def plan_stored_transfer_to_target_placement(
-    source_manifest: WeightManifest,
+    source_manifest: StoredWeightManifest,
     target_placement: WeightPlacementManifest,
     *,
     planning_limits: Optional[PlanningLimits] = None,

@@ -42,6 +42,20 @@
 
 namespace mooncake {
 
+// The historical Mooncake value for outstanding RDMA READ/atomic operations
+// per QP (the IB default most HCAs advertise).
+constexpr int kIdealRdAtomicDepth = 16;
+
+// Program a QP's RD-atomic depth from the device's advertised limit. Capped at
+// kIdealRdAtomicDepth to preserve the previous behaviour on HCAs that support
+// more, and floored at 1 so a device that reports 0 (no single-sided READ
+// support) fails loudly in ibv_modify_qp() instead of silently on every later
+// READ.
+inline int clampRdAtomicDepth(int device_max) {
+    if (device_max <= 0) return 1;
+    return device_max < kIdealRdAtomicDepth ? device_max : kIdealRdAtomicDepth;
+}
+
 class RdmaEndPoint;
 class RdmaTransport;
 class RdmaContextTestPeer;
@@ -85,6 +99,7 @@ struct MemoryRegionMeta {
     // mr->addr is not set to starting address for iova based mr. Therefore we
     // track it ourselves.
     void *addr;
+    size_t length;
     struct ibv_mr *mr;
 };
 
@@ -107,6 +122,8 @@ class RdmaContext {
    public:
     friend class RdmaContextTestPeer;
     friend class WorkerPool;
+    friend class RdmaEndPoint;
+    friend class RdmaTransport;
 
     RdmaContext(RdmaTransport &engine, const std::string &device_name);
 
@@ -131,14 +148,18 @@ class RdmaContext {
     int registerMemoryRegion(void *addr, size_t length, int access,
                              const DmabufExport &exp);
 
-    // Exports a single dma_buf fd for the allocation backing addr. GPU device
+    // Exports a single dma_buf fd covering [addr, addr + length). GPU device
     // memory yields kDmabufReg with a live fd; host memory and the
     // nvidia-peermem path yield kHostReg with no fd. Any fd placed in out.fd
     // MUST be closed by the caller (via closeDmabufExport) AFTER every
     // registerMemoryRegion() call consuming it has returned — each successful
     // registration takes its own reference, so closing earlier would invalidate
     // the fd for the remaining NICs.
-    static int exportDmabuf(void *addr, DmabufExport &out);
+    // `length` is the length of the whole buffer the caller is going to
+    // register (chunked registrations derive their own offset from out.offset),
+    // and is used to guarantee the exported dma_buf really covers that range —
+    // see the VMM note in exportDmabuf().
+    static int exportDmabuf(void *addr, size_t length, DmabufExport &out);
 
     // Closes the fd held by a DmabufExport, if any. Idempotent.
     static void closeDmabufExport(DmabufExport &exp);
@@ -171,8 +192,14 @@ class RdmaContext {
     }
 
    public:
+    bool nativeNotifyEnabled() const { return native_notify_enabled_; }
+
     // EndPoint Management
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
+    std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path,
+                                           int cq_index);
+    std::shared_ptr<RdmaEndPoint> findEndpoint(
+        const std::string &peer_nic_path);
 
     std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr);
@@ -218,7 +245,7 @@ class RdmaContext {
     std::string nicPath() const;
 
    public:
-    uint16_t lid() const { return lid_; }
+    uint32_t lid() const { return lid_; }
 
     std::string gid() const;
 
@@ -254,19 +281,32 @@ class RdmaContext {
 
     ibv_mtu activeMTU() const { return active_mtu_; }
 
+    // Per-NIC outstanding RD-atomic depths, derived from this device's
+    // ibv_device_attr so a slower NIC on a heterogeneous host cannot cap the
+    // QPs of the faster ones.
+    int maxQpRdAtom() const { return max_qp_rd_atom_; }
+    int maxQpInitRdAtom() const { return max_qp_init_rd_atom_; }
+
     ibv_comp_channel *compChannel();
 
     int compVector();
 
     int eventFd() const { return event_fd_; }
 
-    ibv_cq *cq();
+    ibv_cq *cq(int cq_index);
 
     std::atomic<int> *cqOutstandingCount(int cq_index) {
         return &cq_list_[cq_index].outstanding;
     }
 
     int cqCount() const { return cq_list_.size(); }
+    int postingThreadForPeer(const std::string &peer_nic_path) const;
+    int cqIndexForPostingThread(int thread_id) const;
+    int cqIndexForPeer(const std::string &peer_nic_path) const;
+    int transferWorkerCount() const { return transfer_worker_count_; }
+    std::unique_lock<std::mutex> lockEndpointLifecycle(
+        const std::string &peer_nic_path) const;
+    std::vector<std::unique_lock<std::mutex>> lockAllEndpointLifecycles() const;
 
     int poll(int num_entries, ibv_wc *wc, int cq_index = 0);
 
@@ -304,12 +344,14 @@ class RdmaContext {
     ibv_comp_channel **comp_channel_ = nullptr;
 
     uint8_t port_ = 0;
-    uint16_t lid_ = 0;
+    uint32_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;
     int active_width_ = 1;
     ibv_mtu active_mtu_;
     uint8_t num_lag_ports_ = 0;  // 0/1 = not in LAG; ≥2 = LAG active
+    int max_qp_rd_atom_ = kIdealRdAtomicDepth;
+    int max_qp_init_rd_atom_ = kIdealRdAtomicDepth;
     ibv_gid gid_;
     mutable std::mutex gid_lock_;
     mutable std::mutex gid_reprobe_lock_;
@@ -320,6 +362,17 @@ class RdmaContext {
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
+    bool native_notify_enabled_ = false;
+    std::mutex notify_mutex_;
+    // One fixed-size notification CQ per device, separate from the data CQs.
+    ibv_cq *notify_cq_ = nullptr;
+    std::unordered_map<uint32_t, std::weak_ptr<RdmaEndPoint>> notify_endpoints_;
+    void registerNotifyQp(uint32_t qp_num,
+                          const std::weak_ptr<RdmaEndPoint> &endpoint);
+    void unregisterNotifyQp(uint32_t qp_num);
+    int pollNotificationCq();
+    void dispatchNotificationCompletion(
+        const ibv_wc &wc, std::vector<TransferMetadata::NotifyDesc> &received);
 
     // Active-connect circuit-breaker (keyed by peer server name).
     ConnectPauseTracker connect_pause_;
@@ -329,7 +382,9 @@ class RdmaContext {
 
     std::atomic<int> next_comp_channel_index_;
     std::atomic<int> next_comp_vector_index_;
-    std::atomic<int> next_cq_list_index_;
+
+    int transfer_worker_count_ = 0;
+    std::vector<std::unique_ptr<std::mutex>> endpoint_lifecycle_locks_;
 
     std::shared_ptr<WorkerPool> worker_pool_;
 

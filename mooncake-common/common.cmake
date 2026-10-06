@@ -87,6 +87,20 @@ option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
 option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
+option(USE_RISCV "Enable RISC-V build compatibility settings" OFF)
+if(USE_RISCV)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+    message(
+      WARNING
+        "USE_RISCV is enabled, but CMAKE_SYSTEM_PROCESSOR is '${CMAKE_SYSTEM_PROCESSOR}'"
+    )
+  endif()
+  # Define this before any pybind11 module is created. Otherwise pybind11 adds
+  # its default full-LTO target, which is prohibitively resource-intensive on
+  # RISC-V build hosts.
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+  message(STATUS "RISC-V: IPO disabled for Mooncake Python extensions")
+endif()
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -105,8 +119,14 @@ option(
   USE_TPU
   "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
   OFF)
+option(
+  USE_XPU
+  "option for enabling Intel XPU (oneAPI SYCL) staging support in TENT; this is a direct-link (native) build that requires USE_TENT and the Intel DPC++ compiler (icpx / IntelLLVM) at build time -- there is no dlopen shim"
+  OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
+option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -267,8 +287,30 @@ if(USE_SUPA)
     endif()
   endif()
   message(STATUS "  BIREN_HOME: ${BIREN_HOME}")
-  include_directories(${BIREN_HOME}/supa/include)
+  # The SUPA SDK ships generic header names (e.g. version.h) that must not
+  # shadow Mooncake's own headers, so expose it as a system include directory.
+  include_directories(SYSTEM ${BIREN_HOME}/supa/include)
   link_directories(${BIREN_HOME}/supa/lib ${BIREN_HOME}/brumd/lib)
+  # Resolve the runtime library by name: older SUPA SDKs ship libsupa.so with a
+  # separate libsupart.so, while newer SDKs ship a single libsupa-runtime.so.
+  find_library(
+    SUPA_RUNTIME_LIBRARY
+    NAMES supa supa-runtime
+    PATHS ${BIREN_HOME}/supa/lib)
+  find_library(
+    SUPA_PART_LIBRARY
+    NAMES supart
+    PATHS ${BIREN_HOME}/supa/lib)
+  if(NOT SUPA_RUNTIME_LIBRARY)
+    message(
+      FATAL_ERROR
+        "SUPA runtime library not found under ${BIREN_HOME}/supa/lib (expected libsupa.so, libsupa-runtime.so, or libsupart.so)"
+    )
+  endif()
+  set(SUPA_LIBRARIES ${SUPA_RUNTIME_LIBRARY})
+  if(SUPA_PART_LIBRARY)
+    list(APPEND SUPA_LIBRARIES ${SUPA_PART_LIBRARY})
+  endif()
 endif()
 
 if(USE_TPU)
@@ -283,6 +325,34 @@ if(USE_TPU)
   endif()
   add_compile_definitions(USE_TPU)
   message(STATUS "TPU (PJRT) staging support is enabled")
+endif()
+
+if(USE_XPU)
+  # Every XPU source file lives under mooncake-transfer-engine/tent, which is
+  # only added when USE_TENT is ON. Without this guard -DUSE_XPU=ON configures
+  # and builds cleanly while compiling no XPU code at all.
+  if(NOT USE_TENT)
+    message(
+      FATAL_ERROR
+        "USE_XPU=ON requires USE_TENT=ON: all XPU support lives in TENT. Re-run cmake with -DUSE_TENT=ON."
+    )
+  endif()
+  # The XPU platform links oneAPI SYCL directly (native / direct-link): its
+  # translation units include <sycl/sycl.hpp> and are compiled with -fsycl, so
+  # the whole build must use the Intel DPC++ compiler. Configure with icpx, e.g.
+  # CXX=icpx cmake -DUSE_TENT=ON -DUSE_XPU=ON ... (from an intel/oneapi-basekit
+  # or intel/pytorch:xpu image, or after `source /opt/intel/oneapi/setvars.sh`).
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM" AND NOT CMAKE_CXX_COMPILER
+                                                       MATCHES "icpx|icx|dpcpp")
+    message(
+      FATAL_ERROR
+        "USE_XPU=ON requires the Intel DPC++ compiler (icpx): the XPU platform "
+        "links SYCL directly. Re-run cmake with CXX=icpx (detected "
+        "'${CMAKE_CXX_COMPILER_ID}' at ${CMAKE_CXX_COMPILER}).")
+  endif()
+  add_compile_definitions(USE_XPU)
+  message(
+    STATUS "Intel XPU (oneAPI SYCL, direct-link) staging support is enabled")
 endif()
 
 if(NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
@@ -428,6 +498,11 @@ if(USE_COREX)
   if(EXISTS "${COREX_LIB_DIR}")
     link_directories(${COREX_LIB_DIR})
   endif()
+endif()
+
+# Hylink builds on the HIP runtime; enable it automatically.
+if(USE_HYLINK AND NOT USE_HIP)
+  set(USE_HIP ON)
 endif()
 
 if(USE_HIP)
@@ -718,4 +793,16 @@ if(USE_FLAGCX)
     STATUS
       "FlagCX transport enabled, include=${FLAGCX_INCLUDE_DIR}, library=${FLAGCX_LIBRARY}"
   )
+endif()
+
+if(USE_SHCA)
+  add_compile_definitions(USE_SHCA)
+elseif(YLT_ENABLE_IBV)
+  # YLT_ENABLE_IBV is set in FindYLT.cmake (OFF on macOS).
+  add_compile_definitions(YLT_ENABLE_IBV)
+endif()
+
+if(USE_HYLINK)
+  add_compile_definitions(USE_HYLINK)
+  message(STATUS "Hylink transport is enabled")
 endif()

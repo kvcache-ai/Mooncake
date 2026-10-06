@@ -1,15 +1,19 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <functional>
+#include <future>
+#include <utility>
 
+#include "common_types.h"
 #include "control_plane/control_types.h"
 #include "gpu_runtime.h"
 
 #include <transfer_engine.h>
 #include <mooncake_worker_kernels.cuh>
-#include "comm_types.h"
 
 #include <memory>
 #include <mutex>
@@ -24,6 +28,34 @@ namespace mooncake {
 static constexpr size_t kBufferSize = 1u << 24;
 
 class MooncakeCommunicator;
+
+class WorkCompletion {
+   public:
+    explicit WorkCompletion(std::shared_future<void> completion)
+        : completion_(std::move(completion)) {}
+
+    bool isCompleted() const {
+        if (completion_.wait_for(std::chrono::microseconds(0)) !=
+            std::future_status::ready) {
+            return false;
+        }
+        completion_.get();
+        return true;
+    }
+
+    bool wait(std::chrono::microseconds timeout) const {
+        if (timeout.count() < 0) {
+            completion_.wait();
+        } else if (completion_.wait_for(timeout) != std::future_status::ready) {
+            return false;
+        }
+        completion_.get();
+        return true;
+    }
+
+   private:
+    std::shared_future<void> completion_;
+};
 
 // Local collective extension state. Every communicator starts in Isolated.
 //
@@ -67,6 +99,7 @@ struct TransferGroupMeta {
 
     bool* activeRanks;
     bool* activeRanksDevice;
+    int32_t* activeRanksMirrorDevice = nullptr;
     bool* maybeActivatable;
     RankState rankStates[kMaxNumRanks];  // per GlobalRank
     uint64_t rankEpochs[kMaxNumRanks];
@@ -111,6 +144,8 @@ class MooncakeWorker {
 
     void Start();
 
+    bool hasPendingActiveRanksMirrorUpdate(const TransferGroupMeta* meta) const;
+
     /**
      * @brief Waits for all active collective tasks for the given communicator
      * to complete.
@@ -126,26 +161,35 @@ class MooncakeWorker {
     bool drainTasks(const TransferGroupMeta* meta) const;
 
    private:
+    struct CudaTaskSubmissionToken {
+        size_t task_id;
+        uint64_t sequence;
+    };
+
     void startWorker();
     void waitUntilTasksSubmitted(
         const std::vector<CudaTaskSubmissionToken>& tasks) const;
 
-    static constexpr size_t kNumTasks_ = 4;
+    static constexpr size_t kNumCpuTasks_ = 2;
+    static constexpr size_t kNumCudaTasks_ = 2;
+    static constexpr size_t kCudaTaskOffset_ = kNumCpuTasks_;
+    static constexpr size_t kNumTasks_ = kNumCpuTasks_ + kNumCudaTasks_;
 
     static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
     std::atomic<bool> running_{false};
     std::atomic<bool> started_{false};
     int cuda_device_index_;
-    std::optional<GpuStream> enqueue_stream_;
+    std::array<std::optional<GpuStream>, kNumCudaTasks_> enqueue_streams_;
 
     Task *tasks_, *tasks_device_;
     bool hasCallback_[kNumTasks_]{};
     std::function<void()> callbacks_[kNumTasks_]{};
 
     int cpuTaskCount = 0;
-    int cudaTaskCount = 0;
+    size_t cudaOpCount = 0;
     std::atomic<uint64_t> next_cuda_task_sequence_{1};
+    std::atomic<uint64_t> next_active_ranks_mirror_generation_{1};
     std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
 
     std::thread worker_thread_;

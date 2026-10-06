@@ -1,12 +1,13 @@
 #pragma once
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "config/distributed_storage_config.h"
 #include "fs_adapter.h"
 #include "replica.h"
 #include "storage/distributed/object_storage_adapter.h"
@@ -19,26 +20,6 @@ namespace mooncake {
 enum class DistributedStorageMode {
     kFileSystem,
     kObjectStorage,
-};
-
-struct DistributedStorageConfig {
-    std::string fsdir = "/mnt/3fs/mooncake";
-    std::string fs_adapter_type = "hf3fs";
-    bool enable_health_check = false;
-    int shard_count = 64;
-    uint64_t shard_capacity = 4ULL * 1024 * 1024 * 1024;
-    uint64_t alignment = 4096;
-    bool single_tenant = true;
-    bool eviction_enabled = true;
-    double eviction_high_watermark = 0.9;
-    double eviction_low_watermark = 0.7;
-    std::chrono::seconds deferred_free_duration{30};
-    std::chrono::seconds eviction_check_interval{5};
-
-    bool Validate() const;
-    bool ValidateForAllocator() const;
-    static DistributedStorageConfig FromEnvironment();
-    std::string FormatStr() const;
 };
 
 struct DfsWriteRequest {
@@ -117,11 +98,23 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::mutex mutex;
     };
 
+    tl::expected<ShardFile*, ErrorCode> GetOrOpenShard(
+        const DistributedFSDescriptor& descriptor);
+    tl::expected<int, ErrorCode> OpenBucket(
+        const DistributedFSDescriptor& descriptor);
+    bool UsesBucketAllocator() const;
+
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
-    std::vector<std::unique_ptr<ShardFile>> shard_files_;
+    // Create shard entries only from descriptors published by the master.
+    // The cache lock protects lookup/insertion; each shard's mutex protects
+    // initialization (fd stays -1 until opening succeeds) and positional I/O.
+    // Entries are never erased while the backend is running, so callers can
+    // retain a ShardFile pointer after releasing the cache lock.
+    std::mutex shard_files_mutex_;
+    std::unordered_map<int, std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
     bool initialized_ = false;
 };

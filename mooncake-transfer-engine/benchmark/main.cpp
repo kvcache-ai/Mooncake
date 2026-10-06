@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include "utils.h"
+#include "split_output.h"
+#include "common.h"
 
 #include "bench_runner.h"
 #include "qos_metrics_adapter.h"
@@ -143,11 +145,18 @@ int processBatchSizes(
                    deadline_us * 1000ull;
         };
 
+        auto failTask = [&]() {
+            measurement_started.store(true, std::memory_order_release);
+            return -1;
+        };
+
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {
-            runner.runSingleTransfer(local_addr, target_id, target_addr,
-                                     thread_block_size, thread_batch_size,
-                                     opcode, deadlineNs(), intent_type);
+            if (runner.runSingleTransfer(
+                    local_addr, target_id, target_addr, thread_block_size,
+                    thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
+                return failTask();
+            }
         }
         if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
             num_threads) {
@@ -174,6 +183,7 @@ int processBatchSizes(
                 auto val = runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
+                if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
                 transfer_duration.push_back(val);
@@ -182,6 +192,7 @@ int processBatchSizes(
                 val = runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
+                if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
                 if (XferBenchConfig::check_consistency)
@@ -206,6 +217,7 @@ int processBatchSizes(
                 auto val = runner.runSingleTransfer(
                     local_addr, target_id, target_addr, thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
+                if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
                 if (read_verify) {
@@ -296,6 +308,40 @@ int main(int argc, char* argv[]) {
         "Usage: ./tebench [options]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
+    if (!XferBenchConfig::split_output_jsonl.empty()) {
+        std::string error;
+        if (!openSplitOutput(XferBenchConfig::split_output_jsonl, &error)) {
+            LOG(ERROR) << error;
+            return EXIT_FAILURE;
+        }
+    }
+    if (XferBenchConfig::use_hugepage) {
+        if (XferBenchConfig::backend != "classic" ||
+            (XferBenchConfig::xport_type != "shm" &&
+             XferBenchConfig::xport_type != "rdma")) {
+            LOG(ERROR) << "--use_hugepage requires --backend=classic and "
+                          "--xport_type=shm or rdma";
+            return EXIT_FAILURE;
+        }
+        if (XferBenchConfig::hugepage_size == static_cast<size_t>(-1)) {
+            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, 1GB, or a byte "
+                          "count (2097152, 536870912, 1073741824)";
+            return EXIT_FAILURE;
+        }
+        const size_t hp = XferBenchConfig::hugepage_size == 0
+                              ? mooncake::SharedMemoryOptions::kHugepage2MB
+                              : XferBenchConfig::hugepage_size;
+        if (!mooncake::SharedMemoryOptions::isSupportedHugepageSize(hp)) {
+            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, 1GB, or a byte "
+                          "count (2097152, 536870912, 1073741824)";
+            return EXIT_FAILURE;
+        }
+        if (XferBenchConfig::total_buffer_size % hp != 0) {
+            LOG(ERROR) << "--total_buffer_size must be a multiple of "
+                          "hugepage_size";
+            return EXIT_FAILURE;
+        }
+    }
     std::vector<WorkloadClassConfig> workload_classes;
     std::vector<QosClassConfig> qos_classes;
     if (!XferBenchConfig::workload_classes_json.empty() &&
@@ -459,5 +505,5 @@ int main(int argc, char* argv[]) {
         }
         runner->stopInitiator();
     }
-    return 0;
+    return interrupted ? EXIT_FAILURE : EXIT_SUCCESS;
 }

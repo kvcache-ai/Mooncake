@@ -56,7 +56,9 @@ struct SharedSegmentOptions {
     uint32_t owner_rank = 0;
     // Accelerator that is granted access to the host pages (D2H/H2D).
     int32_t device_id = 0;
-    // true: POSIX shm_open + mmap on the same host.
+    // true: unnamed memfd + mmap. Prefer THP (MADV_HUGEPAGE) so the kernel
+    // can back the span with 2MiB pages; 4KiB pages if THP cannot allocate.
+    // Does not use the HugeTLB pool. Ranks share the pages through the memfd.
     // false: platform VMM with a fabric shareable handle.
     bool mmap = true;
     // When mmap is true: HostRegister the pages for device_id (Ascend).
@@ -80,9 +82,9 @@ class SharedSegment {
                          std::shared_ptr<SharedSegment>& segment,
                          std::string& out_blob);
 
-    // Whether this build can share memory across processes. mmap uses POSIX
-    // shm (always available). host_register additionally needs Ascend.
-    // VMM (mmap=false) needs a platform fabric backend.
+    // Whether this build can share memory across processes. mmap uses an
+    // anonymous memfd (always available). host_register additionally needs
+    // Ascend. VMM (mmap=false) needs a platform fabric backend.
     static bool Supported(bool mmap = true, bool host_register = false);
 
     // Phase two. `blobs` is indexed by rank. After success, `ready()` is true
@@ -94,7 +96,7 @@ class SharedSegment {
     uint64_t size() const { return size_; }
 
     // Address the accelerator sees, when the backend had to map the pages for
-    // it separately (POSIX shm plus HostRegister on Ascend). Zero when
+    // it separately (mmap plus HostRegister on Ascend). Zero when
     // `base_addr()` is already device-accessible.
     uintptr_t device_addr() const;
 

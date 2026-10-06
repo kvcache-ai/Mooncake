@@ -2,14 +2,25 @@
 
 #include <glog/logging.h>
 #include <chrono>
-#include <cstdlib>
 #include <thread>
 
-#include "bool_parser.h"
-#include "integer_parser.h"
+#include "common/byte_size.h"
+#include "config/store_cluster_identity_config.h"
 #include "version.h"
 
 namespace mooncake {
+
+const std::map<std::string, std::string> merge_labels(
+    const std::map<std::string, std::string>& labels) {
+    static const std::string cluster_id =
+        StoreClusterIdentityConfig::FromEnvironment().cluster_id.value_or("");
+    std::map<std::string, std::string> merged_labels;
+    if (!cluster_id.empty()) {
+        merged_labels["cluster_id"] = cluster_id;
+    }
+    merged_labels.insert(labels.begin(), labels.end());
+    return merged_labels;
+}
 
 namespace {
 
@@ -22,55 +33,6 @@ std::map<std::string, std::string> WithBuildInfoLabels(
     return labels;
 }
 
-bool parseMetricsEnabled() {
-    const char* metric_env = std::getenv("MC_STORE_CLIENT_METRIC");
-    if (!metric_env) {
-        return true;
-    }
-    return TryParseBool(metric_env).value_or(false);
-}
-
-bool parseBoolEnv(const char* env_name, bool default_value) {
-    const char* env_value = std::getenv(env_name);
-    if (!env_value) {
-        return default_value;
-    }
-
-    const auto parsed = TryParseBool(env_value);
-    if (parsed.has_value()) {
-        return *parsed;
-    }
-
-    LOG(WARNING) << "Failed to parse " << env_name << ": " << env_value
-                 << ", fallback to default=" << default_value;
-    return default_value;
-}
-
-uint64_t parseMetricsInterval() {
-    const char* interval_env = std::getenv("MC_STORE_CLIENT_METRIC_INTERVAL");
-    if (!interval_env) {
-        // Default to disabled
-        return 0;
-    }
-
-    const auto interval = TryParseInteger<uint64_t>(
-        interval_env,
-        {.trim_ascii_whitespace = true, .allow_leading_plus = true});
-    if (!interval.has_value()) {
-        LOG(WARNING) << "Failed to parse MC_STORE_CLIENT_METRIC_INTERVAL: "
-                     << interval_env << ", disabling metrics reporting";
-        return 0;
-    }
-    if (*interval == 0) {
-        LOG(INFO) << "Client metrics reporting disabled (interval=0) via "
-                     "MC_STORE_CLIENT_METRIC_INTERVAL";
-    } else {
-        LOG(INFO) << "Client metrics interval set to " << *interval
-                  << "s via MC_STORE_CLIENT_METRIC_INTERVAL";
-    }
-    return *interval;
-}
-
 }  // anonymous namespace
 
 ClientMetric::ClientMetric(uint64_t interval_seconds,
@@ -81,10 +43,13 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       master_client_metric(labels),
       transfer_operation_metric(labels),
       ssd_metric(labels),
+      dfs_metric(labels),
+      allocator_metric(labels),
       build_info("mooncake_build_info",
                  "Build version of the running client; the value is always 1 "
                  "and the version strings are carried by the labels",
                  WithBuildInfoLabels(labels)),
+      master_heartbeat_metric(labels),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds),
       bandwidth_reporting_enabled_(bandwidth_reporting_enabled),
@@ -105,24 +70,23 @@ ClientMetric::~ClientMetric() { StopMetricsReportingThread(); }
 std::unique_ptr<ClientMetric> ClientMetric::Create(
     const std::map<std::string, std::string>& labels,
     bool master_rpc_metrics_enabled) {
-    if (!parseMetricsEnabled()) {
+    const auto config = ClientMetricConfig::FromEnvironment();
+    if (!config.enabled) {
         LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=0 to "
                      "disable)";
         return nullptr;
     }
 
-    uint64_t interval = parseMetricsInterval();
-    bool bandwidth_reporting_enabled =
-        parseBoolEnv("MC_STORE_CLIENT_METRIC_BANDWIDTH", true);
-
     LOG(INFO) << "Client metrics enabled (default enabled)";
     LOG(INFO) << "Client bandwidth summary "
-              << (bandwidth_reporting_enabled ? "enabled" : "disabled")
+              << (config.bandwidth_reporting_enabled ? "enabled" : "disabled")
               << " via MC_STORE_CLIENT_METRIC_BANDWIDTH";
 
-    return std::make_unique<ClientMetric>(interval, labels,
-                                          bandwidth_reporting_enabled,
-                                          master_rpc_metrics_enabled);
+    return std::make_unique<ClientMetric>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            config.reporting_interval)
+            .count(),
+        labels, config.bandwidth_reporting_enabled, master_rpc_metrics_enabled);
 }
 
 void ClientMetric::serialize(std::string& str) {
@@ -132,7 +96,11 @@ void ClientMetric::serialize(std::string& str) {
     }
     transfer_operation_metric.serialize(str);
     ssd_metric.serialize(str);
+    dfs_metric.serialize(str);
+    allocator_metric.Refresh();
+    allocator_metric.serialize(str);
     build_info.serialize(str);
+    master_heartbeat_metric.serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {
@@ -151,6 +119,11 @@ std::string ClientMetric::summary_metrics() {
     ss << transfer_operation_metric.summary_metrics();
     ss << "\n";
     ss << ssd_metric.summary_metrics();
+    ss << "\n";
+    ss << dfs_metric.summary_metrics();
+    ss << "\n";
+    allocator_metric.Refresh();
+    ss << allocator_metric.summary_metrics();
     return ss.str();
 }
 

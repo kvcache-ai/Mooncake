@@ -260,7 +260,12 @@ class FakeTransport : public Transport {
         return Status::OK();
     }
 
-    Status removeMemoryBuffer(BufferDesc&) override { return Status::OK(); }
+    Status removeMemoryBuffer(BufferDesc& desc) override {
+        desc.transports.erase(std::remove(desc.transports.begin(),
+                                          desc.transports.end(), self_type_),
+                              desc.transports.end());
+        return Status::OK();
+    }
 
     Status allocateLocalMemory(void** addr, size_t size,
                                MemoryOptions&) override {
