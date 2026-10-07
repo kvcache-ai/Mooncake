@@ -258,6 +258,7 @@ redirects = {
     "design/engram": "store/engram.html",
     "design/tent/tebench": "../../performance/mooncake/tebench.html",
     "deployment/ssd-offload": "ssd/ssd-offload.html",
+    "deployment/oss-offload": "object-storage-offload.html",
     "deployment/nvmf-ssd-deployment-guide": "ssd/nvmf-ssd-deployment-guide.html",
     "integrations/index": "../deployment/index.html",
     "integrations/lmcache": "../deployment/integrations/lmcache/index.html",
