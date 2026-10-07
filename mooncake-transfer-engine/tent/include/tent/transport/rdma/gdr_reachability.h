@@ -28,9 +28,9 @@ namespace tent {
 class Config;
 
 // GdrReachability tracks whether a NIC can actually GPUDirect-DMA (P2P) to a
-// GPU. ibv_reg_mr succeeds on a GPU buffer for every NIC (nvidia-peermem maps
-// the GPU pages per-GPU and hands back a BAR address), so registration cannot
-// tell whether a given NIC's PCIe path can really reach the GPU -- that depends
+// GPU. ibv_reg_mr (nvidia-peermem) and ibv_reg_dmabuf_mr (DMA-BUF) both
+// succeed on a GPU buffer for every NIC, so registration cannot tell whether
+// a given NIC's PCIe path can really reach the GPU -- that depends
 // on PCIe topology / ACS and only surfaces on the data plane as
 // IBV_WC_LOC_PROT_ERR (local NIC -> local GPU) or IBV_WC_REM_ACCESS_ERR
 // (remote NIC -> remote GPU).
