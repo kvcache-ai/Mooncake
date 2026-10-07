@@ -236,8 +236,10 @@ class FileStorage {
     // Backend disk-error observer. Runs inline on the failing I/O thread, so
     // it makes no RPC and takes no lock that I/O or the heartbeat holds.
     void OnDiskError(int err, const char* op);
-    int CheckFilesystem() const;  // errno, 0 if the filesystem is up
-    void ApplyDiskFence();        // heartbeat: offloading off, latch drain
+    // errno, 0 if the filesystem is up; sync_first runs syncfs before fstat.
+    int CheckFilesystem(bool sync_first) const;
+    // Heartbeat: latch the drain and hand pending offload work back.
+    void ApplyDiskFence();
     // Heartbeat, while draining_: unmount until the master acknowledges it
     // (the master treats an already-unmounted segment as success).
     void UnmountLocalDiskIfPending();
@@ -279,7 +281,8 @@ class FileStorage {
     std::atomic<bool> disk_fenced_{false};
     int disk_dir_fd_{-1};  // offload dir, held open for CheckFilesystem
     std::atomic<bool> filesystem_check_running_{false};
-    std::function<int()> test_filesystem_check_;  // test-only, returns errno
+    // Test-only replacement for CheckFilesystem; returns errno.
+    std::function<int(bool sync_first)> test_filesystem_check_;
     std::mutex heartbeat_wake_mutex_;
     std::condition_variable heartbeat_wake_cv_;
 };

@@ -48,6 +48,13 @@ struct FdGuard {
         return r;
     }
 };
+
+// ", errno=<n> (<strerror>)" for a failed syscall, empty for a logical
+// failure (errno 0).
+std::string ErrnoSuffix(int err) {
+    if (err == 0) return "";
+    return ", errno=" + std::to_string(err) + " (" + strerror(err) + ")";
+}
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
@@ -1888,7 +1895,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 NotifyDiskError(file->sys_errno(), "preadv");
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_result.error();
+                           << ", error: " << read_result.error()
+                           << ErrnoSuffix(file->sys_errno());
                 return tl::make_unexpected(read_result.error());
             }
             if (read_result.value() != plan.dest_slice.size) {
@@ -2512,7 +2520,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         if (!write_result) {
             NotifyDiskError(file->sys_errno(), "pwritev");
             LOG(ERROR) << "vector_write failed for: " << bucket_id
-                       << ", error: " << write_result.error();
+                       << ", error: " << write_result.error()
+                       << ErrnoSuffix(file->sys_errno());
             return tl::make_unexpected(write_result.error());
         }
         if (static_cast<int64_t>(write_result.value()) !=

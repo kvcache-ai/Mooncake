@@ -406,44 +406,79 @@ class FileStorageTest : public ::testing::Test {
     struct DiskFenceOutcome {
         bool fenced = false;
         int filesystem_checks = 0;
-        int backend_loads = 0;  // after two reads
-        bool offloading_enabled = true;
-        bool segment_mounted = true;  // after two heartbeats
+        int synced_checks = 0;          // checks that ran syncfs first
+        int backend_loads = 0;          // after two reads
+        bool gauge_exported = false;    // before any disk error
+        bool segment_mounted = true;    // after two heartbeats
+        bool offload_released = false;  // queued offload task, after them
         int64_t fenced_gauge = -1;
         bool fenced_offload_reached_backend = false;
     };
 
     static constexpr int kRealFilesystemCheck = -1;
 
-    // A store with a mounted LOCAL_DISK segment whose disk reads fail with
-    // read_errno while the filesystem check answers check_errno
-    // (kRealFilesystemCheck: the real syncfs + fstat on the live test
-    // directory). Runs two reads, then two heartbeats, and records what
+    // True if a serialized metric text has a sample (not only # HELP/# TYPE)
+    // for the metric.
+    static bool HasSample(const std::string& text, const std::string& name) {
+        return text.rfind(name, 0) == 0 ||
+               text.find("\n" + name) != std::string::npos;
+    }
+
+    // A store with a memory segment and a mounted LOCAL_DISK segment whose
+    // disk reads fail with read_errno while the filesystem check answers
+    // check_errno (kRealFilesystemCheck: the real check on the live test
+    // directory). One put leaves an offload task queued at the master for
+    // this store. Runs two reads, then two heartbeats, and records what
     // happened.
     void RunDiskErrorScenario(const std::string& name, int read_errno,
                               int check_errno, DiskFenceOutcome& out) {
-        auto master_root = fs::path(data_path) / (name + "_master");
-        fs::create_directories(master_root);
         testing::InProcMaster master;
         ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
                                      .set_enable_offload(true)
-                                     .set_root_fs_dir(master_root.string())
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
                                      .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
         const std::string local_rpc_addr =
             "127.0.0.1:" + std::to_string(getFreeTcpPort());
-        auto client =
+        auto client_result =
             Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
                            std::nullopt, master.master_address());
-        ASSERT_TRUE(client.has_value());
-        ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+        ASSERT_TRUE(client_result.has_value());
+        auto client = client_result.value();
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true).has_value());
+
+        // The put queues an offload task for this store that holds a
+        // reference on the memory replica. Once the store is no longer
+        // registered, Upsert is refused until the master releases the task
+        // (while the task is still queued, Upsert would cancel it itself).
+        const std::string offload_key = "offload_key";
+        const std::string value(64, 'v');
+        void* buffer = allocator.allocate(value.size());
+        ASSERT_NE(buffer, nullptr);
+        std::memcpy(buffer, value.data(), value.size());
+        std::vector<Slice> slices{{buffer, value.size()}};
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        ASSERT_TRUE(client->Put(offload_key, slices, replicate));
 
         FileStorageConfig config = FileStorageConfig::FromEnvironment();
         config.storage_filepath = data_path + "/" + name;
         config.local_buffer_size = 4 * 1024 * 1024;
         fs::create_directories(config.storage_filepath);
         SsdMetric metric;
-        FileStorage file_storage(config, client.value(), local_rpc_addr,
-                                 &metric);
+        FileStorage file_storage(config, client, local_rpc_addr, &metric);
+        std::string metrics_text;
+        metric.serialize(metrics_text);
+        out.gauge_exported =
+            HasSample(metrics_text, "mooncake_ssd_disk_fenced");
         BucketBackendConfig bucket_config;
         bucket_config.bucket_keys_limit = 1;
         auto backend = std::make_shared<FailingReadBackend>(
@@ -454,8 +489,10 @@ class FileStorageTest : public ::testing::Test {
         });
         ASSERT_TRUE(backend->Init());
         if (check_errno != kRealFilesystemCheck) {
-            file_storage.test_filesystem_check_ = [&out, check_errno] {
+            file_storage.test_filesystem_check_ = [&out,
+                                                   check_errno](bool sync) {
                 ++out.filesystem_checks;
+                out.synced_checks += sync ? 1 : 0;
                 return check_errno;
             };
         }
@@ -465,9 +502,9 @@ class FileStorageTest : public ::testing::Test {
         }
 
         for (int i = 0; i < 2; ++i) {
-            std::string buffer(64, '\0');
+            std::string read_buffer(64, '\0');
             std::unordered_map<std::string, Slice> batch{
-                {"key", Slice{buffer.data(), buffer.size()}}};
+                {"key", Slice{read_buffer.data(), read_buffer.size()}}};
             EXPECT_FALSE(file_storage.BatchLoad(batch).has_value());
         }
         for (int i = 0; i < 2; ++i) {
@@ -476,30 +513,35 @@ class FileStorageTest : public ::testing::Test {
 
         out.fenced = file_storage.disk_fenced_.load();
         out.backend_loads = backend->loads;
-        {
-            MutexLocker locker(&file_storage.offloading_mutex_);
-            out.offloading_enabled = file_storage.enable_offloading_;
-        }
         std::vector<OffloadTaskItem> items;
         out.segment_mounted =
-            client.value()->OffloadObjectHeartbeat(true, items).has_value();
+            client->OffloadObjectHeartbeat(true, items).has_value();
+        out.offload_released =
+            client->Upsert(offload_key, slices, replicate).has_value();
         out.fenced_gauge = metric.ssd_disk_fenced.value();
         if (out.fenced) {
-            // Offload work already in hand must not reach a fenced disk.
+            // Offload work already in hand must not reach a fenced disk. The
+            // key has a memory replica on this store, so without the fence
+            // this offload would reach the backend.
             auto offload = file_storage.OffloadObjects(
                 {OffloadTaskItem{.tenant_id = TenantId::Default().value(),
-                                 .key = "offload_key",
-                                 .size = 64}});
+                                 .key = offload_key,
+                                 .size = static_cast<int64_t>(value.size())}});
             EXPECT_FALSE(offload.has_value());
             out.fenced_offload_reached_backend = backend->offloads > 0;
         }
+        allocator.deallocate(buffer, value.size());
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
 
     // A second disk failure arrives while the first one's filesystem check
     // is running (simulated by re-entering from inside the check).
     static void FailDuringFilesystemCheck(FileStorage& fileStorage, int& checks,
-                                          bool& fenced) {
-        fileStorage.test_filesystem_check_ = [&fileStorage, &checks] {
+                                          bool& synced, bool& fenced) {
+        fileStorage.test_filesystem_check_ = [&fileStorage, &checks,
+                                              &synced](bool sync) {
+            synced = sync;
             if (++checks == 1) fileStorage.OnDiskError(EIO, "preadv");
             return EIO;
         };
@@ -1538,16 +1580,18 @@ TEST_F(FileStorageTest, ClassifyDiskErrno) {
 }
 
 // EIO on a filesystem that is shut down: the first failure fences the disk
-// tier. Reads stop reaching the disk at once, offload stops, and the
-// heartbeat unmounts the segment and never re-mounts it.
+// tier. Reads stop reaching the disk at once, offload stops, the heartbeat
+// hands the queued offload task back to the master (releasing the memory
+// replica it pinned), unmounts the segment and never re-mounts it.
 TEST_F(FileStorageTest, DiskFenceEioOnDeadFilesystemFencesDiskTier) {
     DiskFenceOutcome out;
     RunDiskErrorScenario("fence_eio_dead", EIO, EIO, out);
     EXPECT_TRUE(out.fenced);
     EXPECT_EQ(out.filesystem_checks, 1);
+    EXPECT_EQ(out.synced_checks, 0);  // a read failure checks without syncfs
     EXPECT_EQ(out.backend_loads, 1);
-    EXPECT_FALSE(out.offloading_enabled);
     EXPECT_FALSE(out.segment_mounted);
+    EXPECT_TRUE(out.offload_released);
     EXPECT_EQ(out.fenced_gauge, 1);
     EXPECT_FALSE(out.fenced_offload_reached_backend);
 }
@@ -1559,8 +1603,8 @@ TEST_F(FileStorageTest, DiskFenceEioOnLiveFilesystemDoesNotFence) {
     RunDiskErrorScenario("fence_eio_live", EIO, kRealFilesystemCheck, out);
     EXPECT_FALSE(out.fenced);
     EXPECT_EQ(out.backend_loads, 2);
-    EXPECT_TRUE(out.offloading_enabled);
     EXPECT_TRUE(out.segment_mounted);
+    EXPECT_TRUE(out.gauge_exported);
     EXPECT_EQ(out.fenced_gauge, 0);
 }
 
@@ -1582,20 +1626,23 @@ TEST_F(FileStorageTest, DiskFenceEnodevFencesWithoutFilesystemCheck) {
     EXPECT_TRUE(out.fenced);
     EXPECT_EQ(out.filesystem_checks, 0);
     EXPECT_EQ(out.backend_loads, 1);
-    EXPECT_FALSE(out.offloading_enabled);
     EXPECT_FALSE(out.segment_mounted);
+    EXPECT_TRUE(out.offload_released);
 }
 
 // Concurrent failures do not run parallel filesystem checks: one that finds
-// a check running skips its own, and the running check still fences.
+// a check running skips its own, and the running check still fences. A
+// write failure's check runs syncfs first.
 TEST_F(FileStorageTest, DiskFenceSkipsCheckWhileOneIsRunning) {
     auto config = FileStorageConfig::FromEnvironment();
     config.storage_filepath = data_path;
     FileStorage file_storage(config, nullptr, "localhost:9003");
     int checks = 0;
+    bool synced = false;
     bool fenced = false;
-    FailDuringFilesystemCheck(file_storage, checks, fenced);
+    FailDuringFilesystemCheck(file_storage, checks, synced, fenced);
     EXPECT_EQ(checks, 1);
+    EXPECT_TRUE(synced);
     EXPECT_TRUE(fenced);
 }
 

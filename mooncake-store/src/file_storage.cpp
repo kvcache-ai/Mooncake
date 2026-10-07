@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -124,6 +125,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     PLOG_IF(WARNING, disk_dir_fd_ < 0) << "open " << config_.storage_filepath;
     storage_backend_->SetDiskErrorObserver(
         [this](int err, const char* op) { OnDiskError(err, op); });
+    // Export 0 from the start: an unset gauge has no series at all.
+    if (ssd_metric_) ssd_metric_->ssd_disk_fenced.update(0);
 
     // Register the client buffer with the process-wide io_uring fixed-buffer
     // mechanism. This must happen before any I/O threads start so that they
@@ -923,16 +926,20 @@ void FileStorage::WakeHeartbeat() {
     heartbeat_wake_cv_.notify_all();
 }
 
-int FileStorage::CheckFilesystem() const {
-    if (test_filesystem_check_) return test_filesystem_check_();
+int FileStorage::CheckFilesystem(bool sync_first) const {
+    if (test_filesystem_check_) return test_filesystem_check_(sync_first);
     // On XFS, fstat fails with EIO exactly when the filesystem is shut down,
     // without device I/O (statfs keeps succeeding). XFS shuts down only when
     // a log write fails, which usually comes after the first EIO a store
-    // sees, so syncfs first forces the log; its own result is ignored (it
-    // also reports a single bad file's writeback error once).
-    (void)::syncfs(disk_dir_fd_);
+    // sees, so sync_first forces the log with syncfs; its own result is
+    // ignored (it also reports a single bad file's writeback error once).
+    // stat on the path gives the same signal if the dir fd failed to open.
+    if (sync_first && disk_dir_fd_ >= 0) (void)::syncfs(disk_dir_fd_);
     struct stat st;
-    return ::fstat(disk_dir_fd_, &st) == 0 ? 0 : errno;
+    const int rc = disk_dir_fd_ >= 0
+                       ? ::fstat(disk_dir_fd_, &st)
+                       : ::stat(config_.storage_filepath.c_str(), &st);
+    return rc == 0 ? 0 : errno;
 }
 
 void FileStorage::OnDiskError(int err, const char* op) {
@@ -942,11 +949,18 @@ void FileStorage::OnDiskError(int err, const char* op) {
     if (action == DiskErrorAction::kCheckFilesystem) {
         // One check at a time; a concurrent failure defers to the running one.
         if (filesystem_check_running_.exchange(true)) return;
-        check_err = CheckFilesystem();
+        // syncfs only for write-path failures: reads leave the log nothing to
+        // write (measured: they alone never shut XFS down), and one bad file
+        // would otherwise flush the whole filesystem on every failed read.
+        const std::string_view op_name(op);
+        const bool sync_first = op_name != "preadv" && op_name != "read";
+        check_err = CheckFilesystem(sync_first);
         filesystem_check_running_.store(false);
         if (ClassifyDiskErrno(check_err) == DiskErrorAction::kIgnore) {
             LOG(WARNING) << "action=disk_error_not_fenced, op=" << op
-                         << ", errno=" << err << " (" << strerror(err) << ")";
+                         << ", errno=" << err << " (" << strerror(err)
+                         << "), check="
+                         << (sync_first ? "syncfs+fstat" : "fstat");
             return;
         }
     }
@@ -963,14 +977,27 @@ void FileStorage::ApplyDiskFence() {
     MutexLocker locker(&offloading_mutex_);
     enable_offloading_ = false;
     draining_.store(true);
+    if (local_disk_unmounted_) return;  // a drain already deregistered
+    // Unmounting drops the master's queue of offload tasks for this store but
+    // not the source-replica references those tasks hold, which would pin the
+    // memory replicas until the master's TTL reaper. A heartbeat with
+    // offloading disabled releases both. Best effort: the TTL is the backstop.
+    std::vector<OffloadTaskItem> discarded;
+    auto result = client_->OffloadObjectHeartbeat(false, discarded);
+    LOG(INFO) << "action=release_offload_queue, result="
+              << (result ? ErrorCode::OK : result.error());
 }
 
 void FileStorage::UnmountLocalDiskIfPending() {
     MutexLocker locker(&offloading_mutex_);
     if (local_disk_unmounted_) return;
     auto result = client_->UnmountLocalDiskSegment();
-    LOG(INFO) << "action=unmount_local_disk_segment, result="
-              << (result ? ErrorCode::OK : result.error());
+    if (result) {
+        LOG(INFO) << "action=unmount_local_disk_segment, result=OK";
+    } else {
+        LOG(WARNING) << "action=unmount_local_disk_segment, result="
+                     << result.error();
+    }
     local_disk_unmounted_ = result.has_value();
 }
 
