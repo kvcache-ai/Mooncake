@@ -410,7 +410,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
         if (RpcProtocolConfig::FromEnvironment().use_rdma) {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#else
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
         }
 
         mooncake::WrappedMasterServiceConfig wrapped_config(
@@ -454,7 +459,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                       })
                 : wrapped_master_service->RestoreFromStandby(
                       promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                      promotion_ctx->segments);
+                      promotion_ctx->segments, promotion_ctx->weight_metadata);
         if (!restore_result) {
             LOG(ERROR) << "Standby restore failed: "
                        << toString(restore_result.error());
@@ -643,12 +648,12 @@ int MasterServiceSupervisor::Start() {
         return -1;
     }
 
+    const auto metrics = config_.metrics.Get();
     mooncake::MasterAdminServer admin_server(
-        static_cast<uint16_t>(config_.metrics_port),
-        config_.enable_metric_reporting, config_.metrics_host);
+        static_cast<uint16_t>(metrics.port), metrics.enabled, metrics.host);
     if (!admin_server.Start()) {
         LOG(ERROR) << "Failed to start master admin server, metrics_port="
-                   << config_.metrics_port;
+                   << metrics.port;
         return -1;
     }
     return RunSupervisorLoop(*spec, config_, admin_server,

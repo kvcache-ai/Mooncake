@@ -36,6 +36,7 @@ class Status final {
         kTooManyRequests = 2,
         kAddressNotRegistered = 3,
         kBatchBusy = 4,
+        kBatchCleanupDeferred = 5,
         kDeviceNotFound = 6,
         kAddressOverlapped = 7,
         kNotSupportedTransport = 8,
@@ -100,6 +101,11 @@ class Status final {
 
     // Returns true iff the status indicates a BatchBusy error.
     [[nodiscard]] bool IsBatchBusy() const { return Code::kBatchBusy == code_; }
+
+    // Returns true iff batch cleanup was deferred and the handle is invalid.
+    [[nodiscard]] bool IsBatchCleanupDeferred() const {
+        return Code::kBatchCleanupDeferred == code_;
+    }
 
     // Returns true iff the status indicates an DeviceNotFound error.
     [[nodiscard]] bool IsDeviceNotFound() const {
@@ -174,6 +180,9 @@ class Status final {
     }
     static Status BatchBusy(std::string_view msg) {
         return Status(Code::kBatchBusy, msg);
+    }
+    static Status BatchCleanupDeferred(std::string_view msg) {
+        return Status(Code::kBatchCleanupDeferred, msg);
     }
     static Status DeviceNotFound(std::string_view msg) {
         return Status(Code::kDeviceNotFound, msg);

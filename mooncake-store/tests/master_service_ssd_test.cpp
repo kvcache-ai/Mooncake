@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -29,17 +30,13 @@ class MasterServiceSSDTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
-    // PushOffloadingQueue AND its ObjectIdentity parameter type are both
-    // private to MasterService; this fixture is a friend, but friendship is not
-    // inherited by the per-test subclass TEST_F generates. So both naming
-    // ObjectIdentity and calling PushOffloadingQueue must happen inside a
-    // member of this class, not in the TEST_F body. Take plain tenant/key args
-    // and build the private identity here. See issue #2997.
+    // Reach PushOffloadingQueue and its private identity type through the
+    // test peer to exercise replica states unavailable via PutStart (#2997).
     static tl::expected<void, ErrorCode> CallPushOffloadingQueue(
         MasterService& service, const TenantId& tenant, const std::string& key,
         Replica& replica) {
-        const MasterService::ObjectIdentity id{tenant, key};
-        return service.PushOffloadingQueue(id, replica);
+        const MasterServiceTestPeer::ObjectIdentity id{tenant, key};
+        return MasterServiceTestPeer(service).PushOffloadingQueue(id, replica);
     }
 };
 
@@ -453,22 +450,21 @@ TEST_F(MasterServiceSSDTest,
         << "%\n\n";
 }
 
-// Friended by MasterService: runs the two halves of UnmountLocalDiskSegment
+// Uses the test peer to run the two halves of UnmountLocalDiskSegment
 // (deregistration, replica sweep) as separate steps, so a competing mount +
 // register can be serialized between them -- the interleaving is pinned by
-// construction instead of hoping a scheduler produces it. The helpers are
-// members of this class because friendship does not extend to the
-// TEST_F-generated subclasses.
+// construction instead of hoping a scheduler produces it.
 class LocalDiskUnmountInterleavingTest : public MasterServiceSSDTest {
    protected:
     static void DeregisterHalf(MasterService& service, const UUID& client_id) {
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            service.snapshot_mutex_);
-        service.local_ssd_manager_.UnregisterClient(client_id);
+            MasterServiceTestPeer::SnapshotMutex(service));
+        MasterServiceTestPeer::LocalSsdManager(service).UnregisterClient(
+            client_id);
     }
 
     static void SweepHalf(MasterService& service, const UUID& client_id) {
-        service.ClearLocalDiskHandlesOwnedBy(client_id);
+        MasterServiceTestPeer(service).ClearLocalDiskHandlesOwnedBy(client_id);
     }
 };
 
@@ -544,13 +540,11 @@ TEST_F(LocalDiskUnmountInterleavingTest,
 // EnqueueOffload and (pre-fix as well as post-fix) already returned
 // UNABLE_OFFLOADING via SEGMENT_NOT_FOUND. To actually guard the two lines this
 // PR changed, the test constructs the degenerate replicas directly and calls
-// PushOffloadingQueue through the test-friend seam, asserting the no-op is
+// PushOffloadingQueue through the test peer, asserting the no-op is
 // reported as a failure rather than a silent success.
 TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     auto service = CreateSsdAwareOffloadService();
-    // ObjectIdentity is private to MasterService, so it is constructed inside
-    // the friend helper from these plain args rather than named here (see
-    // helper).
+    // The helper constructs the peer-exposed identity from tenant/key args.
     const TenantId tenant = TenantId::Default();
     const std::string key = "noop_offload_key";
 

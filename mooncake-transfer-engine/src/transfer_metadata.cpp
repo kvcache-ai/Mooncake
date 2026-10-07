@@ -490,8 +490,8 @@ static int encodeMultiProtocolSegmentDesc(
         } else if (buffer.protocol == "shm") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
-        } else if (buffer.protocol == "hip" || buffer.protocol == "maca" ||
-                   buffer.protocol == "musa") {
+        } else if (buffer.protocol == "hip" || buffer.protocol == "hylink" ||
+                   buffer.protocol == "maca" || buffer.protocol == "musa") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
         }
@@ -523,8 +523,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         is_multi_protocol = true;
         for (const auto &proto : protocols) {
             if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                proto != "hip" && proto != "maca" && proto != "musa" &&
-                proto != "shm") {
+                proto != "hip" && proto != "hylink" && proto != "maca" &&
+                proto != "musa" && proto != "shm") {
                 is_multi_protocol = false;
                 break;
             }
@@ -532,8 +532,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only cxl, tcp, rdma, hip, maca, musa and shm may "
-                          "be combined.";
+                       << ". Only cxl, tcp, rdma, hip, hylink, maca, musa "
+                          "and shm may be combined.";
             return ERR_INVALID_ARGUMENT;
         }
     }
@@ -683,6 +683,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     } else if (segmentJSON["protocol"] == "nvlink" ||
                segmentJSON["protocol"] == "nvlink_intra" ||
                segmentJSON["protocol"] == "hip" ||
+               segmentJSON["protocol"] == "hylink" ||
                segmentJSON["protocol"] == "maca" ||
                segmentJSON["protocol"] == "musa" ||
                segmentJSON["protocol"] == "ubshmem" ||
@@ -925,8 +926,8 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
-        } else if (buffer_protocol == "hip" || buffer_protocol == "maca" ||
-                   buffer_protocol == "musa") {
+        } else if (buffer_protocol == "hip" || buffer_protocol == "hylink" ||
+                   buffer_protocol == "maca" || buffer_protocol == "musa") {
             TransferMetadata::BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
@@ -963,8 +964,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &protocolStr : segmentJSON["protocol"]) {
                 std::string proto = protocolStr.asString();
                 if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                    proto != "hip" && proto != "maca" && proto != "musa" &&
-                    proto != "shm") {
+                    proto != "hip" && proto != "hylink" && proto != "maca" &&
+                    proto != "musa" && proto != "shm") {
                     is_multi_protocol = false;
                     break;
                 }
@@ -973,8 +974,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(ERROR)
                     << "Unsupported multi-protocol combination in segment: "
                     << segment_name
-                    << ". Only cxl, tcp, rdma, hip, maca, musa and shm may be "
-                       "combined.";
+                    << ". Only cxl, tcp, rdma, hip, hylink, maca, musa and "
+                       "shm may be combined.";
                 return nullptr;
             }
         }
@@ -982,7 +983,9 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
 
     // If multi-protocol scenario, use multi-protocol decoding
     if (is_multi_protocol) {
-        return decodeMultiProtocolSegmentDesc(segmentJSON, segment_name);
+        auto desc = decodeMultiProtocolSegmentDesc(segmentJSON, segment_name);
+        if (desc) desc->rebuildBufferRangeIndex();
+        return desc;
     }
 #endif
 
@@ -1145,8 +1148,9 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             desc->buffers.push_back(buffer);
         }
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
-               desc->protocol == "hip" || desc->protocol == "maca" ||
-               desc->protocol == "musa" || desc->protocol == "ubshmem" ||
+               desc->protocol == "hip" || desc->protocol == "hylink" ||
+               desc->protocol == "maca" || desc->protocol == "musa" ||
+               desc->protocol == "ubshmem" ||
                desc->protocol == "sunrise_link" || desc->protocol == "shm") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
@@ -1251,6 +1255,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                    << " protocol " << desc->protocol;
         return nullptr;
     }
+    desc->rebuildBufferRangeIndex();
     return desc;
 }
 
@@ -1367,9 +1372,9 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
 }
 
 bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
-    // timestamp and metadata_version are intentionally excluded: metadata
-    // encoding/publication may refresh them even when the operational
-    // descriptor is unchanged.
+    // timestamp, metadata_version, and buffer_range_index are excluded:
+    // publication may refresh timestamps, and the index is derived from
+    // `buffers`.
     return name == other.name && protocol == other.protocol &&
            devices == other.devices && topology == other.topology &&
            buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&
@@ -1722,6 +1727,7 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
         segment_desc->buffers.push_back(buffer_desc);
+        segment_desc->rebuildBufferRangeIndex();
     }
     if (update_metadata) return updateLocalSegmentDesc();
     return 0;
@@ -1746,6 +1752,7 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
             ) {
                 segment_desc->buffers.erase(iter);
                 addr_exist = true;
+                segment_desc->rebuildBufferRangeIndex();
                 break;
             }
         }

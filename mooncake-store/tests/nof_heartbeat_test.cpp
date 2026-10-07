@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -74,7 +75,7 @@ TEST_F(NoFHeartbeatTest, HealthyNoFSegmentDoesNotUnmount) {
                                  /*probe_timeout_ms=*/50,
                                  /*failure_threshold=*/3);
     std::atomic<int> probe_calls{0};
-    service->SetNoFProbeFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
         [&probe_calls](const std::string&, uint32_t, std::string*) {
             probe_calls.fetch_add(1, std::memory_order_relaxed);
             return true;
@@ -87,10 +88,14 @@ TEST_F(NoFHeartbeatTest, HealthyNoFSegmentDoesNotUnmount) {
     ASSERT_TRUE(WaitForCondition(std::chrono::milliseconds(2500),
                                  std::chrono::milliseconds(50),
                                  [&]() { return probe_calls.load() >= 1; }));
-    EXPECT_TRUE(service->IsNoFSegmentMountedForTesting(segment.id));
-    EXPECT_EQ(service->GetMountedNoFSegmentCountForTesting(), 1u);
+    EXPECT_TRUE(MasterServiceTestPeer(*service).IsNoFSegmentMountedForTesting(
+        segment.id));
+    EXPECT_EQ(
+        MasterServiceTestPeer(*service).GetMountedNoFSegmentCountForTesting(),
+        1u);
     auto failure_count =
-        service->GetNoFHeartbeatFailureCountForTesting(segment.id);
+        MasterServiceTestPeer(*service).GetNoFHeartbeatFailureCountForTesting(
+            segment.id);
     ASSERT_TRUE(failure_count.has_value());
     EXPECT_EQ(*failure_count, 0u);
 }
@@ -100,7 +105,7 @@ TEST_F(NoFHeartbeatTest, NewlyMountedNoFSegmentHasInitialGracePeriod) {
                                  /*probe_timeout_ms=*/50,
                                  /*failure_threshold=*/1);
     std::atomic<int> probe_calls{0};
-    service->SetNoFProbeFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
         [&probe_calls](const std::string&, uint32_t, std::string* reason) {
             probe_calls.fetch_add(1, std::memory_order_relaxed);
             if (reason) {
@@ -116,9 +121,11 @@ TEST_F(NoFHeartbeatTest, NewlyMountedNoFSegmentHasInitialGracePeriod) {
     std::this_thread::sleep_for(std::chrono::milliseconds(800));
 
     EXPECT_EQ(probe_calls.load(), 0);
-    EXPECT_TRUE(service->IsNoFSegmentMountedForTesting(segment.id));
+    EXPECT_TRUE(MasterServiceTestPeer(*service).IsNoFSegmentMountedForTesting(
+        segment.id));
     auto failure_count =
-        service->GetNoFHeartbeatFailureCountForTesting(segment.id);
+        MasterServiceTestPeer(*service).GetNoFHeartbeatFailureCountForTesting(
+            segment.id);
     ASSERT_TRUE(failure_count.has_value());
     EXPECT_EQ(*failure_count, 0u);
 }
@@ -128,7 +135,7 @@ TEST_F(NoFHeartbeatTest, FailedNoFSegmentUnmountsAfterThreshold) {
                                  /*probe_timeout_ms=*/50,
                                  /*failure_threshold=*/3);
     std::atomic<int> probe_calls{0};
-    service->SetNoFProbeFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
         [&probe_calls](const std::string&, uint32_t, std::string* reason) {
             probe_calls.fetch_add(1, std::memory_order_relaxed);
             if (reason) {
@@ -142,12 +149,17 @@ TEST_F(NoFHeartbeatTest, FailedNoFSegmentUnmountsAfterThreshold) {
     ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
 
     ASSERT_TRUE(WaitForCondition(
-        std::chrono::milliseconds(5000), std::chrono::milliseconds(50),
-        [&]() { return !service->IsNoFSegmentMountedForTesting(segment.id); }));
+        std::chrono::milliseconds(5000), std::chrono::milliseconds(50), [&]() {
+            return !MasterServiceTestPeer(*service)
+                        .IsNoFSegmentMountedForTesting(segment.id);
+        }));
     EXPECT_GE(probe_calls.load(), 3);
-    EXPECT_EQ(service->GetMountedNoFSegmentCountForTesting(), 0u);
-    EXPECT_FALSE(
-        service->GetNoFHeartbeatFailureCountForTesting(segment.id).has_value());
+    EXPECT_EQ(
+        MasterServiceTestPeer(*service).GetMountedNoFSegmentCountForTesting(),
+        0u);
+    EXPECT_FALSE(MasterServiceTestPeer(*service)
+                     .GetNoFHeartbeatFailureCountForTesting(segment.id)
+                     .has_value());
 }
 
 TEST_F(NoFHeartbeatTest, FailureCountResetsAfterRecovery) {
@@ -155,7 +167,7 @@ TEST_F(NoFHeartbeatTest, FailureCountResetsAfterRecovery) {
                                  /*probe_timeout_ms=*/50,
                                  /*failure_threshold=*/3);
     std::atomic<int> probe_calls{0};
-    service->SetNoFProbeFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
         [&probe_calls](const std::string&, uint32_t, std::string* reason) {
             int current = probe_calls.fetch_add(1, std::memory_order_relaxed);
             if (current < 2) {
@@ -174,11 +186,13 @@ TEST_F(NoFHeartbeatTest, FailureCountResetsAfterRecovery) {
     ASSERT_TRUE(WaitForCondition(
         std::chrono::milliseconds(5000), std::chrono::milliseconds(50), [&]() {
             auto failure_count =
-                service->GetNoFHeartbeatFailureCountForTesting(segment.id);
+                MasterServiceTestPeer(*service)
+                    .GetNoFHeartbeatFailureCountForTesting(segment.id);
             return probe_calls.load() >= 4 && failure_count.has_value() &&
                    *failure_count == 0;
         }));
-    EXPECT_TRUE(service->IsNoFSegmentMountedForTesting(segment.id));
+    EXPECT_TRUE(MasterServiceTestPeer(*service).IsNoFSegmentMountedForTesting(
+        segment.id));
 }
 
 TEST_F(NoFHeartbeatTest, OnlyFailedSegmentIsUnmounted) {
@@ -187,7 +201,7 @@ TEST_F(NoFHeartbeatTest, OnlyFailedSegmentIsUnmounted) {
                                  /*failure_threshold=*/2);
     std::atomic<int> good_probe_calls{0};
     std::atomic<int> bad_probe_calls{0};
-    service->SetNoFProbeFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
         [&good_probe_calls, &bad_probe_calls](const std::string& endpoint,
                                               uint32_t, std::string* reason) {
             if (endpoint == "nof_good") {
@@ -212,10 +226,13 @@ TEST_F(NoFHeartbeatTest, OnlyFailedSegmentIsUnmounted) {
 
     ASSERT_TRUE(WaitForCondition(
         std::chrono::milliseconds(5000), std::chrono::milliseconds(50), [&]() {
-            return service->GetMountedNoFSegmentCountForTesting() == 1u;
+            return MasterServiceTestPeer(*service)
+                       .GetMountedNoFSegmentCountForTesting() == 1u;
         }));
-    EXPECT_TRUE(service->IsNoFSegmentMountedForTesting(good_segment.id));
-    EXPECT_FALSE(service->IsNoFSegmentMountedForTesting(bad_segment.id));
+    EXPECT_TRUE(MasterServiceTestPeer(*service).IsNoFSegmentMountedForTesting(
+        good_segment.id));
+    EXPECT_FALSE(MasterServiceTestPeer(*service).IsNoFSegmentMountedForTesting(
+        bad_segment.id));
     EXPECT_GE(good_probe_calls.load(), 1);
     EXPECT_GE(bad_probe_calls.load(), 2);
 }
@@ -224,11 +241,11 @@ TEST_F(NoFHeartbeatTest, UnmountReleasesNoFProbeResources) {
     auto service = CreateService(/*heartbeat_interval_sec=*/1,
                                  /*probe_timeout_ms=*/50,
                                  /*failure_threshold=*/3);
-    service->SetNoFProbeFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
         [](const std::string&, uint32_t, std::string*) { return true; });
     std::mutex released_mutex;
     std::vector<std::string> released_endpoints;
-    service->SetNoFProbeReleaseFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeReleaseFnForTesting(
         [&released_mutex, &released_endpoints](const std::string& endpoint) {
             std::lock_guard<std::mutex> lock(released_mutex);
             released_endpoints.push_back(endpoint);
@@ -242,7 +259,8 @@ TEST_F(NoFHeartbeatTest, UnmountReleasesNoFProbeResources) {
     // tracking the segment, so wait until its state exists.
     ASSERT_TRUE(WaitForCondition(
         std::chrono::milliseconds(2000), std::chrono::milliseconds(20), [&]() {
-            return service->GetNoFHeartbeatFailureCountForTesting(segment.id)
+            return MasterServiceTestPeer(*service)
+                .GetNoFHeartbeatFailureCountForTesting(segment.id)
                 .has_value();
         }));
 
@@ -257,15 +275,16 @@ TEST_F(NoFHeartbeatTest, UnmountReleasesNoFProbeResources) {
     for (const auto& endpoint : released) {
         EXPECT_EQ(endpoint, segment.te_endpoint);
     }
-    EXPECT_FALSE(
-        service->GetNoFHeartbeatFailureCountForTesting(segment.id).has_value());
+    EXPECT_FALSE(MasterServiceTestPeer(*service)
+                     .GetNoFHeartbeatFailureCountForTesting(segment.id)
+                     .has_value());
 }
 
 TEST_F(NoFHeartbeatTest, HeartbeatUnmountReleasesNoFProbeResources) {
     auto service = CreateService(/*heartbeat_interval_sec=*/1,
                                  /*probe_timeout_ms=*/50,
                                  /*failure_threshold=*/2);
-    service->SetNoFProbeFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
         [](const std::string&, uint32_t, std::string* reason) {
             if (reason) {
                 *reason = "submit_fail";
@@ -274,7 +293,7 @@ TEST_F(NoFHeartbeatTest, HeartbeatUnmountReleasesNoFProbeResources) {
         });
     std::mutex released_mutex;
     std::vector<std::string> released_endpoints;
-    service->SetNoFProbeReleaseFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeReleaseFnForTesting(
         [&released_mutex, &released_endpoints](const std::string& endpoint) {
             std::lock_guard<std::mutex> lock(released_mutex);
             released_endpoints.push_back(endpoint);
@@ -285,14 +304,15 @@ TEST_F(NoFHeartbeatTest, HeartbeatUnmountReleasesNoFProbeResources) {
     ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
 
     ASSERT_TRUE(WaitForCondition(
-        std::chrono::milliseconds(5000), std::chrono::milliseconds(50),
-        [&]() { return !service->IsNoFSegmentMountedForTesting(segment.id); }));
-    ASSERT_TRUE(WaitForCondition(std::chrono::milliseconds(2000),
-                                 std::chrono::milliseconds(20), [&]() {
-                                     std::lock_guard<std::mutex> lock(
-                                         released_mutex);
-                                     return !released_endpoints.empty();
-                                 }));
+        std::chrono::milliseconds(5000), std::chrono::milliseconds(50), [&]() {
+            return !MasterServiceTestPeer(*service)
+                        .IsNoFSegmentMountedForTesting(segment.id);
+        }));
+    ASSERT_TRUE(WaitForCondition(
+        std::chrono::milliseconds(2000), std::chrono::milliseconds(20), [&]() {
+            std::lock_guard<std::mutex> lock(released_mutex);
+            return !released_endpoints.empty();
+        }));
 
     std::vector<std::string> released;
     {
@@ -309,7 +329,7 @@ TEST_F(NoFHeartbeatTest, ClientExpiryDoesNotUnmountNoFSegment) {
                                  /*probe_timeout_ms=*/50,
                                  /*failure_threshold=*/1,
                                  /*client_ttl_sec=*/1);
-    service->SetNoFProbeFnForTesting(
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
         [](const std::string&, uint32_t, std::string* reason) {
             if (reason) {
                 *reason = "submit_fail";
@@ -324,10 +344,14 @@ TEST_F(NoFHeartbeatTest, ClientExpiryDoesNotUnmountNoFSegment) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1800));
 
-    EXPECT_TRUE(service->IsNoFSegmentMountedForTesting(segment.id));
-    EXPECT_EQ(service->GetMountedNoFSegmentCountForTesting(), 1u);
+    EXPECT_TRUE(MasterServiceTestPeer(*service).IsNoFSegmentMountedForTesting(
+        segment.id));
+    EXPECT_EQ(
+        MasterServiceTestPeer(*service).GetMountedNoFSegmentCountForTesting(),
+        1u);
     auto failure_count =
-        service->GetNoFHeartbeatFailureCountForTesting(segment.id);
+        MasterServiceTestPeer(*service).GetNoFHeartbeatFailureCountForTesting(
+            segment.id);
     ASSERT_TRUE(failure_count.has_value());
     EXPECT_EQ(*failure_count, 0u);
 }

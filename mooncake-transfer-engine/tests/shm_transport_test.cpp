@@ -16,13 +16,17 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/magic.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -30,6 +34,7 @@
 
 #include "common.h"
 #include "multi_transport.h"
+#include "shm_hugepage_test_util.h"
 #include "transfer_metadata.h"
 #include "transport/shm_transport/shm_transport.h"
 
@@ -39,8 +44,16 @@ class MultiTransportTestPeer {
    public:
     static Status selectTransport(MultiTransport& multi,
                                   const Transport::TransferRequest& entry,
-                                  Transport*& transport) {
-        return multi.selectTransport(entry, transport);
+                                  Transport*& transport,
+                                  bool* allows_reuse = nullptr) {
+        return multi.selectTransport(entry, transport, allows_reuse);
+    }
+
+    static Status selectTransports(
+        MultiTransport& multi,
+        const std::vector<Transport::TransferRequest>& entries,
+        std::vector<Transport*>& transports) {
+        return multi.selectTransports(entries, transports);
     }
 };
 
@@ -176,10 +189,17 @@ void addPeerSegment(TransferMetadata& metadata, const std::string& shm_name,
 TEST(ShmNameTest, PrefixDetectsPosixNames) {
     EXPECT_TRUE(isPosixShmName("/mooncake_1234_abcdefgh"));
     EXPECT_TRUE(isPosixShmName("mooncake_1234_abcdefgh"));
+    EXPECT_TRUE(isPosixShmName("/dev/hugepages/mooncake_1234_abcdefgh"));
+    EXPECT_TRUE(isFilesystemShmPath("/dev/hugepages/mooncake_1234_abcdefgh"));
+    EXPECT_FALSE(isFilesystemShmPath("/mooncake_1234_abcdefgh"));
+    EXPECT_TRUE(pathHasDotDotComponent("/dev/hugepages/../../tmp/mooncake_x"));
+    EXPECT_FALSE(isFilesystemShmPath("/dev/hugepages/../../tmp/mooncake_x"));
+    EXPECT_FALSE(pathHasDotDotComponent("/dev/hugepages/mooncake_x"));
     EXPECT_FALSE(isPosixShmName(""));
     EXPECT_FALSE(isPosixShmName("/mooncake_"));
     EXPECT_FALSE(isPosixShmName("mooncake_"));
     EXPECT_FALSE(isPosixShmName("cuda-ipc-handle"));
+    EXPECT_FALSE(isPosixShmName("/dev/hugepages/other_file"));
 }
 
 TEST(ShmTransportTest, SharesRelocationAcrossThreads) {
@@ -551,10 +571,11 @@ TEST(ShmTransportTest, RelocateCopySurvivesConcurrentCap) {
     std::atomic<bool> stop{false};
     std::thread copier([&]() {
         std::vector<char> src(page_size, 0x5a);
-        while (!stop.load()) {
+        // The cap loop may finish before this thread is scheduled.
+        do {
             std::memcpy(reinterpret_cast<void*>(pinned_addr), src.data(),
                         page_size);
-        }
+        } while (!stop.load());
     });
     for (int round = 0; round < 4; ++round) {
         for (const auto& buffer : buffers) {
@@ -702,6 +723,212 @@ TEST(ShmTransportTest, RegisterBatchSkipsMallocAndExportsShm) {
     ASSERT_EQ(transport.freeSharedMemory(base), 0);
 }
 
+TEST(ShmTransportTest, RegisterShorterPrefixAndPeerRelocate) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t alloc_len = page_size * 2;
+    const size_t prefix_len = page_size;
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    ShmTransport transport;
+    std::string local = "127.0.0.1:19000";
+    ASSERT_EQ(ShmTransportTestPeer::install(transport, local, metadata), 0);
+
+    void* base = transport.allocateSharedMemory(alloc_len);
+    ASSERT_NE(base, nullptr);
+    std::string shm_name;
+    ASSERT_TRUE(transport.getShmName(base, &shm_name));
+
+    ASSERT_EQ(
+        ShmTransportTestPeer::registerLocalMemory(transport, base, prefix_len),
+        0);
+    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(desc);
+    ASSERT_FALSE(desc->buffers.empty());
+    EXPECT_EQ(desc->buffers[0].length, prefix_len);
+
+    addPeerSegment(*metadata, shm_name, kRemoteAddress, prefix_len);
+    uint64_t relocated = kRemoteAddress;
+    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, relocated, prefix_len,
+                                               kPeerSegmentId)
+                    .ok());
+    EXPECT_NE(relocated, kRemoteAddress);
+    auto* mapped = reinterpret_cast<char*>(relocated);
+    mapped[0] = 0x5d;
+    EXPECT_EQ(static_cast<char*>(base)[0], 0x5d);
+
+    ASSERT_EQ(transport.freeSharedMemory(base), 0);
+}
+
+class ShmHugepageAllocateTest : public ::testing::TestWithParam<size_t> {};
+
+TEST_P(ShmHugepageAllocateTest, AllocateRegisterAndRelocate) {
+    const size_t length = GetParam();
+    auto mount = FindHugetlbfsMount(length);
+    if (!mount) {
+        GTEST_SKIP() << "No writable " << HugepageSizeLabel(length)
+                     << " hugetlbfs mount";
+    }
+
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    ShmTransport transport;
+    std::string local = "127.0.0.1:19000";
+    ASSERT_EQ(ShmTransportTestPeer::install(transport, local, metadata), 0);
+
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = length;
+    opt.hugetlbfs_path = *mount;
+    opt.populate = false;
+
+    void* base = transport.allocateSharedMemory(length, opt);
+    if (!base) {
+        GTEST_SKIP() << HugepageSizeLabel(length)
+                     << " hugetlbfs mount present but allocation failed "
+                        "(no free hugepages?)";
+    }
+    std::string shm_name;
+    ASSERT_TRUE(transport.getShmName(base, &shm_name));
+    EXPECT_TRUE(isFilesystemShmPath(shm_name));
+    EXPECT_TRUE(isPosixShmName(shm_name));
+    EXPECT_EQ(shm_name.rfind(*mount, 0), 0u);
+
+    ASSERT_EQ(
+        ShmTransportTestPeer::registerLocalMemory(transport, base, length), 0);
+    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(desc);
+    ASSERT_FALSE(desc->buffers.empty());
+    EXPECT_TRUE(isFilesystemShmPath(desc->buffers[0].shm_name));
+    EXPECT_EQ(desc->buffers[0].length, length);
+
+    addPeerSegment(*metadata, shm_name, kRemoteAddress, length);
+    uint64_t relocated = kRemoteAddress;
+    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, relocated, length,
+                                               kPeerSegmentId)
+                    .ok());
+    EXPECT_NE(relocated, kRemoteAddress);
+    auto* mapped = reinterpret_cast<char*>(relocated);
+    mapped[0] = 0x5a;
+    EXPECT_EQ(static_cast<char*>(base)[0], 0x5a);
+
+    ASSERT_EQ(transport.freeSharedMemory(base), 0);
+    EXPECT_EQ(access(shm_name.c_str(), F_OK), -1);
+}
+
+INSTANTIATE_TEST_SUITE_P(HugepageSizes, ShmHugepageAllocateTest,
+                         ::testing::Values(SharedMemoryOptions::kHugepage2MB,
+                                           SharedMemoryOptions::kHugepage512MB,
+                                           SharedMemoryOptions::kHugepage1GB),
+                         [](const testing::TestParamInfo<size_t>& info) {
+                             return HugepageSizeTestName(info.param);
+                         });
+
+TEST(ShmTransportTest, HugepageRejectsUnsupportedSize) {
+    ShmTransport transport;
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = 64ULL * 1024;  // not a Store/TE hugepage size
+    opt.hugetlbfs_path = "/tmp/mooncake_hugepages_2m";
+    EXPECT_EQ(transport.allocateSharedMemory(opt.hugepage_size, opt), nullptr);
+}
+
+TEST(ShmTransportTest, HugepageRejectsUnalignedLength) {
+    ShmTransport transport;
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage2MB;
+    opt.hugetlbfs_path = "/tmp/mooncake_hugepages_2m";
+    opt.populate = false;
+    EXPECT_EQ(transport.allocateSharedMemory(4096, opt), nullptr);
+}
+
+TEST(ShmTransportTest, HugepageRejectsPageSizeMismatch) {
+    auto mount_2m = FindHugetlbfsMount(SharedMemoryOptions::kHugepage2MB);
+    if (!mount_2m) {
+        GTEST_SKIP() << "No writable 2MB hugetlbfs mount";
+    }
+    // Request 1GB against a 2MB mount → must fail (no tmpfs fallback).
+    ShmTransport transport;
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage1GB;
+    opt.hugetlbfs_path = *mount_2m;
+    opt.populate = false;
+    EXPECT_EQ(
+        transport.allocateSharedMemory(SharedMemoryOptions::kHugepage1GB, opt),
+        nullptr);
+}
+
+TEST(ShmTransportTest, HugepageDoesNotFallbackToTmpfs) {
+    ShmTransport transport;
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage2MB;
+    opt.hugetlbfs_path = "/tmp/mooncake_not_a_hugetlbfs_mount";
+    opt.populate = false;
+    EXPECT_EQ(
+        transport.allocateSharedMemory(SharedMemoryOptions::kHugepage2MB, opt),
+        nullptr);
+}
+
+TEST(ShmTransportTest, HugepageRejectsRelativeMount) {
+    ShmTransport transport;
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage2MB;
+    opt.hugetlbfs_path = "hugepages";
+    opt.populate = false;
+    EXPECT_EQ(
+        transport.allocateSharedMemory(SharedMemoryOptions::kHugepage2MB, opt),
+        nullptr);
+}
+
+TEST(ShmTransportTest, HugepageRejectsDotDotMount) {
+    ShmTransport transport;
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage2MB;
+    opt.hugetlbfs_path = "/dev/hugepages/../hugepages";
+    opt.populate = false;
+    EXPECT_EQ(
+        transport.allocateSharedMemory(SharedMemoryOptions::kHugepage2MB, opt),
+        nullptr);
+}
+
+TEST(ShmTransportTest, RelocateRejectsTraversalFilesystemPath) {
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    addPeerSegment(*metadata, "/dev/hugepages/../../tmp/mooncake_poison",
+                   kRemoteAddress, 4096);
+
+    ShmTransport transport;
+    std::string local = "127.0.0.1:19000";
+    ASSERT_EQ(ShmTransportTestPeer::install(transport, local, metadata), 0);
+
+    uint64_t address = kRemoteAddress;
+    EXPECT_FALSE(
+        ShmTransportTestPeer::relocate(transport, address, 4096, kPeerSegmentId)
+            .ok());
+}
+
+TEST(ShmTransportTest, RelocateRejectsNonHugetlbfsFilesystemPath) {
+    char tmpl[] = "/tmp/mooncake_XXXXXX";
+    int fd = mkstemp(tmpl);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, 4096), 0);
+    close(fd);
+
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    addPeerSegment(*metadata, tmpl, kRemoteAddress, 4096);
+
+    ShmTransport transport;
+    std::string local = "127.0.0.1:19000";
+    ASSERT_EQ(ShmTransportTestPeer::install(transport, local, metadata), 0);
+
+    uint64_t address = kRemoteAddress;
+    EXPECT_FALSE(
+        ShmTransportTestPeer::relocate(transport, address, 4096, kPeerSegmentId)
+            .ok());
+    unlink(tmpl);
+}
+
 #ifndef ENABLE_MULTI_PROTOCOL
 TEST(ShmTransportTest, InstallReplacesNonShmProtocol) {
     auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
@@ -751,11 +978,12 @@ class ShmRoutingTest : public ::testing::Test {
 
     void AddBuffer(TransferMetadata::SegmentDesc& desc,
                    const std::string& shm_name,
-                   const std::string& buffer_protocol) {
+                   const std::string& buffer_protocol,
+                   uint64_t addr = kRemoteAddr, uint64_t length = 4096) {
         TransferMetadata::BufferDesc buffer;
         buffer.name = "cpu:0";
-        buffer.addr = kRemoteAddr;
-        buffer.length = 4096;
+        buffer.addr = addr;
+        buffer.length = length;
         buffer.shm_name = shm_name;
 #ifdef ENABLE_MULTI_PROTOCOL
         buffer.protocol = buffer_protocol;
@@ -779,12 +1007,13 @@ class ShmRoutingTest : public ::testing::Test {
         return id;
     }
 
-    Transport::TransferRequest MakeWrite(Transport::SegmentID id) const {
+    Transport::TransferRequest MakeWrite(
+        Transport::SegmentID id, uint64_t target_offset = kRemoteAddr) const {
         Transport::TransferRequest request;
         request.opcode = Transport::TransferRequest::WRITE;
         request.source = nullptr;
         request.target_id = id;
-        request.target_offset = kRemoteAddr;
+        request.target_offset = target_offset;
         request.length = 64;
         return request;
     }
@@ -878,6 +1107,107 @@ TEST_F(ShmRoutingTest, HipBufferDoesNotSelectShm) {
         MultiTransportTestPeer::selectTransport(*multi_, request, transport);
     EXPECT_TRUE(status.IsNotSupportedTransport()) << status.ToString();
     EXPECT_NE(transport, shm_);
+}
+#endif
+
+TEST_F(ShmRoutingTest, HomogeneousProtocolAllowsReuse) {
+    auto id = AddPeer("127.0.0.1:19001", "mooncake_1_abcdefgh");
+    auto request = MakeWrite(id);
+    Transport* transport = nullptr;
+    bool allows_reuse = false;
+    auto status = MultiTransportTestPeer::selectTransport(
+        *multi_, request, transport, &allows_reuse);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(transport, shm_);
+    EXPECT_TRUE(allows_reuse);
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST_F(ShmRoutingTest, CommaProtocolDisablesReuse) {
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "127.0.0.1:19001";
+    desc->protocol = "tcp,shm";
+    AddBuffer(*desc, "", "tcp");
+    AddBuffer(*desc, "mooncake_1_abcdefgh", "shm");
+    const auto id = next_segment_id_++;
+    metadata_->addLocalSegment(id, desc->name, std::move(desc));
+
+    auto request = MakeWrite(id);
+    Transport* transport = nullptr;
+    bool allows_reuse = true;
+    auto status = MultiTransportTestPeer::selectTransport(
+        *multi_, request, transport, &allows_reuse);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(transport, shm_);
+    EXPECT_FALSE(allows_reuse);
+}
+#endif
+
+TEST_F(ShmRoutingTest, InvalidSegmentClearsReuse) {
+    auto request = MakeWrite(9999);
+    Transport* transport = nullptr;
+    bool allows_reuse = true;
+    auto status = MultiTransportTestPeer::selectTransport(
+        *multi_, request, transport, &allows_reuse);
+    EXPECT_FALSE(status.ok());
+    EXPECT_FALSE(allows_reuse);
+}
+
+TEST_F(ShmRoutingTest, ReuseLoopMatchesPerRequestSelect) {
+    auto first = AddPeer("127.0.0.1:19001", "mooncake_1_abcdefgh");
+    auto second = AddPeer("127.0.0.1:19002", "mooncake_2_abcdefgh");
+    const std::vector<Transport::TransferRequest> entries = {
+        MakeWrite(first), MakeWrite(first), MakeWrite(second),
+        MakeWrite(first)};
+
+    std::vector<Transport*> got;
+    auto status =
+        MultiTransportTestPeer::selectTransports(*multi_, entries, got);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_EQ(got.size(), entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        Transport* expected = nullptr;
+        auto per_request = MultiTransportTestPeer::selectTransport(
+            *multi_, entries[i], expected);
+        ASSERT_TRUE(per_request.ok()) << per_request.ToString();
+        EXPECT_EQ(got[i], expected) << "index " << i;
+        EXPECT_EQ(got[i], shm_);
+    }
+}
+
+TEST_F(ShmRoutingTest, ReuseLoopDoesNotReuseUnsupportedTarget) {
+    auto first = AddPeer("127.0.0.1:19001", "mooncake_1_abcdefgh");
+    auto second = AddPeer("127.0.0.1:19002", "mooncake_2_abcdefgh", "rdma");
+    const std::vector<Transport::TransferRequest> entries = {
+        MakeWrite(first), MakeWrite(first), MakeWrite(second)};
+
+    std::vector<Transport*> got;
+    auto status =
+        MultiTransportTestPeer::selectTransports(*multi_, entries, got);
+    EXPECT_TRUE(status.IsNotSupportedTransport()) << status.ToString();
+    EXPECT_EQ(got.size(), 2u);
+    EXPECT_EQ(got[0], shm_);
+    EXPECT_EQ(got[1], shm_);
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST_F(ShmRoutingTest, ReuseLoopDoesNotSkipMixedProtocolOffsets) {
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "127.0.0.1:19001";
+    desc->protocol = "tcp,shm";
+    AddBuffer(*desc, "", "tcp", kRemoteAddr);
+    AddBuffer(*desc, "mooncake_1_abcdefgh", "shm", kRemoteAddr + 4096);
+    const auto id = next_segment_id_++;
+    metadata_->addLocalSegment(id, desc->name, std::move(desc));
+
+    const std::vector<Transport::TransferRequest> entries = {
+        MakeWrite(id, kRemoteAddr + 4096), MakeWrite(id, kRemoteAddr)};
+    std::vector<Transport*> got;
+    auto status =
+        MultiTransportTestPeer::selectTransports(*multi_, entries, got);
+    EXPECT_TRUE(status.IsNotSupportedTransport()) << status.ToString();
+    EXPECT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0], shm_);
 }
 #endif
 
