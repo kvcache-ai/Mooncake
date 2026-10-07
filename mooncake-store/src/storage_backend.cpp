@@ -2540,6 +2540,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
+#ifdef USE_URING
+    // Bucket data writes stay buffered, but with io_uring enabled every bucket
+    // read goes through O_DIRECT and never hits these pages. Drop them now
+    // that they are clean so spilling does not build up page cache.
+    if (file_storage_config_.use_uring) {
+        file->drop_page_cache();
+    }
+#endif
+
     // Invalidate cache for this file since content changed
     {
         MutexLocker cache_locker(&file_cache_mutex_);
