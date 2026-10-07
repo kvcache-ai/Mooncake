@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -120,7 +121,7 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsQueuedOffloadWithOffloadOnEvict) {
     // Let leases expire so the keys are evictable, then run one eviction
     // cycle to queue their offloads without draining the mirrors.
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
-    service->RunBatchEvictForTesting(1.0, 1.0);
+    MasterServiceTestPeer(*service).RunBatchEvictForTesting(1.0, 1.0);
 
     std::string offloading_key;
     for (const auto& k : keys) {

@@ -14,8 +14,9 @@
 #include <ylt/metric/counter.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
-#include "environ.h"
+#include "allocator_metric.h"
 #include "hybrid_metric.h"
+#include "master_heartbeat_metric.h"
 #include "common/byte_size.h"
 
 namespace mooncake {
@@ -34,18 +35,9 @@ const std::vector<double> kLatencyBucket = {
 // In production mode, more labels are needed for monitoring and troubleshooting
 // Static labels include but are not limited to machine address, cluster name,
 // etc. These labels remain constant during the lifetime of the application
-const std::string kClusterID = Environ::GetString("MC_STORE_CLUSTER_ID", "");
-
 // Merge static labels with dynamic labels
-const inline std::map<std::string, std::string> merge_labels(
-    const std::map<std::string, std::string>& labels) {
-    std::map<std::string, std::string> merged_labels;
-    if (!kClusterID.empty()) {
-        merged_labels["cluster_id"] = kClusterID;
-    }
-    merged_labels.insert(labels.begin(), labels.end());
-    return merged_labels;
-}
+const std::map<std::string, std::string> merge_labels(
+    const std::map<std::string, std::string>& labels);
 
 inline std::string format_metric_rate(double value, const char* suffix) {
     const double KB = 1024.0;
@@ -887,12 +879,14 @@ struct ClientMetric {
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
     DfsMetric dfs_metric;
+    AllocatorMetric allocator_metric;
     // Prometheus "info" pattern: the value carries no meaning and is always 1,
     // the version strings ride along as static labels next to any caller
     // supplied labels so a scrape can attribute samples to a concrete build.
     // Shares the `mooncake_build_info` name with the master-side metric; the
     // two are told apart by the scrape target's job/instance labels.
     ylt::metric::gauge_t build_info;
+    MasterHeartbeatMetric master_heartbeat_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables

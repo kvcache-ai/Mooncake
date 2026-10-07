@@ -18,6 +18,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
 | **shm** | None (POSIX shm, same host) | Same-host DRAM copies without NIC loopback | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
+| **hylink** | Hygon DCU + DTK | Hygon DCU HSL fabric communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
 | **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
 | **flagcx** | RDMA-capable NIC(s) | Unified P2P transfer through FlagOS FlagCX | ⚠️ Advanced |
@@ -70,6 +71,7 @@ export MOONCAKE_PROTOCOL="tcp"
 - NVIDIA GPUDirect RDMA
 - Non-NVIDAI GPUDirect RDMA (e.g., Intel E810 RDMA NIC)
 - Cambricon MLU memory via Neuware (`-DUSE_MLU=ON`)
+- Biren GPU memory via SUPA (`-DUSE_SUPA=ON`)
 
 **Use When:**
 - High-performance networking is required
@@ -168,7 +170,7 @@ cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON
 - Software-emulated RDMA writes (higher CPU overhead than true RDMA)
 - ~88% of RoCE RDMA throughput
 
-**Documentation:** See [EFA Transport](../design/transfer-engine/efa_transport.md) for build instructions, benchmarks, and tuning.
+**Documentation:** See [EFA Transport](../design/transfer-engine/transport/efa_transport.md) for build instructions, benchmarks, and tuning.
 
 ## Advanced Protocols (C++ Transfer Engine)
 
@@ -336,7 +338,7 @@ export MC_INTRANODE_NVLINK=true
 - You want to avoid RDMA/TCP loopback for that path
 
 **Requirements:**
-- Linux POSIX shm (`/dev/shm`)
+- Linux POSIX shm (`/dev/shm`), or a writable hugetlbfs mount when allocating with `SharedMemoryOptions.use_hugepage` (2MB / 512MB / 1GB)
 - Buffers allocated with `TransferEngine::allocateSharedMemory` (ordinary `malloc` cannot be exported)
 - Runtime opt-in: `MC_FORCE_SHM=1`, or `installTransport("shm")`. With `-DENABLE_MULTI_PROTOCOL=ON` this adds SHM next to RDMA/TCP (`rdma,shm` / `tcp,shm`); without it, SHM is the only transport.
 - Same-host SHM **and** cross-host RDMA/TCP in one engine: build with `-DENABLE_MULTI_PROTOCOL=ON` (segment protocol becomes `rdma,shm` or `tcp,shm`)
@@ -344,9 +346,10 @@ export MC_INTRANODE_NVLINK=true
 **Limitations:**
 - Same host only. Without `ENABLE_MULTI_PROTOCOL`, `MC_FORCE_SHM=1` (or `installTransport("shm")` after another transport) sets `segment.protocol` to `shm` and replaces RDMA/TCP routing; `installTransport("shm")` logs a WARNING when it overwrites a non-empty protocol. Coexistence needs `-DENABLE_MULTI_PROTOCOL=ON`.
 - `registerLocalMemory` must use the pointer from `allocateSharedMemory` (a shorter prefix is allowed). A sub-range or overflowing range returns an error instead of silently skipping. Ordinary `malloc` is still skipped so TCP/RDMA can register it.
-- Same-UID only: objects are created `0600` with POSIX names `/mooncake_<pid>_xxxxxxxx`. Creator and consumer must share a user; a hostname match does not imply a shared `/dev/shm` (for example Kubernetes `hostNetwork` pods).
-- Crash or `SIGKILL` can leave objects in `/dev/shm` until reboot; there is no automatic reaper.
-- After `freeSharedMemory` + `allocateSharedMemory`, a peer that still has a cached mapping probes the POSIX name before memcpy. An unlinked object is dropped and the segment descriptor is refetched once; a changed virtual address still requires the initiator to read the new `BufferDesc.addr` (relocate cannot guess a new offset). Background refresh remains optional via `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`.
+- Same-UID only: objects are created `0600`. POSIX names are `/mooncake_<pid>_xxxxxxxx`; hugepage files are `<hugetlbfs-mount>/mooncake_<pid>_xxxxxxxx`. Creator and consumer must share a user; a hostname match does not imply a shared `/dev/shm` or hugetlbfs mount (for example Kubernetes `hostNetwork` pods).
+- Crash or `SIGKILL` can leave POSIX objects in `/dev/shm` and hugetlbfs files on the mount. There is no automatic reaper (wiping `mooncake_*` on start would hit live peers on the same mount). POSIX leftovers waste tmpfs until reboot; **hugetlbfs leftovers keep hugepages reserved** until the file is unlinked or the node reboots. After a crash, delete only `mooncake_<pid>_*` whose pid no longer exists, e.g. `rm /dev/hugepages/mooncake_<dead-pid>_*`.
+- Hugepage allocations do not fall back to tmpfs. `length` must be a multiple of the hugepage size; TE does not round up.
+- After `freeSharedMemory` + `allocateSharedMemory`, a peer that still has a cached mapping probes the object name before memcpy. An unlinked object is dropped and the segment descriptor is refetched once; a changed virtual address still requires the initiator to read the new `BufferDesc.addr` (relocate cannot guess a new offset). Background refresh remains optional via `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`.
 - Relocate caches at most 32 mmap'd peer objects per target. An in-flight copy pins its mapping so prune/cap cannot `munmap` it until memcpy returns; the cache may briefly exceed 32 while pins are held.
 - Default off because the path is not NUMA-aware
 - Mooncake Store segments are not shm-backed until a follow-up allocator change
@@ -364,8 +367,40 @@ export MC_INTRANODE_NVLINK=true
 - HCCL runtime
 
 **Documentation:**
-- [Heterogeneous Ascend](../design/transfer-engine/heterogeneous_ascend.md)
-- [Ascend Transport](../design/transfer-engine/ascend_transport.md)
+- [Heterogeneous Ascend](../design/transfer-engine/transport/heterogeneous_ascend.md)
+- [Ascend Transport](../design/transfer-engine/transport/ascend_transport.md)
+
+### Hylink Transport (hylink)
+
+**Description:** Transfer Engine transport for Hygon DCU memory over HSL
+(Hygon Scale-up Link). HSL connects DCUs directly, including across machines,
+and does not use an IB/RoCE NIC. Peers exchange a DTK VMM fabric handle
+(`hipMemAllocationHandleType` `0x8`, 512 bytes). The same handle works on one
+machine and across machines. An imported fabric address can be granted access
+only once, and only to one device, so each local GPU imports and maps the
+handle, then grants access on its own device. The TENT transport uses the same
+HSL fabric path by default, and remains selectable across machines. Set
+`MC_HYLINK_USE_VMM=0` on both sides of a TENT run to use HIP IPC in
+environments that do not support VMM. IPC cannot cross machines.
+
+**Status:** Select it with `transfer_engine_bench --protocol=hylink`.
+TENT selects it with `transports.hylink.enable=true` or
+`transfer_engine_bench --backend=tent --protocol=hylink`. It is off unless
+that switch is set, so a DTK build keeps using RDMA/TCP by default.
+
+**Use When:**
+- DCU copies on one machine or across machines should use HSL instead of a
+  NIC path. The exporter must register VMM memory (`hipMemCreate`)
+- TENT only: set `MC_HYLINK_USE_VMM=0` in environments that do not support
+  VMM. That path uses same-machine `hipMalloc` buffers and a HIP IPC
+  handle, and cannot cross machines
+
+**Requirements:**
+- Built with `-DUSE_HYLINK=ON` (implies `USE_HIP`)
+- TENT builds also pass `-DUSE_TENT=ON`
+- Hygon DTK runtime
+- Both sides must support DTK VMM fabric
+- TENT IPC does not require VMM and stays on one machine
 
 ### TPU Transport (tpu) — Experimental
 
@@ -426,7 +461,7 @@ so it cannot be selected through `MOONCAKE_PROTOCOL` or `transfer_engine_bench -
 { "transports": { "mpcomm": { "enable": true } } }
 ```
 
-See [MPComm Transport](../design/transfer-engine/mpcomm_transport.md) for the full guide,
+See [MPComm Transport](../design/transfer-engine/transport/mpcomm_transport.md) for the full guide,
 including selection via transport policy, tuning environment variables, and troubleshooting.
 
 ### FlagOS FlagCX Transport (flagcx)
@@ -475,7 +510,7 @@ export FLAGCX_SOCKET_IFNAME="eth0"
 - Buffers should be registered before the first transfer to a peer and remain registered while
   that peer connection is active
 
-See [FlagOS FlagCX Transport](../design/transfer-engine/flagcx_transport.md) for dependency,
+See [FlagOS FlagCX Transport](../design/transfer-engine/transport/flagcx_transport.md) for dependency,
 build, benchmark, runtime configuration, and troubleshooting details.
 
 ## Configuration Examples
@@ -538,6 +573,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
 | Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
+| Hygon DCU Clusters | rdma + hylink | Build with `-DUSE_HYLINK=ON`; use hylink for HSL fabric communication |
 | Multi-vendor or cross-vendor clusters | flagcx | Build with `-DUSE_FLAGCX=ON`; transfers use the FlagCX P2P Engine over RDMA-capable NICs |
 
 ## Troubleshooting
@@ -581,3 +617,17 @@ If a protocol fails to initialize:
 - [Transfer Engine Benchmark](../design/transfer-engine/transfer-engine-bench-tuning.md) - Performance tuning
 - [Python API Reference](../api-reference/python/transfer-engine.md) - API documentation
 - [Deployment Guide](../deployment/mooncake-store-deployment-guide.md) - Production deployment
+
+:::{toctree}
+:maxdepth: 1
+:hidden:
+
+../design/transfer-engine/transport/efa_transport
+../design/transfer-engine/transport/ascend_direct_transport
+../design/transfer-engine/transport/ascend_transport
+../design/transfer-engine/transport/heterogeneous_ascend
+../design/transfer-engine/transport/kunpeng_ub_transport
+../design/transfer-engine/transport/sunrise_link_transport
+../design/transfer-engine/transport/flagcx_transport
+../design/transfer-engine/transport/mpcomm_transport
+:::

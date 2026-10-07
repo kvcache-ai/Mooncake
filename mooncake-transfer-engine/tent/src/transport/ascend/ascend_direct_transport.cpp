@@ -1,4 +1,4 @@
-// Copyright 2024 KVCache.AI
+// Copyright 2026 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,740 +13,826 @@
 // limitations under the License.
 
 #include "tent/transport/ascend/ascend_direct_transport.h"
+#include "tent/transport/ascend/hixl_engine.h"
+#include "tent/transport/ascend/local_copy_engine.h"
+#include "tent/transport/ascend/resource_config.h"
 
 #include <algorithm>
-#include <cstddef>
-#include <cstdint>
-#include <iomanip>
-#include <memory>
-#include <random>
-#include <string>
+#include <chrono>
+#include <map>
+#include <utility>
+#include <variant>
 
-#include <bits/stdint-uintn.h>
+#include <acl/acl.h>
 #include <glog/logging.h>
 
 #include "tent/common/status.h"
+#include "tent/common/utils/os.h"
 #include "tent/runtime/slab.h"
-#include "tent/runtime/control_plane.h"
+#include "tent/thirdparty/nlohmann/json.h"
 
 namespace mooncake {
 namespace tent {
 namespace {
-constexpr size_t MEM_CPY_LIMIT = 4096;
-constexpr int BASE_PORT = 20000;
-std::string hixlTransferStatusToString(hixl::TransferStatus status) {
-    switch (status) {
-        case hixl::TransferStatus::WAITING:
-            return "WAITING";
-        case hixl::TransferStatus::COMPLETED:
-            return "COMPLETED";
-        case hixl::TransferStatus::TIMEOUT:
-            return "TIMEOUT";
-        case hixl::TransferStatus::FAILED:
-            return "FAILED";
+
+constexpr int64_t kMillisToNano = 1000000;
+constexpr int kMaxInflightReqs = 100;
+
+bool IsHostMem(const std::string& location, void* addr) {
+    if (location.rfind("cpu", 0) == 0) {
+        return true;
+    }
+    if (location.rfind("npu", 0) == 0) {
+        return false;
+    }
+    aclrtPtrAttributes attributes{};
+    if (aclrtPointerGetAttributes(addr, &attributes) != ACL_SUCCESS) {
+        LOG(ERROR) << "aclrtPointerGetAttributes failed, errmsg: "
+                   << aclGetRecentErrMsg();
+        return true;
+    }
+    return attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST;
+}
+
+TransferStatusEnum FromHixlState(HixlXferState state) {
+    switch (state) {
+        case HixlXferState::Completed:
+            return TransferStatusEnum::COMPLETED;
+        case HixlXferState::Timeout:
+            return TransferStatusEnum::TIMEOUT;
+        case HixlXferState::Failed:
+            return TransferStatusEnum::FAILED;
+        case HixlXferState::Waiting:
         default:
-            return "UNKNOWN(" + std::to_string(static_cast<int>(status)) + ")";
+            return TransferStatusEnum::PENDING;
     }
 }
-uint16_t findListenPort(int32_t dev_id) {
-    char *rt_visible_devices = std::getenv("ASCEND_RT_VISIBLE_DEVICES");
-    if (rt_visible_devices) {
-        std::vector<std::string> device_list;
-        std::stringstream ss(rt_visible_devices);
-        std::string item;
-        while (std::getline(ss, item, ',')) {
-            device_list.push_back(item);
-        }
-        if (dev_id < static_cast<int32_t>(device_list.size())) {
-            try {
-                dev_id = std::stoi(device_list[dev_id]);
-            } catch (const std::exception &e) {
-                LOG(WARNING) << "ASCEND_RT_VISIBLE_DEVICES is not valid, value:"
-                             << rt_visible_devices;
-            }
-        } else {
-            LOG(WARNING) << "Device id is " << dev_id
-                         << ", ASCEND_RT_VISIBLE_DEVICES is "
-                         << rt_visible_devices << ", which is unexpected.";
-        }
-    }
-    static std::random_device rand_gen;
-    const int min_port = BASE_PORT + dev_id * 1000;
-    const int max_port = BASE_PORT + (dev_id + 1) * 1000;
-    LOG(INFO) << "Find available between " << min_port << " and " << max_port;
-    const int max_attempts = 500;
-    std::uniform_int_distribution<> rand_dist(min_port, max_port);
-    int sockfd;
-    for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        int port = rand_dist(rand_gen);
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (sockfd == -1) {
-            continue;
-        }
-        struct timeval timeout;
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                       sizeof(timeout))) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
-        }
-        sockaddr_in bind_address;
-        memset(&bind_address, 0, sizeof(sockaddr_in));
-        bind_address.sin_family = AF_INET;
-        bind_address.sin_port = htons(port);
-        bind_address.sin_addr.s_addr = INADDR_ANY;
-        if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
-        }
-        close(sockfd);
-        return port;
-    }
-    return 0;
-}
+
 }  // namespace
-AscendDirectTransport::AscendDirectTransport() : installed_(false) {}
 
-AscendDirectTransport::~AscendDirectTransport() {
-    hixl_->Finalize();
-    uninstall();
-}
+AscendDirectTransport::AscendDirectTransport() = default;
 
-Status AscendDirectTransport::install(std::string &local_segment_name,
+AscendDirectTransport::~AscendDirectTransport() { (void)uninstall(); }
+
+Status AscendDirectTransport::install(std::string& local_segment_name,
                                       std::shared_ptr<ControlService> metadata,
                                       std::shared_ptr<Topology> local_topology,
                                       std::shared_ptr<Config> conf) {
     if (installed_) {
         return Status::InvalidArgument(
-            "Hixl transport has been installed" LOC_MARK);
+            "AscendDirectTransport has been installed" LOC_MARK);
     }
-
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
-    installed_ = true;
+    conf_ = conf;
+    options_ = LoadAscendDirectOptions(conf_);
+    init_options_ = BuildHixlInitOptions(options_);
+    transfer_timeout_ns_ =
+        static_cast<int64_t>(options_.transfer_timeout_ms) * kMillisToNano;
     caps.dram_to_dram = true;
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;
     caps.gpu_to_gpu = true;
-    transfer_timeout_ =
-        conf->get("transports/ascend_direct/transfer_timeout_ns", 3000000UL);
-    connect_timeout_ =
-        conf->get("transports/ascend_direct/connect_timeout_ns", 3000000UL);
-    return initHixl(conf);
+    auto status = initEngines();
+    if (!status.ok()) {
+        finalizeEngines();
+        return status;
+    }
+    status = publishLocalEngines();
+    if (!status.ok()) {
+        finalizeEngines();
+        return status;
+    }
+    installed_ = true;
+    LOG(INFO) << "Installed AscendDirectTransport engines=" << engines_.size()
+              << " agent_mode=" << options_.agent_mode
+              << " fabric_mem=" << options_.use_fabric_mem
+              << " roce_mode=" << options_.roce_mode
+              << " timeout_ms=" << options_.transfer_timeout_ms;
+    return Status::OK();
 }
 
-Status AscendDirectTransport::initHixl(const std::shared_ptr<Config> &conf) {
-    auto ret = aclrtGetDevice(&device_logic_id_);
-    if (ret) {
-        LOG(ERROR) << "Call aclrtGetDevice failed, ret: " << ret;
-        return Status::InvalidArgument(
-            "Get device id failed, device id may be not set.");
+Status AscendDirectTransport::initEngines() {
+    // A failed install may be retried. Release any engines left by that
+    // attempt before rebuilding the per-device set.
+    finalizeEngines();
+    aclrtContext saved = nullptr;
+    if (aclrtGetCurrentContext(&saved) != ACL_ERROR_NONE) {
+        return Status::InternalError(
+            "Get device context failed, device may be not set." LOC_MARK);
     }
-    ret = aclrtGetCurrentContext(&rt_context_);
-    if (ret) {
-        LOG(ERROR) << "Call aclrtGetCurrentContext failed, ret: " << ret;
-        return Status::InternalError("Get rt context failed.");
-    }
-    auto host_ip = local_segment_name_;
-    const size_t colon_pos = local_segment_name_.find(':');
-    if (colon_pos != std::string::npos) {
-        host_ip = local_segment_name_.substr(0, colon_pos);
-    }
-    auto port = findListenPort(device_logic_id_);
-    auto hixl_name = host_ip + ":" + std::to_string(port);
-    local_hixl_name_ = hixl_name;
 
-    CHECK_STATUS(metadata_->segmentManager().updateLocal(
-        [&](SegmentDesc &segment) -> Status {
-            auto &detail = std::get<MemorySegmentDesc>(segment.detail);
-            detail.device_attrs["hixl_name"] = hixl_name;
-            return Status::OK();
-        }));
+    std::vector<std::pair<int32_t, aclrtContext>> devices;
+    if (options_.agent_mode) {
+        uint32_t device_count = 0;
+        if (aclrtGetDeviceCount(&device_count) != ACL_ERROR_NONE ||
+            device_count == 0) {
+            return Status::InternalError(
+                "aclrtGetDeviceCount failed in agent mode" LOC_MARK);
+        }
+        for (uint32_t i = 0; i < device_count; ++i) {
+            auto device_id = static_cast<int32_t>(i);
+            if (aclrtSetDevice(device_id) != ACL_ERROR_NONE) {
+                LOG(ERROR) << "aclrtSetDevice failed for device " << device_id
+                           << ", errmsg: " << aclGetRecentErrMsg();
+                (void)aclrtSetCurrentContext(saved);
+                return Status::InternalError("aclrtSetDevice failed" LOC_MARK);
+            }
+            aclrtContext context = nullptr;
+            if (aclrtGetCurrentContext(&context) != ACL_ERROR_NONE) {
+                (void)aclrtSetCurrentContext(saved);
+                return Status::InternalError(
+                    "aclrtGetCurrentContext failed" LOC_MARK);
+            }
+            devices.emplace_back(device_id, context);
+        }
+        (void)aclrtSetCurrentContext(saved);
+    } else {
+        int32_t device_id = 0;
+        if (aclrtGetDevice(&device_id) != ACL_ERROR_NONE) {
+            return Status::InvalidArgument(
+                "Get device id failed, device id may be not set." LOC_MARK);
+        }
+        devices.emplace_back(device_id, saved);
+    }
 
-    hixl_ = std::make_unique<hixl::Hixl>();
-    if (!hixl_) return Status::InternalError("Create hixl failed.");
-    std::map<hixl::AscendString, hixl::AscendString> options;
-    std::string rdma_tc = conf->get("transports/ascend_direct/rdma_tc", "");
-    if (!rdma_tc.empty()) {
-        options["RdmaTrafficClass"] = rdma_tc.c_str();
-        LOG(INFO) << "Set RdmaTrafficClass to:" << rdma_tc;
-    } else {
-        auto rdma_tc_env = std::getenv("HCCL_RDMA_TC");
-        if (rdma_tc_env) {
-            options["RdmaTrafficClass"] = rdma_tc_env;
-            LOG(INFO) << "Set RdmaTrafficClass to:" << rdma_tc_env;
+    const auto host_ip = HostIpFromSegmentName(local_segment_name_);
+    for (const auto& [device_id, context] : devices) {
+        auto port = FindHixlListenPort(options_.base_port, device_id);
+        if (port == 0) {
+            return Status::InternalError("Find available port failed" LOC_MARK);
         }
-    }
-    std::string rdma_sl = conf->get("transports/ascend_direct/rdma_sl", "");
-    if (!rdma_sl.empty()) {
-        options["RdmaServiceLevel"] = rdma_sl.c_str();
-        LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
-    } else {
-        auto rdma_sl_env = std::getenv("HCCL_RDMA_SL");
-        if (rdma_sl_env) {
-            options["RdmaServiceLevel"] = rdma_sl_env;
-            LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl_env;
+        auto engine = std::make_unique<HixlEngine>();
+        const auto name = MakeHixlEngineName(host_ip, port);
+        auto init = init_options_;
+        if (options_.roce_mode) {
+            const auto roce_listen = HixlRoceListenPort(port);
+            init = WithHixlListenPort(init_options_, roce_listen);
+            LOG(INFO) << "HIXL engine " << name
+                      << " roce listen_port=" << roce_listen;
+        } else {
+            LOG(INFO) << "HIXL engine " << name;
         }
+        auto status = engine->initialize(name, context, device_id, init);
+        if (!status.ok()) {
+            engine->finalize();
+            return status;
+        }
+        auto local_copy = std::make_unique<LocalCopyEngine>();
+        auto copy_status = local_copy->initialize(engine->context(), device_id);
+        if (!copy_status.ok()) {
+            engine->finalize();
+            return copy_status;
+        }
+        engines_.push_back(std::move(engine));
+        local_copies_.push_back(std::move(local_copy));
     }
-    std::string auto_connect =
-        conf->get("transports/ascend_direct/auto_connect", "");
-    if (!auto_connect.empty()) {
-        auto_connect_ = (auto_connect == "1");
-        options["AutoConnect"] = auto_connect_ ? "1" : "0";
-        LOG(INFO) << "Set AutoConnect to: " << auto_connect;
-    } else {
-        options["AutoConnect"] = "1";
-        auto_connect_ = true;
-        LOG(INFO) << "Set AutoConnect to default: 1";
-    }
-    auto status =
-        hixl_->Initialize(hixl::AscendString(hixl_name.c_str()), options);
-    if (status != hixl::SUCCESS) {
-        LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status
-                   << ", errmsg: " << aclGetRecentErrMsg();
-        return Status::InternalError("Initialize hixl failed.");
-    }
-    ret = aclrtCreateStreamWithConfig(
-        &stream_, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "AscendDirectTransport: cannot create stream, ret: "
-                   << ret;
-        return Status::InternalError("Create stream failed.");
-    }
-    LOG(INFO) << "Success to initialize hixl engine:" << hixl_name
-              << " with device_id:" << device_logic_id_;
     return Status::OK();
+}
+
+void AscendDirectTransport::finalizeEngines() {
+    // Local copy streams may still have ACL work queued, so tear them down
+    // before dropping the HIXL engines and their contexts.
+    for (auto& local_copy : local_copies_) {
+        if (local_copy) {
+            local_copy->finalize();
+        }
+    }
+    local_copies_.clear();
+    for (auto& engine : engines_) {
+        if (engine) {
+            engine->finalize();
+        }
+    }
+    engines_.clear();
+}
+
+Status AscendDirectTransport::publishLocalEngines() {
+    if (!metadata_) {
+        return Status::InvalidArgument("metadata is null" LOC_MARK);
+    }
+    nlohmann::json names = nlohmann::json::array();
+    for (const auto& engine : engines_) {
+        names.push_back(engine->name());
+    }
+    return metadata_->segmentManager().updateLocal(
+        [&](SegmentDesc& segment) -> Status {
+            if (!std::holds_alternative<MemorySegmentDesc>(segment.detail)) {
+                segment.detail = MemorySegmentDesc{};
+            }
+            auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+            if (!names.empty()) {
+                detail.device_attrs[kHixlNameAttr] =
+                    names.front().get<std::string>();
+            }
+            detail.device_attrs[kHixlNamesAttr] = names.dump();
+            return Status::OK();
+        });
+}
+
+size_t AscendDirectTransport::currentEngineIndex() const {
+    if (engines_.size() <= 1) {
+        return 0;
+    }
+    int32_t device_id = 0;
+    if (aclrtGetDevice(&device_id) != ACL_ERROR_NONE) {
+        return 0;
+    }
+    auto idx = static_cast<size_t>(device_id);
+    if (idx >= engines_.size()) {
+        return 0;
+    }
+    return idx;
 }
 
 Status AscendDirectTransport::uninstall() {
-    if (installed_) {
-        metadata_.reset();
-        installed_ = false;
+    (void)quiesce();
+    finalizeEngines();
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        groups_.clear();
+        route_groups_.clear();
+    }
+    inflight_.store(0, std::memory_order_release);
+    inflight_cv_.notify_all();
+    installed_ = false;
+    metadata_.reset();
+    return Status::OK();
+}
+
+Status AscendDirectTransport::quiesce() {
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(options_.transfer_timeout_ms);
+    std::unique_lock<std::mutex> lock(inflight_mu_);
+    while (inflight_.load(std::memory_order_acquire) > 0) {
+        if (inflight_cv_.wait_until(lock, deadline) ==
+            std::cv_status::timeout) {
+            LOG(WARNING) << "AscendDirectTransport quiesce timed out with "
+                         << inflight_.load() << " in-flight requests";
+            break;
+        }
     }
     return Status::OK();
 }
 
-Status AscendDirectTransport::allocateSubBatch(SubBatchRef &batch,
+Status AscendDirectTransport::allocateSubBatch(SubBatchRef& batch,
                                                size_t max_size) {
-    auto hixl_batch = Slab<HixlSubBatch>::Get().allocate();
-    if (!hixl_batch)
-        return Status::InternalError("Unable to allocate TCP sub-batch");
-    batch = hixl_batch;
+    auto* hixl_batch = Slab<HixlSubBatch>::Get().allocate();
+    if (!hixl_batch) {
+        return Status::InternalError("Unable to allocate HIXL sub-batch");
+    }
+    hixl_batch->task_list.clear();
     hixl_batch->task_list.reserve(max_size);
     hixl_batch->max_size = max_size;
+    batch = hixl_batch;
     return Status::OK();
 }
 
-Status AscendDirectTransport::freeSubBatch(SubBatchRef &batch) {
-    auto hixl_batch = dynamic_cast<HixlSubBatch *>(batch);
-    if (!hixl_batch)
-        return Status::InvalidArgument("Invalid TCP sub-batch" LOC_MARK);
+Status AscendDirectTransport::freeSubBatch(SubBatchRef& batch) {
+    auto* hixl_batch = dynamic_cast<HixlSubBatch*>(batch);
+    if (!hixl_batch) {
+        return Status::InvalidArgument("Invalid HIXL sub-batch" LOC_MARK);
+    }
     Slab<HixlSubBatch>::Get().deallocate(hixl_batch);
     batch = nullptr;
     return Status::OK();
 }
 
+Status AscendDirectTransport::resolveRequest(const Request& request,
+                                             PreparedRequest& prepared) const {
+    if (engines_.empty()) {
+        return Status::InternalError(
+            "HIXL engines are not initialized" LOC_MARK);
+    }
+    if (!metadata_) {
+        return Status::InvalidArgument("metadata is null" LOC_MARK);
+    }
+    SegmentDescRef pin;
+    SegmentDesc* desc = nullptr;
+    auto status = metadata_->segmentManager().withCachedSegment(
+        request.target_id, pin, [&](SegmentDesc* cached) {
+            desc = cached;
+            return Status::OK();
+        });
+    if (!status.ok() || desc == nullptr) {
+        return Status::InvalidArgument("Cannot find target segment" LOC_MARK);
+    }
+    if (!std::holds_alternative<MemorySegmentDesc>(desc->detail)) {
+        return Status::InvalidArgument(
+            "Target is not a memory segment" LOC_MARK);
+    }
+    const auto& detail = std::get<MemorySegmentDesc>(desc->detail);
+    prepared.request = request;
+    prepared.local_engine_idx = currentEngineIndex();
+    prepared.remote_hixl = ResolveRemoteHixlName(detail, request.target_offset);
+    if (prepared.remote_hixl.empty()) {
+        return Status::InvalidArgument("Missing remote hixl_name" LOC_MARK);
+    }
+    if (request.target_id != LOCAL_SEGMENT_ID &&
+        prepared.local_engine_idx < engines_.size() &&
+        engines_[prepared.local_engine_idx] &&
+        prepared.remote_hixl == engines_[prepared.local_engine_idx]->name()) {
+        LOG(WARNING) << "Remote segment id=" << request.target_id
+                     << " resolved to local HIXL name " << prepared.remote_hixl;
+    }
+    return Status::OK();
+}
+
 Status AscendDirectTransport::submitTransferTasks(
-    SubBatchRef batch, const std::vector<Request> &request_list) {
-    auto hixl_batch = dynamic_cast<HixlSubBatch *>(batch);
-    if (!hixl_batch)
-        return Status::InvalidArgument("Invalid TCP sub-batch" LOC_MARK);
+    SubBatchRef batch, const std::vector<Request>& request_list) {
+    auto* hixl_batch = dynamic_cast<HixlSubBatch*>(batch);
+    if (!hixl_batch) {
+        return Status::InvalidArgument("Invalid HIXL sub-batch" LOC_MARK);
+    }
     if (request_list.size() + hixl_batch->task_list.size() >
-        hixl_batch->max_size)
+        hixl_batch->max_size) {
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
-    std::map<SegmentID, std::map<Request::OpCode, std::vector<HixlTask *>>>
-        seg_to_tasks;
-    for (auto &request : request_list) {
-        hixl_batch->task_list.push_back(HixlTask{});
-        auto &task = hixl_batch->task_list[hixl_batch->task_list.size() - 1];
-        uint64_t target_addr = request.target_offset;
-        task.target_addr = target_addr;
-        task.request = request;
+    }
+
+    std::vector<PreparedRequest> prepared;
+    prepared.reserve(request_list.size());
+    for (const auto& request : request_list) {
+        PreparedRequest item;
+        CHECK_STATUS(resolveRequest(request, item));
+        prepared.push_back(std::move(item));
+    }
+
+    const size_t start = hixl_batch->task_list.size();
+    hixl_batch->task_list.resize(start + prepared.size());
+    using GroupKey = std::pair<size_t, std::pair<std::string, bool>>;
+    std::map<GroupKey, std::vector<HixlTask*>> groups;
+    for (size_t i = 0; i < prepared.size(); ++i) {
+        auto& task = hixl_batch->task_list[start + i];
+        task.request = prepared[i].request;
         task.status_word = TransferStatusEnum::PENDING;
         task.transferred_bytes = 0;
-        seg_to_tasks[task.request.target_id][task.request.opcode].push_back(
+        task.req_handle = nullptr;
+        task.local_engine_idx = prepared[i].local_engine_idx;
+        task.remote_hixl = prepared[i].remote_hixl;
+        const bool write = task.request.opcode == Request::WRITE;
+        groups[{task.local_engine_idx, {task.remote_hixl, write}}].push_back(
             &task);
     }
-    for (auto &[seg_id, op_to_tasks] : seg_to_tasks) {
-        for (auto &[opcode, tasks] : op_to_tasks) {
-            startTransfer(seg_id, opcode, tasks);
-        }
+    for (auto& [key, tasks] : groups) {
+        startGroup(key.second.first, key.first, key.second.second, tasks);
     }
     return Status::OK();
 }
 
-Status AscendDirectTransport::checkAndConnect(const std::string &remote_hixl) {
-    std::lock_guard<std::mutex> lock(connection_mutex_);
-    auto it = connected_segments_.find(remote_hixl);
-    if (it != connected_segments_.end()) {
-        VLOG(1) << "Already connected to target hixl engine: " << remote_hixl;
-    } else {
-        auto status = hixl_->Connect(
-            remote_hixl.c_str(), static_cast<int32_t>(connect_timeout_ / 1000));
-        if (status == hixl::TIMEOUT) {
-            LOG(ERROR) << "Connect timeout to: " << remote_hixl
-                       << ", you can increase the timeout duration to reduce "
-                          "the failure rate by configuring "
-                          "the ASCEND_CONNECT_TIMEOUT environment variable"
-                       << ", errmsg: " << aclGetRecentErrMsg();
-            return Status::InternalError("Connect to target timed out.");
-        } else if (status != hixl::SUCCESS) {
-            LOG(ERROR) << "Failed to connect to target: " << remote_hixl
-                       << ", status: " << status
-                       << ", errmsg: " << aclGetRecentErrMsg();
-            return Status::InternalError("Connect to target failed.");
-        }
-        connected_segments_.emplace(remote_hixl);
-        LOG(INFO) << "Connected to segment: " << remote_hixl;
-    }
-    return Status::OK();
-}
-
-void AscendDirectTransport::startTransfer(
-    SegmentID target_id, Request::OpCode opcode,
-    const std::vector<HixlTask *> &tasks) {
-    std::string rpc_server_addr;
-    SegmentDesc *desc = nullptr;
-    auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
-    if (!status.ok()) {
-        for (auto &task : tasks) {
+void AscendDirectTransport::startGroup(const std::string& remote_hixl,
+                                       size_t local_engine_idx, bool write,
+                                       const std::vector<HixlTask*>& tasks) {
+    auto fail_all = [&]() {
+        for (auto* task : tasks) {
             task->status_word = TransferStatusEnum::FAILED;
         }
+    };
+    if (local_engine_idx >= engines_.size() || !engines_[local_engine_idx]) {
+        fail_all();
         return;
     }
-    auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-    auto remote_hixl = detail.device_attrs["hixl_name"];
-    if (remote_hixl == local_hixl_name_) {
-        VLOG(1) << "Target is local.";
-        auto start = std::chrono::steady_clock::now();
-        localCopy(opcode, tasks);
-        LOG(INFO) << "Local copy cost: "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(
-                         std::chrono::steady_clock::now() - start)
-                         .count()
-                  << " us.";
+    if (remote_hixl == engines_[local_engine_idx]->name()) {
+        startLocalCopy(local_engine_idx, write, tasks);
         return;
-    } else {
-        if (!auto_connect_) {
-            auto ret = checkAndConnect(remote_hixl);
-            if (!ret.ok()) {
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(inflight_mu_);
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(options_.transfer_timeout_ms);
+        while (inflight_.load(std::memory_order_acquire) >= kMaxInflightReqs) {
+            if (inflight_cv_.wait_until(lock, deadline) ==
+                std::cv_status::timeout) {
+                fail_all();
                 return;
             }
-        } else {
-            std::lock_guard<std::mutex> lock(connection_mutex_);
-            connected_segments_.emplace(remote_hixl);
         }
+        inflight_.fetch_add(1, std::memory_order_acq_rel);
     }
-    auto op = (opcode == Request::WRITE) ? hixl::WRITE : hixl::READ;
-    std::vector<hixl::TransferOpDesc> op_descs;
+
+    std::vector<HixlOpDesc> op_descs;
     op_descs.reserve(tasks.size());
-    for (auto &task : tasks) {
-        hixl::TransferOpDesc op_desc{};
-        op_desc.local_addr = reinterpret_cast<uintptr_t>(task->request.source);
-        op_desc.remote_addr =
-            reinterpret_cast<uintptr_t>(task->request.target_offset);
-        op_desc.len = task->request.length;
-        op_descs.emplace_back(op_desc);
+    for (auto* task : tasks) {
+        HixlOpDesc desc{};
+        desc.local_addr = reinterpret_cast<uintptr_t>(task->request.source);
+        desc.remote_addr = task->request.target_offset;
+        desc.len = task->request.length;
+        op_descs.push_back(desc);
     }
-    hixl::Status hixl_ret;
-    hixl::TransferReq req_handle;
-    hixl_ret = hixl_->TransferAsync(hixl::AscendString(remote_hixl.c_str()), op,
-                                    op_descs, hixl::TransferArgs(), req_handle);
-    if (hixl_ret != hixl::SUCCESS) {
-        LOG(ERROR) << "Failed to transfer to: " << remote_hixl
-                   << ", status: " << hixl_ret
-                   << ", errmsg: " << aclGetRecentErrMsg();
-        // AutoConnect tears down failed routes inside HIXL. Calling
-        // Disconnect again is redundant; only discard our local bookkeeping.
-        if (auto_connect_) {
-            forgetConnectedSegment(remote_hixl);
-        } else {
-            disconnect(remote_hixl, 10);
-        }
-        for (auto &task : tasks) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
+    void* req = nullptr;
+    auto status = engines_[local_engine_idx]->transferAsync(remote_hixl, write,
+                                                            op_descs, req);
+    if (!status.ok() || req == nullptr) {
+        releaseInflight();
+        // AutoConnect already tore down the failed route inside HIXL.
+        fail_all();
         return;
     }
-    for (auto &task : tasks) {
-        task->start_time = getCurrentTimeInNano();
-        task->req_handle = req_handle;
+    const auto now = getCurrentTimeInNano();
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        GroupState group;
+        group.status = TransferStatusEnum::PENDING;
+        group.remaining = static_cast<int>(tasks.size());
+        group.engine_idx = local_engine_idx;
+        group.remote = remote_hixl;
+        group.counted = true;
+        groups_[req] = std::move(group);
+        route_groups_[{local_engine_idx, remote_hixl}].push_back(req);
+    }
+    for (auto* task : tasks) {
+        task->req_handle = req;
         task->batch_size = tasks.size();
-        task->remote_hixl = remote_hixl;
+        task->start_time_ns = now;
         task->status_word = TransferStatusEnum::PENDING;
     }
 }
 
+void AscendDirectTransport::markGroupHandles(const std::vector<void*>& handles,
+                                             TransferStatusEnum status) {
+    int inflight_dec = 0;
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        for (void* handle : handles) {
+            auto git = groups_.find(handle);
+            if (git == groups_.end()) {
+                continue;
+            }
+            if (git->second.status == TransferStatusEnum::PENDING) {
+                git->second.status = status;
+            }
+            if (git->second.counted) {
+                git->second.counted = false;
+                inflight_dec++;
+            }
+        }
+    }
+    releaseInflight(inflight_dec);
+}
+
+void AscendDirectTransport::failLocalCopyStream(size_t engine_idx,
+                                                TransferStatusEnum status) {
+    if (engine_idx >= local_copies_.size() || !local_copies_[engine_idx]) {
+        return;
+    }
+    auto handles = local_copies_[engine_idx]->failAndRecreate();
+    markGroupHandles(handles, status);
+}
+
+void AscendDirectTransport::startLocalCopy(
+    size_t local_engine_idx, bool write, const std::vector<HixlTask*>& tasks) {
+    auto fail_all = [&]() {
+        for (auto* task : tasks) {
+            task->status_word = TransferStatusEnum::FAILED;
+            task->local_copy = true;
+        }
+    };
+    if (local_engine_idx >= local_copies_.size() ||
+        !local_copies_[local_engine_idx]) {
+        fail_all();
+        return;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(inflight_mu_);
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(options_.transfer_timeout_ms);
+        while (inflight_.load(std::memory_order_acquire) >= kMaxInflightReqs) {
+            if (inflight_cv_.wait_until(lock, deadline) ==
+                std::cv_status::timeout) {
+                fail_all();
+                return;
+            }
+        }
+        inflight_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    std::vector<HixlOpDesc> op_descs;
+    op_descs.reserve(tasks.size());
+    for (auto* task : tasks) {
+        HixlOpDesc desc{};
+        desc.local_addr = reinterpret_cast<uintptr_t>(task->request.source);
+        desc.remote_addr = task->request.target_offset;
+        desc.len = task->request.length;
+        op_descs.push_back(desc);
+    }
+
+    void* req = nullptr;
+    std::vector<void*> failed_handles;
+    auto status = local_copies_[local_engine_idx]->submit(write, op_descs, req,
+                                                          failed_handles);
+    if (!failed_handles.empty()) {
+        markGroupHandles(failed_handles, TransferStatusEnum::FAILED);
+    }
+    if (!status.ok() || req == nullptr) {
+        releaseInflight();
+        fail_all();
+        return;
+    }
+
+    const auto now = getCurrentTimeInNano();
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        GroupState group;
+        group.status = TransferStatusEnum::PENDING;
+        group.remaining = static_cast<int>(tasks.size());
+        group.engine_idx = local_engine_idx;
+        group.remote = engines_[local_engine_idx]->name();
+        group.counted = true;
+        group.local_copy = true;
+        groups_[req] = std::move(group);
+    }
+    for (auto* task : tasks) {
+        task->req_handle = req;
+        task->batch_size = tasks.size();
+        task->start_time_ns = now;
+        task->status_word = TransferStatusEnum::PENDING;
+        task->local_copy = true;
+        task->local_engine_idx = local_engine_idx;
+    }
+}
+
+void AscendDirectTransport::releaseInflight(int n) {
+    if (n <= 0) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(inflight_mu_);
+        const int cur = inflight_.load(std::memory_order_acquire);
+        inflight_.store(std::max(0, cur - n), std::memory_order_release);
+    }
+    inflight_cv_.notify_all();
+}
+
+bool AscendDirectTransport::applyGroupStatus(HixlTask& task,
+                                             GroupState& group) {
+    task.status_word = group.status;
+    if (group.status == TransferStatusEnum::COMPLETED) {
+        task.transferred_bytes = task.request.length;
+    }
+    if (group.remaining > 0) {
+        group.remaining--;
+    }
+    if (group.counted && group.status != TransferStatusEnum::PENDING) {
+        group.counted = false;
+        return true;
+    }
+    return false;
+}
+
+void AscendDirectTransport::failEntireRoute(size_t engine_idx,
+                                            const std::string& remote,
+                                            TransferStatusEnum status,
+                                            bool disconnect) {
+    int inflight_dec = 0;
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        auto it = route_groups_.find({engine_idx, remote});
+        std::vector<void*> handles;
+        if (it != route_groups_.end()) {
+            handles = it->second;
+        }
+        for (void* handle : handles) {
+            auto git = groups_.find(handle);
+            if (git == groups_.end()) {
+                continue;
+            }
+            if (git->second.status == TransferStatusEnum::PENDING) {
+                git->second.status = status;
+            }
+            if (git->second.counted) {
+                git->second.counted = false;
+                inflight_dec++;
+            }
+        }
+    }
+    // Never acquire inflight_mu_ while holding req_mutex_: submit waits on
+    // inflight_mu_ and later takes req_mutex_.
+    releaseInflight(inflight_dec);
+    if (disconnect && engine_idx < engines_.size() && engines_[engine_idx]) {
+        (void)engines_[engine_idx]->disconnectOnTimeout(
+            remote, kAscendTimeoutDisconnectMs);
+    }
+}
+
+bool AscendDirectTransport::finishTaskLocked(HixlTask& task,
+                                             void** local_release_handle,
+                                             size_t* local_release_engine) {
+    auto git = groups_.find(task.req_handle);
+    if (git == groups_.end()) {
+        return false;
+    }
+    const bool release = applyGroupStatus(task, git->second);
+    if (git->second.remaining > 0) {
+        return release;
+    }
+    auto route_it =
+        route_groups_.find({git->second.engine_idx, git->second.remote});
+    if (route_it != route_groups_.end()) {
+        auto& handles = route_it->second;
+        handles.erase(
+            std::remove(handles.begin(), handles.end(), task.req_handle),
+            handles.end());
+        if (handles.empty()) {
+            route_groups_.erase(route_it);
+        }
+    }
+    if (local_release_handle != nullptr && local_release_engine != nullptr &&
+        git->second.local_copy) {
+        *local_release_handle = task.req_handle;
+        *local_release_engine = git->second.engine_idx;
+    }
+    groups_.erase(git);
+    return release;
+}
+
+void AscendDirectTransport::completePolledTask(HixlTask& task) {
+    bool release = false;
+    void* local_handle = nullptr;
+    size_t local_engine = 0;
+    {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        auto git = groups_.find(task.req_handle);
+        if (git != groups_.end() &&
+            git->second.status != TransferStatusEnum::PENDING) {
+            release = finishTaskLocked(task, &local_handle, &local_engine);
+        }
+    }
+    // Release host flags outside req_mutex_ so timeout rebuild
+    // (LocalCopyEngine mutex -> req_mutex_) cannot deadlock.
+    if (local_handle != nullptr && local_engine < local_copies_.size() &&
+        local_copies_[local_engine]) {
+        local_copies_[local_engine]->release(local_handle);
+    }
+    if (release) {
+        releaseInflight();
+    }
+}
+
 Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
-                                                TransferStatus &status) {
-    auto hixl_batch = dynamic_cast<HixlSubBatch *>(batch);
-    if (task_id < 0 || task_id >= (int)hixl_batch->task_list.size()) {
+                                                TransferStatus& status) {
+    auto* hixl_batch = dynamic_cast<HixlSubBatch*>(batch);
+    if (!hixl_batch) {
+        return Status::InvalidArgument("Invalid HIXL sub-batch" LOC_MARK);
+    }
+    if (task_id < 0 ||
+        task_id >= static_cast<int>(hixl_batch->task_list.size())) {
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
-    auto &task = hixl_batch->task_list[task_id];
-    if (task.status_word == TransferStatusEnum::PENDING) {
-        if (task.req_handle == nullptr) {
-            status = TransferStatus{task.status_word, task.transferred_bytes};
-            return Status::OK();
+    auto& task = hixl_batch->task_list[task_id];
+    if (task.status_word != TransferStatusEnum::PENDING) {
+        status = TransferStatus{task.status_word, task.transferred_bytes};
+        return Status::OK();
+    }
+    if (task.req_handle == nullptr) {
+        status = TransferStatus{task.status_word, task.transferred_bytes};
+        return Status::OK();
+    }
+
+    completePolledTask(task);
+    if (task.status_word != TransferStatusEnum::PENDING) {
+        status = TransferStatus{task.status_word, task.transferred_bytes};
+        return Status::OK();
+    }
+
+    const auto now = getCurrentTimeInNano();
+    if (now >= 0 && task.start_time_ns >= 0 &&
+        (now - task.start_time_ns) > transfer_timeout_ns_) {
+        if (task.local_copy) {
+            failLocalCopyStream(task.local_engine_idx,
+                                TransferStatusEnum::TIMEOUT);
+        } else {
+            failEntireRoute(task.local_engine_idx, task.remote_hixl,
+                            TransferStatusEnum::TIMEOUT, /*disconnect=*/true);
         }
-        std::lock_guard<std::mutex> lock(req_mutex_);
-        auto it = req_map_.find(task.req_handle);
-        if (it != req_map_.end()) {
-            auto xfer_status = it->second.first;
-            task.status_word = xfer_status;
-            if (xfer_status == TransferStatusEnum::COMPLETED) {
-                task.transferred_bytes = task.request.length;
-            }
-            if (--req_map_[task.req_handle].second == 0) {
-                req_map_.erase(task.req_handle);
-            }
-            status = TransferStatus{task.status_word, task.transferred_bytes};
-            return Status::OK();
-        }
-        uint64_t current_ts = getCurrentTimeInNano();
-        if ((current_ts - task.start_time) > transfer_timeout_) {
-            disconnect(task.remote_hixl, 10);
+        completePolledTask(task);
+        if (task.status_word == TransferStatusEnum::PENDING) {
             task.status_word = TransferStatusEnum::TIMEOUT;
-            if (task.batch_size > 1) {
-                req_map_[task.req_handle] =
-                    std::make_pair(task.status_word, task.batch_size - 1);
+        }
+        status = TransferStatus{task.status_word, task.transferred_bytes};
+        return Status::OK();
+    }
+
+    if (task.local_copy) {
+        if (task.local_engine_idx >= local_copies_.size() ||
+            !local_copies_[task.local_engine_idx]) {
+            failLocalCopyStream(task.local_engine_idx,
+                                TransferStatusEnum::FAILED);
+        } else {
+            const auto mapped =
+                local_copies_[task.local_engine_idx]->poll(task.req_handle);
+            if (mapped == TransferStatusEnum::COMPLETED ||
+                mapped == TransferStatusEnum::FAILED) {
+                std::lock_guard<std::mutex> lock(req_mutex_);
+                auto git = groups_.find(task.req_handle);
+                if (git != groups_.end() &&
+                    git->second.status == TransferStatusEnum::PENDING) {
+                    git->second.status = mapped;
+                }
             }
-            status = TransferStatus{task.status_word, task.transferred_bytes};
-            return Status::OK();
         }
-        hixl::TransferStatus xfer_status;
-        auto err = hixl_->GetTransferStatus(task.req_handle, xfer_status);
-        if (err != hixl::SUCCESS) {
-            // call failed equal to transfer failed;
-            xfer_status = hixl::TransferStatus::FAILED;
-        }
-        if (xfer_status == hixl::TransferStatus::WAITING) {
-            status = TransferStatus{task.status_word, task.transferred_bytes};
-            return Status::OK();
-        }
-        if (xfer_status == hixl::TransferStatus::COMPLETED) {
-            task.transferred_bytes = task.request.length;
-            task.status_word = TransferStatusEnum::COMPLETED;
-        } else if (xfer_status == hixl::TransferStatus::FAILED) {
-            LOG(ERROR) << "Get transfer status failed, ret: "
-                       << hixlTransferStatusToString(xfer_status)
-                       << ", errmsg: " << aclGetRecentErrMsg();
-            // HIXL DisconnectOnError has already handled AutoConnect failures.
-            // Explicit application timeouts still use disconnect() above.
-            if (auto_connect_) {
-                forgetConnectedSegment(task.remote_hixl);
-            } else {
-                disconnect(task.remote_hixl, 10);
-            }
+        completePolledTask(task);
+        if (task.status_word == TransferStatusEnum::PENDING &&
+            (task.local_engine_idx >= local_copies_.size() ||
+             !local_copies_[task.local_engine_idx])) {
             task.status_word = TransferStatusEnum::FAILED;
         }
-        if (task.batch_size > 1) {
-            req_map_[task.req_handle] =
-                std::make_pair(task.status_word, task.batch_size - 1);
+        status = TransferStatus{task.status_word, task.transferred_bytes};
+        return Status::OK();
+    }
+
+    if (task.local_engine_idx >= engines_.size() ||
+        !engines_[task.local_engine_idx]) {
+        failEntireRoute(task.local_engine_idx, task.remote_hixl,
+                        TransferStatusEnum::FAILED, /*disconnect=*/false);
+        completePolledTask(task);
+        if (task.status_word == TransferStatusEnum::PENDING) {
+            task.status_word = TransferStatusEnum::FAILED;
+        }
+        status = TransferStatus{task.status_word, task.transferred_bytes};
+        return Status::OK();
+    }
+
+    HixlXferState xfer_status = HixlXferState::Waiting;
+    auto err = engines_[task.local_engine_idx]->getTransferStatus(
+        task.req_handle, xfer_status);
+    const auto mapped = FromHixlState(xfer_status);
+    if (!err.ok() || mapped == TransferStatusEnum::FAILED) {
+        failEntireRoute(task.local_engine_idx, task.remote_hixl,
+                        TransferStatusEnum::FAILED, /*disconnect=*/false);
+    } else if (mapped == TransferStatusEnum::TIMEOUT) {
+        failEntireRoute(task.local_engine_idx, task.remote_hixl,
+                        TransferStatusEnum::TIMEOUT, /*disconnect=*/true);
+    } else if (mapped == TransferStatusEnum::COMPLETED) {
+        std::lock_guard<std::mutex> lock(req_mutex_);
+        auto git = groups_.find(task.req_handle);
+        if (git != groups_.end() &&
+            git->second.status == TransferStatusEnum::PENDING) {
+            git->second.status = TransferStatusEnum::COMPLETED;
         }
     }
-    // Read status AFTER the poll so a just-observed completion/failure is
-    // reported on this call rather than one poll cycle late.
+
+    completePolledTask(task);
     status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }
 
-void AscendDirectTransport::disconnect(const std::string &remote_hixl,
-                                       int32_t timeout_in_millis) {
-    if (auto_connect_) {
-        auto status = hixl_->Disconnect(remote_hixl.c_str(), timeout_in_millis);
-        if (status != hixl::SUCCESS) {
-            LOG(ERROR) << "Failed to disconnect to: " << remote_hixl
-                       << ", status: " << status
-                       << ", errmsg: " << aclGetRecentErrMsg();
-        } else {
-            std::lock_guard<std::mutex> lock(connection_mutex_);
-            connected_segments_.erase(remote_hixl);
-        }
-        return;
+Status AscendDirectTransport::addMemoryBuffer(BufferDesc& desc,
+                                              const MemoryOptions& options) {
+    (void)options;
+    if (engines_.empty()) {
+        return Status::InternalError(
+            "HIXL engines are not initialized" LOC_MARK);
     }
-    std::lock_guard<std::mutex> lock(connection_mutex_);
-    auto it = connected_segments_.find(remote_hixl);
-    if (it == connected_segments_.end()) {
-        LOG(INFO) << "Target hixl engine: " << remote_hixl
-                  << " is not connected.";
-    } else {
-        auto status = hixl_->Disconnect(remote_hixl.c_str(), timeout_in_millis);
-        connected_segments_.erase(remote_hixl);
-        if (status != hixl::SUCCESS) {
-            LOG(ERROR) << "Failed to disconnect to: " << remote_hixl
-                       << ", status: " << status
-                       << ", errmsg: " << aclGetRecentErrMsg();
-        }
+    const size_t engine_idx = currentEngineIndex();
+    const bool host =
+        IsHostMem(desc.location, reinterpret_cast<void*>(desc.addr));
+    if (engine_idx >= engines_.size() || !engines_[engine_idx]) {
+        return Status::InternalError("Invalid HIXL engine index" LOC_MARK);
     }
-}
-
-void AscendDirectTransport::forgetConnectedSegment(
-    const std::string &remote_hixl) {
-    std::lock_guard<std::mutex> lock(connection_mutex_);
-    connected_segments_.erase(remote_hixl);
-}
-
-Status AscendDirectTransport::addMemoryBuffer(BufferDesc &desc,
-                                              const MemoryOptions &options) {
+    CHECK_STATUS(engines_[engine_idx]->registerMem(
+        reinterpret_cast<void*>(desc.addr), desc.length, host));
     desc.transports.push_back(TransportType::AscendDirect);
-    hixl::MemDesc mem_desc{};
-    mem_desc.addr =
-        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(desc.addr));
-    mem_desc.len = desc.length;
-    hixl::MemType mem_type;
-    if (desc.location.starts_with("cpu")) {
-        mem_type = hixl::MEM_HOST;
-    } else if (desc.location.starts_with("npu")) {
-        mem_type = hixl::MEM_DEVICE;
-    } else if (desc.location == kWildcardLocation) {
-        aclrtPtrAttributes attributes;
-        auto ret = aclrtPointerGetAttributes(
-            reinterpret_cast<void *>(desc.addr), &attributes);
-        if (ret != ACL_SUCCESS) {
-            LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
-            return Status::InvalidArgument("Invalid location of addr:" +
-                                           std::to_string(desc.addr));
-        }
-        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-            mem_type = hixl::MEM_HOST;
-        } else {
-            mem_type = hixl::MEM_DEVICE;
-        }
-    } else {
-        LOG(ERROR) << "location:" << desc.location << " is not supported.";
-        return Status::InvalidArgument("Invalid location of addr:" +
-                                       std::to_string(desc.addr));
-    }
-    hixl::MemHandle mem_handle;
-    auto hixl_ret = hixl_->RegisterMem(mem_desc, mem_type, mem_handle);
-    if (hixl_ret != hixl::SUCCESS) {
-        LOG(ERROR) << "hixl_ret:" << hixl_ret
-                   << ", errmsg: " << aclGetRecentErrMsg();
-        return Status::InternalError("Register failed for addr:" +
-                                     std::to_string(desc.addr));
-    }
-    LOG(INFO) << "AscendDirectTransport register mem addr:" << desc.addr
-              << ", length:" << desc.length << ", location:" << desc.location
-              << ", mem type:"
-              << (mem_type == hixl::MEM_HOST ? "host" : "device");
-    std::lock_guard<std::mutex> lock(mem_handle_mutex_);
-    addr_to_mem_handle_[desc.addr] = mem_handle;
+    desc.transport_attrs[TransportType::AscendDirect] =
+        std::to_string(engine_idx);
     return Status::OK();
 }
 
-Status AscendDirectTransport::removeMemoryBuffer(BufferDesc &desc) {
-    std::vector<std::string> remote_hixls;
-    {
-        std::lock_guard<std::mutex> lock(connection_mutex_);
-        remote_hixls.assign(connected_segments_.begin(),
-                            connected_segments_.end());
-    }
-    for (const auto &remote_hixl : remote_hixls) {
-        disconnect(remote_hixl, 10);
-    }
-    std::lock_guard<std::mutex> lock(mem_handle_mutex_);
-    auto addr = desc.addr;
-    if (addr_to_mem_handle_.find(addr) != addr_to_mem_handle_.end()) {
-        (void)hixl_->DeregisterMem(addr_to_mem_handle_[addr]);
-        addr_to_mem_handle_.erase(addr);
+Status AscendDirectTransport::addMemoryBuffer(
+    std::vector<BufferDesc>& desc_list, const MemoryOptions& options) {
+    std::vector<void*> registered;
+    registered.reserve(desc_list.size());
+    for (auto& desc : desc_list) {
+        auto status = addMemoryBuffer(desc, options);
+        if (!status.ok()) {
+            for (void* addr : registered) {
+                BufferDesc rollback{};
+                rollback.addr = reinterpret_cast<uint64_t>(addr);
+                (void)removeMemoryBuffer(rollback);
+            }
+            return status;
+        }
+        registered.push_back(reinterpret_cast<void*>(desc.addr));
     }
     return Status::OK();
 }
 
-void AscendDirectTransport::localCopy(Request::OpCode opcode,
-                                      const std::vector<HixlTask *> &tasks) {
-    aclrtMemcpyKind kind;
-    auto &first_task = tasks[0];
-    auto remote_ptr =
-        reinterpret_cast<void *>(first_task->request.target_offset);
-    aclrtPtrAttributes attributes;
-    auto ret =
-        aclrtPointerGetAttributes(first_task->request.source, &attributes);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
-        for (auto &task : tasks) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-        return;
-    }
-    aclrtPtrAttributes dst_attributes;
-    ret = aclrtPointerGetAttributes(remote_ptr, &dst_attributes);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
-        for (auto &task : tasks) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-        return;
-    }
-    if (attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
-        attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
-        LOG(ERROR) << "location of local addr is not supported.";
-        for (auto &task : tasks) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-        return;
-    }
-    if (dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
-        dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
-        LOG(ERROR) << "location of remote addr is not supported.";
-        for (auto &task : tasks) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-        return;
-    }
-    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST &&
-        dst_attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-        kind = ACL_MEMCPY_HOST_TO_HOST;
-    } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE &&
-               dst_attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
-        kind = ACL_MEMCPY_DEVICE_TO_DEVICE;
-    } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-        kind = (opcode == Request::OpCode::WRITE) ? ACL_MEMCPY_HOST_TO_DEVICE
-                                                  : ACL_MEMCPY_DEVICE_TO_HOST;
-    } else {
-        kind = (opcode == Request::OpCode::WRITE) ? ACL_MEMCPY_DEVICE_TO_HOST
-                                                  : ACL_MEMCPY_HOST_TO_DEVICE;
-    }
-    if (kind == ACL_MEMCPY_HOST_TO_HOST) {
-        return copyWithSync(opcode, tasks, kind);
-    }
-    if (kind == ACL_MEMCPY_DEVICE_TO_DEVICE) {
-        return copyWithAsync(opcode, tasks, kind);
-    }
-    auto left_num = tasks.size();
-    size_t task_index = 0;
-    while (left_num > 0) {
-        auto batch_num = std::min(left_num, MEM_CPY_LIMIT);
-        ret = copyWithBatch(opcode, tasks, kind, batch_num, task_index);
-        if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
-            return copyWithAsync(opcode, tasks, kind);
-        }
-        left_num -= batch_num;
-        task_index += batch_num;
-    }
-}
-
-aclError AscendDirectTransport::copyWithBatch(
-    Request::OpCode opcode, const std::vector<HixlTask *> &tasks,
-    aclrtMemcpyKind kind, size_t batch_num, size_t task_index) const {
-    std::vector<void *> void_remote_addrs(batch_num);
-    std::vector<void *> void_local_addrs(batch_num);
-    std::vector<aclrtMemcpyBatchAttr> attrs(batch_num);
-    std::vector<size_t> attrsIds(batch_num);
-    std::vector<size_t> sizes(batch_num);
-    size_t idx = 0;
-    for (size_t i = 0; i < batch_num; i++) {
-        auto device_loc = aclrtMemLocation{
-            static_cast<uint32_t>(device_logic_id_),
-            aclrtMemLocationType::ACL_MEM_LOCATION_TYPE_DEVICE};
-        auto host_loc = aclrtMemLocation{
-            0, aclrtMemLocationType::ACL_MEM_LOCATION_TYPE_HOST};
-        if (kind == ACL_MEMCPY_DEVICE_TO_HOST) {
-            attrs[i] = aclrtMemcpyBatchAttr{host_loc, device_loc, {}};
-        } else {
-            attrs[i] = aclrtMemcpyBatchAttr{device_loc, host_loc, {}};
-        }
-        attrsIds[i] = idx++;
-        auto &task = tasks[task_index + i];
-        void_local_addrs[i] = task->request.source;
-        void_remote_addrs[i] =
-            reinterpret_cast<void *>(task->request.target_offset);
-        sizes[i] = task->request.length;
-    }
-    size_t fail_idx;
-    aclError ret;
-    if (opcode == Request::OpCode::WRITE) {
-        ret = aclrtMemcpyBatch(void_remote_addrs.data(), sizes.data(),
-                               void_local_addrs.data(), sizes.data(),
-                               sizes.size(), attrs.data(), attrsIds.data(),
-                               attrs.size(), &fail_idx);
-    } else {
-        ret = aclrtMemcpyBatch(void_local_addrs.data(), sizes.data(),
-                               void_remote_addrs.data(), sizes.data(),
-                               sizes.size(), attrs.data(), attrsIds.data(),
-                               attrs.size(), &fail_idx);
-    }
-    if (ret != ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
-        if (ret == ACL_ERROR_NONE) {
-            VLOG(1) << "Copy with aclrtMemcpyBatch suc.";
-            for (size_t i = 0; i < batch_num; i++) {
-                auto &task = tasks[task_index + i];
-                task->status_word = TransferStatusEnum::COMPLETED;
-            }
-        } else {
-            for (size_t i = 0; i < batch_num; i++) {
-                auto &task = tasks[task_index + i];
-                task->status_word = TransferStatusEnum::FAILED;
-            }
-        }
-    }
-    return ret;
-}
-
-void AscendDirectTransport::copyWithSync(Request::OpCode opcode,
-                                         const std::vector<HixlTask *> &tasks,
-                                         aclrtMemcpyKind kind) {
-    for (auto &task : tasks) {
-        auto local_ptr = task->request.source;
-        auto remote_ptr = reinterpret_cast<void *>(task->request.target_offset);
-        auto len = task->request.length;
-        aclError ret;
-        if (opcode == Request::OpCode::WRITE) {
-            ret = aclrtMemcpy(remote_ptr, len, local_ptr, len, kind);
-        } else {
-            ret = aclrtMemcpy(local_ptr, len, remote_ptr, len, kind);
-        }
-        if (ret == ACL_ERROR_NONE) {
-            VLOG(1) << "Copy with aclrtMemcpy suc.";
-            task->status_word = TransferStatusEnum::COMPLETED;
-        } else {
-            LOG(ERROR) << "aclrtMemcpy failed, ret:" << ret;
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-    }
-}
-void AscendDirectTransport::copyWithAsync(Request::OpCode opcode,
-                                          const std::vector<HixlTask *> &tasks,
-                                          aclrtMemcpyKind kind) {
-    std::vector<HixlTask *> async_list;
-    aclError ret;
-    for (auto &task : tasks) {
-        auto local_ptr = task->request.source;
-        auto remote_ptr = reinterpret_cast<void *>(task->request.target_offset);
-        auto len = task->request.length;
-        if (opcode == Request::OpCode::WRITE) {
-            ret = aclrtMemcpyAsync(remote_ptr, len, local_ptr, len, kind,
-                                   stream_);
-        } else {
-            ret = aclrtMemcpyAsync(local_ptr, len, remote_ptr, len, kind,
-                                   stream_);
-        }
-        if (ret != ACL_ERROR_NONE) {
-            LOG(ERROR) << "aclrtMemcpyAsync failed, ret:" << ret;
-            task->status_word = TransferStatusEnum::FAILED;
+Status AscendDirectTransport::removeMemoryBuffer(BufferDesc& desc) {
+    Status first_error = Status::OK();
+    for (auto& engine : engines_) {
+        if (!engine) {
             continue;
         }
-        async_list.emplace_back(task);
-    }
-    ret = aclrtSynchronizeStreamWithTimeout(
-        stream_, static_cast<int32_t>(transfer_timeout_));
-    if (ret == ACL_ERROR_NONE) {
-        VLOG(1) << "Copy with aclrtMemcpyAsync suc.";
-        for (auto &task : async_list) {
-            task->status_word = TransferStatusEnum::COMPLETED;
-        }
-    } else {
-        LOG(ERROR) << "Memory copy failed.";
-        (void)aclrtStreamAbort(stream_);
-        for (auto &task : async_list) {
-            task->status_word = TransferStatusEnum::FAILED;
+        auto status = engine->deregisterMem(reinterpret_cast<void*>(desc.addr));
+        if (!status.ok() && first_error.ok()) {
+            first_error = status;
         }
     }
+    return first_error;
 }
 
 }  // namespace tent

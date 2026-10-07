@@ -24,7 +24,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
-#include <fstream>
 #include <future>
 #include <set>
 #include <thread>
@@ -47,39 +46,6 @@ namespace mooncake {
 // With 4KB pages: 22M × 4KB ≈ 88GB per NIC.
 // With 2MB hugepages: 22M × 2MB ≈ 44TB per NIC (effectively unlimited).
 static constexpr size_t kDefaultMaxPteEntries = 22ULL * 1024 * 1024;  // 22M
-
-// Detect the kernel page size backing the memory at `addr` by reading
-// /proc/self/smaps.  Falls back to sysconf(_SC_PAGESIZE) on any failure.
-static size_t detectBufferPageSize(void* addr) {
-    size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    std::ifstream smaps("/proc/self/smaps");
-    if (!smaps.is_open()) return fallback;
-
-    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
-    std::string line;
-    bool in_range = false;
-
-    while (std::getline(smaps, line)) {
-        // VMA header: "start-end perms offset dev inode [pathname]".
-        // Cast to unsigned char before std::isxdigit: passing a (possibly
-        // signed) char whose value is > 0x7F is UB, since the argument must be
-        // representable as unsigned char or equal EOF.
-        if (!line.empty() &&
-            std::isxdigit(static_cast<unsigned char>(line[0]))) {
-            unsigned long start = 0, end = 0;
-            if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
-                in_range = (target >= start && target < end);
-            }
-        } else if (in_range && line.compare(0, 15, "KernelPageSize:") == 0) {
-            unsigned long kb = 0;
-            if (sscanf(line.c_str(), "KernelPageSize: %lu kB", &kb) == 1 &&
-                kb > 0) {
-                return kb * 1024;
-            }
-        }
-    }
-    return fallback;
-}
 
 static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
 
@@ -1110,9 +1076,13 @@ Status EfaTransport::getTransferStatus(BatchID batch_id,
     status.resize(task_count);
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto& task = batch_desc.task_list[task_id];
-        status[task_id].transferred_bytes = task.transferred_bytes;
-        uint64_t success_slice_count = task.success_slice_count;
-        uint64_t failed_slice_count = task.failed_slice_count;
+        uint64_t success_slice_count =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        uint64_t failed_slice_count =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        // Completion counters publish the preceding byte updates.
+        status[task_id].transferred_bytes =
+            __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
         if (success_slice_count + failed_slice_count == task.slice_count) {
             if (failed_slice_count)
                 status[task_id].s = TransferStatusEnum::FAILED;
@@ -1136,9 +1106,13 @@ Status EfaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count)
             status.s = TransferStatusEnum::FAILED;
