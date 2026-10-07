@@ -186,13 +186,90 @@ static uint64_t ipcPayloadOffset(const std::vector<unsigned char>& buffer) {
     return offset;
 }
 
+// hipIpcGetMemHandle stamps the handle with the exporter's device as an
+// ordinal among the devices the exporter sees (HIP_VISIBLE_DEVICES), and
+// hipIpcOpenMemHandle reads that ordinal against the importer's own device
+// list: one at or past the importer's device count fails with
+// hipErrorInvalidValue, before the mapping is attempted. So peers that see
+// different numbers of devices, such as the ranks of a TP4 decode and a TP2
+// prefill on one node, cannot open each other's handles from the higher
+// ordinals. The field is not part of the mapping: the runtime only uses it
+// to enable peer access to "the owner" (which, across different visible
+// sets, is an unrelated local device anyway, and the constructor already
+// enabled every local pair) and the mapping comes from the ROCr handle. An
+// out-of-range ordinal is therefore replaced with the importer's current
+// device; an in-range one is left alone, so every open that already worked
+// is unchanged.
+//
+// This private ROCclr LP64 layout is not a HIP API contract. Enable the
+// workaround only after qualifying the deployed runtime and both peers with
+// the cross-process test. A runtime version does not establish ABI
+// compatibility. MC_HIP_IPC_OWNER_DEVICE_WORKAROUND=1 opts in; all other values
+// leave handles unchanged. Prefer a runtime with the upstream fix when
+// available.
+struct HipIpcMemHandleLayout {
+    char ipc_handle[32];
+    size_t psize;
+    size_t poffset;
+    int owners_process_id;
+    int owners_device_id;
+    char reserved[8];
+};
+static_assert(sizeof(void*) == 8, "the mirrored layout is the LP64 one");
+static_assert(sizeof(HipIpcMemHandleLayout) == sizeof(hipIpcMemHandle_t),
+              "hipIpcMemHandle_t no longer matches ROCclr's IpcMemHandle");
+static_assert(offsetof(HipIpcMemHandleLayout, owners_device_id) == 52,
+              "owners_device_id moved in the mirrored IpcMemHandle");
+
+static bool ipcOwnerDeviceWorkaroundEnabled() {
+    const char* value = getenv("MC_HIP_IPC_OWNER_DEVICE_WORKAROUND");
+    return value != nullptr && strcmp(value, "1") == 0;
+}
+
+// Returns true if it changed the handle.
+static bool clampIpcHandleOwnerDevice(hipIpcMemHandle_t* handle,
+                                      int device_count, int current_device) {
+    HipIpcMemHandleLayout layout;
+    memcpy(&layout, handle, sizeof(layout));
+    if (!ipcOwnerDeviceWorkaroundEnabled() ||
+        (layout.owners_device_id >= 0 &&
+         layout.owners_device_id < device_count)) {
+        return false;
+    }
+    layout.owners_device_id = current_device;
+    memcpy(handle, &layout, sizeof(layout));
+    return true;
+}
+
 static int openIPCHandle(const std::vector<unsigned char>& buffer,
                          void** shm_addr) {
     hipIpcMemHandle_t handle;
     memcpy(&handle, buffer.data(), sizeof(handle));
+    int device_count = 0, current_device = 0;
+    if (!checkHip(hipGetDeviceCount(&device_count),
+                  "HipTransport: hipGetDeviceCount failed") ||
+        !checkHip(hipGetDevice(&current_device),
+                  "HipTransport: hipGetDevice failed")) {
+        return -1;
+    }
+    if (clampIpcHandleOwnerDevice(&handle, device_count, current_device) &&
+        globalConfig().trace) {
+        LOG(INFO) << "HipTransport: IPC handle's owner device is outside "
+                     "this process's "
+                  << device_count << " devices; opening it on device "
+                  << current_device;
+    }
     if (!checkHip(hipIpcOpenMemHandle(shm_addr, handle,
                                       hipIpcMemLazyEnablePeerAccess),
                   "HipTransport: hipIpcOpenMemHandle failed")) {
+        if (!ipcOwnerDeviceWorkaroundEnabled()) {
+            LOG(WARNING)
+                << "HipTransport: HIP IPC can fail when peers use different "
+                   "visible device sets. Prefer a ROCm runtime with the IPC "
+                   "owner-device fix. MC_HIP_IPC_OWNER_DEVICE_WORKAROUND=1 "
+                   "enables a private-layout workaround that requires "
+                   "qualification on the deployed runtime.";
+        }
         return -1;
     }
     return 0;

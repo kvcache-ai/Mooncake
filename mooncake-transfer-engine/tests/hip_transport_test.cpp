@@ -16,6 +16,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -29,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <memory>
 #include <sstream>
@@ -161,6 +163,18 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
 // allocation.
 
 DEFINE_bool(hip_ipc_dst, false, "Internal: run as the IPC destination.");
+DEFINE_int32(hip_ipc_dst_device, 0,
+             "Device ordinal, among the ones the IPC destination sees, that it "
+             "allocates its buffers on.");
+DEFINE_string(hip_ipc_dst_visible_devices, "",
+              "If set, HIP_VISIBLE_DEVICES for the IPC destination process.");
+DEFINE_int32(hip_ipc_expect_devices, 0,
+             "If set, the number of devices this process must see.");
+DEFINE_int32(hip_ipc_dst_expect_devices, 0,
+             "If set, the number of devices the IPC destination must see.");
+DEFINE_string(
+    hip_ipc_rerun_marker, "",
+    "If set, the IPC transfer test creates this file when it passes.");
 
 namespace {
 constexpr size_t kAllocLen = 4 * 1024 * 1024;
@@ -209,6 +223,11 @@ unsigned char expectedDstByte(size_t i) {
 }
 
 int runIpcDestination() {
+    int device_count = 0;
+    if (FLAGS_hip_ipc_expect_devices > 0 &&
+        (cudaGetDeviceCount(&device_count) != cudaSuccess ||
+         device_count != FLAGS_hip_ipc_expect_devices))
+        return dstFailed(kDstSetupFailed, "the visible device count check");
     auto engine = std::make_unique<TransferEngine>(false);
     // P2PHANDSHAKE binds a free port (the one given here is ignored); the
     // address it really uses is reported below.
@@ -218,7 +237,8 @@ int runIpcDestination() {
         return dstFailed(kDstSetupFailed, "installTransport");
 
     char* alloc = nullptr;
-    if (cudaSetDevice(0) != cudaSuccess ||
+    const int device = FLAGS_hip_ipc_dst_device;
+    if (cudaSetDevice(device) != cudaSuccess ||
         cudaMalloc(reinterpret_cast<void**>(&alloc), kAllocLen) !=
             cudaSuccess ||
         cudaMemset(alloc, 0, kAllocLen) != cudaSuccess ||
@@ -229,7 +249,8 @@ int runIpcDestination() {
     std::string report = kDstMarker + engine->getLocalIpAndPort();
     for (size_t off : kSliceOffsets) {
         if (engine->registerLocalMemory(alloc + off, kSliceLen,
-                                        GPU_PREFIX + "0") != 0)
+                                        GPU_PREFIX + std::to_string(device)) !=
+            0)
             return dstFailed(kDstRegisterFailed, "registerLocalMemory");
         report +=
             " " + std::to_string(reinterpret_cast<uintptr_t>(alloc + off));
@@ -263,6 +284,25 @@ int runIpcDestination() {
     return rc;
 }
 
+// A copy of this process's environment with `name` set to `value` (or
+// removed, for nullptr).
+std::vector<std::string> environWith(const std::string& name,
+                                     const char* value) {
+    std::vector<std::string> env;
+    for (char** e = environ; *e != nullptr; ++e) {
+        if (std::string(*e).rfind(name + "=", 0) != 0) env.emplace_back(*e);
+    }
+    if (value != nullptr) env.push_back(name + "=" + value);
+    return env;
+}
+
+std::vector<char*> cStrings(std::vector<std::string>& strings) {
+    std::vector<char*> out;
+    for (auto& s : strings) out.push_back(s.data());
+    out.push_back(nullptr);
+    return out;
+}
+
 // Owns the destination process and reaps it when destroyed.
 class DestinationProcess {
    public:
@@ -275,8 +315,18 @@ class DestinationProcess {
             return false;
         }
         char exe[] = "/proc/self/exe";
-        char flag[] = "--hip_ipc_dst";
-        char* argv[] = {exe, flag, nullptr};
+        std::vector<std::string> args = {
+            exe, "--hip_ipc_dst",
+            "--hip_ipc_dst_device=" + std::to_string(FLAGS_hip_ipc_dst_device),
+            "--hip_ipc_expect_devices=" +
+                std::to_string(FLAGS_hip_ipc_dst_expect_devices)};
+        auto argv = cStrings(args);
+        std::vector<std::string> env_strings =
+            environWith("HIP_VISIBLE_DEVICES",
+                        FLAGS_hip_ipc_dst_visible_devices.empty()
+                            ? getenv("HIP_VISIBLE_DEVICES")
+                            : FLAGS_hip_ipc_dst_visible_devices.c_str());
+        auto envp = cStrings(env_strings);
         posix_spawn_file_actions_t actions;
         int rc = posix_spawn_file_actions_init(&actions);
         if (rc == 0) {
@@ -293,7 +343,8 @@ class DestinationProcess {
                     rc = posix_spawn_file_actions_addclose(&actions, fd);
             }
             if (rc == 0)
-                rc = posix_spawn(&pid_, exe, &actions, nullptr, argv, environ);
+                rc = posix_spawn(&pid_, exe, &actions, nullptr, argv.data(),
+                                 envp.data());
             posix_spawn_file_actions_destroy(&actions);
         }
         close(to_child[0]);
@@ -438,6 +489,8 @@ TEST(HipTransportTest, IpcTransfersHitBuffersInsideLargerAllocation) {
         (count_err == cudaSuccess && device_count < 1))
         GTEST_SKIP() << "Needs a GPU.";
     ASSERT_EQ(count_err, cudaSuccess);
+    if (FLAGS_hip_ipc_expect_devices > 0)
+        ASSERT_EQ(device_count, FLAGS_hip_ipc_expect_devices);
     // MC_USE_HIP_IPC=0 or MC_USE_NVLINK_IPC=0 selects fabric handles; both
     // processes must use IPC.
     ScopedEnv hip_ipc("MC_USE_HIP_IPC", "1");
@@ -543,6 +596,109 @@ TEST(HipTransportTest, IpcTransfersHitBuffersInsideLargerAllocation) {
     (void)cudaFree(local);
     const int dst_rc = dst.finish();
     EXPECT_EQ(dst_rc, kDstOk) << describeDstExit(dst_rc);
+    if (!FLAGS_hip_ipc_rerun_marker.empty() && !HasFailure())
+        close(
+            open(FLAGS_hip_ipc_rerun_marker.c_str(), O_CREAT | O_WRONLY, 0600));
+}
+
+// Same-node peers need not see the same devices: in SGLang PD each role sees
+// only its own GPUs, so a TP4 decode's rank 3 exports from device ordinal 3
+// while a TP2 prefill process sees two devices. hipIpcOpenMemHandle checks
+// the handle's owner ordinal against the importer's device count and fails
+// with hipErrorInvalidValue. This reruns the test above with the destination
+// seeing two devices and allocating on the second, and the source seeing
+// only the first.
+TEST(HipTransportTest, IpcOpensHandlesFromDeviceOrdinalsTheImporterLacks) {
+    ScopedEnv workaround("MC_HIP_IPC_OWNER_DEVICE_WORKAROUND", "1");
+    if (!FLAGS_hip_ipc_rerun_marker.empty())
+        GTEST_SKIP() << "Already running as the restricted rerun.";
+    int device_count = 0;
+    const auto count_err = cudaGetDeviceCount(&device_count);
+    if (count_err == cudaErrorNoDevice ||
+        count_err == cudaErrorInsufficientDriver ||
+        (count_err == cudaSuccess && device_count < 2))
+        GTEST_SKIP() << "Needs >= 2 GPUs.";
+    ASSERT_EQ(count_err, cudaSuccess);
+    // The children's device sets are written as HIP_VISIBLE_DEVICES indices
+    // into what ROCr exposes, which only matches this process's ordinals
+    // when HIP applies no filter of its own.
+    for (const char* name : {"HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"}) {
+        const char* value = getenv(name);
+        if (value != nullptr && *value != '\0')
+            GTEST_SKIP() << name << " is set; this test sets it itself, so "
+                         << "restrict GPUs with ROCR_VISIBLE_DEVICES instead.";
+    }
+    // The source's only device must reach the destination's second one.
+    int peer = -1;
+    for (int d = 1; d < device_count && peer < 0; ++d) {
+        int can_access = 0;
+        ASSERT_EQ(cudaDeviceCanAccessPeer(&can_access, 0, d), cudaSuccess);
+        if (can_access) peer = d;
+    }
+    if (peer < 0) GTEST_SKIP() << "No GPU has peer access to GPU 0.";
+
+    char marker[] = "/tmp/hip_ipc_rerun_XXXXXX";
+    const int marker_fd = mkstemp(marker);
+    ASSERT_GE(marker_fd, 0);
+    close(marker_fd);
+    unlink(marker);
+    std::vector<std::string> args = {
+        "/proc/self/exe",
+        "--hip_ipc_dst_device=1",
+        "--hip_ipc_dst_visible_devices=0," + std::to_string(peer),
+        "--hip_ipc_dst_expect_devices=2",
+        "--hip_ipc_expect_devices=1",
+        std::string("--hip_ipc_rerun_marker=") + marker};
+    auto argv = cStrings(args);
+    std::vector<std::string> env_strings =
+        environWith("HIP_VISIBLE_DEVICES", "0");
+    // HIP also honors CUDA_VISIBLE_DEVICES; only HIP_VISIBLE_DEVICES may
+    // restrict the rerun. gflags rejects --gtest_* flags, so the filter goes
+    // through the environment, and inherited sharding must not drop the test.
+    for (auto it = env_strings.begin(); it != env_strings.end();) {
+        const bool drop = it->rfind("CUDA_VISIBLE_DEVICES=", 0) == 0 ||
+                          it->rfind("GTEST_FILTER=", 0) == 0 ||
+                          it->rfind("GTEST_SHARD_INDEX=", 0) == 0 ||
+                          it->rfind("GTEST_TOTAL_SHARDS=", 0) == 0;
+        it = drop ? env_strings.erase(it) : it + 1;
+    }
+    env_strings.push_back(
+        "GTEST_FILTER=HipTransportTest."
+        "IpcTransfersHitBuffersInsideLargerAllocation");
+    auto envp = cStrings(env_strings);
+    // Its own process group, so a timeout also kills the destination the
+    // rerun starts.
+    posix_spawnattr_t attr;
+    ASSERT_EQ(posix_spawnattr_init(&attr), 0);
+    ASSERT_EQ(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP), 0);
+    ASSERT_EQ(posix_spawnattr_setpgroup(&attr, 0), 0);
+    pid_t pid = -1;
+    const int spawn_rc =
+        posix_spawn(&pid, argv[0], nullptr, &attr, argv.data(), envp.data());
+    posix_spawnattr_destroy(&attr);
+    ASSERT_EQ(spawn_rc, 0);
+    int status = 0;
+    pid_t waited = 0;
+    for (int i = 0; i < 2400 && waited == 0; ++i) {  // up to 240 s
+        waited = waitpid(pid, &status, WNOHANG);
+        if (waited < 0 && errno == EINTR) waited = 0;
+        if (waited == 0) usleep(100 * 1000);
+    }
+    if (waited == 0) {
+        kill(-pid, SIGKILL);
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+        unlink(marker);
+        FAIL() << "the rerun did not finish within 240 s";
+    }
+    ASSERT_EQ(waited, pid) << "waitpid failed: " << strerror(errno);
+    const bool passed = access(marker, F_OK) == 0;
+    unlink(marker);
+    ASSERT_TRUE(WIFEXITED(status)) << "the rerun was killed";
+    EXPECT_EQ(WEXITSTATUS(status), 0)
+        << "transfers to a destination on device ordinal 1 failed from a "
+           "process that sees one device (its output is above)";
+    EXPECT_TRUE(passed) << "the rerun did not run the transfer test to the end";
 }
 
 int main(int argc, char** argv) {
