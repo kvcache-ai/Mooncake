@@ -1,6 +1,7 @@
 // Unit tests for dynamic MEMORY replica fanout on hot reads.
 
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -63,7 +64,8 @@ class DynamicReplicationTest : public ::testing::Test {
 
     void AdmitDynamicReplication(MasterService& service,
                                  const std::string& key) const {
-        for (uint32_t i = 0; i < service.DynamicReplicationAdmissionMinHits();
+        for (uint32_t i = 0; i < MasterServiceTestPeer(service)
+                                     .DynamicReplicationAdmissionMinHits();
              ++i) {
             ObserveDynamicReplicationAccess(service, key);
         }
@@ -98,19 +100,22 @@ class DynamicReplicationTest : public ::testing::Test {
         proposal.proposal_id = generate_uuid();
         proposal.tenant_id = TenantId::Default().value();
         proposal.key = key;
-        proposal.expire_at_ms_epoch = MasterService::DynamicReplicationNowMs() +
-                                      std::chrono::seconds(30).count() * 1000;
+        proposal.expire_at_ms_epoch =
+            MasterServiceTestPeer::DynamicReplicationNowMs() +
+            std::chrono::seconds(30).count() * 1000;
         if (preferred_target_segment.has_value()) {
             proposal.preferred_target_segment = *preferred_target_segment;
         }
 
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         EXPECT_TRUE(accessor.Exists());
         if (accessor.Exists()) {
             const auto& metadata = accessor.Get();
             proposal.observed_version_epoch =
-                service.DynamicReplicationVersionEpoch(metadata);
+                MasterServiceTestPeer(service).DynamicReplicationVersionEpoch(
+                    metadata);
             proposal.object_size_bytes = static_cast<uint64_t>(metadata.size);
         }
         if (admit) {
@@ -121,8 +126,9 @@ class DynamicReplicationTest : public ::testing::Test {
 
     size_t DynamicReplicaCount(MasterService& service,
                                const std::string& key) const {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         EXPECT_TRUE(accessor.Exists());
         return accessor.Exists() ? accessor.Get().DynamicReplicaCount() : 0;
     }
@@ -130,8 +136,9 @@ class DynamicReplicationTest : public ::testing::Test {
     bool HasCompleteDynamicReplica(MasterService& service,
                                    const std::string& key,
                                    const std::string& target_segment) const {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         EXPECT_TRUE(accessor.Exists());
         if (!accessor.Exists()) {
             return false;
@@ -149,8 +156,9 @@ class DynamicReplicationTest : public ::testing::Test {
     bool HasIncompleteDynamicReplica(MasterService& service,
                                      const std::string& key,
                                      const std::string& target_segment) const {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         EXPECT_TRUE(accessor.Exists());
         if (!accessor.Exists()) {
             return false;
@@ -166,15 +174,17 @@ class DynamicReplicationTest : public ::testing::Test {
 
     void BumpVersionEpoch(MasterService& service,
                           const std::string& key) const {
-        MasterService::MetadataAccessorRW accessor(
-            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
         accessor.Get().put_start_time += std::chrono::milliseconds(1);
     }
 
     bool HasDynamicState(MasterService& service, const std::string& key) const {
-        MasterService::MetadataAccessorRW accessor(
-            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         auto& tenant_state = accessor.GetTenantState();
         const bool has_lease = std::any_of(
             tenant_state.dynamic_replication_leases.begin(),
@@ -186,73 +196,80 @@ class DynamicReplicationTest : public ::testing::Test {
     }
 
     size_t DynamicReplicationWindowEntryLimit() const {
-        return MasterService::kDynamicReplicationWindowEntryLimit;
+        return MasterServiceTestPeer::kDynamicReplicationWindowEntryLimit;
     }
 
     size_t DynamicReplicationWindowCount(MasterService& service) const {
-        return service.dynamic_replication_windows_.size();
+        return MasterServiceTestPeer::DynamicReplicationWindows(service).size();
     }
 
     void ExpireDynamicReplicationWindows(MasterService& service) const {
         const auto stale_start =
             std::chrono::steady_clock::now() - std::chrono::seconds(3);
-        for (auto& [_, window] : service.dynamic_replication_windows_) {
+        for (auto& [_, window] :
+             MasterServiceTestPeer::DynamicReplicationWindows(service)) {
             window.window_start = stale_start;
         }
     }
 
     void ClearDynamicReplicationState(MasterService& service,
                                       const std::string& key) const {
-        MasterService::MetadataAccessorRW accessor(
-            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
-        service.ClearDynamicReplicationStateForKey(accessor.GetTenantState(),
-                                                   key);
+        MasterServiceTestPeer(service).ClearDynamicReplicationStateForKey(
+            accessor.GetTenantState(), key);
     }
 
     void DiscardExpiredProcessingReplicas(MasterService& service,
                                           const std::string& key) const {
-        const size_t shard_idx =
-            service.getShardIndex(TenantId::Default(), key);
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
-        service.DiscardExpiredProcessingReplicas(
+        const size_t shard_idx = MasterServiceTestPeer(service).getShardIndex(
+            TenantId::Default(), key);
+        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
+                                                             shard_idx);
+        MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::now() + std::chrono::seconds(1));
     }
 
     bool ObserveDynamicReplicationAccess(MasterService& service,
                                          const std::string& key) const {
-        return service.ObserveDynamicReplicationAccess(
-            MasterService::ObjectIdentity{TenantId::Default(), key});
+        return MasterServiceTestPeer(service).ObserveDynamicReplicationAccess(
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
     }
 
     size_t EvictReplicaOnSegment(MasterService& service, const std::string& key,
                                  const std::string& target_segment) const {
-        MasterService::MetadataAccessorRW accessor(
-            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         EXPECT_TRUE(accessor.Exists());
         if (!accessor.Exists()) {
             return 0;
         }
         std::vector<ReplicaID> erased_replica_ids;
-        return service.EraseReplicasWithCacheTotalAccounting(
-            accessor.Get(),
-            [&target_segment](const Replica& replica) {
-                if (!replica.is_memory_replica()) {
-                    return false;
-                }
-                const auto& segment_names = replica.get_segment_names();
-                return std::any_of(segment_names.begin(), segment_names.end(),
-                                   [&target_segment](const auto& name) {
-                                       return name && *name == target_segment;
-                                   });
-            },
-            &erased_replica_ids);
+        return MasterServiceTestPeer(service)
+            .EraseReplicasWithCacheTotalAccounting(
+                accessor.Get(),
+                [&target_segment](const Replica& replica) {
+                    if (!replica.is_memory_replica()) {
+                        return false;
+                    }
+                    const auto& segment_names = replica.get_segment_names();
+                    return std::any_of(
+                        segment_names.begin(), segment_names.end(),
+                        [&target_segment](const auto& name) {
+                            return name && *name == target_segment;
+                        });
+                },
+                &erased_replica_ids);
     }
 
     void ExpireDynamicPending(MasterService& service,
                               const std::string& key) const {
-        MasterService::MetadataAccessorRW accessor(
-            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         auto& tenant_state = accessor.GetTenantState();
         auto pending_it = tenant_state.dynamic_replication_pending.find(key);
         ASSERT_NE(pending_it, tenant_state.dynamic_replication_pending.end());

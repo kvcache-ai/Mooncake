@@ -26,7 +26,7 @@
 // dereferences nullptr -> SIGSEGV (fault address 0x0, exactly as observed in
 // the prod kernel logs).
 //
-// Production trigger chain reproduced here (public API + one friend hook):
+// Production trigger chain reproduced here (public API + test peer):
 //   1. MountSegment                     (a "ghost" client mounts a segment)
 //   2. PutStart without PutEnd          (key stays in processing_keys with an
 //                                        incomplete replica on that segment)
@@ -55,6 +55,7 @@
 // simply reports OBJECT_NOT_FOUND) and the test passes.
 
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -91,11 +92,12 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     // tenant non-empty).
     std::string FindKeyOnSameShard(MasterService& service,
                                    const std::string& key) {
-        const size_t target = service.getShardIndex(TenantId::Default(), key);
+        const size_t target = MasterServiceTestPeer(service).getShardIndex(
+            TenantId::Default(), key);
         for (int i = 0; i < 100000; ++i) {
             std::string candidate = key + "_keepalive_" + std::to_string(i);
-            if (service.getShardIndex(TenantId::Default(), candidate) ==
-                target) {
+            if (MasterServiceTestPeer(service).getShardIndex(
+                    TenantId::Default(), candidate) == target) {
                 return candidate;
             }
         }
@@ -150,7 +152,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         //    No ClearInvalidHandles sweep here (see file header).
         size_t metrics_dec_capacity = 0;
         {
-            auto segment_access = service.segment_manager_.getSegmentAccess();
+            auto segment_access = MasterServiceTestPeer::SegmentManager(service)
+                                      .getSegmentAccess();
             if (segment_access.PrepareUnmountSegment(
                     segment.id, metrics_dec_capacity) != ErrorCode::OK) {
                 ::_exit(kExitUnmountFailed);

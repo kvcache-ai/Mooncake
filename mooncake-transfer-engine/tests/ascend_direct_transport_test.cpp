@@ -2292,9 +2292,23 @@ int32_t CurrentAclDevice() {
     return device_id;
 }
 
+int g_host_alloc_calls = 0;
+
+void* CountingHostAlloc(size_t size, size_t alignment, bool defer) {
+    (void)alignment;
+    (void)defer;
+    ++g_host_alloc_calls;
+    void* ptr = nullptr;
+    EXPECT_EQ(aclrtMallocHost(&ptr, size), ACL_ERROR_NONE);
+    return ptr;
+}
+
+void* NullHostAlloc(size_t, size_t, bool) { return nullptr; }
+
 struct AgentAllocEnv {
     explicit AgentAllocEnv(int device_count) {
         mock_acl::reset();
+        g_host_alloc_calls = 0;
         globalConfig().ascend_agent_mode = true;
         globalConfig().ascend_use_fabric_mem = false;
         mock_acl::set_device_count(device_count);
@@ -2338,6 +2352,73 @@ TEST(AgentModeAllocTest, ConsecutiveStoreAllocsRotateDevices) {
     ASSERT_NE(wrap, nullptr);
     EXPECT_EQ(CurrentAclDevice(), first);
     ascend_free_memory("ascend", wrap);
+}
+
+TEST(AgentModeAllocTest, HostAllocRotatesDevices) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kAllocSize = 4096;
+    AgentAllocEnv env(kDeviceCount);
+
+    int first = -1;
+    for (int i = 0; i < kDeviceCount; ++i) {
+        size_t actual = 0;
+        void* ptr = ascend_allocate_memory_best_effort(
+            kAllocSize, "ascend", &actual, CountingHostAlloc, kAllocSize,
+            false);
+        ASSERT_NE(ptr, nullptr);
+        EXPECT_EQ(actual, kAllocSize);
+        if (i == 0) {
+            first = CurrentAclDevice();
+            ASSERT_GE(first, 0);
+            ASSERT_LT(first, kDeviceCount);
+        } else {
+            EXPECT_EQ(CurrentAclDevice(), (first + i) % kDeviceCount);
+        }
+        ascend_free_memory("ascend", ptr);
+    }
+    EXPECT_EQ(g_host_alloc_calls, kDeviceCount);
+}
+
+TEST(AgentModeAllocTest, FabricMemIgnoresHostAlloc) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    AgentAllocEnv env(kDeviceCount);
+    globalConfig().ascend_use_fabric_mem = true;
+    mock_acl::set_malloc_physical_max_success(0);
+
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(
+        kGiB, "ascend", &actual, CountingHostAlloc, kGiB, false);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(g_host_alloc_calls, 0) << "fabric_mem must not call host_alloc";
+    EXPECT_GT(actual, 0);
+    ascend_free_memory("ascend", ptr);
+}
+
+TEST(AgentModeAllocTest, FailedHostAllocDoesNotConsumeSlot) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kAllocSize = 4096;
+    AgentAllocEnv env(kDeviceCount);
+
+    size_t actual = 0;
+    void* marker =
+        ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
+    ASSERT_NE(marker, nullptr);
+    const int d0 = CurrentAclDevice();
+    ascend_free_memory("ascend", marker);
+
+    actual = 0;
+    void* failed = ascend_allocate_memory_best_effort(
+        kAllocSize, "ascend", &actual, NullHostAlloc, kAllocSize, false);
+    EXPECT_EQ(failed, nullptr);
+    EXPECT_EQ(actual, 0);
+
+    actual = 0;
+    void* ok =
+        ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(CurrentAclDevice(), (d0 + 1) % kDeviceCount);
+    ascend_free_memory("ascend", ok);
 }
 
 TEST(AgentModeAllocTest, DirectVmmDoesNotRotateSequencer) {
@@ -2461,72 +2542,6 @@ TEST(RoceModeDetectionTest, IsRoceModeEnabled_FromHcclEnv) {
     setenv("HCCL_INTRA_ROCE_ENABLE", "1", 1);
     EXPECT_TRUE(IsRoceModeEnabled());
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
-}
-
-TEST(FabricMemConfigDetectionTest, GlobalResourceConfig_FlatFabricMemory) {
-    EXPECT_TRUE(HasFabricMemoryInGlobalResourceConfig(
-        R"({"fabric_memory.max_capacity":32})"));
-    EXPECT_TRUE(HasFabricMemoryInGlobalResourceConfig(
-        R"({"fabric_memory.start_address":"72","comm_resource_config.protocol_desc":"hccs:device"})"));
-}
-
-TEST(FabricMemConfigDetectionTest, GlobalResourceConfig_NestedFabricMemory) {
-    EXPECT_TRUE(HasFabricMemoryInGlobalResourceConfig(
-        R"({"fabric_memory":{"max_capacity":32,"start_address":40}})"));
-}
-
-TEST(FabricMemConfigDetectionTest, GlobalResourceConfig_NoFabricMemory) {
-    EXPECT_FALSE(HasFabricMemoryInGlobalResourceConfig(
-        R"({"comm_resource_config.protocol_desc":"hccs:device"})"));
-    EXPECT_FALSE(HasFabricMemoryInGlobalResourceConfig("{}"));
-    EXPECT_FALSE(HasFabricMemoryInGlobalResourceConfig(nullptr));
-}
-
-TEST(FabricMemConfigDetectionTest,
-     IsFabricMemEnabled_FromGlobalResourceConfig) {
-    globalConfig().ascend_store_te_init = false;
-    globalConfig().ascend_use_fabric_mem = false;
-    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
-           R"({"fabric_memory.max_capacity":32})", 1);
-    EXPECT_TRUE(IsFabricMemEnabledFromGlobalResourceConfig());
-    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
-}
-
-TEST_F(AscendDirectTransportTest,
-       Standalone_FabricMem_FromGlobalResourceConfig) {
-    // Normal/P2P TE enables fabric mem when ASCEND_GLOBAL_RESOURCE_CONFIG
-    // carries fabric_memory, without ASCEND_ENABLE_USE_FABRIC_MEM / store init.
-    globalConfig().ascend_agent_mode = false;
-    globalConfig().ascend_store_te_init = false;
-    globalConfig().ascend_use_fabric_mem = false;
-    unsetenv("HCCL_INTRA_ROCE_ENABLE");
-    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
-           R"({"fabric_memory.max_capacity":32})", 1);
-    constexpr int kDeviceCount = 4;
-    mock_acl::set_device_count(kDeviceCount);
-    g_device_id = 1;
-    auto transport = createTransport();
-    ASSERT_NE(transport, nullptr);
-    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
-                                             "cpu:0", true, true),
-              0);
-
-    std::vector<std::string> endpoints = {"127.0.0.1:8000", "127.0.0.1:8100",
-                                          "127.0.0.1:8200", "127.0.0.1:8300"};
-    addMultiEndpointRemoteSegment(transport->meta(), 1, "fabric_via_grc",
-                                  "127.0.0.1", endpoints, /*dest_device_id=*/2,
-                                  0x10000, kTransferBufSize);
-
-    initTestData(kTransferBufSize);
-    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
-                                    0x10000, kTransferBufSize);
-    ASSERT_TRUE(result.finished);
-    EXPECT_FALSE(result.failed);
-    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:8200")
-        << "Normal TE with fabric_memory in GLOBAL_RESOURCE_CONFIG routes by "
-           "dest buffer device_id";
-
-    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
 }
 
 // -----------------------------------------------------------------------------

@@ -20,10 +20,10 @@ concurrency:
 # ── Workflow Design Notes ──────────────────────────────────────────────────────
 # 1. version-stamp computes a forward-looking nightly version (next patch + .devYYYYMMDD)
 #    that sorts AFTER the current release per PEP 440, e.g. "0.3.12.dev20260720".
-# 2. Build jobs pass the nightly version via `version-override` to _build-wheel.yaml
-#    so each wheel is stamped with the correct dev version for TestPyPI.
+# 2. Build jobs pass the nightly version to their reusable wheel workflows so
+#    each wheel is stamped with the correct dev version for TestPyPI.
 # 3. Specialized platform and packaging checks run nightly instead of on every PR.
-# 4. publish-testpypi uploads all nightly-* artifacts to TestPyPI.
+# 4. publish-testpypi uploads standard and ROCm nightly artifacts to TestPyPI.
 # 5. nightly-gate aggregates ALL build + test results; notify-failure files an issue.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -93,6 +93,19 @@ jobs:
       artifact_name: nightly-cuda13-x86-py312
     secrets: inherit
 
+  build-wheel-rocm:
+    needs: version-stamp
+    uses: ./.github/workflows/ci_rocm.yml
+    with:
+      version_override: ${{ needs.version-stamp.outputs.nightly_version }}
+
+  rocm-integration-test:
+    needs: build-wheel-rocm
+    uses: ./.github/workflows/integration-test-rocm.yml
+    with:
+      checkout_ref: ${{ github.sha }}
+    secrets: inherit
+
   build-musa:
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
@@ -153,7 +166,7 @@ jobs:
     secrets: inherit
 
   publish-testpypi:
-    needs: [version-stamp, build-wheels, nightly-test]
+    needs: [version-stamp, build-wheels, build-wheel-rocm, nightly-test]
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
@@ -164,13 +177,21 @@ jobs:
         run: |
           echo "Publishing nightly version: ${{ needs.version-stamp.outputs.nightly_version }}"
 
-      - name: Download all nightly wheel artifacts
+      - name: Download standard nightly wheel artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist-all
           pattern: 'nightly-*'
 
-      - name: Collect and rename wheels with nightly version
+      # Keep the established artifact names because integration-test-rocm.yml
+      # consumes them from the same run.
+      - name: Download ROCm nightly wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          pattern: 'mooncake-wheel-rocm-ubuntu-*'
+
+      - name: Collect wheels for nightly publication
         run: |
           mkdir -p dist-publish
           find dist-all -name "*.whl" -exec cp {} dist-publish/ \;
@@ -215,13 +236,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install and start etcd
-        run: |
-          wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-          tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-          sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-          etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-          sleep 3
-          ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+        uses: ./.github/actions/setup-etcd
 
       - name: Free up disk space
         run: |
@@ -241,15 +256,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build
 
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Configure sccache
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Set up compiler cache
+        uses: ./.github/actions/setup-sccache
 
       - name: Configure project (Release, no ASAN)
         run: |
@@ -264,21 +272,7 @@ jobs:
             -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
 
       - name: Configure CUDA driver runtime
-        run: |
-          cuda_driver_library=$(sed -n \
-            's/^CUDA_cuda_driver_LIBRARY:FILEPATH=//p' build/CMakeCache.txt)
-          if [ -z "$cuda_driver_library" ] || [ ! -f "$cuda_driver_library" ]; then
-            echo "::error::CMake did not resolve the CUDA driver library"
-            exit 1
-          fi
-
-          cuda_driver_dir=$(dirname "$cuda_driver_library")
-          if [ ! -e "$cuda_driver_dir/libcuda.so.1" ]; then
-            sudo ln -s "$(basename "$cuda_driver_library")" \
-              "$cuda_driver_dir/libcuda.so.1"
-          fi
-          echo "LIBRARY_PATH=$cuda_driver_dir:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$cuda_driver_dir:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/setup-cuda-runtime
 
       - name: Build project
         run: |
@@ -293,23 +287,10 @@ jobs:
           bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
 
       - name: Start Metadata Server
-        run: |
-          cd mooncake-transfer-engine/example/http-metadata-server-python
-          pip install aiohttp
-          python ./bootstrap_server.py &
-          echo "NIGHTLY_METADATA_SERVER_PID=$!" >> "$GITHUB_ENV"
-          sleep 2
+        uses: ./.github/actions/setup-metadata-server
 
       - name: Run CTest unit tests
-        run: |
-          # Keep ephemeral TIME_WAIT sockets off mooncake_client's RPC port.
-          reserved_ports=$(sysctl -n net.ipv4.ip_local_reserved_ports)
-          sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
-          cd build
-          export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
-          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-          DEFAULT_KV_LEASE_TTL=500 \
-            ctest --parallel $(nproc) --output-on-failure
+        uses: ./.github/actions/run-ctest
 
       - name: Run Mooncake Store Rust smoke test
         env:
@@ -401,68 +382,13 @@ jobs:
           master_pid=$!
           trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
           sleep 3
-          python scripts/test_tensor_api.py -n 1
-          python scripts/test_async_store.py
+          python -m unittest mooncake-wheel.tests.test_weight_snapshot_api
+          python python/tests/store/async_store_integration.py
           python scripts/test_copy_move_api.py
           python scripts/test_drain_http_api.py --timeout-sec 90
 
       - name: Run RPC Communicator Bandwidth Test
-        run: |
-          rpc_server_pid=""
-          cleanup() {
-            status=$?
-            trap - EXIT
-            if [ -n "$rpc_server_pid" ]; then
-              kill "$rpc_server_pid" 2>/dev/null || true
-              wait "$rpc_server_pid" 2>/dev/null || true
-            fi
-            if [ "$status" -ne 0 ]; then
-              cat "$RUNNER_TEMP/rpc-server.log" 2>/dev/null || true
-            fi
-            exit "$status"
-          }
-          trap cleanup EXIT
-
-          python -u mooncake-transfer-engine/tests/rpc_communicator_test.py \
-            server --url 127.0.0.1:9004 --data-size 1 \
-            >"$RUNNER_TEMP/rpc-server.log" 2>&1 &
-          rpc_server_pid=$!
-
-          rpc_ready=false
-          for _ in {1..50}; do
-            if ! kill -0 "$rpc_server_pid" 2>/dev/null; then
-              cat "$RUNNER_TEMP/rpc-server.log"
-              echo "::error::RPC communicator server exited before becoming ready"
-              exit 1
-            fi
-            if ss -H -ltn 'sport = :9004' | grep -q .; then
-              rpc_ready=true
-              break
-            fi
-            sleep 0.1
-          done
-          if [ "$rpc_ready" != true ]; then
-            cat "$RUNNER_TEMP/rpc-server.log"
-            echo "::error::RPC communicator server did not become ready within 5 seconds"
-            exit 1
-          fi
-
-          client_rc=0
-          timeout 10 python -u \
-            mooncake-transfer-engine/tests/rpc_communicator_test.py \
-            client --url 127.0.0.1:9004 --threads 2 --data-size 1 \
-            >"$RUNNER_TEMP/rpc-client.log" 2>&1 || \
-            client_rc=$?
-          cat "$RUNNER_TEMP/rpc-client.log"
-          if [ "$client_rc" -ne 0 ] && [ "$client_rc" -ne 124 ]; then
-            echo "::error::RPC communicator client failed with exit code $client_rc"
-            exit "$client_rc"
-          fi
-          if ! grep -q '^bandwidth:' "$RUNNER_TEMP/rpc-client.log"; then
-            cat "$RUNNER_TEMP/rpc-server.log"
-            echo "::error::RPC communicator did not complete a successful transfer"
-            exit 1
-          fi
+        run: ./scripts/ci/run_rpc_smoke.sh
         shell: bash
 
   nightly-coverage:
@@ -487,13 +413,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install and start etcd
-        run: |
-          wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-          tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-          sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-          etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-          sleep 3
-          ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+        uses: ./.github/actions/setup-etcd
 
       - name: Free up disk space
         uses: ./.github/actions/free-disk-space
@@ -514,15 +434,8 @@ jobs:
       - name: Test HugeTLB sizing helper
         run: python3 scripts/test_hicache_hugepage_requirements.py
 
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Configure sccache
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Set up compiler cache
+        uses: ./.github/actions/setup-sccache
 
       - name: Configure project with coverage support
         run: |
@@ -539,19 +452,12 @@ jobs:
           sudo cmake --install .
 
       - name: Start Metadata Server
-        run: |
-          cd mooncake-transfer-engine/example/http-metadata-server-python
-          pip install aiohttp
-          python ./bootstrap_server.py &
-          sleep 2
+        uses: ./.github/actions/setup-metadata-server
 
       - name: Run CTest with coverage
-        run: |
-          cd build
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-          DEFAULT_KV_LEASE_TTL=500 \
-            ctest --parallel $(nproc) --output-on-failure
+        uses: ./.github/actions/run-ctest
+        with:
+          reserve-rpc-port: 'false'
 
       - name: Run Mooncake Store Rust sanitizer smoke test
         env:
@@ -630,6 +536,8 @@ jobs:
       - version-stamp
       - build-wheels
       - tone-sglang-integration
+      - build-wheel-rocm
+      - rocm-integration-test
       - build-musa
       - build-docker
       - ascend-test

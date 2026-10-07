@@ -11,6 +11,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
+#include "client_liveness.h"
 #include "offset_allocator/offset_allocator.h"
 #include "storage_usage.h"
 #include "types.h"
@@ -44,6 +45,27 @@ static constexpr size_t kAllocatorUnknownFreeSpace =
 // Forward declarations
 class BufferAllocatorBase;
 class Replica;
+class SegmentAllocatorRegistration;
+
+class SegmentLifetime {
+   public:
+    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
+
+    [[nodiscard]] bool isAvailable() const {
+        return available_->load(std::memory_order_acquire);
+    }
+
+    void setAvailable(bool available) const {
+        available_->store(available, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool operator==(const SegmentLifetime& other) const {
+        return available_ == other.available_;
+    }
+
+   private:
+    std::shared_ptr<std::atomic<bool>> available_;
+};
 
 class AllocatedBuffer {
    public:
@@ -76,11 +98,37 @@ class AllocatedBuffer {
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
     [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired();
+        return !allocator_.expired() && segment_lifetime_.isAvailable();
     }
 
     [[nodiscard]] std::shared_ptr<BufferAllocatorBase> getAllocator() const {
         return allocator_.lock();
+    }
+
+    [[nodiscard]] bool isAvailable() const {
+        if (!isAllocatorValid()) {
+            return false;
+        }
+        const auto record = std::atomic_load_explicit(
+            &client_liveness_, std::memory_order_acquire);
+        return !record || record->IsServing();
+    }
+
+    void bindClientLiveness(
+        std::shared_ptr<ClientLivenessRecord> client_liveness) {
+        std::atomic_store_explicit(&client_liveness_,
+                                   std::move(client_liveness),
+                                   std::memory_order_release);
+    }
+
+    void bindSegmentLifetime(SegmentLifetime lifetime) {
+        segment_lifetime_ = std::move(lifetime);
+    }
+
+    [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
+        const {
+        return std::atomic_load_explicit(&client_liveness_,
+                                         std::memory_order_acquire);
     }
 
     // Serialize the buffer into a descriptor for transfer
@@ -109,6 +157,8 @@ class AllocatedBuffer {
     bool copyTransferProtocolFrom(const AllocatedBuffer& source);
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
+    SegmentLifetime segment_lifetime_;
+    std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
@@ -119,6 +169,7 @@ class AllocatedBuffer {
 
     friend class Serializer<AllocatedBuffer>;
     friend class Replica;
+    friend class SegmentAllocatorRegistration;
 };
 
 /**
@@ -294,6 +345,26 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
+// A detached capture of host-memory allocator metadata; owns no live allocator
+// and contributes neither usage nor capacity metrics.
+struct OffsetBufferAllocatorSnapshot {
+    std::string segment_name;
+    size_t base;
+    size_t capacity;
+    size_t used_bytes;
+    std::string transport_endpoint;
+    offset_allocator::OffsetAllocatorSnapshot allocation_state;
+
+    // Validate the detached snapshot without publishing resources or metrics.
+    [[nodiscard]] tl::expected<void, std::string> Validate() const;
+
+   private:
+    tl::expected<void, std::string> ValidateMetadata() const;
+    // Restore composes this cheap outer check with OffsetAllocator::Restore's
+    // mandatory layout validation, avoiding two graph scans in one factory.
+    friend class OffsetBufferAllocator;
+};
+
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
  * strategy, which provides efficient memory allocation with bin-based
@@ -308,6 +379,18 @@ class OffsetBufferAllocator
                           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
+
+    // Restore an unpublished allocator from decoded state. Installs the
+    // allocation layout and accounts usage before returning a runtime-ready
+    // object; capacity accounting remains the owning pool's responsibility.
+    // Consumes the snapshot and rejects inconsistent state with
+    // ErrorCode::INVALID_PARAMS.
+    static tl::expected<std::shared_ptr<OffsetBufferAllocator>, ErrorCode>
+    Restore(OffsetBufferAllocatorSnapshot snapshot);
+
+    // Requires a forked snapshot child or externally quiesced state. Does not
+    // acquire inherited runtime locks; copies all state needed by the codec.
+    OffsetBufferAllocatorSnapshot CaptureSnapshot() const;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
 
@@ -333,9 +416,9 @@ class OffsetBufferAllocator
     }
 
    private:
-    void RestoreUsageBytes(size_t bytes) noexcept {
-        SetUsageBytesForRestore(bytes);
-    }
+    OffsetBufferAllocator(
+        OffsetBufferAllocatorSnapshot snapshot,
+        std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator);
 
     // metadata
     const std::string segment_name_;
@@ -346,8 +429,6 @@ class OffsetBufferAllocator
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
-
-    friend class Serializer<OffsetBufferAllocator>;
 };
 
 struct RestoredOffsetBufferAllocator {

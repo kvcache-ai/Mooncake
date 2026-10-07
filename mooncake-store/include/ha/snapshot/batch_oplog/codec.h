@@ -7,6 +7,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "metadata_store.h"
+#include "weight_metadata_store.h"
 
 namespace mooncake {
 
@@ -21,6 +22,11 @@ std::vector<uint8_t> EncodeBatchOpLogSnapshotSegments(
     const std::vector<StandbySegmentInfo>& segments);
 tl::expected<std::vector<StandbySegmentInfo>, std::string>
 DecodeBatchOpLogSnapshotSegments(const std::vector<uint8_t>& encoded);
+
+std::vector<uint8_t> EncodeBatchOpLogSnapshotWeightMetadata(
+    const WeightMetadataSnapshot& snapshot);
+tl::expected<WeightMetadataSnapshot, std::string>
+DecodeBatchOpLogSnapshotWeightMetadata(const std::vector<uint8_t>& encoded);
 
 std::vector<uint8_t> EncodeBatchOpLogSnapshotObjectChunk(
     uint64_t chunk_index, std::vector<StandbyObjectEntry> objects);

@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "tent/common/config.h"
+#include "tent/common/config_lifecycle.h"
 #include "tent/common/types.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -52,6 +53,17 @@
 #include "tent/transport/fault_proxy/fault_proxy_transport.h"
 
 namespace mooncake {
+
+class TransferEngineImplTestPeer {
+   public:
+    static tent::Status submitRequiringPostSubmitCancellation(
+        tent::TransferEngineImpl& engine, tent::BatchID batch_id,
+        const std::vector<tent::Request>& requests) {
+        return engine.submitTransferRequiringPostSubmitCancellation(batch_id,
+                                                                    requests);
+    }
+};
+
 namespace tent {
 namespace {
 
@@ -80,11 +92,13 @@ class FakeTransport : public Transport {
     explicit FakeTransport(TransportType self_type,
                            StatusFactory status_factory = {},
                            PollStatusFactory poll_status_factory = {},
-                           bool force_submit_fail = false)
+                           bool force_submit_fail = false,
+                           bool cancellation_supported = true)
         : self_type_(self_type),
           status_factory_(std::move(status_factory)),
           poll_status_factory_(std::move(poll_status_factory)),
-          force_submit_fail_(force_submit_fail) {
+          force_submit_fail_(force_submit_fail),
+          cancellation_supported_(cancellation_supported) {
         caps.dram_to_dram = true;  // so checkAvailability returns true
     }
 
@@ -93,6 +107,7 @@ class FakeTransport : public Transport {
     // Number of individual requests handed to submitTransferTasks().
     std::atomic<int> submitted_request_count{0};
     std::atomic<int> status_calls{0};
+    std::atomic<int> cancel_calls{0};
     std::atomic<int> add_mem_calls{0};
 
     Status install(std::string& /*local_segment_name*/,
@@ -145,12 +160,28 @@ class FakeTransport : public Transport {
             return Status::InvalidArgument("bad task_id" LOC_MARK);
         }
         ++fb->poll_counts[task_id];
-        if (poll_status_factory_) {
+        if (fb->statuses[task_id].s == TransferStatusEnum::CANCELED) {
+            status = fb->statuses[task_id];
+        } else if (poll_status_factory_) {
             status = poll_status_factory_(fb->requests[task_id],
                                           fb->poll_counts[task_id]);
         } else {
             status = fb->statuses[task_id];
         }
+        return Status::OK();
+    }
+
+    bool supportsCancellation() const override {
+        return cancellation_supported_;
+    }
+
+    Status cancelTransferTask(SubBatchRef batch, int task_id) override {
+        auto* fb = static_cast<FakeSubBatch*>(batch);
+        if (task_id < 0 || task_id >= (int)fb->statuses.size()) {
+            return Status::InvalidArgument("bad task_id" LOC_MARK);
+        }
+        ++cancel_calls;
+        fb->statuses[task_id] = {TransferStatusEnum::CANCELED, 0};
         return Status::OK();
     }
 
@@ -200,6 +231,7 @@ class FakeTransport : public Transport {
     StatusFactory status_factory_;
     PollStatusFactory poll_status_factory_;
     bool force_submit_fail_;
+    bool cancellation_supported_;
 };
 
 class HpTcpRecoveryTransport : public FakeTransport {
@@ -457,6 +489,90 @@ TEST(EngineFailoverE2E, HpTcpStaleMetadataRetriesSameTransportOnce) {
     releaseHpTcpRecoveryBatch(engine, batch);
 }
 
+TEST(EngineFailoverE2E,
+     PostSubmitCancellationRequirementRejectsUnsupportedTransport) {
+    auto config = makeMinimalP2PConfig();
+    config->set("enable_runtime_queue", true);
+    config->set("runtime_queue/max_outstanding_owners", 16UL);
+    config->set("runtime_queue/max_outstanding_bytes", 1UL << 20);
+    config->set("runtime_queue/max_dispatch_owners", 16UL);
+    config->set("runtime_queue/max_dispatch_bytes", 1UL << 20);
+    config->set("runtime_queue/staging_owner_reserve", 0UL);
+    config->set("runtime_queue/staging_byte_reserve", 0UL);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    auto transport = std::make_shared<FakeTransport>(
+        TCP, FakeTransport::StatusFactory{}, FakeTransport::PollStatusFactory{},
+        false, false);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(transport->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, transport);
+
+    std::vector<uint8_t> buffer(4096, 0xA5);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const auto batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+
+    const auto status =
+        TransferEngineImplTestPeer::submitRequiringPostSubmitCancellation(
+            engine, batch_id, {request});
+    EXPECT_TRUE(status.IsNotImplemented()) << status.ToString();
+    EXPECT_EQ(transport->submit_calls.load(), 0);
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E, PostSubmitCancellationRequirementPinsValidatedRoute) {
+    auto config = makeMinimalP2PConfig();
+    config->set("enable_runtime_queue", true);
+    config->set("runtime_queue/max_outstanding_owners", 16UL);
+    config->set("runtime_queue/max_outstanding_bytes", 1UL << 20);
+    config->set("runtime_queue/max_dispatch_owners", 1UL);
+    config->set("runtime_queue/max_dispatch_bytes", 1UL << 20);
+    config->set("runtime_queue/staging_owner_reserve", 0UL);
+    config->set("runtime_queue/staging_byte_reserve", 0UL);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    auto transport = std::make_shared<FakeTransport>(TCP);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(transport->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, transport);
+
+    std::vector<uint8_t> buffer(4096, 0xA5);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const auto batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+
+    ASSERT_TRUE(
+        TransferEngineImplTestPeer::submitRequiringPostSubmitCancellation(
+            engine, batch_id, {request})
+            .ok());
+    EXPECT_EQ(transport->submit_calls.load(), 1);
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
 TEST(EngineFailoverE2E, HpTcpPermanentFailureDoesNotFailOver) {
     auto config = makeMinimalP2PConfig();
     TransferEngineImpl engine(config);
@@ -581,6 +697,57 @@ TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledLeavesTaskFailed) {
     EXPECT_TRUE(
         engine.unregisterLocalMemory(batch.buf.data(), batch.buf.size()).ok());
 }
+
+class PinnedFailoverPolicyTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(PinnedFailoverPolicyTest, PolicyIsPinnedAtSubmit) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("max_failover_attempts", 1);
+    cfg->set("enable_auto_failover_on_poll", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    CorruptedRdmaBatch old_generation;
+    submitCorruptedRdmaBatch(engine, old_generation, 0xB1);
+
+    auto next_cfg = makeMinimalP2PConfig();
+    // Change each field independently so one cannot mask the other.
+    next_cfg->set("max_failover_attempts", GetParam() ? 1 : 0);
+    next_cfg->set("enable_auto_failover_on_poll", !GetParam());
+    ASSERT_TRUE(engine
+                    .publishRuntimeConfigForTest(
+                        buildTentConfigBundle(*next_cfg, 1).runtime)
+                    .ok());
+    // Reject a null publication without replacing the active policy.
+    EXPECT_TRUE(
+        engine.publishRuntimeConfigForTest(nullptr).IsInvalidArgument());
+
+    auto old_status = pollUntilDone(engine, old_generation.batch_id, 0);
+    EXPECT_EQ(old_status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(old_generation.fake_tcp->submit_calls.load(), 1);
+
+    CorruptedRdmaBatch new_generation;
+    submitCorruptedRdmaBatch(engine, new_generation, 0xB2);
+    TransferStatus new_status{};
+    ASSERT_TRUE(
+        engine.getTransferStatus(new_generation.batch_id, 0, new_status).ok());
+    EXPECT_EQ(new_status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(new_generation.fake_tcp->submit_calls.load(), 0);
+
+    EXPECT_TRUE(engine.freeBatch(old_generation.batch_id).ok());
+    EXPECT_TRUE(engine
+                    .unregisterLocalMemory(old_generation.buf.data(),
+                                           old_generation.buf.size())
+                    .ok());
+    EXPECT_TRUE(engine.freeBatch(new_generation.batch_id).ok());
+    EXPECT_TRUE(engine
+                    .unregisterLocalMemory(new_generation.buf.data(),
+                                           new_generation.buf.size())
+                    .ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(EngineFailoverE2E, PinnedFailoverPolicyTest,
+                         ::testing::Bool());
 
 TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledAppliesToVectorStatus) {
     auto cfg = makeMinimalP2PConfig();
@@ -1526,6 +1693,125 @@ TEST(EngineFailoverE2E, SubmitStageFailoverWithDerivedTasks) {
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(EngineFailoverE2E, PollStageFailoverWithDerivedTasksRunsOnce) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("merge_requests", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{}, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::FAILED, 0};
+        });
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(segment_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kHalf = 2048;
+    std::vector<uint8_t> buffer(kHalf * 2, 0x4b);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch_id = engine.allocateBatch(2);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request first;
+    first.opcode = Request::WRITE;
+    first.source = buffer.data();
+    first.target_id = LOCAL_SEGMENT_ID;
+    first.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    first.length = kHalf;
+    Request second = first;
+    second.source = buffer.data() + kHalf;
+    second.target_offset += kHalf;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {first, second}).ok());
+
+    auto derived_status = pollUntilDone(engine, batch_id, 1);
+    auto owner_status = pollUntilDone(engine, batch_id, 0);
+    EXPECT_EQ(derived_status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(owner_status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submitted_request_count.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E, DerivedCancellationFollowsPollStageFailoverOwner) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("merge_requests", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{}, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::FAILED, 0};
+        });
+    auto fake_tcp = std::make_shared<FakeTransport>(
+        TCP, FakeTransport::StatusFactory{}, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::PENDING, 0};
+        });
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(segment_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kHalf = 2048;
+    std::vector<uint8_t> buffer(kHalf * 4, 0x5c);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch_id = engine.allocateBatch(3);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request first;
+    first.opcode = Request::WRITE;
+    first.source = buffer.data();
+    first.target_id = LOCAL_SEGMENT_ID;
+    first.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    first.length = kHalf;
+    Request second = first;
+    second.source = buffer.data() + kHalf;
+    second.target_offset += kHalf;
+    Request unrelated = first;
+    unrelated.source = buffer.data() + 3 * kHalf;
+    unrelated.target_offset += 3 * kHalf;
+    ASSERT_TRUE(
+        engine.submitTransfer(batch_id, {first, second, unrelated}).ok());
+
+    TransferStatus derived{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 1, derived).ok());
+    EXPECT_EQ(derived.s, TransferStatusEnum::PENDING);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    TransferStatus unrelated_status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 2, unrelated_status).ok());
+    EXPECT_EQ(unrelated_status.s, TransferStatusEnum::PENDING);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 2);
+
+    ASSERT_TRUE(engine.cancelTransfer(batch_id, 1).ok());
+    EXPECT_EQ(fake_rdma->cancel_calls.load(), 0);
+    EXPECT_EQ(fake_tcp->cancel_calls.load(), 1);
+
+    TransferStatus owner{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, owner).ok());
+    EXPECT_EQ(owner.s, TransferStatusEnum::CANCELED);
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 1, derived).ok());
+    EXPECT_EQ(derived.s, TransferStatusEnum::CANCELED);
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 2, unrelated_status).ok());
+    EXPECT_EQ(unrelated_status.s, TransferStatusEnum::PENDING);
+
+    ASSERT_TRUE(engine.cancelTransfer(batch_id, 2).ok());
+    EXPECT_EQ(fake_tcp->cancel_calls.load(), 2);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(EngineFailoverE2E, QueuedPathSubmitStageFailover) {

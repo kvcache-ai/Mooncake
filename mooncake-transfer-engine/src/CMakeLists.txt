@@ -89,6 +89,11 @@ target_link_libraries(
          asio_shared
          yalantinglibs::yalantinglibs
   PRIVATE transport transfer_metadata_plugin)
+if(UNIX AND NOT APPLE)
+  # shm_open/shm_unlink live in librt on glibc; OBJECT-library PRIVATE deps do
+  # not propagate through $<TARGET_OBJECTS:shm_transport>.
+  target_link_libraries(transfer_engine PRIVATE rt)
+endif()
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
@@ -117,7 +122,7 @@ if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
 endif()
 
 if(USE_SUPA)
-  target_link_libraries(transfer_engine PUBLIC supa supart)
+  target_link_libraries(transfer_engine PUBLIC ${SUPA_LIBRARIES})
 endif()
 
 if(USE_MACA)

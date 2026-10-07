@@ -8,7 +8,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 
 namespace mooncake {
 

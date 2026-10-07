@@ -42,8 +42,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
+    const auto num_sms = kNumSMs == 0 ? static_cast<int>(gridDim.x) : kNumSMs;
     const auto global_warp_idx =
-        warp_idx * kNumSMs +
+        warp_idx * num_sms +
         sm_idx;  // NOTES: Here we prioritize distributing tasks to different
                  // SMs to ensure that the last wave is evenly concentrated on
                  // each SM.
@@ -81,7 +82,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
     // Read from buffers and do reduction
     for (int token_idx = global_warp_idx; token_idx < num_combined_tokens;
-         token_idx += kNumWarps * kNumSMs) {
+         token_idx += kNumWarps * num_sms) {
         // Preprocess all indices
         int stored_dst_rank_idx = -1, stored_dst_expert_idx = -1;
         EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");

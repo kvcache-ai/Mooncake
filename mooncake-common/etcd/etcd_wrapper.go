@@ -324,7 +324,6 @@ func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	cancelAllStoreKeepAlives()
 	closeAllStoreMaintenanceSessions()
 	cancelAllStoreWatches()
 	cancelAllStorePrefixWatches()
@@ -593,20 +592,6 @@ func cancelAndDeleteWatch(k string) int {
 	return -1
 }
 
-func cancelAllStoreKeepAlives() {
-	storeKeepAliveMutex.Lock()
-	cancels := make([]context.CancelFunc, 0, len(storeKeepAliveCtx))
-	for leaseId, cancel := range storeKeepAliveCtx {
-		cancels = append(cancels, cancel)
-		delete(storeKeepAliveCtx, leaseId)
-	}
-	storeKeepAliveMutex.Unlock()
-
-	for _, cancel := range cancels {
-		cancel()
-	}
-}
-
 func closeAllStoreMaintenanceSessions() {
 	storeMaintenanceMutex.Lock()
 	sessions := make([]*maintenanceSession, 0, len(storeMaintenanceSessions))
@@ -768,11 +753,19 @@ func hasKeepAliveContext(leaseId int64) bool {
 
 //export EtcdStoreKeepAliveWrapper
 func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
-	cli := getStoreClient()
-	if cli == nil {
+	storeCli := getStoreClient()
+	if storeCli == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
+	// Keep lease traffic separate from Store traffic. A Store client reset or
+	// a busy Store connection must not stop leadership keep-alive.
+	cli, err := clientv3.New(newStoreClientConfig(storeCli.Endpoints()))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	defer cli.Close()
 
 	// Create a context with cancel function
 	ctx, cancel := context.WithCancel(context.Background())
@@ -938,7 +931,7 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 }
 
 //export EtcdStoreTxnCompareAndPutWrapper
-func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareRevisions *int64, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareRevisions *int64, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putPreserveLeases *C.int, putCount C.int, errMsg **C.char) int {
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -979,10 +972,15 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 		putKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(putKeySizes))[:putN:putN]
 		putValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putValues))[:putN:putN]
 		putValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(putValueSizes))[:putN:putN]
+		putPreserveLeaseList := (*[1 << 28]C.int)(unsafe.Pointer(putPreserveLeases))[:putN:putN]
 		for i := 0; i < putN; i++ {
 			k := C.GoStringN(putKeyPtrs[i], putKeySizeList[i])
 			v := C.GoStringN(putValuePtrs[i], putValueSizeList[i])
-			ops = append(ops, clientv3.OpPut(k, v))
+			if putPreserveLeaseList[i] != 0 {
+				ops = append(ops, clientv3.OpPut(k, v, clientv3.WithIgnoreLease()))
+			} else {
+				ops = append(ops, clientv3.OpPut(k, v))
+			}
 		}
 	}
 

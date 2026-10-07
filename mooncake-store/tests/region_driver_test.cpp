@@ -68,6 +68,33 @@ TEST(RegionDriverTest, ReplacementRollbackKeepsCommittedResource) {
     EXPECT_EQ(driver->GetResource(spec.id), committed);
 }
 
+TEST(RegionDriverTest,
+     CommitRetainsReplacedResourceUntilPreparationIsReleased) {
+    auto driver = CreateTestDriver(RegionKind::HOST_MEMORY);
+    ASSERT_NE(driver, nullptr);
+    const auto spec = MakeSpec();
+    auto first = driver->PrepareOpen(spec, {});
+    ASSERT_TRUE(first.has_value());
+    std::weak_ptr<BufferAllocatorBase> old_allocator =
+        first->resource().allocator();
+    first->Commit();
+
+    {
+        auto replacement = driver->PrepareOpen(spec, {});
+        ASSERT_TRUE(replacement.has_value());
+        auto& resource = replacement->resource();
+        replacement->Commit();
+        EXPECT_EQ(driver->GetResource(spec.id), &resource);
+        EXPECT_TRUE(resource.active);
+        EXPECT_FALSE(old_allocator.expired());
+        replacement->Commit();
+        EXPECT_FALSE(old_allocator.expired());
+    }
+    EXPECT_TRUE(old_allocator.expired());
+    ASSERT_NE(driver->GetResource(spec.id), nullptr);
+    EXPECT_TRUE(driver->GetResource(spec.id)->active);
+}
+
 TEST(RegionDriverTest, RestoreInputValidatesEndpointBoundsAndPreservesOrder) {
     const auto spec = MakeSpec(0x200000000ULL);
     std::vector<AllocatedBuffer::Descriptor> descriptors{
@@ -130,7 +157,7 @@ TEST(RegionDriverTest, CxlRejectsLiveRestoreInput) {
     EXPECT_EQ(driver->GetResource(spec.id), nullptr);
 }
 
-TEST(RegionDriverTest, CxlTargetProducesCxlDescriptors) {
+TEST(RegionDriverTest, CxlCandidateProducesCxlDescriptors) {
     auto driver = CreateTestDriver(RegionKind::CXL);
     ASSERT_NE(driver, nullptr);
     RegionResourceSpec spec{generate_uuid(), "binding", 0, kRegionSize,
@@ -138,7 +165,7 @@ TEST(RegionDriverTest, CxlTargetProducesCxlDescriptors) {
     auto prepared = driver->PrepareOpen(spec, {});
     ASSERT_TRUE(prepared.has_value());
 
-    auto buffer = prepared->resource().target->Allocate(4096);
+    auto buffer = prepared->resource().candidate->Allocate(4096);
     ASSERT_NE(buffer, nullptr);
     const auto descriptor = buffer->get_descriptor();
     EXPECT_EQ(descriptor.protocol_, "cxl");

@@ -211,6 +211,37 @@ Targets with no assigned worker are retained with zero-valued metrics. This
 makes an under-provisioned run (`threads < targets`) visible instead of silently
 dropping targets from the result.
 
+### 4.4 Submit/Wait Split Log
+
+`Avg Tx` is submit plus completion wait in one timer. To separate those
+phases, pass `--split_output_jsonl=<path>` on the **initiator**. Default is
+empty: the transfer loop is unchanged, with no extra clocks or I/O.
+
+When set, each completed transfer appends one JSON line:
+
+```json
+{"batch_size":207360,"submit_us":66874,"wait_us":556363,"polls":201}
+```
+
+| Field | Meaning |
+| ----- | ------- |
+| `submit_us` | Time in `submitTransfer` |
+| `wait_us` | Time from submit return until the batch reports COMPLETED |
+| `polls` | Number of status polls in that wait |
+
+The file is opened once as `std::ofstream` and written with stream buffering. Skip the first
+couple of lines when summarizing; they include warmup. This log is for
+control-path analysis. Do not treat `wait_us` or table `BW` as a substitute
+for an application poll interval.
+
+```bash
+./tebench \
+  --target_seg_name=<SEG> \
+  --backend=classic \
+  --op_type=read \
+  --split_output_jsonl=submit-wait.jsonl
+```
+
 ## 5. Runtime Configuration
 
 This section summarizes the key runtime options that control workload behavior,
@@ -368,6 +399,9 @@ gpu_id + thread_id
   is explicitly enabled or disabled by tebench — the engine reads the
   transport enable list from the `MC_TENT_CONF` config file (see Section
   5.8 for multi-transport scenarios).
+  Classic `--backend=classic --xport_type=shm` also uses this flag: DRAM
+  buffers come from POSIX shm and are `mbind`'d onto the same NUMA node as
+  `numa_alloc_onnode` before registering `cpu:<node>`.
 * `--tent_intent_type` : attach a standard transfer intent to every request,
   such as `foreground_get`, `background_prefetch`, or `checkpoint`. This is
   useful for validating intent-specific transport and QoS policy selection.
@@ -387,6 +421,8 @@ gpu_id + thread_id
   configuration
 * `--result_output_jsonl` : append aggregate and per-target metrics for each
   benchmark configuration
+* `--split_output_jsonl` : initiator-only per-transfer submit/wait JSONL
+  described in Section 4.4; empty disables it
 
 QoS mode intentionally requires a fixed thread count. Sweep offered load by
 running explicit cases with different class thread allocations so every output
