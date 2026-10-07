@@ -15,6 +15,7 @@ if(USE_CUDA)
   set(MOONCAKE_EP_JIT_SOURCES
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/combine_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/dispatch_jit.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/elastic_dispatch_prologue_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_runtime.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_cache.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_utils.cpp"
@@ -51,7 +52,12 @@ if(USE_CUDA)
       mooncake_ep_dispatch.cuh
       mooncake_ep_combine.cuh
       mooncake_ep_exception.cuh
-      mooncake_ep_utils.cuh)
+      mooncake_ep_utils.cuh
+      elastic/mooncake_ep_elastic_compiled.cuh
+      elastic/mooncake_ep_elastic_dispatch_deterministic_prologue.cuh
+      elastic/mooncake_ep_elastic_exception.cuh
+      elastic/mooncake_ep_elastic_math.cuh
+      elastic/mooncake_ep_elastic_ptx.cuh)
 
   set(MOONCAKE_EP_JIT_TRANSFER_HEADERS
       include/cuda_alike.h

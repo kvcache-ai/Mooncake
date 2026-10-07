@@ -11,6 +11,9 @@
 #include <elastic/mooncake_ep_elastic_exception.cuh>
 #include <elastic/mooncake_ep_elastic_launch.cuh>
 #include <transport/device/comm_device.cuh>
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#include <jit/elastic_dispatch_prologue_jit.h>
+#endif
 
 namespace mooncake {
 namespace {
@@ -444,9 +447,23 @@ void launch_elastic_dispatch_deterministic_prologue(
     int scaleup_rank_idx, int num_scaleup_ranks, int num_sms,
     int num_smem_bytes, cudaStream_t stream) {
     constexpr int kNumWarps = kElasticNumEpilogueWarps;
-    constexpr int kNumThreads = kNumWarps * 32;
     const int smem_bytes = (1 + 2 * kNumWarps) * num_scaleup_ranks * sizeof(int);
     (void)num_smem_bytes;
+
+    const elastic::DispatchDeterministicPrologueKernelArgs args {
+        const_cast<int64_t*>(topk_idx),
+        rank_count_buffer,
+        dst_buffer_slot_idx,
+        num_tokens,
+        scaleup_rank_idx,
+    };
+
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+    jit::launch_elastic_dispatch_prologue_jit(
+        kNumWarps, num_sms, num_scaleup_ranks, num_max_tokens_per_rank,
+        num_experts, num_topk, smem_bytes, args, stream);
+#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+    constexpr int kNumThreads = kNumWarps * 32;
 #ifdef MOONCAKE_EP_USE_MUSA
     constexpr int device_id = 0;
 #else
@@ -456,12 +473,10 @@ void launch_elastic_dispatch_deterministic_prologue(
 
 #define LAUNCH_PROLOGUE(HIDDEN, EXPERTS, TOPK, MAXTOK, SMS, RANKS)             \
     do {                                                                       \
-        auto kernel = elastic::dispatch_deterministic_prologue_impl<           \
+        auto kernel = elastic::dispatch_deterministic_prologue<                \
             SMS, kNumWarps, RANKS, MAXTOK, EXPERTS, TOPK>;                    \
         launch_cooperative(kernel, device_id, SMS, kNumThreads, smem_bytes, stream,       \
-                           const_cast<int64_t*>(topk_idx), rank_count_buffer,  \
-                           dst_buffer_slot_idx, num_tokens,                    \
-                           scaleup_rank_idx);                                  \
+                           args);                                              \
     } while (false)
 
 #define TRY_PROLOGUE(H, E, K, M, S, R)                                         \
@@ -491,6 +506,7 @@ void launch_elastic_dispatch_deterministic_prologue(
     unsupported_elastic_config("deterministic_prologue", 0, num_experts,
                                num_topk, num_max_tokens_per_rank, num_sms,
                                num_scaleup_ranks);
+#endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 }
 
 template <typename Ops>
