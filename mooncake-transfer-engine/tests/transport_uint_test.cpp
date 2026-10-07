@@ -454,7 +454,9 @@ class BatchResultTransport : public Transport {
         return 0;
     }
 
-    int unregisterLocalMemory(void*, bool) override { return 0; }
+    int unregisterLocalMemory(void*, bool) override {
+        return unregister_result_;
+    }
 
     int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
                                  const std::string&) override {
@@ -1311,6 +1313,56 @@ TEST_F(TransportTest, FailedRegistrationReleasesReservedRegion) {
     EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
               0);
     EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+}
+
+TEST_F(TransportTest, UnregisterSkippedTransportReleasesReservation) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto skipped =
+        std::make_shared<BatchResultTransport>(ERR_ADDRESS_NOT_REGISTERED);
+    TransferEngineImplTestPeer::replaceTransports(engine, skipped);
+    std::array<char, 128> buffer{};
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
+              0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
+              0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()),
+              ERR_ADDRESS_NOT_REGISTERED);
+}
+
+TEST_F(TransportTest, UnregisterSkippedTransportBatchReleasesReservation) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto skipped =
+        std::make_shared<BatchResultTransport>(ERR_ADDRESS_NOT_REGISTERED);
+    TransferEngineImplTestPeer::replaceTransports(engine, skipped);
+    std::array<char, 128> buffer{};
+    const std::vector<BufferEntry> entries = {{buffer.data(), buffer.size()}};
+    ASSERT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}), 0);
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}), 0);
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}),
+              ERR_ADDRESS_NOT_REGISTERED);
+}
+
+TEST_F(TransportTest, UnregisterTransportErrorRetainsReservation) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto failing = std::make_shared<BatchResultTransport>(ERR_MEMORY);
+    auto skipped =
+        std::make_shared<BatchResultTransport>(ERR_ADDRESS_NOT_REGISTERED);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"a-skipped", skipped}, {"b-failing", failing}});
+    std::array<char, 128> buffer{};
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
+              0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), ERR_MEMORY);
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}), ERR_MEMORY);
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
+              ERR_ADDRESS_OVERLAPPED);
 }
 
 TEST_F(TransportTest, UnregisterLocalMemoryBatchPropagatesTransportError) {
