@@ -53,6 +53,7 @@ def _collective_payload(
         return {"value": int(tensor.cpu().item())}
 
     if case_name == "noncontiguous_collectives":
+
         def make_matrix(values: torch.Tensor, transposed: bool) -> torch.Tensor:
             storage = torch.empty((2, 2), dtype=torch.int32, device=device)
             tensor = storage.t() if transposed else storage
@@ -173,9 +174,7 @@ def _collective_payload(
         allgather_base_output = allgather_base_output_storage[:, 0]
         dist.all_gather_into_tensor(allgather_base_output, allgather_base_input)
         expected_allgather_base = [
-            value
-            for peer in range(world_size)
-            for value in (peer * 10, peer * 10 + 1)
+            value for peer in range(world_size) for value in (peer * 10, peer * 10 + 1)
         ]
         if allgather_base_output.cpu().tolist() != expected_allgather_base:
             errors.append("all_gather_into_tensor returned incorrect values")
@@ -185,8 +184,7 @@ def _collective_payload(
         )
         reduce_scatter_base_input = reduce_scatter_base_input_storage[:, 0]
         reduce_scatter_base_input.copy_(
-            torch.arange(world_size * 2, dtype=torch.int32, device=device) * 10
-            + rank
+            torch.arange(world_size * 2, dtype=torch.int32, device=device) * 10 + rank
         )
         reduce_scatter_base_output_storage = torch.empty(
             (2, 2), dtype=torch.int32, device=device
