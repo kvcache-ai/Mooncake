@@ -5283,4 +5283,62 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     EXPECT_FALSE(exists.value());
 }
 
+// A failed disk syscall reaches the disk-error observer with its errno and
+// name; a logical failure (no errno) does not.
+TEST_F(StorageBackendTest, BucketBackendReportsFailedSyscallErrno) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    std::vector<std::pair<int, std::string>> reported;
+    storage_backend.SetDiskErrorObserver([&reported](int err, const char* op) {
+        reported.emplace_back(err, op);
+    });
+
+    std::unordered_map<std::string, std::string> data;
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> buckets;
+    ASSERT_TRUE(BatchOffloadUtil(storage_backend, keys, sizes, data, buckets));
+    ASSERT_GE(buckets.size(), 2u);
+    const size_t keys_per_bucket = keys.size() / buckets.size();
+    auto bucket_file = [&](size_t i) {
+        return (fs::path(data_path) / (std::to_string(buckets[i]) + ".bucket"))
+            .string();
+    };
+    auto load_first_key_of = [&](size_t i) {
+        const auto& key = keys[i * keys_per_bucket];
+        std::string out(data.at(key).size(), '\0');
+        std::unordered_map<std::string, Slice> batch{
+            {key, Slice{out.data(), out.size()}}};
+        return storage_backend.BatchLoad(batch);
+    };
+    EXPECT_TRUE(reported.empty());
+
+    // open() of a vanished bucket file fails with ENOENT.
+    ASSERT_TRUE(fs::remove(bucket_file(0)));
+    ASSERT_FALSE(load_first_key_of(0));
+    ASSERT_EQ(reported.size(), 1u);
+    EXPECT_EQ(reported[0], std::make_pair(ENOENT, std::string("open")));
+
+    // A directory in its place opens fine; preadv() fails with EISDIR.
+    ASSERT_TRUE(fs::remove(bucket_file(1)));
+    ASSERT_TRUE(fs::create_directory(bucket_file(1)));
+    ASSERT_FALSE(load_first_key_of(1));
+    ASSERT_EQ(reported.size(), 2u);
+    EXPECT_EQ(reported[1], std::make_pair(EISDIR, std::string("preadv")));
+
+    // The injected datasync failure has no errno: logical, not reported.
+    storage_backend.SetDatasyncFailureForTest(true);
+    std::string value = "logical_failure_payload";
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {"logical_failure_key",
+         std::vector<Slice>{Slice{value.data(), value.size()}}}};
+    ASSERT_FALSE(storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    EXPECT_EQ(reported.size(), 2u);
+}
+
 }  // namespace mooncake::test

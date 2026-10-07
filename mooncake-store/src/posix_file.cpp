@@ -16,6 +16,7 @@ PosixFile::PosixFile(const std::string &filename, int fd)
 
 tl::expected<void, ErrorCode> PosixFile::datasync() {
     if (fdatasync(fd_) != 0) {
+        record_sys_errno(errno);
         LOG(ERROR) << "fdatasync failed: " << strerror(errno);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -64,6 +65,7 @@ tl::expected<size_t, ErrorCode> PosixFile::write(std::span<const char> data,
         ssize_t written = ::write(fd_, ptr, remaining);
         if (written == -1) {
             if (errno == EINTR) continue;
+            record_sys_errno(errno);
             return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
         remaining -= written;
@@ -95,6 +97,7 @@ tl::expected<size_t, ErrorCode> PosixFile::read(std::string &buffer,
         ssize_t n = ::read(fd_, ptr, length - read_bytes);
         if (n == -1) {
             if (errno == EINTR) continue;
+            record_sys_errno(errno);
             buffer.clear();
             return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
@@ -122,6 +125,7 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_write(const iovec *iov,
 
     ssize_t ret = ::pwritev(fd_, iov, iovcnt, offset);
     if (ret < 0) {
+        record_sys_errno(errno);
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
     if (static_cast<size_t>(ret) != expected_bytes) {
@@ -140,6 +144,7 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_read(const iovec *iov,
 
     ssize_t ret = ::preadv(fd_, iov, iovcnt, offset);
     if (ret < 0) {
+        record_sys_errno(errno);
         return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
     }
 

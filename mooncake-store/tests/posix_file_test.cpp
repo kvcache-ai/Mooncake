@@ -215,6 +215,50 @@ TEST_F(PosixFileTest, ShortVectorizedWriteRemovesPartialFile) {
 #endif
 }
 
+// A failed syscall keeps its errno (the first one wins), so the disk fence
+// can classify it; the ErrorCode alone cannot.
+TEST_F(PosixFileTest, FailedSyscallKeepsFirstErrno) {
+    int full_fd = open("/dev/full", O_RDWR);
+    if (full_fd < 0) GTEST_SKIP() << "/dev/full is unavailable";
+    {
+        PosixFile full("/dev/full", full_fd);
+        // A failed write would otherwise unlink the path on destruction.
+        full.SetDeleteOnWriteFail(false);
+        EXPECT_EQ(full.sys_errno(), 0);
+        std::string data(4096, 'x');
+        auto written = full.write(data, data.size());
+        ASSERT_FALSE(written);
+        EXPECT_EQ(written.error(), ErrorCode::FILE_WRITE_FAIL);
+        EXPECT_EQ(full.sys_errno(), ENOSPC);
+
+        iovec iov{data.data(), data.size()};
+        ASSERT_FALSE(full.vector_write(&iov, 1, 0));
+        EXPECT_EQ(full.sys_errno(), ENOSPC);
+    }
+
+    // preadv on a write-only descriptor fails with EBADF.
+    int wronly_fd = open(test_filename.c_str(), O_WRONLY);
+    ASSERT_GE(wronly_fd, 0);
+    PosixFile wronly(test_filename, wronly_fd);
+    char buf[16];
+    iovec iov{buf, sizeof(buf)};
+    auto read = wronly.vector_read(&iov, 1, 0);
+    ASSERT_FALSE(read);
+    EXPECT_EQ(read.error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(wronly.sys_errno(), EBADF);
+}
+
+// A short read is a logical failure: no syscall failed, so errno stays 0.
+TEST_F(PosixFileTest, ShortReadHasNoErrno) {
+    PosixFile posix_file(test_filename, test_fd);
+    test_fd = -1;  // owned by posix_file now
+    std::string buffer;
+    auto read = posix_file.read(buffer, 64);  // the file is empty
+    ASSERT_FALSE(read);
+    EXPECT_EQ(read.error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(posix_file.sys_errno(), 0);
+}
+
 // Test vectorized read operation
 TEST_F(PosixFileTest, VectorizedRead) {
     // Clear file content

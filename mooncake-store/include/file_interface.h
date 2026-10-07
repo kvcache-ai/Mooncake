@@ -137,6 +137,9 @@ class StorageFile {
         return tl::make_unexpected(code);
     }
 
+    // errno of the first failed syscall; 0 for logical failures (short I/O).
+    int sys_errno() const { return sys_errno_; }
+
     /**
      * @brief file locking mechanism
      */
@@ -155,10 +158,15 @@ class StorageFile {
     ErrorCode get_error_code() { return error_code_; }
 
    protected:
+    void record_sys_errno(int err) {
+        if (sys_errno_ == 0) sys_errno_ = err;
+    }
+
     bool delete_on_write_fail_ = true;
     std::string filename_;
     int fd_;
     ErrorCode error_code_{ErrorCode::OK};
+    int sys_errno_ = 0;
     std::atomic<bool> is_locked_{false};
 };
 

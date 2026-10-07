@@ -1885,6 +1885,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
             auto read_result = file->vector_read(&iov, 1, actual_offset);
             if (!read_result) {
+                NotifyDiskError(file->sys_errno(), "preadv");
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
                            << ", error: " << read_result.error();
@@ -2509,6 +2510,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         // Fallback to vector_write for non-UringFile
         auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
         if (!write_result) {
+            NotifyDiskError(file->sys_errno(), "pwritev");
             LOG(ERROR) << "vector_write failed for: " << bucket_id
                        << ", error: " << write_result.error();
             return tl::make_unexpected(write_result.error());
@@ -2535,6 +2537,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         sync_result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     if (!sync_result) {
+        NotifyDiskError(file->sys_errno(), "fdatasync");
         LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
         CleanupOrphanedBucket(bucket_id);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -3358,6 +3361,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     struct_pb::to_pb(*metadata, str);
     auto write_result = file->write(str, str.size());
     if (!write_result) {
+        NotifyDiskError(file->sys_errno(), "write");
         LOG(ERROR) << "Write failed for: " << meta_path
                    << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
@@ -3390,6 +3394,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
     int64_t size = std::filesystem::file_size(meta_path);
     auto read_result = file->read(str, size);
     if (!read_result) {
+        NotifyDiskError(file->sys_errno(), "read");
         LOG(ERROR) << "read failed for: " << meta_path
                    << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
@@ -3460,8 +3465,10 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
 
     int fd = open(path.c_str(), flags | access_mode, 0644);
     if (fd < 0) {
-        LOG(ERROR) << "Failed to open file: " << path << ", errno=" << errno
-                   << " (" << strerror(errno) << ")";
+        const int err = errno;
+        LOG(ERROR) << "Failed to open file: " << path << ", errno=" << err
+                   << " (" << strerror(err) << ")";
+        NotifyDiskError(err, "open");
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 #ifdef USE_URING

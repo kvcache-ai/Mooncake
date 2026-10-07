@@ -529,6 +529,8 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          ssd_disk_fenced("mooncake_ssd_disk_fenced",
+                          "1 after a disk failure fenced the SSD tier", labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -543,6 +545,7 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    ylt::metric::gauge_t ssd_disk_fenced;
     std::chrono::steady_clock::time_point start_time_;
 
     void serialize(std::string& str) {
@@ -558,6 +561,7 @@ struct SsdMetric {
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        ssd_disk_fenced.serialize(str);
     }
 
     std::string summary_metrics() {
