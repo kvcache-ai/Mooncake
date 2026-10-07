@@ -473,9 +473,15 @@ static inline ssize_t writeFullySocket(int fd, const void *buf, size_t len) {
     size_t nbytes = len;
     while (nbytes) {
         ssize_t rc = send(fd, pos, nbytes, kSendFlags);
-        if (rc < 0 && (errno == EAGAIN || errno == EINTR))
+        if (rc < 0 && errno == EINTR)
             continue;
-        else if (rc < 0) {
+        else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // A blocking socket only reports EAGAIN once SO_SNDTIMEO fires;
+            // retrying here would spin forever, so fail the write instead.
+            LOG(WARNING) << "Socket write timed out: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        } else if (rc < 0) {
             PLOG(ERROR) << "Socket write failed";
             return rc;
         } else if (rc == 0) {
