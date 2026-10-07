@@ -11992,9 +11992,12 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     uint64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    auto is_evictable_nof_replica = [](const Replica& replica) {
+    // Same readability gate as IsEvictableMemoryReplica: a NoF replica on a
+    // quarantined endpoint is kept until a mount can import it, so eviction
+    // must not reclaim its descriptor either.
+    auto is_evictable_nof_replica = [this](const Replica& replica) {
         return replica.is_nof_replica() && replica.is_completed() &&
-               replica.get_refcnt() == 0;
+               IsReplicaReadable(replica) && replica.get_refcnt() == 0;
     };
 
     size_t start_idx = randomIndex(metadata_shards_.size());

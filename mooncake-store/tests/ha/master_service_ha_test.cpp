@@ -1231,6 +1231,41 @@ TEST_F(MasterServiceHATest, RestoreQuarantinesNoFReplicas) {
     EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
 }
 
+TEST_F(MasterServiceHATest, NoFBatchEvictSkipsQuarantinedReplicas) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(false)
+                              .build());
+
+    const std::string key = "standby_nof_evict_quarantine_key";
+    const std::string endpoint = "standby_nof_evict_quarantine_endpoint";
+    constexpr uintptr_t offset = 4096;
+    constexpr size_t size = 1024;
+
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot(
+                {MakeStandbyNoFObject(key, endpoint, offset, size)}, 7, {})
+            .has_value());
+
+    // Once the lease runs out the restored replica is NoF, COMPLETE and
+    // unreferenced, so without the quarantine check eviction would take it
+    // and the descriptor a later import needs would be gone.
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    service.RunNoFBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                       /*evict_ratio_lowerbound=*/1.0);
+
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_nof_replica());
+    const auto& buffer =
+        replicas.front().get_nof_descriptor().buffer_descriptor;
+    EXPECT_EQ(buffer.transport_endpoint_, endpoint);
+    EXPECT_EQ(buffer.buffer_address_, offset);
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+}
+
 #ifdef USE_NOF
 TEST_F(MasterServiceHATest, QuarantinedNoFEndpointCannotBeMounted) {
     MasterService service(
