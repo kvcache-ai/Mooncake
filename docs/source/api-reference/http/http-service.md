@@ -608,7 +608,11 @@ workers or serving start. Older binaries cannot read the new format.
 During cold restore and full-payload `1.1.0` promotion, an orphaned `DRAINING`
 segment (for example, from a legacy cold-restore snapshot) stays
 non-allocatable, with existing readable replicas retained. Recovery logs the
-segment and increments `master_orphaned_draining_restore_total`. No target list
+segment and increments `master_orphaned_draining_restore_total`. While a segment
+stays `DRAINING` without a live owning job, the job dispatcher repeats a warning
+every minute with its `stranded_capacity_bytes`, including when its client keeps
+pinging. Warnings stop after the segment is reopened, unmounted, or acquired by
+a live drain job. No target list
 is guessed and the segment is not automatically reopened. Interrupted moves
 without recoverable runtime state may require operator cleanup; their allocated
 target buffers are retained rather than reused while a transfer may still be
@@ -625,6 +629,27 @@ Reopening is rejected while a live drain job owns the source or an unfinished
 move task still references it. Completed drain jobs remain queryable after
 recovery and are not restarted. Legacy standby bootstrap retains its previous
 object-view behavior; it does not provide full orphan recovery.
+
+#### Compatibility notes for snapshot format 1.1.0
+
+`MoveStart` now returns `UNAVAILABLE_IN_CURRENT_STATUS` if an existing target
+replica is incomplete and no replication runtime owns it. Earlier versions
+could reuse that target without copying, allowing `MoveEnd` to remove the only
+complete source. The rejection keeps the source readable and quarantines the
+half-written target.
+
+The in-tree `Client::Move` propagates a failed `MoveStart` without automatically
+calling `MoveRevoke`. Revocation is available only after a matching move runtime
+has started; an orphan with no runtime returns `OBJECT_NO_REPLICATION_TASK`, so
+blindly revoking or retrying does not repair it. Async task execution reports
+this start error as `FAILED`; the drain scheduler applies its existing bounded
+unit retry budget. Operators must stop any stale transfer and resolve the
+incomplete replica before retrying or reopening capacity. Client transfer
+failures after a successful start still use the existing `MoveRevoke` path.
+
+Format 1.1.0 stores the current full-allocation quota charge: object size times
+the number of newly allocated targets. Changing the billing formula requires
+translation of this representation or a new snapshot format version.
 
 #### `POST /api/v1/drain_jobs`
 Create a drain job for the given segments.

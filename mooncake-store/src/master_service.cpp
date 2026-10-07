@@ -1638,7 +1638,8 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
                         TenantQuotaAccount::kMaxChargedBytes ||
                     charged_bytes > TenantQuotaAccount::kMaxChargedBytes -
                                         task.pending_quota_charge_bytes) {
-                    throw std::overflow_error(
+                    throw MasterSnapshotRestoreError(
+                        ErrorCode::DESERIALIZE_FAIL,
                         "rebuilt pending tenant quota exceeds 2^63 - 1 bytes");
                 }
                 charged_bytes += task.pending_quota_charge_bytes;
@@ -1649,7 +1650,8 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
                 if (charge > TenantQuotaAccount::kMaxChargedBytes ||
                     charged_bytes >
                         TenantQuotaAccount::kMaxChargedBytes - charge) {
-                    throw std::overflow_error(
+                    throw MasterSnapshotRestoreError(
+                        ErrorCode::DESERIALIZE_FAIL,
                         "rebuilt tenant quota exceeds 2^63 - 1 bytes");
                 }
                 charged_bytes += charge;
@@ -1667,9 +1669,10 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
                     tenant_state.quota_account,
                     CompletedMemoryQuotaCharge(metadata));
                 if (!rebuild_result) {
-                    throw std::runtime_error(
+                    throw MasterSnapshotRestoreError(
+                        ErrorCode::DESERIALIZE_FAIL,
                         "failed to rebuild object tenant quota ledger for " +
-                        tenant_id.value() + "/" + key);
+                            tenant_id.value() + "/" + key);
                 }
             }
         }
@@ -1687,7 +1690,9 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
     const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
     auto rebuild_result = tenant_quota_table_.RebuildUsage(usage, capacity);
     if (!rebuild_result) {
-        throw std::runtime_error("failed to rebuild tenant quota usage");
+        throw MasterSnapshotRestoreError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "failed to rebuild tenant quota usage");
     }
 }
 
@@ -14624,9 +14629,44 @@ void MasterService::ProcessDrainJobs() {
     }
 }
 
+void MasterService::WarnOrphanedDrainingSegments() {
+    std::lock_guard drain_lock(drain_snapshot_mutex_);
+    std::unordered_set<std::string> owned;
+    {
+        std::lock_guard lock(job_mutex_);
+        for (const auto& [id, job] : drain_jobs_) {
+            std::lock_guard job_lock(job->mutex);
+            if (job->status < JobStatus::SUCCEEDED)
+                owned.insert(job->request.segments.begin(),
+                             job->request.segments.end());
+        }
+    }
+    auto access = segment_manager_.getSegmentAccess();
+    std::vector<std::pair<Segment, UUID>> segments;
+    access.GetAllSegments(segments);
+    for (const auto& [segment, client] : segments) {
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        access.GetSegmentStatusById(segment.id, status);
+        if (status == SegmentStatus::DRAINING &&
+            !owned.contains(segment.name)) {
+            LOG(WARNING) << "[Drain] orphaned DRAINING segment=" << segment.name
+                         << " stranded_capacity_bytes=" << segment.size
+                         << "; finish outstanding transfers and use PUT "
+                            "/api/v1/segments/status to resume allocation.";
+        }
+    }
+}
+
 void MasterService::JobDispatchThreadFunc() {
+    auto next_orphan_warning =
+        std::chrono::steady_clock::now() + std::chrono::minutes(1);
     while (job_dispatch_running_) {
         ProcessDrainJobs();
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_orphan_warning) {
+            WarnOrphanedDrainingSegments();
+            next_orphan_warning = now + std::chrono::minutes(1);
+        }
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kJobDispatchThreadSleepMs));
     }

@@ -210,9 +210,16 @@ class MasterSnapshotCodecTest : public ::testing::Test {
             MasterServiceTestPeer::StopDrainDispatcher(*orphan);
             // Legacy orphan buffers remain quarantined and cannot be mistaken
             // for an already-completed move destination.
-            EXPECT_FALSE(orphan->MoveStart(owner, "copy_key",
-                                           TenantId::Default(), source.name,
-                                           target.name));
+            auto blocked =
+                orphan->MoveStart(owner, "copy_key", TenantId::Default(),
+                                  source.name, target.name);
+            ASSERT_FALSE(blocked);
+            EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+                      blocked.error());
+            auto revoked =
+                orphan->MoveRevoke(owner, "copy_key", TenantId::Default());
+            ASSERT_FALSE(revoked);
+            EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK, revoked.error());
             EXPECT_TRUE(
                 orphan->GetReplicaList("copy_key", TenantId::Default()));
         }

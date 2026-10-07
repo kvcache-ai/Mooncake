@@ -38,6 +38,10 @@ class MasterServiceTestPeer {
         service.ResetStateAfterFailedRestoreAttempt();
     }
 
+    static void WarnOrphanedDrainingSegments(MasterService& service) {
+        service.WarnOrphanedDrainingSegments();
+    }
+
     static void ProcessDrainJobs(MasterService& service) {
         service.ProcessDrainJobs();
     }

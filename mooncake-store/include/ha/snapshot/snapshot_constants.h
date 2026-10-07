@@ -14,6 +14,9 @@ inline constexpr const char* kSnapshotLatestFile = "latest.txt";
 
 // Snapshot format
 inline constexpr const char* kSnapshotSerializerType = "messagepack";
+// Format 1.1.0 replication pending_bytes is the full allocation charge:
+// object size * number of newly allocated targets. A different billing formula
+// must translate this representation or use a new snapshot format version.
 inline constexpr const char* kSnapshotSerializerVersion = "1.1.0";
 inline constexpr const char* kLegacySnapshotSerializerVersion = "1.0.0";
 

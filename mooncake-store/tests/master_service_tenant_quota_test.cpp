@@ -1058,6 +1058,39 @@ TEST_F(MasterServiceTenantQuotaTest,
     }
 }
 
+TEST_F(MasterServiceTenantQuotaTest,
+       QuotaRebuildOverflowUsesSnapshotRestoreError) {
+    const TenantId tenant("tenant-a");
+    MasterService service(MakeConfig({{tenant, 300}}));
+    const auto client = MountSegment(service, 1024, "segment-a");
+    PutComplete(service, client, "key", tenant, 100);
+    MountSegment(service, 1024, "segment-b");
+    ASSERT_TRUE(
+        service.CopyStart(client, "key", tenant, "segment-a", {"segment-b"}));
+    {
+        MasterServiceTestPeer::MetadataAccessorRW metadata(&service,
+                                                           {tenant, "key"});
+        metadata.GetReplicationTask().pending_quota_charge_bytes =
+            TenantQuotaAccount::kMaxChargedBytes + 1;
+    }
+    bool caught = false;
+    try {
+        MasterServiceTestPeer(service).RebuildTenantQuotaUsageFromMetadata();
+    } catch (const MasterSnapshotRestoreError& error) {
+        caught = true;
+        EXPECT_EQ(ErrorCode::DESERIALIZE_FAIL, error.code);
+    } catch (const std::exception& error) {
+        ADD_FAILURE() << "Unexpected exception type: " << error.what();
+    }
+    EXPECT_TRUE(caught);
+    {
+        MasterServiceTestPeer::MetadataAccessorRW metadata(&service,
+                                                           {tenant, "key"});
+        metadata.GetReplicationTask().pending_quota_charge_bytes = 100;
+    }
+    ASSERT_TRUE(service.CopyRevoke(client, "key", tenant));
+}
+
 TEST_F(MasterServiceTenantQuotaTest, MoveEndSettlesToFinalReplicaCharge) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 300}}));
     UUID client_id = MountSegment(service, /*size=*/1024, "segment-a");

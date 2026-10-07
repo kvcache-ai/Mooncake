@@ -2111,6 +2111,65 @@ TEST_F(SnapshotChildProcessTest,
     EXPECT_EQ(SegmentStatus::OK, *service_->QuerySegmentStatus(segment.name));
 }
 
+TEST_F(SnapshotChildProcessTest,
+       CurrentOrphanRoundTripReportsMetricAndContinuesWarning) {
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_object_store_type("local")
+                      .set_default_kv_lease_ttl(0)
+                      .build();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "current_orphan";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    const auto client = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client));
+    ASSERT_TRUE(
+        service_->SetSegmentStatus(segment.name, SegmentStatus::DRAINING));
+    const auto counter = [] {
+        const auto metrics =
+            MasterMetricManager::instance().serialize_metrics();
+        std::smatch match;
+        return std::regex_search(metrics, match, std::regex(R"((?:^|
+)master_orphaned_draining_restore_total ([0-9]+))"))
+                   ? std::stoull(match[1].str())
+                   : 0ULL;
+    };
+    const auto before = counter();
+    ASSERT_TRUE(CallPersistState("20261007_120000_000"));
+    service_.reset();
+    CreateService(config);
+    MasterServiceTestPeer::StopDrainDispatcher(*service_);
+    EXPECT_EQ(before + 1, counter());
+    EXPECT_EQ(SegmentStatus::DRAINING,
+              *service_->QuerySegmentStatus(segment.name));
+    ASSERT_TRUE(service_->Ping(client));
+    EXPECT_FALSE(MasterServiceTestPeer::SegmentManager(*service_)
+                     .getSegmentAccess()
+                     .IsSegmentAllocatable(segment.name));
+
+    testing::internal::CaptureStderr();
+    MasterServiceTestPeer::WarnOrphanedDrainingSegments(*service_);
+    const auto warning = testing::internal::GetCapturedStderr();
+    EXPECT_NE(std::string::npos,
+              warning.find("orphaned DRAINING segment=current_orphan"));
+    EXPECT_NE(std::string::npos,
+              warning.find("stranded_capacity_bytes=16777216"));
+    EXPECT_EQ(before + 1,
+              counter());  // repeated visibility is not another restore
+    ASSERT_TRUE(service_->SetSegmentStatus(segment.name, SegmentStatus::OK));
+    testing::internal::CaptureStderr();
+    MasterServiceTestPeer::WarnOrphanedDrainingSegments(*service_);
+    const auto cleared = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(std::string::npos,
+              cleared.find("orphaned DRAINING segment=current_orphan"));
+}
+
 TEST_F(SnapshotChildProcessTest, DrainPayloadUploadFailureDoesNotPublish) {
     CreateDefaultService();
     const std::string snapshot = "20261002_120000_000";
