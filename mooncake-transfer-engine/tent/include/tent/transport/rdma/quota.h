@@ -188,7 +188,15 @@ class DeviceSelector {
 
     // Allocate devices for a request (new API)
     // slice_bytes: pre-calculated slice size from rdma_transport to ensure
-    // consistency
+    // consistency.
+    //
+    // The slices partition the request: the first num_slices - 1 carry
+    // slice_bytes each and the last carries what is left, which is a block
+    // plus a folded-in tail when planRdmaSlices() folded one -- so it can be
+    // longer than slice_bytes. Each device is charged what its slices
+    // actually carry, so release(), which returns a slice's real length,
+    // balances. Charging every slice slice_bytes would leave the folded tail
+    // released but never charged, and inflight_bytes is unsigned.
     Status allocate(uint64_t total_length, uint32_t num_slices,
                     uint64_t slice_bytes, const std::string &location,
                     std::vector<int> &slice_dev_ids, int priority = PRIO_HIGH,

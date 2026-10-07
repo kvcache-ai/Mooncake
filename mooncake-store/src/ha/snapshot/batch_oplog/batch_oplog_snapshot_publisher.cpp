@@ -31,16 +31,19 @@ BatchOpLogSnapshotPublisher::BatchOpLogSnapshotPublisher(HaKvBackend& backend,
     : backend_(backend), cluster_id_(std::move(cluster_id)) {}
 
 ErrorCode BatchOpLogSnapshotPublisher::Publish(
-    const SnapshotMaintenanceLease& lease, std::string_view descriptor_json) {
+    const SnapshotMaintenanceLease& lease, std::string_view descriptor_json,
+    std::optional<std::string>* expected_fallback) {
     if (!lease.IsHeld()) {
         return ErrorCode::ETCD_TRANSACTION_FAIL;
     }
-    return PublishImpl(lease.owner_token(), descriptor_json, lease);
+    return PublishImpl(lease.owner_token(), descriptor_json, lease,
+                       expected_fallback);
 }
 
 ErrorCode BatchOpLogSnapshotPublisher::PublishImpl(
     std::string_view owner_token, std::string_view descriptor_json,
-    const SnapshotMaintenanceLease& lease) {
+    const SnapshotMaintenanceLease& lease,
+    std::optional<std::string>* expected_fallback) {
     if (owner_token.empty() || !lease.IsHeld() || !backend_.SupportsTxn() ||
         cluster_id_.empty()) {
         return ErrorCode::INVALID_PARAMS;
@@ -136,7 +139,15 @@ ErrorCode BatchOpLogSnapshotPublisher::PublishImpl(
     }
     txn.puts.push_back(
         {.key = latest_key, .value = std::string(descriptor_json)});
-    return backend_.Txn(txn);
+    err = backend_.Txn(txn);
+    if (err == ErrorCode::OK && expected_fallback) {
+        *expected_fallback =
+            latest_valid
+                ? std::optional<std::string>(latest)
+                : (fallback_exists ? std::optional<std::string>(fallback)
+                                   : std::nullopt);
+    }
+    return err;
 }
 
 }  // namespace mooncake

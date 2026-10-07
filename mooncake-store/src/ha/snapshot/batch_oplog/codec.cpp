@@ -27,6 +27,16 @@ std::vector<uint8_t> Encode(const T& value) {
 
 }  // namespace
 
+std::vector<uint8_t> EncodeBatchOpLogSnapshotWeightMetadata(
+    const WeightMetadataSnapshot& snapshot) {
+    return Encode(snapshot);
+}
+
+tl::expected<WeightMetadataSnapshot, std::string>
+DecodeBatchOpLogSnapshotWeightMetadata(const std::vector<uint8_t>& encoded) {
+    return Decode<WeightMetadataSnapshot>(encoded, "snapshot weight metadata");
+}
+
 std::vector<uint8_t> EncodeBatchOpLogSnapshotSegments(
     const std::vector<StandbySegmentInfo>& segments) {
     return Encode(segments);

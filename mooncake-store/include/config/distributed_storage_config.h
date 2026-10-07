@@ -9,9 +9,12 @@ namespace mooncake {
 struct DistributedStorageConfig {
     std::string fsdir = "/mnt/3fs/mooncake";
     std::string fs_adapter_type = "hf3fs";
+    std::string allocator_type = "shard";
     bool enable_health_check = false;
     int shard_count = 64;
     uint64_t shard_capacity = 4ULL * 1024 * 1024 * 1024;
+    uint64_t bucket_capacity = 1ULL * 1024 * 1024 * 1024;
+    int64_t max_bucket_count = 64;
     uint64_t alignment = 4096;
     bool single_tenant = true;
     bool eviction_enabled = true;

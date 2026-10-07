@@ -191,6 +191,64 @@ void SpdkWrapper::Free(void *ptr) {
     }
 }
 
+int SpdkWrapper::RegisterMemory(void *addr, size_t size) {
+    if (!addr || size == 0) {
+        return -1;
+    }
+    if (!InitializeEnv()) {
+        LOG(ERROR) << "SPDK env init failed, cannot register memory";
+        return -1;
+    }
+    int rc = spdk_mem_register(addr, size);
+    if (rc != 0) {
+        LOG(ERROR) << "spdk_mem_register failed (addr=" << addr
+                   << ", size=" << size << "): " << strerror(-rc);
+    }
+    return rc;
+}
+
+bool SpdkWrapper::IsRegistrableRange(void *addr, size_t size) {
+    // spdk_mem_register() rejects a range up front (memory.c:339-348) when the
+    // address is outside the 256TB window it can represent (MASK_256TB) or when
+    // addr/size is not 2MB-aligned. Those rejections happen before anything is
+    // marked, so a caller that skips the registration for such a range can
+    // still munmap it; every other failure may have left state behind.
+    constexpr uintptr_t kSpdkAddressMask = (1ULL << 48) - 1;  // MASK_256TB
+    constexpr uintptr_t kSpdk2MbAlignment = 2ULL * 1024 * 1024;
+    const uintptr_t vaddr = reinterpret_cast<uintptr_t>(addr);
+    return addr != nullptr && size != 0 && (vaddr & ~kSpdkAddressMask) == 0 &&
+           (vaddr % kSpdk2MbAlignment) == 0 && (size % kSpdk2MbAlignment) == 0;
+}
+
+int SpdkWrapper::UnregisterMemory(void *addr, size_t size) {
+    if (!addr || size == 0) {
+        return -1;
+    }
+    // SPDK env may not be initialized (registration is opt-in) or may already
+    // have been finalized by Cleanup() -> spdk_env_fini(). In both cases there
+    // is no registered memory to release; calling spdk_mem_unregister would
+    // walk a torn-down or never-created global mem_map. (With ShmHelper
+    // destroyed before SpdkWrapper, the `initialized` atomic is still alive
+    // here.)
+    if (!initialized.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    int rc = spdk_mem_unregister(addr, size);
+    if (rc != 0) {
+        // Every code is reported, -EINVAL included: it does NOT mean "the range
+        // was never registered" (spdk_mem_unregister returns it at memory.c:426
+        // when a page of the range is not REG_MAP_REGISTERED -- exactly what
+        // spdk_mem_register leaves behind when it fails after marking the range
+        // but before its notify callbacks run, memory.c:370-384). In iova=va it
+        // is also returned by the notify callback when the translation does not
+        // cover the range, *before* the IOMMU unmap at memory.c:1224, so a live
+        // DMA mapping can remain. Callers must keep the mapping unless rc == 0.
+        LOG(ERROR) << "spdk_mem_unregister failed (addr=" << addr
+                   << ", size=" << size << "): " << strerror(-rc);
+    }
+    return rc;
+}
+
 void SpdkWrapper::ProbeReadComplete(void *ctx,
                                     const struct spdk_nvme_cpl *cpl) {
     auto *probe_ctx = reinterpret_cast<ProbeRequestContext *>(ctx);
@@ -310,6 +368,18 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
 }
 
 nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
+    // ConnectController -> spdk_nvme_probe() uses env-provided sockets and
+    // memory, so the SPDK env must be up. Do not rely on an earlier
+    // RegisterMemory() to have initialized it: callers now skip the
+    // registration for ranges SPDK would reject (IsRegistrableRange), and that
+    // must not decide whether NoF can be used at all. Every other entry point
+    // (Alloc, RegisterMemory, ProbeNofSegment) already initializes the env
+    // itself; this makes OpenNofSegment self-sufficient too.
+    if (!InitializeEnv()) {
+        LOG(ERROR) << "SPDK env init failed, cannot open NoF segment";
+        return nullptr;
+    }
+
     tr_info tr;
     int ret = ParseTransPortStr(tr_str, &tr);
     if (ret != 0) {

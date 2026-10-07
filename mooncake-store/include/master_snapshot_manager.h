@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -74,10 +75,13 @@ class MasterSnapshotManager {
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
     void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
 
+    // Direct persistence requires quiesced state. The periodic producer passes
+    // weight state frozen together with the descriptor's sequence boundary.
     tl::expected<void, SerializationError> PersistState(
         const std::string& snapshot_id);
     tl::expected<void, SerializationError> PersistState(
-        const ha::SnapshotDescriptor& descriptor);
+        const ha::SnapshotDescriptor& descriptor,
+        const WeightMetadataSnapshot* frozen_weight_metadata = nullptr);
     tl::expected<ha::SnapshotDescriptor, SerializationError>
     BuildSnapshotDescriptor(const std::string& snapshot_id,
                             const std::string& manifest_path,

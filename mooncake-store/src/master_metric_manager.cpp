@@ -51,6 +51,15 @@ MasterMetricManager::MasterMetricManager()
           "Total bytes currently allocated for file storage in 3fs/nfs"),
       file_total_capacity_("master_total_file_capacity_bytes",
                            "Total capacity for file storage in 3fs/nfs"),
+      dfs_allocated_size_("master_dfs_allocated_bytes",
+                          "Total bytes currently allocated by the DFS "
+                          "allocator (shard/bucket mode)"),
+      dfs_total_capacity_("master_dfs_total_capacity_bytes",
+                          "Total capacity of the DFS allocator "
+                          "(shard/bucket mode)"),
+      dfs_file_count_("master_dfs_file_count",
+                      "Number of DFS backing files (shard files in shard "
+                      "mode, bucket files in bucket mode)"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
       soft_pin_key_count_(
@@ -99,6 +108,10 @@ MasterMetricManager::MasterMetricManager()
                           "Total number of PutStart requests received"),
       put_start_failures_("master_put_start_failures_total",
                           "Total number of failed PutStart requests"),
+      put_start_object_already_exists_(
+          "master_put_start_object_already_exists_total",
+          "Total PutStart requests returning "
+          "OBJECT_ALREADY_EXISTS"),
       put_start_alloc_failures_(
           "master_put_start_alloc_failures_total",
           "Total number of PutStart failures caused by replica allocation "
@@ -267,6 +280,9 @@ MasterMetricManager::MasterMetricManager()
       batch_put_start_failures_(
           "master_batch_put_start_failures_total",
           "Total number of failed BatchPutStart requests"),
+      batch_put_start_object_already_exists_(
+          "master_batch_put_start_object_already_exists_total",
+          "Total BatchPutStart response items with OBJECT_ALREADY_EXISTS"),
       batch_put_start_partial_successes_(
           "master_batch_put_start_partial_successes_total",
           "Total number of partially successful BatchPutStart requests"),
@@ -444,6 +460,23 @@ MasterMetricManager::MasterMetricManager()
       tenant_evict_bytes_total_(
           "mooncake_tenant_evict_bytes_total",
           "Total bytes evicted by tenant-scoped quota eviction", {"tenant_id"}),
+      offload_enqueued_total_(
+          "master_offload_enqueued_total",
+          "SSD offload tasks successfully enqueued (per store worker)",
+          {"client_id"}),
+      offload_completed_total_(
+          "master_offload_completed_total",
+          "SSD offload tasks completed (worker reported OK)", {"client_id"}),
+      offload_failed_total_("master_offload_failed_total",
+                            "SSD offload tasks failed (worker reported NACK)",
+                            {"client_id"}),
+      offload_cancelled_total_(
+          "master_offload_cancelled_total",
+          "SSD offload tasks cancelled (preempted before write)",
+          {"client_id"}),
+      offload_enqueue_rejected_total_(
+          "master_offload_enqueue_rejected_total",
+          "SSD offload tasks rejected at enqueue (queue full)", {"client_id"}),
 
       // Snapshot Metrics
       snapshot_duration_ms_(
@@ -535,6 +568,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     mem_total_capacity_.update(0);
     file_allocated_size_.update(0);
     file_total_capacity_.update(0);
+    dfs_allocated_size_.update(0);
+    dfs_total_capacity_.update(0);
+    dfs_file_count_.update(0);
     key_count_.update(0);
     soft_pin_key_count_.update(0);
     active_clients_.update(0);
@@ -571,6 +607,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_candidate_dropped_limit_.inc(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
+    put_start_object_already_exists_.inc(0);
     put_start_alloc_failures_.inc(0);
     put_start_partial_allocations_.inc(0);
     put_end_requests_.inc(0);
@@ -648,6 +685,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_get_replica_list_failed_items_.inc(0);
     batch_put_start_requests_.inc(0);
     batch_put_start_failures_.inc(0);
+    batch_put_start_object_already_exists_.inc(0);
     batch_put_start_partial_successes_.inc(0);
     batch_put_start_items_.inc(0);
     batch_put_start_failed_items_.inc(0);
@@ -718,6 +756,7 @@ void MasterMetricManager::dec_total_mem_capacity(const std::string& segment,
                                                  int64_t val) {
     mem_total_capacity_.dec(val);
     if (!segment.empty()) mem_total_capacity_per_segment_.dec({segment}, val);
+    remove_segment_metrics(segment);
 }
 
 void MasterMetricManager::reset_total_mem_capacity() {
@@ -753,6 +792,11 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
 }
 
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
+    if (segment.empty() ||
+        mem_allocated_size_per_segment_.value({segment}) != 0 ||
+        mem_total_capacity_per_segment_.value({segment}) != 0) {
+        return;
+    }
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
 }
@@ -836,6 +880,11 @@ void MasterMetricManager::project_storage_usage(
     project_tier(snapshot.nof, nof_allocated_size_, nof_total_capacity_,
                  nof_allocated_size_per_segment_,
                  nof_total_capacity_per_segment_, projected_nof_segments_);
+
+    dfs_allocated_size_.update(static_cast<int64_t>(snapshot.dfs.used_bytes));
+    dfs_total_capacity_.update(
+        static_cast<int64_t>(snapshot.dfs.capacity_bytes));
+    dfs_file_count_.update(static_cast<int64_t>(snapshot.dfs.file_count));
 }
 
 int64_t MasterMetricManager::get_segment_allocated_nof_size(
@@ -898,6 +947,18 @@ double MasterMetricManager::get_global_file_used_ratio(void) {
         return 0.0;
     }
     return allocated / capacity;
+}
+
+int64_t MasterMetricManager::get_dfs_allocated_bytes() {
+    return dfs_allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_dfs_total_capacity() {
+    return dfs_total_capacity_.value();
+}
+
+int64_t MasterMetricManager::get_dfs_file_count() {
+    return dfs_file_count_.value();
 }
 
 // Key/Value Metrics
@@ -1064,6 +1125,9 @@ void MasterMetricManager::inc_exist_key_failures(int64_t val) {
 }
 void MasterMetricManager::inc_put_start_requests(int64_t val) {
     put_start_requests_.inc(val);
+}
+void MasterMetricManager::inc_put_start_object_already_exists(int64_t val) {
+    put_start_object_already_exists_.inc(val);
 }
 void MasterMetricManager::inc_put_start_failures(int64_t val) {
     put_start_failures_.inc(val);
@@ -1244,6 +1308,10 @@ void MasterMetricManager::inc_batch_put_start_failures(int64_t failed_items) {
     batch_put_start_failures_.inc(1);
     batch_put_start_failed_items_.inc(failed_items);
 }
+void MasterMetricManager::inc_batch_put_start_object_already_exists(
+    int64_t items) {
+    batch_put_start_object_already_exists_.inc(items);
+}
 void MasterMetricManager::inc_batch_put_start_partial_success(
     int64_t failed_items) {
     batch_put_start_partial_successes_.inc(1);
@@ -1359,6 +1427,31 @@ void MasterMetricManager::inc_tenant_evict_bytes(const std::string& tenant_id,
     tenant_evict_bytes_total_.inc({tenant_id}, bytes);
 }
 
+void MasterMetricManager::inc_offload_enqueued(const std::string& client_id,
+                                               int64_t val) {
+    offload_enqueued_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_completed(const std::string& client_id,
+                                                int64_t val) {
+    offload_completed_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_failed(const std::string& client_id,
+                                             int64_t val) {
+    offload_failed_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_cancelled(const std::string& client_id,
+                                                int64_t val) {
+    offload_cancelled_total_.inc({client_id}, val);
+}
+
+void MasterMetricManager::inc_offload_enqueue_rejected(
+    const std::string& client_id, int64_t val) {
+    offload_enqueue_rejected_total_.inc({client_id}, val);
+}
+
 void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
     snapshot_duration_ms_.observe(size);
 }
@@ -1371,6 +1464,9 @@ int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
 
+int64_t MasterMetricManager::get_put_start_object_already_exists() {
+    return put_start_object_already_exists_.value();
+}
 int64_t MasterMetricManager::get_put_start_failures() {
     return put_start_failures_.value();
 }
@@ -1565,6 +1661,10 @@ int64_t MasterMetricManager::get_batch_put_start_requests() {
 
 int64_t MasterMetricManager::get_batch_put_start_failures() {
     return batch_put_start_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_put_start_object_already_exists() {
+    return batch_put_start_object_already_exists_.value();
 }
 
 int64_t MasterMetricManager::get_batch_put_start_partial_successes() {
@@ -1935,6 +2035,11 @@ std::string MasterMetricManager::serialize_metrics() {
         ss << metric_str;
     };
 
+    // The generic lambda above accepts AllocatorMetric because it matches the
+    // serialize(std::string&) shape of every other metric type here.
+    allocator_metric_.Refresh();
+    serialize_metric(allocator_metric_);
+
     // Serialize Gauges
     serialize_metric(mem_allocated_size_);
     serialize_metric(mem_total_capacity_);
@@ -1946,6 +2051,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
+    serialize_metric(dfs_allocated_size_);
+    serialize_metric(dfs_total_capacity_);
+    serialize_metric(dfs_file_count_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
@@ -1969,6 +2077,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(exist_key_failures_);
     serialize_metric(put_start_requests_);
     serialize_metric(put_start_failures_);
+    serialize_metric(put_start_object_already_exists_);
     serialize_metric(put_start_alloc_failures_);
     serialize_metric(put_start_partial_allocations_);
     serialize_metric(put_end_requests_);
@@ -2058,6 +2167,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(batch_get_replica_list_failed_items_);
     serialize_metric(batch_put_start_requests_);
     serialize_metric(batch_put_start_failures_);
+    serialize_metric(batch_put_start_object_already_exists_);
     serialize_metric(batch_put_start_partial_successes_);
     serialize_metric(batch_put_start_items_);
     serialize_metric(batch_put_start_failed_items_);
@@ -2120,6 +2230,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
+    serialize_metric(offload_enqueued_total_);
+    serialize_metric(offload_completed_total_);
+    serialize_metric(offload_failed_total_);
+    serialize_metric(offload_cancelled_total_);
+    serialize_metric(offload_enqueue_rejected_total_);
     serialize_metric(build_info_);
 
     // Serialize Snapshot Metrics
@@ -2223,6 +2338,9 @@ std::string MasterMetricManager::get_summary_string(
     int64_t nof_capacity = nof_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     [[maybe_unused]] int64_t file_capacity = file_total_capacity_.value();
+    int64_t dfs_allocated = dfs_allocated_size_.value();
+    int64_t dfs_capacity = dfs_total_capacity_.value();
+    int64_t dfs_files = dfs_file_count_.value();
     int64_t keys = key_count_.value();
     int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();
@@ -2522,6 +2640,16 @@ std::string MasterMetricManager::get_summary_string(
     }
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_display_capacity);
+    if (dfs_capacity > 0 || dfs_allocated > 0 || dfs_files > 0) {
+        ss << " | DFS: " << byte_size_to_string(dfs_allocated) << " / "
+           << byte_size_to_string(dfs_capacity);
+        if (dfs_capacity > 0) {
+            ss << " (" << std::fixed << std::setprecision(1)
+               << ((double)dfs_allocated / (double)dfs_capacity * 100.0)
+               << "%)";
+        }
+        ss << " files=" << dfs_files;
+    }
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     ss << " | Clients: " << active_clients;
 

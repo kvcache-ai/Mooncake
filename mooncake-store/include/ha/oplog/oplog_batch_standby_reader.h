@@ -16,6 +16,7 @@ class OpLogApplier;
 enum class OpLogBatchStandbyPollDisposition {
     OK,
     RETRYABLE,
+    REBOOTSTRAP_REQUIRED,
     FATAL,
 };
 
@@ -25,7 +26,10 @@ struct OpLogBatchStandbyPollResult {
     ErrorCode error{ErrorCode::OK};
     bool durable_prefix_present{false};
     size_t applied_entries{0};
+    // Complete batches processed in this poll, including before a later error.
+    size_t applied_batches{0};
     DurablePrefix durable_prefix{};
+    uint64_t compaction_floor{0};
 };
 
 class OpLogBatchStandbyReader {
@@ -45,6 +49,7 @@ class OpLogBatchStandbyReader {
     }
 
    private:
+    OpLogBatchStandbyPollResult PollBatches(size_t max_batches, uint64_t floor);
     OpLogBatchStorage storage_;
     OpLogApplier& applier_;
     bool batch_format_seen_{false};

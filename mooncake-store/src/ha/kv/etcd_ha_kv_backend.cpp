@@ -76,6 +76,20 @@ ErrorCode EtcdHaKvBackend::Range(std::string_view begin_key,
 
 bool EtcdHaKvBackend::SupportsTxn() const { return true; }
 
+ErrorCode EtcdHaKvBackend::DeleteRange(std::string_view begin_key,
+                                       std::string_view end_key) {
+    // etcd treats an empty end as a single-key delete and NUL as unbounded.
+    if (begin_key.empty() || end_key.empty() ||
+        end_key == std::string_view("\0", 1) || begin_key > end_key) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (begin_key == end_key) {
+        return ErrorCode::OK;
+    }
+    return EtcdHelper::DeleteRange(begin_key.data(), begin_key.size(),
+                                   end_key.data(), end_key.size());
+}
+
 ErrorCode EtcdHaKvBackend::Txn(const KvTxn& txn) {
     std::vector<EtcdHelper::TxnCompare> compares;
     compares.reserve(txn.compares.size());

@@ -150,6 +150,13 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
                        << " from " << metadata_uri_;
             return false;
         }
+        if (resp->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "RedisStoragePlugin: get " << key << " rejected by "
+                       << metadata_uri_ << ": "
+                       << (resp->str ? resp->str : "unknown error");
+            freeReplyObject(resp);
+            return false;
+        }
         if (!resp->str) {
             LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
                        << " from " << metadata_uri_;
@@ -183,6 +190,13 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
                        << " from " << metadata_uri_;
             return GetResult::kUnavailable;
         }
+        if (resp->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "RedisStoragePlugin: get " << key << " rejected by "
+                       << metadata_uri_ << ": "
+                       << (resp->str ? resp->str : "unknown error");
+            freeReplyObject(resp);
+            return GetResult::kUnavailable;
+        }
         if (!resp->str) {
             freeReplyObject(resp);
             return GetResult::kNotFound;
@@ -212,6 +226,17 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
                        << " from " << metadata_uri_;
             return false;
         }
+        if (resp->type == REDIS_REPLY_ERROR) {
+            // The server received and rejected the write (READONLY after a
+            // failover, OOM at maxmemory, MISCONF, NOAUTH). Reporting success
+            // loses the write silently; the constructor already treats the
+            // same reply type as failure for AUTH/SELECT.
+            LOG(ERROR) << "RedisStoragePlugin: put " << key << " rejected by "
+                       << metadata_uri_ << ": "
+                       << (resp->str ? resp->str : "unknown error");
+            freeReplyObject(resp);
+            return false;
+        }
         freeReplyObject(resp);
         return true;
     }
@@ -225,6 +250,13 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to remove " << key
                        << " from " << metadata_uri_;
+            return false;
+        }
+        if (resp->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "RedisStoragePlugin: remove " << key
+                       << " rejected by " << metadata_uri_ << ": "
+                       << (resp->str ? resp->str : "unknown error");
+            freeReplyObject(resp);
             return false;
         }
         freeReplyObject(resp);

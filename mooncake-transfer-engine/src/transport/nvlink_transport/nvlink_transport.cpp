@@ -28,6 +28,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #include "common.h"
@@ -696,6 +697,31 @@ NvlinkTransport::~NvlinkTransport() {
         }
     }
     remap_entries_.clear();
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    for (auto it = host_numa_registration_handles_.begin();
+         it != host_numa_registration_handles_.end();) {
+        void *address = (it++)->first;
+        const int rc = unregisterHostNumaMemoryLocked(
+            address, true,
+            [this](void *base, bool update) {
+                return metadata_
+                           ? metadata_->removeLocalMemoryBuffer(base, update)
+                           : ERR_METADATA;
+            },
+            [this]() {
+                return metadata_ ? metadata_->updateLocalSegmentDesc()
+                                 : ERR_METADATA;
+            });
+        if (rc != 0) {
+            // Destruction cannot offer a retry. Keep the registry pin so the
+            // allocation cannot unmap a range whose cleanup is incomplete.
+            LOG(ERROR) << "NvlinkTransport: HOST_NUMA cleanup incomplete for "
+                       << address << ": " << rc
+                       << "; unregister before destroying the transport";
+        }
+    }
+#endif
 }
 
 int NvlinkTransport::install(std::string &local_server_name,
@@ -861,9 +887,13 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             }
         }
     }
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
@@ -989,6 +1019,19 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
 #endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     } else {
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+        const auto host_numa_result = registerHostNumaMemoryLocked(
+            addr, length, location, update_metadata,
+            [this](const BufferDesc &desc, bool update) {
+                return metadata_->addLocalMemoryBuffer(desc, update);
+            },
+            [this](void *base, bool update) {
+                return metadata_->removeLocalMemoryBuffer(base, update);
+            },
+            [this]() { return metadata_->updateLocalSegmentDesc(); });
+        if (host_numa_result) return *host_numa_result;
+#endif
+
         CUmemGenericAllocationHandle handle;
         auto result = cuMemRetainAllocationHandle(&handle, addr);
         if (result != CUDA_SUCCESS) {
@@ -1036,8 +1079,241 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
     }
 }
 
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+std::optional<int> NvlinkTransport::registerHostNumaMemoryLocked(
+    void *addr, size_t length, const std::string &location,
+    bool update_metadata, const AddLocalMemoryBufferOp &add_buffer,
+    const RemoveLocalMemoryBufferOp &remove_buffer,
+    const UpdateLocalSegmentDescOp &update_segment) {
+    auto previous = host_numa_registration_handles_.find(addr);
+    if (previous != host_numa_registration_handles_.end()) {
+        if (previous->second.registration_succeeded ||
+            previous->second.length != length)
+            return ERR_ADDRESS_OVERLAPPED;
+    }
+
+    NvlinkHostNumaAllocation::DriverApi driver_api;
+    using OwnedRangeResult = NvlinkHostNumaAllocation::OwnedRangeResult;
+    const auto range =
+        NvlinkHostNumaAllocation::AcquireOwnedRange(addr, length, &driver_api);
+    if (range == OwnedRangeResult::kNotOwned) {
+        if (previous != host_numa_registration_handles_.end())
+            return ERR_INVALID_ARGUMENT;
+        return std::nullopt;
+    }
+    if (range == OwnedRangeResult::kError) return ERR_MEMORY;
+    if (range != OwnedRangeResult::kPinned) return ERR_INVALID_ARGUMENT;
+
+    if (previous != host_numa_registration_handles_.end()) {
+        // Keep the new pin across old cleanup, so Release cannot recycle the
+        // VA between attempts. Deferred publication cannot waive old cleanup.
+        const int rc = unregisterHostNumaMemoryLocked(addr, true, remove_buffer,
+                                                      update_segment);
+        if (rc != 0) {
+            NvlinkHostNumaAllocation::ReleaseOwnedRange(addr, length);
+            return rc;
+        }
+    }
+
+    try {
+        HostNumaRegistration pending;
+        pending.api = std::move(driver_api);
+        pending.length = length;
+        const bool inserted =
+            host_numa_registration_handles_.emplace(addr, std::move(pending))
+                .second;
+        if (!inserted) {
+            NvlinkHostNumaAllocation::ReleaseOwnedRange(addr, length);
+            return ERR_ADDRESS_OVERLAPPED;
+        }
+    } catch (...) {
+        NvlinkHostNumaAllocation::ReleaseOwnedRange(addr, length);
+        return ERR_MEMORY;
+    }
+
+    auto registration = host_numa_registration_handles_.find(addr);
+    CUmemGenericAllocationHandle handle;
+    const auto &api = registration->second.api;
+    CUresult result = api.mem_retain_allocation_handle(&handle, addr);
+    if (result != CUDA_SUCCESS) {
+        LOG(WARNING) << "NvlinkTransport: failed to retain the exact HOST_NUMA "
+                        "allocation handle for "
+                     << addr << ": " << result;
+        const int cleanup_rc = unregisterHostNumaMemoryLocked(
+            addr, false, remove_buffer, update_segment);
+        if (cleanup_rc != 0)
+            LOG(ERROR) << "NvlinkTransport: HOST_NUMA pin cleanup failed: "
+                       << cleanup_rc;
+        return ERR_MEMORY;
+    }
+    registration->second.handle = handle;
+    registration->second.handle_owned = true;
+
+    CUmemFabricHandle export_handle;
+    result = api.mem_export_to_shareable_handle(&export_handle, handle,
+                                                CU_MEM_HANDLE_TYPE_FABRIC, 0);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: failed to export the exact HOST_NUMA "
+                      "allocation handle for "
+                   << addr << ": " << result;
+        const int cleanup_rc = unregisterHostNumaMemoryLocked(
+            addr, false, remove_buffer, update_segment);
+        if (cleanup_rc != 0) {
+            LOG(ERROR) << "NvlinkTransport: failed to release retained "
+                          "HOST_NUMA handle after export failure for "
+                       << addr << ": " << cleanup_rc;
+        }
+        return ERR_MEMORY;
+    }
+
+    BufferDesc desc;
+    desc.addr = reinterpret_cast<uint64_t>(addr);
+    desc.length = length;
+    desc.name = location;
+    desc.shm_name =
+        serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+    registration->second.metadata_removed_locally = false;
+    registration->second.metadata_cleanup_complete = false;
+
+    const int publication_rc = add_buffer(desc, update_metadata);
+    if (publication_rc == 0) {
+        registration->second.registration_succeeded = true;
+        return 0;
+    }
+
+    const int rollback_rc = unregisterHostNumaMemoryLocked(
+        addr, update_metadata, remove_buffer, update_segment);
+    if (rollback_rc != 0) {
+        LOG(ERROR) << "NvlinkTransport: failed to roll back exact HOST_NUMA "
+                      "registration for "
+                   << addr << ": " << rollback_rc;
+    }
+    return publication_rc;
+}
+
+int NvlinkTransport::unregisterHostNumaMemoryLocked(
+    void *addr, bool update_metadata,
+    const RemoveLocalMemoryBufferOp &remove_buffer,
+    const UpdateLocalSegmentDescOp &update_segment) {
+    auto registration = host_numa_registration_handles_.find(addr);
+    if (registration == host_numa_registration_handles_.end())
+        return ERR_ADDRESS_NOT_REGISTERED;
+
+    if (!registration->second.metadata_removed_locally) {
+        const int rc = remove_buffer(addr, update_metadata);
+        if (rc == ERR_ADDRESS_NOT_REGISTERED) {
+            registration->second.metadata_removed_locally = true;
+            if (update_metadata) {
+                const int update_rc = update_segment();
+                if (update_rc != 0) return update_rc;
+            }
+            registration->second.metadata_cleanup_complete = update_metadata;
+        } else if (rc != 0) {
+            // removeLocalMemoryBuffer updates the local descriptor before it
+            // attempts external publication.
+            registration->second.metadata_removed_locally = true;
+            return rc;
+        } else {
+            registration->second.metadata_removed_locally = true;
+            registration->second.metadata_cleanup_complete = update_metadata;
+        }
+    } else if (!registration->second.metadata_cleanup_complete) {
+        if (!update_metadata) return 0;
+        const int rc = update_segment();
+        if (rc != 0) return rc;
+        registration->second.metadata_cleanup_complete = true;
+    }
+
+    // Deferred deletion is not permission to unmap the allocation. The batch
+    // publisher (or a later unregister with update_metadata=true) completes it.
+    if (!registration->second.metadata_cleanup_complete) return 0;
+
+    // Project policy treats a non-success result as retaining this reference,
+    // so the registration record remains available for a later retry.
+    if (registration->second.handle_owned) {
+        CUresult result =
+            registration->second.api.mem_release(registration->second.handle);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR)
+                << "NvlinkTransport: failed to release retained HOST_NUMA "
+                   "registration handle for "
+                << addr << ": " << result;
+            return ERR_MEMORY;
+        }
+        registration->second.handle_owned = false;
+    }
+    if (!NvlinkHostNumaAllocation::ReleaseOwnedRange(
+            addr, registration->second.length))
+        return ERR_MEMORY;
+    host_numa_registration_handles_.erase(registration);
+    return 0;
+}
+
+int NvlinkTransport::unregisterHostNumaMemoryBatchLocked(
+    const std::vector<void *> &addr_list,
+    const RemoveLocalMemoryBufferOp &remove_buffer,
+    const UpdateLocalSegmentDescOp &update_segment) {
+    int first_error = 0;
+    bool needs_publication = false;
+    for (void *addr : addr_list) {
+        auto registration = host_numa_registration_handles_.find(addr);
+        int rc = 0;
+        if (registration != host_numa_registration_handles_.end()) {
+            // Completed publication need not be repeated after a release
+            // failure. Other records wait for the single batch publication.
+            if (!registration->second.metadata_cleanup_complete) {
+                rc = unregisterHostNumaMemoryLocked(addr, false, remove_buffer,
+                                                    update_segment);
+                needs_publication = true;
+            }
+        } else if (!NvlinkHostNumaAllocation::IsOwnedRangeBase(addr)) {
+            // Keep legacy address/error semantics. Owned addresses without a
+            // record are already done, including on a partial-batch retry.
+            rc = remove_buffer(addr, false);
+            needs_publication = true;
+        }
+        if (rc != 0 && first_error == 0) first_error = rc;
+    }
+
+    if (needs_publication) {
+        const int rc = update_segment();
+        if (rc != 0) return first_error ? first_error : rc;
+        for (void *addr : addr_list) {
+            auto registration = host_numa_registration_handles_.find(addr);
+            if (registration != host_numa_registration_handles_.end() &&
+                registration->second.metadata_removed_locally)
+                registration->second.metadata_cleanup_complete = true;
+        }
+    }
+
+    std::unordered_set<void *> finalized;
+    for (void *addr : addr_list) {
+        if (!finalized.insert(addr).second) continue;
+        if (host_numa_registration_handles_.count(addr) == 0) continue;
+        const int rc = unregisterHostNumaMemoryLocked(
+            addr, false, remove_buffer, update_segment);
+        if (rc != 0 && first_error == 0) first_error = rc;
+    }
+    return first_error;
+}
+#endif
+
 int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+    std::unique_lock<std::mutex> lock(register_mutex_);
+    if (host_numa_registration_handles_.count(addr) == 0) {
+        lock.unlock();
+        return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    }
+    return unregisterHostNumaMemoryLocked(
+        addr, update_metadata,
+        [this](void *base, bool update) {
+            return metadata_->removeLocalMemoryBuffer(base, update);
+        },
+        [this]() { return metadata_->updateLocalSegmentDesc(); });
+#else
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+#endif
 }
 
 int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
@@ -1168,6 +1444,15 @@ int NvlinkTransport::registerLocalMemoryBatch(
 
 int NvlinkTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    return unregisterHostNumaMemoryBatchLocked(
+        addr_list,
+        [this](void *base, bool update) {
+            return metadata_->removeLocalMemoryBuffer(base, update);
+        },
+        [this]() { return metadata_->updateLocalSegmentDesc(); });
+#else
     int first_error = 0;
     for (auto &addr : addr_list) {
         int ret = unregisterLocalMemory(addr, false);
@@ -1175,6 +1460,7 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
     }
     int metadata_ret = metadata_->updateLocalSegmentDesc();
     return first_error ? first_error : metadata_ret;
+#endif
 }
 
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
