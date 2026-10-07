@@ -33,23 +33,23 @@ class TestBatchProbePolicy(unittest.TestCase):
             self.assertEqual(self.store.put(key, b"checkpoint"), 0)
             self.addCleanup(self.store.remove, key, True)
 
-    def test_default_and_selected_masks(self):
+    def test_existence_and_last_complete_candidate(self):
         a, b, c, missing = self.keys
         self.assertEqual(self.store.batch_probe_key(self.keys), [1, 1, 1, 0])
         self.assertEqual(self.store.batch_is_exist(self.keys), [1, 1, 1, 0])
         self.assertEqual(
-            self.store.batch_probe_key(self.keys, "LastHitOnly", 2), [1, 1, 0, 0]
+            self.store.batch_probe_key(self.keys, "LastHitOnly", 2), [1, 1, 1, 0]
         )
         self.assertEqual(
             self.store.batch_probe_key([a, b, b, c], "LastHitOnly", 2),
-            [0, 0, 1, 1],
+            [1, 1, 1, 1],
         )
         self.assertEqual(
             self.store.batch_probe_key([a, missing, b, c], "LastHitOnly", 2),
-            [0, 0, 1, 1],
+            [1, 0, 1, 1],
         )
         self.assertEqual(
-            self.store.batch_probe_key([a, missing], "LastHitOnly", 2), [0, 0]
+            self.store.batch_probe_key([a, missing], "LastHitOnly", 2), [1, 0]
         )
         self.assertEqual(self.store.get(c), b"checkpoint")
 
@@ -57,15 +57,16 @@ class TestBatchProbePolicy(unittest.TestCase):
         a, b, _, _ = self.keys
         self.assertEqual(
             self.store.batch_probe_key([a, b, a, a], "LastHitOnly", 2),
-            [0, 0, 1, 1],
+            [1, 1, 1, 1],
         )
-        self.assertEqual(self.store.batch_probe_key([a, b], "LastHitOnly"), [0, 1])
+        self.assertEqual(self.store.batch_probe_key([a, b], "LastHitOnly"), [1, 1])
         self.assertEqual(self.store.batch_probe_key([a], candidate_size=0), [1])
         self.assertEqual(self.store.batch_probe_key([]), [])
         self.assertEqual(self.store.batch_probe_key([], "LastHitOnly", 0), [])
         for size in (0, 3):
-            with self.assertRaises(ValueError):
-                self.store.batch_probe_key([a, b], "LastHitOnly", size)
+            result = self.store.batch_probe_key([a, b], "LastHitOnly", size)
+            self.assertEqual(len(result), 2)
+            self.assertTrue(all(value < 0 for value in result))
         with self.assertRaises(ValueError):
             self.store.batch_probe_key([a], "unknown")
         with self.assertRaises(TypeError):

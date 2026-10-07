@@ -331,6 +331,90 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
 }
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, LastHitOnlyGpuCheckpointRoundTrip) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    StartMasterAndSetupClient();
+    ASSERT_FALSE(HasFatalFailure());
+
+    // Three synthetic TP8 checkpoints, each with two state components per
+    // rank. The last checkpoint is missing one component.
+    constexpr size_t kCandidateSize = 16;
+    constexpr size_t kKeyCount = 3 * kCandidateSize;
+    constexpr size_t kPartSize = 4096;
+    constexpr size_t kPayloadSize = kKeyCount * kPartSize;
+    std::vector<char> source(kPayloadSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    void* allocation = nullptr;
+    ASSERT_EQ(cudaMalloc(&allocation, 2 * kPayloadSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(allocation, cleanup);
+    ASSERT_EQ(cudaMemcpy(allocation, source.data(), kPayloadSize,
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+    ASSERT_EQ(py_client_->register_buffer(allocation, 2 * kPayloadSize), 0);
+    registered = true;
+
+    std::vector<std::string> keys;
+    std::vector<void*> buffers;
+    for (size_t i = 0; i < kKeyCount; ++i) {
+        keys.push_back("gpu-probe-" + std::to_string(i));
+        if (i + 1 < kKeyCount) {
+            buffers.push_back(static_cast<char*>(allocation) + i * kPartSize);
+        }
+    }
+    const std::vector<std::string> present(keys.begin(), keys.end() - 1);
+    ASSERT_EQ(
+        py_client_->batch_put_from(
+            present, buffers, std::vector<size_t>(present.size(), kPartSize),
+            {.replica_num = 1}),
+        std::vector<int>(present.size(), 0));
+
+    auto expected = std::vector<int>(kKeyCount, 1);
+    expected.back() = 0;
+    EXPECT_EQ(py_client_->batchProbeKey(keys), expected);
+    ASSERT_EQ(py_client_->batchProbeKey(
+                  keys, {ProbeLeaseMode::LastHitOnly, kCandidateSize}),
+              expected);
+
+    const std::vector<std::string> selected(keys.begin() + kCandidateSize,
+                                            keys.begin() + 2 * kCandidateSize);
+    for (const auto& key : selected) {
+        EXPECT_EQ(py_client_->remove(key), toInt(ErrorCode::OBJECT_HAS_LEASE));
+    }
+    // Existence results remain true for unselected keys without leasing them.
+    EXPECT_EQ(py_client_->remove(keys.front()), 0);
+    EXPECT_EQ(py_client_->remove(keys[kKeyCount - 2]), 0);
+
+    auto* destination = static_cast<char*>(allocation) + kPayloadSize;
+    ASSERT_EQ(cudaMemset(destination, 0, kCandidateSize * kPartSize),
+              cudaSuccess);
+    buffers.clear();
+    for (size_t i = 0; i < kCandidateSize; ++i) {
+        buffers.push_back(destination + i * kPartSize);
+    }
+    ASSERT_EQ(
+        py_client_->batch_get_into(
+            selected, buffers, std::vector<size_t>(kCandidateSize, kPartSize)),
+        std::vector<int64_t>(kCandidateSize, kPartSize));
+    std::vector<char> actual(kCandidateSize * kPartSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, actual.size(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kCandidateSize * kPartSize));
+}
+
 TEST_F(RealClientTest, SessionRangesReadDfsIntoGpuUsesPinnedArena) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
@@ -1571,6 +1655,140 @@ TEST_F(RealClientTest, TestPutGetSessionRanges) {
 
     ASSERT_EQ(py_client_->unregister_buffer(src_data.data()), 0);
     ASSERT_EQ(py_client_->unregister_buffer(dst_data.data()), 0);
+}
+
+// Issue #3658: read SSD-only keys through a separate TCP client.
+TEST_F(RealClientTest, TestGetSessionRangesFromSsdOffload) {
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_session_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    constexpr int kLeaseMs = 1000;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(kLeaseMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+    const std::string owner = "localhost:17822";
+    ASSERT_EQ(py_client_->setup_real(
+                  owner, "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, ssd_path_),
+              0);
+    auto reader = RealClient::create();
+    ASSERT_EQ(reader->setup_real("localhost:17823", "P2PHANDSHAKE", 0, 0, "tcp",
+                                 "", master_address_),
+              0);
+
+    constexpr size_t kPageSize = 64;
+    constexpr size_t kObjectSize = 4 * kPageSize;
+    const std::vector<std::string> keys = {"session_ssd_0", "session_ssd_1",
+                                           "session_memory"};
+    std::string src(kObjectSize * keys.size(), '\0');
+    std::string dst(src.size(), 'Z');
+    for (size_t i = 0; i < src.size(); ++i) {
+        src[i] = static_cast<char>(i % 251);
+    }
+    ASSERT_EQ(reader->register_buffer(dst.data(), dst.size()), 0);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_EQ(py_client_->put(
+                      keys[i], std::span<const char>(
+                                   src.data() + i * kObjectSize, kObjectSize)),
+                  0);
+    }
+
+    const std::vector<std::string> ssd_keys(keys.begin(), keys.begin() + 2);
+    for (const auto& key : ssd_keys) {
+        bool ready = false;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!ready && std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                ready |= replica.is_local_disk_replica() &&
+                         replica.status == ReplicaStatus::COMPLETE;
+            }
+            if (!ready)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        ASSERT_TRUE(ready) << key;
+    }
+    // Querying above granted a lease; wait for it before clearing MEMORY.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseMs + 50));
+    ASSERT_EQ(py_client_->batch_replica_clear(ssd_keys, owner).size(),
+              ssd_keys.size());
+    for (const auto& key : ssd_keys) {
+        const auto replicas = py_client_->get_replica_desc(key);
+        ASSERT_EQ(replicas.size(), 1u);
+        ASSERT_TRUE(replicas.front().is_local_disk_replica());
+    }
+    ASSERT_EQ(reader->batch_get_session_start(keys), std::vector<int>(3, 0));
+
+    auto read_ranges = [&](const std::vector<size_t>& offsets,
+                           const std::vector<size_t>& sizes) {
+        std::fill(dst.begin(), dst.end(), 'Z');
+        std::string expected(dst);
+        std::vector<std::vector<void*>> buffers(keys.size());
+        size_t total = 0;
+        for (size_t j = 0; j < sizes.size(); ++j) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                buffers[i].push_back(dst.data() + i * kObjectSize + total);
+                expected.replace(i * kObjectSize + total, sizes[j], src,
+                                 i * kObjectSize + offsets[j], sizes[j]);
+            }
+            total += sizes[j];
+        }
+        const auto before = reader->get_offload_rpc_read_count();
+        EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                      keys, buffers,
+                      std::vector<std::vector<size_t>>(keys.size(), sizes),
+                      std::vector<std::vector<size_t>>(keys.size(), offsets)),
+                  std::vector<int>(keys.size(), total));
+        EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 1);
+        EXPECT_EQ(dst, expected);
+    };
+    read_ranges({0, kPageSize, 2 * kPageSize, 3 * kPageSize},
+                {kPageSize, kPageSize, kPageSize, kPageSize});
+    read_ranges({kPageSize}, {kPageSize});            // Non-tail partial read.
+    read_ranges({2 * kPageSize, 7, 9}, {16, 16, 8});  // Unordered, overlapping.
+
+    // Repeated SSD keys must fill each destination without duplicate reads.
+    const auto before_duplicate = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[0], keys[0]}, {{dst.data()}, {dst.data() + kPageSize}},
+                  {{kPageSize}, {kPageSize}}, {{0}, {2 * kPageSize}}),
+              std::vector<int>(2, kPageSize));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before_duplicate + 1);
+    EXPECT_EQ(dst.substr(0, kPageSize), src.substr(0, kPageSize));
+    EXPECT_EQ(dst.substr(kPageSize, kPageSize),
+              src.substr(2 * kPageSize, kPageSize));
+
+    // Invalid entries must not prevent valid entries in the batch from reading.
+    const int invalid = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    EXPECT_EQ(
+        reader->batch_get_into_multi_buffer_ranges(
+            keys, {{dst.data()}, {dst.data()}, {dst.data() + kObjectSize}},
+            {{kPageSize}, {kPageSize}, {kPageSize}},
+            {{std::numeric_limits<size_t>::max()}, {0}, {kObjectSize}}),
+        (std::vector<int>{invalid, kPageSize, invalid}));
+    const auto before_empty = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[0], keys[1]}, {{}, {nullptr}}, {{}, {1}}, {{}, {0}}),
+              (std::vector<int>{0, invalid}));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before_empty);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseMs + 50));
+    EXPECT_EQ(
+        reader->batch_get_into_multi_buffer_ranges({keys[0]}, {{dst.data()}},
+                                                   {{1}}, {{0}}),
+        (std::vector<int>{static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED))}));
+    EXPECT_EQ(reader->batch_get_session_end(keys), 0);
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[1]}, {{dst.data()}}, {{1}}, {{0}}),
+              (std::vector<int>{invalid}));
+    ASSERT_EQ(reader->unregister_buffer(dst.data()), 0);
+    EXPECT_EQ(reader->tearDownAll(), 0);
 }
 
 // Abnormal put/get session cases. See check table in PR / review notes.

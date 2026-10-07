@@ -1566,25 +1566,34 @@ def batch_probe_key(
   positive and divide the number of keys exactly. Empty input returns `[]`.
 
 **Returns:**
-- `"none"`: per-key existence results (1=readable at probe time, 0=missing).
-- `"LastHitOnly"`: a selected-only mask of the same length and order as `keys`.
-  Every position in the last complete candidate is 1; all other positions are
-  0, **even if those objects exist**. An all-zero mask means no complete
-  candidate was found. Negative values indicate errors, not cache misses.
+- Both policies return per-key existence results in the same length and order
+  as `keys`: 1=readable when checked, 0=missing or unreadable. Negative values
+  indicate errors, not cache misses.
+- With `"LastHitOnly"`, the last group of `candidate_size` all-1 results is
+  the selected, leased candidate. Earlier complete groups and incomplete
+  groups retain their existence results. If no group is all-1, no complete
+  candidate was selected.
 
-Candidates are ordered by the caller. Every key in a candidate must have a
-readable replica before any member receives a lease. Earlier candidates may
-be missing or incomplete. The caller must include all required components,
+Candidates are ordered by the caller. A candidate is complete when every key
+has a readable replica. Earlier candidates may be missing or incomplete.
+The caller must include all required components,
 cache groups, and rank shards; Store does not infer prefix or model semantics.
 Duplicate key positions are allowed and must not alter the grouping.
 
-Selection, completeness validation, and lease acquisition are protected
-against normal eviction within the candidate. Selected objects receive the
-Master's default read-lease TTL; this does not change their soft-pin deadlines.
-The policy does not protect against lease expiry, forced removal, or replica
-loss. It does not explicitly renew unselected objects, but existing shared
-group leases (or a physical key repeated outside the selected candidate) may
-also protect unselected positions. No persistent group registration is added.
+The Master first probes without leases, then rechecks and leases complete
+candidates in reverse order using the existing per-shard lookup. Recheck
+results replace that candidate's initial results; a candidate that loses a
+member cannot remain all-1. A failed candidate may retain partial leases
+while selection falls back to an earlier candidate. This is not an atomic
+snapshot of all keys, and unselected existence results are not lease guarantees.
+
+Selected objects receive the Master's default read-lease TTL, protecting them
+from normal eviction while the leases remain valid; soft-pin deadlines are
+unchanged. The policy does not protect against lease expiry, forced removal,
+or replica loss. Existing shared group leases (or a physical key repeated
+outside the selected candidate) may also protect unselected positions. No
+persistent group registration is added. Invalid candidate sizes return
+per-key parameter errors; unknown policy strings raise `ValueError` in Python.
 
 **Example:**
 ```python
@@ -1601,8 +1610,13 @@ candidates within that boundary, in increasing resume-position order:
 ```python
 keys = ["checkpoint128.rank0", "checkpoint128.rank1",
         "checkpoint256.rank0", "checkpoint256.rank1"]
-selected = store.batch_probe_key(keys, policy="LastHitOnly", candidate_size=2)
-# Both complete: [0, 0, 1, 1]. Last incomplete: [1, 1, 0, 0].
+results = store.batch_probe_key(keys, policy="LastHitOnly", candidate_size=2)
+if any(result < 0 for result in results):
+    raise RuntimeError("Checkpoint lookup failed")
+selected = next((i for i in reversed(range(len(keys) // 2))
+                 if all(result == 1 for result in results[i * 2:(i + 1) * 2])), None)
+# Both complete: [1, 1, 1, 1] selects 1.
+# Last incomplete: [1, 1, 1, 0] selects 0.
 # Load only the selected checkpoint, with the KV prefix it needs.
 ```
 
@@ -2997,18 +3011,26 @@ Typical flow:
 - Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
-Get sessions cache a filtered `QueryResult` (one complete MEMORY or DFS replica
-plus its lease). The MEMORY path remains zero-copy. DFS replicas are read into
-request-scoped host staging and then scattered to host or device destinations.
-If a key has no complete MEMORY or DFS replica, for example because it has only
-LOCAL_DISK, DISK, or NOF replicas, `batch_get_session_start` returns
-`INVALID_REPLICA` for that key and does not open a session.
-For device destinations, DFS staging first uses the fixed-capacity pinned restore
-arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`; if that arena is
-unavailable or exhausted, it falls back to the regular client buffer allocator.
-Host-only reads use the regular client buffer allocator. Range calls only check
-the cached lease locally (zero Master RPCs). Put sessions reserve object space
-via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+Get sessions cache a filtered `QueryResult` (one complete supported replica,
+plus lease). Range calls only check the cached lease locally (zero Master RPCs),
+and each request re-checks it once its transfer completes: if the cached lease
+lapsed while the read was in flight, the call returns `LEASE_EXPIRED`, the
+result is discarded, and the session is dropped. LOCAL_DISK reads additionally
+report `OBJECT_HAS_LEASE` when the restored offload buffer outlives its GC TTL.
+The MEMORY path remains zero-copy via `BatchTransferReadRanges`. DFS replicas
+are read into request-scoped host staging and then scattered to host or device
+destinations; for device destinations, staging first uses the fixed-capacity
+pinned restore arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`
+and falls back to the regular client buffer allocator if it is unavailable or
+exhausted. LOCAL_DISK replicas are restored on the owner via the offload RPC
+and then scatter object-byte ranges into already `register_buffer`'d
+destinations (the reader does not need a setup local buffer). DISK replicas
+`BatchGet` into a temporary host buffer and scatter by `src_offset`. If a key
+has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
+it has only NOF replicas — `batch_get_session_start` returns
+`INVALID_REPLICA` for that key and does not open a session. Put sessions
+reserve object space via Master `BatchPutStart` and finalize with
+`BatchPutEnd`.
 
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where

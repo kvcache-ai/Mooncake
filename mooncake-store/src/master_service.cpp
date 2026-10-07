@@ -33,6 +33,8 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "common/network.h"
+#include "config/dfs_enablement_config.h"
+#include "config/master_metadata_config.h"
 #include "environ.h"
 #include "segment.h"
 #include "segment/region_driver.h"
@@ -250,16 +252,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument("Invalid soft-pin TTL configuration");
     }
 
-    // Initialize HTTP metadata key prefix (read env var once at startup)
-    const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
-    if (custom_prefix && std::strlen(custom_prefix) > 0) {
-        http_metadata_prefix_ = "mooncake/" + std::string(custom_prefix);
-        if (http_metadata_prefix_.back() != '/') {
-            http_metadata_prefix_ += '/';
-        }
-    } else {
-        http_metadata_prefix_ = "mooncake/";
-    }
+    // Initialize the HTTP metadata key prefix from its component-owned
+    // startup configuration.
+    http_metadata_prefix_ =
+        MasterMetadataConfig::FromEnvironment().HttpMetadataPrefix();
     if (allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST) {
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
@@ -606,8 +602,7 @@ tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
 
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
-    enable_dfs_ = Environ::GetBool(
-        "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
+    enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled;
     if (!enable_dfs_) return;
 
     if (config.enable_snapshot || config.enable_snapshot_restore ||
@@ -786,10 +781,19 @@ void MasterService::StopBatchOpLogWriter() {
 }
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
-    return {
+    TieredStorageUsageSnapshot snapshot{
         .memory = segment_manager_.GetMemoryUsageSnapshot(),
         .nof = nof_segment_manager_.GetUsageSnapshot(),
     };
+    if (enable_dfs_ && dfs_allocator_ && dfs_allocator_->IsInitialized()) {
+        snapshot.dfs = {
+            .enabled = true,
+            .used_bytes = dfs_allocator_->GetUsedBytes(),
+            .capacity_bytes = dfs_allocator_->GetTotalCapacity(),
+            .file_count = dfs_allocator_->GetFileCount(),
+        };
+    }
+    return snapshot;
 }
 
 bool MasterService::IsTenantQuotaEnabled() const {
@@ -3311,62 +3315,50 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
     const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
     const TenantId& tenant_id) {
     if (keys.empty()) return {};
-    if (policy.lease_mode == ProbeLeaseMode::None) {
-        return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/false);
+    const char* invalid_reason = nullptr;
+    if (policy.lease_mode != ProbeLeaseMode::None &&
+        policy.lease_mode != ProbeLeaseMode::LastHitOnly) {
+        invalid_reason = "unknown lease mode";
+    } else if (policy.lease_mode == ProbeLeaseMode::LastHitOnly) {
+        if (policy.candidate_size == 0) {
+            invalid_reason = "candidate_size is zero";
+        } else if (keys.size() % policy.candidate_size != 0) {
+            invalid_reason = "key count is not divisible by candidate_size";
+        }
     }
-    if (policy.lease_mode != ProbeLeaseMode::LastHitOnly ||
-        policy.candidate_size == 0 ||
-        keys.size() % policy.candidate_size != 0) {
+    if (invalid_reason != nullptr) {
+        LOG(WARNING) << "BatchProbeKey: " << invalid_reason
+                     << ", lease_mode=" << static_cast<int>(policy.lease_mode)
+                     << ", candidate_size=" << policy.candidate_size
+                     << ", key_count=" << keys.size();
         return std::vector<tl::expected<bool, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
-    std::vector<tl::expected<bool, ErrorCode>> results(keys.size(), false);
+    auto results = BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/false);
+    if (policy.lease_mode == ProbeLeaseMode::None) return results;
+
+    const auto is_readable = [](const auto& result) {
+        return result.has_value() && result.value();
+    };
     for (size_t end = keys.size(); end > 0; end -= policy.candidate_size) {
         const size_t begin = end - policy.candidate_size;
-        std::map<size_t, std::vector<size_t>> indices_by_shard;
-        for (size_t i = begin; i < end; ++i) {
-            indices_by_shard[getShardIndex(normalized_tenant, keys[i])]
-                .push_back(i);
+        if (!std::all_of(results.begin() + begin, results.begin() + end,
+                         is_readable)) {
+            continue;
         }
 
-        // Lock only this candidate's distinct shards, in ascending order.
-        // Keep eviction excluded until every member is checked and leased;
-        // do not reenter accessors that would acquire these locks again.
-        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-        std::vector<std::unique_ptr<MetadataShardAccessorRO>> shards;
-        shards.reserve(indices_by_shard.size());
-        std::unordered_set<const ObjectMetadata*> objects;
-        bool complete = true;
-        for (const auto& [shard_idx, indices] : indices_by_shard) {
-            shards.push_back(
-                std::make_unique<MetadataShardAccessorRO>(this, shard_idx));
-            const auto& shard = *shards.back();
-            auto tenant_it = shard->tenants.find(normalized_tenant);
-            if (tenant_it == shard->tenants.end()) {
-                complete = false;
-                break;
-            }
-            for (const size_t i : indices) {
-                auto it = tenant_it->second.metadata.find(keys[i]);
-                if (it == tenant_it->second.metadata.end() ||
-                    !it->second.IsValid() || !HasReadableReplica(it->second)) {
-                    complete = false;
-                    break;
-                }
-                objects.insert(&it->second);
-            }
-            if (!complete) break;
+        const std::vector<std::string> candidate(keys.begin() + begin,
+                                                 keys.begin() + end);
+        auto leased =
+            BatchExistKeyImpl(candidate, tenant_id, /*grant_lease=*/true);
+        // Recheck under the existing per-shard locks. Publish the fresh
+        // results so a candidate lost since probing cannot remain all-true.
+        // Failed candidates may retain partial leases until their TTL expires.
+        std::copy(leased.begin(), leased.end(), results.begin() + begin);
+        if (std::all_of(leased.begin(), leased.end(), is_readable)) {
+            break;
         }
-        if (!complete) continue;
-
-        for (const auto* object : objects) {
-            object->GrantReadLease(
-                std::chrono::milliseconds(default_kv_lease_ttl_));
-        }
-        std::fill(results.begin() + begin, results.begin() + end, true);
-        break;
     }
     return results;
 }
@@ -3556,6 +3548,44 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
         return tl::make_unexpected(err);
     }
     return status;
+}
+
+tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
+    const std::string& segment_name, SegmentStatus status) {
+    if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    for (const auto& [_, job] : drain_jobs_) {
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        if (job->status == JobStatus::SUCCEEDED ||
+            job->status == JobStatus::FAILED ||
+            job->status == JobStatus::CANCELED) {
+            continue;
+        }
+        const auto& sources = job->request.segments;
+        if (std::find(sources.begin(), sources.end(), segment_name) !=
+            sources.end()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentStatus current = SegmentStatus::UNDEFINED;
+    auto err = segment_access.GetSegmentStatusByName(segment_name, current);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    if (current != SegmentStatus::OK && current != SegmentStatus::DRAINING) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    err = segment_access.SetSegmentStatusByName(segment_name, status);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
@@ -4595,6 +4625,15 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
                 const auto& metadata = metadata_it->second;
                 auto replica_list = GetReadableReplicaDescriptors(metadata);
+
+                if (dfs_allocator_) {
+                    for (const auto& replica : replica_list) {
+                        if (replica.is_dfs_replica()) {
+                            const auto& desc = replica.get_dfs_descriptor();
+                            dfs_allocator_->UpdateAccess(key, desc);
+                        }
+                    }
+                }
 
                 if (replica_list.empty()) {
                     if (metadata.AllReplicas([](const Replica& replica) {
@@ -14075,6 +14114,9 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
+    // Held until the job is registered so SetSegmentStatus never sees a
+    // segment this job has marked DRAINING without also seeing the job.
+    std::lock_guard<std::mutex> lock(job_mutex_);
     std::vector<std::string> draining_segments;
     {
         ScopedSegmentAccess segment_access =
@@ -14106,12 +14148,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     job->last_updated_at = job->created_at;
     job->status = JobStatus::CREATED;
     job->message = "Drain job created";
-
-    {
-        std::lock_guard<std::mutex> lock(job_mutex_);
-        drain_jobs_.emplace(job->id, job);
-    }
-
+    drain_jobs_.emplace(job->id, job);
     return job->id;
 }
 

@@ -127,8 +127,8 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 class MasterService {
     friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
-    friend class MasterSnapshotManager;    // Allow access to internal state for
-                                           // snapshot
+    friend class MasterSnapshotManager;  // Allow access to internal state for
+                                         // snapshot
     friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
@@ -897,6 +897,15 @@ class MasterService {
         const UUID& segment_id);
 
     /**
+     * @brief Switch a segment between OK and DRAINING without a drain job.
+     * DRAINING stops new allocations on the segment while its existing
+     * replicas stay readable. Rejected while an unfinished drain job lists
+     * the segment as a source.
+     */
+    tl::expected<void, ErrorCode> SetSegmentStatus(
+        const std::string& segment_name, SegmentStatus status);
+
+    /**
      * @brief Restore primary state from standby promotion context.
      * Called once at promotion time before serving requests.
      */
@@ -1654,15 +1663,15 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                     // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double eviction_ratio_;                 // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
     // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
     // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
     // sufficient once quotas partition the pool.
     const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
-    const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
 
     // Eviction thread related members
     std::thread eviction_thread_;

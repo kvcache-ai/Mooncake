@@ -155,11 +155,11 @@ TEST_F(DummyClientProbeKeyTest, LastHitOnlyPolicySurvivesBothRpcBoundaries) {
     for (const auto &key : {"a", "b", "c"}) PutData(key, "state");
     const GrantLeasePolicy policy{ProbeLeaseMode::LastHitOnly, 2};
     EXPECT_EQ(dummy_client_->batchProbeKey({"a", "b", "c", "missing"}, policy),
-              (std::vector<int>{1, 1, 0, 0}));
+              (std::vector<int>{1, 1, 1, 0}));
     EXPECT_EQ(dummy_client_->batchProbeKey({"a", "missing", "b", "c"}, policy),
-              (std::vector<int>{0, 0, 1, 1}));
+              (std::vector<int>{1, 0, 1, 1}));
     EXPECT_EQ(real_client_->batchProbeKey({"a", "b", "b", "c"}, policy),
-              (std::vector<int>{0, 0, 1, 1}));
+              (std::vector<int>{1, 1, 1, 1}));
     EXPECT_EQ(dummy_client_->batchProbeKey({"a", "b", "c"}),
               (std::vector<int>{1, 1, 1}));
     EXPECT_TRUE(dummy_client_->batchProbeKey({}, policy).empty());

@@ -59,6 +59,14 @@ class FakeRegistrationEngine:
         return 0
 
 
+class InterruptAfterUnregisterResult(int):
+    def __new__(cls):
+        return super().__new__(cls, 0)
+
+    def __ne__(self, other) -> bool:
+        raise KeyboardInterrupt("interrupted after unregister returned")
+
+
 class InterruptedTicket:
     status = "COMPLETION_UNKNOWN"
 
@@ -498,6 +506,39 @@ def test_unregister_failure_retains_cleanup_until_retry_succeeds(
     assert released_states == [TerminalTransferState.COMPLETED]
     gc.collect()
     assert token_ref() is None
+
+
+@pytest.mark.parametrize("label", ("source", "target"))
+def test_unregister_interruption_quarantines_before_token_release(label: str) -> None:
+    engine = FakeRegistrationEngine(
+        unregister_results=[InterruptAfterUnregisterResult()]
+    )
+    executor = MooncakeTransferEngineExecutor(engine)
+    released_states: list[TerminalTransferState] = []
+    token_set = AllocationTokenSet((_token(f"{label}-interrupt", released_states),))
+    fragments = (
+        _fragment("runtime-0", storage_address=0x10000),
+        _fragment("runtime-1", storage_address=0x20000),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="after unregister returned"):
+        with _registered(
+            label,
+            engine,
+            executor,
+            fragments,
+            lifetime_tokens=token_set,
+        ):
+            pass
+
+    pending_ids = executor.pending_transfer_ids()
+    assert len(pending_ids) == 1
+    assert executor.pending_transfer_status(pending_ids[0]) == (
+        "COMPLETION_UNKNOWN_RESTART_REQUIRED"
+    )
+    assert released_states == []
+    assert token_set.pending
+    assert engine.unregister_calls == [0x20000]
 
 
 @pytest.mark.parametrize("label", ("source", "target"))

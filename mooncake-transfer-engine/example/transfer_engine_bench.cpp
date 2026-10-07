@@ -44,7 +44,8 @@
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
-    defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
+    defined(USE_MLU) || defined(USE_UBSHMEM) || defined(USE_SUPA) || \
+    defined(USE_SUNRISE)
 #include <cassert>
 
 #if defined(USE_MNNVL) || defined(USE_MUSA) || defined(USE_UBSHMEM)
@@ -53,6 +54,14 @@
 
 #ifdef USE_INTRA_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
+#endif
+
+#if defined(USE_HYLINK)
+#if defined(USE_TENT)
+#include "tent/transport/hylink/hylink_transport.h"
+#else
+#include "transport/hylink_transport/hylink_transport.h"
+#endif
 #endif
 
 #if defined(USE_UBSHMEM)
@@ -90,7 +99,8 @@ DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma",
               "Transfer protocol: "
-              "rdma|barex|tcp|efa|nvlink|musa|nvlink_intra|hip|sunrise_link");
+              "rdma|barex|tcp|efa|nvlink|musa|nvlink_intra|hip|sunrise_link|"
+              "hylink");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -110,7 +120,8 @@ DEFINE_string(backend, "classic", "Backend to use: classic|tent");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
-    defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
+    defined(USE_MLU) || defined(USE_UBSHMEM) || defined(USE_SUPA) || \
+    defined(USE_SUNRISE)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU/NPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0,
@@ -123,7 +134,8 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
-    defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
+    defined(USE_MLU) || defined(USE_UBSHMEM) || defined(USE_SUPA) || \
+    defined(USE_SUNRISE)
     if (from_vram) {
         int gpu_id;
         if (FLAGS_gpu_id == -1) {
@@ -166,6 +178,19 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
             LOG(ERROR) << "--protocol=ubshmem requires USE_UBSHMEM=ON";
             return nullptr;
 #endif
+        } else if (FLAGS_protocol == "hylink") {
+#if defined(USE_HYLINK)
+#if defined(USE_TENT)
+            d_buf = mooncake::tent::HylinkTransport::allocateFabricMemory(size);
+            LOG(INFO) << "Using TENT hylink fabric memory allocation";
+#else
+            d_buf = mooncake::HylinkTransport::allocateFabricMemory(size);
+            LOG(INFO) << "Using hylink fabric memory allocation";
+#endif
+#else
+            LOG(ERROR) << "--protocol=hylink requires USE_HYLINK=ON";
+            return nullptr;
+#endif
         } else {
 #ifndef USE_UBSHMEM
             checkCudaError(cudaMalloc(&d_buf, size),
@@ -196,7 +221,8 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
 static void freeMemoryPool(void* addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
-    defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
+    defined(USE_MLU) || defined(USE_UBSHMEM) || defined(USE_SUPA) || \
+    defined(USE_SUNRISE)
     if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "musa" ||
         FLAGS_protocol == "hip") {
 #if defined(USE_MNNVL) || defined(USE_MUSA)
@@ -216,6 +242,17 @@ static void freeMemoryPool(void* addr, size_t size) {
 #ifdef USE_UBSHMEM
         if (FLAGS_use_vram) {
             freeFabricMemory(addr);
+            return;
+        }
+#endif
+    } else if (FLAGS_protocol == "hylink") {
+#if defined(USE_HYLINK)
+        if (FLAGS_use_vram) {
+#if defined(USE_TENT)
+            mooncake::tent::HylinkTransport::freeFabricMemory(addr);
+#else
+            mooncake::HylinkTransport::freeFabricMemory(addr);
+#endif
             return;
         }
 #endif
@@ -298,7 +335,7 @@ std::atomic<size_t> total_batch_count(0);
 static inline void setWorkerDeviceIfNeeded() {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
-    defined(USE_SUPA) || defined(USE_SUNRISE)
+    defined(USE_MLU) || defined(USE_SUPA) || defined(USE_SUNRISE)
     if (FLAGS_use_vram && FLAGS_gpu_id >= 0) {
         checkCudaError(cudaSetDevice(FLAGS_gpu_id),
                        "Failed to set device in worker");
@@ -310,7 +347,7 @@ static inline void setWorkerDeviceIfNeeded() {
 static int determineBufferCount() {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
-    defined(USE_SUPA) || defined(USE_SUNRISE)
+    defined(USE_MLU) || defined(USE_SUPA) || defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
@@ -342,7 +379,8 @@ static std::vector<void*> allocateBuffers() {
     std::vector<void*> addr(buffer_num);
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
-    defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
+    defined(USE_MLU) || defined(USE_UBSHMEM) || defined(USE_SUPA) || \
+    defined(USE_SUNRISE)
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
     }
@@ -366,7 +404,8 @@ static void freeBuffers(std::vector<void*>& addr) {
 static std::string getLocationName(int buffer_id) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
-    defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
+    defined(USE_MLU) || defined(USE_UBSHMEM) || defined(USE_SUPA) || \
+    defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
         int name_suffix = (FLAGS_gpu_id == -1) ? buffer_id : FLAGS_gpu_id;
         return std::string(GPU_PREFIX) + std::to_string(name_suffix);
@@ -514,7 +553,7 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
         xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
                FLAGS_protocol == "musa" || FLAGS_protocol == "hip" ||
-               FLAGS_protocol == "nvlink_intra" ||
+               FLAGS_protocol == "hylink" || FLAGS_protocol == "nvlink_intra" ||
                FLAGS_protocol == "ubshmem" ||
                FLAGS_protocol == "sunrise_link" || FLAGS_protocol == "flagcx") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
@@ -675,6 +714,29 @@ std::shared_ptr<mooncake::tent::Config> createTentConfig() {
     config->set("metadata_servers", metadata_servers);
     config->set("local_segment_name", FLAGS_local_server_name);
     config->set("verbose", true);
+
+    // --protocol=hylink forces the TENT hylink transport and turns off the
+    // network fallbacks so a successful run cannot have gone through RDMA/TCP.
+#if defined(USE_HYLINK)
+    if (FLAGS_protocol == "hylink") {
+        config->set("transports/hylink/enable", true);
+        config->set("transports/rdma/enable", false);
+        config->set("transports/tcp/enable", false);
+        config->set("transports/hp_tcp/enable", false);
+        config->set("transports/shm/enable", false);
+        mooncake::tent::json policy = mooncake::tent::json::array(
+            {mooncake::tent::json{{"name", "hylink_memory"},
+                                  {"segment_type", "memory"},
+                                  {"transports", {"hylink"}}}});
+        config->set("policy", policy);
+        LOG(INFO) << "TENT hylink mode: RDMA/TCP/SHM disabled, policy=hylink";
+    }
+#else
+    if (FLAGS_protocol == "hylink") {
+        LOG(ERROR) << "--protocol=hylink requires -DUSE_HYLINK=ON";
+        exit(EXIT_FAILURE);
+    }
+#endif
 
     return config;
 }

@@ -153,9 +153,9 @@ class MasterClient {
 
     /**
      * @brief Probe multiple objects, optionally leasing the last complete
-     * candidate. LastHitOnly returns a selected-only mask, not existence.
+     * candidate. LastHitOnly leases the last all-true candidate in the results.
      * @param object_keys Vector of keys to query
-     * @return Per-key existence results (None) or a selected-only mask
+     * @return Per-key existence results in input order
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
         const std::vector<std::string>& object_keys,

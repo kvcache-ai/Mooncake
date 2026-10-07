@@ -22,8 +22,8 @@ class BatchProbePolicyTest : public MasterServiceTest {
                                  : std::chrono::system_clock::time_point{};
     }
 
-    void ExpectMask(const std::vector<tl::expected<bool, ErrorCode>>& result,
-                    const std::vector<bool>& expected) {
+    void ExpectResults(const std::vector<tl::expected<bool, ErrorCode>>& result,
+                       const std::vector<bool>& expected) {
         ASSERT_EQ(result.size(), expected.size());
         for (size_t i = 0; i < result.size(); ++i) {
             ASSERT_TRUE(result[i].has_value()) << i;
@@ -45,17 +45,18 @@ TEST_F(BatchProbePolicyTest, NonePreservesReadAndSoftPinDeadlines) {
     ASSERT_TRUE(soft_pin.has_value());
 
     // candidate_size is deliberately ignored in None mode.
-    ExpectMask(
+    ExpectResults(
         service.BatchProbeKey({ProbeLeaseMode::None, 0},
                               {"key", "missing", "key"}, TenantId::Default()),
         {true, false, true});
     EXPECT_EQ(Deadline(service, "key"), before);
     EXPECT_EQ(GetSoftPinDeadline(service, "key"), soft_pin);
 
-    ExpectMask(service.BatchExistKey({"key"}, TenantId::Default()), {true});
+    ExpectResults(service.BatchExistKey({"key"}, TenantId::Default()), {true});
     EXPECT_GT(Deadline(service, "key"), before);
     const auto leased = Deadline(service, "key");
-    ExpectMask(service.BatchProbeKey({}, {"key"}, TenantId::Default()), {true});
+    ExpectResults(service.BatchProbeKey({}, {"key"}, TenantId::Default()),
+                  {true});
     EXPECT_EQ(Deadline(service, "key"), leased);
 }
 
@@ -76,8 +77,8 @@ TEST_F(BatchProbePolicyTest, SelectsLastCompleteSparseCandidate) {
     const auto partial = Deadline(service, keys[6]);
     const auto chosen = Deadline(service, keys[4]);
     const auto soft_pin = GetSoftPinDeadline(service, keys[4]);
-    ExpectMask(service.BatchProbeKey(kLastPair, keys, TenantId::Default()),
-               {false, false, false, false, true, true, false, false});
+    ExpectResults(service.BatchProbeKey(kLastPair, keys, TenantId::Default()),
+                  {true, true, false, false, true, true, true, false});
     EXPECT_EQ(Deadline(service, keys[0]), old);
     EXPECT_EQ(Deadline(service, keys[6]), partial);
     EXPECT_GT(Deadline(service, keys[4]), chosen);
@@ -99,11 +100,11 @@ TEST_F(BatchProbePolicyTest, OnlySelectedCandidateSurvivesNormalEviction) {
     for (const auto& key : keys) {
         PutCompletedObject(service, context.client_id, key, config);
     }
-    ExpectMask(service.BatchProbeKey(kLastPair, keys, TenantId::Default()),
-               {false, false, true, true});
+    ExpectResults(service.BatchProbeKey(kLastPair, keys, TenantId::Default()),
+                  {true, true, true, true});
     MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
-    ExpectMask(service.BatchProbeKey({}, keys, TenantId::Default()),
-               {false, false, true, true});
+    ExpectResults(service.BatchProbeKey({}, keys, TenantId::Default()),
+                  {false, false, true, true});
 }
 
 TEST_F(BatchProbePolicyTest, IncompleteAndUnreadableCandidatesAreNotLeased) {
@@ -118,8 +119,8 @@ TEST_F(BatchProbePolicyTest, IncompleteAndUnreadableCandidatesAreNotLeased) {
                     .has_value());
     const auto before = Deadline(service, "complete");
     const std::vector<std::string> keys = {"complete", "writing"};
-    ExpectMask(service.BatchProbeKey(kLastPair, keys, TenantId::Default()),
-               {false, false});
+    ExpectResults(service.BatchProbeKey(kLastPair, keys, TenantId::Default()),
+                  {true, false});
     EXPECT_EQ(Deadline(service, "complete"), before);
     ASSERT_TRUE(service
                     .PutEnd(context.client_id, "writing", TenantId::Default(),
@@ -127,8 +128,8 @@ TEST_F(BatchProbePolicyTest, IncompleteAndUnreadableCandidatesAreNotLeased) {
                     .has_value());
     ASSERT_TRUE(service.UnmountSegment(context.segment_id, context.client_id)
                     .has_value());
-    ExpectMask(service.BatchProbeKey(kLastPair, keys, TenantId::Default()),
-               {false, false});
+    ExpectResults(service.BatchProbeKey(kLastPair, keys, TenantId::Default()),
+                  {false, false});
 }
 
 TEST_F(BatchProbePolicyTest, ValidationDoesNotLeaseAndEmptyInputIsEmpty) {
@@ -156,7 +157,7 @@ TEST_F(BatchProbePolicyTest, ValidationDoesNotLeaseAndEmptyInputIsEmpty) {
     EXPECT_TRUE(service.BatchProbeKey({}, {}, TenantId::Default()).empty());
 }
 
-TEST_F(BatchProbePolicyTest, DuplicateKeysAndSameShardAreLockedOnce) {
+TEST_F(BatchProbePolicyTest, DuplicateKeysAndSameShardPreserveExistence) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
     const std::string first = "same-shard-first";
@@ -173,17 +174,18 @@ TEST_F(BatchProbePolicyTest, DuplicateKeysAndSameShardAreLockedOnce) {
     for (const auto& key : {first, second}) {
         PutCompletedObject(service, context.client_id, key, {.replica_num = 1});
     }
-    ExpectMask(service.BatchProbeKey(kLastPair, {first, first, first, second},
-                                     TenantId::Default()),
-               {false, false, true, true});
-    ExpectMask(
+    ExpectResults(
+        service.BatchProbeKey(kLastPair, {first, first, first, second},
+                              TenantId::Default()),
+        {true, true, true, true});
+    ExpectResults(
         service.BatchProbeKey(kLastPair, {"missing", first, first, first},
                               TenantId::Default()),
-        {false, false, true, true});
-    ExpectMask(
+        {false, true, true, true});
+    ExpectResults(
         service.BatchProbeKey({ProbeLeaseMode::LastHitOnly, 1},
                               {first, "missing", second}, TenantId::Default()),
-        {false, false, true});
+        {true, false, true});
 }
 
 TEST_F(BatchProbePolicyTest, PreservesExistingSharedGroupLease) {
@@ -196,13 +198,14 @@ TEST_F(BatchProbePolicyTest, PreservesExistingSharedGroupLease) {
         PutCompletedObject(service, context.client_id, key, config);
     }
     const auto before = Deadline(service, "old");
-    ExpectMask(
+    ExpectResults(
         service.BatchProbeKey({}, {"old", "selected"}, TenantId::Default()),
         {true, true});
     EXPECT_EQ(Deadline(service, "old"), before);
-    ExpectMask(service.BatchProbeKey({ProbeLeaseMode::LastHitOnly, 1},
-                                     {"old", "selected"}, TenantId::Default()),
-               {false, true});
+    ExpectResults(
+        service.BatchProbeKey({ProbeLeaseMode::LastHitOnly, 1},
+                              {"old", "selected"}, TenantId::Default()),
+        {true, true});
     EXPECT_GT(Deadline(service, "old"), before);
     EXPECT_EQ(Deadline(service, "old"), Deadline(service, "selected"));
 }
@@ -224,12 +227,12 @@ TEST_F(BatchProbePolicyTest, TenantIsolationAndErrorsThroughWrapper) {
                                          ReplicaType::MEMORY, tenant);
         for (const auto& item : ended) ASSERT_TRUE(item.has_value());
     }
-    ExpectMask(service.BatchProbeKey(kLastPair, keys, "left"),
-               {true, true, false, false});
-    ExpectMask(service.BatchProbeKey(kLastPair, keys, "right"),
-               {false, false, true, true});
-    ExpectMask(service.BatchProbeKey(kLastPair, keys, "unregistered"),
-               {false, false, false, false});
+    ExpectResults(service.BatchProbeKey(kLastPair, keys, "left"),
+                  {true, true, false, false});
+    ExpectResults(service.BatchProbeKey(kLastPair, keys, "right"),
+                  {false, false, true, true});
+    ExpectResults(service.BatchProbeKey(kLastPair, keys, "unregistered"),
+                  {false, false, false, false});
     auto invalid = service.BatchProbeKey(kLastPair, keys, "_invalid-tenant");
     ASSERT_EQ(invalid.size(), keys.size());
     for (const auto& item : invalid) {
@@ -238,42 +241,42 @@ TEST_F(BatchProbePolicyTest, TenantIsolationAndErrorsThroughWrapper) {
     }
 }
 
-TEST_F(BatchProbePolicyTest, ConcurrentRemovalNeverReturnsPartialSelection) {
+TEST_F(BatchProbePolicyTest,
+       ConcurrentRemovalPreservesLeasedSelectionOrFallback) {
     MasterService service(
         MasterServiceConfig::builder().set_default_kv_lease_ttl(60000).build());
     const auto context = PrepareSimpleSegment(service);
     for (int iteration = 0; iteration < 64; ++iteration) {
         std::vector<std::string> keys;
-        std::vector<std::chrono::system_clock::time_point> before;
-        for (int part = 0; part < 4; ++part) {
+        for (int part = 0; part < 8; ++part) {
             keys.push_back("race-" + std::to_string(iteration) + "-" +
                            std::to_string(part));
             PutCompletedObject(service, context.client_id, keys.back(),
                                {.replica_num = 1});
-            before.push_back(Deadline(service, keys.back()));
         }
         std::barrier start(2);
         std::thread remover([&] {
             start.arrive_and_wait();
-            for (const auto& key : keys)
-                service.Remove(key, TenantId::Default());
+            for (size_t i = 4; i < keys.size(); ++i)
+                service.Remove(keys[i], TenantId::Default());
         });
         start.arrive_and_wait();
         auto result = service.BatchProbeKey({ProbeLeaseMode::LastHitOnly, 4},
                                             keys, TenantId::Default());
         remover.join();
         ASSERT_EQ(result.size(), keys.size());
-        ASSERT_TRUE(result.front().has_value());
-        ExpectMask(result,
-                   std::vector<bool>(keys.size(), result.front().value()));
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (result.front().value()) {
-                auto removed = service.Remove(keys[i], TenantId::Default());
-                ASSERT_FALSE(removed.has_value());
-                EXPECT_EQ(removed.error(), ErrorCode::OBJECT_HAS_LEASE);
-            } else if (service.ProbeKey(keys[i], TenantId::Default()).value()) {
-                EXPECT_EQ(Deadline(service, keys[i]), before[i]);
-            }
+        for (const auto& item : result) ASSERT_TRUE(item.has_value());
+        for (size_t i = 0; i < 4; ++i) EXPECT_TRUE(result[i].value());
+        const bool last_complete =
+            std::all_of(result.begin() + 4, result.end(),
+                        [](const auto& item) { return item.value(); });
+        const size_t selected = last_complete ? 4 : 0;
+        // Partial results and partial leases on the failed candidate are
+        // allowed. The last all-true candidate must nevertheless be protected.
+        for (size_t i = selected; i < selected + 4; ++i) {
+            auto removed = service.Remove(keys[i], TenantId::Default());
+            ASSERT_FALSE(removed.has_value());
+            EXPECT_EQ(removed.error(), ErrorCode::OBJECT_HAS_LEASE);
         }
     }
 }
