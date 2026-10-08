@@ -12,6 +12,7 @@
 #include <elastic/mooncake_ep_elastic_launch.cuh>
 #include <transport/device/comm_device.cuh>
 #if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#include <jit/elastic_combine_jit.h>
 #include <jit/elastic_dispatch_copy_epilogue_jit.h>
 #include <jit/elastic_dispatch_jit.h>
 #include <jit/elastic_dispatch_prologue_jit.h>
@@ -998,84 +999,160 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
 #endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 }
 
-template <typename Ops>
-void* launch_mooncake_elastic_combine_backend(
+void* launch_mooncake_elastic_combine(
     void* x, float* topk_weights, int* src_metadata,
     int* psum_num_recv_tokens_per_scaleup_rank,
     int* token_metadata_at_forward, int* channel_linked_list,
     int num_reduced_tokens, int num_max_tokens_per_rank, int hidden,
     int num_experts, int num_topk, int num_sms, int num_smem_bytes,
     int num_channels, bool use_expanded_layout, bool allow_multiple_reduction,
-    const ElasticLaunchContext& ctx, const typename Ops::Context& comm_ctx,
-    cudaStream_t stream) {
-    const int num_threads = Ops::kNumCombineWarps * 32;
+    const ElasticLaunchContext& ctx, cudaStream_t stream) {
+    using elastic::transport::IbgdaOps;
+#ifdef USE_NCCL_DEVICE
+    using elastic::transport::NcclOps;
+    const int num_combine_warps = ctx.backend == ElasticTransportBackend::kNccl
+                                      ? NcclOps::kNumCombineWarps
+                                      : IbgdaOps::kNumCombineWarps;
+#else
+    if (ctx.backend != ElasticTransportBackend::kIbgda)
+        throw std::invalid_argument(
+            "Mooncake EP was built without NCCL device backend support");
+    const int num_combine_warps = IbgdaOps::kNumCombineWarps;
+#endif
+
     const int smem_bytes = std::max(
-        num_smem_bytes, combine_smem_bytes(hidden, num_topk, Ops::kNumCombineWarps));
+        num_smem_bytes, combine_smem_bytes(hidden, num_topk, num_combine_warps));
     (void)token_metadata_at_forward;
     (void)channel_linked_list;
 
+    // Neither the JIT nor the prebuilt path instantiates these modes.
+    if (use_expanded_layout || !allow_multiple_reduction)
+        unsupported_elastic_config("combine", hidden, num_experts, num_topk,
+                                   num_max_tokens_per_rank, num_sms,
+                                   ctx.num_scaleup_ranks);
+
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
+#ifdef USE_NCCL_DEVICE
         const int hybrid_combine_warps =
-            Ops::kNumHybridScaleupWarps + Ops::kNumHybridForwardWarps;
+            ctx.backend == ElasticTransportBackend::kNccl
+                ? NcclOps::kNumHybridScaleupWarps + NcclOps::kNumHybridForwardWarps
+                : IbgdaOps::kNumHybridScaleupWarps + IbgdaOps::kNumHybridForwardWarps;
+#else
+        const int hybrid_combine_warps =
+            IbgdaOps::kNumHybridScaleupWarps + IbgdaOps::kNumHybridForwardWarps;
+#endif
         const int hybrid_threads = hybrid_combine_warps * 32;
         const int hybrid_smem_bytes = std::max(
             num_smem_bytes,
             combine_smem_bytes(hidden, num_topk, hybrid_combine_warps));
 
-#define LAUNCH_HYBRID_COMBINE(H, E, K, M, S, SO, SU)                           \
+#define LAUNCH_HYBRID_COMBINE(OPS, COMM_CTX, H, E, K, M, S, SO, SU)            \
         do {                                                                   \
-            auto kernel = elastic::hybrid_combine_impl<Ops,                    \
-                false, true, S, Ops::kNumHybridScaleupWarps,                       \
-                Ops::kNumHybridForwardWarps, SO, SU, H, M, E, K,             \
-                Ops::kNumQPs, kElasticTimeoutCycles>;                        \
+            auto kernel = elastic::hybrid_combine_impl<OPS,                    \
+                false, true, S, OPS::kNumHybridScaleupWarps,                   \
+                OPS::kNumHybridForwardWarps, SO, SU, H, M, E, K,               \
+                OPS::kNumQPs, kElasticTimeoutCycles>;                          \
             launch_cooperative(kernel, ctx.device_id, S, hybrid_threads, hybrid_smem_bytes,   \
                                stream, static_cast<nv_bfloat16*>(x),           \
                                topk_weights, src_metadata,                     \
                                psum_num_recv_tokens_per_scaleup_rank,          \
                                token_metadata_at_forward, channel_linked_list, \
-                               comm_ctx, ctx.buffer, ctx.workspace,            \
+                               (COMM_CTX), ctx.buffer, ctx.workspace,          \
                                ctx.scaleout_rank_idx, ctx.scaleup_rank_idx,    \
                                num_reduced_tokens);                            \
         } while (false)
 
-#define TRY_HYBRID_COMBINE(H, E, K, M, S, SO, SU)                              \
+#define TRY_HYBRID_COMBINE(OPS, COMM_CTX, H, E, K, M, S, SO, SU)               \
         if (hidden == H && num_experts == E && num_topk == K &&                \
             num_max_tokens_per_rank == M && num_sms == S &&                   \
             ctx.num_scaleout_ranks == SO && ctx.num_scaleup_ranks == SU &&     \
             allow_multiple_reduction && !use_expanded_layout &&                \
-            num_channels == hybrid_num_channels<Ops>(S) &&                     \
+            num_channels == hybrid_num_channels<OPS>(S) &&                     \
             token_metadata_at_forward != nullptr && channel_linked_list != nullptr) { \
-            LAUNCH_HYBRID_COMBINE(H, E, K, M, S, SO, SU);                      \
+            LAUNCH_HYBRID_COMBINE(OPS, COMM_CTX, H, E, K, M, S, SO, SU);       \
             return hybrid_combine_reduce_buffer_ptr(                            \
                 ctx.buffer, H, K, M, SO, SU, allow_multiple_reduction);         \
         }
 
-#define TRY_HYBRID_COMBINE_SHAPE(H, E, K, M, S)                                \
-        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 4);                               \
-        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8);                               \
-        TRY_HYBRID_COMBINE(H, E, K, M, S, 4, 4)
+#define TRY_HYBRID_COMBINE_SHAPE(OPS, COMM_CTX, H, E, K, M, S)                 \
+        TRY_HYBRID_COMBINE(OPS, COMM_CTX, H, E, K, M, S, 2, 4);                \
+        TRY_HYBRID_COMBINE(OPS, COMM_CTX, H, E, K, M, S, 2, 8);                \
+        TRY_HYBRID_COMBINE(OPS, COMM_CTX, H, E, K, M, S, 4, 4)
 
-        TRY_HYBRID_COMBINE_SHAPE(4096, 256, 8, 128, 24);
+        // hybrid_combine_impl is still prebuilt, so instantiate it per backend.
+#ifdef USE_NCCL_DEVICE
+        if (ctx.backend == ElasticTransportBackend::kNccl) {
+            TRY_HYBRID_COMBINE_SHAPE(NcclOps, ctx.nccl, 4096, 256, 8, 128, 24);
+        }
+#endif
+        if (ctx.backend == ElasticTransportBackend::kIbgda) {
+            TRY_HYBRID_COMBINE_SHAPE(IbgdaOps, make_comm_ctx(ctx), 4096, 256, 8,
+                                     128, 24);
+        }
 
 #undef TRY_HYBRID_COMBINE_SHAPE
 #undef TRY_HYBRID_COMBINE
 #undef LAUNCH_HYBRID_COMBINE
+        // Do not fall through to the non-hybrid kernel on a hybrid topology.
+        unsupported_elastic_config("hybrid_combine", hidden, num_experts,
+                                   num_topk, num_max_tokens_per_rank, num_sms,
+                                   ctx.num_scaleup_ranks);
     }
 #endif
 
     (void)num_channels;
 
+#ifdef USE_NCCL_DEVICE
+    if (ctx.backend == ElasticTransportBackend::kNccl) {
+        const elastic::CombineKernelArgs<NcclOps> args {
+            static_cast<nv_bfloat16*>(x),
+            topk_weights,
+            src_metadata,
+            psum_num_recv_tokens_per_scaleup_rank,
+            ctx.nccl,
+            ctx.buffer,
+            ctx.workspace,
+            ctx.scaleup_rank_idx,
+            num_reduced_tokens,
+        };
+        jit::launch_elastic_combine_jit(
+            ctx.backend, num_combine_warps, num_sms, ctx.num_scaleup_ranks,
+            hidden, num_max_tokens_per_rank, num_experts, num_topk, smem_bytes,
+            &args, stream);
+        return ctx.buffer;
+    }
+#endif
+
+    const elastic::CombineKernelArgs<IbgdaOps> args {
+        static_cast<nv_bfloat16*>(x),
+        topk_weights,
+        src_metadata,
+        psum_num_recv_tokens_per_scaleup_rank,
+        make_comm_ctx(ctx),
+        ctx.buffer,
+        ctx.workspace,
+        ctx.scaleup_rank_idx,
+        num_reduced_tokens,
+    };
+
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+    jit::launch_elastic_combine_jit(
+        ctx.backend, num_combine_warps, num_sms, ctx.num_scaleup_ranks, hidden,
+        num_max_tokens_per_rank, num_experts, num_topk, smem_bytes, &args,
+        stream);
+    return ctx.buffer;
+#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+    // MUSA / MACA builds have no NCCL backend.
+    using Ops = IbgdaOps;
+    const int num_threads = num_combine_warps * 32;
+
 #define LAUNCH_COMBINE(H, E, K, M, S, R)                                       \
     do {                                                                       \
-        auto kernel = elastic::combine_impl<Ops, true, false, true, S,         \
+        auto kernel = elastic::combine<Ops, true, false, true, S,              \
             Ops::kNumCombineWarps, R, H, M, E, K, Ops::kNumQPs,           \
             kElasticTimeoutCycles>;                                           \
-        launch_cooperative(kernel, ctx.device_id, S, num_threads, smem_bytes, stream,         \
-                           static_cast<nv_bfloat16*>(x), topk_weights,         \
-                           src_metadata, psum_num_recv_tokens_per_scaleup_rank,\
-                           comm_ctx, ctx.buffer, ctx.workspace,                \
-                           ctx.scaleup_rank_idx, num_reduced_tokens);          \
+        launch_cooperative(kernel, ctx.device_id, S, num_threads, smem_bytes, stream, args); \
     } while (false)
 
 #define TRY_COMBINE(H, E, K, M, S, R)                                          \
@@ -1100,39 +1177,7 @@ void* launch_mooncake_elastic_combine_backend(
     unsupported_elastic_config("combine", hidden, num_experts, num_topk,
                                num_max_tokens_per_rank, num_sms,
                                ctx.num_scaleup_ranks);
-}
-
-void* launch_mooncake_elastic_combine(
-    void* x, float* topk_weights, int* src_metadata,
-    int* psum_num_recv_tokens_per_scaleup_rank,
-    int* token_metadata_at_forward, int* channel_linked_list,
-    int num_reduced_tokens, int num_max_tokens_per_rank, int hidden,
-    int num_experts, int num_topk, int num_sms, int num_smem_bytes,
-    int num_channels, bool use_expanded_layout, bool allow_multiple_reduction,
-    const ElasticLaunchContext& ctx, cudaStream_t stream) {
-#ifdef USE_NCCL_DEVICE
-    if (ctx.backend == ElasticTransportBackend::kNccl) {
-        return launch_mooncake_elastic_combine_backend<
-            elastic::transport::NcclOps>(
-            x, topk_weights, src_metadata,
-            psum_num_recv_tokens_per_scaleup_rank, token_metadata_at_forward,
-            channel_linked_list, num_reduced_tokens,
-            num_max_tokens_per_rank, hidden, num_experts, num_topk, num_sms,
-            num_smem_bytes, num_channels, use_expanded_layout,
-            allow_multiple_reduction, ctx, ctx.nccl, stream);
-    }
-#endif
-    if (ctx.backend != ElasticTransportBackend::kIbgda)
-        throw std::invalid_argument(
-            "Mooncake EP was built without NCCL device backend support");
-    const auto comm_ctx = make_comm_ctx(ctx);
-    return launch_mooncake_elastic_combine_backend<
-        elastic::transport::IbgdaOps>(
-        x, topk_weights, src_metadata,
-        psum_num_recv_tokens_per_scaleup_rank, token_metadata_at_forward,
-        channel_linked_list, num_reduced_tokens, num_max_tokens_per_rank,
-        hidden, num_experts, num_topk, num_sms, num_smem_bytes, num_channels,
-        use_expanded_layout, allow_multiple_reduction, ctx, comm_ctx, stream);
+#endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 }
 
 template <int kNumEpilogueWarps>
