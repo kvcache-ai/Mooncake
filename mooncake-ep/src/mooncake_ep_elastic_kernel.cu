@@ -14,6 +14,7 @@
 #if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 #include <jit/elastic_dispatch_jit.h>
 #include <jit/elastic_dispatch_prologue_jit.h>
+#include <jit/elastic_hybrid_dispatch_jit.h>
 #endif
 
 namespace mooncake {
@@ -559,139 +560,165 @@ void launch_mooncake_elastic_dispatch(
     }
 #endif
 
+    // Neither the JIT nor the prebuilt path instantiates these modes.
+    if (expert_alignment != 1 || do_cpu_sync)
+        unsupported_elastic_config("dispatch", hidden, num_experts, num_topk,
+                                   num_max_tokens_per_rank, num_sms,
+                                   ctx.num_scaleup_ranks);
+
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
         const bool hybrid_reuse_slot_indices = cached_mode;
 #ifdef USE_NCCL_DEVICE
-        const int hybrid_dispatch_warps =
+        const int hybrid_scaleout_warps =
             ctx.backend == ElasticTransportBackend::kNccl
-                ? NcclOps::kNumHybridScaleoutWarps + NcclOps::kNumHybridForwardWarps
-                : IbgdaOps::kNumHybridScaleoutWarps + IbgdaOps::kNumHybridForwardWarps;
+                ? NcclOps::kNumHybridScaleoutWarps
+                : IbgdaOps::kNumHybridScaleoutWarps;
+        const int hybrid_forward_warps =
+            ctx.backend == ElasticTransportBackend::kNccl
+                ? NcclOps::kNumHybridForwardWarps
+                : IbgdaOps::kNumHybridForwardWarps;
 #else
-        const int hybrid_dispatch_warps =
-            IbgdaOps::kNumHybridScaleoutWarps + IbgdaOps::kNumHybridForwardWarps;
+        const int hybrid_scaleout_warps = IbgdaOps::kNumHybridScaleoutWarps;
+        const int hybrid_forward_warps = IbgdaOps::kNumHybridForwardWarps;
 #endif
-        const int hybrid_threads =
-            (num_notify_warps + hybrid_dispatch_warps) * 32;
         const int hybrid_smem_bytes = std::max(
             num_smem_bytes,
             dispatch_smem_bytes(hidden, elem_size, num_sf_packs, num_topk,
                                 ctx.num_scaleout_ranks * ctx.num_scaleup_ranks,
                                 num_experts, num_notify_warps,
-                                hybrid_dispatch_warps));
+                                hybrid_scaleout_warps + hybrid_forward_warps));
 
-#define LAUNCH_HYBRID_DISPATCH(OPS, COMM_CTX, HB, SFP, E, K, M, S, SO, SU)     \
+#ifdef USE_NCCL_DEVICE
+        if (ctx.backend == ElasticTransportBackend::kNccl) {
+            const elastic::HybridDispatchKernelArgs<NcclOps> args {
+                x,
+                static_cast<sf_pack_t*>(sf),
+                topk_idx,
+                topk_weights,
+                copied_topk_idx,
+                cumulative_local_expert_recv_stats,
+                psum_num_recv_tokens_per_scaleup_rank,
+                psum_num_recv_tokens_per_expert,
+                dst_buffer_slot_idx,
+                token_metadata_at_forward,
+                num_tokens,
+                sf_token_stride,
+                sf_hidden_stride,
+                ctx.nccl,
+                ctx.buffer,
+                ctx.workspace,
+                ctx.mapped_host_workspace,
+                ctx.scaleout_rank_idx,
+                ctx.scaleup_rank_idx,
+            };
+            jit::launch_elastic_hybrid_dispatch_jit(
+                ctx.backend, hybrid_reuse_slot_indices, num_notify_warps,
+                hybrid_scaleout_warps, hybrid_forward_warps, num_sms,
+                ctx.num_scaleout_ranks, ctx.num_scaleup_ranks,
+                hidden * elem_size, num_sf_packs, num_max_tokens_per_rank,
+                num_experts, num_topk, hybrid_smem_bytes, &args, stream);
+            return;
+        }
+#endif
+
+        const elastic::HybridDispatchKernelArgs<IbgdaOps> args {
+            x,
+            static_cast<sf_pack_t*>(sf),
+            topk_idx,
+            topk_weights,
+            copied_topk_idx,
+            cumulative_local_expert_recv_stats,
+            psum_num_recv_tokens_per_scaleup_rank,
+            psum_num_recv_tokens_per_expert,
+            dst_buffer_slot_idx,
+            token_metadata_at_forward,
+            num_tokens,
+            sf_token_stride,
+            sf_hidden_stride,
+            make_comm_ctx(ctx),
+            ctx.buffer,
+            ctx.workspace,
+            ctx.mapped_host_workspace,
+            ctx.scaleout_rank_idx,
+            ctx.scaleup_rank_idx,
+        };
+
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+        jit::launch_elastic_hybrid_dispatch_jit(
+            ctx.backend, hybrid_reuse_slot_indices, num_notify_warps,
+            hybrid_scaleout_warps, hybrid_forward_warps, num_sms,
+            ctx.num_scaleout_ranks, ctx.num_scaleup_ranks, hidden * elem_size,
+            num_sf_packs, num_max_tokens_per_rank, num_experts, num_topk,
+            hybrid_smem_bytes, &args, stream);
+        return;
+#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+        const int hybrid_threads =
+            (num_notify_warps + hybrid_scaleout_warps + hybrid_forward_warps) *
+            32;
+
+#define LAUNCH_HYBRID_DISPATCH(OPS, HB, SFP, E, K, M, S, SO, SU)               \
         do {                                                                   \
             constexpr int kHiddenBytes = (HB);                                 \
             constexpr int kNumSFPacks = (SFP);                                 \
             if (cached_mode) {                                                 \
-                auto kernel = elastic::hybrid_dispatch_impl<OPS,               \
+                auto kernel = elastic::hybrid_dispatch<OPS,                    \
                     false, true, S, 0, OPS::kNumHybridScaleoutWarps,               \
                     OPS::kNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
                     kNumSFPacks, M, E, K, 1, OPS::kNumQPs,                   \
                     kElasticTimeoutCycles>;                                    \
                 launch_cooperative(kernel, ctx.device_id, S, hybrid_threads,                  \
-                                   hybrid_smem_bytes, stream, x,               \
-                                   static_cast<sf_pack_t*>(sf), topk_idx,      \
-                                   topk_weights, copied_topk_idx,              \
-                                   cumulative_local_expert_recv_stats,         \
-                                   psum_num_recv_tokens_per_scaleup_rank,      \
-                                   psum_num_recv_tokens_per_expert,            \
-                                   dst_buffer_slot_idx,                        \
-                                   token_metadata_at_forward, num_tokens,      \
-                                   sf_token_stride, sf_hidden_stride,          \
-                                   (COMM_CTX), ctx.buffer, ctx.workspace,      \
-                                   ctx.mapped_host_workspace,                  \
-                                   ctx.scaleout_rank_idx,                      \
-                                   ctx.scaleup_rank_idx);                      \
+                                   hybrid_smem_bytes, stream, args);           \
             } else if (hybrid_reuse_slot_indices) {                            \
-                auto kernel = elastic::hybrid_dispatch_impl<OPS,               \
+                auto kernel = elastic::hybrid_dispatch<OPS,                    \
                     false, true, S, kElasticNumNotifyWarps,                    \
                     OPS::kNumHybridScaleoutWarps,                              \
                     OPS::kNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
                     kNumSFPacks, M, E, K, 1, OPS::kNumQPs,                   \
                     kElasticTimeoutCycles>;                                    \
                 launch_cooperative(kernel, ctx.device_id, S, hybrid_threads,                  \
-                                   hybrid_smem_bytes, stream, x,               \
-                                   static_cast<sf_pack_t*>(sf), topk_idx,      \
-                                   topk_weights, copied_topk_idx,              \
-                                   cumulative_local_expert_recv_stats,         \
-                                   psum_num_recv_tokens_per_scaleup_rank,      \
-                                   psum_num_recv_tokens_per_expert,            \
-                                   dst_buffer_slot_idx,                        \
-                                   token_metadata_at_forward, num_tokens,      \
-                                   sf_token_stride, sf_hidden_stride,          \
-                                   (COMM_CTX), ctx.buffer, ctx.workspace,      \
-                                   ctx.mapped_host_workspace,                  \
-                                   ctx.scaleout_rank_idx,                      \
-                                   ctx.scaleup_rank_idx);                      \
+                                   hybrid_smem_bytes, stream, args);           \
             } else {                                                           \
-                auto kernel = elastic::hybrid_dispatch_impl<OPS,               \
+                auto kernel = elastic::hybrid_dispatch<OPS,                    \
                     false, false, S, kElasticNumNotifyWarps,                   \
                     OPS::kNumHybridScaleoutWarps,                              \
                     OPS::kNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
                     kNumSFPacks, M, E, K, 1, OPS::kNumQPs,                   \
                     kElasticTimeoutCycles>;                                    \
                 launch_cooperative(kernel, ctx.device_id, S, hybrid_threads,                  \
-                                   hybrid_smem_bytes, stream, x,               \
-                                   static_cast<sf_pack_t*>(sf), topk_idx,      \
-                                   topk_weights, copied_topk_idx,              \
-                                   cumulative_local_expert_recv_stats,         \
-                                   psum_num_recv_tokens_per_scaleup_rank,      \
-                                   psum_num_recv_tokens_per_expert,            \
-                                   dst_buffer_slot_idx,                        \
-                                   token_metadata_at_forward, num_tokens,      \
-                                   sf_token_stride, sf_hidden_stride,          \
-                                   (COMM_CTX), ctx.buffer, ctx.workspace,      \
-                                   ctx.mapped_host_workspace,                  \
-                                   ctx.scaleout_rank_idx,                      \
-                                   ctx.scaleup_rank_idx);                      \
+                                   hybrid_smem_bytes, stream, args);           \
             }                                                                  \
         } while (false)
 
-#define TRY_HYBRID_DISPATCH_TYPED(OPS, COMM_CTX, H, E, K, M, S, SO, SU, EL, SFP) \
+#define TRY_HYBRID_DISPATCH_TYPED(OPS, H, E, K, M, S, SO, SU, EL, SFP)         \
         if (hidden == H && num_experts == E && num_topk == K &&                \
             num_max_tokens_per_rank == M && num_sms == S &&                   \
             ctx.num_scaleout_ranks == SO && ctx.num_scaleup_ranks == SU &&     \
             elem_size == EL && num_sf_packs == SFP && expert_alignment == 1 && \
             !do_cpu_sync) {                                                    \
-            LAUNCH_HYBRID_DISPATCH(OPS, COMM_CTX, (H) * (EL), SFP, E, K, M, S, SO, SU); \
+            LAUNCH_HYBRID_DISPATCH(OPS, (H) * (EL), SFP, E, K, M, S, SO, SU);  \
             return;                                                            \
         }
 
-#define TRY_HYBRID_DISPATCH(OPS, COMM_CTX, H, E, K, M, S, SO, SU)              \
-        TRY_HYBRID_DISPATCH_TYPED(OPS, COMM_CTX, H, E, K, M, S, SO, SU,        \
+#define TRY_HYBRID_DISPATCH(OPS, H, E, K, M, S, SO, SU)                        \
+        TRY_HYBRID_DISPATCH_TYPED(OPS, H, E, K, M, S, SO, SU,                  \
                                   static_cast<int>(sizeof(nv_bfloat16)), 0);   \
-        TRY_HYBRID_DISPATCH_TYPED(OPS, COMM_CTX, H, E, K, M, S, SO, SU, 1, (H) / 128)
+        TRY_HYBRID_DISPATCH_TYPED(OPS, H, E, K, M, S, SO, SU, 1, (H) / 128)
 
-#define TRY_HYBRID_DISPATCH_SHAPE(OPS, COMM_CTX, H, E, K, M, S)                \
-        TRY_HYBRID_DISPATCH(OPS, COMM_CTX, H, E, K, M, S, 2, 4);               \
-        TRY_HYBRID_DISPATCH(OPS, COMM_CTX, H, E, K, M, S, 2, 8);               \
-        TRY_HYBRID_DISPATCH(OPS, COMM_CTX, H, E, K, M, S, 4, 4)
+#define TRY_HYBRID_DISPATCH_SHAPE(OPS, H, E, K, M, S)                          \
+        TRY_HYBRID_DISPATCH(OPS, H, E, K, M, S, 2, 4);                         \
+        TRY_HYBRID_DISPATCH(OPS, H, E, K, M, S, 2, 8);                         \
+        TRY_HYBRID_DISPATCH(OPS, H, E, K, M, S, 4, 4)
 
-        // hybrid_dispatch_impl is still prebuilt, so instantiate it per backend.
-#ifdef USE_NCCL_DEVICE
-        if (ctx.backend == ElasticTransportBackend::kNccl) {
-            TRY_HYBRID_DISPATCH_SHAPE(NcclOps, ctx.nccl, 4096, 256, 8, 128, 24);
-        }
-#endif
-        if (ctx.backend == ElasticTransportBackend::kIbgda) {
-            TRY_HYBRID_DISPATCH_SHAPE(IbgdaOps, make_comm_ctx(ctx), 4096, 256, 8,
-                                      128, 24);
-        }
+        TRY_HYBRID_DISPATCH_SHAPE(IbgdaOps, 4096, 256, 8, 128, 24);
 
 #undef TRY_HYBRID_DISPATCH_SHAPE
 #undef TRY_HYBRID_DISPATCH
 #undef TRY_HYBRID_DISPATCH_TYPED
 #undef LAUNCH_HYBRID_DISPATCH
+#endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
     }
 #endif
-
-    // Neither the JIT nor the prebuilt path instantiates these modes.
-    if (expert_alignment != 1 || do_cpu_sync)
-        unsupported_elastic_config("dispatch", hidden, num_experts, num_topk,
-                                   num_max_tokens_per_rank, num_sms,
-                                   ctx.num_scaleup_ranks);
 
 #ifdef USE_NCCL_DEVICE
     if (ctx.backend == ElasticTransportBackend::kNccl) {
