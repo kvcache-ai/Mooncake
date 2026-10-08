@@ -324,6 +324,7 @@ struct RpcNameTraits<&WrappedMasterService::QueryTask> {
     static constexpr const char* value = "QueryTask";
 };
 
+
 template <>
 struct RpcNameTraits<&WrappedMasterService::FetchTasks> {
     static constexpr const char* value = "FetchTasks";
@@ -1278,6 +1279,7 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
     timer.LogResponseExpected(result);
     return result;
 }
+
 
 tl::expected<void, ErrorCode> MasterClient::CopyEnd(const std::string& key) {
     return CopyEnd(key, tenant_id_.value());

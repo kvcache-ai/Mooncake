@@ -667,6 +667,7 @@ class MasterClient {
     [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
         const UUID& task_id);
 
+
     /**
      * @brief Fetch tasks assigned to a client
      * @param batch_size Number of tasks to fetch

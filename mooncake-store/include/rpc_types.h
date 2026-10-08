@@ -90,19 +90,52 @@ struct GetReplicaListResponse {
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
 
+// Request-local provider metadata. It travels with client-side cached query
+// results and is never persisted by the Master.
+struct ProviderShardReadContext {
+    uint32_t shard_id = 0;
+    uint64_t size = 0;
+};
+YLT_REFL(ProviderShardReadContext, shard_id, size);
+
+struct ProviderReadContext {
+    ReplicaID replica_id = 0;
+    std::string logical_key;
+    uint32_t total_shard = 1;
+    uint64_t total_size = 0;
+    std::vector<ProviderShardReadContext> shards;
+    bool layout_known = true;
+};
+YLT_REFL(ProviderReadContext, replica_id, logical_key, total_shard, total_size,
+         shards, layout_known);
+
 struct CachedQueryResultResponse {
     bool success;
     GetReplicaListResponse value;
     ErrorCode error;
+    struct_pack::compatible<std::vector<ProviderReadContext>, 1>
+        provider_read_contexts;
 
     CachedQueryResultResponse()
         : success(false), value(), error(ErrorCode::INVALID_PARAMS) {}
-    CachedQueryResultResponse(GetReplicaListResponse&& value_param)
-        : success(true), value(std::move(value_param)), error(ErrorCode::OK) {}
+    CachedQueryResultResponse(
+        GetReplicaListResponse&& value_param,
+        std::vector<ProviderReadContext>&& provider_contexts = {})
+        : success(true),
+          value(std::move(value_param)),
+          error(ErrorCode::OK) {
+        provider_read_contexts.emplace(std::move(provider_contexts));
+    }
     CachedQueryResultResponse(ErrorCode error_param)
         : success(false), value(), error(error_param) {}
+
+    const std::vector<ProviderReadContext>& ProviderReadContexts() const {
+        static const std::vector<ProviderReadContext> kEmpty;
+        return provider_read_contexts.has_value() ? provider_read_contexts.value() : kEmpty;
+    }
 };
-YLT_REFL(CachedQueryResultResponse, success, value, error);
+YLT_REFL(CachedQueryResultResponse, success, value, error,
+         provider_read_contexts);
 
 /**
  * @brief Response structure for GetStorageConfig operation

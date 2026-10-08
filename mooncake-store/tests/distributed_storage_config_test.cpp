@@ -48,6 +48,9 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar legacy_root_dir{"MOONCAKE_DISTRIBUTED_ROOT_DIR"};
     ScopedEnvVar fs_adapter{"MOONCAKE_DFS_FS_ADAPTER"};
     ScopedEnvVar legacy_fs_adapter{"MOONCAKE_DISTRIBUTED_FS_TYPE"};
+    ScopedEnvVar kvcs_mode{"MOONCAKE_KVCS_MODE"};
+    ScopedEnvVar kvcs_socket{"MOONCAKE_KVCS_EFC_SOCKET"};
+    ScopedEnvVar kvcs_query_timeout{"MOONCAKE_KVCS_QUERY_TIMEOUT_MS"};
     ScopedEnvVar health_check{"MOONCAKE_DISTRIBUTED_HEALTH_CHECK"};
     ScopedEnvVar shard_count{"MOONCAKE_DFS_SHARD_COUNT"};
     ScopedEnvVar shard_capacity{"MOONCAKE_DFS_SHARD_CAPACITY"};
@@ -60,6 +63,7 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar deferred_free_seconds{"MOONCAKE_DFS_DEFERRED_FREE_SECONDS"};
     ScopedEnvVar eviction_check_interval{
         "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL"};
+
 };
 
 void ExpectDefaultConfig(const DistributedStorageConfig& config) {
@@ -75,6 +79,7 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(30));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(5));
+    EXPECT_EQ(config.provider_query_timeout_ms, 50u);
 }
 
 DistributedStorageConfig ValidConfig() {
@@ -119,6 +124,7 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     env.eviction_low_watermark.Set("0.65");
     env.deferred_free_seconds.Set("12");
     env.eviction_check_interval.Set("3");
+    env.kvcs_query_timeout.Set("75");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
 
@@ -134,6 +140,7 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
+    EXPECT_EQ(config.provider_query_timeout_ms, 75u);
     EXPECT_TRUE(config.Validate());
     EXPECT_TRUE(config.ValidateForAllocator());
 
@@ -158,6 +165,112 @@ TEST_F(DistributedStorageConfigTest, PreservesAliasPrecedence) {
     const auto preferred = DistributedStorageConfig::FromEnvironment();
     EXPECT_EQ(preferred.fsdir, "/tmp/preferred-dfs");
     EXPECT_EQ(preferred.fs_adapter_type, "hf3fs");
+}
+
+TEST_F(DistributedStorageConfigTest, EfcSocketDoesNotEnableKvcsWithoutOptIn) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    ExpectDefaultConfig(config);
+    EXPECT_FALSE(config.UsesKvcs());
+}
+
+TEST_F(DistributedStorageConfigTest,
+       ExplicitFilesystemAdapterRemainsSelectedWithEfcSocket) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
+    env.fs_adapter.Set("posix");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.fs_adapter_type, "posix");
+    EXPECT_FALSE(config.UsesKvcs());
+    EXPECT_FALSE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, ExplicitKvcsModeSelectsLowLevel) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
+    env.kvcs_mode.Set("low-level");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.fs_adapter_type, "kvcs-lowlevel");
+    EXPECT_TRUE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, KvcsModeEnablesHealthCheckByDefault) {
+    env.kvcs_mode.Set("low-level");
+    const auto config = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_TRUE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, LegacyKvcsModeSelectsLowLevelAdapter) {
+    env.kvcs_mode.Set("kvcs");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.fs_adapter_type, "kvcs-lowlevel");
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_TRUE(config.enable_health_check);
+    EXPECT_TRUE(config.Validate());
+}
+
+TEST_F(DistributedStorageConfigTest, KvcsAdapterEnablesHealthCheckByDefault) {
+    env.fs_adapter.Set("kvcs-lowlevel");
+    const auto config = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_TRUE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, KvcsHealthCheckCanBeExplicitlyDisabled) {
+    env.health_check.Set("false");
+    env.kvcs_mode.Set("low-level");
+    const auto config = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_FALSE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest,
+       KvcsHealthCheckCanBeExplicitlyEnabled) {
+    env.kvcs_mode.Set("low-level");
+    env.health_check.Set("true");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_TRUE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, EfcSocketAndHealthFlagDoNotEnableKvcs) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
+    env.health_check.Set("false");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_FALSE(config.UsesKvcs());
+    EXPECT_FALSE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, NonKvcsAdaptersKeepHealthDisabledByDefault) {
+    for (const char* adapter : {"hf3fs", "posix", "oss"}) {
+        SCOPED_TRACE(adapter);
+        env.fs_adapter.Set(adapter);
+
+        const auto config = DistributedStorageConfig::FromEnvironment();
+
+        EXPECT_FALSE(config.UsesKvcs());
+        EXPECT_FALSE(config.enable_health_check);
+    }
+}
+
+TEST_F(DistributedStorageConfigTest, MissingEfcSocketKeepsDefaultAdapter) {
+    env.kvcs_socket.Set("/tmp/mooncake-kvcs-config-test-missing");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.fs_adapter_type, "hf3fs");
+    EXPECT_FALSE(config.UsesKvcs());
 }
 
 TEST_F(DistributedStorageConfigTest, EmptyPreferredRootOverridesAlias) {
@@ -231,6 +344,20 @@ TEST_F(DistributedStorageConfigTest,
     EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.9);
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_TRUE(logs.empty());
+}
+
+TEST(DistributedStorageConfigValidationTest, AcceptsKvcsQueryHealthCheck) {
+    DistributedStorageConfig config;
+    config.fs_adapter_type = "kvcs-lowlevel";
+    config.enable_health_check = true;
+    EXPECT_TRUE(config.Validate());
+}
+
+TEST(DistributedStorageConfigValidationTest, RejectsZeroProviderQueryTimeout) {
+    DistributedStorageConfig config;
+    config.fs_adapter_type = "kvcs-lowlevel";
+    config.provider_query_timeout_ms = 0;
+    EXPECT_FALSE(config.Validate());
 }
 
 TEST(DistributedStorageConfigValidationTest, RejectsInvalidBaseSettings) {

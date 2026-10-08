@@ -195,10 +195,12 @@ class ObjectStorageAdapterTest : public ::testing::Test {
 
     std::unique_ptr<DistributedStorageBackend> MakeObjectStorageBackend(
         FakeObjectStorageAdapter*& adapter, FileStorageConfig file_config = {},
-        bool enable_health_check = false) const {
+        bool enable_health_check = false,
+        const std::string& fs_adapter_type = "fake-object-storage") const {
         DistributedStorageConfig distributed_config;
         distributed_config.fsdir = root_dir_.string();
         distributed_config.enable_health_check = enable_health_check;
+        distributed_config.fs_adapter_type = fs_adapter_type;
         auto owned_adapter = std::make_unique<FakeObjectStorageAdapter>();
         adapter = owned_adapter.get();
         return std::make_unique<DistributedStorageBackend>(
@@ -241,9 +243,8 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     FakeObjectStorageAdapter* adapter = nullptr;
     auto backend = MakeObjectStorageBackend(adapter);
 
-    EXPECT_EQ(backend->GetStorageMode(),
-              DistributedStorageMode::kObjectStorage);
     EXPECT_TRUE(backend->UsesObjectStorage());
+    EXPECT_FALSE(backend->UsesKvcs());
     ASSERT_TRUE(backend->Init());
     EXPECT_TRUE(adapter->initialized);
     EXPECT_EQ(adapter->init_calls, 1);
@@ -252,6 +253,19 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
 
     ASSERT_TRUE(backend->Init());
     EXPECT_EQ(adapter->init_calls, 1);
+}
+
+TEST_F(ObjectStorageAdapterTest, KvcsModeIsDistinguishedFromOtherObjectStores) {
+    FileStorageConfig file_config;
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = root_dir_.string();
+    distributed_config.fs_adapter_type = "kvcs-lowlevel";
+    auto owned_adapter = std::make_unique<FakeObjectStorageAdapter>();
+    DistributedStorageBackend backend(file_config, distributed_config, nullptr,
+                                      std::move(owned_adapter));
+
+    EXPECT_TRUE(backend.UsesObjectStorage());
+    EXPECT_TRUE(backend.UsesKvcs());
 }
 
 TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRejectsDfsRequests) {
@@ -268,6 +282,45 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRejectsDfsRequests) {
     ASSERT_EQ(read_results.size(), 1);
     ASSERT_FALSE(read_results.front());
     EXPECT_EQ(read_results.front().error(), ErrorCode::NOT_SUPPORTED);
+}
+
+TEST_F(ObjectStorageAdapterTest, KvcsModeRunsEnabledHealthCheck) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter, {}, true,
+                                            "kvcs-lowlevel");
+
+    ASSERT_TRUE(backend->Init());
+    EXPECT_EQ(adapter->init_calls, 1);
+    EXPECT_EQ(adapter->health_check_calls, 1);
+
+    ASSERT_TRUE(backend->Init());
+    EXPECT_EQ(adapter->init_calls, 1);
+    EXPECT_EQ(adapter->health_check_calls, 1);
+}
+
+TEST_F(ObjectStorageAdapterTest, KvcsHealthCheckFailureFailsInit) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter, {}, true,
+                                            "kvcs-lowlevel");
+    adapter->fail_health_check = true;
+
+    auto result = backend->Init();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(adapter->init_calls, 1);
+    EXPECT_EQ(adapter->health_check_calls, 1);
+}
+
+TEST_F(ObjectStorageAdapterTest, KvcsModeSkipsDisabledHealthCheck) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter, {}, false,
+                                            "kvcs-lowlevel");
+    adapter->fail_health_check = true;
+
+    ASSERT_TRUE(backend->Init());
+    EXPECT_EQ(adapter->init_calls, 1);
+    EXPECT_EQ(adapter->health_check_calls, 0);
 }
 
 TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRunsEnabledHealthCheck) {
@@ -581,7 +634,6 @@ TEST_F(ObjectStorageAdapterTest, FileSystemModeKeepsDfsOnlyContract) {
     DistributedStorageBackend backend(file_config, distributed_config,
                                       std::move(owned_adapter));
 
-    EXPECT_EQ(backend.GetStorageMode(), DistributedStorageMode::kFileSystem);
     EXPECT_FALSE(backend.UsesObjectStorage());
 
     std::unordered_map<std::string, std::vector<Slice>> offload_batch;
