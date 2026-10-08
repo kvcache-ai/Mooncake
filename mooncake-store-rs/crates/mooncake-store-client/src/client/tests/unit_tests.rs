@@ -874,8 +874,11 @@ fn payload_checksum_all_0xff_bytes_is_deterministic() {
 #[test]
 fn payload_checksum_is_order_sensitive() {
     let ab = payload_checksum(&[0x01, 0x02]);
-    let ba = payload_checksum(&[0x02, 0x01]);
-    assert_ne!(ab, ba, "checksum must be sensitive to byte order");
+    let reverse_order = payload_checksum(&[0x02, 0x01]);
+    assert_ne!(
+        ab, reverse_order,
+        "checksum must be sensitive to byte order"
+    );
 }
 
 #[test]

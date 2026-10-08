@@ -12681,7 +12681,7 @@ fn helper_primitives_and_request_builders_cover_contracts() {
     let mut scatter_c = [0u8; 2];
     let mut scatter_refs: [&mut [u8]; 3] = [&mut scatter_a, &mut scatter_b, &mut scatter_c];
     scatter_into_buffers(b"hello", &mut scatter_refs);
-    assert_eq!(&scatter_a, b"hel");
+    assert_eq!(&scatter_a[..], &b"hello"[..scatter_a.len()]);
     assert_eq!(&scatter_b, b"lo\0\0");
     assert_eq!(&scatter_c, b"\0\0");
 

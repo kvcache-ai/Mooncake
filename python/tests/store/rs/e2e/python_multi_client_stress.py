@@ -4,11 +4,10 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
-import signal
 import sys
 import time
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any
 
 

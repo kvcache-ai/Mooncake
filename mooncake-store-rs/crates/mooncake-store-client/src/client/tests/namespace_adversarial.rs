@@ -5,7 +5,7 @@
 // These tests document the current boundary behavior for "interesting" tenant /
 // domain / object_set strings:
 //   * Known ambiguous separator cases are kept as ignored regression baselines;
-//   * Unicode look-alikes must not collide due to accidental normalisation;
+//   * Visually similar Unicode strings must not collide due to normalisation;
 //   * Empty or extremely long inputs must not crash the encoder;
 //   * Routing-layer key isolation should not be bypassed by control characters.
 //
@@ -232,7 +232,7 @@ fn empty_tenant_is_a_distinct_namespace_from_default_tenant() {
 #[ignore = "known limitation: tenant/key with literal '::' can collide; see FIXME above"]
 fn keys_with_double_colon_substring_do_not_collide_across_tenants() {
     // The default-scope encoding uses "::" as a separator.  A key that
-    // itself contains "::" must not be mis-parsed in a way that lets it
+    // itself contains "::" must not be parsed incorrectly in a way that lets it
     // collide with another tenant's key.
     let cluster = IsolationCluster::with_clients("adv-colon-key", 1);
     let client = cluster.client(0);

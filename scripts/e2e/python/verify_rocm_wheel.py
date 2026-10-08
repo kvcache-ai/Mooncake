@@ -114,10 +114,17 @@ def main() -> None:
 
     store = importlib.import_module("mooncake.store")
     private_store = importlib.import_module("mooncake._store")
-    if store._BACKEND != "cpp" or store.MooncakeDistributedStore is not private_store.MooncakeDistributedStore:
-        raise RuntimeError("the installed C++ Store facade did not select its private extension")
+    if (
+        store._BACKEND != "cpp"
+        or store.MooncakeDistributedStore is not private_store.MooncakeDistributedStore
+    ):
+        raise RuntimeError(
+            "the installed C++ Store facade did not select its private extension"
+        )
 
-    if any(str(item).endswith("mooncake_store_rs.pth") for item in distribution.files or ()):
+    if any(
+        str(item).endswith("mooncake_store_rs.pth") for item in distribution.files or ()
+    ):
         raise RuntimeError("the wheel still installs the legacy Store-RS startup hook")
 
 

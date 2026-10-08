@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """Manual/nightly drain HTTP verification script.
 
 This script intentionally targets non-ASan builds only. The ASan CI gate uses
 TaskExecutorIntegrationTest.DrainJobCompleteFlow instead, because running the
 pybind store client inside a Python host process is not stable under ASan.
 """
+
+from __future__ import annotations
 
 import argparse
 import importlib.util
@@ -29,7 +29,9 @@ os.environ["MOONCAKE_STORE_BACKEND"] = "cpp"
 def _find_store_extension() -> Path:
     spec = importlib.util.find_spec("mooncake._store")
     if spec is None or spec.origin is None:
-        raise ImportError("the installed root wheel does not include the C++ Store component")
+        raise ImportError(
+            "the installed root wheel does not include the C++ Store component"
+        )
     return Path(spec.origin).resolve()
 
 

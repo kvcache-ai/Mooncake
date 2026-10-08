@@ -8,8 +8,9 @@
 
 namespace {
 
-int encodeSegmentDescForStore(const mooncake::TransferMetadata::SegmentDesc &desc,
-                              Json::Value &segmentJSON) {
+int encodeSegmentDescForStore(
+    const mooncake::TransferMetadata::SegmentDesc &desc,
+    Json::Value &segmentJSON) {
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
@@ -60,8 +61,7 @@ int encodeSegmentDescForStore(const mooncake::TransferMetadata::SegmentDesc &des
     }
 
     LOG(ERROR) << "Unsupported segment descriptor for Store-RS classic TE "
-               << "export, name " << desc.name << " protocol "
-               << desc.protocol;
+               << "export, name " << desc.name << " protocol " << desc.protocol;
     return -1;
 }
 
@@ -84,8 +84,7 @@ decodeSegmentDescForStore(Json::Value &segmentJSON,
             device.gid = deviceJSON["gid"].asString();
             if (device.name.empty() || device.gid.empty()) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol "
-                             << desc->protocol;
+                             << segment_name << " protocol " << desc->protocol;
                 return nullptr;
             }
             desc->devices.push_back(device);
@@ -116,8 +115,8 @@ decodeSegmentDescForStore(Json::Value &segmentJSON,
         int ret = desc->topology.parse(
             segmentJSON["priority_matrix"].toStyledString());
         if (ret) {
-            LOG(WARNING) << "Corrupted segment topology, name "
-                         << segment_name << " protocol " << desc->protocol;
+            LOG(WARNING) << "Corrupted segment topology, name " << segment_name
+                         << " protocol " << desc->protocol;
         }
         return desc;
     }
@@ -130,8 +129,7 @@ decodeSegmentDescForStore(Json::Value &segmentJSON,
             buffer.length = bufferJSON["length"].asUInt64();
             if (buffer.name.empty() || !buffer.addr || !buffer.length) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol "
-                             << desc->protocol;
+                             << segment_name << " protocol " << desc->protocol;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
@@ -287,8 +285,8 @@ extern "C" int mooncake_classic_get_batch_transfer_status(
 
     auto *native = reinterpret_cast<mooncake::TransferEngine *>(engine);
     mooncake::TransferStatus native_status;
-    auto result =
-        native->getBatchTransferStatus((mooncake::BatchID)batch_id, native_status);
+    auto result = native->getBatchTransferStatus((mooncake::BatchID)batch_id,
+                                                 native_status);
     if (!result.ok()) {
         return static_cast<int>(result.code());
     }
@@ -342,9 +340,11 @@ extern "C" int mooncake_classic_get_segment_buffer_count(
     return 0;
 }
 
-extern "C" int mooncake_classic_get_segment_buffer(
-    transfer_engine_t engine, segment_handle_t segment_id, size_t index,
-    uint64_t *addr_out, uint64_t *length_out) {
+extern "C" int mooncake_classic_get_segment_buffer(transfer_engine_t engine,
+                                                   segment_handle_t segment_id,
+                                                   size_t index,
+                                                   uint64_t *addr_out,
+                                                   uint64_t *length_out) {
     if (engine == nullptr || addr_out == nullptr || length_out == nullptr) {
         return -1;
     }

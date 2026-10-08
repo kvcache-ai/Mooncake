@@ -123,7 +123,7 @@ This creates several correctness gaps:
 
 Two writers can both observe usage below limit and both admit writes that together exceed quota.
 
-### 2. Overwrite mis-accounting
+### 2. Incorrect overwrite accounting
 
 Quota should be charged on **delta**:
 

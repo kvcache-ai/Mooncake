@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import importlib
 
 import pytest
 
 pytest.importorskip("mooncake._store_rs")
-from mooncake.store.rs.buffer_pool import BufferPool
+BufferPool = importlib.import_module("mooncake.store.rs.buffer_pool").BufferPool
 
 
 class _LocalLease:

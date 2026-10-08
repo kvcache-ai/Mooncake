@@ -903,7 +903,7 @@ struct ExtentStoreDeletedExtent {
 }
 
 // Keep reuse exact-size for now: recovery still scans segment records linearly,
-// so splitting a freed record would create an unparseable hole without a new
+// so splitting a freed record would create an unparsable hole without a new
 // padding/free-record format.
 #[derive(Default)]
 struct ExtentStoreFreeExtents {
@@ -6165,7 +6165,7 @@ mod extent_store_engine_tests {
     fn engine_recovers_reusable_exact_extent_after_restart() {
         let root = test_extent_store_root("reuse-exact-restart");
         let first_payload = b"restart-first";
-        let second_payload = b"restart-secon";
+        let second_payload = b"restart-other";
         assert_eq!(first_payload.len(), second_payload.len());
         let first_locator;
         let first_decoded;

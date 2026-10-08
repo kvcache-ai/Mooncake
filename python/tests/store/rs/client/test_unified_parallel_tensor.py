@@ -29,7 +29,6 @@ from mooncake.store import (
     ReadTarget,
     AXIS_DP,
     AXIS_TP,
-    AXIS_EP,
     AXIS_PP,
     READ_MODE_AS_STORED,
     READ_MODE_SHARD,
@@ -588,7 +587,7 @@ def test_read_into_preallocated_tensor(store, tenant):
     weight = generate_weight([64, 32], seed=26)
     store.put_tensor_with_parallelism("test_prealloc.weight", weight, tenant=tenant)
     target_tensor = torch.empty_like(weight)
-    result = store.get_tensor_with_parallelism(
+    store.get_tensor_with_parallelism(
         "test_prealloc.weight",
         target=ReadTarget(READ_MODE_AS_STORED),
         tensor=target_tensor,

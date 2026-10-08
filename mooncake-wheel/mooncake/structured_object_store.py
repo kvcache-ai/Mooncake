@@ -11,7 +11,16 @@ from collections.abc import MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Protocol, Sequence
+from typing import (
+    Any,
+    Callable,
+    Iterator,
+    Literal,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 import numpy as np
 
@@ -6364,7 +6373,6 @@ def _object_array_from_decoded_values(values: list[Any]) -> np.ndarray:
     return result
 
 
-
 def _cpp_tensor_codec_module():
     try:
         return importlib.import_module("mooncake._store")
@@ -6668,9 +6676,7 @@ def _copy_write_config(config: Any) -> Any:
 def _config_with_group_id(config: Any, group_id: str) -> Any:
     configured_ids = getattr(_config_for_grouped_keys(config, 1), "group_ids", None)
     if configured_ids and configured_ids[0] and configured_ids[0] != group_id:
-        raise ValueError(
-            "config.group_ids conflicts with the DataProto storage group"
-        )
+        raise ValueError("config.group_ids conflicts with the DataProto storage group")
     grouped_config = ReplicateConfig() if config is None else _copy_write_config(config)
     if not hasattr(grouped_config, "group_ids"):
         raise NotImplementedError(

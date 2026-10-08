@@ -11,7 +11,9 @@ import pytest
 PYTHON_SOURCE = Path(__file__).resolve().parents[2]
 
 
-def _run_python(tmp_path: Path, source: str, backend: str | None) -> subprocess.CompletedProcess:
+def _run_python(
+    tmp_path: Path, source: str, backend: str | None
+) -> subprocess.CompletedProcess:
     environment = os.environ.copy()
     environment.pop("MOONCAKE_STORE_BACKEND", None)
     environment.pop("PYTHONPATH", None)

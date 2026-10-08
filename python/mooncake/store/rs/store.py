@@ -10,7 +10,11 @@ import os
 import queue
 import threading
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 import warnings
+
+if TYPE_CHECKING:
+    import torch
 
 try:
     _native = importlib.import_module("mooncake._store_rs")
@@ -737,8 +741,6 @@ class MooncakeDistributedStore:
         For tensors NOT in registered memory, omit the *tensor* parameter —
         the fallback path allocates internally and returns a new torch.Tensor.
         """
-        import torch
-
         if tensor is not None:
             buf_ptr = tensor.data_ptr() - TENSOR_METADATA_WIRE_SIZE
             buf_size = (

@@ -117,8 +117,7 @@ elif _BACKEND == "rs":
     _EXPORTS = _RS_EXPORTS
 else:
     raise ValueError(
-        "MOONCAKE_STORE_BACKEND must be exactly 'cpp' or 'rs'; "
-        f"got {_BACKEND!r}"
+        "MOONCAKE_STORE_BACKEND must be exactly 'cpp' or 'rs'; " f"got {_BACKEND!r}"
     )
 
 __all__ = sorted(_EXPORTS)

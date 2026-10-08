@@ -237,7 +237,6 @@ def main():
     print("EngramStore Backend Benchmark")
     print("  Config: 1 token, Mooncake row-id lookup only")
     print("  Batch sizes: 1, 4, 16, 64, 128, 256")
-    print(f"  Build dir: {build_dir}")
     print(f"  Protocol: {os.environ.get('MOONCAKE_PROTOCOL', '<unset>')}")
     print(f"  Allow populate fallback: {ALLOW_POPULATE_FALLBACK}")
     print("=" * 60)

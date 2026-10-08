@@ -302,7 +302,9 @@ def test_cli_entry_points_remain_stable_across_build_interfaces() -> None:
 
     root_project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
     scripts = root_project["project"]["scripts"]
-    assert {name: scripts[name] for name in STORE_RS_CLI_ENTRY_POINTS} == STORE_RS_CLI_ENTRY_POINTS
+    assert {
+        name: scripts[name] for name in STORE_RS_CLI_ENTRY_POINTS
+    } == STORE_RS_CLI_ENTRY_POINTS
     old_store_rs_commands = {
         "mooncake-store-client",
         "mooncake-store-admin",

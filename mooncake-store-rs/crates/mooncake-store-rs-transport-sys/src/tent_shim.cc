@@ -37,7 +37,8 @@ extern "C" uint64_t mooncake_tent_probe_rdma_max_mr_size() {
             continue;
         }
         ibv_device_attr attr = {};
-        if (verbs.ibv_query_device(context, &attr) == 0 && attr.max_mr_size > 0) {
+        if (verbs.ibv_query_device(context, &attr) == 0 &&
+            attr.max_mr_size > 0) {
             limit = std::min(limit, static_cast<uint64_t>(attr.max_mr_size));
             found = true;
         }

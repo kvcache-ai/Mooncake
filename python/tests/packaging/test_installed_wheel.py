@@ -377,11 +377,14 @@ def test_store_rs_backend_from_installed_root_wheel(tmp_path: Path) -> None:
         "mooncake/mooncake-store-rs-admin",
         "mooncake/mooncake-store-rs-bench",
     } <= wheel_files
-    assert not {
-        "mooncake/mooncake-store-client",
-        "mooncake/mooncake-store-admin",
-        "mooncake/mooncake-store-bench",
-    } & wheel_files
+    assert (
+        not {
+            "mooncake/mooncake-store-client",
+            "mooncake/mooncake-store-admin",
+            "mooncake/mooncake-store-bench",
+        }
+        & wheel_files
+    )
     assert not any(name.endswith("mooncake_store_rs.pth") for name in wheel_files)
     assert not any(name.startswith("mooncake_store_rs/") for name in wheel_files)
 
