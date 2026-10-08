@@ -229,8 +229,20 @@ struct DistributedFSDescriptor {
     uint64_t object_size = 0;
     uint64_t aligned_size = 0;
     int shard_idx = 0;
+    struct_pack::compatible<bool, 1> object_storage{};
+    struct_pack::compatible<std::string, 1> object_storage_backend{};
+
+    bool IsObjectStorage() const { return object_storage.value_or(false); }
+    std::string ObjectStorageBackend() const {
+        return object_storage_backend.value_or("");
+    }
+    void SetObjectStorageBackend(std::string backend) {
+        object_storage.emplace(true);
+        object_storage_backend.emplace(std::move(backend));
+    }
+
     YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
-             aligned_size, shard_idx);
+             aligned_size, shard_idx, object_storage, object_storage_backend);
 };
 
 struct DfsReplicaData {

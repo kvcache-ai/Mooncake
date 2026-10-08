@@ -401,6 +401,11 @@ enum class ErrorCode : int32_t {
     TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
     TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
     TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
+
+    // KVCS provider errors (Range: -1800 to -1899)
+    KVCS_INCOMPLETE = -1800,          ///< KVCS query is not complete yet.
+    KVCS_UNAVAILABLE = -1801,         ///< KVCS target or service unavailable.
+    KVCS_RESOURCE_EXHAUSTED = -1802,  ///< KVCS capacity or buffers exhausted.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

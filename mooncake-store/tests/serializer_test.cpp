@@ -217,6 +217,87 @@ TEST_F(SerializerTest, MountedSegmentDeserializesLegacyFormatWithoutHostId) {
     EXPECT_EQ(restored->status, SegmentStatus::OK);
 }
 
+TEST_F(SerializerTest, DfsReplicaPreservesObjectStorageDescriptor) {
+    DistributedFSDescriptor descriptor{
+        .file_path = "",
+        .offset = 0,
+        .object_size = 4096,
+        .aligned_size = 0,
+        .shard_idx = -1,
+    };
+    descriptor.SetObjectStorageBackend("kvcs-lowlevel");
+    Replica original(descriptor, ReplicaStatus::COMPLETE);
+    SegmentView segment_view(nullptr);
+
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    ASSERT_TRUE(Serializer<Replica>::serialize(original, segment_view, packer));
+
+    auto object_handle = msgpack::unpack(buffer.data(), buffer.size());
+    ASSERT_EQ(object_handle.get().type, msgpack::type::ARRAY);
+    ASSERT_EQ(object_handle.get().via.array.size, 4u);
+    const auto& payload = object_handle.get().via.array.ptr[3];
+    ASSERT_EQ(payload.type, msgpack::type::ARRAY);
+    EXPECT_EQ(payload.via.array.size, 7u);
+    auto restored =
+        Serializer<Replica>::deserialize(object_handle.get(), segment_view);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE((*restored)->is_dfs_replica());
+    const auto& restored_descriptor = (*restored)->get_dfs_descriptor();
+    EXPECT_TRUE(restored_descriptor.IsObjectStorage());
+    EXPECT_EQ(restored_descriptor.ObjectStorageBackend(), "kvcs-lowlevel");
+    EXPECT_EQ(restored_descriptor.object_size, descriptor.object_size);
+}
+
+TEST_F(SerializerTest, DfsReplicaKeepsLegacyFiveFieldEncoding) {
+    DistributedFSDescriptor descriptor{
+        .file_path = "/mnt/3fs/shard.data",
+        .offset = 4096,
+        .object_size = 1024,
+        .aligned_size = 4096,
+        .shard_idx = 2,
+    };
+    Replica original(descriptor, ReplicaStatus::COMPLETE);
+    SegmentView segment_view(nullptr);
+
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    ASSERT_TRUE(Serializer<Replica>::serialize(original, segment_view, packer));
+
+    auto object_handle = msgpack::unpack(buffer.data(), buffer.size());
+    ASSERT_EQ(object_handle.get().type, msgpack::type::ARRAY);
+    ASSERT_EQ(object_handle.get().via.array.size, 4u);
+    const auto& payload = object_handle.get().via.array.ptr[3];
+    ASSERT_EQ(payload.type, msgpack::type::ARRAY);
+    EXPECT_EQ(payload.via.array.size, 5u);
+}
+
+TEST_F(SerializerTest, DfsReplicaDeserializesLegacyFiveFieldDescriptor) {
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    packer.pack_array(4);
+    packer.pack(static_cast<uint64_t>(123));
+    packer.pack(static_cast<int16_t>(ReplicaStatus::COMPLETE));
+    packer.pack(static_cast<int8_t>(ReplicaType::DFS));
+    packer.pack_array(5);
+    packer.pack(std::string("/mnt/3fs/shard.data"));
+    packer.pack(static_cast<uint64_t>(4096));
+    packer.pack(static_cast<uint64_t>(1024));
+    packer.pack(static_cast<uint64_t>(4096));
+    packer.pack(static_cast<int32_t>(2));
+
+    SegmentView segment_view(nullptr);
+    auto object_handle = msgpack::unpack(buffer.data(), buffer.size());
+    auto restored =
+        Serializer<Replica>::deserialize(object_handle.get(), segment_view);
+    ASSERT_TRUE(restored);
+    const auto& descriptor = (*restored)->get_dfs_descriptor();
+    EXPECT_FALSE(descriptor.IsObjectStorage());
+    EXPECT_TRUE(descriptor.ObjectStorageBackend().empty());
+    EXPECT_EQ(descriptor.file_path, "/mnt/3fs/shard.data");
+    EXPECT_EQ(descriptor.shard_idx, 2);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

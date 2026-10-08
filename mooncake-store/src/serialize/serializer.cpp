@@ -771,8 +771,11 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
                     ErrorCode::DESERIALIZE_FAIL,
                     "serialize_msgpack Replica missing DfsReplicaData"));
             }
-            // Format: [file_path, offset, object_size, aligned_size, shard_idx]
-            packer.pack_array(5);
+            // Keep regular DFS replicas in the legacy five-field format so
+            // older peers can continue to deserialize them during rolling
+            // upgrades. Object-storage replicas require the extended fields.
+            const bool extended = dfs_data->descriptor.IsObjectStorage();
+            packer.pack_array(extended ? 7 : 5);
             packer.pack(dfs_data->descriptor.file_path);
             packer.pack(static_cast<uint64_t>(dfs_data->descriptor.offset));
             packer.pack(
@@ -780,6 +783,10 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             packer.pack(
                 static_cast<uint64_t>(dfs_data->descriptor.aligned_size));
             packer.pack(static_cast<int32_t>(dfs_data->descriptor.shard_idx));
+            if (extended) {
+                packer.pack(dfs_data->descriptor.IsObjectStorage());
+                packer.pack(dfs_data->descriptor.ObjectStorageBackend());
+            }
             break;
         }
         default:
@@ -885,11 +892,12 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
         case static_cast<int8_t>(ReplicaType::DFS): {
             const auto &payload = array_items[3];
             if (payload.type != msgpack::type::ARRAY ||
-                payload.via.array.size != 5) {
+                (payload.via.array.size != 5 && payload.via.array.size != 7)) {
                 return tl::unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                        "deserialize_msgpack Replica DFS "
-                                       "payload is not valid array[5]"));
+                                       "payload is not valid array[5] or "
+                                       "array[7]"));
             }
             auto *payload_items = payload.via.array.ptr;
             DistributedFSDescriptor descriptor;
@@ -898,6 +906,12 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             descriptor.object_size = payload_items[2].as<uint64_t>();
             descriptor.aligned_size = payload_items[3].as<uint64_t>();
             descriptor.shard_idx = payload_items[4].as<int32_t>();
+            if (payload.via.array.size == 7) {
+                if (payload_items[5].as<bool>()) {
+                    descriptor.SetObjectStorageBackend(
+                        payload_items[6].as<std::string>());
+                }
+            }
 
             replica = std::make_shared<Replica>(std::move(descriptor), status);
             break;

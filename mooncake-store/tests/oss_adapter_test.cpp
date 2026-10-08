@@ -1600,6 +1600,7 @@ TEST(OssObjectStorageAdapterTest, StorageBackendFactoryRunsObjectHealthCheck) {
         std::dynamic_pointer_cast<DistributedStorageBackend>(*backend);
     ASSERT_NE(distributed, nullptr);
     EXPECT_TRUE(distributed->UsesObjectStorage());
+    EXPECT_FALSE(distributed->UsesKvcs());
     ASSERT_TRUE(distributed->Init());
     server.Wait();
     ASSERT_TRUE(server.error().empty()) << server.error();
