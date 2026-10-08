@@ -83,8 +83,7 @@ class NofTaskLifecycleTest : public ::testing::Test {
     }
 
     SpdkNofStallAction Advance(bool io_timed_out) {
-        return SpdkNofAdvanceStallState(*qos_, io_timed_out,
-                                        std::chrono::steady_clock::now());
+        return SpdkNofAdvanceStallState(*qos_, io_timed_out);
     }
 
     void ExpectBaseline() {
@@ -119,6 +118,7 @@ TEST_F(NofTaskLifecycleTest, NormalCompletion) {
     ASSERT_TRUE(state->is_completed());
     EXPECT_EQ(state->get_result(), ErrorCode::OK);
     EXPECT_EQ(Advance(false), SpdkNofStallAction::kNone);
+    EXPECT_EQ(qos_->drain_started, std::chrono::steady_clock::time_point{});
     ExpectBaseline();
 }
 
@@ -251,10 +251,15 @@ TEST_F(NofTaskLifecycleTest, RepeatedTimeoutReportWhileDrainingIsIgnored) {
     SpdkNofSubTask* sub_task = Submit(task, 1);
     PopFromChain(task);
 
+    const auto before_drain = std::chrono::steady_clock::now();
     ASSERT_EQ(Advance(true), SpdkNofStallAction::kAbort);
+    const auto drain_started = qos_->drain_started;
+    EXPECT_GE(drain_started, before_drain);
+    EXPECT_LE(drain_started, std::chrono::steady_clock::now());
     // e.g. a reset issued by another path, or SPDK reporting the next
     // request of the same qpair, must not restart the drain.
     EXPECT_EQ(Advance(true), SpdkNofStallAction::kNone);
+    EXPECT_EQ(qos_->drain_started, drain_started);
     EXPECT_EQ(qos_->state, SpdkNofSegmentState::kDraining);
     EXPECT_EQ(qos_->drained_sub_io, 0);
 

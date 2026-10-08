@@ -108,6 +108,9 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
 struct nof_seg_handle {
     struct spdk_nvme_qpair *qpair;
     struct spdk_nvme_ns *ns;
+    // Worker affinity is per pool; OpenNofSegment() caches handles across
+    // pools and probes. Keep these flags atomic for those shared accesses;
+    // qpair operations themselves still require serialization.
     // Set by NofIoTimeoutCallback() while the qpair is being polled, read
     // back by NvmePollProcessCompletion() on the same thread.
     std::atomic<bool> io_timed_out{false};

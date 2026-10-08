@@ -585,16 +585,15 @@ inline void SpdkNofCompleteSubTask(SpdkNofSubTask* sub_task, bool failed) {
  *         kDrained once every sub-I/O outstanding at that point has been
  *         reclaimed through its completion callback.
  */
-inline SpdkNofStallAction SpdkNofAdvanceStallState(
-    SpdkNofQos& nof_qos, bool io_timed_out,
-    std::chrono::steady_clock::time_point now) {
+inline SpdkNofStallAction SpdkNofAdvanceStallState(SpdkNofQos& nof_qos,
+                                                   bool io_timed_out) {
     switch (nof_qos.state) {
         case SpdkNofSegmentState::kActive:
             if (!io_timed_out) {
                 return SpdkNofStallAction::kNone;
             }
             nof_qos.state = SpdkNofSegmentState::kDraining;
-            nof_qos.drain_started = now;
+            nof_qos.drain_started = std::chrono::steady_clock::now();
             nof_qos.drained_sub_io = 0;
             return SpdkNofStallAction::kAbort;
         case SpdkNofSegmentState::kDraining:
