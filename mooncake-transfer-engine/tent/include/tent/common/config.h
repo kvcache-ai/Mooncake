@@ -166,6 +166,11 @@ class Config {
 
     std::string dump(int indent = 2) const;
 
+    // Return an independent copy of the complete JSON value under one lock.
+    // Validation uses this instead of dump()/parse(), which loses non-finite
+    // numeric values by serializing them as null.
+    json toJson() const;
+
     // If key_path resolves to a JSON value, dump it into *out and return true.
     bool dumpSubtree(const std::string& key_path, std::string* out) const;
 
