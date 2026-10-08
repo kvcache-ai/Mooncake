@@ -214,7 +214,7 @@ per step, the page sizes 1 and 64, and both layouts.
   kernel_summary.csv   summary table, one row per measured step
 ```
 
-Every phase record carries p50, p95 and p99 over the timed iterations, the branch the step ran and the
+Every window carries min, p50, p95 and p99 over the timed iterations, the branch the step ran and the
 order it ran in, and the CSV also carries the derived figures of section 4 plus the result of every
 correctness check, so a reader can see which step a number came from and whether its check passed.
 

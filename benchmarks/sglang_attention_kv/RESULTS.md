@@ -31,7 +31,7 @@ python -m benchmarks.sglang_attention_kv --full --model <model> --tp-size 4 --de
 ```
 
 The machine is shared: other tenants held 66 to 87 GB of each GPU's memory and one of them ran work on
-the same device during these runs. Every phase is therefore recorded as its min, p50, p95 and p99, and
+the same device during these runs. Every window is therefore recorded as its min, p50, p95 and p99, and
 the tables below quote p50.
 
 ## The columns
@@ -111,10 +111,10 @@ the loop, 2048 tokens 8.527 ms and 512 tokens 2.677 ms. Behind an 8192-token his
 loop reads 6.803 ms for 128 queries, 11.769 ms for 512 and 45.578 ms for 2048; behind a 2048-token
 history the same three queries read 6.743, 6.950 and 18.184 ms.
 
-**A decode step's loop stays between 3.285 and 3.375 ms from a 129-token to a 32769-token history**,
-and its isolated attention window between 1.629 and 1.649 ms over the same range, while the KV the step
-reads grows from 4.7 MB to 1.2 GB per rank. The whole step reads 3.881 to 3.968 ms across the twelve
-decode steps of the two runs.
+**A single-sequence decode step's loop stays between 3.282 and 3.378 ms from a 129-token to a
+32769-token history**, and its isolated attention window between 1.622 and 1.668 ms over the same
+range, while the KV the step reads grows from 4.7 MB to 1.2 GB per rank. The whole step reads 3.851 to
+3.968 ms across the 40 decode steps of the matrix run and the two of the long-context run.
 
 **The page size and the layout move no window beyond a few hundredths of a millisecond.** Decode at a
 8193-token history reads 3.285 to 3.341 ms in the loop and 3.883 to 3.912 ms in the step over page
@@ -148,6 +148,11 @@ against 1.167 ms of write window, 1.642 ms of attention window, 0.340 ms of `ind
 1.657 ms of issue against a 1.681 ms window. Decode computes one token per sequence, so both windows
 are shorter than the host takes to issue them and neither is a device rate.
 
+On the 4×512-token prefill rows the two windows sum to 3.43 ms against a loop of 2.57 ms, and neither
+window is wrong: the attention window is device time (2.26 ms of attention in a 2.57 ms loop that also
+holds the writes), and the write window is the host's issue of the calls the loop hides. Only the
+device parts of the two windows are inside the loop.
+
 `write` reads two regimes for the same 72 calls. In 583 of the 600 matrix rows its p50 is 1.127 to
 1.296 ms, and in the other 17 it is 0.050 to 0.240 ms — for calls whose count and byte count do not
 change, 1.127 ms at 128 new tokens and 1.158 ms at 8192 in one regime against 0.101 ms at 2048 tokens
@@ -158,17 +163,30 @@ no bandwidth or per-token cost from the write side.
 
 **A component can also be slowed by the machine.** Both component passes and the probe run after the
 timed loop, one window per iteration, and a co-tenant that takes the device during one of those passes
-shows up in that pass. The signature is a value that disagrees with the same shape at another page size
-or layout in the same run: besides the merge row re-run above, the matrix run has 14 more rows where a
-component's sum exceeds its own loop by more than a quarter, and the same shape at the neighbouring
-page sizes reads clean values. The loop and the components of one row are not a decomposition of each
-other, which is why no table here normalises one by the other.
+shows up in that pass alone. On the prefill and extend rows, where the attention keeps the device busy
+for longer than the host takes to issue its calls, the loop and the attention window measure the same
+device work, and a slowed pass stands out as a window that disagrees with the loop of its own row. Five
+rows do:
+
+| step | its attention window | its own loop | the step re-run: window | loop |
+|---|---|---|---|---|
+| `prefill_len1024-8192_bs4_ps1_random` | 181.141 | 84.738 | 84.568 | 84.732 |
+| `extend_pref8192_chunk2048_bs1_ps64` | 97.579 | 45.618 | 45.677 | 45.578 |
+| `extend_pref1024-8192_chunk512_bs4_ps64` | 85.132 | 39.522 | 39.615 | 39.512 |
+| `extend_pref512_chunk2048_bs4_ps1` | 59.842 | 28.320 | 28.244 | 28.307 |
+| `extend_pref256-2048_chunk512_bs4_ps1` | 22.841 | 12.098 | 12.091 | 12.058 |
+
+Each re-run agrees with the loop of its row, and for the first three the nine other combinations of
+page size and layout of the same shape read within 0.1 ms of the re-run's window. The rows of the
+tables above are the re-runs. A slowed pass leaves the loop of its row untouched, so the loop and the
+components of one row are not a decomposition of each other, and no table here normalises one by the
+other.
 
 ## Reading a row back
 
 `kernel_summary.csv` carries, per step: the branch and the order the step ran in, the ledger
 (`kv_bytes_written`, `kv_bytes_read_valid`, `kv_bytes_read_pages`, `gather_rows`, `gather_bytes`,
 `attention_pairs`, `attention_flops`), every window's min, p50, p95 and p99, the derived figures, and
-the result of the three checks. The min is the smallest window the phase ever took in that row, and on a
+the result of the three checks. The min is the smallest value that window took in the row, and on a
 shared machine it is the figure closest to what a quiet device gives: the matrix run's largest loop, the
 242.374 ms batch-4 prefill of 8192-token sequences, has a p95 0.77 ms above its min.
