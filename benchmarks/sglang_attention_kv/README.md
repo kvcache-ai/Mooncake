@@ -221,9 +221,10 @@ correctness check, so a reader can see which step a number came from and whether
 ## 9. What one run measured
 
 `RESULTS.md` holds the numbers from one validation run, the machine they were taken on, and what they
-say about the four stages. This document keeps the method, the matrix and the boundaries: a run on
-another machine, model or sharding reports its own numbers, and the CSV and manifest of that run are
-what a reader compares, because the two sides of every figure in it are recorded there.
+say about the windows a step is timed in and the components measured beside it. This document keeps the
+method, the matrix and the boundaries: a run on another machine, model or sharding reports its own
+numbers, and the CSV and manifest of that run are what a reader compares, because the two sides of
+every figure in it are recorded there.
 
 Nothing here is a precondition of the benchmark: the GPU, the driver, the tensor parallel size, the
 model's shapes and the page sizes are either probed at runtime or taken from the model config, and the
