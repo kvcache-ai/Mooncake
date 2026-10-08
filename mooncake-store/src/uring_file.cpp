@@ -115,9 +115,9 @@ class SharedUringRing {
 
     tl::expected<size_t, ErrorCode> read(int fd, void* buf, size_t len,
                                          off_t off) {
+        cqe_errno_ = 0;
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        cqe_errno_ = 0;
         ensure_buf_registered();
         bool fix = in_registered_buf(buf, len);
         return submit_rw(/*write=*/false, fd, buf, len, off, fix);
@@ -125,26 +125,26 @@ class SharedUringRing {
 
     tl::expected<size_t, ErrorCode> write(int fd, const void* buf, size_t len,
                                           off_t off) {
+        cqe_errno_ = 0;
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        cqe_errno_ = 0;
         return submit_rw(/*write=*/true, fd, const_cast<void*>(buf), len, off,
                          /*use_fixed_buf=*/false);
     }
 
     tl::expected<size_t, ErrorCode> vector_read(int fd, const iovec* iovs,
                                                 int cnt, off_t off) {
+        cqe_errno_ = 0;
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        cqe_errno_ = 0;
         return submit_vector(/*write=*/false, fd, iovs, cnt, off);
     }
 
     tl::expected<size_t, ErrorCode> vector_write(int fd, const iovec* iovs,
                                                  int cnt, off_t off) {
+        cqe_errno_ = 0;
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        cqe_errno_ = 0;
         return submit_vector(/*write=*/true, fd, iovs, cnt, off);
     }
 
@@ -155,9 +155,9 @@ class SharedUringRing {
     /// collect completions. Repeat until all @p cnt descs are done.
     /// This gives the NVMe device queue depth > 1 within a single thread.
     tl::expected<void, ErrorCode> batch_read(int fd, ReadDesc* descs, int cnt) {
+        cqe_errno_ = 0;
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        cqe_errno_ = 0;
         ensure_buf_registered();
         for (int i = 0; i < cnt; ++i) {
             descs[i].bytes_read = 0;
@@ -210,9 +210,9 @@ class SharedUringRing {
 
     /// Issue IORING_FSYNC_DATASYNC.  Blocks until complete.
     tl::expected<void, ErrorCode> fsync(int fd) {
+        cqe_errno_ = 0;
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        cqe_errno_ = 0;
 
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
@@ -488,17 +488,7 @@ class SharedUringRing {
                     return tl::make_unexpected(err_code);
                 }
 
-                if (is_write) {
-                    if (fix_buf)
-                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur, 0);
-                    else
-                        io_uring_prep_write(sqe, fd, ptr, chunk, cur);
-                } else {
-                    if (fix_buf)
-                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur, 0);
-                    else
-                        io_uring_prep_read(sqe, fd, ptr, chunk, cur);
-                }
+                prep_rw(sqe, is_write, fix_buf, fd, ptr, chunk, cur);
                 sqe->user_data = op | static_cast<uint64_t>(n + 1);
                 chunks[n++] = ReadDesc{ptr, chunk, cur};
 
@@ -520,6 +510,21 @@ class SharedUringRing {
         return total;
     }
 
+    static void prep_rw(struct io_uring_sqe* sqe, bool is_write, bool fix_buf,
+                        int fd, char* ptr, size_t len, off_t off) {
+        if (is_write) {
+            if (fix_buf)
+                io_uring_prep_write_fixed(sqe, fd, ptr, len, off, 0);
+            else
+                io_uring_prep_write(sqe, fd, ptr, len, off);
+        } else {
+            if (fix_buf)
+                io_uring_prep_read_fixed(sqe, fd, ptr, len, off, 0);
+            else
+                io_uring_prep_read(sqe, fd, ptr, len, off);
+        }
+    }
+
     // io_uring completes a read or write short, without an errno, when it
     // fails after moving some bytes. As with pwritev/preadv, that count is
     // not an error: submit the rest, so that its CQE reports why (EIO on a
@@ -529,20 +534,47 @@ class SharedUringRing {
     tl::expected<size_t, ErrorCode> finish_short(bool is_write, int fd,
                                                  const ReadDesc& d,
                                                  bool use_fixed_buf) {
-        if (d.bytes_read == d.len) return d.len;
-        if (d.bytes_read == 0) {
-            if (!is_write) return 0;
-            LOG(ERROR) << "[SharedUringRing] zero bytes written";
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
         constexpr off_t kBlock = 4096;
-        const off_t stop = d.off + static_cast<off_t>(d.bytes_read);
-        if (!is_write && stop % kBlock != 0) return d.bytes_read;
-        auto rest =
-            submit_rw(is_write, fd, static_cast<char*>(d.buf) + d.bytes_read,
-                      d.len - d.bytes_read, stop, use_fixed_buf);
-        if (!rest) return rest;
-        return d.bytes_read + rest.value();
+        size_t done = d.bytes_read;
+        size_t moved = d.bytes_read;  // by the last completion
+        while (done < d.len) {
+            if (moved == 0) {
+                if (!is_write) return done;
+                LOG(ERROR) << "[SharedUringRing] zero bytes written";
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            const off_t stop = d.off + static_cast<off_t>(done);
+            if (!is_write && stop % kBlock != 0) return done;
+            auto rest =
+                submit_one(is_write, fd, static_cast<char*>(d.buf) + done,
+                           d.len - done, stop, use_fixed_buf);
+            if (!rest) return rest;
+            moved = rest.value();
+            done += moved;
+        }
+        return done;
+    }
+
+    // One read or write SQE for the rest of a short completion. No larger
+    // than the SQE that completed short, so it needs no chunking.
+    tl::expected<size_t, ErrorCode> submit_one(bool is_write, int fd, char* ptr,
+                                               size_t len, off_t off,
+                                               bool use_fixed_buf) {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        if (!sqe) {
+            LOG(ERROR) << "[SharedUringRing] SQ full (short completion)";
+            return tl::make_unexpected(is_write ? ErrorCode::FILE_WRITE_FAIL
+                                                : ErrorCode::FILE_READ_FAIL);
+        }
+        prep_rw(sqe, is_write, use_fixed_buf && buf_registered_, fd, ptr, len,
+                off);
+        const uint64_t op = next_operation_tag();
+        sqe->user_data = op | 1;
+        ReadDesc d{ptr, len, off};
+        if (!collect_batch(1, op, &d)) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return d.bytes_read;
     }
 
     // Scatter/gather read or write (one SQE per iovec, sequential offsets).

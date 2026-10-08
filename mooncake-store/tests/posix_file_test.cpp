@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 #include "file_interface.h"
+#include "../src/iovec_cursor.h"
 #include "../src/uring_submit.h"
 
 namespace mooncake {
@@ -44,6 +45,139 @@ class PosixFileTest : public ::testing::Test {
     std::string test_filename;
     int test_fd = -1;
 };
+
+// PosixFile continues a short pwritev/preadv on a copy of the caller's
+// iovecs. A kernel cannot be made to stop at an arbitrary byte and then
+// succeed, so where the continuation starts is tested on the helpers.
+class IovecCursorTest : public ::testing::Test {
+   protected:
+    // iovecs over consecutive slices of `stream_`, one per length.
+    std::vector<iovec> Slices(const std::vector<size_t>& lens) {
+        size_t total = 0;
+        for (size_t len : lens) total += len;
+        stream_.resize(total);
+        for (size_t i = 0; i < total; ++i)
+            stream_[i] = static_cast<char>('!' + i % 89);
+        std::vector<iovec> iovs;
+        size_t at = 0;
+        for (size_t len : lens) {
+            iovs.push_back({stream_.data() + at, len});
+            at += len;
+        }
+        return iovs;
+    }
+
+    // The bytes the remaining iovecs still describe, in order.
+    static std::string Remaining(const std::vector<iovec>& iovs, size_t first) {
+        std::string out;
+        for (size_t i = first; i < iovs.size(); ++i)
+            out.append(static_cast<const char*>(iovs[i].iov_base),
+                       iovs[i].iov_len);
+        return out;
+    }
+
+    char* At(size_t offset) { return stream_.data() + offset; }
+
+    std::string stream_;
+};
+
+TEST_F(IovecCursorTest, StopInsideAnIovecResumesAtThatByte) {
+    auto iovs = Slices({3000, 3000});
+    size_t first = 0;
+    ASSERT_TRUE(detail::SkipEmptyIovecs(iovs, first));
+    detail::ConsumeIovecs(iovs, first, 4096);
+    ASSERT_TRUE(detail::SkipEmptyIovecs(iovs, first));
+    EXPECT_EQ(first, 1u);
+    EXPECT_EQ(iovs[1].iov_base, At(4096));
+    EXPECT_EQ(iovs[1].iov_len, 1904u);
+    EXPECT_EQ(Remaining(iovs, first), stream_.substr(4096));
+}
+
+TEST_F(IovecCursorTest, StopAtAnIovecBoundaryResumesAtTheNextIovec) {
+    auto iovs = Slices({3000, 3000});
+    size_t first = 0;
+    detail::ConsumeIovecs(iovs, first, 3000);
+    EXPECT_EQ(first, 1u);
+    EXPECT_EQ(iovs[0].iov_len, 0u);
+    EXPECT_EQ(iovs[1].iov_base, At(3000));
+    EXPECT_EQ(iovs[1].iov_len, 3000u);
+    EXPECT_EQ(Remaining(iovs, first), stream_.substr(3000));
+}
+
+TEST_F(IovecCursorTest, StopAcrossSeveralBoundaries) {
+    auto iovs = Slices({100, 200, 300, 400});
+    size_t first = 0;
+    detail::ConsumeIovecs(iovs, first, 350);
+    EXPECT_EQ(first, 2u);
+    EXPECT_EQ(iovs[2].iov_base, At(350));
+    EXPECT_EQ(iovs[2].iov_len, 250u);
+    EXPECT_EQ(iovs[3].iov_base, At(600));
+    EXPECT_EQ(iovs[3].iov_len, 400u);
+    EXPECT_EQ(Remaining(iovs, first), stream_.substr(350));
+
+    detail::ConsumeIovecs(iovs, first, 650);
+    EXPECT_EQ(first, 4u);
+    EXPECT_FALSE(detail::SkipEmptyIovecs(iovs, first));
+}
+
+TEST_F(IovecCursorTest, ZeroLengthIovecsAreSkipped) {
+    // Empty iovecs at the front, in the middle and at the end.
+    auto iovs = Slices({0, 100, 0, 0, 200, 0});
+    size_t first = 0;
+    ASSERT_TRUE(detail::SkipEmptyIovecs(iovs, first));
+    EXPECT_EQ(first, 1u);
+
+    detail::ConsumeIovecs(iovs, first, 100);
+    EXPECT_EQ(first, 2u);
+    ASSERT_TRUE(detail::SkipEmptyIovecs(iovs, first));
+    EXPECT_EQ(first, 4u);
+
+    detail::ConsumeIovecs(iovs, first, 50);
+    EXPECT_EQ(iovs[4].iov_base, At(150));
+    EXPECT_EQ(iovs[4].iov_len, 150u);
+    EXPECT_EQ(Remaining(iovs, first), stream_.substr(150));
+
+    detail::ConsumeIovecs(iovs, first, 150);
+    EXPECT_FALSE(detail::SkipEmptyIovecs(iovs, first));
+    EXPECT_EQ(first, 6u);
+
+    // ConsumeIovecs also steps over empty iovecs on its own.
+    iovs = Slices({10, 0, 0, 20});
+    first = 0;
+    detail::ConsumeIovecs(iovs, first, 15);
+    EXPECT_EQ(first, 3u);
+    EXPECT_EQ(iovs[3].iov_base, At(15));
+    EXPECT_EQ(iovs[3].iov_len, 15u);
+}
+
+// The same loop as PosixFile::vector_write, with a fake pwritev that moves
+// at most `max_per_call` bytes: the destination must equal the stream for
+// every short count, including stops inside, at and across iovec bounds.
+TEST_F(IovecCursorTest, EveryShortCountCopiesTheStreamInOrder) {
+    const std::vector<size_t> lens = {0, 3000, 0, 1096, 1, 0, 2903, 0};
+    for (size_t max_per_call :
+         {size_t{1}, size_t{7}, size_t{1095}, size_t{1096}, size_t{2999},
+          size_t{3000}, size_t{3001}, size_t{4096}, size_t{7000}}) {
+        auto iovs = Slices(lens);
+        std::string dest(stream_.size(), '\0');
+        size_t first = 0;
+        size_t written = 0;
+        while (detail::SkipEmptyIovecs(iovs, first)) {
+            size_t moved = 0;
+            for (size_t i = first; i < iovs.size() && moved < max_per_call;
+                 ++i) {
+                const size_t n =
+                    std::min(iovs[i].iov_len, max_per_call - moved);
+                std::memcpy(dest.data() + written + moved, iovs[i].iov_base, n);
+                moved += n;
+            }
+            written += moved;
+            detail::ConsumeIovecs(iovs, first, moved);
+        }
+        EXPECT_EQ(written, stream_.size()) << "max_per_call=" << max_per_call;
+        EXPECT_EQ(dest, stream_) << "max_per_call=" << max_per_call;
+    }
+}
 
 #ifdef USE_URING
 TEST(UringSubmitTest, ContinuesAfterPositiveShortSubmit) {
@@ -174,8 +308,8 @@ TEST_F(PosixFileTest, VectorizedWrite) {
     EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
 }
 
-// A short pwritev must be treated as a failed write. Otherwise the PosixFile
-// destructor has no failure state and leaves a truncated object on disk.
+// A write that cannot complete must fail, so that the PosixFile destructor
+// removes the partial object instead of leaving it truncated on disk.
 TEST_F(PosixFileTest, ShortVectorizedWriteRemovesPartialFile) {
 #if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
     const std::string partial_filename =
@@ -308,9 +442,12 @@ TEST_F(PosixFileTest, ShortVectorWriteContinuesToTheRealErrno) {
 #endif
 }
 
-// The first pwritev stops inside the second iovec. The continuation must start
-// at that byte of that iovec; the bytes before it are on disk unchanged.
-TEST_F(PosixFileTest, ShortVectorWriteInsideSecondIovecResumesThere) {
+// The first pwritev stops inside the second iovec, at the file size limit,
+// and the continuation fails there with EFBIG. The caller sees that errno, its
+// iovecs are not modified, and the bytes before the stop are on disk. (The
+// continuation writes nothing here; where it resumes is tested by
+// IovecCursorTest.)
+TEST_F(PosixFileTest, ShortVectorWriteInsideSecondIovecKeepsTheRealErrno) {
 #if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
     const std::string path =
         "short_write_iov_" + std::to_string(getpid()) + ".tmp";
@@ -728,9 +865,13 @@ TEST_F(PosixFileTest, UringFailedCqeKeepsErrno) {
     UringFile::ReadDesc desc{buf.data(), buf.size(), 0};
     ASSERT_FALSE(wronly.batch_read(&desc, 1));
     EXPECT_EQ(wronly.sys_errno(), EBADF);
+    // A new file: the first errno wins, so `wronly` would keep EBADF anyway.
+    int wronly_fd2 = open(test_filename.c_str(), O_WRONLY);
+    ASSERT_GE(wronly_fd2, 0);
+    UringFile wronly2(test_filename, wronly_fd2, 32, false);
     iovec iov{buf.data(), buf.size()};
-    ASSERT_FALSE(wronly.vector_read(&iov, 1, 0));
-    EXPECT_EQ(wronly.sys_errno(), EBADF);
+    ASSERT_FALSE(wronly2.vector_read(&iov, 1, 0));
+    EXPECT_EQ(wronly2.sys_errno(), EBADF);
 }
 
 #if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
@@ -740,6 +881,34 @@ static int OnFreshRing(const std::function<int()>& body) {
     int rc = -1;
     std::thread([&] { rc = body(); }).join();
     return rc;
+}
+
+// Whether this kernel applies the file size limit to io_uring writes: a
+// write across the limit completes short, and the next one fails with EFBIG.
+// Buffered writes can be punted to io-wq workers, which older kernels did
+// not run with the submitter's limits.
+static bool UringHonorsFileSizeLimit(const std::string& path) {
+    int rc = RunWithFileSizeLimit(4096, [&]() -> int {
+        int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) return 10;
+        struct io_uring ring;
+        if (io_uring_queue_init(2, &ring, 0) < 0) return 11;
+        std::string data(8192, 'x');
+        const off_t offsets[2] = {0, 4096};
+        int results[2] = {0, 0};
+        for (int i = 0; i < 2; ++i) {
+            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            io_uring_prep_write(sqe, fd, data.data(), data.size(), offsets[i]);
+            struct io_uring_cqe* cqe = nullptr;
+            if (io_uring_submit_and_wait(&ring, 1) < 0) return 12;
+            if (io_uring_wait_cqe(&ring, &cqe) < 0) return 12;
+            results[i] = cqe->res;
+            io_uring_cqe_seen(&ring, cqe);
+        }
+        return results[0] == 4096 && results[1] == -EFBIG ? 0 : 13;
+    });
+    unlink(path.c_str());
+    return rc == 0;
 }
 #endif
 
@@ -751,6 +920,9 @@ TEST_F(PosixFileTest, UringShortWriteContinuesToTheRealErrno) {
     if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
     const std::string path =
         "uring_short_write_" + std::to_string(getpid()) + ".tmp";
+    if (!UringHonorsFileSizeLimit(path))
+        GTEST_SKIP() << "this kernel does not apply RLIMIT_FSIZE to io_uring "
+                        "writes";
     int rc = RunWithFileSizeLimit(5000, [&]() -> int {
         return OnFreshRing([&]() -> int {
             int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
@@ -765,8 +937,8 @@ TEST_F(PosixFileTest, UringShortWriteContinuesToTheRealErrno) {
     unlink(path.c_str());
     EXPECT_EQ(rc, 0) << "11: write succeeded, 12: errno is not EFBIG";
 
-    // One SQE per iovec: the second iovec stops at the limit and its rest is
-    // resubmitted from that byte; the caller's iovecs are not modified.
+    // One SQE per iovec: the second iovec stops at the limit, and its rest is
+    // resubmitted and fails with EFBIG. The caller's iovecs are not modified.
     rc = RunWithFileSizeLimit(4096, [&]() -> int {
         return OnFreshRing([&]() -> int {
             int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
@@ -809,8 +981,10 @@ TEST_F(PosixFileTest, UringShortWriteContinuesToTheRealErrno) {
 // half and completes short, and the continuation fails with EFAULT.
 TEST_F(PosixFileTest, UringReadIsShortOnlyAtEof) {
     if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
+    // A short completion resumes only on a 4 KiB boundary (O_DIRECT), and
+    // the inaccessible page below must start on one.
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    ASSERT_EQ(page, 4096u);
+    if (page != 4096) GTEST_SKIP() << "needs 4 KiB pages, not " << page;
     std::string content(3 * page, '\0');
     for (size_t i = 0; i < content.size(); ++i)
         content[i] = static_cast<char>('0' + i % 75);
@@ -839,6 +1013,31 @@ TEST_F(PosixFileTest, UringReadIsShortOnlyAtEof) {
     EXPECT_FALSE(result);
     EXPECT_EQ(file.sys_errno(), EFAULT);
     EXPECT_EQ(std::string(buf, page / 2), content.substr(page / 2, page / 2));
+
+    // The same through batch_read and vector_read, each on a new file (the
+    // first errno wins).
+    {
+        int fd = dup(uring_fd);
+        ASSERT_GE(fd, 0);
+        UringFile batch_file(test_filename, fd, 32, false);
+        std::memset(buf, 0, page / 2);
+        UringFile::ReadDesc desc{buf, page, static_cast<off_t>(page / 2)};
+        EXPECT_FALSE(batch_file.batch_read(&desc, 1));
+        EXPECT_EQ(batch_file.sys_errno(), EFAULT);
+        EXPECT_EQ(std::string(buf, page / 2),
+                  content.substr(page / 2, page / 2));
+    }
+    {
+        int fd = dup(uring_fd);
+        ASSERT_GE(fd, 0);
+        UringFile vector_file(test_filename, fd, 32, false);
+        std::memset(buf, 0, page / 2);
+        iovec iov{buf, page};
+        EXPECT_FALSE(vector_file.vector_read(&iov, 1, page / 2));
+        EXPECT_EQ(vector_file.sys_errno(), EFAULT);
+        EXPECT_EQ(std::string(buf, page / 2),
+                  content.substr(page / 2, page / 2));
+    }
     munmap(mem, 2 * page);
 }
 #endif
