@@ -834,8 +834,8 @@ class MasterServiceHATest : public ::testing::Test {
     static std::string GroupIdForTesting(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         return accessor.Exists() ? accessor.Get().group_id
                                  : std::string("<absent>");
     }
@@ -2475,7 +2475,9 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
                               .set_oplog_batch_max_entries(2)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
     ASSERT_TRUE(HasOpLogWriter(service));
 
     const std::string endpoint = "standby_repair_durable_segment";
