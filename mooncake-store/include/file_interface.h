@@ -254,6 +254,9 @@ class UringFile : public StorageFile {
     bool use_direct_io_;
     static constexpr size_t ALIGNMENT_ = 4096;
 
+    /// After a failed ring call: keep the errno of its first failed CQE.
+    void record_ring_errno();
+
     /// Allocate / free an O_DIRECT aligned bounce buffer.
     void *alloc_aligned_buffer(size_t size) const;
     void free_aligned_buffer(void *ptr) const;

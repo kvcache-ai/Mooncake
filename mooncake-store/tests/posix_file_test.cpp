@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <sys/uio.h>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include "file_interface.h"
 #include "../src/uring_submit.h"
@@ -705,6 +706,140 @@ TEST_F(PosixFileTest, UringVectorWriteAbortsWhenPreservationReadFails) {
     EXPECT_EQ(out_neighbor, neighbor);
 
     remove(direct_filename.c_str());
+}
+
+// Some sandboxes block io_uring (seccomp); the tests below skip there.
+static bool UringAvailable() {
+    struct io_uring ring;
+    if (io_uring_queue_init(2, &ring, 0) < 0) return false;
+    io_uring_queue_exit(&ring);
+    return true;
+}
+
+// A failed CQE keeps its errno, as a failed syscall does in PosixFile.
+TEST_F(PosixFileTest, UringFailedCqeKeepsErrno) {
+    if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
+    // Reads on a write-only descriptor fail with EBADF.
+    int wronly_fd = open(test_filename.c_str(), O_WRONLY);
+    ASSERT_GE(wronly_fd, 0);
+    UringFile wronly(test_filename, wronly_fd, 32, false);
+    EXPECT_EQ(wronly.sys_errno(), 0);
+    std::array<char, 16> buf{};
+    UringFile::ReadDesc desc{buf.data(), buf.size(), 0};
+    ASSERT_FALSE(wronly.batch_read(&desc, 1));
+    EXPECT_EQ(wronly.sys_errno(), EBADF);
+    iovec iov{buf.data(), buf.size()};
+    ASSERT_FALSE(wronly.vector_read(&iov, 1, 0));
+    EXPECT_EQ(wronly.sys_errno(), EBADF);
+}
+
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+// Runs `body` on a new thread so that it gets its own io_uring ring: a forked
+// child must not submit to the ring it inherited from the parent's thread.
+static int OnFreshRing(const std::function<int()>& body) {
+    int rc = -1;
+    std::thread([&] { rc = body(); }).join();
+    return rc;
+}
+#endif
+
+// A write that completes short (here it crosses the file size limit) is
+// continued, so the caller sees the errno of the part that really failed
+// (EFBIG here, EIO on a dying disk) instead of a short success.
+TEST_F(PosixFileTest, UringShortWriteContinuesToTheRealErrno) {
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+    if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
+    const std::string path =
+        "uring_short_write_" + std::to_string(getpid()) + ".tmp";
+    int rc = RunWithFileSizeLimit(5000, [&]() -> int {
+        return OnFreshRing([&]() -> int {
+            int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+            if (fd < 0) return 10;
+            UringFile file(path, fd, 32, false);
+            std::string data(8192, 'x');
+            if (file.write_aligned(data.data(), data.size(), 0)) return 11;
+            if (file.sys_errno() != EFBIG) return 12;
+            return 0;
+        });
+    });
+    unlink(path.c_str());
+    EXPECT_EQ(rc, 0) << "11: write succeeded, 12: errno is not EFBIG";
+
+    // One SQE per iovec: the second iovec stops at the limit and its rest is
+    // resubmitted from that byte; the caller's iovecs are not modified.
+    rc = RunWithFileSizeLimit(4096, [&]() -> int {
+        return OnFreshRing([&]() -> int {
+            int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+            if (fd < 0) return 10;
+            UringFile file(path, fd, 32, false);
+            file.SetDeleteOnWriteFail(false);  // keep the bytes for the check
+            std::string a(3000, 'a');
+            std::string b(3000, 'b');
+            iovec iov[2] = {{a.data(), a.size()}, {b.data(), b.size()}};
+            if (file.vector_write(iov, 2, 0)) return 11;
+            if (file.sys_errno() != EFBIG) return 12;
+            if (iov[0].iov_base != a.data() || iov[0].iov_len != a.size() ||
+                iov[1].iov_base != b.data() || iov[1].iov_len != b.size())
+                return 13;
+            return 0;
+        });
+    });
+    EXPECT_EQ(rc, 0) << "11: write succeeded, 12: errno is not EFBIG, "
+                        "13: caller's iovecs changed";
+    std::string on_disk;
+    {
+        int fd = open(path.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0);
+        char buf[8192];
+        ssize_t n = pread(fd, buf, sizeof(buf), 0);
+        close(fd);
+        ASSERT_GE(n, 0);
+        on_disk.assign(buf, static_cast<size_t>(n));
+    }
+    unlink(path.c_str());
+    EXPECT_EQ(on_disk, std::string(3000, 'a') + std::string(1096, 'b'));
+#else
+    GTEST_SKIP() << "RLIMIT_FSIZE/SIGXFSZ is unavailable on this platform";
+#endif
+}
+
+// A read completes short only at EOF. A short CQE before EOF is continued,
+// so the caller sees the errno of the part that really failed: here the
+// buffer runs into an inaccessible page, the kernel fills the accessible
+// half and completes short, and the continuation fails with EFAULT.
+TEST_F(PosixFileTest, UringReadIsShortOnlyAtEof) {
+    if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    ASSERT_EQ(page, 4096u);
+    std::string content(3 * page, '\0');
+    for (size_t i = 0; i < content.size(); ++i)
+        content[i] = static_cast<char>('0' + i % 75);
+    ASSERT_EQ(pwrite(test_fd, content.data(), content.size(), 0),
+              static_cast<ssize_t>(content.size()));
+    int uring_fd = dup(test_fd);
+    ASSERT_GE(uring_fd, 0);
+    UringFile file(test_filename, uring_fd, 32, false);
+
+    // EOF: the short count, no error.
+    std::string tail(page, '\0');
+    auto at_eof = file.read_aligned(tail.data(), page, content.size() - 100);
+    ASSERT_TRUE(at_eof) << toString(at_eof.error());
+    EXPECT_EQ(*at_eof, 100u);
+    EXPECT_EQ(tail.substr(0, 100), content.substr(content.size() - 100));
+    EXPECT_EQ(file.sys_errno(), 0);
+
+    // Short before EOF: continued, and the continuation's errno is kept.
+    void* mem = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mem, MAP_FAILED);
+    char* base = static_cast<char*>(mem);
+    ASSERT_EQ(mprotect(base + page, page, PROT_NONE), 0);
+    char* buf = base + page / 2;  // half a page, then the inaccessible page
+    auto result = file.read_aligned(buf, page, page / 2);
+    EXPECT_FALSE(result);
+    EXPECT_EQ(file.sys_errno(), EFAULT);
+    EXPECT_EQ(std::string(buf, page / 2), content.substr(page / 2, page / 2));
+    munmap(mem, 2 * page);
 }
 #endif
 

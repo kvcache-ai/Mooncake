@@ -62,6 +62,8 @@ class SharedUringRing {
     SharedUringRing& operator=(const SharedUringRing&) = delete;
 
     bool is_initialized() const { return initialized_; }
+    // errno of the first failed CQE of the last I/O call; 0 if none failed.
+    int cqe_errno() const { return cqe_errno_; }
     bool is_buffer_registered() const { return buf_registered_; }
     void* buffer_base() const { return buf_base_; }
     size_t buffer_size() const { return buf_size_; }
@@ -115,6 +117,7 @@ class SharedUringRing {
                                          off_t off) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        cqe_errno_ = 0;
         ensure_buf_registered();
         bool fix = in_registered_buf(buf, len);
         return submit_rw(/*write=*/false, fd, buf, len, off, fix);
@@ -124,6 +127,7 @@ class SharedUringRing {
                                           off_t off) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        cqe_errno_ = 0;
         return submit_rw(/*write=*/true, fd, const_cast<void*>(buf), len, off,
                          /*use_fixed_buf=*/false);
     }
@@ -132,6 +136,7 @@ class SharedUringRing {
                                                 int cnt, off_t off) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        cqe_errno_ = 0;
         return submit_vector(/*write=*/false, fd, iovs, cnt, off);
     }
 
@@ -139,6 +144,7 @@ class SharedUringRing {
                                                  int cnt, off_t off) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        cqe_errno_ = 0;
         return submit_vector(/*write=*/true, fd, iovs, cnt, off);
     }
 
@@ -151,6 +157,7 @@ class SharedUringRing {
     tl::expected<void, ErrorCode> batch_read(int fd, ReadDesc* descs, int cnt) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        cqe_errno_ = 0;
         ensure_buf_registered();
         for (int i = 0; i < cnt; ++i) {
             descs[i].bytes_read = 0;
@@ -185,6 +192,16 @@ class SharedUringRing {
 
             auto res = collect_batch(batch, op, descs + idx);
             if (!res) return res;
+            for (int i = 0; i < batch; ++i) {
+                auto& d = descs[idx + i];
+                auto done = finish_short(/*write=*/false, fd, d,
+                                         in_registered_buf(d.buf, d.len));
+                if (!done) {
+                    d.error = ErrorCode::FILE_READ_FAIL;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                d.bytes_read = done.value();
+            }
             idx += batch;
             remaining -= batch;
         }
@@ -195,6 +212,7 @@ class SharedUringRing {
     tl::expected<void, ErrorCode> fsync(int fd) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        cqe_errno_ = 0;
 
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
@@ -382,6 +400,7 @@ class SharedUringRing {
             if (cqe->res < 0) {
                 LOG(ERROR) << "[SharedUringRing] CQE error: "
                            << strerror(-cqe->res);
+                record_cqe_errno(cqe->res);
                 err = true;
             } else {
                 total += static_cast<size_t>(cqe->res);
@@ -426,6 +445,7 @@ class SharedUringRing {
                 if (cqe->res < 0) {
                     LOG(ERROR) << "[SharedUringRing] batch CQE error: "
                                << strerror(-cqe->res);
+                    record_cqe_errno(cqe->res);
                     desc.error = ErrorCode::FILE_READ_FAIL;
                     has_error = true;
                 } else {
@@ -448,7 +468,6 @@ class SharedUringRing {
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
         const bool fix_buf = (use_fixed_buf && buf_registered_);
 
-        uint64_t op = next_operation_tag();
         char* ptr = static_cast<char*>(buf);
         size_t total = 0;
         size_t remaining = len;
@@ -456,10 +475,11 @@ class SharedUringRing {
 
         while (remaining > 0) {
             size_t cs = calc_chunk(remaining, QUEUE_DEPTH);
-            unsigned n = std::min(
-                static_cast<unsigned>((remaining + cs - 1) / cs), QUEUE_DEPTH);
+            uint64_t op = next_operation_tag();
+            ReadDesc chunks[QUEUE_DEPTH];
+            int n = 0;
 
-            for (unsigned i = 0; i < n; ++i) {
+            while (remaining > 0 && n < static_cast<int>(QUEUE_DEPTH)) {
                 size_t chunk = std::min({cs, remaining, max_rw_count()});
 
                 struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
@@ -479,24 +499,50 @@ class SharedUringRing {
                     else
                         io_uring_prep_read(sqe, fd, ptr, chunk, cur);
                 }
-                sqe->user_data = op;
+                sqe->user_data = op | static_cast<uint64_t>(n + 1);
+                chunks[n++] = ReadDesc{ptr, chunk, cur};
 
                 ptr += chunk;
                 cur += static_cast<off_t>(chunk);
                 remaining -= chunk;
-                if (remaining == 0) break;
             }
 
-            auto res = collect(static_cast<int>(n), op);
-            if (!res) return res;
-            total += res.value();
-            if (!is_write && res.value() == 0) break;  // read EOF
-            if (is_write && res.value() == 0) {
-                LOG(ERROR) << "[SharedUringRing] zero bytes written";
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            if (!collect_batch(n, op, chunks)) {
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            for (int i = 0; i < n; ++i) {
+                auto done = finish_short(is_write, fd, chunks[i], fix_buf);
+                if (!done) return done;
+                total += done.value();
+                if (done.value() < chunks[i].len) return total;  // read EOF
             }
         }
         return total;
+    }
+
+    // io_uring completes a read or write short, without an errno, when it
+    // fails after moving some bytes. As with pwritev/preadv, that count is
+    // not an error: submit the rest, so that its CQE reports why (EIO on a
+    // dead disk). A write that moves nothing fails. A read ends at EOF: a
+    // 0-byte result, or a stop off a 4 KiB boundary (only EOF stops there,
+    // and an O_DIRECT read could not resume from it).
+    tl::expected<size_t, ErrorCode> finish_short(bool is_write, int fd,
+                                                 const ReadDesc& d,
+                                                 bool use_fixed_buf) {
+        if (d.bytes_read == d.len) return d.len;
+        if (d.bytes_read == 0) {
+            if (!is_write) return 0;
+            LOG(ERROR) << "[SharedUringRing] zero bytes written";
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        constexpr off_t kBlock = 4096;
+        const off_t stop = d.off + static_cast<off_t>(d.bytes_read);
+        if (!is_write && stop % kBlock != 0) return d.bytes_read;
+        auto rest =
+            submit_rw(is_write, fd, static_cast<char*>(d.buf) + d.bytes_read,
+                      d.len - d.bytes_read, stop, use_fixed_buf);
+        if (!rest) return rest;
+        return d.bytes_read + rest.value();
     }
 
     // Scatter/gather read or write (one SQE per iovec, sequential offsets).
@@ -507,7 +553,6 @@ class SharedUringRing {
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
         const size_t max_io = max_rw_count();
 
-        uint64_t op = next_operation_tag();
         size_t total = 0;
         off_t cur = off;
         int remaining = cnt;
@@ -520,6 +565,7 @@ class SharedUringRing {
                                      /*use_fixed_buf=*/false);
                 if (!res) return res;
                 total += res.value();
+                if (res.value() < iovs[idx].iov_len) return total;  // read EOF
                 cur += static_cast<off_t>(iovs[idx].iov_len);
                 ++idx;
                 --remaining;
@@ -532,6 +578,8 @@ class SharedUringRing {
                 ++batch;
             }
 
+            uint64_t op = next_operation_tag();
+            ReadDesc parts[QUEUE_DEPTH];
             for (int i = 0; i < batch; ++i) {
                 struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
                 if (!sqe) {
@@ -545,15 +593,22 @@ class SharedUringRing {
                 else
                     io_uring_prep_read(sqe, fd, iovs[idx].iov_base,
                                        iovs[idx].iov_len, cur);
-                sqe->user_data = op;
+                sqe->user_data = op | static_cast<uint64_t>(i + 1);
+                parts[i] = ReadDesc{iovs[idx].iov_base, iovs[idx].iov_len, cur};
 
                 cur += static_cast<off_t>(iovs[idx].iov_len);
                 ++idx;
             }
 
-            auto res = collect(batch, op);
-            if (!res) return res;
-            total += res.value();
+            if (!collect_batch(batch, op, parts)) {
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            for (int i = 0; i < batch; ++i) {
+                auto done = finish_short(is_write, fd, parts[i], false);
+                if (!done) return done;
+                total += done.value();
+                if (done.value() < parts[i].len) return total;  // read EOF
+            }
             remaining -= batch;
         }
         return total;
@@ -570,6 +625,11 @@ class SharedUringRing {
     void* buf_base_ = nullptr;
     size_t buf_size_ = 0;
     uint64_t op_id_ = 0;  // monotonic ID for stale CQE filtering
+    int cqe_errno_ = 0;   // see cqe_errno()
+
+    void record_cqe_errno(int res) {
+        if (cqe_errno_ == 0) cqe_errno_ = -res;
+    }
 };
 
 // ============================================================================
@@ -638,6 +698,10 @@ void UringFile::free_aligned_buffer(void* ptr) const {
     if (ptr) free(ptr);
 }
 
+void UringFile::record_ring_errno() {
+    record_sys_errno(SharedUringRing::instance().cqe_errno());
+}
+
 bool UringFile::in_registered_buffer(const void* buf, size_t len) const {
     auto& r = SharedUringRing::instance();
     if (!r.is_buffer_registered()) return false;
@@ -679,7 +743,10 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
 
     if (bounce) free_aligned_buffer(bounce);
 
-    if (!res) return make_error<size_t>(res.error());
+    if (!res) {
+        record_ring_errno();
+        return make_error<size_t>(res.error());
+    }
     if (res.value() < length)
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     return length;
@@ -718,7 +785,10 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string& buffer,
         free_aligned_buffer(bounce);
     }
 
-    if (!res) return make_error<size_t>(res.error());
+    if (!res) {
+        record_ring_errno();
+        return make_error<size_t>(res.error());
+    }
     size_t got = use_direct_io_ ? std::min(res.value(), length) : res.value();
     if (!use_direct_io_) buffer.resize(got);
     if (got == 0) return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
@@ -743,7 +813,9 @@ tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    return SharedUringRing::instance().write(fd_, buffer, length, offset);
+    auto res = SharedUringRing::instance().write(fd_, buffer, length, offset);
+    if (!res) record_ring_errno();
+    return res;
 }
 
 tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
@@ -760,7 +832,9 @@ tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    return SharedUringRing::instance().read(fd_, buffer, length, offset);
+    auto res = SharedUringRing::instance().read(fd_, buffer, length, offset);
+    if (!res) record_ring_errno();
+    return res;
 }
 
 // ---------------------------------------------------------------------------
@@ -782,7 +856,9 @@ tl::expected<void, ErrorCode> UringFile::batch_read(ReadDesc* descs, int cnt) {
         }
     }
 
-    return SharedUringRing::instance().batch_read(fd_, descs, cnt);
+    auto res = SharedUringRing::instance().batch_read(fd_, descs, cnt);
+    if (!res) record_ring_errno();
+    return res;
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +945,7 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
             if (!read_res) {
                 // A real read error must not proceed with a zero-filled
                 // bounce buffer — that would silently corrupt neighbors.
+                record_ring_errno();
                 return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
             }
             if (read_res.value() < aligned_len) {
@@ -888,6 +965,7 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
             res = make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
     }
+    if (!res) record_ring_errno();
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)
@@ -951,6 +1029,7 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
     }
 
     if (!res) {
+        record_ring_errno();
         LOG(ERROR) << "[UringFile::vector_read] FAILED fd=" << fd_
                    << " offset=" << offset << " iovcnt=" << iovcnt
                    << " expected=" << expected_bytes;
@@ -966,6 +1045,7 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
     if (fd_ < 0) return make_error<void>(ErrorCode::FILE_NOT_FOUND);
     auto res = SharedUringRing::instance().fsync(fd_);
     if (!res) {
+        record_ring_errno();
         LOG(ERROR) << "[UringFile::datasync] fsync failed for: " << filename_;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }

@@ -1848,13 +1848,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             auto batch_read_result = uring_file->batch_read(
                 read_descs.data(), static_cast<int>(read_descs.size()));
             if (!batch_read_result) {
+                NotifyDiskError(uring_file->sys_errno(), "read");
                 for (size_t i = 0; i < read_descs.size(); ++i) {
                     if (read_descs[i].error == ErrorCode::OK) continue;
                     LOG(ERROR)
                         << "batch_read failed for key: "
                         << batch_read_plans[i].plan->key
                         << ", bucket_id=" << batch_read_plans[i].plan->bucket_id
-                        << ", error=" << read_descs[i].error;
+                        << ", error=" << read_descs[i].error
+                        << ErrnoSuffix(uring_file->sys_errno());
                 }
                 return tl::make_unexpected(batch_read_result.error());
             }
@@ -2502,8 +2504,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         auto write_result =
             uring_file->write_aligned(write_buffer, aligned_size, 0);
         if (!write_result) {
+            NotifyDiskError(uring_file->sys_errno(), "write");
             LOG(ERROR) << "write_aligned failed for: " << bucket_id
-                       << ", error: " << write_result.error();
+                       << ", error: " << write_result.error()
+                       << ErrnoSuffix(uring_file->sys_errno());
             return tl::make_unexpected(write_result.error());
         }
         if (write_result.value() != aligned_size) {

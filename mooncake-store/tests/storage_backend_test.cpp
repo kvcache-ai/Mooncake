@@ -23,6 +23,7 @@
 #include <mutex>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
@@ -5222,6 +5223,50 @@ TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
     auto load_result = storage_backend.BatchLoad(load_batch);
     ASSERT_FALSE(load_result.has_value());
     EXPECT_EQ(load_result.error(), ErrorCode::FILE_READ_FAIL);
+}
+
+// With io_uring, a failed read CQE reaches the disk-error observer with its
+// errno, as a failed preadv does on the PosixFile path.
+TEST_F(StorageBackendTest, BucketBackendReportsUringReadErrno) {
+    {
+        struct io_uring ring;
+        if (io_uring_queue_init(2, &ring, 0) < 0)
+            GTEST_SKIP() << "io_uring is unavailable";
+        io_uring_queue_exit(&ring);
+    }
+    constexpr size_t kValueSize = 4096;
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+    std::vector<std::pair<int, std::string>> reported;
+    storage_backend.SetDiskErrorObserver([&reported](int err, const char* op) {
+        reported.emplace_back(err, op);
+    });
+
+    const std::string key = "uring_errno_key";
+    std::string value(kValueSize, 'u');
+    std::unordered_map<std::string, std::vector<Slice>> offload_batch{
+        {key, std::vector<Slice>{Slice{value.data(), value.size()}}}};
+    auto offload_result = storage_backend.BatchOffload(
+        offload_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+    EXPECT_TRUE(reported.empty());
+
+    // The O_DIRECT read into an inaccessible buffer fails with EFAULT.
+    void* mem = mmap(nullptr, 2 * kValueSize, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mem, MAP_FAILED);
+    std::unordered_map<std::string, Slice> load_batch{
+        {key, Slice{mem, kValueSize}}};
+    EXPECT_FALSE(storage_backend.BatchLoad(load_batch).has_value());
+    munmap(mem, 2 * kValueSize);
+    ASSERT_EQ(reported.size(), 1u);
+    EXPECT_EQ(reported[0], std::make_pair(EFAULT, std::string("read")));
 }
 
 #endif
