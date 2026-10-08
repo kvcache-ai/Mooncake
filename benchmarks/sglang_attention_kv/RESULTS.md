@@ -127,19 +127,26 @@ through the addresses in that stream and nowhere else.
 71.737 ms of loop, four take 242.374 ms, and four sequences of 8192, 4096, 2048 and 1024 take 84.745 ms,
 which is the same 8192 tokens under a causal mask.
 
-**The gather probe moves the same rows about twenty times faster than the attention reads them.** At a
-32768-token history it moves 1.2 GB per rank in 1.741 ms, 693.9 GB/s, and the attention window over the
-same rows is 931.228 ms. The probe only indexes; the attention reads the same bytes through the paged
-kernel and multiplies them.
+**The gather probe moves the same rows in a window of its own.** At a 32768-token history it moves
+1.2 GB per rank in 1.741 ms, 693.9 GB/s, while the attention window over the same rows is 931.228 ms.
+The probe indexes and copies; the attention reads the same bytes through the paged kernel and
+multiplies them.
 
 ## Two kinds of window behind the two components
 
 The two component passes do not price the same quantity, and a reader comparing them with the loop
 should know which regime each window caught.
 
-`attn` is device time wherever the attention keeps the device busy for longer than the host takes to
-issue its calls, which is every row whose attention exceeds a millisecond: it reads 72.208 ms against a
-loop of 71.737 ms for the 8192-token prefill, and 45.677 against 45.578 for the merge step above.
+`attn` is device time on the prefill and extend rows, where the attention keeps the device busy for
+longer than the host takes to issue its calls: it reads 72.208 ms against a loop of 71.737 ms for the
+8192-token prefill, 931.228 against 931.418 for the 32768-token one, and 45.677 against 45.578 for the
+merge step above.
+
+On the decode rows the same window is host-bound. There the loop is the sum of its parts — 3.341 ms
+against 1.167 ms of write window, 1.642 ms of attention window, 0.340 ms of `indices` and 0.218 ms of
+`plan`, which is 3.367 ms — and a probe that timed the host's issue of the same calls separately read
+1.657 ms of issue against a 1.681 ms window. Decode computes one token per sequence, so both windows
+are shorter than the host takes to issue them and neither is a device rate.
 
 `write` reads two regimes for the same 72 calls. In 583 of the 600 matrix rows its p50 is 1.127 to
 1.296 ms, and in the other 17 it is 0.050 to 0.240 ms — for calls whose count and byte count do not
