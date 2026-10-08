@@ -367,16 +367,35 @@ TEST_F(FabricTransportTest, UnregisteredTargetIsRejected) {
     EXPECT_NE(run({request}), 1);
 }
 
+// Some providers (tcp) fail ops to a dead peer; others (efa) never return
+// them. Then the ops go overdue, and new ops to that peer fail unposted.
 TEST_F(FabricTransportTest, PeerLossFails) {
-    connect(0, 0);
+    connect(0, 0, [](Config& config) {
+        config.set("transports/fabric/op_timeout_ms", uint64_t(1000));
+        config.set("transports/fabric/quiesce_timeout_ms", uint64_t(1000));
+        config.set("max_failover_attempts", 0);
+    });
     roundTrip(0, 0, 64 * 1024, 1, 64 * 1024);
     server_.kill();
     std::vector<Request> requests;
     for (size_t t = 0; t < 4; ++t)
         requests.push_back(makeRequest(Request::WRITE, t * 1024 * 1024,
                                        t * 1024 * 1024, 1024 * 1024));
-    const int result = run(requests);
-    EXPECT_TRUE(result == -1 || result == -2) << "result " << result;
+    BatchID batch = client_->allocateBatch(requests.size());
+    if (!client_->submitTransfer(batch, requests).ok()) {
+        (void)client_->freeBatch(batch);
+        return;
+    }
+    const auto status = settle(batch, 5000);
+    if (status == TransferStatusEnum::PENDING) {
+        // Not freed: the batch stays pending until the provider returns
+        // its ops.
+        const int result = run({makeRequest(Request::WRITE, 0, 0, 4096)});
+        EXPECT_TRUE(result == -1 || result == -2) << "result " << result;
+        return;
+    }
+    EXPECT_EQ(status, TransferStatusEnum::FAILED);
+    (void)client_->freeBatch(batch);
 }
 
 // Pins both sides to one NIC with the given op limits.
