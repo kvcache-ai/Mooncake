@@ -109,7 +109,6 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
-    storage/distributed/kvcs/kvcs_driver.cpp
     storage/distributed/kvcs/kvcs_efc_topology.cpp
     storage/distributed/kvcs/kvcs_capi_driver.cpp
     storage/distributed/kvcs/kvcs_object_storage_adapter.cpp

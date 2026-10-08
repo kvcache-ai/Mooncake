@@ -56,83 +56,57 @@ tl::expected<std::vector<Slice>, ErrorCode> DestinationSlices(
 
 }  // namespace
 
-struct KvcsObjectStorageAdapter::Impl {
-    std::string target_id;
-    uint32_t mountpoint_index = 0;
-    std::unique_ptr<KvcsDriver> driver;
-};
-
 KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
     const FileStorageConfig& config, std::string efc_config_path)
     : config_(config), efc_config_path_(std::move(efc_config_path)) {}
 
 KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
     const FileStorageConfig& config, std::unique_ptr<KvcsDriver> driver)
-    : KvcsObjectStorageAdapter(config) {
-    pending_targets_.push_back(
-        {.id = "injected", .mountpoint_index = 1, .driver = std::move(driver)});
-}
-
-KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
-    const FileStorageConfig& config,
-    std::vector<KvcsLowLevelTargetSpec> targets)
-    : KvcsObjectStorageAdapter(config) {
-    pending_targets_ = std::move(targets);
-}
+    : config_(config), target_id_("injected"), mountpoint_index_(1),
+      driver_(std::move(driver)) {}
 
 KvcsObjectStorageAdapter::~KvcsObjectStorageAdapter() = default;
 
 tl::expected<ObjectKey, ErrorCode> KvcsObjectStorageAdapter::EncodeKey(
     std::string_view logical_key) const {
     const TenantId tenant(config_.kvcs_tenant_id);
-    if (logical_key.empty() || !tenant.IsValid() || !impl_)
+    if (logical_key.empty() || !tenant.IsValid() || !driver_)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     auto encoded = EncodeKvcsKey(tenant.value(), logical_key);
-    if (!IsKvcsKeyStringSafe(encoded, impl_->driver->MaxKeySize()))
+    if (!IsKvcsKeyStringSafe(encoded, driver_->MaxKeySize()))
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     return encoded;
 }
 
 tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
     if (initialized_) return {};
-    if (pending_targets_.empty()) {
+    if (!driver_) {
         auto target = LoadKvcsEfcTarget(efc_config_path_);
         if (!target) return tl::make_unexpected(target.error());
-        const std::array<uint32_t, 1> index{target->mountpoint_index};
-        auto drivers = CreateKvcsLowLevelDrivers(index);
-        if (!drivers) return tl::make_unexpected(drivers.error());
-        pending_targets_.push_back(
-            {.id = target->id,
-             .mountpoint_index = target->mountpoint_index,
-             .driver = std::move(drivers->front())});
+        auto driver = CreateKvcsLowLevelDriver(target->mountpoint_index);
+        if (!driver) return tl::make_unexpected(driver.error());
+        target_id_ = std::move(target->id);
+        mountpoint_index_ = target->mountpoint_index;
+        driver_ = std::move(*driver);
     }
-    // Never silently select one target out of a multi-target deployment.
-    if (pending_targets_.size() != 1 || pending_targets_[0].id.empty() ||
-        !pending_targets_[0].driver)
+    if (target_id_.empty() || !driver_)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
-    auto& target = pending_targets_.front();
-    auto init = target.driver->Init();
+    auto init = driver_->Init();
     if (!init) return init;
-    if (target.driver->MaxValueSize() == 0 ||
-        target.driver->MaxKeySize() == 0 ||
-        target.driver->MaxKeySize() > kKvcsMaxKeySize)
+    if (driver_->MaxValueSize() == 0 || driver_->MaxKeySize() == 0 ||
+        driver_->MaxKeySize() > kKvcsMaxKeySize)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    impl_ = std::make_unique<Impl>();
-    impl_->target_id = std::move(target.id);
-    impl_->mountpoint_index = target.mountpoint_index;
-    impl_->driver = std::move(target.driver);
-    pending_targets_.clear();
     initialized_ = true;
-    LOG(INFO) << "KVCS Low Level target=" << impl_->target_id
-              << ", mountpoint_index=" << impl_->mountpoint_index;
+    LOG(INFO) << "KVCS Low Level target=" << target_id_
+              << ", mountpoint_index=" << mountpoint_index_;
     return {};
 }
 
 tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::CheckHealth() {
     if (!initialized_) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     const std::array<ObjectKey, 1> probe{std::string(kHealthProbeKey)};
-    const auto result = BatchQueryKvcsObjects(*impl_->driver, probe);
+    const auto result = driver_->BatchQuery(probe);
     if (result.size() != 1)
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     if (!result[0] && result[0].error() != ErrorCode::OBJECT_NOT_FOUND)
@@ -175,121 +149,79 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
     std::span<const ObjectStoragePutRequest> requests) {
     if (!initialized_)
         return IoErrors(requests.size(), ErrorCode::INTERNAL_ERROR);
+    ObjectStorageIoResults results(requests.size());
     std::vector<KvcsPutRequest> puts;
+    std::vector<size_t> put_indices;
     puts.reserve(requests.size());
+    put_indices.reserve(requests.size());
     std::unordered_set<std::string> keys;
-    for (const auto& request : requests) {
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        if (request.replace_existing) {
+            results[i] = tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+            continue;
+        }
         auto key = EncodeKey(request.logical_key);
-        if (!key || !keys.insert(*key).second || request.slices.empty())
+        if (!key || !keys.insert(*key).second || request.slices.empty() ||
+            request.slices.size() >
+                static_cast<size_t>(std::numeric_limits<int>::max()))
             return IoErrors(requests.size(), ErrorCode::INVALID_PARAMS);
         uint64_t size = 0;
         for (const auto& slice : request.slices) {
             if (!slice.ptr || slice.size == 0 ||
-                slice.size > impl_->driver->MaxValueSize() - size)
+                slice.size > driver_->MaxValueSize() - size)
                 return IoErrors(requests.size(), ErrorCode::INVALID_PARAMS);
             size += slice.size;
         }
         if (size == 0)
             return IoErrors(requests.size(), ErrorCode::INVALID_PARAMS);
-        puts.push_back({std::move(*key), request.slices});
+        puts.push_back({std::move(*key), request.slices, size});
+        put_indices.push_back(i);
     }
 
-    ObjectStorageIoResults results(requests.size());
-    for (size_t i = 0; i < requests.size(); ++i) {
-        if (!requests[i].replace_existing) continue;
-        auto removed = impl_->driver->BatchDelete(
-            std::array<ObjectKey, 1>{puts[i].logical_key});
-        if (removed.size() != 1)
-            results[i] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        else if (!removed[0] &&
-                 removed[0].error() != ErrorCode::OBJECT_NOT_FOUND)
-            results[i] = tl::make_unexpected(removed[0].error());
-    }
     for (size_t i = 0; i < puts.size(); ++i) {
-        if (!results[i]) continue;
-        auto put = BatchPutKvcsObjects(
-            *impl_->driver, std::span<const KvcsPutRequest>(&puts[i], 1));
-        results[i] = put.size() == 1
-                         ? std::move(put[0])
-                         : tl::expected<void, ErrorCode>(
-                               tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        const size_t request_index = put_indices[i];
+        if (!results[request_index]) continue;
+        try {
+            auto put = driver_->BatchPut({&puts[i], 1});
+            results[request_index] = put.size() == 1
+                             ? std::move(put[0])
+                             : tl::expected<void, ErrorCode>(
+                                   tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        } catch (...) {
+            results[request_index] =
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
     }
     return results;
 }
 
-KvcsManifestResults KvcsObjectStorageAdapter::BatchQueryKvcs(
+ObjectStorageQueryResults KvcsObjectStorageAdapter::BatchQueryKvcs(
     std::span<const ObjectKey> logical_keys,
     std::optional<std::chrono::steady_clock::time_point> deadline) {
     if (!initialized_)
-        return Errors<KvcsManifest>(logical_keys.size(),
-                                    ErrorCode::INTERNAL_ERROR);
-    std::vector<ObjectKey> keys;
-    keys.reserve(logical_keys.size());
+        return IoErrors(logical_keys.size(), ErrorCode::INTERNAL_ERROR);
+    ObjectStorageQueryResults results;
+    results.reserve(logical_keys.size());
     for (const auto& logical_key : logical_keys) {
         auto key = EncodeKey(logical_key);
-        if (!key) return Errors<KvcsManifest>(logical_keys.size(), key.error());
-        keys.push_back(std::move(*key));
-    }
-    auto results = BatchQueryKvcsObjects(*impl_->driver, keys, deadline);
-    for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i]) continue;
-        if (results[i]->layout_known &&
-            (results[i]->total_shard != 1 ||
-             results[i]->total_size > impl_->driver->MaxValueSize())) {
-            results[i] = tl::make_unexpected(ErrorCode::KVCS_INCOMPLETE);
-        } else {
-            results[i]->logical_key = logical_keys[i];
-        }
-    }
-    return results;
-}
-
-KvcsGetResults KvcsObjectStorageAdapter::BatchGetKvcsWithManifests(
-    std::span<const KvcsGetRequest> requests,
-    std::span<const tl::expected<KvcsManifest, ErrorCode>> manifests) {
-    if (!initialized_)
-        return IoErrors(requests.size(), ErrorCode::INTERNAL_ERROR);
-    if (requests.size() != manifests.size())
-        return IoErrors(requests.size(), ErrorCode::INVALID_PARAMS);
-    KvcsGetResults results;
-    results.reserve(requests.size());
-    for (size_t i = 0; i < requests.size(); ++i) {
-        if (!manifests[i]) {
-            results.emplace_back(tl::make_unexpected(manifests[i].error()));
-            continue;
-        }
-        auto key = EncodeKey(requests[i].logical_key);
         if (!key) {
             results.emplace_back(tl::make_unexpected(key.error()));
             continue;
         }
-        uint64_t size = 0;
-        for (const auto& slice : requests[i].destination_slices)
-            size += slice.size;
-        if (size == 0 || size > impl_->driver->MaxValueSize() ||
-            (manifests[i]->layout_known &&
-             (manifests[i]->total_shard != 1 ||
-              manifests[i]->total_size != size))) {
+        try {
+            auto queried = deadline
+                ? driver_->BatchQueryUntil({&*key, 1}, *deadline)
+                : driver_->BatchQuery({&*key, 1});
             results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
+                queried.size() == 1
+                    ? std::move(queried[0])
+                    : tl::expected<void, ErrorCode>(
+                          tl::make_unexpected(ErrorCode::INTERNAL_ERROR)));
+        } catch (...) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
         }
-        auto manifest =
-            BuildKvcsManifest(*key, size, impl_->driver->MaxValueSize());
-        if (!manifest) {
-            results.emplace_back(tl::make_unexpected(manifest.error()));
-            continue;
-        }
-        KvcsGetRequest get{*key, requests[i].destination_slices};
-        auto read = BatchGetKvcsObjects(
-            *impl_->driver, std::span<const KvcsGetRequest>(&get, 1),
-            std::span<const tl::expected<KvcsManifest, ErrorCode>>(&manifest,
-                                                                   1));
-        results.emplace_back(
-            read.size() == 1
-                ? std::move(read[0])
-                : tl::expected<void, ErrorCode>(
-                      tl::make_unexpected(ErrorCode::INTERNAL_ERROR)));
     }
     return results;
 }
@@ -305,28 +237,6 @@ ObjectStorageQueryResults KvcsObjectStorageAdapter::BatchQueryProviderUntil(
     return BatchQueryKvcs(keys, deadline);
 }
 
-ObjectStorageIoResults KvcsObjectStorageAdapter::BatchGetIntoWithQueryContexts(
-    std::span<const ObjectStorageGetRequest> requests,
-    std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>
-        contexts) {
-    if (!initialized_)
-        return IoErrors(requests.size(), ErrorCode::INTERNAL_ERROR);
-    if (requests.size() != contexts.size())
-        return IoErrors(requests.size(), ErrorCode::INVALID_PARAMS);
-    std::vector<KvcsGetRequest> gets;
-    KvcsManifestResults manifests;
-    gets.reserve(requests.size());
-    manifests.reserve(requests.size());
-    for (size_t i = 0; i < requests.size(); ++i) {
-        auto slices =
-            DestinationSlices(requests[i], impl_->driver->MaxValueSize());
-        if (!slices) return IoErrors(requests.size(), slices.error());
-        gets.push_back({requests[i].logical_key, std::move(*slices)});
-        manifests.push_back(contexts[i]);
-    }
-    return BatchGetKvcsWithManifests(gets, manifests);
-}
-
 tl::expected<size_t, ErrorCode> KvcsObjectStorageAdapter::Get(
     const std::string& key, void* buf, size_t len) {
     const ObjectStorageGetRequest request{key, {{buf, len}}, len};
@@ -339,23 +249,31 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchGetInto(
     std::span<const ObjectStorageGetRequest> requests) {
     if (!initialized_)
         return IoErrors(requests.size(), ErrorCode::INTERNAL_ERROR);
-    std::vector<ObjectKey> keys;
-    std::vector<KvcsGetRequest> gets;
-    keys.reserve(requests.size());
-    gets.reserve(requests.size());
+    ObjectStorageIoResults results;
+    results.reserve(requests.size());
     for (const auto& request : requests) {
-        auto slices = DestinationSlices(request, impl_->driver->MaxValueSize());
-        if (!slices) return IoErrors(requests.size(), slices.error());
-        keys.push_back(request.logical_key);
-        gets.push_back({request.logical_key, std::move(*slices)});
+        auto slices = DestinationSlices(request, driver_->MaxValueSize());
+        auto key = EncodeKey(request.logical_key);
+        if (!slices || !key) {
+            results.emplace_back(tl::make_unexpected(
+                !slices ? slices.error() : key.error()));
+            continue;
+        }
+        const KvcsGetRequest get{std::move(*key), std::move(*slices),
+                                 request.expected_size};
+        try {
+            auto read = driver_->BatchGet({&get, 1});
+            results.emplace_back(
+                read.size() == 1
+                    ? std::move(read[0])
+                    : tl::expected<void, ErrorCode>(
+                          tl::make_unexpected(ErrorCode::INTERNAL_ERROR)));
+        } catch (...) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        }
     }
-    auto manifests = BatchQueryKvcs(keys);
-    for (size_t i = 0; i < manifests.size(); ++i) {
-        if (manifests[i] && manifests[i]->layout_known &&
-            manifests[i]->total_size != requests[i].expected_size)
-            manifests[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    return BatchGetKvcsWithManifests(gets, manifests);
+    return results;
 }
 
 tl::expected<bool, ErrorCode> KvcsObjectStorageAdapter::Exists(
@@ -376,16 +294,26 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Delete(
 ObjectStorageIoResults KvcsObjectStorageAdapter::BatchDelete(
     std::span<const std::string> keys) {
     if (!initialized_) return IoErrors(keys.size(), ErrorCode::INTERNAL_ERROR);
-    std::vector<ObjectKey> encoded;
-    encoded.reserve(keys.size());
+    ObjectStorageIoResults results;
+    results.reserve(keys.size());
     for (const auto& key : keys) {
-        auto value = EncodeKey(key);
-        if (!value) return IoErrors(keys.size(), value.error());
-        encoded.push_back(std::move(*value));
+        auto encoded = EncodeKey(key);
+        if (!encoded) {
+            results.emplace_back(tl::make_unexpected(encoded.error()));
+            continue;
+        }
+        try {
+            auto removed = driver_->BatchDelete({&*encoded, 1});
+            results.emplace_back(
+                removed.size() == 1
+                    ? std::move(removed[0])
+                    : tl::expected<void, ErrorCode>(
+                          tl::make_unexpected(ErrorCode::INTERNAL_ERROR)));
+        } catch (...) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        }
     }
-    auto results = impl_->driver->BatchDelete(encoded);
-    if (results.size() != keys.size())
-        return IoErrors(keys.size(), ErrorCode::INTERNAL_ERROR);
     return results;
 }
 

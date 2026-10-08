@@ -123,15 +123,4 @@ ObjectStorageQueryResults ObjectStorageAdapter::BatchQueryProvider(
     return results;
 }
 
-ObjectStorageIoResults ObjectStorageAdapter::BatchGetIntoWithQueryContexts(
-    std::span<const ObjectStorageGetRequest> requests,
-    std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>) {
-    ObjectStorageIoResults results;
-    results.reserve(requests.size());
-    for (size_t i = 0; i < requests.size(); ++i) {
-        results.emplace_back(tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
-    }
-    return results;
-}
-
 }  // namespace mooncake

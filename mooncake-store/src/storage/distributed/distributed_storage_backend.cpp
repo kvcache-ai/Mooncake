@@ -746,20 +746,6 @@ ObjectStorageQueryResults DistributedStorageBackend::BatchQueryProvider(
                                                               deadline);
 }
 
-ObjectStorageIoResults
-DistributedStorageBackend::BatchGetProviderWithQueryContexts(
-    std::span<const ObjectStorageGetRequest> requests,
-    std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>
-        contexts) {
-    if (!initialized_ || !SupportsProviderQuery()) {
-        return ObjectStorageIoResults(
-            requests.size(),
-            tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
-    }
-    return object_storage_adapter_->BatchGetIntoWithQueryContexts(requests,
-                                                                  contexts);
-}
-
 ObjectStorageIoResults DistributedStorageBackend::BatchDeleteProvider(
     std::span<const std::string> logical_keys) {
     if (!initialized_ || !UsesObjectStorage() || !object_storage_adapter_) {

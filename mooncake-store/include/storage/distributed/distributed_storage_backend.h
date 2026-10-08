@@ -89,10 +89,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
     ObjectStorageQueryResults BatchQueryProvider(
         std::span<const std::string> logical_keys,
         std::chrono::steady_clock::time_point deadline);
-    ObjectStorageIoResults BatchGetProviderWithQueryContexts(
-        std::span<const ObjectStorageGetRequest> requests,
-        std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>
-            contexts);
     ObjectStorageIoResults BatchDeleteProvider(
         std::span<const std::string> logical_keys);
 

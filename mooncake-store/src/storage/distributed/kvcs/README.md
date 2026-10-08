@@ -28,8 +28,16 @@ Set `MOONCAKE_KVCS_MODE=low-level` (or explicitly select
 `MOONCAKE_DFS_FS_ADAPTER=kvcs-lowlevel`) on the cooperating Mooncake
 processes. The initial distributed-storage configuration is single-tenant;
 each provider key nevertheless includes the tenant ID and logical key in a
-printable, injective encoding. Upsert remains Remove followed by Put, not an
-atomic replacement. Insert-only writes do not overwrite existing keys.
+printable, injective encoding. Upsert/replace remains unsupported in this
+initial change; insert-only writes do not overwrite existing keys. Single-key
+`Remove` and `BatchRemove` first delete the physical value and then release
+the Master name. This ordering is safe for insert-only Put: a concurrent Put
+either still sees the old Master name and is rejected, or starts after the
+physical delete has completed. A missing provider value is idempotent. If
+Master rejects the removal, the physical value is gone and the logical
+metadata remains for a retry; an atomic cross-system reservation is a later
+follow-up. `RemoveByRegex` and `RemoveAll` return `NOT_SUPPORTED` in this
+initial KVCS mode because provider-wide conditional deletion is not defined.
 
 The KVCS SDK is optional at build time. With no SDK, other Mooncake backends
 build normally and explicit KVCS initialization returns `NOT_SUPPORTED`.
@@ -37,6 +45,8 @@ With the SDK installed, CMake discovers `kvcs` using `pkg-config`. Deploy
 EFC using the official KVCacheStore tooling; Mooncake does not start EFC,
 configure storage capacity, or modify `/dev/shm`.
 
+The SDK's Query proves presence but does not return the value size. Reads use
+the Master descriptor's size and reject a shorter or longer provider value.
 Provider misses and incomplete records never become valid data merely
 because the Master has a COMPLETE descriptor. The adapter does not yet repair
 stale Master metadata automatically; safe conditional invalidation belongs to

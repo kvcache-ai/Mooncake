@@ -42,22 +42,8 @@ struct ObjectStorageGetRequest {
     size_t expected_size = 0;
 };
 
-struct ObjectStorageShardContext {
-    uint32_t shard_id = 0;
-    uint64_t size = 0;
-};
-
-struct ObjectStorageQueryContext {
-    std::string logical_key;
-    uint32_t total_shard = 1;
-    uint64_t total_size = 0;
-    std::vector<ObjectStorageShardContext> shards;
-    bool layout_known = true;
-};
-
 using ObjectStorageIoResults = std::vector<tl::expected<void, ErrorCode>>;
-using ObjectStorageQueryResults =
-    std::vector<tl::expected<ObjectStorageQueryContext, ErrorCode>>;
+using ObjectStorageQueryResults = ObjectStorageIoResults;
 
 /**
  * @brief Adapts object storage services to the distributed backend's
@@ -126,9 +112,8 @@ class ObjectStorageAdapter {
     virtual ObjectStorageIoResults BatchDelete(
         std::span<const std::string> logical_keys);
 
-    // Provider query contexts are request-local hints. Mooncake never stores
-    // them in master metadata; clients use them only to issue the matching
-    // direct provider read after the master query completes.
+    // A successful query proves presence, not size or layout. The Master owns
+    // the object size; Get must check that the provider returns exactly it.
     virtual bool SupportsProviderQuery() const { return false; }
     virtual ObjectStorageQueryResults BatchQueryProvider(
         std::span<const std::string> logical_keys);
@@ -137,11 +122,6 @@ class ObjectStorageAdapter {
         std::chrono::steady_clock::time_point deadline) {
         return BatchQueryProvider(logical_keys);
     }
-    virtual ObjectStorageIoResults BatchGetIntoWithQueryContexts(
-        std::span<const ObjectStorageGetRequest> requests,
-        std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>
-            contexts);
-
     // Pagination is an implementation detail. Returns decoded logical keys
     // from the adapter's configured physical namespace.
     virtual tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() = 0;

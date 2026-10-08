@@ -459,14 +459,9 @@ using mooncake::SelectBestReplica;
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
                                      bool include_object_checksum = true) {
-    std::vector<ProviderReadContext> provider_contexts;
-    if (const auto *context = qr.FindProviderReadContext(replica.id)) {
-        provider_contexts.push_back(*context);
-    }
     return QueryResult(
         {replica}, qr.lease_timeout,
-        include_object_checksum ? qr.object_checksum : std::nullopt,
-        std::move(provider_contexts));
+        include_object_checksum ? qr.object_checksum : std::nullopt);
 }
 
 // Shared object-byte range overflow check (same semantics as

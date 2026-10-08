@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -11,7 +10,6 @@
 
 #include <ylt/util/tl/expected.hpp>
 
-#include "storage/distributed/object_storage_adapter.h"
 #include "types.h"
 
 namespace mooncake {
@@ -48,43 +46,22 @@ inline ObjectKey EncodeKvcsKey(std::string_view tenant_id,
     return encoded;
 }
 
-using KvcsShardLocation = ObjectStorageShardContext;
-using KvcsManifest = ObjectStorageQueryContext;
-
 struct KvcsPutRequest {
     ObjectKey logical_key;
     std::vector<Slice> slices;
+    uint64_t size = 0;
 };
 
 struct KvcsGetRequest {
     ObjectKey logical_key;
-    std::vector<Slice> destination_slices;
-};
-
-struct KvcsShardPutRequest {
-    ObjectKey logical_key;
-    uint32_t total_shard = 1;
-    uint32_t shard_id = 0;
     std::vector<Slice> slices;
     uint64_t size = 0;
 };
 
-struct KvcsShardGetRequest {
-    ObjectKey logical_key;
-    uint32_t total_shard = 1;
-    uint32_t shard_id = 0;
-    std::vector<Slice> slices;
-    uint64_t size = 0;
-};
-
-using KvcsPutShardResults = std::vector<tl::expected<void, ErrorCode>>;
-using KvcsGetShardResults = std::vector<tl::expected<void, ErrorCode>>;
-using KvcsDeleteResults = std::vector<tl::expected<void, ErrorCode>>;
-using KvcsDriverQueryResults =
-    std::vector<tl::expected<KvcsManifest, ErrorCode>>;
-using KvcsManifestResults = KvcsDriverQueryResults;
 using KvcsPutResults = std::vector<tl::expected<void, ErrorCode>>;
 using KvcsGetResults = std::vector<tl::expected<void, ErrorCode>>;
+using KvcsDeleteResults = std::vector<tl::expected<void, ErrorCode>>;
+using KvcsDriverQueryResults = std::vector<tl::expected<void, ErrorCode>>;
 
 /**
  * The SDK-facing boundary used by the KVCS backend.
@@ -99,8 +76,8 @@ class KvcsDriver {
     virtual uint64_t MaxValueSize() const = 0;
     virtual uint32_t MaxKeySize() const { return kKvcsDefaultMaxKeySize; }
 
-    virtual KvcsPutShardResults BatchPut(
-        std::span<const KvcsShardPutRequest> requests) = 0;
+    virtual KvcsPutResults BatchPut(
+        std::span<const KvcsPutRequest> requests) = 0;
     virtual KvcsDriverQueryResults BatchQuery(
         std::span<const ObjectKey> logical_keys) = 0;
     virtual KvcsDriverQueryResults BatchQueryUntil(
@@ -113,28 +90,10 @@ class KvcsDriver {
         }
         return BatchQuery(logical_keys);
     }
-    virtual KvcsGetShardResults BatchGet(
-        std::span<const KvcsShardGetRequest> requests) = 0;
+    virtual KvcsGetResults BatchGet(
+        std::span<const KvcsGetRequest> requests) = 0;
     virtual KvcsDeleteResults BatchDelete(
         std::span<const ObjectKey> logical_keys) = 0;
 };
-
-KvcsManifestResults BatchQueryKvcsObjects(
-    KvcsDriver& driver, std::span<const ObjectKey> logical_keys,
-    std::optional<std::chrono::steady_clock::time_point> deadline =
-        std::nullopt);
-
-KvcsPutResults BatchPutKvcsObjects(KvcsDriver& driver,
-                                   std::span<const KvcsPutRequest> requests);
-
-KvcsGetResults BatchGetKvcsObjects(
-    KvcsDriver& driver, std::span<const KvcsGetRequest> requests,
-    std::span<const tl::expected<KvcsManifest, ErrorCode>> manifests);
-
-tl::expected<void, ErrorCode> ValidateKvcsManifest(
-    const KvcsManifest& manifest);
-
-tl::expected<KvcsManifest, ErrorCode> BuildKvcsManifest(
-    ObjectKey logical_key, uint64_t total_size, uint64_t max_value_size);
 
 }  // namespace mooncake

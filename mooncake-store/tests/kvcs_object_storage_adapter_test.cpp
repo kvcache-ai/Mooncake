@@ -21,10 +21,10 @@ class MemoryDriver final : public KvcsDriver {
     tl::expected<void, ErrorCode> Init() override { return {}; }
     uint64_t MaxValueSize() const override { return 8; }
 
-    KvcsPutShardResults BatchPut(
-        std::span<const KvcsShardPutRequest> requests) override {
+    KvcsPutResults BatchPut(
+        std::span<const KvcsPutRequest> requests) override {
         ++put_calls_;
-        KvcsPutShardResults results;
+        KvcsPutResults results;
         for (const auto& request : requests) {
             if (values_.contains(request.logical_key)) {
                 results.emplace_back(
@@ -50,19 +50,14 @@ class MemoryDriver final : public KvcsDriver {
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
                 continue;
             }
-            results.emplace_back(KvcsManifest{
-                .logical_key = key,
-                .total_shard = 1,
-                .total_size = it->second.size(),
-                .shards = {{.shard_id = 0, .size = it->second.size()}},
-                .layout_known = true});
+            results.emplace_back();
         }
         return results;
     }
 
-    KvcsGetShardResults BatchGet(
-        std::span<const KvcsShardGetRequest> requests) override {
-        KvcsGetShardResults results;
+    KvcsGetResults BatchGet(
+        std::span<const KvcsGetRequest> requests) override {
+        KvcsGetResults results;
         for (const auto& request : requests) {
             auto it = values_.find(request.logical_key);
             if (it == values_.end()) {
@@ -71,6 +66,11 @@ class MemoryDriver final : public KvcsDriver {
                 continue;
             }
             size_t offset = 0;
+            if (request.size != it->second.size()) {
+                results.emplace_back(
+                    tl::make_unexpected(ErrorCode::KVCS_INCOMPLETE));
+                continue;
+            }
             for (const auto& slice : request.slices) {
                 std::memcpy(slice.ptr, it->second.data() + offset, slice.size);
                 offset += slice.size;
@@ -139,14 +139,14 @@ TEST(KvcsObjectStorageAdapterTest, PutQueryGetAndRemove) {
 
     ASSERT_TRUE(adapter.Exists("key").value());
     const std::array<ObjectKey, 1> keys{"key"};
-    auto contexts = adapter.BatchQueryProviderUntil(
+    auto queried = adapter.BatchQueryProviderUntil(
         keys, std::chrono::steady_clock::now() + std::chrono::seconds(1));
-    ASSERT_EQ(contexts.size(), 1u);
-    ASSERT_TRUE(contexts[0]);
+    ASSERT_EQ(queried.size(), 1u);
+    ASSERT_TRUE(queried[0]);
     std::string output(value.size(), '\0');
     ObjectStorageGetRequest get{
         "key", {{output.data(), output.size()}}, output.size()};
-    ASSERT_TRUE(adapter.BatchGetIntoWithQueryContexts({&get, 1}, contexts)[0]);
+    ASSERT_TRUE(adapter.BatchGetInto({&get, 1})[0]);
     EXPECT_EQ(output, value);
 
     ASSERT_TRUE(adapter.Delete("key"));
@@ -167,6 +167,42 @@ TEST(KvcsObjectStorageAdapterTest, RejectsOversizeBeforeProviderWrite) {
     EXPECT_EQ(driver_ptr->put_calls(), 0u);
 }
 
+TEST(KvcsObjectStorageAdapterTest, QueryAndDeleteKeepPerKeyErrorsIsolated) {
+    auto adapter = MakeAdapter();
+    ASSERT_TRUE(adapter.Init());
+    std::string value = "value";
+    const ObjectStoragePutRequest put{"valid", {{value.data(), value.size()}}};
+    ASSERT_TRUE(adapter.BatchPutV({&put, 1})[0]);
+
+    const std::array<std::string, 2> keys{"valid", std::string(300, 'x')};
+    auto queried = adapter.BatchQueryProvider(keys);
+    ASSERT_EQ(queried.size(), keys.size());
+    EXPECT_TRUE(queried[0]);
+    ASSERT_FALSE(queried[1]);
+    EXPECT_EQ(queried[1].error(), ErrorCode::INVALID_PARAMS);
+
+    auto removed = adapter.BatchDelete(keys);
+    ASSERT_EQ(removed.size(), keys.size());
+    EXPECT_TRUE(removed[0]);
+    ASSERT_FALSE(removed[1]);
+    EXPECT_EQ(removed[1].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_FALSE(adapter.Exists("valid").value());
+}
+
+TEST(KvcsObjectStorageAdapterTest, GetRejectsMasterSizeMismatch) {
+    auto adapter = MakeAdapter();
+    ASSERT_TRUE(adapter.Init());
+    std::string value = "value";
+    const ObjectStoragePutRequest put{"key", {{value.data(), value.size()}}};
+    ASSERT_TRUE(adapter.BatchPutV({&put, 1})[0]);
+    std::string output(value.size() - 1, '\0');
+    const ObjectStorageGetRequest get{
+        "key", {{output.data(), output.size()}}, output.size()};
+    auto result = adapter.BatchGetInto({&get, 1});
+    ASSERT_FALSE(result[0]);
+    EXPECT_EQ(result[0].error(), ErrorCode::KVCS_INCOMPLETE);
+}
+
 TEST(KvcsObjectStorageAdapterTest, UpsertRequiresExplicitReplace) {
     auto adapter = MakeAdapter();
     ASSERT_TRUE(adapter.Init());
@@ -179,14 +215,16 @@ TEST(KvcsObjectStorageAdapterTest, UpsertRequiresExplicitReplace) {
 
     put.replace_existing = true;
     put.slices = {{nullptr, 0}};
-    auto invalid = adapter.BatchPutV({&put, 1});
-    ASSERT_FALSE(invalid[0]);
-    EXPECT_EQ(invalid[0].error(), ErrorCode::INVALID_PARAMS);
-    EXPECT_TRUE(adapter.Exists("key").value());
-
     std::string second = "two";
-    put.slices = {{second.data(), second.size()}};
-    ASSERT_TRUE(adapter.BatchPutV({&put, 1})[0]);
+    const ObjectStoragePutRequest insert{
+        "second", {{second.data(), second.size()}}};
+    const std::array<ObjectStoragePutRequest, 2> requests{put, insert};
+    auto invalid = adapter.BatchPutV(requests);
+    ASSERT_FALSE(invalid[0]);
+    EXPECT_EQ(invalid[0].error(), ErrorCode::NOT_SUPPORTED);
+    ASSERT_TRUE(invalid[1]);
+    EXPECT_TRUE(adapter.Exists("key").value());
+    EXPECT_TRUE(adapter.Exists("second").value());
 }
 
 TEST(KvcsObjectStorageAdapterTest, RejectsInvalidRequests) {
@@ -197,20 +235,6 @@ TEST(KvcsObjectStorageAdapterTest, RejectsInvalidRequests) {
     auto result = adapter.BatchPutV({&empty, 1});
     ASSERT_FALSE(result[0]);
     EXPECT_EQ(result[0].error(), ErrorCode::INVALID_PARAMS);
-}
-
-TEST(KvcsObjectStorageAdapterTest, RejectsMultipleTargets) {
-    FileStorageConfig config;
-    std::vector<KvcsLowLevelTargetSpec> targets;
-    for (uint32_t index = 1; index <= 2; ++index) {
-        targets.push_back({.id = "target-" + std::to_string(index),
-                           .mountpoint_index = index,
-                           .driver = std::make_unique<MemoryDriver>()});
-    }
-    KvcsObjectStorageAdapter adapter(config, std::move(targets));
-    auto result = adapter.Init();
-    ASSERT_FALSE(result);
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST(KvcsObjectStorageAdapterTest, DefaultEfcTargetRejectsMultipleMountpoints) {
@@ -247,25 +271,23 @@ TEST(KvcsObjectStorageAdapterTest, MissingSdkIsExplicitlyUnsupported) {
 #ifdef MOONCAKE_KVCS_TEST_SDK
 TEST(KvcsObjectStorageAdapterTest, OfficialMockSingleValueRoundTrip) {
     if (!std::getenv("MOONCAKE_KVCS_TEST_MOCK")) GTEST_SKIP();
-    const std::array<uint32_t, 1> index{1};
-    auto drivers = CreateKvcsLowLevelDrivers(index);
-    ASSERT_TRUE(drivers);
-    auto& driver = *drivers->front();
+    auto created = CreateKvcsLowLevelDriver(1);
+    ASSERT_TRUE(created);
+    auto& driver = **created;
     ASSERT_TRUE(driver.Init());
     std::string value = "value";
-    const KvcsShardPutRequest put{.logical_key = "pr1-mock-roundtrip",
-                                  .slices = {{value.data(), value.size()}},
-                                  .size = value.size()};
+    const KvcsPutRequest put{.logical_key = "pr1-mock-roundtrip",
+                             .slices = {{value.data(), value.size()}},
+                             .size = value.size()};
     ASSERT_TRUE(driver.BatchPut({&put, 1})[0]);
 
     const std::array<ObjectKey, 1> keys{put.logical_key};
     auto query = driver.BatchQuery(keys);
     ASSERT_TRUE(query[0]);
-    EXPECT_FALSE(query[0]->layout_known);
     std::string output(value.size(), '\0');
-    const KvcsShardGetRequest get{.logical_key = put.logical_key,
-                                  .slices = {{output.data(), output.size()}},
-                                  .size = output.size()};
+    const KvcsGetRequest get{.logical_key = put.logical_key,
+                             .slices = {{output.data(), output.size()}},
+                             .size = output.size()};
     ASSERT_TRUE(driver.BatchGet({&get, 1})[0]);
     EXPECT_EQ(output, value);
     ASSERT_TRUE(driver.BatchDelete(keys)[0]);

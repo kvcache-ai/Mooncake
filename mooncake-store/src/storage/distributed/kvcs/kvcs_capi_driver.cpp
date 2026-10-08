@@ -263,11 +263,7 @@ class SingleValueDriver final : public KvcsDriver {
             if (!status) {
                 results.emplace_back(tl::make_unexpected(status.error()));
             } else if (*status == "ok") {
-                results.emplace_back(KvcsManifest{.logical_key = key,
-                                                  .total_shard = 1,
-                                                  .total_size = 0,
-                                                  .shards = {},
-                                                  .layout_known = false});
+                results.emplace_back();
             } else if (*status == "not_found") {
                 results.emplace_back(
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
@@ -288,12 +284,12 @@ class SingleValueDriver final : public KvcsDriver {
         return results;
     }
 
-    KvcsPutShardResults BatchPut(
-        std::span<const KvcsShardPutRequest> requests) override {
+    KvcsPutResults BatchPut(
+        std::span<const KvcsPutRequest> requests) override {
         if (!client_)
-            return Errors<KvcsPutShardResults>(requests.size(),
+            return Errors<KvcsPutResults>(requests.size(),
                                                ErrorCode::INTERNAL_ERROR);
-        KvcsPutShardResults results;
+        KvcsPutResults results;
         results.reserve(requests.size());
         for (const auto& request : requests) {
             if (!Valid(request) || Quarantined(request.logical_key)) {
@@ -356,12 +352,12 @@ class SingleValueDriver final : public KvcsDriver {
         return results;
     }
 
-    KvcsGetShardResults BatchGet(
-        std::span<const KvcsShardGetRequest> requests) override {
+    KvcsGetResults BatchGet(
+        std::span<const KvcsGetRequest> requests) override {
         if (!client_)
-            return Errors<KvcsGetShardResults>(requests.size(),
+            return Errors<KvcsGetResults>(requests.size(),
                                                ErrorCode::INTERNAL_ERROR);
-        KvcsGetShardResults results;
+        KvcsGetResults results;
         results.reserve(requests.size());
         for (const auto& request : requests) {
             if (!Valid(request) || Quarantined(request.logical_key)) {
@@ -455,8 +451,7 @@ class SingleValueDriver final : public KvcsDriver {
    private:
     template <typename Request>
     bool Valid(const Request& request) const {
-        if (request.total_shard != 1 || request.shard_id != 0 ||
-            !IsKvcsKeyStringSafe(request.logical_key, config_.max_key_size) ||
+        if (!IsKvcsKeyStringSafe(request.logical_key, config_.max_key_size) ||
             request.size == 0 || request.size > config_.max_value_size ||
             request.slices.empty() || request.slices.size() > INT_MAX)
             return false;
@@ -492,19 +487,17 @@ class SingleValueDriver final : public KvcsDriver {
 #endif  // MOONCAKE_HAVE_KVCS_SDK
 }  // namespace
 
-tl::expected<std::vector<std::unique_ptr<KvcsDriver>>, ErrorCode>
-CreateKvcsLowLevelDrivers(std::span<const uint32_t> mountpoint_indices) {
+tl::expected<std::unique_ptr<KvcsDriver>, ErrorCode>
+CreateKvcsLowLevelDriver(uint32_t mountpoint_index) {
 #ifdef MOONCAKE_HAVE_KVCS_SDK
-    if (mountpoint_indices.size() != 1 || mountpoint_indices[0] == 0)
+    if (mountpoint_index == 0)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     auto config = ReadConfig();
     if (!config) return tl::make_unexpected(config.error());
-    std::vector<std::unique_ptr<KvcsDriver>> drivers;
-    drivers.push_back(
-        std::make_unique<SingleValueDriver>(*config, mountpoint_indices[0]));
-    return drivers;
+    return std::unique_ptr<KvcsDriver>(
+        std::make_unique<SingleValueDriver>(*config, mountpoint_index));
 #else
-    (void)mountpoint_indices;
+    (void)mountpoint_index;
     return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
 }

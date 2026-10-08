@@ -16,12 +16,6 @@ namespace mooncake {
 
 inline constexpr char kKvcsLowLevelAdapterName[] = "kvcs-lowlevel";
 
-struct KvcsLowLevelTargetSpec {
-    std::string id;
-    uint32_t mountpoint_index = 0;
-    std::unique_ptr<KvcsDriver> driver;
-};
-
 // Bridges the distributed object-storage contract to KVCS Low Level.
 // The adapter owns tenant encoding and one explicit target; the driver owns
 // I/O.
@@ -31,8 +25,6 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
                              std::string efc_config_path = {});
     KvcsObjectStorageAdapter(const FileStorageConfig& config,
                              std::unique_ptr<KvcsDriver> driver);
-    KvcsObjectStorageAdapter(const FileStorageConfig& config,
-                             std::vector<KvcsLowLevelTargetSpec> targets);
     ~KvcsObjectStorageAdapter() override;
 
     tl::expected<void, ErrorCode> Put(const std::string& logical_key,
@@ -61,10 +53,6 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
     ObjectStorageQueryResults BatchQueryProviderUntil(
         std::span<const std::string> logical_keys,
         std::chrono::steady_clock::time_point deadline) override;
-    ObjectStorageIoResults BatchGetIntoWithQueryContexts(
-        std::span<const ObjectStorageGetRequest> requests,
-        std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>
-            contexts) override;
 
     tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() override;
 
@@ -75,20 +63,16 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
    private:
     tl::expected<ObjectKey, ErrorCode> EncodeKey(
         std::string_view logical_key) const;
-    KvcsManifestResults BatchQueryKvcs(
+    ObjectStorageQueryResults BatchQueryKvcs(
         std::span<const ObjectKey> logical_keys,
         std::optional<std::chrono::steady_clock::time_point> deadline =
             std::nullopt);
-    KvcsGetResults BatchGetKvcsWithManifests(
-        std::span<const KvcsGetRequest> requests,
-        std::span<const tl::expected<KvcsManifest, ErrorCode>> manifests);
-
-    struct Impl;
 
     FileStorageConfig config_;
     std::string efc_config_path_;
-    std::vector<KvcsLowLevelTargetSpec> pending_targets_;
-    std::unique_ptr<Impl> impl_;
+    std::string target_id_;
+    uint32_t mountpoint_index_ = 0;
+    std::unique_ptr<KvcsDriver> driver_;
     bool initialized_ = false;
 };
 
