@@ -149,11 +149,16 @@ class ShmTransport : public Transport {
     const char* getName() const override { return "shm"; }
 
     friend class ShmTransportTestPeer;
+    friend class TransferEngineImpl;
 
     struct AllocatedShmEntry {
         std::string name;
         size_t length = 0;
     };
+
+    int lockAndValidateRegistrationRanges(
+        const std::vector<Transport::BufferEntry>& buffer_list,
+        std::unique_lock<std::mutex>* lock);
 
     using RelocateMap =
         std::unordered_map<uint64_t, std::shared_ptr<OpenedShmEntry>>;
