@@ -48,10 +48,10 @@ startup environment. The legacy `kvcs` value is accepted and canonicalized
 from `MOONCAKE_KVCS_MODE`, but new deployments should not use it. KVCS has no
 dedicated health endpoint.
 Startup health checking follows the common
-`MOONCAKE_DISTRIBUTED_HEALTH_CHECK` setting. It defaults to `true` when KVCS is
-selected, including through socket auto-detection, and remains `false` for
-other adapters. Set it to `false` to opt out. The check queries a reserved
-probe key on every KVCS target in either Standard or Low Level mode.
+`MOONCAKE_DISTRIBUTED_HEALTH_CHECK` setting. It defaults to `true` for Low
+Level, including through socket auto-detection, and remains `false` for
+Standard and other adapters. Standard deployments may opt in explicitly. The
+check queries a reserved probe key on every KVCS target in either mode.
 A missing probe key is healthy; other provider errors fail backend
 initialization. Individual provider read/write failures are logged and returned
 to the caller.
@@ -191,7 +191,9 @@ The official SDK does not provide a Mooncake-facing capacity or bandwidth
 contract that would make a local load model authoritative. Capacity, watermarks,
 space reclamation, and provider-side health remain KVCS/EFC responsibilities;
 Mooncake reacts to the result of each operation. Startup health probing is
-enabled by default for KVCS and honors the common health-check setting.
+enabled by default for Low Level and honors the common health-check setting.
+Standard mode requires explicit opt-in because its provider query has no
+bounded deadline.
 
 Mooncake keeps tenant isolation in the provider key. The adapter encodes
 `tenant_id` and the logical key as the printable, injective raw key

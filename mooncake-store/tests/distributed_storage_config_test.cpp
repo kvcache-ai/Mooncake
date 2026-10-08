@@ -271,31 +271,42 @@ TEST_F(DistributedStorageConfigTest,
     const auto config = DistributedStorageConfig::FromEnvironment();
 
     EXPECT_EQ(config.fs_adapter_type, "kvcs-standard");
+    EXPECT_FALSE(config.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, KvcsModesUseSafeHealthDefaults) {
+    env.kvcs_mode.Set("low-level");
+    const auto low_level = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(low_level.UsesKvcs());
+    EXPECT_TRUE(low_level.enable_health_check);
+
+    env.kvcs_mode.Set("standard");
+    const auto standard = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(standard.UsesKvcs());
+    EXPECT_FALSE(standard.enable_health_check);
+}
+
+TEST_F(DistributedStorageConfigTest, LegacyKvcsModeSelectsLowLevelAdapter) {
+    env.kvcs_mode.Set("kvcs");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.fs_adapter_type, "kvcs-lowlevel");
+    EXPECT_TRUE(config.UsesKvcs());
     EXPECT_TRUE(config.enable_health_check);
+    EXPECT_TRUE(config.Validate());
 }
 
-TEST_F(DistributedStorageConfigTest, ExplicitKvcsModesEnableHealthByDefault) {
-    for (const char* mode : {"standard", "low-level"}) {
-        SCOPED_TRACE(mode);
-        env.kvcs_mode.Set(mode);
+TEST_F(DistributedStorageConfigTest, KvcsAdaptersUseSafeHealthDefaults) {
+    env.fs_adapter.Set("kvcs-lowlevel");
+    const auto low_level = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(low_level.UsesKvcs());
+    EXPECT_TRUE(low_level.enable_health_check);
 
-        const auto config = DistributedStorageConfig::FromEnvironment();
-
-        EXPECT_TRUE(config.UsesKvcs());
-        EXPECT_TRUE(config.enable_health_check);
-    }
-}
-
-TEST_F(DistributedStorageConfigTest, ExplicitKvcsAdaptersEnableHealthByDefault) {
-    for (const char* adapter : {"kvcs-standard", "kvcs-lowlevel"}) {
-        SCOPED_TRACE(adapter);
-        env.fs_adapter.Set(adapter);
-
-        const auto config = DistributedStorageConfig::FromEnvironment();
-
-        EXPECT_TRUE(config.UsesKvcs());
-        EXPECT_TRUE(config.enable_health_check);
-    }
+    env.fs_adapter.Set("kvcs-standard");
+    const auto standard = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(standard.UsesKvcs());
+    EXPECT_FALSE(standard.enable_health_check);
 }
 
 TEST_F(DistributedStorageConfigTest, KvcsHealthCheckCanBeExplicitlyDisabled) {
@@ -309,6 +320,17 @@ TEST_F(DistributedStorageConfigTest, KvcsHealthCheckCanBeExplicitlyDisabled) {
         EXPECT_TRUE(config.UsesKvcs());
         EXPECT_FALSE(config.enable_health_check);
     }
+}
+
+TEST_F(DistributedStorageConfigTest,
+       StandardHealthCheckCanBeExplicitlyEnabled) {
+    env.kvcs_mode.Set("standard");
+    env.health_check.Set("true");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_TRUE(config.enable_health_check);
 }
 
 TEST_F(DistributedStorageConfigTest, AutoDetectedKvcsHealthCanBeDisabled) {

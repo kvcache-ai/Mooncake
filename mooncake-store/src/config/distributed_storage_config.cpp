@@ -189,7 +189,7 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     const auto kvcs_mode = Environ::GetString("MOONCAKE_KVCS_MODE", "");
     if (kvcs_mode == "standard") {
         config.fs_adapter_type = "kvcs-standard";
-    } else if (kvcs_mode == "low-level") {
+    } else if (kvcs_mode == "low-level" || kvcs_mode == "kvcs") {
         config.fs_adapter_type = "kvcs-lowlevel";
     } else if (!kvcs_mode.empty()) {
         config.fs_adapter_type = kvcs_mode;
@@ -213,7 +213,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     }
     config.enable_health_check =
         Environ::ReadOr(Variables::MOONCAKE_DISTRIBUTED_HEALTH_CHECK,
-                        config.UsesKvcs() || config.enable_health_check);
+                        config.fs_adapter_type == "kvcs-lowlevel" ||
+                            config.enable_health_check);
     config.shard_count = Environ::ReadOr(Variables::MOONCAKE_DFS_SHARD_COUNT,
                                          config.shard_count);
     config.shard_capacity = Environ::ReadOr(

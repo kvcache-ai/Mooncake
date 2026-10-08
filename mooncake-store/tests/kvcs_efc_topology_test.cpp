@@ -159,7 +159,8 @@ TEST(KvcsEfcTopologyTest, ExplicitMountpointsStillOverrideDefaults) {
 }
 
 TEST(KvcsEfcTopologyTest, LocalBackendIsOneEfcOwnedRoute) {
-    auto routes = ResolveKvcsEfcTopology({.backend = "disk"});
+    auto routes = ResolveKvcsEfcTopology(
+        {.backend = "disk", .extra_backends = {}, .mountpoints = {}});
     ASSERT_TRUE(routes);
     ASSERT_EQ(routes->size(), 1);
     EXPECT_EQ((*routes)[0].kind, KvcsEfcRouteKind::kLocal);
@@ -186,6 +187,7 @@ TEST(KvcsEfcTopologyTest, MixedPoolExposesLocalAndRemoteRoutes) {
 TEST(KvcsEfcTopologyTest, DirectKvCacheStoreExposesEveryMountpoint) {
     KvcsEfcDeployment deployment{
         .backend = "kvcachestore",
+        .extra_backends = {},
         .mountpoints = {{.id = "remote-a", .index = 1, .is_default = true},
                         {.id = "remote-b", .index = 2}},
         .require_single_default = true,
@@ -199,7 +201,8 @@ TEST(KvcsEfcTopologyTest, DirectKvCacheStoreExposesEveryMountpoint) {
 }
 
 TEST(KvcsEfcTopologyTest, DisklessWithoutKvCacheStoreIsRejected) {
-    auto routes = ResolveKvcsEfcTopology({.backend = "diskless"});
+    auto routes = ResolveKvcsEfcTopology(
+        {.backend = "diskless", .extra_backends = {}, .mountpoints = {}});
     ASSERT_FALSE(routes);
     EXPECT_EQ(routes.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -207,6 +210,7 @@ TEST(KvcsEfcTopologyTest, DisklessWithoutKvCacheStoreIsRejected) {
 TEST(KvcsEfcTopologyTest, DirectMountpointsMustBeUnique) {
     KvcsEfcDeployment deployment{
         .backend = "kvcachestore",
+        .extra_backends = {},
         .mountpoints = {{.id = "remote-a", .index = 1, .is_default = true},
                         {.id = "remote-a", .index = 2}},
         .require_single_default = true,
