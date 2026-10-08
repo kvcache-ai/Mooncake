@@ -4,6 +4,8 @@
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
@@ -40,7 +42,10 @@ cp -r mooncake-wheel/tests test_env/
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cp -r python/tests/ssd test_env/ssd_tests
 cd test_env
-pip install torch numpy
+torch_requirement=$(python "$script_dir/ci/select_pg_torch_version.py" \
+    ../mooncake-wheel/dist/*.whl)
+echo "Installing $torch_requirement for the bundled PG extensions"
+pip install "$torch_requirement" numpy
 python -c "import mooncake._fast_copy"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py

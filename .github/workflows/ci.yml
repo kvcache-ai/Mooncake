@@ -116,7 +116,7 @@ jobs:
         python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
       shell: bash
 
-    - name: Run all PG CPU tests with latest PyTorch
+    - name: Run all PG CPU tests with latest bundled PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
