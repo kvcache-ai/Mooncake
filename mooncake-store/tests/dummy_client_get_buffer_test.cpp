@@ -765,6 +765,112 @@ TEST_F(DummyClientGetBufferTest, Perf_BatchHotVsCold) {
         << "Batch hot cache path should be faster than fallback";
 }
 
+// ---- Regression: an evicted shm context must be recoverable ----
+//
+// The dummy-client monitor drops a client's mapped segments once its pings stop
+// arriving within the live TTL, and RealClient::ping never inspects
+// shm_contexts_, so the client is never told. Its local
+// ShmHelper::ShmSegment::registered flag stays true, which makes the next
+// register_buffer() a silent no-op and leaves retry loops spinning without ever
+// re-registering. Reporting DUMMY_BUFFER_NOT_MAPPED lets the client drop the
+// stale flag and recover.
+TEST_F(DummyClientGetBufferTest,
+       EvictedShmContextRecoversOnNextRegisterBuffer) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    constexpr size_t kSize = 4096;
+    const uint64_t address = dummy_client_->alloc_from_mem_pool(kSize);
+    ASSERT_NE(address, 0u);
+    void *buffer = reinterpret_cast<void *>(address);
+    ASSERT_EQ(dummy_client_->register_buffer(buffer, kSize), 0);
+    std::memset(buffer, 'E', kSize);
+
+    auto shm = ShmHelper::getInstance()->get_shm(buffer);
+    ASSERT_NE(shm, nullptr);
+    ASSERT_TRUE(shm->registered.load());
+
+    const std::vector<void *> buffers{buffer};
+    const std::vector<size_t> sizes{kSize};
+    ASSERT_EQ(
+        dummy_client_->batch_put_from({"dummy_evict_before"}, buffers, sizes),
+        (std::vector<int>{0}));
+
+    // Exactly what the monitor does for a client whose TTL expired.
+    ASSERT_TRUE(real_client_->unmap_shm_internal(dummy_client_->client_id())
+                    .has_value());
+
+    EXPECT_EQ(
+        dummy_client_->batch_put_from({"dummy_evict_during"}, buffers, sizes),
+        (std::vector<int>{toInt(ErrorCode::DUMMY_BUFFER_NOT_MAPPED)}))
+        << "the store must report the dedicated not-mapped code so the client "
+           "can tell an eviction apart from a caller error";
+
+    EXPECT_FALSE(shm->registered.load())
+        << "the failed batch op must drop the stale local registration, "
+           "otherwise register_buffer() stays a silent no-op";
+
+    ASSERT_EQ(dummy_client_->register_buffer(buffer, kSize), 0);
+    EXPECT_TRUE(shm->registered.load());
+    EXPECT_EQ(
+        dummy_client_->batch_put_from({"dummy_evict_after"}, buffers, sizes),
+        (std::vector<int>{0}))
+        << "re-registration must restore the mapping instead of looping";
+
+    std::memset(buffer, 0, kSize);
+    EXPECT_EQ(
+        dummy_client_->batch_get_into({"dummy_evict_after"}, buffers, sizes),
+        (std::vector<int64_t>{static_cast<int64_t>(kSize)}));
+    EXPECT_EQ(std::string(static_cast<char *>(buffer), kSize),
+              std::string(kSize, 'E'));
+
+    EXPECT_EQ(dummy_client_->unregister_buffer(buffer), 0);
+    EXPECT_EQ(ShmHelper::getInstance()->free(buffer), 0);
+}
+
+// A not-mapped buffer must be distinguishable from a caller error, otherwise
+// the client cannot tell whether clearing its local registration is the right
+// recovery step.
+TEST_F(DummyClientGetBufferTest, DummyBufferNotMappedIsADistinctErrorCode) {
+    EXPECT_NE(toInt(ErrorCode::DUMMY_BUFFER_NOT_MAPPED),
+              toInt(ErrorCode::INVALID_PARAMS));
+    EXPECT_EQ(toString(ErrorCode::DUMMY_BUFFER_NOT_MAPPED),
+              "DUMMY_BUFFER_NOT_MAPPED");
+}
+
+// A large segment registration can monopolize the single-threaded UDS channel
+// past the default TTL, so the monitor evicts clients that are still alive.
+// Deployments must be able to raise the TTL, and a malformed override must
+// never shorten it.
+TEST_F(DummyClientGetBufferTest, DummyClientLiveTtlSecHonoursEnvOverride) {
+    const char *saved = std::getenv("MC_DUMMY_CLIENT_TTL_SEC");
+    const bool had_saved = (saved != nullptr);
+    const std::string saved_value = had_saved ? std::string(saved) : "";
+
+    unsetenv("MC_DUMMY_CLIENT_TTL_SEC");
+    EXPECT_EQ(ResolveDummyClientLiveTtlSec(), DEFAULT_CLIENT_LIVE_TTL_SEC);
+
+    setenv("MC_DUMMY_CLIENT_TTL_SEC", "45", 1);
+    EXPECT_EQ(ResolveDummyClientLiveTtlSec(), 45);
+
+    setenv("MC_DUMMY_CLIENT_TTL_SEC", " 90 ", 1);
+    EXPECT_EQ(ResolveDummyClientLiveTtlSec(), 90)
+        << "surrounding ASCII whitespace should be trimmed";
+
+    for (const char *invalid : {"", "0", "-5", "abc", "12abc", "1.5"}) {
+        setenv("MC_DUMMY_CLIENT_TTL_SEC", invalid, 1);
+        EXPECT_EQ(ResolveDummyClientLiveTtlSec(), DEFAULT_CLIENT_LIVE_TTL_SEC)
+            << "a malformed override must fall back instead of shortening the "
+               "TTL, value='"
+            << invalid << "'";
+    }
+
+    if (had_saved) {
+        setenv("MC_DUMMY_CLIENT_TTL_SEC", saved_value.c_str(), 1);
+    } else {
+        unsetenv("MC_DUMMY_CLIENT_TTL_SEC");
+    }
+}
+
 }  // namespace testing
 }  // namespace mooncake
 
