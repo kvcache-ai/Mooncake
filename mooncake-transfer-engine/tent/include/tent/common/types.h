@@ -60,6 +60,7 @@ enum TransportType : int {
     HP_TCP,
     XPU,
     HYLINK,
+    FABRIC,
     // Sentinel: must remain the last enumerator.
     kNumTransportTypes,
 };
@@ -105,6 +106,8 @@ inline const char* transportTypeName(TransportType type) {
             return "xpu";
         case HYLINK:
             return "hylink";
+        case FABRIC:
+            return "fabric";
         case kNumTransportTypes:
             return "unknown";
     }
@@ -128,6 +131,7 @@ inline TransportType parseTransportType(const std::string& str) {
     if (str == "hp_tcp") return HP_TCP;
     if (str == "xpu") return XPU;
     if (str == "hylink") return HYLINK;
+    if (str == "fabric") return FABRIC;
     return UNSPEC;
 }
 

@@ -41,14 +41,21 @@ int main(int argc, char** argv) {
     // httpServerPort defaults to 13333, overwritten by the
     // config file whenever it parses.
     int http_server_port = 13333;
-    auto services =
-        mooncake::conductor::kvevent::ParseConfig(&http_server_port);
+    // rpcServerPort defaults to 13334 (RPC channel on); the config file may
+    // override it, and an explicit 0 disables the channel.
+    int rpc_server_port = 13334;
+    auto services = mooncake::conductor::kvevent::ParseConfig(&http_server_port,
+                                                              &rpc_server_port);
 
-    mooncake::conductor::kvevent::EventManager manager(std::move(services),
-                                                       http_server_port);
+    mooncake::conductor::kvevent::EventManager manager(
+        std::move(services), http_server_port, rpc_server_port);
 
     if (!manager.StartHTTPServer()) {
         LOG(ERROR) << "Failed to start HTTP server";
+    }
+
+    if (!manager.StartRPCServer()) {
+        LOG(ERROR) << "Failed to start RPC server";
     }
 
     manager.Start();

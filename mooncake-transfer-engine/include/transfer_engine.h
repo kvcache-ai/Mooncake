@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -139,6 +140,12 @@ class TransferEngine {
     // compat-layer type conversion. Returns nullptr when not in TENT mode.
     std::shared_ptr<mooncake::tent::TransferEngine> getTentEngine() const {
         return use_tent_ ? impl_tent_ : nullptr;
+    }
+
+    // Configuration of the successfully initialized engine, for clients that
+    // reuse it without repeating the metadata connection string.
+    const std::string& getMetadataConnectionString() const {
+        return metadata_conn_string_;
     }
 
     SegmentHandle openSegment(const std::string& segment_name);
@@ -341,10 +348,14 @@ class TransferEngine {
 
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::unique_ptr<Transport> tent_compat_transport_;
+    std::mutex tent_compat_transport_mutex_;
+    std::once_flag tent_compat_log_once_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
     // Classic callers provide this through TransferEngine(auto_discover,
     // filter) before init() creates the native TENT engine.
     std::vector<std::string> tent_device_filter_;
+    std::string metadata_conn_string_;
     bool use_tent_{false};
     friend class TransferEngineImplTestPeer;
 };
