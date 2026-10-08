@@ -188,6 +188,15 @@ class ScopedEnvVar {
     std::optional<std::string> original_;
 };
 
+#ifdef MOONCAKE_KVCS_TEST_NO_SDK
+TEST(KvcsDriverTest, MissingSdkReturnsNotSupported) {
+    const std::array<uint32_t, 1> mountpoints{0};
+    auto drivers = CreateKvcsLowLevelDrivers(mountpoints);
+    ASSERT_FALSE(drivers);
+    EXPECT_EQ(drivers.error(), ErrorCode::NOT_SUPPORTED);
+}
+#endif
+
 #ifdef MOONCAKE_KVCS_TEST_SDK
 struct KvcsLowLevelEnvironment {
     KvcsLowLevelEnvironment() {
@@ -1076,7 +1085,7 @@ TEST(KvcsObjectStorageAdapterTest, BoundsSingleTargetIoConcurrency) {
     FileStorageConfig config;
     auto driver = std::make_unique<ConcurrencyTrackingKvcsDriver>();
     auto* driver_ptr = driver.get();
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kLowLevel,
+    KvcsObjectStorageAdapter adapter(config,
                                      std::move(driver));
     ASSERT_TRUE(adapter.Init());
 
@@ -1116,7 +1125,7 @@ TEST(KvcsObjectStorageAdapterTest,
     FileStorageConfig config;
     auto driver = std::make_unique<InsertOnlyKvcsDriver>(true);
     auto* driver_ptr = driver.get();
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kLowLevel,
+    KvcsObjectStorageAdapter adapter(config,
                                      std::move(driver));
     ASSERT_TRUE(adapter.Init());
 
@@ -1152,7 +1161,7 @@ TEST(KvcsObjectStorageAdapterTest, RejectsMismatchedDriverQueryKey) {
     FileStorageConfig config;
     auto driver = std::make_unique<InsertOnlyKvcsDriver>();
     auto* driver_ptr = driver.get();
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kLowLevel,
+    KvcsObjectStorageAdapter adapter(config,
                                      std::move(driver));
     ASSERT_TRUE(adapter.Init());
 
@@ -1178,7 +1187,7 @@ TEST(KvcsObjectStorageAdapterTest, ReplacesOnlyExplicitUpserts) {
     FileStorageConfig config;
     auto driver = std::make_unique<InsertOnlyKvcsDriver>();
     auto* driver_ptr = driver.get();
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kLowLevel,
+    KvcsObjectStorageAdapter adapter(config,
                                      std::move(driver));
     EXPECT_STREQ(adapter.GetName(), kKvcsLowLevelAdapterName);
     ASSERT_TRUE(adapter.Init());
@@ -1226,9 +1235,9 @@ TEST(KvcsObjectStorageAdapterTest, ReplacesOnlyExplicitUpserts) {
 
 TEST(KvcsObjectStorageAdapterTest, DeleteIsIdempotentAndListingIsDisabled) {
     FileStorageConfig config;
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kStandard,
+    KvcsObjectStorageAdapter adapter(config,
                                      std::make_unique<InsertOnlyKvcsDriver>());
-    EXPECT_STREQ(adapter.GetName(), kKvcsStandardAdapterName);
+    EXPECT_STREQ(adapter.GetName(), kKvcsLowLevelAdapterName);
     ASSERT_TRUE(adapter.Init());
 
     const std::vector<std::string> keys{"missing"};
@@ -1240,7 +1249,7 @@ TEST(KvcsObjectStorageAdapterTest, DeleteIsIdempotentAndListingIsDisabled) {
 
 TEST(KvcsObjectStorageAdapterTest, EnforcesTenantQualifiedKeyLimit) {
     FileStorageConfig config;
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kStandard,
+    KvcsObjectStorageAdapter adapter(config,
                                      std::make_unique<InsertOnlyKvcsDriver>());
     ASSERT_TRUE(adapter.Init());
 
@@ -1260,7 +1269,7 @@ TEST(KvcsObjectStorageAdapterTest, RejectsInvalidBatchBeforeDriverWrite) {
     FileStorageConfig config;
     auto driver = std::make_unique<InsertOnlyKvcsDriver>();
     auto* driver_ptr = driver.get();
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kStandard,
+    KvcsObjectStorageAdapter adapter(config,
                                      std::move(driver));
     ASSERT_TRUE(adapter.Init());
 
@@ -1277,11 +1286,11 @@ TEST(KvcsObjectStorageAdapterTest, RejectsInvalidBatchBeforeDriverWrite) {
     EXPECT_EQ(driver_ptr->put_calls(), 0u);
 }
 
-TEST(KvcsObjectStorageAdapterTest, StandardDelegatesHealthToSdk) {
+TEST(KvcsObjectStorageAdapterTest, TransientWriteErrorsDoNotDisableDriver) {
     FileStorageConfig config;
     auto driver = std::make_unique<InsertOnlyKvcsDriver>();
     auto* driver_ptr = driver.get();
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kStandard,
+    KvcsObjectStorageAdapter adapter(config,
                                      std::move(driver));
     ASSERT_TRUE(adapter.Init());
 
@@ -1659,71 +1668,11 @@ TEST(KvcsObjectStorageAdapterTest,
     EXPECT_GT(second_ptr->put_calls(), 0u);
 }
 
-TEST(KvcsObjectStorageAdapterTest, SerializesOperationAndBatchMetrics) {
-    FileStorageConfig config;
-    auto driver = std::make_unique<InsertOnlyKvcsDriver>();
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kLowLevel,
-                                     std::move(driver));
-    ASSERT_TRUE(adapter.Init());
-
-    std::string value = "value";
-    const std::array<ObjectStoragePutRequest, 1> puts{{
-        {.logical_key = "metrics-key",
-         .slices = {{value.data(), value.size()}}},
-    }};
-    ASSERT_TRUE(adapter.BatchPutV(puts)[0]);
-
-    const std::array<ObjectKey, 2> keys{"metrics-key", "metrics-missing"};
-    auto queries = adapter.BatchQueryProvider(keys);
-    ASSERT_EQ(queries.size(), keys.size());
-    ASSERT_TRUE(queries[0]);
-    ASSERT_FALSE(queries[1]);
-    EXPECT_EQ(queries[1].error(), ErrorCode::OBJECT_NOT_FOUND);
-
-    std::string output(value.size(), '\0');
-    const std::array<ObjectStorageGetRequest, 1> gets{{
-        {.logical_key = "metrics-key",
-         .slices = {{output.data(), output.size()}},
-         .expected_size = output.size()},
-    }};
-    const std::array<tl::expected<ObjectStorageQueryContext, ErrorCode>, 1>
-        contexts{queries[0]};
-    ASSERT_TRUE(adapter.BatchGetIntoWithQueryContexts(gets, contexts)[0]);
-    EXPECT_EQ(output, value);
-
-    const std::array<std::string, 1> deletes{"metrics-key"};
-    ASSERT_TRUE(adapter.BatchDelete(deletes)[0]);
-
-    std::string metrics;
-    adapter.SerializeMetrics(metrics);
-    EXPECT_NE(metrics.find("mooncake_kvcs_operations_total"),
-              std::string::npos);
-    EXPECT_NE(metrics.find("mooncake_kvcs_bytes_total"), std::string::npos);
-    EXPECT_NE(metrics.find("mooncake_kvcs_latency_us_bucket"),
-              std::string::npos);
-    EXPECT_NE(metrics.find("mooncake_kvcs_batches_total"), std::string::npos);
-    EXPECT_NE(metrics.find("mooncake_kvcs_batch_items_total"),
-              std::string::npos);
-    EXPECT_NE(metrics.find("mooncake_kvcs_batch_latency_us_bucket"),
-              std::string::npos);
-    EXPECT_NE(metrics.find("operation=\"put\""), std::string::npos);
-    EXPECT_NE(metrics.find("operation=\"query\""), std::string::npos);
-    EXPECT_NE(metrics.find("operation=\"get\""), std::string::npos);
-    EXPECT_NE(metrics.find("operation=\"delete\""), std::string::npos);
-    EXPECT_NE(metrics.find("target=\"injected\""), std::string::npos);
-    EXPECT_NE(
-        metrics.find("mooncake_kvcs_query_hits_total{mode=\"low-level\"} 1"),
-        std::string::npos);
-    EXPECT_NE(
-        metrics.find("mooncake_kvcs_query_misses_total{mode=\"low-level\"} 1"),
-        std::string::npos);
-}
-
 TEST(KvcsObjectStorageAdapterTest, UsesQueryForHealthCheck) {
     FileStorageConfig config;
     auto driver = std::make_unique<InsertOnlyKvcsDriver>();
     auto* driver_ptr = driver.get();
-    KvcsObjectStorageAdapter adapter(config, KvcsAccessMode::kLowLevel,
+    KvcsObjectStorageAdapter adapter(config,
                                      std::move(driver));
     ASSERT_TRUE(adapter.Init());
 

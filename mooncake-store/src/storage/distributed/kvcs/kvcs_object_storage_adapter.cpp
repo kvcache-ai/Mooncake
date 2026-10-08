@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <future>
 #include <limits>
@@ -11,7 +10,6 @@
 #include <string_view>
 #include <utility>
 
-#include "hybrid_metric.h"
 #include "storage/distributed/kvcs/kvcs_capi_driver.h"
 #include "storage/distributed/kvcs/kvcs_efc_topology.h"
 #include "tenant_id.h"
@@ -22,11 +20,6 @@ namespace {
 
 constexpr std::string_view kHealthProbeKey =
     "mc1:6d6f6f6e63616b65.6b7663732d6865616c74682d70726f6265";
-const std::vector<double> kLatencyBucketsUs = {
-    50,     100,     200,     500,     1000,     2000,
-    5000,   10000,   20000,   50000,   100000,   200000,
-    500000, 1000000, 2000000, 5000000, 10000000, 30000000};
-
 template <typename T>
 std::vector<tl::expected<T, ErrorCode>> Errors(size_t count, ErrorCode error) {
     std::vector<tl::expected<T, ErrorCode>> results;
@@ -40,13 +33,6 @@ ObjectStorageIoResults IoErrors(size_t count, ErrorCode error) {
     return Errors<void>(count, error);
 }
 
-uint64_t ElapsedUs(std::chrono::steady_clock::time_point start) {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - start)
-            .count());
-}
-
 uint64_t StableHash64(std::string_view value) {
     uint64_t hash = 14695981039346656037ULL;
     for (const unsigned char byte : value) {
@@ -54,22 +40,6 @@ uint64_t StableHash64(std::string_view value) {
         hash *= 1099511628211ULL;
     }
     return hash;
-}
-
-std::string_view BatchResultLabel(size_t succeeded, size_t total) {
-    if (succeeded == total) return "ok";
-    if (succeeded == 0) return "error";
-    return "partial";
-}
-
-std::string EscapeLabel(std::string_view value) {
-    std::string escaped;
-    escaped.reserve(value.size());
-    for (const char c : value) {
-        if (c == '\\' || c == '"' || c == '\n') escaped.push_back('\\');
-        escaped.push_back(c);
-    }
-    return escaped;
 }
 
 void LogKvcsIoError(std::string_view operation, std::string_view target,
@@ -124,74 +94,6 @@ struct KvcsObjectStorageAdapter::Impl {
         std::unique_ptr<KvcsDriver> driver;
     };
 
-    explicit Impl(KvcsAccessMode access_mode)
-        : mode(access_mode == KvcsAccessMode::kStandard ? "standard"
-                                                        : "low-level"),
-          operation_count("mooncake_kvcs_operations_total",
-                          "Total KVCS operations", {{"mode", mode}},
-                          metric_label_names),
-          operation_bytes("mooncake_kvcs_bytes_total",
-                          "Total bytes processed by KVCS operations",
-                          {{"mode", mode}}, metric_label_names),
-          operation_latency("mooncake_kvcs_latency_us",
-                            "KVCS operation latency in microseconds",
-                            kLatencyBucketsUs, {{"mode", mode}},
-                            metric_label_names),
-          batch_count("mooncake_kvcs_batches_total", "Total KVCS batches",
-                      {{"mode", mode}}, metric_label_names),
-          batch_items("mooncake_kvcs_batch_items_total",
-                      "Total items submitted in KVCS batches", {{"mode", mode}},
-                      metric_label_names),
-          batch_latency("mooncake_kvcs_batch_latency_us",
-                        "KVCS batch latency in microseconds", kLatencyBucketsUs,
-                        {{"mode", mode}}, metric_label_names) {}
-
-    void Observe(std::string_view operation, size_t target_index,
-                 std::string_view result, uint64_t bytes, uint64_t latency_us) {
-        const auto& target = *targets[target_index];
-        const std::array<std::string, 3> labels{std::string(operation),
-                                                EscapeLabel(target.id),
-                                                std::string(result)};
-        operation_count.inc(labels);
-        operation_bytes.inc(labels, static_cast<int64_t>(bytes));
-        operation_latency.observe(
-            labels, static_cast<int64_t>(std::max<uint64_t>(latency_us, 1)));
-    }
-
-    void ObserveBatch(std::string_view operation, size_t target_index,
-                      std::string_view result, uint64_t items,
-                      uint64_t latency_us) {
-        const auto& target = *targets[target_index];
-        const std::array<std::string, 3> labels{std::string(operation),
-                                                EscapeLabel(target.id),
-                                                std::string(result)};
-        batch_count.inc(labels);
-        batch_items.inc(labels, static_cast<int64_t>(items));
-        batch_latency.observe(
-            labels, static_cast<int64_t>(std::max<uint64_t>(latency_us, 1)));
-    }
-
-    void Serialize(std::string& output) const {
-        operation_count.serialize(output);
-        operation_bytes.serialize(output);
-        operation_latency.serialize(output);
-        batch_count.serialize(output);
-        batch_items.serialize(output);
-        batch_latency.serialize(output);
-        output.append("# TYPE mooncake_kvcs_query_hits_total counter\n")
-            .append("mooncake_kvcs_query_hits_total{mode=\"")
-            .append(mode)
-            .append("\"} ")
-            .append(std::to_string(query_hits.load(std::memory_order_relaxed)))
-            .append("\n# TYPE mooncake_kvcs_query_misses_total counter\n")
-            .append("mooncake_kvcs_query_misses_total{mode=\"")
-            .append(mode)
-            .append("\"} ")
-            .append(
-                std::to_string(query_misses.load(std::memory_order_relaxed)))
-            .append("\n");
-    }
-
     std::vector<size_t> TargetOrder(std::string_view logical_key) const {
         std::vector<size_t> result;
         result.reserve(targets.size());
@@ -229,30 +131,16 @@ struct KvcsObjectStorageAdapter::Impl {
     std::vector<std::unique_ptr<Target>> targets;
     bool delete_local_first = false;
     std::unique_ptr<ThreadPool> io_workers;
-    std::string mode;
-    const std::array<std::string, 3> metric_label_names{"operation", "target",
-                                                        "result"};
-    mutable ylt::metric::hybrid_counter_3t operation_count;
-    mutable ylt::metric::hybrid_counter_3t operation_bytes;
-    mutable ylt::metric::hybrid_histogram_3t operation_latency;
-    mutable ylt::metric::hybrid_counter_3t batch_count;
-    mutable ylt::metric::hybrid_counter_3t batch_items;
-    mutable ylt::metric::hybrid_histogram_3t batch_latency;
-    std::atomic<uint64_t> query_hits{0};
-    std::atomic<uint64_t> query_misses{0};
 };
 
 KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
-    const FileStorageConfig& config, KvcsAccessMode mode,
-    std::string efc_config_path)
+    const FileStorageConfig& config, std::string efc_config_path)
     : config_(config),
-      mode_(mode),
       efc_config_path_(std::move(efc_config_path)) {}
 
 KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
-    const FileStorageConfig& config, KvcsAccessMode mode,
-    std::unique_ptr<KvcsDriver> driver)
-    : KvcsObjectStorageAdapter(config, mode) {
+    const FileStorageConfig& config, std::unique_ptr<KvcsDriver> driver)
+    : KvcsObjectStorageAdapter(config) {
     pending_targets_.push_back(
         {.id = "injected", .mountpoint_index = 0, .driver = std::move(driver)});
 }
@@ -260,7 +148,7 @@ KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
 KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
     const FileStorageConfig& config,
     std::vector<KvcsLowLevelTargetSpec> targets)
-    : KvcsObjectStorageAdapter(config, KvcsAccessMode::kLowLevel) {
+    : KvcsObjectStorageAdapter(config) {
     pending_targets_ = std::move(targets);
 }
 
@@ -284,42 +172,31 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
     if (initialized_) return {};
 
     if (pending_targets_.empty()) {
-        if (mode_ == KvcsAccessMode::kStandard) {
-            auto driver = CreateKvcsStandardDriver();
-            if (!driver) return tl::make_unexpected(driver.error());
-            pending_targets_.push_back({.id = "standard",
-                                        .mountpoint_index = 0,
-                                        .driver = std::move(driver.value())});
-        } else {
-            auto targets = LoadKvcsEfcTopology(efc_config_path_);
-            if (!targets) return tl::make_unexpected(targets.error());
-            std::vector<uint32_t> mountpoint_indices;
-            mountpoint_indices.reserve(targets->size());
-            for (const auto& target : targets.value())
-                mountpoint_indices.push_back(target.mountpoint_index);
-            auto drivers = CreateKvcsLowLevelDrivers(mountpoint_indices);
-            if (!drivers) return tl::make_unexpected(drivers.error());
-            for (size_t i = 0; i < targets->size(); ++i) {
-                pending_targets_.push_back(
-                    {.id = (*targets)[i].id,
-                     .mountpoint_index = (*targets)[i].mountpoint_index,
-                     .route_kind = (*targets)[i].kind,
-                     .driver = std::move((*drivers)[i])});
-            }
+        auto targets = LoadKvcsEfcTopology(efc_config_path_);
+        if (!targets) return tl::make_unexpected(targets.error());
+        std::vector<uint32_t> mountpoint_indices;
+        mountpoint_indices.reserve(targets->size());
+        for (const auto& target : targets.value())
+            mountpoint_indices.push_back(target.mountpoint_index);
+        auto drivers = CreateKvcsLowLevelDrivers(mountpoint_indices);
+        if (!drivers) return tl::make_unexpected(drivers.error());
+        for (size_t i = 0; i < targets->size(); ++i) {
+            pending_targets_.push_back(
+                {.id = (*targets)[i].id,
+                 .mountpoint_index = (*targets)[i].mountpoint_index,
+                 .route_kind = (*targets)[i].kind,
+                 .driver = std::move((*drivers)[i])});
         }
     }
     if (pending_targets_.empty())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
-    impl_ = std::make_unique<Impl>(mode_);
-    const char* mode_name =
-        mode_ == KvcsAccessMode::kStandard ? "standard" : "low-level";
+    impl_ = std::make_unique<Impl>();
     std::set<std::string> ids;
     std::set<uint32_t> indices;
     for (auto& spec : pending_targets_) {
         if (spec.id.empty() || !spec.driver || !ids.insert(spec.id).second ||
-            (mode_ == KvcsAccessMode::kLowLevel &&
-             !indices.insert(spec.mountpoint_index).second)) {
+            !indices.insert(spec.mountpoint_index).second) {
             impl_.reset();
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -339,11 +216,9 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
         target->mountpoint_index = spec.mountpoint_index;
         target->route_kind = spec.route_kind;
         target->driver = std::move(spec.driver);
-        LOG(INFO) << "KVCS target configured, mode=" << mode_name
+        LOG(INFO) << "KVCS target configured, mode=low-level"
                   << ", target=" << target->id << ", route_kind="
-                  << (mode_ == KvcsAccessMode::kStandard
-                          ? "standard"
-                          : ToString(target->route_kind))
+                  << ToString(target->route_kind)
                   << ", mountpoint_index=" << target->mountpoint_index;
         impl_->targets.push_back(std::move(target));
     }
@@ -361,7 +236,7 @@ tl::expected<void, ErrorCode> KvcsObjectStorageAdapter::Init() {
     impl_->io_workers =
         std::make_unique<ThreadPool>(std::clamp<size_t>(io_concurrency, 2, 32));
     initialized_ = true;
-    LOG(INFO) << "KVCS DFS adapter initialized, mode=" << mode_name
+    LOG(INFO) << "KVCS DFS adapter initialized, mode=low-level"
               << ", targets=" << impl_->targets.size()
               << ", write_placement=stable-hash"
               << ", io_workers=" << std::clamp<size_t>(io_concurrency, 2, 32);
@@ -429,9 +304,7 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
     if (!initialized_ || !impl_)
         return IoErrors(requests.size(), ErrorCode::INTERNAL_ERROR);
     std::vector<KvcsPutRequest> kvcs_requests;
-    std::vector<uint64_t> request_sizes;
     kvcs_requests.reserve(requests.size());
-    request_sizes.reserve(requests.size());
     for (const auto& request : requests) {
         auto key = EncodeKey(request.logical_key);
         if (!key || request.slices.empty())
@@ -448,7 +321,6 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
             return IoErrors(requests.size(), ErrorCode::INVALID_PARAMS);
         kvcs_requests.push_back(
             {.logical_key = std::move(key.value()), .slices = request.slices});
-        request_sizes.push_back(request_size);
     }
 
     std::vector<std::string> replace_keys;
@@ -487,7 +359,6 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
         size_t target;
         std::vector<size_t> request_indices;
         KvcsPutResults results;
-        uint64_t latency_us;
     };
     size_t remaining =
         static_cast<size_t>(std::count(done.begin(), done.end(), false));
@@ -513,11 +384,10 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
                     for (const size_t index : indices) {
                         batch.push_back(kvcs_requests[index]);
                     }
-                    const auto start = std::chrono::steady_clock::now();
                     auto put = BatchPutKvcsObjects(
                         *impl_->targets[target]->driver, batch);
                     return PutBatchResult{target, std::move(indices),
-                                          std::move(put), ElapsedUs(start)};
+                                          std::move(put)};
                 }));
         }
 
@@ -527,14 +397,9 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
                 batch.results = Errors<void>(batch.request_indices.size(),
                                              ErrorCode::INTERNAL_ERROR);
             }
-            size_t batch_successes = 0;
             for (size_t i = 0; i < batch.results.size(); ++i) {
                 const size_t request_index = batch.request_indices[i];
                 if (batch.results[i]) {
-                    ++batch_successes;
-                    impl_->Observe("put", batch.target, "ok",
-                                   request_sizes[request_index],
-                                   batch.latency_us);
                     results[request_index] = {};
                     done[request_index] = true;
                     --remaining;
@@ -542,8 +407,6 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
                 }
 
                 const ErrorCode error = batch.results[i].error();
-                impl_->Observe("put", batch.target, "error", 0,
-                               batch.latency_us);
                 LogKvcsIoError("put", impl_->targets[batch.target]->id,
                                impl_->targets[batch.target]->mountpoint_index,
                                error);
@@ -557,10 +420,6 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
                     --remaining;
                 }
             }
-            impl_->ObserveBatch(
-                "put", batch.target,
-                BatchResultLabel(batch_successes, batch.results.size()),
-                batch.results.size(), batch.latency_us);
         }
     }
     return results;
@@ -588,7 +447,6 @@ KvcsManifestResults KvcsObjectStorageAdapter::BatchQueryKvcs(
         size_t target;
         std::vector<size_t> request_indices;
         KvcsManifestResults results;
-        uint64_t latency_us;
     };
     auto run_groups = [this, &encoded_keys, deadline](
                           const std::vector<std::vector<size_t>>& groups) {
@@ -604,41 +462,24 @@ KvcsManifestResults KvcsObjectStorageAdapter::BatchQueryKvcs(
                     for (const size_t index : indices) {
                         keys.push_back(encoded_keys[index]);
                     }
-                    const auto start = std::chrono::steady_clock::now();
                     auto results = BatchQueryKvcsObjects(
                         *impl_->targets[target]->driver, keys, deadline);
                     return QueryBatchResult{target, std::move(indices),
-                                            std::move(results),
-                                            ElapsedUs(start)};
+                                            std::move(results)};
                 }));
         }
 
         std::vector<QueryBatchResult> batches;
         for (auto& future : futures) {
             auto batch = future.get();
-            size_t batch_successes = 0;
             for (size_t i = 0; i < batch.results.size(); ++i) {
                 const auto& query = batch.results[i];
-                if (query) {
-                    ++batch_successes;
-                    impl_->Observe("query", batch.target, "hit",
-                                   query->total_size, batch.latency_us);
-                } else if (query.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                    ++batch_successes;
-                    impl_->Observe("query", batch.target, "miss", 0,
-                                   batch.latency_us);
-                } else {
-                    impl_->Observe("query", batch.target, "error", 0,
-                                   batch.latency_us);
+                if (!query && query.error() != ErrorCode::OBJECT_NOT_FOUND) {
                     LogKvcsIoError("query", impl_->targets[batch.target]->id,
                                    impl_->targets[batch.target]->mountpoint_index,
                                    query.error());
                 }
             }
-            impl_->ObserveBatch(
-                "query", batch.target,
-                BatchResultLabel(batch_successes, batch.request_indices.size()),
-                batch.request_indices.size(), batch.latency_us);
             batches.push_back(std::move(batch));
         }
         return batches;
@@ -683,13 +524,6 @@ KvcsManifestResults KvcsObjectStorageAdapter::BatchQueryKvcs(
                     --remaining;
                 }
             }
-        }
-    }
-    for (const auto& result : results) {
-        if (result) {
-            impl_->query_hits.fetch_add(1, std::memory_order_relaxed);
-        } else if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-            impl_->query_misses.fetch_add(1, std::memory_order_relaxed);
         }
     }
     return results;
@@ -776,7 +610,6 @@ KvcsGetResults KvcsObjectStorageAdapter::BatchGetKvcsWithManifests(
             size_t target;
             std::vector<size_t> request_indices;
             KvcsGetResults results;
-            uint64_t latency_us;
         };
         std::vector<std::future<GetBatchResult>> futures;
         for (size_t target = 0; target < groups.size(); ++target) {
@@ -793,12 +626,11 @@ KvcsGetResults KvcsObjectStorageAdapter::BatchGetKvcsWithManifests(
                         batch_requests.push_back(encoded_requests[index]);
                         batch_manifests.emplace_back(encoded_manifests[index]);
                     }
-                    const auto start = std::chrono::steady_clock::now();
                     auto get =
                         BatchGetKvcsObjects(*impl_->targets[target]->driver,
                                             batch_requests, batch_manifests);
                     return GetBatchResult{target, std::move(indices),
-                                          std::move(get), ElapsedUs(start)};
+                                          std::move(get)};
                 }));
         }
         for (auto& future : futures) {
@@ -806,21 +638,14 @@ KvcsGetResults KvcsObjectStorageAdapter::BatchGetKvcsWithManifests(
             if (batch.results.size() != batch.request_indices.size())
                 batch.results = Errors<void>(batch.request_indices.size(),
                                              ErrorCode::INTERNAL_ERROR);
-            size_t batch_successes = 0;
             for (size_t i = 0; i < batch.results.size(); ++i) {
                 const size_t request_index = batch.request_indices[i];
                 if (batch.results[i]) {
-                    ++batch_successes;
-                    impl_->Observe("get", batch.target, "ok",
-                                   encoded_manifests[request_index].total_size,
-                                   batch.latency_us);
                     results[request_index] = {};
                     done[request_index] = true;
                     --remaining;
                 } else {
                     const ErrorCode error = batch.results[i].error();
-                    impl_->Observe("get", batch.target, "error", 0,
-                                   batch.latency_us);
                     LogKvcsIoError("get", impl_->targets[batch.target]->id,
                                    impl_->targets[batch.target]->mountpoint_index,
                                    error);
@@ -835,10 +660,6 @@ KvcsGetResults KvcsObjectStorageAdapter::BatchGetKvcsWithManifests(
                     }
                 }
             }
-            impl_->ObserveBatch(
-                "get", batch.target,
-                BatchResultLabel(batch_successes, batch.results.size()),
-                batch.results.size(), batch.latency_us);
         }
     }
     return results;
@@ -974,7 +795,6 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchDelete(
     struct DeleteBatchResult {
         size_t target;
         KvcsDeleteResults results;
-        uint64_t latency_us;
     };
     std::vector<std::vector<size_t>> delete_rounds(1);
     if (impl_->delete_local_first) delete_rounds.resize(2);
@@ -991,11 +811,9 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchDelete(
         for (const size_t target : target_indices) {
             futures.push_back(
                 impl_->io_workers->submit([this, target, &encoded] {
-                    const auto start = std::chrono::steady_clock::now();
                     auto deleted =
                         impl_->targets[target]->driver->BatchDelete(encoded);
-                    return DeleteBatchResult{target, std::move(deleted),
-                                             ElapsedUs(start)};
+                    return DeleteBatchResult{target, std::move(deleted)};
                 }));
         }
         for (auto& future : futures) {
@@ -1004,16 +822,10 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchDelete(
                 batch.results = Errors<void>(logical_keys.size(),
                                              ErrorCode::INTERNAL_ERROR);
             }
-            size_t batch_successes = 0;
             for (size_t i = 0; i < batch.results.size(); ++i) {
                 if (batch.results[i]) {
-                    ++batch_successes;
-                    impl_->Observe("delete", batch.target, "ok", 0,
-                                   batch.latency_us);
                     continue;
                 }
-                impl_->Observe("delete", batch.target, "error", 0,
-                               batch.latency_us);
                 LogKvcsIoError("delete", impl_->targets[batch.target]->id,
                                impl_->targets[batch.target]->mountpoint_index,
                                batch.results[i].error());
@@ -1021,10 +833,6 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchDelete(
                     results[i] =
                         tl::make_unexpected(batch.results[i].error());
             }
-            impl_->ObserveBatch(
-                "delete", batch.target,
-                BatchResultLabel(batch_successes, batch.results.size()),
-                batch.results.size(), batch.latency_us);
         }
     }
     return results;
@@ -1033,10 +841,6 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchDelete(
 tl::expected<std::vector<KeyInfo>, ErrorCode>
 KvcsObjectStorageAdapter::ListKeys() {
     return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-}
-
-void KvcsObjectStorageAdapter::SerializeMetrics(std::string& output) const {
-    if (impl_) impl_->Serialize(output);
 }
 
 }  // namespace mooncake

@@ -4,33 +4,32 @@ This document describes the optional KVCS integration and its deployment
 contract. The integration never starts EFC or a storage server in a Mooncake
 process; deploy those components separately using KVCS tooling.
 
-Mooncake exposes KVCS Standard and Low Level as two explicit implementations
-of the distributed object-storage backend:
+Mooncake exposes KVCS Low Level as an explicit distributed object-storage
+backend:
 
 | Adapter | Provider metadata owner | Placement and health | Physical layout |
 | --- | --- | --- | --- |
-| `kvcs-standard` | KVCS Redis, Master, and Node Manager | KVCS selects and monitors replicas | KVCS Standard shards |
 | `kvcs-lowlevel` | KVCS Low Level records | Mooncake selects one EFC target and falls back per operation | Inline root value, or chunks plus a manifest stored in KVCS |
 
-Mooncake's master remains responsible for the logical object lifecycle in both
-modes. It persists only the logical object descriptor and selected adapter;
+Mooncake's master remains responsible for the logical object lifecycle.
+It persists only the logical object descriptor and selected adapter;
 SDK query results and target locations remain request-local and are never
-copied into Master metadata. The adapter name prevents an object from being
-reopened through the other mode's incompatible physical-key rules.
+copied into Master metadata.
 
 ## Deployment contract
+
+The KVCS SDK is optional at build time. Without it, Mooncake and its other
+storage backends still build; explicitly initializing the KVCS adapter returns
+`NOT_SUPPORTED`. To use KVCS, build with the SDK visible to `pkg-config`.
 
 Use the official KVCS YAML or Helm chart to deploy and configure EFC. Remote
 disk registration, capacity, health, and mountpoints belong to that deployment
 configuration; they must not be duplicated in Mooncake flags.
 
 All Mooncake processes that access KVCS need the EFC socket and shared-memory
-volume mounted at the paths configured for KVCS. When the default EFC socket
-`/var/run/kvcs/efc-grpc.sock` exists, Mooncake detects it during startup and
-automatically enables the Low Level KVCS adapter. No KVCS mode or socket
-environment variable is required for this path. An explicit
-`MOONCAKE_KVCS_MODE` or filesystem adapter setting still takes precedence, so
-existing non-KVCS deployments are not changed accidentally.
+volume mounted at the paths configured for KVCS. Opt in explicitly with
+`MOONCAKE_KVCS_MODE=low-level` or `MOONCAKE_DFS_FS_ADAPTER=kvcs-lowlevel`.
+The presence of an EFC socket alone does not enable KVCS.
 
 ```yaml
 volumeMounts:
@@ -49,39 +48,13 @@ from `MOONCAKE_KVCS_MODE`, but new deployments should not use it. KVCS has no
 dedicated health endpoint.
 Startup health checking follows the common
 `MOONCAKE_DISTRIBUTED_HEALTH_CHECK` setting. It defaults to `true` for Low
-Level, including through socket auto-detection, and remains `false` for
-Standard and other adapters. Standard deployments may opt in explicitly. The
-check queries a reserved probe key on every KVCS target in either mode.
+Level and remains `false` for other adapters. The check queries a reserved
+probe key on every KVCS target.
 A missing probe key is healthy; other provider errors fail backend
 initialization. Individual provider read/write failures are logged and returned
 to the caller.
 
 Low Level health queries use `MOONCAKE_KVCS_QUERY_TIMEOUT_MS` (default: 50 ms).
-Standard mode uses the SDK's query API, which exposes no per-call deadline.
-KVCS SDK 0.4.7 bounds Redis connection/socket/pool waits, but its G3.5 query
-fallback calls `GetStat` and `QueryMeta` without gRPC deadlines. Standard
-startup health therefore has no guaranteed end-to-end timeout if that RPC
-server stops responding; SDK support is needed to bound or cancel these calls.
-
-### Standard
-
-Standard mode requires the complete KVCS control plane. KVCS owns namespace,
-shard, replica, target, capacity, load-balancing, and node-health metadata.
-Mooncake does not persist a replica location hint: query and get let KVCS
-select a healthy replica, and delete asks KVCS to remove all replicas.
-
-```yaml
-env:
-  - {name: MOONCAKE_KVCS_MODE, value: standard}
-  - {name: MOONCAKE_KVCS_EFC_SOCKET, value: /var/run/kvcs/efc-grpc.sock}
-  - {name: MOONCAKE_KVCS_REDIS_ENDPOINTS, value: "tcp://redis:6379"}
-  - {name: MOONCAKE_KVCS_NAMESPACE, value: mooncake}
-  - {name: MOONCAKE_KVCS_SINGLE_TENANT, value: "true"}
-```
-
-The adapter gets or creates the namespace during initialization. Standard
-mode does not accept a nonzero Mooncake mountpoint index because target and
-replica selection are provider-owned.
 
 ### Low Level
 
@@ -143,7 +116,7 @@ the following remote delete.
 
 ```yaml
 env:
-  # Mode and socket are auto-detected from /var/run/kvcs/efc-grpc.sock.
+  - {name: MOONCAKE_KVCS_MODE, value: low-level}
   - {name: MOONCAKE_KVCS_SINGLE_TENANT, value: "true"}
   # KVCS_BACKEND / KVCS_EXTRA_BACKENDS / KVCS_MOUNTPOINTS_JSON are optional.
   # If omitted, Mooncake uses one built-in KVCacheStore target (index 1).
@@ -192,8 +165,6 @@ contract that would make a local load model authoritative. Capacity, watermarks,
 space reclamation, and provider-side health remain KVCS/EFC responsibilities;
 Mooncake reacts to the result of each operation. Startup health probing is
 enabled by default for Low Level and honors the common health-check setting.
-Standard mode requires explicit opt-in because its provider query has no
-bounded deadline.
 
 Mooncake keeps tenant isolation in the provider key. The adapter encodes
 `tenant_id` and the logical key as the printable, injective raw key
@@ -210,9 +181,7 @@ default. Values up to and including the configured limit use the
 inline fast path: the logical object is stored under one Mooncake-owned
 physical root key. Larger objects use chunks of at most the configured size
 plus a Mooncake-owned manifest. The manifest has a versioned, fixed 32-byte
-little-endian wire format; it is not a serialized C++ structure. Standard mode
-keeps the SDK's 4 MiB default unless the same parameter explicitly overrides
-it, and uses KVCS-owned shard metadata.
+little-endian wire format; it is not a serialized C++ structure.
 
 KVCS sizes shared memory as approximately:
 
@@ -270,8 +239,6 @@ result.
 
 `MOONCAKE_KVCS_QUERY_TIMEOUT_MS` also bounds Low-Level query calls. Its default
 is 50 milliseconds, matching the Mooncake-side parallel-query wait window.
-Standard mode uses the public SDK query API, which has no per-call deadline;
-therefore Standard provider query is not enabled on the parallel query path.
 
 Low Level query uses the stable-hash preferred target first. If that target
 misses, reports an incomplete object, or encounters a transient error,
@@ -284,7 +251,6 @@ Mooncake queries the remaining targets in fixed route order before returning.
   upsert operation.
 - Low Level deletes chunks first and removes the manifest only after all chunk
   deletes succeed, preserving enough metadata to retry a partial failure.
-- Standard deletes without a location hint so KVCS removes every replica.
 - A one-slice Low Level read goes directly into the caller's buffer. A
   multi-slice destination uses one staging buffer and then scatters the data.
 - Key listing is unsupported. Mooncake master metadata remains the DFS source

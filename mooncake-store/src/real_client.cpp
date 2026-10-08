@@ -2222,9 +2222,6 @@ int RealClient::start_http_server(int port) {
                                             "metrics not available");
                 return;
             }
-            if (file_storage_) {
-                file_storage_->SerializeProviderMetrics(*result);
-            }
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, std::move(*result));
         });
@@ -4908,7 +4905,6 @@ void RealClient::cache_pending_query_results(
     auto now = std::chrono::steady_clock::now();
     const auto cache_deadline = now + std::chrono::seconds(30);
     bool created = false;
-    bool capacity_rejected = false;
 
     {
         std::lock_guard<std::mutex> lock(pending_query_mutex_);
@@ -4945,7 +4941,6 @@ void RealClient::cache_pending_query_results(
             }
             if (!pending_query_results_.contains(keys[i]) &&
                 pending_query_results_.size() >= kMaxPendingQueryResults) {
-                capacity_rejected = true;
                 continue;
             }
 
@@ -4960,12 +4955,6 @@ void RealClient::cache_pending_query_results(
         if (created) ensure_pending_query_cleanup_thread_locked();
     }
 
-    if (created) {
-        client_->ObserveQueryResultCacheEvent("created");
-    }
-    if (capacity_rejected) {
-        client_->ObserveQueryResultCacheEvent("capacity_rejected");
-    }
 }
 
 void RealClient::invalidate_pending_query_result(const std::string &key) {
@@ -4999,7 +4988,6 @@ RealClient::take_pending_query_result_or_query(const std::string &key) {
 
     std::optional<QueryResult> cached;
     auto now = std::chrono::steady_clock::now();
-    bool expired = false;
     {
         std::lock_guard<std::mutex> lock(pending_query_mutex_);
         const auto it = pending_query_results_.find(key);
@@ -5010,18 +4998,12 @@ RealClient::take_pending_query_result_or_query(const std::string &key) {
             pending_query_results_.erase(it);
         } else if (it != pending_query_results_.end()) {
             pending_query_results_.erase(it);
-            expired = true;
         }
     }
 
     if (cached) {
-        client_->ObserveQueryResultCacheEvent("hit");
         return std::move(*cached);
     }
-    if (expired) {
-        client_->ObserveQueryResultCacheEvent("expired");
-    }
-    client_->ObserveQueryResultCacheEvent("miss");
     return client_->Query(key);
 }
 
@@ -5042,8 +5024,6 @@ RealClient::take_pending_query_results_or_query(
     std::vector<size_t> missing_indexes;
     std::unordered_set<std::string> consumed_keys;
     auto now = std::chrono::steady_clock::now();
-    bool hit = false;
-    bool expired = false;
 
     {
         std::lock_guard<std::mutex> lock(pending_query_mutex_);
@@ -5054,12 +5034,10 @@ RealClient::take_pending_query_results_or_query(
                 !it->second.query_result.IsLeaseExpired(now)) {
                 slots[i].emplace(it->second.query_result);
                 consumed_keys.insert(keys[i]);
-                hit = true;
                 continue;
             }
             if (it != pending_query_results_.end()) {
                 pending_query_results_.erase(it);
-                expired = true;
             }
             missing_keys.push_back(keys[i]);
             missing_indexes.push_back(i);
@@ -5069,14 +5047,7 @@ RealClient::take_pending_query_results_or_query(
         }
     }
 
-    if (hit) {
-        client_->ObserveQueryResultCacheEvent("hit");
-    }
-    if (expired) {
-        client_->ObserveQueryResultCacheEvent("expired");
-    }
     if (!missing_keys.empty()) {
-        client_->ObserveQueryResultCacheEvent("miss");
         auto queried = client_->BatchQuery(missing_keys);
         if (queried.size() != missing_keys.size()) {
             for (const auto index : missing_indexes) {
@@ -5118,7 +5089,6 @@ void RealClient::ensure_pending_query_cleanup_thread_locked() {
                 if (stop_token.stop_requested()) break;
 
                 const auto now = std::chrono::steady_clock::now();
-                bool expired = false;
                 for (auto it = pending_query_results_.begin();
                      it != pending_query_results_.end();) {
                     if (now < it->second.cleanup_deadline) {
@@ -5126,14 +5096,7 @@ void RealClient::ensure_pending_query_cleanup_thread_locked() {
                         continue;
                     }
                     it = pending_query_results_.erase(it);
-                    expired = true;
                 }
-
-                lock.unlock();
-                if (expired && client_) {
-                    client_->ObserveQueryResultCacheEvent("expired");
-                }
-                lock.lock();
             }
         });
 }

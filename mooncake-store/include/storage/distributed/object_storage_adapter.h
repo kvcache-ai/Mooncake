@@ -143,8 +143,6 @@ class ObjectStorageAdapter {
         std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>
             contexts);
 
-    virtual void SerializeMetrics(std::string& output) const {}
-
     // Pagination is an implementation detail. Returns decoded logical keys
     // from the adapter's configured physical namespace.
     virtual tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() = 0;

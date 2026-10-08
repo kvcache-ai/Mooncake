@@ -74,7 +74,7 @@ constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 constexpr size_t kProviderQueryThreads = 8;
 constexpr size_t kProviderQueryMaxInflight = kProviderQueryThreads;
 
-using ProviderQueryResponse = std::pair<ObjectStorageQueryResults, uint64_t>;
+using ProviderQueryResponse = ObjectStorageQueryResults;
 
 std::future<ProviderQueryResponse> QueryProviderAsync(
     ThreadPool& thread_pool,
@@ -100,10 +100,8 @@ std::future<ProviderQueryResponse> QueryProviderAsync(
                         count.fetch_sub(1, std::memory_order_release);
                     }
                 } guard{inflight};
-                const auto start = std::chrono::steady_clock::now();
-                return std::make_pair(
-                    provider_backend->BatchQueryProvider(object_keys, deadline),
-                    elapsed_us_since(start));
+                return provider_backend->BatchQueryProvider(object_keys,
+                                                            deadline);
             });
     } catch (...) {
         inflight.fetch_sub(1, std::memory_order_release);
@@ -1452,12 +1450,7 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
             provider_backend, {object_key}, provider_deadline);
     }
 
-    const auto master_start = std::chrono::steady_clock::now();
     auto master_result = master_client_.GetReplicaList(object_key);
-    if (metrics_) {
-        metrics_->ObserveQueryLatency("single_master",
-                                      elapsed_us_since(master_start));
-    }
     ObjectStorageQueryResults provider_results;
     if (query_provider && master_result &&
         !HasCompleteMemoryReplica(master_result->replicas)) {
@@ -1465,12 +1458,7 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
             if (provider_future.valid() &&
                 provider_future.wait_until(provider_deadline) ==
                 std::future_status::ready) {
-                auto provider_response = provider_future.get();
-                provider_results = std::move(provider_response.first);
-                if (metrics_) {
-                    metrics_->ObserveQueryLatency("single_provider",
-                                                  provider_response.second);
-                }
+                provider_results = provider_future.get();
             } else {
                 LOG(WARNING)
                     << "KVCS provider query deadline exceeded or executor "
@@ -1478,9 +1466,6 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
                     << object_key << ", timeout_ms="
                     << provider_backend->ProviderQueryTimeout().count()
                     << ", submitted=" << provider_future.valid();
-                if (metrics_) {
-                    metrics_->ObserveQueryCacheEvent("provider_query_timeout");
-                }
                 provider_results.emplace_back(
                     tl::make_unexpected(ErrorCode::RPC_TIMEOUT));
             }
@@ -1492,32 +1477,16 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
             provider_results = ObjectStorageQueryResults{
                 tl::make_unexpected(ErrorCode::INTERNAL_ERROR)};
         }
-    } else if (provider_future.valid() && master_result &&
-               HasCompleteMemoryReplica(master_result->replicas)) {
-        if (metrics_) {
-            metrics_->ObserveQueryCacheEvent("memory_hit_skip_provider");
-        }
     }
     if (!master_result) {
-        if (metrics_) {
-            metrics_->ObserveQueryLatency("single_total",
-                                          elapsed_us_since(start_time));
-        }
         return tl::unexpected(master_result.error());
     }
 
     const auto* provider_result =
         provider_results.empty() ? nullptr : &provider_results.front();
-    const auto merge_start = std::chrono::steady_clock::now();
     auto result =
         BuildQueryResult(object_key, std::move(master_result.value()),
                          start_time, provider_backend, provider_result);
-    if (metrics_) {
-        metrics_->ObserveQueryLatency("single_merge",
-                                      elapsed_us_since(merge_start));
-        metrics_->ObserveQueryLatency("single_total",
-                                      elapsed_us_since(start_time));
-    }
     return result;
 }
 
@@ -1549,12 +1518,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             provider_backend, object_keys, provider_deadline);
     }
 
-    const auto master_start = std::chrono::steady_clock::now();
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
-    if (metrics_) {
-        metrics_->ObserveQueryLatency("batch_master",
-                                      elapsed_us_since(master_start));
-    }
 
     ObjectStorageQueryResults provider_results;
     bool wait_for_provider = false;
@@ -1569,12 +1533,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             if (provider_future.valid() &&
                 provider_future.wait_until(provider_deadline) ==
                 std::future_status::ready) {
-                auto provider_response = provider_future.get();
-                provider_results = std::move(provider_response.first);
-                if (metrics_) {
-                    metrics_->ObserveQueryLatency("batch_provider",
-                                                  provider_response.second);
-                }
+                provider_results = provider_future.get();
             } else {
                 LOG(WARNING)
                     << "KVCS provider batch query deadline exceeded or "
@@ -1582,10 +1541,6 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                     << object_keys.size() << ", timeout_ms="
                     << provider_backend->ProviderQueryTimeout().count()
                     << ", submitted=" << provider_future.valid();
-                if (metrics_) {
-                    metrics_->ObserveQueryCacheEvent(
-                        "provider_batch_query_timeout");
-                }
                 provider_results = ObjectStorageQueryResults(
                     object_keys.size(),
                     tl::make_unexpected(ErrorCode::RPC_TIMEOUT));
@@ -1600,10 +1555,6 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 object_keys.size(),
                 tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
         }
-    } else if (provider_future.valid() && !wait_for_provider) {
-        if (metrics_) {
-            metrics_->ObserveQueryCacheEvent("batch_memory_hit_skip_provider");
-        }
     }
 
     // Check if we got the expected number of responses
@@ -1616,13 +1567,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
         }
-        if (metrics_) {
-            metrics_->ObserveQueryLatency("batch_total",
-                                          elapsed_us_since(start_time));
-        }
         return results;
     }
-    const auto merge_start = std::chrono::steady_clock::now();
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
@@ -1635,12 +1581,6 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
-    }
-    if (metrics_) {
-        metrics_->ObserveQueryLatency("batch_merge",
-                                      elapsed_us_since(merge_start));
-        metrics_->ObserveQueryLatency("batch_total",
-                                      elapsed_us_since(start_time));
     }
     return results;
 }

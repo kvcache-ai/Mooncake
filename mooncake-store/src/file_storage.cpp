@@ -38,14 +38,6 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 
 }  // namespace
 
-void FileStorage::SerializeProviderMetrics(std::string& output) const {
-    auto distributed_backend =
-        std::dynamic_pointer_cast<DistributedStorageBackend>(storage_backend_);
-    if (distributed_backend) {
-        distributed_backend->SerializeProviderMetrics(output);
-    }
-}
-
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
                          const std::string& local_rpc_addr,

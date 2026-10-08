@@ -14,12 +14,6 @@
 
 namespace mooncake {
 
-enum class KvcsAccessMode {
-    kStandard,
-    kLowLevel,
-};
-
-inline constexpr char kKvcsStandardAdapterName[] = "kvcs-standard";
 inline constexpr char kKvcsLowLevelAdapterName[] = "kvcs-lowlevel";
 
 struct KvcsLowLevelTargetSpec {
@@ -29,16 +23,13 @@ struct KvcsLowLevelTargetSpec {
     std::unique_ptr<KvcsDriver> driver;
 };
 
-// Bridges the distributed object-storage contract to KVCS Standard or
-// Low-Level mode. The adapter owns tenant encoding and target routing; the
-// selected driver owns provider-specific I/O and metadata.
+// Bridges the distributed object-storage contract to KVCS Low Level.
+// The adapter owns tenant encoding and target routing; the driver owns I/O.
 class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
    public:
     KvcsObjectStorageAdapter(const FileStorageConfig& config,
-                             KvcsAccessMode mode,
                              std::string efc_config_path = {});
     KvcsObjectStorageAdapter(const FileStorageConfig& config,
-                             KvcsAccessMode mode,
                              std::unique_ptr<KvcsDriver> driver);
     KvcsObjectStorageAdapter(const FileStorageConfig& config,
                              std::vector<KvcsLowLevelTargetSpec> targets);
@@ -65,9 +56,7 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
         std::span<const std::string> logical_keys) override;
 
     bool SupportsProviderQuery() const override { return true; }
-    bool SupportsProviderQueryInParallel() const override {
-        return mode_ == KvcsAccessMode::kLowLevel;
-    }
+    bool SupportsProviderQueryInParallel() const override { return true; }
     ObjectStorageQueryResults BatchQueryProvider(
         std::span<const std::string> logical_keys) override;
     ObjectStorageQueryResults BatchQueryProviderUntil(
@@ -77,16 +66,12 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
         std::span<const ObjectStorageGetRequest> requests,
         std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>
             contexts) override;
-    void SerializeMetrics(std::string& output) const override;
 
     tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() override;
 
     tl::expected<void, ErrorCode> Init() override;
     tl::expected<void, ErrorCode> CheckHealth() override;
-    const char* GetName() const override {
-        return mode_ == KvcsAccessMode::kStandard ? kKvcsStandardAdapterName
-                                                  : kKvcsLowLevelAdapterName;
-    }
+    const char* GetName() const override { return kKvcsLowLevelAdapterName; }
 
    private:
     tl::expected<ObjectKey, ErrorCode> EncodeKey(
@@ -102,7 +87,6 @@ class KvcsObjectStorageAdapter final : public ObjectStorageAdapter {
     struct Impl;
 
     FileStorageConfig config_;
-    KvcsAccessMode mode_;
     std::string efc_config_path_;
     std::vector<KvcsLowLevelTargetSpec> pending_targets_;
     std::unique_ptr<Impl> impl_;

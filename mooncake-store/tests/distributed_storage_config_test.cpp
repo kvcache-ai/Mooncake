@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -9,10 +8,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
 
 #include "config/distributed_storage_config.h"
 
@@ -48,57 +43,6 @@ class ScopedEnvVar {
     std::optional<std::string> original_;
 };
 
-class UnixSocketFixture {
-   public:
-    UnixSocketFixture() = default;
-
-    bool Create() {
-        static unsigned int sequence = 0;
-        path_ = "/tmp/mooncake-kvcs-config-test-" +
-                std::to_string(static_cast<unsigned long long>(::getpid())) +
-                "-" + std::to_string(++sequence);
-
-        fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        sockaddr_un address{};
-        if (fd_ < 0 || path_.size() >= sizeof(address.sun_path)) {
-            Cleanup();
-            return false;
-        }
-
-        address.sun_family = AF_UNIX;
-        std::copy(path_.begin(), path_.end(), address.sun_path);
-        address.sun_path[path_.size()] = '\0';
-        ::unlink(path_.c_str());
-        if (::bind(fd_, reinterpret_cast<const sockaddr*>(&address),
-                   sizeof(address)) != 0) {
-            Cleanup();
-            return false;
-        }
-        return true;
-    }
-
-    ~UnixSocketFixture() { Cleanup(); }
-
-    UnixSocketFixture(const UnixSocketFixture&) = delete;
-    UnixSocketFixture& operator=(const UnixSocketFixture&) = delete;
-
-    const std::string& path() const { return path_; }
-
-   private:
-    void Cleanup() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
-        if (!path_.empty()) {
-            ::unlink(path_.c_str());
-        }
-    }
-
-    int fd_{-1};
-    std::string path_;
-};
-
 struct DistributedStorageEnvironment {
     ScopedEnvVar root_dir{"MOONCAKE_DFS_ROOT_DIR"};
     ScopedEnvVar legacy_root_dir{"MOONCAKE_DISTRIBUTED_ROOT_DIR"};
@@ -106,7 +50,6 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar legacy_fs_adapter{"MOONCAKE_DISTRIBUTED_FS_TYPE"};
     ScopedEnvVar kvcs_mode{"MOONCAKE_KVCS_MODE"};
     ScopedEnvVar kvcs_socket{"MOONCAKE_KVCS_EFC_SOCKET"};
-    ScopedEnvVar kvcs_config{"MOONCAKE_KVCS_EFC_CONFIG"};
     ScopedEnvVar kvcs_parallel_query{"MOONCAKE_KVCS_ENABLE_PARALLEL_QUERY"};
     ScopedEnvVar kvcs_query_timeout{"MOONCAKE_KVCS_QUERY_TIMEOUT_MS"};
     ScopedEnvVar health_check{"MOONCAKE_DISTRIBUTED_HEALTH_CHECK"};
@@ -122,13 +65,6 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar eviction_check_interval{
         "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL"};
 
-    DistributedStorageEnvironment() {
-        // Keep the pre-existing non-KVCS tests deterministic on hosts where
-        // the real EFC socket is mounted.
-        const char* path = "/tmp/mooncake-kvcs-config-test-no-socket";
-        ::unlink(path);
-        kvcs_socket.Set(path);
-    }
 };
 
 void ExpectDefaultConfig(const DistributedStorageConfig& config) {
@@ -235,23 +171,18 @@ TEST_F(DistributedStorageConfigTest, PreservesAliasPrecedence) {
     EXPECT_EQ(preferred.fs_adapter_type, "hf3fs");
 }
 
-TEST_F(DistributedStorageConfigTest, AutoEnablesKvcsWhenEfcSocketExists) {
-    UnixSocketFixture socket;
-    ASSERT_TRUE(socket.Create());
-    env.kvcs_socket.Set(socket.path().c_str());
+TEST_F(DistributedStorageConfigTest, EfcSocketDoesNotEnableKvcsWithoutOptIn) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
 
-    EXPECT_EQ(config.fs_adapter_type, "kvcs-lowlevel");
-    EXPECT_TRUE(config.UsesKvcs());
-    EXPECT_TRUE(config.enable_health_check);
+    ExpectDefaultConfig(config);
+    EXPECT_FALSE(config.UsesKvcs());
 }
 
 TEST_F(DistributedStorageConfigTest,
-       ExplicitFilesystemAdapterOverridesKvcsAutoDetection) {
-    UnixSocketFixture socket;
-    ASSERT_TRUE(socket.Create());
-    env.kvcs_socket.Set(socket.path().c_str());
+       ExplicitFilesystemAdapterRemainsSelectedWithEfcSocket) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
     env.fs_adapter.Set("posix");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
@@ -261,29 +192,21 @@ TEST_F(DistributedStorageConfigTest,
     EXPECT_FALSE(config.enable_health_check);
 }
 
-TEST_F(DistributedStorageConfigTest,
-       ExplicitKvcsModeOverridesFilesystemAutoDetection) {
-    UnixSocketFixture socket;
-    ASSERT_TRUE(socket.Create());
-    env.kvcs_socket.Set(socket.path().c_str());
-    env.kvcs_mode.Set("standard");
+TEST_F(DistributedStorageConfigTest, ExplicitKvcsModeSelectsLowLevel) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
+    env.kvcs_mode.Set("low-level");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
 
-    EXPECT_EQ(config.fs_adapter_type, "kvcs-standard");
-    EXPECT_FALSE(config.enable_health_check);
+    EXPECT_EQ(config.fs_adapter_type, "kvcs-lowlevel");
+    EXPECT_TRUE(config.enable_health_check);
 }
 
-TEST_F(DistributedStorageConfigTest, KvcsModesUseSafeHealthDefaults) {
+TEST_F(DistributedStorageConfigTest, KvcsModeEnablesHealthCheckByDefault) {
     env.kvcs_mode.Set("low-level");
-    const auto low_level = DistributedStorageConfig::FromEnvironment();
-    EXPECT_TRUE(low_level.UsesKvcs());
-    EXPECT_TRUE(low_level.enable_health_check);
-
-    env.kvcs_mode.Set("standard");
-    const auto standard = DistributedStorageConfig::FromEnvironment();
-    EXPECT_TRUE(standard.UsesKvcs());
-    EXPECT_FALSE(standard.enable_health_check);
+    const auto config = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_TRUE(config.enable_health_check);
 }
 
 TEST_F(DistributedStorageConfigTest, LegacyKvcsModeSelectsLowLevelAdapter) {
@@ -297,34 +220,24 @@ TEST_F(DistributedStorageConfigTest, LegacyKvcsModeSelectsLowLevelAdapter) {
     EXPECT_TRUE(config.Validate());
 }
 
-TEST_F(DistributedStorageConfigTest, KvcsAdaptersUseSafeHealthDefaults) {
+TEST_F(DistributedStorageConfigTest, KvcsAdapterEnablesHealthCheckByDefault) {
     env.fs_adapter.Set("kvcs-lowlevel");
-    const auto low_level = DistributedStorageConfig::FromEnvironment();
-    EXPECT_TRUE(low_level.UsesKvcs());
-    EXPECT_TRUE(low_level.enable_health_check);
-
-    env.fs_adapter.Set("kvcs-standard");
-    const auto standard = DistributedStorageConfig::FromEnvironment();
-    EXPECT_TRUE(standard.UsesKvcs());
-    EXPECT_FALSE(standard.enable_health_check);
+    const auto config = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_TRUE(config.enable_health_check);
 }
 
 TEST_F(DistributedStorageConfigTest, KvcsHealthCheckCanBeExplicitlyDisabled) {
     env.health_check.Set("false");
-    for (const char* mode : {"standard", "low-level"}) {
-        SCOPED_TRACE(mode);
-        env.kvcs_mode.Set(mode);
-
-        const auto config = DistributedStorageConfig::FromEnvironment();
-
-        EXPECT_TRUE(config.UsesKvcs());
-        EXPECT_FALSE(config.enable_health_check);
-    }
+    env.kvcs_mode.Set("low-level");
+    const auto config = DistributedStorageConfig::FromEnvironment();
+    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_FALSE(config.enable_health_check);
 }
 
 TEST_F(DistributedStorageConfigTest,
-       StandardHealthCheckCanBeExplicitlyEnabled) {
-    env.kvcs_mode.Set("standard");
+       KvcsHealthCheckCanBeExplicitlyEnabled) {
+    env.kvcs_mode.Set("low-level");
     env.health_check.Set("true");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
@@ -333,15 +246,13 @@ TEST_F(DistributedStorageConfigTest,
     EXPECT_TRUE(config.enable_health_check);
 }
 
-TEST_F(DistributedStorageConfigTest, AutoDetectedKvcsHealthCanBeDisabled) {
-    UnixSocketFixture socket;
-    ASSERT_TRUE(socket.Create());
-    env.kvcs_socket.Set(socket.path().c_str());
+TEST_F(DistributedStorageConfigTest, EfcSocketAndHealthFlagDoNotEnableKvcs) {
+    env.kvcs_socket.Set("/var/run/kvcs/efc-grpc.sock");
     env.health_check.Set("false");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
 
-    EXPECT_TRUE(config.UsesKvcs());
+    EXPECT_FALSE(config.UsesKvcs());
     EXPECT_FALSE(config.enable_health_check);
 }
 
@@ -443,8 +354,6 @@ TEST(DistributedStorageConfigValidationTest, AcceptsKvcsQueryHealthCheck) {
     DistributedStorageConfig config;
     config.fs_adapter_type = "kvcs-lowlevel";
     config.enable_health_check = true;
-    EXPECT_TRUE(config.Validate());
-    config.fs_adapter_type = "kvcs-standard";
     EXPECT_TRUE(config.Validate());
 }
 

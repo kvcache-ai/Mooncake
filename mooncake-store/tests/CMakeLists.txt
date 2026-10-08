@@ -357,6 +357,10 @@ add_store_test(object_layout_test object_layout_test.cpp)
 add_store_test(kvcs_efc_topology_test kvcs_efc_topology_test.cpp)
 add_store_test(kvcs_object_storage_adapter_test
                kvcs_object_storage_adapter_test.cpp)
+if(NOT MOONCAKE_KVCS_SDK_FOUND)
+  target_compile_definitions(kvcs_object_storage_adapter_test
+                             PRIVATE MOONCAKE_KVCS_TEST_NO_SDK=1)
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
    AND MOONCAKE_KVCS_SDK_FOUND)
   target_compile_definitions(kvcs_object_storage_adapter_test

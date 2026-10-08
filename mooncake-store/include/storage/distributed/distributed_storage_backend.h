@@ -96,7 +96,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
             contexts);
     ObjectStorageIoResults BatchDeleteProvider(
         std::span<const std::string> logical_keys);
-    void SerializeProviderMetrics(std::string& output) const;
 
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.

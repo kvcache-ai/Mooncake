@@ -272,30 +272,6 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
                 summary.find("No data") != std::string::npos);
 }
 
-TEST_F(ClientMetricsTest, QueryLatencyAndResultCacheMetricsAreSerialized) {
-    ClientMetric metrics;
-    metrics.ObserveQueryLatency("batch_master", 625);
-    metrics.ObserveQueryLatency("batch_total", 840);
-    metrics.ObserveQueryCacheEvent("created");
-    metrics.ObserveQueryCacheEvent("hit");
-
-    std::string serialized;
-    metrics.serialize(serialized);
-
-    EXPECT_NE(serialized.find(
-                  "mooncake_query_latency_count{phase=\"batch_master\"}"),
-              std::string::npos);
-    EXPECT_NE(serialized.find(
-                  "mooncake_query_latency_sum{phase=\"batch_master\"} 625"),
-              std::string::npos);
-    EXPECT_NE(serialized.find(
-                  "mooncake_query_result_cache_events_total{event=\"created\"} 1"),
-              std::string::npos);
-    EXPECT_NE(serialized.find(
-                  "mooncake_query_result_cache_events_total{event=\"hit\"} 1"),
-              std::string::npos);
-}
-
 TEST_F(ClientMetricsTest, HybridHistogramSerializesEachLabelOnce) {
     ylt::metric::hybrid_histogram_1t histogram(
         "request_latency", "Request latency", {10.0, 20.0}, {}, {"route"});

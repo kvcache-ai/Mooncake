@@ -27,12 +27,10 @@ struct DistributedStorageConfig {
     uint32_t provider_query_timeout_ms = 50;
 
     bool UsesObjectStorage() const {
-        return fs_adapter_type == "oss" || fs_adapter_type == "kvcs-standard" ||
-               fs_adapter_type == "kvcs-lowlevel";
+        return fs_adapter_type == "oss" || fs_adapter_type == "kvcs-lowlevel";
     }
     bool UsesKvcs() const {
-        return fs_adapter_type == "kvcs-standard" ||
-               fs_adapter_type == "kvcs-lowlevel";
+        return fs_adapter_type == "kvcs-lowlevel";
     }
 
     bool Validate() const;

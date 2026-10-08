@@ -776,13 +776,6 @@ ObjectStorageIoResults DistributedStorageBackend::BatchDeleteProvider(
     return object_storage_adapter_->BatchDelete(logical_keys);
 }
 
-void DistributedStorageBackend::SerializeProviderMetrics(
-    std::string& output) const {
-    if (UsesObjectStorage() && object_storage_adapter_) {
-        object_storage_adapter_->SerializeMetrics(output);
-    }
-}
-
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
     if (!UsesObjectStorage()) {

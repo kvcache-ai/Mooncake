@@ -689,12 +689,6 @@ class Client {
         }
     }
 
-    void ObserveQueryResultCacheEvent(const std::string& event) {
-        if (metrics_ != nullptr) {
-            metrics_->ObserveQueryCacheEvent(event);
-        }
-    }
-
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {

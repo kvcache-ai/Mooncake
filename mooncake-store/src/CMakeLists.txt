@@ -187,9 +187,9 @@ endif()
 find_package(OpenSSL QUIET)
 if(TARGET PkgConfig::KVCS AND TARGET OpenSSL::Crypto)
   set(MOONCAKE_KVCS_SDK_FOUND ON)
-  message(STATUS "KVCS SDK found: standard and low-level adapters enabled")
+  message(STATUS "KVCS SDK found: low-level adapter enabled")
 else()
-  message(STATUS "KVCS SDK not found: adapters build with unsupported stubs")
+  message(STATUS "KVCS SDK not found: low-level adapter builds with unsupported stub")
 endif()
 set(MOONCAKE_KVCS_SDK_FOUND
     ${MOONCAKE_KVCS_SDK_FOUND}

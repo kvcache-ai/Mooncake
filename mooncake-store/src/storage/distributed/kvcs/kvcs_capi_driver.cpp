@@ -34,7 +34,7 @@ namespace {
 
 #ifdef MOONCAKE_HAVE_KVCS_SDK
 
-constexpr uint64_t kStandardDefaultMaxValueSize = 4ULL * 1024 * 1024;
+constexpr uint64_t kKvcsDefaultMaxValueSize = 4ULL * 1024 * 1024;
 constexpr uint64_t kDefaultOperationTimeoutMs = 30'000;
 constexpr uint64_t kDefaultQueryOperationTimeoutMs = 50;
 constexpr std::string_view kDefaultEfcSocket = "/var/run/kvcs/efc-grpc.sock";
@@ -147,7 +147,7 @@ struct LowLevelConfig {
     uint32_t mountpoint_index = 0;
     // Safe defaults for a 4 MiB value limit: about 96 MiB of ring/shm
     // capacity with one worker per operation class and eight keys per batch.
-    uint64_t max_value_size = kStandardDefaultMaxValueSize;
+    uint64_t max_value_size = kKvcsDefaultMaxValueSize;
     int max_keys_per_batch = 8;
     int get_workers = 1;
     int set_workers = 1;
@@ -157,23 +157,13 @@ struct LowLevelConfig {
     uint64_t query_operation_timeout_ms = kDefaultQueryOperationTimeoutMs;
 };
 
-struct StandardConfig {
-    std::string efc_socket;
-    std::vector<std::string> redis_endpoints;
-    std::string redis_password;
-    std::string name_space = "mooncake";
-    uint32_t max_key_size = kKvcsDefaultMaxKeySize;
-    uint64_t max_value_size = kStandardDefaultMaxValueSize;
-};
-
 struct CommonConfig {
     std::string efc_socket;
     uint32_t max_key_size = kKvcsDefaultMaxKeySize;
-    uint64_t max_value_size = 0;
+    uint64_t max_value_size = kKvcsDefaultMaxValueSize;
 };
 
-tl::expected<CommonConfig, ErrorCode> ParseCommonConfig(
-    std::optional<uint64_t> default_max_value_size) {
+tl::expected<CommonConfig, ErrorCode> ParseCommonConfig() {
     CommonConfig config;
     if (const char* value = std::getenv("MOONCAKE_KVCS_EFC_SOCKET");
         value != nullptr && *value != '\0') {
@@ -203,12 +193,6 @@ tl::expected<CommonConfig, ErrorCode> ParseCommonConfig(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         config.max_value_size = *parsed;
-    } else if (default_max_value_size) {
-        config.max_value_size = *default_max_value_size;
-    } else {
-        LOG(ERROR) << "KVCS Low Level mode requires "
-                      "MOONCAKE_KVCS_MAX_VALUE_SIZE";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return config;
 }
@@ -225,7 +209,7 @@ tl::expected<int, ErrorCode> ParseNonnegativeIntEnvironment(const char* name,
 }
 
 tl::expected<LowLevelConfig, ErrorCode> ParseLowLevelConfig() {
-    auto common = ParseCommonConfig(kStandardDefaultMaxValueSize);
+    auto common = ParseCommonConfig();
     if (!common) {
         return tl::make_unexpected(common.error());
     }
@@ -280,59 +264,6 @@ tl::expected<LowLevelConfig, ErrorCode> ParseLowLevelConfig() {
     return config;
 }
 
-tl::expected<StandardConfig, ErrorCode> ParseStandardConfig() {
-    auto common = ParseCommonConfig(kStandardDefaultMaxValueSize);
-    if (!common) {
-        return tl::make_unexpected(common.error());
-    }
-
-    StandardConfig config;
-    config.efc_socket = std::move(common->efc_socket);
-    config.max_key_size = common->max_key_size;
-    config.max_value_size = common->max_value_size;
-
-    const char* endpoints = std::getenv("MOONCAKE_KVCS_REDIS_ENDPOINTS");
-    if (endpoints == nullptr || *endpoints == '\0') {
-        endpoints = std::getenv("KVCS_REDIS_ENDPOINTS");
-    }
-    if (endpoints == nullptr || *endpoints == '\0') {
-        LOG(ERROR) << "KVCS Standard mode requires "
-                      "MOONCAKE_KVCS_REDIS_ENDPOINTS";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    std::string_view remaining(endpoints);
-    while (!remaining.empty()) {
-        const size_t delimiter = remaining.find(',');
-        const auto endpoint =
-            TrimAsciiWhitespace(remaining.substr(0, delimiter));
-        if (endpoint.empty() || endpoint.find('\0') != std::string_view::npos) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        config.redis_endpoints.emplace_back(endpoint);
-        if (delimiter == std::string_view::npos) break;
-        remaining.remove_prefix(delimiter + 1);
-    }
-    if (config.redis_endpoints.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    const char* password = std::getenv("MOONCAKE_KVCS_REDIS_PASSWORD");
-    if (password == nullptr) {
-        password = std::getenv("KVCS_REDIS_PASSWORD");
-    }
-    if (password != nullptr) {
-        config.redis_password = password;
-    }
-    if (const char* name_space = std::getenv("MOONCAKE_KVCS_NAMESPACE");
-        name_space != nullptr && *name_space != '\0') {
-        config.name_space = name_space;
-    }
-    if (config.name_space.empty() || config.name_space.size() >= 128 ||
-        config.name_space.find('\0') != std::string::npos) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    return config;
-}
 
 ErrorCode MapCallStatus(int status) {
     if (status >= 0) {
@@ -589,396 +520,6 @@ class QueryResults {
 std::string_view BoundedString(const char* value, size_t capacity) {
     return std::string_view(value, strnlen(value, capacity));
 }
-
-class KvcsStandardCapiDriver final : public KvcsDriver {
-   public:
-    explicit KvcsStandardCapiDriver(StandardConfig config)
-        : efc_socket_(std::move(config.efc_socket)),
-          redis_endpoints_(std::move(config.redis_endpoints)),
-          redis_password_(std::move(config.redis_password)),
-          namespace_(std::move(config.name_space)),
-          max_key_size_(config.max_key_size),
-          max_value_size_(config.max_value_size) {}
-
-    ~KvcsStandardCapiDriver() override {
-        if (client_ != nullptr) {
-            kvcs_client_destroy(client_);
-        }
-    }
-
-    tl::expected<void, ErrorCode> Init() override {
-        if (client_ != nullptr) return {};
-
-        std::vector<const char*> endpoint_pointers;
-        endpoint_pointers.reserve(redis_endpoints_.size());
-        for (const auto& endpoint : redis_endpoints_) {
-            endpoint_pointers.push_back(endpoint.c_str());
-        }
-
-        kvcs_client_config_t config{};
-        config.efc_socket = efc_socket_.c_str();
-        config.redis_endpoints = endpoint_pointers.data();
-        config.redis_count = static_cast<int>(endpoint_pointers.size());
-        config.redis_password =
-            redis_password_.empty() ? nullptr : redis_password_.c_str();
-        config.max_key_size = static_cast<int>(max_key_size_);
-        config.max_value_size = static_cast<int64_t>(max_value_size_);
-        config.enable_metrics = 1;
-        client_ = kvcs_client_create(&config);
-        if (client_ == nullptr) {
-            return tl::make_unexpected(errno == EINVAL
-                                           ? ErrorCode::INVALID_PARAMS
-                                           : ErrorCode::KVCS_UNAVAILABLE);
-        }
-
-        kvcs_namespace_info_t namespace_info{};
-        const int get_status =
-            kvcs_get_namespace(client_, namespace_.c_str(), &namespace_info);
-        if (get_status == -KVCS_NAMESPACE_NOT_FOUND) {
-            kvcs_create_ns_opts_t options{};
-            const int create_status =
-                kvcs_create_namespace(client_, namespace_.c_str(), &options);
-            if (create_status < 0 && create_status != -KVCS_ALREADY_EXISTS) {
-                const ErrorCode error = MapCallStatus(create_status);
-                kvcs_client_destroy(client_);
-                client_ = nullptr;
-                return tl::make_unexpected(error);
-            }
-        } else if (get_status < 0) {
-            const ErrorCode error = MapCallStatus(get_status);
-            kvcs_client_destroy(client_);
-            client_ = nullptr;
-            return tl::make_unexpected(error);
-        }
-        return {};
-    }
-
-    uint64_t MaxValueSize() const override { return max_value_size_; }
-    uint32_t MaxKeySize() const override { return max_key_size_; }
-
-    KvcsPutShardResults BatchPut(
-        std::span<const KvcsShardPutRequest> requests) override {
-        if (client_ == nullptr) {
-            return MakeErrors<KvcsPutShardResults>(requests.size(),
-                                                   ErrorCode::INTERNAL_ERROR);
-        }
-        if (requests.empty()) return {};
-        if (requests.size() > static_cast<size_t>(INT_MAX)) {
-            return MakeErrors<KvcsPutShardResults>(requests.size(),
-                                                   ErrorCode::INVALID_PARAMS);
-        }
-
-        std::vector<std::vector<const void*>> segment_pointers(requests.size());
-        std::vector<std::vector<size_t>> segment_lengths(requests.size());
-        std::vector<kvcs_put_item_t> items;
-        items.reserve(requests.size());
-        for (size_t index = 0; index < requests.size(); ++index) {
-            const auto& request = requests[index];
-            if (!ValidateRequest(request)) {
-                return MakeErrors<KvcsPutShardResults>(
-                    requests.size(), ErrorCode::INVALID_PARAMS);
-            }
-            auto& pointers = segment_pointers[index];
-            auto& lengths = segment_lengths[index];
-            pointers.reserve(request.slices.size());
-            lengths.reserve(request.slices.size());
-            for (const auto& slice : request.slices) {
-                pointers.push_back(slice.ptr);
-                lengths.push_back(slice.size);
-            }
-            items.push_back(kvcs_put_item_t{
-                .key = request.logical_key.c_str(),
-                .value_segs = pointers.data(),
-                .seg_lens = lengths.data(),
-                .seg_count = static_cast<int>(pointers.size()),
-                .shard_id = static_cast<int32_t>(request.shard_id),
-                .total_shard = static_cast<int32_t>(request.total_shard),
-                .location = nullptr,
-                .meta = nullptr,
-                .meta_count = 0,
-            });
-        }
-
-        std::vector<kvcs_put_result_t> native_results(requests.size());
-        const int count = static_cast<int>(requests.size());
-        const int call_status =
-            kvcs_batch_put(client_, namespace_.c_str(), items.data(), count,
-                           native_results.data(), count, 0);
-        if (call_status < 0) {
-            return MakeErrors<KvcsPutShardResults>(requests.size(),
-                                                   MapCallStatus(call_status));
-        }
-
-        KvcsPutShardResults results;
-        results.reserve(requests.size());
-        for (const auto& native : native_results) {
-            if (native.status >= 0) {
-                results.emplace_back();
-            } else {
-                results.emplace_back(
-                    tl::make_unexpected(MapItemStatus(native.status)));
-            }
-        }
-
-        // Standard mode reports per-shard results, but a multi-shard object
-        // must not be left partially published when one shard is rejected.
-        // Roll back only accepted shards belonging to a failed logical key:
-        // another object in the same SDK batch may still have completed
-        // successfully.
-        std::unordered_set<ObjectKey> failed_keys;
-        for (size_t index = 0; index < results.size(); ++index) {
-            if (!results[index]) {
-                failed_keys.insert(requests[index].logical_key);
-            }
-        }
-        std::vector<kvcs_delete_item_t> rollback_items;
-        std::vector<size_t> rollback_request_indices;
-        rollback_items.reserve(requests.size());
-        rollback_request_indices.reserve(requests.size());
-        for (size_t index = 0; index < requests.size(); ++index) {
-            if (native_results[index].status >= 0 &&
-                failed_keys.contains(requests[index].logical_key)) {
-                rollback_items.push_back(kvcs_delete_item_t{
-                    .key = requests[index].logical_key.c_str(),
-                    .shard_id = static_cast<int32_t>(requests[index].shard_id),
-                    .location = nullptr,
-                });
-                rollback_request_indices.push_back(index);
-            }
-        }
-        if (!rollback_items.empty()) {
-            std::vector<kvcs_delete_result_t> rollback_results(
-                rollback_items.size());
-            const int rollback_count = static_cast<int>(rollback_items.size());
-            const int rollback_status = kvcs_batch_delete_items(
-                client_, namespace_.c_str(), rollback_items.data(),
-                rollback_count, rollback_results.data(), rollback_count, 0);
-            if (rollback_status < 0) {
-                LOG(WARNING) << "KVCS Standard rollback failed, status="
-                             << rollback_status << ", mapped_error="
-                             << toString(MapCallStatus(rollback_status));
-            } else {
-                for (size_t index = 0; index < rollback_results.size();
-                     ++index) {
-                    if (rollback_results[index].status < 0) {
-                        const size_t request_index =
-                            rollback_request_indices[index];
-                        LOG(WARNING)
-                            << "KVCS Standard rollback item failed, status="
-                            << rollback_results[index].status
-                            << ", key=" << requests[request_index].logical_key
-                            << ", shard_id=" << requests[request_index].shard_id
-                            << ", mapped_error="
-                            << toString(MapItemStatus(
-                                   rollback_results[index].status));
-                    }
-                }
-            }
-        }
-        return results;
-    }
-
-    KvcsDriverQueryResults BatchQuery(
-        std::span<const ObjectKey> logical_keys) override {
-        if (client_ == nullptr) {
-            return MakeErrors<KvcsDriverQueryResults>(
-                logical_keys.size(), ErrorCode::INTERNAL_ERROR);
-        }
-        if (logical_keys.empty()) return {};
-        auto key_pointers = BuildKeyPointers(logical_keys, max_key_size_);
-        if (!key_pointers)
-            return MakeErrors<KvcsDriverQueryResults>(logical_keys.size(),
-                                                      key_pointers.error());
-
-        QueryResults native(logical_keys.size());
-        kvcs_query_opts_t options{
-            .renew = 1, .with_shards = 1, .kvstore_fallback = 1};
-        const int count = static_cast<int>(logical_keys.size());
-        const int returned =
-            kvcs_batch_query(client_, namespace_.c_str(), key_pointers->data(),
-                             count, &options, native.data(), count);
-        auto completion = native.Complete(returned);
-        if (!completion) {
-            return MakeErrors<KvcsDriverQueryResults>(logical_keys.size(),
-                                                      completion.error());
-        }
-
-        KvcsDriverQueryResults results;
-        results.reserve(logical_keys.size());
-        for (size_t index = 0; index < logical_keys.size(); ++index) {
-            const auto& result = native[index];
-            const auto status =
-                BoundedString(result.status, sizeof(result.status));
-            if (status == "not_found") {
-                results.emplace_back(
-                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
-                continue;
-            }
-            if (status == "incomplete") {
-                results.emplace_back(
-                    tl::make_unexpected(ErrorCode::KVCS_INCOMPLETE));
-                continue;
-            }
-            if (status != "ok" || result.total_shard <= 0 ||
-                result.total_size <= 0 || result.shard_count <= 0 ||
-                result.shards == nullptr) {
-                results.emplace_back(
-                    tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-                continue;
-            }
-
-            KvcsManifest manifest{
-                .logical_key = logical_keys[index],
-                .total_shard = static_cast<uint32_t>(result.total_shard),
-                .total_size = static_cast<uint64_t>(result.total_size),
-                .shards = {},
-            };
-            manifest.shards.reserve(static_cast<size_t>(result.shard_count));
-            bool valid = result.shard_count == result.total_shard;
-            for (int shard_index = 0; valid && shard_index < result.shard_count;
-                 ++shard_index) {
-                const auto& shard = result.shards[shard_index];
-                if (shard.shard_id < 0 || shard.size <= 0) {
-                    valid = false;
-                    break;
-                }
-                manifest.shards.push_back(KvcsShardLocation{
-                    .shard_id = static_cast<uint32_t>(shard.shard_id),
-                    .size = static_cast<uint64_t>(shard.size),
-                });
-            }
-            if (valid) {
-                results.emplace_back(std::move(manifest));
-            } else {
-                results.emplace_back(
-                    tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-            }
-        }
-        return results;
-    }
-
-    KvcsGetShardResults BatchGet(
-        std::span<const KvcsShardGetRequest> requests) override {
-        if (client_ == nullptr) {
-            return MakeErrors<KvcsGetShardResults>(requests.size(),
-                                                   ErrorCode::INTERNAL_ERROR);
-        }
-        if (requests.empty()) return {};
-        if (requests.size() > static_cast<size_t>(INT_MAX)) {
-            return MakeErrors<KvcsGetShardResults>(requests.size(),
-                                                   ErrorCode::INVALID_PARAMS);
-        }
-
-        std::vector<kvcs_get_item_t> items;
-        items.reserve(requests.size());
-        for (size_t index = 0; index < requests.size(); ++index) {
-            const auto& request = requests[index];
-            if (!ValidateRequest(request)) {
-                return MakeErrors<KvcsGetShardResults>(
-                    requests.size(), ErrorCode::INVALID_PARAMS);
-            }
-            items.push_back(kvcs_get_item_t{
-                .key = request.logical_key.c_str(),
-                .shard_id = static_cast<int32_t>(request.shard_id),
-                // Standard-mode replica metadata stays authoritative in
-                // Redis. An unhinted read lets the SDK select a healthy
-                // replica.
-                .location = nullptr,
-                .expected_value_size = static_cast<size_t>(request.size),
-                .meta = nullptr,
-                .meta_count = 0,
-            });
-        }
-
-        BatchGetBuffers output(requests);
-        std::vector<int> statuses(requests.size());
-        std::vector<size_t> lengths(requests.size());
-        const int count = static_cast<int>(requests.size());
-        const int call_status = kvcs_batch_get_into(
-            client_, namespace_.c_str(), items.data(), count, output.buffers(),
-            output.capacities(), statuses.data(), lengths.data(), 0);
-        if (call_status < 0) {
-            return MakeErrors<KvcsGetShardResults>(requests.size(),
-                                                   MapCallStatus(call_status));
-        }
-        return output.Finish(requests, statuses, lengths);
-    }
-
-    KvcsDeleteResults BatchDelete(
-        std::span<const ObjectKey> logical_keys) override {
-        if (client_ == nullptr) {
-            return MakeErrors<KvcsDeleteResults>(logical_keys.size(),
-                                                 ErrorCode::INTERNAL_ERROR);
-        }
-        if (logical_keys.empty()) return {};
-
-        auto queries = BatchQuery(logical_keys);
-        if (queries.size() != logical_keys.size()) {
-            return MakeErrors<KvcsDeleteResults>(logical_keys.size(),
-                                                 ErrorCode::INTERNAL_ERROR);
-        }
-        KvcsDeleteResults results(logical_keys.size());
-        std::vector<kvcs_delete_item_t> items;
-        std::vector<size_t> owners;
-        for (size_t index = 0; index < queries.size(); ++index) {
-            const auto& query = queries[index];
-            if (!query) {
-                if (query.error() != ErrorCode::OBJECT_NOT_FOUND) {
-                    results[index] = tl::make_unexpected(query.error());
-                }
-                continue;
-            }
-            for (const auto& shard : query->shards) {
-                items.push_back(kvcs_delete_item_t{
-                    .key = logical_keys[index].c_str(),
-                    .shard_id = static_cast<int32_t>(shard.shard_id),
-                    // An unhinted Standard delete resolves and removes every
-                    // replica recorded in Redis.
-                    .location = nullptr,
-                });
-                owners.push_back(index);
-            }
-        }
-        if (items.empty()) return results;
-        if (items.size() > static_cast<size_t>(INT_MAX)) {
-            return MakeErrors<KvcsDeleteResults>(logical_keys.size(),
-                                                 ErrorCode::INVALID_PARAMS);
-        }
-
-        std::vector<kvcs_delete_result_t> native_results(items.size());
-        const int count = static_cast<int>(items.size());
-        const int call_status =
-            kvcs_batch_delete_items(client_, namespace_.c_str(), items.data(),
-                                    count, native_results.data(), count, 0);
-        if (call_status < 0) {
-            return MakeErrors<KvcsDeleteResults>(logical_keys.size(),
-                                                 MapCallStatus(call_status));
-        }
-        for (size_t index = 0; index < native_results.size(); ++index) {
-            if (native_results[index].status >= 0) continue;
-            const ErrorCode error = MapItemStatus(native_results[index].status);
-            if (error != ErrorCode::OBJECT_NOT_FOUND &&
-                results[owners[index]]) {
-                results[owners[index]] = tl::make_unexpected(error);
-            }
-        }
-        return results;
-    }
-
-   private:
-    template <typename Req>
-    bool ValidateRequest(const Req& request) const {
-        return ValidateShardRequest(request, max_key_size_);
-    }
-
-    std::string efc_socket_;
-    std::vector<std::string> redis_endpoints_;
-    std::string redis_password_;
-    std::string namespace_;
-    uint32_t max_key_size_ = kKvcsDefaultMaxKeySize;
-    uint64_t max_value_size_ = kStandardDefaultMaxValueSize;
-    kvcs_client_t* client_ = nullptr;
-};
 
 class KvcsLowLevelClientState {
    public:
@@ -2342,23 +1883,6 @@ class KvcsCapiDriver final : public KvcsDriver {
 #endif  // MOONCAKE_HAVE_KVCS_SDK
 
 }  // namespace
-
-tl::expected<std::unique_ptr<KvcsDriver>, ErrorCode>
-CreateKvcsStandardDriver() {
-#ifdef MOONCAKE_HAVE_KVCS_SDK
-    auto parsed = ParseStandardConfig();
-    if (!parsed) {
-        return tl::make_unexpected(parsed.error());
-    }
-    std::unique_ptr<KvcsDriver> driver =
-        std::make_unique<KvcsStandardCapiDriver>(std::move(parsed.value()));
-    return driver;
-#else
-    LOG(ERROR) << "KVCS Standard mode requested, but the KVCS SDK was not "
-                  "found at build time";
-    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-#endif
-}
 
 tl::expected<std::vector<std::unique_ptr<KvcsDriver>>, ErrorCode>
 CreateKvcsLowLevelDrivers(std::span<const uint32_t> mountpoint_indices) {

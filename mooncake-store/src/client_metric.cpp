@@ -42,7 +42,6 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
     : transfer_metric(labels),
       master_client_metric(labels),
       transfer_operation_metric(labels),
-      query_metric(labels),
       ssd_metric(labels),
       dfs_metric(labels),
       allocator_metric(labels),
@@ -96,7 +95,6 @@ void ClientMetric::serialize(std::string& str) {
         master_client_metric.serialize(str);
     }
     transfer_operation_metric.serialize(str);
-    query_metric.serialize(str);
     ssd_metric.serialize(str);
     dfs_metric.serialize(str);
     allocator_metric.Refresh();
@@ -120,8 +118,6 @@ std::string ClientMetric::summary_metrics() {
     }
     ss << transfer_operation_metric.summary_metrics();
     ss << "\n";
-    ss << "Query phase metrics are available from /metrics as "
-          "mooncake_query_latency.\n";
     ss << ssd_metric.summary_metrics();
     ss << "\n";
     ss << dfs_metric.summary_metrics();

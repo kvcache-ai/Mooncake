@@ -13,9 +13,6 @@ namespace mooncake {
 
 class KvcsDriver;
 
-// Constructs a built-in KVCS Standard driver backed by the public C ABI.
-tl::expected<std::unique_ptr<KvcsDriver>, ErrorCode> CreateKvcsStandardDriver();
-
 // Constructs target-bound drivers that share one Low-Level SDK client. The
 // mountpoint remains a per-batch option, so one client can reuse its worker and
 // ring resources across all configured EFC filesystems.

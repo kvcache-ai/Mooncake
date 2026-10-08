@@ -285,48 +285,42 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRejectsDfsRequests) {
 }
 
 TEST_F(ObjectStorageAdapterTest, KvcsModeRunsEnabledHealthCheck) {
-    for (const char* mode : {"kvcs-standard", "kvcs-lowlevel"}) {
-        SCOPED_TRACE(mode);
-        FakeObjectStorageAdapter* adapter = nullptr;
-        auto backend = MakeObjectStorageBackend(adapter, {}, true, mode);
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter, {}, true,
+                                            "kvcs-lowlevel");
 
-        ASSERT_TRUE(backend->Init());
-        EXPECT_EQ(adapter->init_calls, 1);
-        EXPECT_EQ(adapter->health_check_calls, 1);
+    ASSERT_TRUE(backend->Init());
+    EXPECT_EQ(adapter->init_calls, 1);
+    EXPECT_EQ(adapter->health_check_calls, 1);
 
-        ASSERT_TRUE(backend->Init());
-        EXPECT_EQ(adapter->init_calls, 1);
-        EXPECT_EQ(adapter->health_check_calls, 1);
-    }
+    ASSERT_TRUE(backend->Init());
+    EXPECT_EQ(adapter->init_calls, 1);
+    EXPECT_EQ(adapter->health_check_calls, 1);
 }
 
 TEST_F(ObjectStorageAdapterTest, KvcsHealthCheckFailureFailsInit) {
-    for (const char* mode : {"kvcs-standard", "kvcs-lowlevel"}) {
-        SCOPED_TRACE(mode);
-        FakeObjectStorageAdapter* adapter = nullptr;
-        auto backend = MakeObjectStorageBackend(adapter, {}, true, mode);
-        adapter->fail_health_check = true;
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter, {}, true,
+                                            "kvcs-lowlevel");
+    adapter->fail_health_check = true;
 
-        auto result = backend->Init();
+    auto result = backend->Init();
 
-        ASSERT_FALSE(result);
-        EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
-        EXPECT_EQ(adapter->init_calls, 1);
-        EXPECT_EQ(adapter->health_check_calls, 1);
-    }
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(adapter->init_calls, 1);
+    EXPECT_EQ(adapter->health_check_calls, 1);
 }
 
 TEST_F(ObjectStorageAdapterTest, KvcsModeSkipsDisabledHealthCheck) {
-    for (const char* mode : {"kvcs-standard", "kvcs-lowlevel"}) {
-        SCOPED_TRACE(mode);
-        FakeObjectStorageAdapter* adapter = nullptr;
-        auto backend = MakeObjectStorageBackend(adapter, {}, false, mode);
-        adapter->fail_health_check = true;
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter, {}, false,
+                                            "kvcs-lowlevel");
+    adapter->fail_health_check = true;
 
-        ASSERT_TRUE(backend->Init());
-        EXPECT_EQ(adapter->init_calls, 1);
-        EXPECT_EQ(adapter->health_check_calls, 0);
-    }
+    ASSERT_TRUE(backend->Init());
+    EXPECT_EQ(adapter->init_calls, 1);
+    EXPECT_EQ(adapter->health_check_calls, 0);
 }
 
 TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRunsEnabledHealthCheck) {

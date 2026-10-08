@@ -100,8 +100,6 @@ class FileStorage {
      */
     tl::expected<bool, ErrorCode> Exists(const std::string& key);
 
-    void SerializeProviderMetrics(std::string& output) const;
-
     FileStorageConfig config_;
 
     /**
