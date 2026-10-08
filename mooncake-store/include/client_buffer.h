@@ -117,7 +117,8 @@ class BufferHandle {
  * @param handle The buffer handle to split
  * @return Vector of slices covering the entire buffer
  */
-std::vector<Slice> split_into_slices(BufferHandle& handle);
+std::vector<Slice> split_into_slices(BufferHandle& handle,
+                                     int32_t device_id = -1);
 
 /**
  * @brief Split a buffer into slices of maximum kMaxSliceSize
@@ -125,7 +126,8 @@ std::vector<Slice> split_into_slices(BufferHandle& handle);
  * @param length The length of the buffer to split
  * @return Vector of slices covering the entire buffer
  */
-std::vector<Slice> split_into_slices(void* buffer, size_t length);
+std::vector<Slice> split_into_slices(void* buffer, size_t length,
+                                     int32_t device_id = -1);
 
 /**
  * @brief Calculate the total size of a replica descriptor
@@ -142,6 +144,7 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica);
  * @return 0 on success, non-zero on error
  */
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica, void* buffer_ptr);
+                   const Replica::Descriptor& replica, void* buffer_ptr,
+                   int32_t device_id = -1);
 
 }  // namespace mooncake

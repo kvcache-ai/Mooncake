@@ -59,6 +59,9 @@ class ContextManager {
     // Returns false if physical id is not managed by this process.
     bool setCurrentContextByPhysicalId(int32_t physical_dev_id) const;
 
+    // Resolve a physical device id to the logical engine index.
+    int32_t logicalDeviceForPhysicalId(int32_t physical_dev_id) const;
+
     // Cleanup all contexts
     void finalize();
 

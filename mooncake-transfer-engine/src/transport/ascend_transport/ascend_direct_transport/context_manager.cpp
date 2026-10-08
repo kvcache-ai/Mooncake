@@ -192,6 +192,22 @@ bool ContextManager::setCurrentContextByPhysicalId(
     return true;
 }
 
+int32_t ContextManager::logicalDeviceForPhysicalId(
+    int32_t physical_dev_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) {
+        LOG(ERROR) << "ContextManager not initialized";
+        return -1;
+    }
+    auto it = physical_to_logic_.find(physical_dev_id);
+    if (it == physical_to_logic_.end()) {
+        LOG(ERROR) << "Physical device id not managed by this process: "
+                   << physical_dev_id;
+        return -1;
+    }
+    return it->second;
+}
+
 void ContextManager::finalize() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_) {

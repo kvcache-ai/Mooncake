@@ -35,9 +35,13 @@
 namespace mooncake {
 namespace {
 
-int32_t ResolveCurrentEngineId(bool agent_mode) {
+int32_t ResolveEngineId(bool agent_mode, int32_t physical_device_id) {
     if (!agent_mode) {
         return 0;
+    }
+    if (physical_device_id >= 0) {
+        return ContextManager::getInstance().logicalDeviceForPhysicalId(
+            physical_device_id);
     }
     int32_t current_device_id = 0;
     if (aclrtGetDevice(&current_device_id) != ACL_ERROR_NONE) {
@@ -263,9 +267,17 @@ Status AscendDirectTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
-    if (current_engine_id < 0) {
-        return Status::Context("aclrtGetDevice failed");
+    std::vector<int32_t> engine_ids;
+    engine_ids.reserve(entries.size());
+    for (const auto &request : entries) {
+        const int32_t engine_id =
+            ResolveEngineId(agent_mode_, request.device_id);
+        if (engine_id < 0) {
+            return Status::Context(request.device_id >= 0
+                                       ? "invalid physical device id"
+                                       : "aclrtGetDevice failed");
+        }
+        engine_ids.push_back(engine_id);
     }
 
     auto cur_task_size = batch_desc.task_list.size();
@@ -273,12 +285,13 @@ Status AscendDirectTransport::submitTransfer(
     std::vector<Slice *> slice_list;
     slice_list.reserve(entries.size());
 
+    size_t request_index = 0;
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[cur_task_size];
         ++cur_task_size;
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
-        InitializeSlice(request, current_engine_id, &task, slice);
+        InitializeSlice(request, engine_ids[request_index++], &task, slice);
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         slice_list.push_back(slice);
@@ -291,14 +304,25 @@ Status AscendDirectTransport::submitTransfer(
 
 Status AscendDirectTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
-    if (current_engine_id < 0) {
-        return Status::Context("aclrtGetDevice failed");
+    std::vector<int32_t> engine_ids;
+    engine_ids.reserve(task_list.size());
+    for (const auto *task : task_list) {
+        assert(task);
+        assert(task->request);
+        const int32_t engine_id =
+            ResolveEngineId(agent_mode_, task->request->device_id);
+        if (engine_id < 0) {
+            return Status::Context(task->request->device_id >= 0
+                                       ? "invalid physical device id"
+                                       : "aclrtGetDevice failed");
+        }
+        engine_ids.push_back(engine_id);
     }
 
     std::vector<Slice *> slice_list;
     slice_list.reserve(task_list.size());
 
+    size_t task_index = 0;
     for (auto index : task_list) {
         assert(index);
         auto &task = *index;
@@ -306,7 +330,7 @@ Status AscendDirectTransport::submitTransferTask(
         auto &request = *task.request;
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
-        InitializeSlice(request, current_engine_id, &task, slice);
+        InitializeSlice(request, engine_ids[task_index++], &task, slice);
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         slice_list.push_back(slice);
