@@ -17,6 +17,7 @@ if(USE_CUDA)
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/dispatch_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/elastic_dispatch_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/elastic_dispatch_prologue_jit.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/elastic_hybrid_dispatch_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_runtime.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_cache.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/jit_utils.cpp"
@@ -59,6 +60,7 @@ if(USE_CUDA)
       elastic/mooncake_ep_elastic_dispatch_deterministic_prologue.cuh
       elastic/mooncake_ep_elastic_dispatch_official.cuh
       elastic/mooncake_ep_elastic_exception.cuh
+      elastic/mooncake_ep_elastic_hybrid_dispatch_official.cuh
       elastic/mooncake_ep_elastic_launch.cuh
       elastic/mooncake_ep_elastic_layout.cuh
       elastic/mooncake_ep_elastic_math.cuh
