@@ -263,9 +263,11 @@ bool WaitForServing(SupervisorChildProcess& child, int admin_port,
 
 int RunSupervisorChild() {
     MasterServiceSupervisorConfig config;
-    config.enable_metric_reporting = false;
-    config.metrics_port = FLAGS_ha_supervisor_admin_port;
-    config.metrics_host = "127.0.0.1";
+    config.metrics = MetricsBootstrapConfig{
+        .enabled = false,
+        .port = static_cast<uint32_t>(FLAGS_ha_supervisor_admin_port),
+        .host = "127.0.0.1",
+    };
     config.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     config.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     config.allow_evict_soft_pinned_objects = true;
@@ -309,8 +311,11 @@ TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
     supervisor_config.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     supervisor_config.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     supervisor_config.allow_evict_soft_pinned_objects = true;
-    supervisor_config.enable_metric_reporting = false;
-    supervisor_config.metrics_port = 0;
+    supervisor_config.metrics = MetricsBootstrapConfig{
+        .enabled = false,
+        .port = 0,
+        .host = std::string(MetricsBootstrapConfig::kDefaultHost),
+    };
     supervisor_config.eviction_ratio = DEFAULT_EVICTION_RATIO;
     supervisor_config.eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;

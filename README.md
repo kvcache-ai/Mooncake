@@ -12,7 +12,6 @@
   <br />
   <br />
 
-  [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kvcache-ai/Mooncake)
   [![PyPI - Downloads](https://static.pepy.tech/badge/mooncake-transfer-engine?period=month)](https://pypi.org/project/mooncake-transfer-engine)
   [![GitHub commit activity](https://img.shields.io/github/commit-activity/w/kvcache-ai/Mooncake)](https://github.com/kvcache-ai/Mooncake/graphs/commit-activity)
   [![license](https://img.shields.io/github/license/kvcache-ai/mooncake.svg)](https://github.com/kvcache-ai/Mooncake/blob/main/LICENSE-APACHE)
@@ -214,6 +213,29 @@ pip install mooncake-transfer-engine
 ```bash
 pip install mooncake-transfer-engine-cuda13
 ```
+
+#### Master image
+
+The multi-architecture master image publishes explicit CUDA flavor tags:
+
+```bash
+# Fixed versions, recommended for production
+docker pull kvcacheai/mooncake:0.3.14-cuda12
+docker pull kvcacheai/mooncake:0.3.14-cuda13
+
+# CUDA 13 is the default flavor
+docker pull kvcacheai/mooncake:0.3.14
+docker pull kvcacheai/mooncake:latest
+
+# Floating flavor aliases
+docker pull kvcacheai/mooncake:cuda12
+docker pull kvcacheai/mooncake:cuda13
+```
+
+The unqualified `:<version>` and `:latest` tags point to CUDA 13 starting with the first
+release published by the new tagging workflow. Existing releases keep their original contents;
+use `:cuda12` or `:<version>-cuda12` when CUDA 12 is required. The former `:latest-cuda13` tag
+is deprecated and is not part of the new naming contract.
 
 In addition to CUDA, Mooncake also supports other accelerator backends, along with flexible installation and deployment options. See the guides below for details:
 

@@ -16,6 +16,8 @@
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 
+#include "ha_metric_manager.h"
+
 namespace mooncake {
 namespace {
 
@@ -131,6 +133,8 @@ void CopyRegistry(const StandbySegmentRegistry& source,
 AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
                            OpLogApplier& applier, const DurablePrefix* baseline,
                            const std::function<bool()>& cancelled) {
+    HAMetricManager::SnapshotOperationTimer metric_timer(
+        HAMetricManager::SnapshotOperation::Replay);
     OpLogBatchStandbyReader reader(cluster_id, backend, applier);
     const DurablePrefix start =
         baseline == nullptr ? DurablePrefix{} : *baseline;
@@ -138,11 +142,21 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
         return Invalid(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
     }
 
+    HAMetricManager::instance().update_snapshot_runtime(
+        [](auto& metrics) { metrics.suffix_batches = 0; });
     for (;;) {
         if (cancelled && cancelled()) {
             return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
         }
         auto poll = reader.PollOnce();
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            metrics.suffix_batches += poll.applied_batches;
+            if (poll.durable_prefix_present)
+                metrics.durable_batch = std::max(metrics.durable_batch,
+                                                 poll.durable_prefix.batch_id);
+            metrics.compaction_floor =
+                std::max(metrics.compaction_floor, poll.compaction_floor);
+        });
         if (poll.error != ErrorCode::OK) {
             return IsRetryableBackendError(poll.error)
                        ? Infrastructure(poll.error)
@@ -155,6 +169,7 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
         }
         const uint64_t applied = applier.GetExpectedSequenceId() - 1;
         if (applied == poll.durable_prefix.last_seq) {
+            metric_timer.error = 0;
             return {AttemptDisposition::kSuccess,
                     ErrorCode::OK,
                     {.last_included_seq = poll.durable_prefix.last_seq,
@@ -233,6 +248,27 @@ AttemptResult RestorePointer(
         return Invalid();
     }
 
+    if (manifest.weight_metadata) {
+        const auto& weights = *manifest.weight_metadata;
+        if (weights.key != ha::BuildBatchOpLogSnapshotWeightMetadataKey(
+                               snapshot_root, descriptor.snapshot_id)) {
+            return Invalid();
+        }
+        std::vector<uint8_t> weight_bytes;
+        auto read_weights =
+            ReadVerifiedObject(object_store, weights.key, weights.stored_size,
+                               weights.crc32c, weight_bytes);
+        if (read_weights.disposition != AttemptDisposition::kSuccess) {
+            return read_weights;
+        }
+        auto decoded_weights =
+            DecodeBatchOpLogSnapshotWeightMetadata(weight_bytes);
+        if (!decoded_weights ||
+            !metadata.RestoreWeightMetadata(*decoded_weights)) {
+            return Invalid(ErrorCode::DESERIALIZE_FAIL);
+        }
+    }
+
     std::unique_ptr<OpLogApplier> owned_applier;
     OpLogApplier* applier = supplied_applier;
     if (applier == nullptr) {
@@ -297,6 +333,18 @@ AttemptResult RestorePointer(
         return Invalid(ErrorCode::DESERIALIZE_FAIL);
     }
     CopyRegistry(applier->GetSegmentRegistry(), registry);
+    uint64_t chunk_bytes = 0;
+    for (const auto& chunk : manifest.object_chunks)
+        chunk_bytes += chunk.stored_size;
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.chunk_count = manifest.object_chunks.size();
+        metrics.chunk_bytes = chunk_bytes;
+        metrics.snapshot_bytes =
+            metrics.chunk_bytes + manifest.segments.stored_size +
+            (manifest.weight_metadata ? manifest.weight_metadata->stored_size
+                                      : 0) +
+            descriptor.manifest_size + pointer_bytes.size();
+    });
     return {AttemptDisposition::kSuccess,
             ErrorCode::OK,
             {.last_included_seq = descriptor.last_included_seq,
@@ -361,6 +409,8 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
                                             OpLogApplier* applier,
                                             uint64_t minimum_snapshot_batch,
                                             std::function<bool()> cancelled) {
+    HAMetricManager::SnapshotOperationTimer metric_timer(
+        HAMetricManager::SnapshotOperation::Bootstrap);
     metadata.Clear();
     registry.Clear();
     if (!NormalizeAndValidateClusterId(cluster_id_) || cluster_id_.empty() ||
@@ -376,6 +426,10 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
     }
     if (floor_error == ErrorCode::OK) {
         minimum_snapshot_batch = std::max(minimum_snapshot_batch, floor);
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            metrics.compaction_floor =
+                std::max(metrics.compaction_floor, floor);
+        });
     }
 
     for (const std::string& pointer_key :
@@ -386,7 +440,16 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
         std::string pointer_bytes;
         const ErrorCode pointer_error =
             backend_.Get(pointer_key, pointer_bytes);
+        const bool latest =
+            pointer_key == ha::BuildBatchOpLogSnapshotLatestKey(cluster_id_);
         if (pointer_error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+            HAMetricManager::instance().update_snapshot_runtime(
+                [&](auto& metrics) {
+                    (latest ? metrics.latest_created_at_ms
+                            : metrics.fallback_created_at_ms) = std::nullopt;
+                    (latest ? metrics.latest_batch : metrics.fallback_batch) =
+                        0;
+                });
             continue;
         }
         if (pointer_error != ErrorCode::OK) {
@@ -394,6 +457,14 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
         }
 
         auto descriptor = ha::DecodeBatchOpLogSnapshotDescriptor(pointer_bytes);
+        HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+            (latest ? metrics.latest_created_at_ms
+                    : metrics.fallback_created_at_ms) =
+                descriptor ? std::optional<int64_t>(descriptor->created_at_ms)
+                           : std::nullopt;
+            (latest ? metrics.latest_batch : metrics.fallback_batch) =
+                descriptor ? descriptor->last_included_batch_id : 0;
+        });
         if (!descriptor ||
             descriptor->last_included_batch_id < minimum_snapshot_batch) {
             continue;
@@ -402,7 +473,7 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
                                       snapshot_root_, pointer_bytes, metadata,
                                       registry, applier, cancelled);
         if (attempt.disposition == AttemptDisposition::kSuccess) {
-            return attempt.value;
+            return metric_timer.Success(attempt.value);
         }
         metadata.Clear();
         registry.Clear();
@@ -425,7 +496,7 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
         registry.Clear();
         return tl::make_unexpected(full_replay.error);
     }
-    return full_replay.value;
+    return metric_timer.Success(full_replay.value);
 }
 
 }  // namespace mooncake

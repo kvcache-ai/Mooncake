@@ -17,24 +17,29 @@
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <memory>
 #include <set>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include <dlfcn.h>
 
+#include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
 #include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
+#include "transport/rdma_transport/rdma_batch_cache.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
@@ -54,57 +59,76 @@ static std::string resolveBufferLocation(
     return location;
 }
 
-// Calculate remaining bytes in buffer for 'address'.
-// Caches 'last_buffer_idx' across sequential slices to avoid rescanning
-// buffers.
+// The last-hit shortcut and the index lookup both assume the MR covering an
+// address is unique; only then do they answer what a first-match scan would.
+// Descriptors with overlapping MRs, or whose index is out of sync with
+// `buffers`, keep the plain scan, which is first-match by construction.
+static const BufferRangeIndex *uniqueCoverageIndex(
+    const TransferMetadata::SegmentDesc *desc) {
+    if (!desc) return nullptr;
+    const BufferRangeIndex &index = desc->buffer_range_index;
+    if (index.size() != desc->buffers.size() || index.overlaps())
+        return nullptr;
+    return &index;
+}
+
+// Calculate remaining bytes in buffer for 'address'. 'last_buffer_idx' carries
+// the previous hit across slices of one request and across consecutive
+// requests in the same MR; -1 means no hit yet.
 static uint64_t bytesUntilBufferEnd(
     const TransferMetadata::SegmentDesc *segment_desc, uint64_t address,
-    bool require_remote_key, size_t *last_buffer_idx = nullptr) {
+    bool require_remote_key, int *last_buffer_idx = nullptr) {
     if (!segment_desc || segment_desc->buffers.empty()) return 0;
+    const auto &buffers = segment_desc->buffers;
 
-    auto is_valid_buffer = [&](const TransferMetadata::BufferDesc &buffer) {
+    auto is_valid_buffer = [&](int i) {
+        if (i < 0 || static_cast<size_t>(i) >= buffers.size()) return false;
+        const auto &buffer = buffers[static_cast<size_t>(i)];
 #ifdef ENABLE_MULTI_PROTOCOL
         if (!buffer.protocol.empty() && buffer.protocol != "rdma") return false;
 #endif
         if (require_remote_key ? buffer.rkey.empty() : buffer.lkey.empty())
             return false;
-        if (address < buffer.addr || address - buffer.addr >= buffer.length)
-            return false;
-        return true;
+        return bufferCoversPoint(buffer.addr, buffer.length, address);
     };
 
-    if (last_buffer_idx && *last_buffer_idx < segment_desc->buffers.size()) {
-        const auto &buffer = segment_desc->buffers[*last_buffer_idx];
-        if (is_valid_buffer(buffer)) {
-            return buffer.length - (address - buffer.addr);
-        }
+    auto remaining_in = [&](int i) {
+        const auto &buffer = buffers[static_cast<size_t>(i)];
+        return buffer.length - (address - buffer.addr);
+    };
+
+    if (const BufferRangeIndex *index = uniqueCoverageIndex(segment_desc)) {
+        if (last_buffer_idx && is_valid_buffer(*last_buffer_idx))
+            return remaining_in(*last_buffer_idx);
+        const int found = index->findCovering(address, 0);
+        if (!is_valid_buffer(found)) return 0;
+        if (last_buffer_idx) *last_buffer_idx = found;
+        return remaining_in(found);
     }
 
     uint64_t max_remaining = 0;
-    for (size_t i = 0; i < segment_desc->buffers.size(); ++i) {
-        const auto &buffer = segment_desc->buffers[i];
-        if (is_valid_buffer(buffer)) {
-            uint64_t remaining = buffer.length - (address - buffer.addr);
-            if (remaining > max_remaining) {
-                max_remaining = remaining;
-                if (last_buffer_idx) *last_buffer_idx = i;
-            }
+    for (int i = 0; i < static_cast<int>(buffers.size()); ++i) {
+        if (!is_valid_buffer(i)) continue;
+        const uint64_t remaining = remaining_in(i);
+        if (remaining > max_remaining) {
+            max_remaining = remaining;
+            if (last_buffer_idx) *last_buffer_idx = i;
         }
     }
     return max_remaining;
 }
 
 // Calculate slice length capped at MR boundary to avoid multi-MR WRs.
-// Caches source and target buffer indices across slices for a single request.
 struct SliceLengthCalculator {
     const Transport::TransferRequest &request;
     size_t block_size;
     size_t fragment_size;
     const TransferMetadata::SegmentDesc *local_desc;
     const TransferMetadata::SegmentDesc *target_desc;
-
-    size_t src_buffer_idx = 0;
-    size_t tgt_buffer_idx = 0;
+    // Last-hit MR per side. The caller owns the storage so a hit survives
+    // across the consecutive requests that share an MR.
+    int *src_buffer_idx;
+    int *tgt_buffer_idx;
 
     inline size_t calculate(uint64_t offset) {
         const size_t remaining = request.length - offset;
@@ -113,12 +137,12 @@ struct SliceLengthCalculator {
 
         const uint64_t src_rem = bytesUntilBufferEnd(
             local_desc, reinterpret_cast<uint64_t>(request.source) + offset,
-            false, &src_buffer_idx);
+            false, src_buffer_idx);
         if (src_rem > 0)
             slice_length = std::min<uint64_t>(slice_length, src_rem);
 
         const uint64_t tgt_rem = bytesUntilBufferEnd(
-            target_desc, request.target_offset + offset, true, &tgt_buffer_idx);
+            target_desc, request.target_offset + offset, true, tgt_buffer_idx);
         if (tgt_rem > 0)
             slice_length = std::min<uint64_t>(slice_length, tgt_rem);
 
@@ -167,6 +191,8 @@ RdmaTransport::RdmaTransport() {
 }
 
 RdmaTransport::~RdmaTransport() {
+    notify_running_.store(false, std::memory_order_release);
+    if (notify_worker_.joinable()) notify_worker_.join();
 #ifdef CONFIG_USE_BATCH_DESC_SET
     for (auto &entry : batch_desc_set_) delete entry.second;
     batch_desc_set_.clear();
@@ -228,7 +254,24 @@ int RdmaTransport::install(std::string &local_server_name,
         return ret;
     }
 
+    if (std::any_of(context_list_.begin(), context_list_.end(),
+                    [](const auto &context) {
+                        return context->nativeNotifyEnabled();
+                    })) {
+        notify_running_.store(true, std::memory_order_release);
+        notify_worker_ = std::thread(&RdmaTransport::notifyWorkerThread, this);
+    }
     return 0;
+}
+
+void RdmaTransport::notifyWorkerThread() {
+    while (notify_running_.load(std::memory_order_acquire)) {
+        int completed = 0;
+        for (const auto &context : context_list_)
+            completed += std::max(0, context->pollNotificationCq());
+        if (!completed)
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
 }
 
 int RdmaTransport::preTouchMemory(void *addr, size_t length) {
@@ -237,27 +280,40 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
         return 0;
     }
 
-    auto hwc = std::thread::hardware_concurrency();
-    auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
+    const auto hwc = std::thread::hardware_concurrency();
+    size_t num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
     if (length > (size_t)globalConfig().max_mr_size) {
         length = (size_t)globalConfig().max_mr_size;
     }
-    size_t block_size = length / num_threads;
-    if (block_size == 0) {
+
+    const size_t page_size = detectBufferPageSize(addr);
+    const size_t page_count = length / page_size;
+    if (page_count == 0) {
         return 0;
     }
+    num_threads = std::min(num_threads, page_count);
+    const size_t pages_per_thread = page_count / num_threads;
+    const size_t extra_pages = page_count % num_threads;
+    size_t offset = 0;
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     std::vector<int> thread_results(num_threads, 0);
 
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
-        void *block_addr = static_cast<char *>(addr) + thread_i * block_size;
+        const size_t block_pages =
+            pages_per_thread + (thread_i < extra_pages ? 1 : 0);
+        size_t block_size = block_pages * page_size;
+        if (thread_i + 1 == num_threads) {
+            block_size += length % page_size;
+        }
+        void *block_addr = static_cast<char *>(addr) + offset;
         threads.emplace_back([this, thread_i, block_addr, block_size,
                               &thread_results]() {
             int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
             thread_results[thread_i] = ret;
         });
+        offset += block_size;
     }
 
     for (auto &thread : threads) {
@@ -293,40 +349,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
 
-    // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
-    // max_mr_size, but the metadata would still advertise the full BufferDesc
-    // length, so any remote RDMA op past the boundary fails with
-    // IBV_WC_REM_ACCESS_ERR (ionic CQE error 10). Split buffers larger than
-    // max_mr_size into chunks of <= max_mr_size, register each as its own MR,
-    // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
-    // are address-range based, so each chunk gets the correct key).
-    size_t chunk_limit = (size_t)globalConfig().max_mr_size;
-    std::vector<std::pair<void *, size_t>> chunks;
-    if (chunk_limit > 0 && length > chunk_limit) {
-        for (size_t offset = 0; offset < length;) {
-            size_t chunk_len = std::min(chunk_limit, length - offset);
-            chunks.emplace_back(static_cast<char *>(addr) + offset, chunk_len);
-            offset += chunk_len;
-        }
-        LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
-                     << " bytes) into " << chunks.size()
-                     << " chunks of <= " << chunk_limit
-                     << " bytes each (device max_mr_size; Mooncake#2017)";
-    } else {
-        chunks.emplace_back(addr, length);
-    }
-
-    // Resolve the location name once, from the original buffer.
-    std::string resolved_name;
-    if (name == kWildcardLocation) {
-        bool only_first_page = true;
-        const std::vector<MemoryLocationEntry> entries =
-            getMemoryLocation(addr, length, only_first_page);
-        if (entries.empty()) return -1;
-        resolved_name = entries[0].location;
-    } else {
-        resolved_name = name;
-    }
+    std::string resolved_name = name;
 
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
@@ -347,6 +370,97 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         DmabufExport &exp;
         ~DmabufCloser() { RdmaContext::closeDmabufExport(exp); }
     } dmabuf_closer{dmabuf_exp};
+
+    // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
+    // max_mr_size, but the metadata would still advertise the full BufferDesc
+    // length, so any remote RDMA op past the boundary fails with
+    // IBV_WC_REM_ACCESS_ERR (ionic CQE error 10). Split buffers larger than
+    // max_mr_size into chunks of <= max_mr_size, register each as its own MR,
+    // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
+    // are address-range based, so each chunk gets the correct key).
+    size_t chunk_limit = (size_t)globalConfig().max_mr_size;
+    // Round the chunk limit down to the buffer's page size before splitting,
+    // but ONLY for HugeTLB-backed buffers (page size larger than the base
+    // page). A non-page-aligned effective max_mr_size (e.g. a hand-set
+    // MC_MAX_MR_SIZE) would otherwise produce chunk boundaries that fall
+    // inside a HugeTLB page. ibv_fork_init() then makes ibv_reg_mr()/pre-touch
+    // run MADV_DONTFORK on that range, and the kernel refuses to split a
+    // hugetlb VMA at a non-hugepage-aligned boundary, failing with EINVAL.
+    // Aligning the limit down keeps every chunk (and thus every pre-touch
+    // block) page-aligned. A limit smaller than one huge page cannot yield a
+    // page-aligned chunk at all, so report the conflict instead of silently
+    // registering an oversized or misaligned MR.
+    //
+    // Regular base pages (and THP, which reports the base page in
+    // KernelPageSize) can be split at any boundary, so this alignment and the
+    // rejection must NOT run for them: the kernel splits ordinary VMAs freely,
+    // so a within-limit registration always succeeds on the hardware. Running
+    // the round-down there would (a) falsely reject a registration when
+    // MC_MAX_MR_SIZE is set below one base page and (b) force needless extra
+    // chunking when the limit is not a page multiple. Gating on the page size
+    // confines the fix to the HugeTLB case that actually needs it.
+    //
+    // Compare against the runtime base page size from sysconf(_SC_PAGESIZE)
+    // rather than a hardcoded 4 KiB: on a larger-base-page platform (e.g. an
+    // ARM64 kernel built with 64 KiB pages) every ordinary mapping reports that
+    // base page in KernelPageSize, so a fixed 4 KiB threshold would misclassify
+    // a regular buffer as HugeTLB and reintroduce the false rejection there.
+    const size_t buffer_page_size = detectBufferPageSize(addr);
+    static const size_t base_page_size =
+        static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    if (chunk_limit > 0 && buffer_page_size > base_page_size) {
+        const size_t aligned_limit =
+            chunk_limit / buffer_page_size * buffer_page_size;
+        if (aligned_limit == 0) {
+            LOG(ERROR) << "Effective max_mr_size " << chunk_limit
+                       << " is smaller than the HugeTLB page size "
+                       << buffer_page_size
+                       << "; cannot form a page-aligned MR chunk. Raise "
+                          "MC_MAX_MR_SIZE to at least one huge page, or check "
+                          "it against the device max_mr_size and the hugepage "
+                          "configuration.";
+            return ERR_INVALID_ARGUMENT;
+        }
+        chunk_limit = aligned_limit;
+    }
+    // Data Direct additionally requires a page-aligned IOVA, so
+    // registerMemoryRegionInternal() expands each chunk's MR down to the
+    // preceding page boundary. Reserve room for that prefix here so the
+    // expanded MR still fits inside chunk_limit. Orthogonal to the HugeTLB
+    // round-down above: that path only triggers for host memory, where
+    // alignment stays 1, while Data Direct only applies to device memory,
+    // whose mappings report the base page size.
+    size_t alignment = 1;
+#ifdef USE_CUDA
+    if (dmabuf_exp.method == DmabufExport::Method::kDmabufReg &&
+        Environ::Get().GetRdmaDataDirect()) {
+        alignment = getpagesize();
+    }
+#endif
+    std::vector<std::pair<void *, size_t>> chunks;
+    if (chunk_limit > 0) {
+        size_t offset = 0;
+        do {
+            auto *chunk_addr = static_cast<char *>(addr) + offset;
+            const size_t prefix = (uintptr_t)chunk_addr % alignment;
+            if (prefix >= chunk_limit) {
+                LOG(ERROR)
+                    << "Data Direct alignment prefix exceeds max_mr_size";
+                return ERR_INVALID_ARGUMENT;
+            }
+            size_t chunk_len = std::min(chunk_limit - prefix, length - offset);
+            chunks.emplace_back(chunk_addr, chunk_len);
+            offset += chunk_len;
+        } while (offset < length);
+        if (chunks.size() > 1) {
+            LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
+                         << " bytes) into " << chunks.size()
+                         << " chunks of <= " << chunk_limit
+                         << " bytes each (device max_mr_size; Mooncake#2017)";
+        }
+    } else {
+        chunks.emplace_back(addr, length);
+    }
 
     // Best-effort unregister of ONE chunk's MRs across all contexts. Used to
     // clean up a chunk whose registration failed part-way (some contexts
@@ -387,9 +501,15 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // which is capped at max_mr_size and would silently disable pre-touch for a
     // >=4GiB buffer). Compute once above the loop to avoid repeated
     // hardware_concurrency() OS queries per chunk.
-    const bool do_pre_touch = context_list_.size() > 0 &&
-                              std::thread::hardware_concurrency() >= 4 &&
-                              length >= (size_t)4 * 1024 * 1024 * 1024;
+    //
+    // Pre-touch faults host pages in before the real registration. It gains
+    // nothing for device memory registered through DMA-BUF, where each
+    // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
+    // block, so skip it there.
+    const bool do_pre_touch =
+        dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
+        context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
+        length >= (size_t)4 * 1024 * 1024 * 1024;
 
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void *chunk_addr = chunks[ci].first;
@@ -484,6 +604,14 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                       << ", contexts=" << context_list_.size()
                       << ", parallel=" << (use_parallel_reg ? "true" : "false")
                       << ", duration=" << reg_duration_ms << "ms";
+        }
+
+        // Registration faults in untouched host pages. Resolve the original
+        // buffer's first page only after it has been pinned, or NUMA discovery
+        // can retain "*" and select NICs on unrelated NUMA nodes.
+        if (ci == 0 && name == kWildcardLocation) {
+            const auto entries = getMemoryLocation(addr, length, true);
+            resolved_name = entries[0].location;
         }
 
         // Collect per-context keys for THIS chunk (address-range lookup).
@@ -693,7 +821,7 @@ int RdmaTransport::allocateLocalSegmentID() {
 }
 
 int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
-                                          uint16_t lid,
+                                          uint32_t lid,
                                           const std::string &gid) {
     std::lock_guard<std::mutex> guard(local_desc_lock_);
     auto original_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
@@ -858,6 +986,12 @@ Status RdmaTransport::submitTransferTask(
     };
     uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
+    BatchRdmaDeviceCache local_device_cache;
+    int last_local_buffer_id = -1;
+    int last_local_device_id = -1;
+    int last_local_device_buffer_id = -1;
+    int last_remote_buffer_id = -1;
+    SegmentID last_remote_target_id = static_cast<SegmentID>(-1);
     while (task_index < task_list.size()) {
         assert(task_list[task_index]);
         auto &task = *task_list[task_index];
@@ -878,18 +1012,39 @@ Status RdmaTransport::submitTransferTask(
                     .first;
         }
         const auto &target_segment_desc = target_desc_it->second;
-
-        auto request_buffer_id = -1, request_device_id = -1;
-        if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
-                         request.length, request_buffer_id,
-                         request_device_id)) {
-            request_buffer_id = -1;
-            request_device_id = -1;
+        if (request.target_id != last_remote_target_id) {
+            last_remote_buffer_id = -1;
+            last_remote_target_id = request.target_id;
         }
 
-        SliceLengthCalculator slice_calc{request, kBlockSize, kFragmentSize,
+        auto request_buffer_id = -1, request_device_id = -1;
+        const int local_hint_device_id =
+            last_local_device_buffer_id == last_local_buffer_id
+                ? last_local_device_id
+                : -1;
+        if (local_device_cache.select(
+                local_segment_desc, (uint64_t)request.source, request.length,
+                request_buffer_id, request_device_id, [&] {
+                    return selectDevice(
+                        local_segment_desc.get(), (uint64_t)request.source,
+                        request.length, request_buffer_id, request_device_id, 0,
+                        last_local_buffer_id, local_hint_device_id);
+                })) {
+            request_buffer_id = -1;
+            request_device_id = -1;
+        } else {
+            last_local_buffer_id = request_buffer_id;
+            last_local_device_id = request_device_id;
+            last_local_device_buffer_id = request_buffer_id;
+        }
+
+        SliceLengthCalculator slice_calc{request,
+                                         kBlockSize,
+                                         kFragmentSize,
                                          local_segment_desc.get(),
-                                         target_segment_desc.get()};
+                                         target_segment_desc.get(),
+                                         &last_local_buffer_id,
+                                         &last_remote_buffer_id};
         for (uint64_t offset = 0; offset < request.length;) {
             size_t slice_length = slice_calc.calculate(offset);
 
@@ -924,9 +1079,14 @@ Status RdmaTransport::submitTransferTask(
                 }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
+                const int slice_hint_device_id =
+                    last_local_device_buffer_id == last_local_buffer_id
+                        ? last_local_device_id
+                        : -1;
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,
-                                 buffer_id, device_id, retry_cnt++))
+                                 buffer_id, device_id, retry_cnt++,
+                                 last_local_buffer_id, slice_hint_device_id))
                     continue;
                 assert(device_id >= 0 &&
                        static_cast<size_t>(device_id) < context_list_.size());
@@ -939,6 +1099,9 @@ Status RdmaTransport::submitTransferTask(
                 assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
                        context_list_.size());
                 found_device = true;
+                last_local_buffer_id = buffer_id;
+                last_local_device_id = device_id;
+                last_local_device_buffer_id = buffer_id;
                 break;
             }
             if (!found_device) {
@@ -1049,6 +1212,46 @@ RdmaTransport::SegmentID RdmaTransport::getSegmentID(
     return metadata_->getSegmentID(segment_name);
 }
 
+int RdmaTransport::sendNativeNotify(
+    const std::string &peer_server_name,
+    const TransferMetadata::NotifyDesc &notify) {
+    if (!RdmaEndPoint::notificationFits(notify)) return ERR_NOT_IMPLEMENTED;
+    if (context_list_.empty() || !context_list_.front()->nativeNotifyEnabled())
+        return ERR_NOT_IMPLEMENTED;
+    auto peer = metadata_->getSegmentDescByName(peer_server_name);
+    if (!peer) return ERR_METADATA;
+    if (peer->devices.empty()) return ERR_NOT_IMPLEMENTED;
+    auto context = context_list_.front();
+    const auto *device = &peer->devices.front();
+    for (const auto &candidate : peer->devices)
+        if (candidate.name == context->deviceName()) {
+            device = &candidate;
+            break;
+        }
+    auto path = MakeNicPath(peer->nicPathServerName(), device->name);
+    auto lifecycle_lock = context->lockEndpointLifecycle(path);
+    if (!context->active() || context->isConnectPaused(path))
+        return ERR_ENDPOINT;
+    auto endpoint = context->endpoint(path);
+    if (!endpoint) return ERR_ENDPOINT;
+    // Neither handshake RPCs nor send-slot waits may hold the lifecycle gate:
+    // passive setup and retirement need it to make progress.
+    lifecycle_lock.unlock();
+    int ret =
+        endpoint->readyToSend() ? 0 : endpoint->setupConnectionsByActive();
+    lifecycle_lock.lock();
+    if (context->findEndpoint(path) != endpoint || !context->active())
+        return ERR_ENDPOINT;
+    lifecycle_lock.unlock();
+    if (!ret) ret = endpoint->sendNotification(notify);
+    // Never replay a send whose delivery is uncertain. A later call may
+    // create a fresh endpoint after a link fault, using the normal lifecycle.
+    lifecycle_lock.lock();
+    if (endpoint->retired() || endpoint->notificationNeedsReconnect())
+        context->deleteEndpointByPtr(endpoint.get());
+    return ret;
+}
+
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
@@ -1157,92 +1360,132 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
 // According to the request desc, offset and length information, find proper
 // buffer_id and device_id as output.
 // Return 0 if successful, ERR_ADDRESS_NOT_REGISTERED otherwise.
-int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
-                                size_t length, std::string_view hint,
-                                int &buffer_id, int &device_id,
-                                int retry_count) {
+namespace {
+
+bool isSelectableRdmaBuffer(
+    [[maybe_unused]] const TransferMetadata::BufferDesc &buffer) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    // The RDMA transport must only bind buffers registered under the rdma
+    // protocol. Device (hip) buffers alias the same GPU addresses but carry
+    // no lkey/rkey, so picking one yields an empty-lkey out-of-bounds read
+    // in the submit path. The !empty() guard leaves legacy single-protocol
+    // descriptors (empty protocol field) unaffected.
+    if (!buffer.protocol.empty() && buffer.protocol != "rdma") return false;
+#endif
+    return true;
+}
+
+int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
+                       const TransferMetadata::BufferDesc &buffer,
+                       uint64_t offset, std::string_view hint,
+                       std::string_view local_hca, int retry_count,
+                       bool by_local_hca) {
+    if (by_local_hca) {
+        const auto location = resolveBufferLocation(buffer, offset);
+        int device_id = desc->topology.selectDeviceByLocalHca(
+            location, local_hca, retry_count);
+        if (device_id >= 0) return device_id;
+        return desc->topology.selectDeviceByLocalHca(kWildcardLocation,
+                                                     local_hca, retry_count);
+    }
+
+    std::string location = buffer.name;
+    SegmentsLocationInfo seg_info;
+    if (parseSegmentsLocation(buffer.name, seg_info)) {
+        location = resolveSegmentsLocation(seg_info, buffer.length,
+                                           offset - buffer.addr);
+    }
+    int device_id =
+        hint.empty() ? desc->topology.selectDevice(location, retry_count)
+                     : desc->topology.selectDevice(location, hint, retry_count);
+    if (device_id >= 0) return device_id;
+    return hint.empty()
+               ? desc->topology.selectDevice(kWildcardLocation, retry_count)
+               : desc->topology.selectDevice(kWildcardLocation, hint,
+                                             retry_count);
+}
+
+int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
+                     size_t length, std::string_view hint,
+                     std::string_view local_hca, bool by_local_hca,
+                     int &buffer_id, int &device_id, int retry_count,
+                     int hint_buffer_id, int hint_device_id) {
     if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
     const auto &buffers = desc->buffers;
-    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
-         ++buffer_id) {
-        const auto &buffer = buffers[buffer_id];
 
-#ifdef ENABLE_MULTI_PROTOCOL
-        // The RDMA transport must only bind buffers registered under the rdma
-        // protocol. Device (hip) buffers alias the same GPU addresses but carry
-        // no lkey/rkey, so picking one yields an empty-lkey out-of-bounds read
-        // in the submit path. The !empty() guard leaves legacy single-protocol
-        // descriptors (empty protocol field) unaffected.
-        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
-            continue;
+    auto try_buffer = [&](int candidate, bool allow_device_reuse) -> bool {
+        if (candidate < 0 || static_cast<size_t>(candidate) >= buffers.size())
+            return false;
+        const auto &buffer = buffers[candidate];
+        if (!isSelectableRdmaBuffer(buffer) ||
+            !bufferCoversRange(buffer.addr, buffer.length, offset, length)) {
+            return false;
         }
-#endif
-
-        // Check if offset is within buffer range
-        if (offset < buffer.addr || length > buffer.length ||
-            offset - buffer.addr > buffer.length - length) {
-            continue;
+        int selected = -1;
+        // Consecutive hits in the same offset-independent MR (typical GPU
+        // "cuda:N" buffers) keep the previous topology pick. retry_count > 0
+        // is a failover walk and must re-run selectDevice.
+        if (allow_device_reuse && retry_count == 0 && hint_device_id >= 0 &&
+            buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0) {
+            const size_t nkeys =
+                by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
+            if (static_cast<size_t>(hint_device_id) < nkeys &&
+                (desc->devices.empty() ||
+                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
+                selected = hint_device_id;
+            }
         }
-
-        // Resolve NUMA-aware location for segmented buffers
-        std::string location = buffer.name;
-        SegmentsLocationInfo seg_info;
-        if (parseSegmentsLocation(buffer.name, seg_info)) {
-            location = resolveSegmentsLocation(seg_info, buffer.length,
-                                               offset - buffer.addr);
+        if (selected < 0) {
+            selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
+                                          retry_count, by_local_hca);
         }
+        if (selected < 0) return false;
+        buffer_id = candidate;
+        device_id = selected;
+        return true;
+    };
 
-        device_id =
-            hint.empty()
-                ? desc->topology.selectDevice(location, retry_count)
-                : desc->topology.selectDevice(location, hint, retry_count);
-        if (device_id >= 0) return 0;
-        device_id = hint.empty() ? desc->topology.selectDevice(
-                                       kWildcardLocation, retry_count)
-                                 : desc->topology.selectDevice(
-                                       kWildcardLocation, hint, retry_count);
-        if (device_id >= 0) return 0;
+    if (const BufferRangeIndex *index = uniqueCoverageIndex(desc)) {
+        if (try_buffer(hint_buffer_id, true)) return 0;
+        const int found = index->findCovering(offset, length);
+        if (found != hint_buffer_id && try_buffer(found, false)) return 0;
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+
+    for (int candidate = 0; candidate < static_cast<int>(buffers.size());
+         ++candidate) {
+        if (try_buffer(candidate, candidate == hint_buffer_id)) return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;
+}
+
+}  // namespace
+
+int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
+                                size_t length, std::string_view hint,
+                                int &buffer_id, int &device_id, int retry_count,
+                                int hint_buffer_id, int hint_device_id) {
+    return selectDeviceImpl(desc, offset, length, hint, {}, false, buffer_id,
+                            device_id, retry_count, hint_buffer_id,
+                            hint_device_id);
 }
 
 int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
                                           size_t length,
                                           std::string_view local_hca,
                                           int &buffer_id, int &device_id,
-                                          int retry_count) {
-    if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
-    const auto &buffers = desc->buffers;
-    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
-         ++buffer_id) {
-        const auto &buffer = buffers[buffer_id];
-
-#ifdef ENABLE_MULTI_PROTOCOL
-        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
-            continue;
-        }
-#endif
-
-        if (offset < buffer.addr || length > buffer.length ||
-            offset - buffer.addr > buffer.length - length) {
-            continue;
-        }
-
-        const auto location = resolveBufferLocation(buffer, offset);
-        device_id = desc->topology.selectDeviceByLocalHca(location, local_hca,
-                                                          retry_count);
-        if (device_id >= 0) return 0;
-        device_id = desc->topology.selectDeviceByLocalHca(
-            kWildcardLocation, local_hca, retry_count);
-        if (device_id >= 0) return 0;
-    }
-    return ERR_ADDRESS_NOT_REGISTERED;
+                                          int retry_count, int hint_buffer_id,
+                                          int hint_device_id) {
+    return selectDeviceImpl(desc, offset, length, {}, local_hca, true,
+                            buffer_id, device_id, retry_count, hint_buffer_id,
+                            hint_device_id);
 }
 
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, int &buffer_id, int &device_id,
-                                int retry_count) {
+                                int retry_count, int hint_buffer_id,
+                                int hint_device_id) {
     return selectDevice(desc, offset, length, "", buffer_id, device_id,
-                        retry_count);
+                        retry_count, hint_buffer_id, hint_device_id);
 }
 }  // namespace mooncake

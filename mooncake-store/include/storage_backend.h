@@ -965,10 +965,16 @@ class BucketStorageBackend : public StorageBackendInterface {
     // FinalizeEviction removes persisted metadata, waits for in-flight reads,
     // and then deletes the data files.
     struct PendingEviction {
-        std::vector<std::string> keys;  // All keys in evicted buckets
+        std::vector<std::string> keys;  // Keys the eviction removed from the
+                                        // index (matched set; skipped
+                                        // duplicates are never re-pointed)
         std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
             buckets;  // (bucket_id, metadata) for file deletion
         std::vector<std::string> write_keys;
+        // Duplicates bypassed instead of failing the batch: already
+        // persisted, or being persisted by a concurrent offload. The
+        // commit phase must skip these (idempotent Put semantics).
+        std::vector<std::string> skipped_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
     };
@@ -1070,6 +1076,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
+    // Held for process lifetime after Init(); enforces one client / path.
+    int owner_lock_fd_{-1};
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 
