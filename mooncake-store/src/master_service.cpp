@@ -11676,8 +11676,9 @@ bool MasterService::BatchEvict(double evict_ratio_target,
 
         // No room left in flight: with offload_force_evict and a failed
         // allocation the object is dropped to free memory now (the warning is
-        // aggregated at the end of the cycle); otherwise the cycle ends here
-        // and the eviction thread waits for the owners to drain the queue.
+        // aggregated at the end of the cycle); otherwise it is skipped, the
+        // pass goes on freeing objects the owners have already written, and
+        // the eviction thread waits for the owners to drain the queue.
         if (offload_queued_this_cycle >= offload_room) {
             if (offload_force_evict_ && allocation_pressure) {
                 offload_cap_forced_count++;
@@ -11855,9 +11856,6 @@ bool MasterService::BatchEvict(double evict_ratio_target,
                 uint64_t freed =
                     try_evict_or_offload(tenant_id, key, metadata, tenant_state,
                                          deferred_replicas, deferred);
-                if (offload_room_exhausted) {
-                    return {.stop_scan = true};
-                }
                 EvictionResult result{
                     .freed_bytes = freed,
                     .evicted_objects = (freed > 0 || deferred) ? 1 : 0};
@@ -11901,9 +11899,6 @@ bool MasterService::BatchEvict(double evict_ratio_target,
             const uint64_t freed =
                 try_evict_or_offload(tenant_id, member_key, member_metadata,
                                      state, deferred_replicas, deferred);
-            if (offload_room_exhausted) {
-                return {.stop_scan = true};
-            }
             EvictMemberOutcome outcome{
                 .freed_bytes = freed,
                 .evicted_objects = (freed > 0 || deferred) ? 1 : 0};
@@ -12264,7 +12259,7 @@ bool MasterService::BatchEvict(double evict_ratio_target,
         // scan is paid only on churn and preserves the behavior of
         // continuing past the cutoff until evict_num is reached.
         if (!stop_eviction_scan && compact_frontier_used &&
-            evicted_this_pass < evict_num) {
+            !offload_room_exhausted && evicted_this_pass < evict_num) {
             auto refill_candidates = collect_candidates(
                 /*use_cutoff=*/true, reserve_cutoff,
                 /*collect_older_or_equal=*/false);
@@ -12492,12 +12487,13 @@ bool MasterService::BatchEvict(double evict_ratio_target,
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
     }
-    // False (so the caller backs off) when nothing was freed and the owners
-    // still hold work: queued this cycle, or earlier cycles' objects in flight.
+    // False (so the caller backs off) while the owners are the bottleneck: the
+    // in-flight room ran out this cycle, or nothing was freed and they still
+    // hold work (queued this cycle, or earlier cycles' objects in flight).
     const bool waiting_on_offloads =
-        offload_on_evict_ && !freed_now &&
-        (offload_deferred_count > 0 || offload_room_exhausted ||
-         pending_offloads > 0);
+        offload_on_evict_ &&
+        (offload_room_exhausted ||
+         (!freed_now && (offload_deferred_count > 0 || pending_offloads > 0)));
     return !waiting_on_offloads;
 }
 
