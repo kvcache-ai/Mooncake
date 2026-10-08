@@ -10,32 +10,29 @@ matrix, the command line and the boundaries.
 
 ## 1. The stages
 
+The step itself is three windows, in the order a forward pass runs them:
+
 | Stage | What it covers | SGLang call it replays |
 |---|---|---|
 | `indices` | the query offsets and the CSR stream of KV slots the paged side reads | `create_flashinfer_kv_indices_triton`, the kernel `KVIndexTranslator.fill_packed_read_stream` launches (`sglang/kernels/ops/kvcache/kv_indices.py`) |
-| `kv_write` | the new K/V of every layer, written at the slots this step allocated | `MHATokenToKVPool.set_kv_buffer` (`sglang/srt/mem_cache/memory_pool.py`) |
-| `attention_plan` | the backend compiling the CSR stream into a kernel schedule | the wrappers' `plan`, as `FlashInferAttnBackend` calls it (`sglang/srt/layers/attention/flashinfer_backend.py`) |
-| `attention` | the per-layer kernel calls that read the cached KV | the same wrappers' `forward`, `forward_return_lse` and `merge_state`, in the order the branch runs them |
-| `total_step` | the attention step: `indices` + `kv_write` + `attention_plan` + `attention` | — |
-| `kv_gather` | a read-only probe: the same rows of K and V, moved with `index_select` and no arithmetic | — |
+| `attention_plan` | the backend compiling the CSR stream into a kernel schedule | the wrappers' `plan`, as `FlashInferAttnBackend` calls it in `init_forward_metadata` |
+| `layer_loop` | the per-layer loop: one layer's attention and one layer's KV write, layer by layer, in the order the branch runs them | the wrappers' `forward` / `forward_return_lse` / `merge_state` and `MHATokenToKVPool.set_kv_buffer` (`sglang/srt/layers/attention/flashinfer_backend.py`) |
+| `total_step` | `indices` + `attention_plan` + `layer_loop` | — |
 
-The step total is the four stages a forward pass runs. A branch that computes its attention before it
-saves the KV cache (section 2) is timed in that order, so `kv_write` comes after `attention` in those
-rows. The gather is a probe: it runs in a pass of its own after the timed loop, so no step iteration is
-ever timed with a probe inside it, and it is never added to the step. Its bandwidth divides the bytes it
-actually moves — both tensors of the rows it reads — rather than the kernel's paged read.
+The loop is timed as one window on purpose. Putting an event pair around each layer's write and read
+would measure the events as much as the work — 144 events per iteration cost about 0.6 ms of the 5 ms
+step on the validation machine — so the write and the read are priced in passes of their own instead,
+and they are components rather than the schedule the step runs:
 
-What a phase's number means: it is the interval the device takes to pass from the phase's first event to
-its last, on the step's own stream. When the phase's work is bound by how fast the host issues it — the
-KV write is 36 per-layer calls, and a step with a handful of tokens issues far less device work than it
-spends issuing it — the interval is that issue time, which the server pays too. The per-layer figure is
-recorded beside each phase in the CSV, and a reader comparing two steps should compare like with like:
-the write interval of a one-token step and of an 8192-token step are not the same quantity.
+| Component | What it covers |
+|---|---|
+| `kv_write_component` | all 36 `set_kv_buffer` calls of a step in one window, without the attention they interleave with |
+| `attention_component` | all 36 attention calls of a step in one window, without the writes |
+| `kv_gather` | a read-only probe: the same rows of K and V, moved with `index_select` and no arithmetic |
 
-The KV buffer is built with the pool's alternate write stream off, so the write stays on the step's
-stream and the phases do not overlap. A server leaves that stream on and lets the write overlap with the
-attention; measured on the validation machine, both settings gave the same per-phase numbers within
-noise (`kv_write_stream` in each record says which one the run used).
+None of the three is added to the step. Each runs after the timed loop, in windows of its own, so no
+step iteration is ever timed with a probe inside it. Their share of the step is named as a component
+share, because the step interleaves the two per layer.
 
 The structures the step is built on are SGLang's throughout: `ReqToTokenPool` for the request to token
 table, `PagedTokenToKVPoolAllocator` for the slots (`alloc`, `alloc_extend` or `alloc_decode`,
@@ -117,18 +114,22 @@ Every derived figure divides by one of these, and all of them are recorded per s
 |---|---|
 | `kv_bytes_written` | `layers * 2 * new_tokens * kv_heads * head_dim * dtype_bytes`: the tokens this step computes |
 | `kv_bytes_read_valid` | the same count over the step's valid context tokens |
-| `kv_bytes_read_pages` | the same count over whole pages, so a last page that is not full is read with its padding; `padding_tokens` states how many tokens that is |
+| `kv_bytes_read_pages` | the same count over whole pages, so a last page that is not full is counted with its padding; `padding_tokens` states how many tokens that is. It is an allocation figure — the capacity the pages occupy — and no bandwidth divides by it |
 | `gather_bytes` | the bytes the read-only probe moves: both K and V of the `gather_rows` rows it reads, for every layer |
 | `attention_pairs` | `sum over sequences of new * prefix + new * (new + 1) / 2`: a causal mask aligned to the end of the context leaves each query the history and everything computed before it |
 | `attention_flops` | `layers * 4 * attention_pairs * qo_heads * head_dim`: QK^T and PV are one multiply-add each, so a query-key pair costs 4 operations, and every layer does that work |
-| `attention_arithmetic_intensity` | `attention_flops / kv_bytes_read_pages` |
+| `attention_arithmetic_intensity` | `attention_flops / kv_bytes_read_valid` |
 
-Bandwidth divides by the window the bytes belong to, and the paged read is priced against
-`kv_bytes_read_pages`, because a paged read touches whole pages: a valid-token denominator would
-overstate the rate. `attention_valid_token_gbps` is recorded beside it for a reader who wants the
-other denominator. The probe's bandwidth divides `gather_bytes`, which is what the probe moves, and
-not the kernel's read: the two are the same count in the branches whose paged side reads the whole
-context, and they differ in the branches that read less, where a row states both.
+Bandwidth divides logical bytes by the window those bytes belong to: the valid KV a step reads
+(`attention_effective_gbps`) and the rows the probe moves (`kv_gather_effective_gbps`). What the memory
+system actually transfers is not observable without a profiler, so no figure here claims it: a paged
+read touches whole pages and a write may coalesce, and the page capacity is reported as the allocation
+figure it is rather than as traffic.
+
+The write side carries no rate of its own. Its window reads two regimes for the same calls, around
+0.1 ms and around 1.16 ms, so it prices the host's issue of the `set_kv_buffer` calls as much as their
+execution on the device, and a quotient of it would report whichever regime the window happened to
+catch. `kv_write_component` is recorded as the window it is.
 
 ## 5. Correctness checks
 
@@ -143,13 +144,14 @@ Each step runs three checks, and a failure fails the run:
   rather than against the tensor the kernel also read. `test_a_corrupted_v_is_caught` writes a value
   into one V row behind the benchmark's back and asserts the check fails.
 - `attention`: the kernel output must match a plain tensor reference computed in float32 over the same
-  content, relative error below 1e-2. In the merge branch that reference is the full causal attention
-  over history and queries, which is what the two kernels and `merge_state` have to add up to; the
-  paged extend branch is planned without a causal mask, so its reference carries none either, and the
-  record states which mask was used. The reference materialises a query by context score matrix, so it
-  runs on a short step of the same shape — the same mode, page size, layout and head counts, with the
-  lengths capped — while the two checks above run at full size. Every record states the short step it
-  used in `correctness.attention.case`.
+  content, relative error below 1e-2. The reference is causal in every branch: a step's queries must not
+  see the tokens after them, and in the merge branch the full causal attention over history and queries
+  is what its two kernels and `merge_state` have to add up to. The same comparison against a reference
+  without the mask has to fail, and a test asserts that it does, so a kernel that saw the future could
+  not pass. The reference materialises a query by context score matrix, so it runs on a short step of
+  the same shape — the same mode, page size, layout and head counts, with the lengths capped — while
+  the two checks above run at full size. Every record states the short step it used in
+  `correctness.attention.case`.
 
 ## 6. Command line
 

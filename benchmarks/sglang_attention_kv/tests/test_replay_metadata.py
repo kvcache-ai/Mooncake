@@ -20,6 +20,10 @@ from benchmarks.sglang_attention_kv.cases import (  # noqa: E402
     KernelCase,
     short_case,
 )
+from benchmarks.sglang_attention_kv.kernel_bench import (  # noqa: E402
+    one_attention_component,
+    one_iteration,
+)
 from benchmarks.sglang_attention_kv.sglang_replay import SglangStep  # noqa: E402
 
 DEVICE = "cuda:0"
@@ -271,6 +275,70 @@ def test_a_contiguous_pool_keeps_the_pages_together():
     pages = [int(slot) // 64 for slot in step.prefix_slots[0].tolist()[::64]]
     assert pages == sorted(pages)
     assert pages[-1] - pages[0] == len(pages) - 1
+
+
+def test_the_attention_check_is_sensitive_to_a_mask_that_is_missing():
+    """An extend step computes more than one query per sequence, so its queries
+    must not see the tokens after them. The check compares against the causal
+    reference, and the same comparison against a reference without the mask has
+    to fail: otherwise a kernel that sees the future would pass."""
+    step, _ = prepared(
+        step_case("extend", (256,), (128,)), extend_branch=BRANCH_PAGED_EXTEND
+    )
+    query = step.make_query()
+    causal = step.check_attention(query)
+    unmasked = step.unmasked_reference(query)
+    assert causal["passed"]
+    assert causal["mask"] == "causal"
+    assert not unmasked["passed"], "a kernel that sees the future must not pass"
+
+
+def test_the_merge_branch_is_causal_as_well():
+    step, _ = prepared(step_case("extend", (256,), (128,)))
+    query = step.make_query()
+    assert step.check_attention(query)["passed"]
+    assert not step.unmasked_reference(query)["passed"]
+
+
+def test_the_attention_bandwidth_uses_the_valid_bytes():
+    """Normalised bandwidth divides the valid KV the step reads; the page-covered
+    count is an allocation figure and is reported beside it."""
+    step, _ = prepared(step_case("extend", (500,), (100,)))
+    case = step.case
+    query = step.make_query()
+    attention_ms = one_attention_component(step, query)
+    gbps = case.kv_bytes_read_valid() / (attention_ms / 1000.0) / 1e9
+    assert case.kv_bytes_read_valid() < case.kv_bytes_read_pages()
+    assert gbps == pytest.approx(
+        case.kv_bytes_read_valid() / (attention_ms / 1000.0) / 1e9, rel=1e-9
+    )
+
+
+def test_the_step_loop_interleaves_write_and_read_per_layer(monkeypatch):
+    """The step is timed as SGLang runs it: one layer's attention and one layer's
+    write, layer by layer, rather than all the writes and then all the reads."""
+    step, _ = prepared(step_case("extend", (256,), (128,)))
+    order = []
+    original_write = step.write_layer
+    original_read = step.run_layer
+
+    def write(layer_id, indexed):
+        order.append(("write", layer_id))
+        return original_write(layer_id, indexed)
+
+    def read(layer_id, query):
+        order.append(("read", layer_id))
+        return original_read(layer_id, query)
+
+    monkeypatch.setattr(step, "write_layer", write)
+    monkeypatch.setattr(step, "run_layer", read)
+    measured = one_iteration(step, step.make_query())
+    assert set(measured) == {"indices", "attention_plan", "layer_loop"}
+    # The merge branch reads a layer and then writes it, so the calls alternate
+    assert order[0] == ("read", 0)
+    assert order[1] == ("write", 0)
+    assert order[2] == ("read", 1)
+    assert len(order) == 2 * step.case.num_layers
 
 
 def test_prefill_writes_kv_but_reads_no_paged_stream():

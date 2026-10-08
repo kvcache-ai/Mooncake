@@ -15,16 +15,23 @@ from .stats import summarize
 
 # The step, in the order one forward pass runs it. The index mapping is the stage
 # that turns the token table into the paged index tensors the attention kernel
-# reads; the write is SGLang's own KV pool writer.
-STEP_PHASES = ("indices", "kv_write", "attention_plan", "attention")
+# reads; the write is SGLang's own KV pool writer. layer_loop is the whole
+# per-layer loop, timed as one window so the events that would break it down do
+# not sit inside the step.
+STEP_PHASES = ("indices", "attention_plan", "layer_loop")
 
-# A read-only probe over the same pages, run in a pass of its own so it never
-# shares a window with the step. It is compared against the read inside the
-# attention kernel and is never added to the step.
-DIAGNOSTIC_PHASES = ("kv_gather",)
+# Passes of their own: the KV write and the attention read each run over all the
+# layers in one window, as components rather than as the schedule the step runs,
+# and the read-only gather probe over the same rows. None of them is added to the
+# step.
+DIAGNOSTIC_PHASES = ("kv_write_component", "attention_component", "kv_gather")
 
 MEASURED_PHASES = STEP_PHASES + DIAGNOSTIC_PHASES
 PHASES = MEASURED_PHASES + ("total_step",)
+
+# The phases total_step adds up: the step's three windows, in order. The
+# components are measured in passes of their own and are never added in.
+TOTAL_PHASES = STEP_PHASES
 
 
 def _case_seed(case, seed):
@@ -34,45 +41,72 @@ def _case_seed(case, seed):
     return zlib.crc32(f"{case.label}|{seed}".encode()) % (2**31)
 
 
+def _event_pair():
+    return (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
+
+
 def one_iteration(step, query):
-    """One timed step, phase by phase."""
-    events = {
-        name: (
-            torch.cuda.Event(enable_timing=True),
-            torch.cuda.Event(enable_timing=True),
-        )
-        for name in MEASURED_PHASES
-    }
+    """One timed step in the order the branch runs it.
 
-    events["indices"][0].record()
+    The layer loop is timed as one window: a forward pass runs one layer's
+    attention and one layer's KV write, layer by layer, in the order the branch
+    puts them, and putting an event pair around each of those would measure the
+    events as much as the work. The write and the read are priced separately, in
+    passes of their own, as components.
+    """
+    indices_events = _event_pair()
+    plan_events = _event_pair()
+    loop_events = _event_pair()
+
+    indices_events[0].record()
     indices = step.build_indices()
-    events["indices"][1].record()
+    indices_events[1].record()
 
-    # SGLang plans once per step, in init_forward_metadata, before its layer loop
-    # runs. The branch then decides what that loop does first: the two ragged
-    # branches compute the attention and save the KV cache afterwards, the paged
-    # branches write first.
-    events["attention_plan"][0].record()
+    # SGLang plans once per step, in init_forward_metadata, before its layer loop.
+    plan_events[0].record()
     step.plan(indices)
-    events["attention_plan"][1].record()
+    plan_events[1].record()
 
-    if step.reads_before_write:
-        events["attention"][0].record()
-        step.read(query)
-        events["attention"][1].record()
-        events["kv_write"][0].record()
-        step.write_kv(indices)
-        events["kv_write"][1].record()
-    else:
-        events["kv_write"][0].record()
-        step.write_kv(indices)
-        events["kv_write"][1].record()
-        events["attention"][0].record()
-        step.read(query)
-        events["attention"][1].record()
+    loop_events[0].record()
+    for layer_id in range(step.case.num_layers):
+        if step.reads_before_write:
+            step.run_layer(layer_id, query)
+            step.write_layer(layer_id, indices)
+        else:
+            step.write_layer(layer_id, indices)
+            step.run_layer(layer_id, query)
+    loop_events[1].record()
 
     torch.cuda.synchronize()
-    return {name: events[name][0].elapsed_time(events[name][1]) for name in STEP_PHASES}
+    return {
+        "indices": indices_events[0].elapsed_time(indices_events[1]),
+        "attention_plan": plan_events[0].elapsed_time(plan_events[1]),
+        "layer_loop": loop_events[0].elapsed_time(loop_events[1]),
+    }
+
+
+def one_write_component(step, indices):
+    """All the write calls of one step in one window, without the attention they
+    interleave with in a real step."""
+    begin, end = _event_pair()
+    begin.record()
+    step.write_kv(indices)
+    end.record()
+    torch.cuda.synchronize()
+    return begin.elapsed_time(end)
+
+
+def one_attention_component(step, query):
+    """All the attention calls of one step in one window, without the writes."""
+    begin, end = _event_pair()
+    begin.record()
+    step.read(query)
+    end.record()
+    torch.cuda.synchronize()
+    return begin.elapsed_time(end)
 
 
 def one_gather(step, indices):
@@ -109,16 +143,20 @@ def run_case(
     samples["total_step"] = []
     for _ in range(timed):
         measured = one_iteration(step, query)
-        total = 0.0
         for name in STEP_PHASES:
             samples[name].append(measured[name])
-            total += measured[name]
-        samples["total_step"].append(total)
+        samples["total_step"].append(sum(measured[name] for name in TOTAL_PHASES))
 
-    # The gather runs after the step loop, in its own windows, so the step is
-    # never timed with a probe inside it
-    gather_indices = step.build_indices()
-    samples["kv_gather"] = [one_gather(step, gather_indices) for _ in range(timed)]
+    # The components and the gather run after the step loop, each in its own
+    # windows, so no step iteration is ever timed with a probe inside it
+    probe_indices = step.build_indices()
+    samples["kv_write_component"] = [
+        one_write_component(step, probe_indices) for _ in range(timed)
+    ]
+    samples["attention_component"] = [
+        one_attention_component(step, query) for _ in range(timed)
+    ]
+    samples["kv_gather"] = [one_gather(step, probe_indices) for _ in range(timed)]
 
     result = {
         "kind": "kernel",
@@ -135,18 +173,18 @@ def run_case(
             for name in STEP_PHASES + ("total_step",)
         },
     }
-    gather_bytes = step.gather_bytes(gather_indices)
+    gather_bytes = step.gather_bytes(probe_indices)
     result["gather_bytes"] = gather_bytes
-    result["gather_rows"] = int(step.gather_rows(gather_indices).numel())
+    result["gather_rows"] = int(step.gather_rows(probe_indices).numel())
     result["derived"] = derive(case, result["phases"], gather_bytes)
     result["correctness"] = {
-        "indices": step.check_indices(gather_indices),
-        "history": step.check_history(gather_indices),
+        "indices": step.check_indices(probe_indices),
+        "history": step.check_history(probe_indices),
         "attention": short_step_attention(case, device, seed, extend_branch),
     }
     # The next step builds its own pools; a step's pool and its tensors are the
     # largest allocations in the run, so release them before moving on.
-    del step, query, gather_indices
+    del step, query, probe_indices
     torch.cuda.empty_cache()
     return result
 
@@ -178,16 +216,31 @@ def short_step_attention(case, device, seed, extend_branch):
 
 
 def derive(case, phases, gather_bytes):
-    """The figures the report quotes, divided by the step's own ledger."""
+    """The figures the report quotes, divided by the step's own ledger.
+
+    Bandwidth and the arithmetic rate divide logical bytes by the window those
+    bytes belong to: the valid KV the step reads, and the rows the probe moves.
+    The page-covered count is an allocation figure and is labelled as one; what
+    the memory system actually transfers is not observable without a profiler, so
+    no figure here claims it.
+
+    The write window carries no rate. It reads two regimes for the same calls —
+    around 0.1 ms and around 1.16 ms — so it prices the host's issue as much as
+    the device's execution, and a quotient of it would report whichever regime
+    the window caught.
+
+    The write and the attention are components, measured in passes of their own.
+    Their share of the step is named as a component share, because the step
+    interleaves the two per layer and their serial sum is not what it runs.
+    """
     index_ms = phases["indices"]["p50"]
-    write_ms = phases["kv_write"]["p50"]
     plan_ms = phases["attention_plan"]["p50"]
-    attention_ms = phases["attention"]["p50"]
+    loop_ms = phases["layer_loop"]["p50"]
+    write_ms = phases["kv_write_component"]["p50"]
+    attention_ms = phases["attention_component"]["p50"]
     gather_ms = phases["kv_gather"]["p50"]
     step_ms = phases["total_step"]["p50"]
 
-    written = case.kv_bytes_written()
-    read_pages = case.kv_bytes_read_pages()
     read_valid = case.kv_bytes_read_valid()
     flops = case.attention_flops()
 
@@ -196,22 +249,20 @@ def derive(case, phases, gather_bytes):
 
     return {
         "attention_plan_us_per_layer": plan_ms * 1000.0 / case.num_layers,
-        "attention_run_us_per_layer": attention_ms * 1000.0 / case.num_layers,
-        "kv_write_us_per_new_token": write_ms * 1000.0 / case.new_tokens,
+        "attention_component_us_per_layer": attention_ms * 1000.0 / case.num_layers,
+        "kv_write_component_us_per_layer": write_ms * 1000.0 / case.num_layers,
         "indices_us_per_new_token": index_ms * 1000.0 / case.new_tokens,
         "attention_us_per_context_token": attention_ms * 1000.0 / case.context_tokens,
-        "kv_write_effective_gbps": written / per_second(write_ms) / 1e9,
-        # The probe's own ledger: both tensors of the rows it reads, which is what
-        # it actually moves, rather than the kernel's paged read.
         "kv_gather_effective_gbps": gather_bytes / per_second(gather_ms) / 1e9,
-        "attention_effective_gbps": read_pages / per_second(attention_ms) / 1e9,
-        "attention_valid_token_gbps": read_valid / per_second(attention_ms) / 1e9,
+        "attention_effective_gbps": read_valid / per_second(attention_ms) / 1e9,
         "attention_tflops": flops / per_second(attention_ms) / 1e12,
-        "attention_arithmetic_intensity": flops / read_pages,
-        "attention_share_of_step": attention_ms / step_ms,
-        "kv_write_share_of_step": write_ms / step_ms,
+        "attention_arithmetic_intensity": flops / read_valid,
         "indices_share_of_step": index_ms / step_ms,
         "attention_plan_share_of_step": plan_ms / step_ms,
-        "kv_gather_share_of_attention_run": gather_ms / attention_ms,
+        "layer_loop_share_of_step": loop_ms / step_ms,
+        "attention_component_share_of_step": attention_ms / step_ms,
+        "kv_write_component_share_of_step": write_ms / step_ms,
+        "components_share_of_step": (write_ms + attention_ms) / step_ms,
+        "kv_gather_share_of_attention_component": gather_ms / attention_ms,
         "total_tokens_per_s": case.new_tokens / per_second(step_ms),
     }

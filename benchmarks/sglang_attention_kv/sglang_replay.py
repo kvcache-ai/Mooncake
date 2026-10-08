@@ -421,11 +421,17 @@ class SglangStep:
         )
         return indices
 
+    def write_layer(self, layer_id, indices):
+        """SGLang's writer for one layer."""
+        k, v = self.new_kv[layer_id]
+        self.kv_pool.set_kv_buffer(
+            self.layers[layer_id], KVWriteLoc(indices.out_cache_loc), k, v
+        )
+
     def write_kv(self, indices):
         """SGLang's writer, once per layer."""
-        for layer_id, layer in enumerate(self.layers):
-            k, v = self.new_kv[layer_id]
-            self.kv_pool.set_kv_buffer(layer, KVWriteLoc(indices.out_cache_loc), k, v)
+        for layer_id in range(self.case.num_layers):
+            self.write_layer(layer_id, indices)
 
     def plan(self, indices):
         case = self.case
@@ -489,8 +495,10 @@ class SglangStep:
             merged, _ = merge_state(suffix, suffix_lse, history, history_lse)
             return merged
         if self.branch == BRANCH_PAGED_EXTEND:
+            # SGLang passes causal=True to this wrapper's forward, which is what
+            # turns the mask on: the queries must not see the tokens after them.
             return self.paged_wrapper.forward(
-                query, self.kv_pool.get_kv_buffer(layer_id), sm_scale=scale
+                query, self.kv_pool.get_kv_buffer(layer_id), causal=True, sm_scale=scale
             )
         return self.decode_wrapper.forward(
             query, self.kv_pool.get_kv_buffer(layer_id), sm_scale=scale
@@ -611,10 +619,11 @@ class SglangStep:
         """The kernel output against a plain tensor reference over the same
         content, in float32.
 
-        The reference is the full causal attention over history and queries, which
-        is what the merge branch's two kernels and merge_state have to add up to.
-        The paged extend branch is planned without a causal mask, so its reference
-        carries none either.
+        The reference is causal for every branch: a step's queries must not see
+        the tokens after them, and in the merge branch the full causal attention
+        over history and queries is what its two kernels and merge_state have to
+        add up to. A reference without the mask would pass a kernel that sees the
+        future, so the mask is not optional here.
         """
         case = self.case
         produced = self.run_layer(0, query)
@@ -622,7 +631,6 @@ class SglangStep:
 
         scale = 1.0 / (case.head_dim**0.5)
         repeat = case.num_qo_heads // case.num_kv_heads
-        causal = self.branch != BRANCH_PAGED_EXTEND
         outputs = []
         q_offset = 0
         for index, new_len in enumerate(case.new_lens):
@@ -635,13 +643,12 @@ class SglangStep:
             q_seq = query[q_offset : q_offset + new_len].transpose(0, 1).float()
             q_offset += new_len
             scores = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * scale
-            if causal:
-                mask = torch.ones(
-                    (new_len, prefix_len + new_len),
-                    dtype=torch.bool,
-                    device=query.device,
-                ).tril(diagonal=prefix_len)
-                scores = scores.masked_fill(~mask, float("-inf"))
+            mask = torch.ones(
+                (new_len, prefix_len + new_len),
+                dtype=torch.bool,
+                device=query.device,
+            ).tril(diagonal=prefix_len)
+            scores = scores.masked_fill(~mask, float("-inf"))
             weights = torch.softmax(scores, dim=-1)
             outputs.append(torch.matmul(weights, v_seq).transpose(0, 1))
         reference = torch.cat(outputs)
@@ -651,7 +658,37 @@ class SglangStep:
             "max_abs_diff": difference.max().item(),
             "reference_abs_max": largest,
             "max_rel_diff": difference.max().item() / max(largest, 1e-6),
-            "mask": "causal" if causal else "none, as the branch plans it",
+            "mask": "causal",
+            "passed": bool(difference.max().item() / max(largest, 1e-6) < 1e-2),
+        }
+
+    def unmasked_reference(self, query):
+        """The same comparison with the mask left out, so a test can show that the
+        causal check above is sensitive to a kernel that sees the future."""
+        case = self.case
+        produced = self.run_layer(0, query)
+        torch.cuda.synchronize()
+
+        scale = 1.0 / (case.head_dim**0.5)
+        repeat = case.num_qo_heads // case.num_kv_heads
+        outputs = []
+        q_offset = 0
+        for index, new_len in enumerate(case.new_lens):
+            key_source, value_source = self._expected_kv(0, index)
+            k_seq = key_source.float().transpose(0, 1).repeat_interleave(repeat, dim=0)
+            v_seq = (
+                value_source.float().transpose(0, 1).repeat_interleave(repeat, dim=0)
+            )
+            q_seq = query[q_offset : q_offset + new_len].transpose(0, 1).float()
+            q_offset += new_len
+            scores = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * scale
+            weights = torch.softmax(scores, dim=-1)
+            outputs.append(torch.matmul(weights, v_seq).transpose(0, 1))
+        reference = torch.cat(outputs)
+        difference = (produced.float() - reference).abs()
+        largest = reference.abs().max().item()
+        return {
+            "max_rel_diff": difference.max().item() / max(largest, 1e-6),
             "passed": bool(difference.max().item() / max(largest, 1e-6) < 1e-2),
         }
 

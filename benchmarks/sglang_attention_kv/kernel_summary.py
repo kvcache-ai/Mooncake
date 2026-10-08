@@ -1,11 +1,17 @@
 import csv
 import json
 
-# Columns of kernel_summary.csv, in the order they are written. The step total is
-# indices + kv_write + attention_plan + attention; the gather is a read-only probe
-# and is reported beside the step, never inside it.
-STEP_PHASES = ("indices", "kv_write", "attention_plan", "attention")
-REPORTED_PHASES = STEP_PHASES + ("kv_gather", "total_step")
+# Columns of kernel_summary.csv, in the order they are written. total_step is
+# indices + attention_plan + layer_loop, the three windows of the step itself.
+# kv_write_component and attention_component are measured in passes of their own,
+# beside the gather probe, and are never added to the step.
+STEP_PHASES = ("indices", "attention_plan", "layer_loop")
+REPORTED_PHASES = STEP_PHASES + (
+    "kv_write_component",
+    "attention_component",
+    "kv_gather",
+    "total_step",
+)
 
 CSV_COLUMNS = [
     "case_id",
@@ -52,21 +58,21 @@ for _phase in REPORTED_PHASES:
 CSV_COLUMNS.extend(
     [
         "attention_plan_us_per_layer",
-        "attention_run_us_per_layer",
-        "kv_write_us_per_new_token",
+        "attention_component_us_per_layer",
+        "kv_write_component_us_per_layer",
         "indices_us_per_new_token",
         "attention_us_per_context_token",
-        "kv_write_effective_gbps",
         "kv_gather_effective_gbps",
         "attention_effective_gbps",
-        "attention_valid_token_gbps",
         "attention_tflops",
         "attention_arithmetic_intensity",
-        "attention_share_of_step",
-        "kv_write_share_of_step",
         "indices_share_of_step",
         "attention_plan_share_of_step",
-        "kv_gather_share_of_attention_run",
+        "layer_loop_share_of_step",
+        "attention_component_share_of_step",
+        "kv_write_component_share_of_step",
+        "components_share_of_step",
+        "kv_gather_share_of_attention_component",
         "total_tokens_per_s",
     ]
 )
