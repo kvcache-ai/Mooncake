@@ -948,27 +948,30 @@ class SglangHashChain final : public HashChain {
         }
         while (computed_.size() <= index) {
             const size_t block_index = computed_.size();
-            encoded_.clear();
             const size_t logical_length =
                 bigram_ ? token_ids_.size() - 1 : token_ids_.size();
             const size_t block_begin = block_index * block_size_;
             const size_t block_end =
                 std::min(block_begin + block_size_, logical_length);
+            // Size once, then write little-endian bytes directly instead of
+            // updating the vectors for each byte of every token.
+            encoded_.resize((block_end - block_begin) * (bigram_ ? 8 : 4));
+            uint8_t* output = encoded_.data();
             for (size_t token_index = block_begin; token_index < block_end;
                  ++token_index) {
                 const int32_t token = token_ids_[token_index];
                 const uint32_t value = static_cast<uint32_t>(token);
-                encoded_.push_back(static_cast<uint8_t>(value));
-                encoded_.push_back(static_cast<uint8_t>(value >> 8));
-                encoded_.push_back(static_cast<uint8_t>(value >> 16));
-                encoded_.push_back(static_cast<uint8_t>(value >> 24));
+                *output++ = static_cast<uint8_t>(value);
+                *output++ = static_cast<uint8_t>(value >> 8);
+                *output++ = static_cast<uint8_t>(value >> 16);
+                *output++ = static_cast<uint8_t>(value >> 24);
                 if (bigram_) {
                     const uint32_t next_value =
                         static_cast<uint32_t>(token_ids_[token_index + 1]);
-                    encoded_.push_back(static_cast<uint8_t>(next_value));
-                    encoded_.push_back(static_cast<uint8_t>(next_value >> 8));
-                    encoded_.push_back(static_cast<uint8_t>(next_value >> 16));
-                    encoded_.push_back(static_cast<uint8_t>(next_value >> 24));
+                    *output++ = static_cast<uint8_t>(next_value);
+                    *output++ = static_cast<uint8_t>(next_value >> 8);
+                    *output++ = static_cast<uint8_t>(next_value >> 16);
+                    *output++ = static_cast<uint8_t>(next_value >> 24);
                 }
             }
             std::vector<uint8_t> input;

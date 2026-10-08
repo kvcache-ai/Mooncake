@@ -9,6 +9,7 @@ endif()
 
 add_executable(
   conductor_test
+  client_types_test.cpp
   common_utils_test.cpp
   json_uint64_test.cpp
   model_context_test.cpp
@@ -17,7 +18,10 @@ add_executable(
   msgpack_reader_test.cpp
   msg_decoder_test.cpp
   zmq_client_test.cpp
-  event_manager_test.cpp)
+  event_manager_test.cpp
+  conductor_service_test.cpp
+  wire_types_test.cpp
+  client_server_e2e_test.cpp)
 
 target_link_libraries(conductor_test PRIVATE conductor_cpp_core
                                              ${CONDUCTOR_GTEST_LIBS})

@@ -69,6 +69,8 @@ endif()
 add_library(
   conductor_cpp_core STATIC
   src/common/utils.cpp
+  src/client/types.cpp
+  src/client/conductor_client.cpp
   src/prefixindex/hash_strategy.cpp
   src/prefixindex/prefix_indexer.cpp
   src/zmq/msg_decoder.cpp
@@ -77,6 +79,8 @@ add_library(
   src/kvevent/object_key_parser.cpp
   src/kvevent/config.cpp
   src/kvevent/event_handler.cpp
+  src/kvevent/conductor_service.cpp
+  src/kvevent/rpc_service.cpp
   src/kvevent/event_manager.cpp)
 
 # mooncake-common headers are consumed directly instead of linking
@@ -108,6 +112,10 @@ endif()
 
 add_executable(mooncake_conductor src/main.cpp)
 target_link_libraries(mooncake_conductor PRIVATE conductor_cpp_core)
+
+# Stage 3's pybind module links conductor_cpp_core into a shared object.
+set_target_properties(conductor_cpp_core PROPERTIES POSITION_INDEPENDENT_CODE
+                                                    ON)
 
 # The /query hash chain prefers the low-level SHA256_* API, which hashes through
 # a stack context instead of allocating an EVP context per call. Those
