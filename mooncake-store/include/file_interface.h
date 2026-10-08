@@ -137,7 +137,7 @@ class StorageFile {
         return tl::make_unexpected(code);
     }
 
-    // errno of the first failed syscall; 0 for logical failures (short I/O).
+    // errno of the first failed syscall; 0 for logical failures (e.g. EOF).
     int sys_errno() const { return sys_errno_; }
 
     /**

@@ -7,6 +7,8 @@
 #include <cstring>
 #include <memory>
 #include <fcntl.h>
+#include <functional>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -257,6 +259,135 @@ TEST_F(PosixFileTest, ShortReadHasNoErrno) {
     ASSERT_FALSE(read);
     EXPECT_EQ(read.error(), ErrorCode::FILE_READ_FAIL);
     EXPECT_EQ(posix_file.sys_errno(), 0);
+}
+
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+// Runs `body` in a child whose file size limit is `limit_bytes`. With SIGXFSZ
+// ignored, a write that crosses the limit is short, and the next write at the
+// limit fails with EFBIG: a short write followed by the real error.
+static int RunWithFileSizeLimit(rlim_t limit_bytes,
+                                const std::function<int()>& body) {
+    pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR) _exit(100);
+        const struct rlimit limit = {limit_bytes, limit_bytes};
+        if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(101);
+        _exit(body());
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+#endif
+
+// A short pwritev is continued, so the caller sees the errno of the call that
+// really failed (EFBIG here, EIO on a dying disk) instead of a bare failure.
+TEST_F(PosixFileTest, ShortVectorWriteContinuesToTheRealErrno) {
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+    const std::string path =
+        "short_write_errno_" + std::to_string(getpid()) + ".tmp";
+    int rc = RunWithFileSizeLimit(4096, [&]() -> int {
+        int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) return 10;
+        PosixFile file(path, fd);
+        std::string data(8192, 'x');
+        iovec iov{data.data(), data.size()};
+        auto result = file.vector_write(&iov, 1, 0);
+        if (result) return 11;
+        if (result.error() != ErrorCode::FILE_WRITE_FAIL) return 12;
+        if (file.sys_errno() != EFBIG) return 13;
+        return 0;
+    });
+    unlink(path.c_str());
+    EXPECT_EQ(rc, 0) << "11: write succeeded, 12: wrong ErrorCode, "
+                        "13: errno is not EFBIG";
+#else
+    GTEST_SKIP() << "RLIMIT_FSIZE/SIGXFSZ is unavailable on this platform";
+#endif
+}
+
+// The first pwritev stops inside the second iovec. The continuation must start
+// at that byte of that iovec; the bytes before it are on disk unchanged.
+TEST_F(PosixFileTest, ShortVectorWriteInsideSecondIovecResumesThere) {
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+    const std::string path =
+        "short_write_iov_" + std::to_string(getpid()) + ".tmp";
+    int rc = RunWithFileSizeLimit(4096, [&]() -> int {
+        int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) return 10;
+        PosixFile file(path, fd);
+        file.SetDeleteOnWriteFail(false);  // keep the bytes for the check
+        std::string a(3000, 'a');
+        std::string b(3000, 'b');
+        iovec iov[2] = {{a.data(), a.size()}, {b.data(), b.size()}};
+        auto result = file.vector_write(iov, 2, 0);
+        if (result) return 11;
+        if (file.sys_errno() != EFBIG) return 12;
+        // The caller's iovecs are not modified.
+        if (iov[0].iov_base != a.data() || iov[0].iov_len != a.size() ||
+            iov[1].iov_base != b.data() || iov[1].iov_len != b.size())
+            return 13;
+        return 0;
+    });
+    EXPECT_EQ(rc, 0) << "11: write succeeded, 12: errno is not EFBIG, "
+                        "13: caller's iovecs changed";
+
+    // 3000 'a' then the first 1096 bytes of the second iovec.
+    std::string on_disk;
+    {
+        int fd = open(path.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0);
+        char buf[8192];
+        ssize_t n = pread(fd, buf, sizeof(buf), 0);
+        close(fd);
+        ASSERT_GE(n, 0);
+        on_disk.assign(buf, static_cast<size_t>(n));
+    }
+    unlink(path.c_str());
+    EXPECT_EQ(on_disk, std::string(3000, 'a') + std::string(1096, 'b'));
+#else
+    GTEST_SKIP() << "RLIMIT_FSIZE/SIGXFSZ is unavailable on this platform";
+#endif
+}
+
+// vector_read returns fewer bytes than asked only at EOF. A short preadv
+// before EOF is continued, so the caller sees the errno of the call that
+// really failed: here the second iovec is an inaccessible page, the kernel
+// fills the first iovec and returns that short count, and the continuation
+// fails with EFAULT (on a disk, a bad block gives a short read, then EIO).
+TEST_F(PosixFileTest, VectorReadIsShortOnlyAtEof) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    std::string content(2 * page, '\0');
+    for (size_t i = 0; i < content.size(); ++i)
+        content[i] = static_cast<char>('0' + i % 75);
+    ASSERT_EQ(pwrite(test_fd, content.data(), content.size(), 0),
+              static_cast<ssize_t>(content.size()));
+    PosixFile file(test_filename, test_fd);
+    test_fd = -1;  // owned by file now
+
+    // EOF inside the third iovec: the short count, no error, iovecs in order.
+    char c1[30], c2[30], c3[30];
+    iovec eof_iov[3] = {{c1, 30}, {c2, 30}, {c3, 30}};
+    auto at_eof = file.vector_read(eof_iov, 3, content.size() - 50);
+    ASSERT_TRUE(at_eof);
+    EXPECT_EQ(*at_eof, 50u);
+    EXPECT_EQ(std::string(c1, 30) + std::string(c2, 20),
+              content.substr(content.size() - 50));
+    EXPECT_EQ(file.sys_errno(), 0);
+
+    // Short before EOF: continued, and the continuation's errno is kept.
+    void* mem = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mem, MAP_FAILED);
+    char* base = static_cast<char*>(mem);
+    ASSERT_EQ(mprotect(base + page, page, PROT_NONE), 0);
+    iovec iov[2] = {{base, page}, {base + page, page}};
+    auto result = file.vector_read(iov, 2, 0);
+    EXPECT_FALSE(result);
+    EXPECT_EQ(file.sys_errno(), EFAULT);
+    EXPECT_EQ(std::string(base, page), content.substr(0, page));
+    munmap(mem, 2 * page);
 }
 
 // Test vectorized read operation
