@@ -429,11 +429,12 @@ class TransferEngineImpl {
 
 #ifdef ENABLE_MULTI_PROTOCOL
     struct RegisteredRecord {
-        std::shared_ptr<Transport> transport;
+        Transport* transport;
         void* addr;
         uint64_t length;
         std::string location;
         bool remote_accessible;
+        bool update_metadata;
     };
     std::vector<RegisteredRecord> rollbackAllRegistrations(
         const std::vector<RegisteredRecord>& records);
@@ -502,7 +503,9 @@ class TransferEngineImpl {
         const std::vector<MemoryRegion>& regions,
         const RegisteredTransportMap* registered_transport_map = nullptr);
 
-    void releaseMemoryRegions(const std::vector<MemoryRegion>& regions);
+    void releaseMemoryRegions(
+        const std::vector<MemoryRegion>& regions,
+        const std::unordered_set<uintptr_t>* quarantined_addresses = nullptr);
 
     void insertMemoryRegionLocked(const MemoryRegion& region);
 
@@ -519,6 +522,7 @@ class TransferEngineImpl {
     std::shared_mutex mutex_;
     MemoryRegionMap local_memory_regions_;
     MemoryRegionMap registering_memory_regions_;
+    MemoryRegionMap quarantined_memory_regions_;
     RegisteredTransportMap registered_transports_;
     RegisteredTransportMap unregistered_transports_;
     MemoryRegionMap unregistering_memory_regions_;
