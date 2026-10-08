@@ -28,6 +28,8 @@ TEST(RdmaCancelTest, PartialCancellationWaitsForPostedSlices) {
     task.success_slices.store(0);
     task.resolved_slices.store(0);
     task.first_error = PENDING;
+    int notifications = 0;
+    task.notify_progress = [&](BatchID) { ++notifications; };
     // Two slice references plus the batch reference. updateSliceStatus drops
     // one reference per resolved slice; the stack object is never deallocated.
     task.ref_count.store(3);
@@ -44,11 +46,13 @@ TEST(RdmaCancelTest, PartialCancellationWaitsForPostedSlices) {
     updateSliceStatus(&canceled, CANCELED);
     EXPECT_EQ(task.status_word, PENDING);
     EXPECT_EQ(task.transferred_bytes, 0u);
+    EXPECT_EQ(notifications, 0);
 
     updateSliceStatus(&posted, COMPLETED);
     EXPECT_EQ(task.status_word, CANCELED);
     EXPECT_EQ(task.transferred_bytes, 8192u);
     EXPECT_EQ(task.resolved_slices.load(), 2);
+    EXPECT_EQ(notifications, 1);
 }
 
 TEST(RdmaCancelTest, FullyPostedTaskMayStillComplete) {
@@ -61,6 +65,8 @@ TEST(RdmaCancelTest, FullyPostedTaskMayStillComplete) {
     task.first_error = PENDING;
     task.cancel_requested.store(true);
     task.ref_count.store(2);
+    int notifications = 0;
+    task.notify_progress = [&](BatchID) { ++notifications; };
 
     RdmaSlice posted{};
     posted.task = &task;
@@ -70,6 +76,10 @@ TEST(RdmaCancelTest, FullyPostedTaskMayStillComplete) {
 
     EXPECT_EQ(task.status_word, COMPLETED);
     EXPECT_EQ(task.transferred_bytes, 4096u);
+    EXPECT_EQ(notifications, 1);
+
+    updateSliceStatus(&posted, COMPLETED);
+    EXPECT_EQ(notifications, 1);
 }
 
 }  // namespace
