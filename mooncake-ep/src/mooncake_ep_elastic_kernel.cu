@@ -12,6 +12,7 @@
 #include <elastic/mooncake_ep_elastic_launch.cuh>
 #include <transport/device/comm_device.cuh>
 #if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#include <jit/elastic_dispatch_copy_epilogue_jit.h>
 #include <jit/elastic_dispatch_jit.h>
 #include <jit/elastic_dispatch_prologue_jit.h>
 #include <jit/elastic_hybrid_dispatch_jit.h>
@@ -838,8 +839,7 @@ void launch_mooncake_elastic_dispatch(
 #endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 }
 
-template <int kNumEpilogueWarps>
-void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
+void launch_mooncake_elastic_dispatch_copy_epilogue(
     void* recv_x, void* recv_sf, int64_t* recv_topk_idx,
     float* recv_topk_weights, int* recv_src_metadata,
     int* channel_linked_list, int num_recv_tokens, int num_max_tokens_per_rank,
@@ -849,11 +849,52 @@ void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
     bool cached_mode,
     const ElasticLaunchContext& ctx, int* psum_num_recv_tokens_per_scaleup_rank,
     int* psum_num_recv_tokens_per_expert, cudaStream_t stream) {
-    const int num_threads = kNumEpilogueWarps * 32;
+    using elastic::transport::IbgdaOps;
+#ifdef USE_NCCL_DEVICE
+    using elastic::transport::NcclOps;
+    const int num_epilogue_warps =
+        ctx.backend == ElasticTransportBackend::kNccl
+            ? NcclOps::kNumDispatchEpilogueWarps
+            : IbgdaOps::kNumDispatchEpilogueWarps;
+#else
+    const int num_epilogue_warps = IbgdaOps::kNumDispatchEpilogueWarps;
+#endif
     const int smem_bytes = std::max(
         num_smem_bytes,
         dispatch_epilogue_smem_bytes(hidden, elem_size, num_sf_packs, num_topk,
-                                     kNumEpilogueWarps));
+                                     num_epilogue_warps));
+
+    const elastic::DispatchCopyEpilogueKernelArgs args {
+        ctx.buffer,
+        ctx.workspace,
+        psum_num_recv_tokens_per_scaleup_rank,
+        psum_num_recv_tokens_per_expert,
+        recv_x,
+        static_cast<sf_pack_t*>(recv_sf),
+        recv_topk_idx,
+        recv_topk_weights,
+        recv_src_metadata,
+        channel_linked_list,
+        num_recv_tokens,
+        recv_sf_token_stride,
+        recv_sf_hidden_stride,
+        ctx.scaleout_rank_idx,
+        ctx.scaleup_rank_idx,
+    };
+
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+    // Expand mode ignores cached_mode and only the hybrid layout has channels,
+    // matching the instantiations of the prebuilt path.
+    jit::launch_elastic_dispatch_copy_epilogue_jit(
+        do_expand, cached_mode && !do_expand,
+        ctx.num_scaleout_ranks != 1 ? num_channels : 1, num_epilogue_warps,
+        num_epilogue_sms, ctx.num_scaleout_ranks, ctx.num_scaleup_ranks,
+        hidden * elem_size, num_sf_packs, num_max_tokens_per_rank, num_experts,
+        num_topk, smem_bytes, args, stream);
+#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+    // MUSA / MACA builds have no NCCL backend.
+    constexpr int kNumEpilogueWarps = IbgdaOps::kNumDispatchEpilogueWarps;
+    const int num_threads = kNumEpilogueWarps * 32;
 
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
@@ -862,27 +903,18 @@ void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
             constexpr int kHiddenBytes = (HB);                                 \
             constexpr int kNumSFPacks = (SFP);                                 \
             auto kernel = do_expand ?                                          \
-                elastic::dispatch_copy_epilogue_impl<                          \
+                elastic::dispatch_copy_epilogue<                               \
                     true, false, 0, C, kNumEpilogueWarps, SO, SU,       \
                     kHiddenBytes, kNumSFPacks, M, E, K> :                      \
                 (cached_mode ?                                                 \
-                    elastic::dispatch_copy_epilogue_impl<                      \
+                    elastic::dispatch_copy_epilogue<                           \
                         false, true, 0, C, kNumEpilogueWarps, SO, SU,   \
                         kHiddenBytes, kNumSFPacks, M, E, K> :                  \
-                    elastic::dispatch_copy_epilogue_impl<                      \
+                    elastic::dispatch_copy_epilogue<                           \
                         false, false, 0, C, kNumEpilogueWarps, SO, SU,  \
                         kHiddenBytes, kNumSFPacks, M, E, K>);                  \
             launch_cooperative(kernel, ctx.device_id, num_epilogue_sms, num_threads,          \
-                               smem_bytes, stream,                               \
-                               ctx.buffer, ctx.workspace,                      \
-                               psum_num_recv_tokens_per_scaleup_rank,          \
-                               psum_num_recv_tokens_per_expert, recv_x,        \
-                               static_cast<sf_pack_t*>(recv_sf),               \
-                               recv_topk_idx, recv_topk_weights,               \
-                               recv_src_metadata, channel_linked_list,         \
-                               num_recv_tokens, recv_sf_token_stride,          \
-                               recv_sf_hidden_stride, ctx.scaleout_rank_idx,   \
-                               ctx.scaleup_rank_idx);                          \
+                               smem_bytes, stream, args);                      \
         } while (false)
 
 #define TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, EL, SFP, CPS) \
@@ -906,9 +938,6 @@ void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, CPS);                \
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 4, 4, CPS)
 
-#ifdef USE_NCCL_DEVICE
-        TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24, 8);
-#endif
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24, 4);
 
 #undef TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE
@@ -923,26 +952,18 @@ void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
         constexpr int kHiddenBytes = (HB);                                     \
         constexpr int kNumSFPacks = (SFP);                                     \
         auto kernel = do_expand ?                                              \
-            elastic::dispatch_copy_epilogue_impl<                              \
+            elastic::dispatch_copy_epilogue<                                   \
                 true, false, 0, 1, kNumEpilogueWarps, 1, R,             \
                 kHiddenBytes, kNumSFPacks, M, E, K> :                          \
             (cached_mode ?                                                     \
-                elastic::dispatch_copy_epilogue_impl<                          \
+                elastic::dispatch_copy_epilogue<                               \
                     false, true, 0, 1, kNumEpilogueWarps, 1, R,         \
                     kHiddenBytes, kNumSFPacks, M, E, K> :                      \
-                elastic::dispatch_copy_epilogue_impl<                          \
+                elastic::dispatch_copy_epilogue<                               \
                     false, false, 0, 1, kNumEpilogueWarps, 1, R,        \
                     kHiddenBytes, kNumSFPacks, M, E, K>);                      \
         launch_cooperative(kernel, ctx.device_id, num_epilogue_sms, num_threads,              \
-                           smem_bytes, stream,                                   \
-                           ctx.buffer, ctx.workspace,                          \
-                           psum_num_recv_tokens_per_scaleup_rank,              \
-                           psum_num_recv_tokens_per_expert, recv_x,            \
-                           static_cast<sf_pack_t*>(recv_sf), recv_topk_idx,    \
-                           recv_topk_weights, recv_src_metadata,               \
-                           channel_linked_list, num_recv_tokens,               \
-                           recv_sf_token_stride, recv_sf_hidden_stride,        \
-                           ctx.scaleout_rank_idx, ctx.scaleup_rank_idx);       \
+                           smem_bytes, stream, args);                          \
     } while (false)
 
 #define TRY_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, R, EL, SFP)                 \
@@ -974,38 +995,7 @@ void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
     unsupported_elastic_config("dispatch_copy_epilogue", hidden, num_experts,
                                num_topk, num_max_tokens_per_rank, num_sms,
                                ctx.num_scaleup_ranks);
-}
-
-
-void launch_mooncake_elastic_dispatch_copy_epilogue(
-    void* recv_x, void* recv_sf, int64_t* recv_topk_idx,
-    float* recv_topk_weights, int* recv_src_metadata,
-    int* channel_linked_list, int num_recv_tokens, int num_max_tokens_per_rank,
-    int hidden, int elem_size, int num_sf_packs, int recv_sf_token_stride,
-    int recv_sf_hidden_stride, int num_experts, int num_topk, int num_sms,
-    int num_epilogue_sms, int num_smem_bytes, int num_channels, bool do_expand,
-    bool cached_mode,
-    const ElasticLaunchContext& ctx, int* psum_num_recv_tokens_per_scaleup_rank,
-    int* psum_num_recv_tokens_per_expert, cudaStream_t stream) {
-#define CALL_DISPATCH_EPILOGUE(WARPS)                                          \
-    launch_mooncake_elastic_dispatch_copy_epilogue_backend<WARPS>(             \
-        recv_x, recv_sf, recv_topk_idx, recv_topk_weights, recv_src_metadata,  \
-        channel_linked_list, num_recv_tokens, num_max_tokens_per_rank, hidden, \
-        elem_size, num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,  \
-        num_experts, num_topk, num_sms, num_epilogue_sms, num_smem_bytes,      \
-        num_channels,                                                          \
-        do_expand, cached_mode, ctx, psum_num_recv_tokens_per_scaleup_rank,    \
-        psum_num_recv_tokens_per_expert, stream)
-#ifdef USE_NCCL_DEVICE
-    if (ctx.backend == ElasticTransportBackend::kNccl) {
-        CALL_DISPATCH_EPILOGUE(
-            elastic::transport::NcclOps::kNumDispatchEpilogueWarps);
-        return;
-    }
-#endif
-    CALL_DISPATCH_EPILOGUE(
-        elastic::transport::IbgdaOps::kNumDispatchEpilogueWarps);
-#undef CALL_DISPATCH_EPILOGUE
+#endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 }
 
 template <typename Ops>
