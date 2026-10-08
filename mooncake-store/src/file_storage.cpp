@@ -934,6 +934,10 @@ int FileStorage::CheckFilesystem(bool sync_first) const {
     // sees, so sync_first forces the log with syncfs; its own result is
     // ignored (it also reports a single bad file's writeback error once).
     // stat on the path gives the same signal if the dir fd failed to open.
+    // syncfs runs on the failing I/O thread. A device that fails the
+    // triggering call quickly but wedges writeback can park it here; that
+    // thread is already stuck on that device, and hang detection is out of
+    // scope.
     if (sync_first && disk_dir_fd_ >= 0) (void)::syncfs(disk_dir_fd_);
     struct stat st;
     const int rc = disk_dir_fd_ >= 0
