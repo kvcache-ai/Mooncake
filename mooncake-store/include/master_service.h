@@ -1024,7 +1024,9 @@ class MasterService {
     auto AddReplicaForRetainedClient(const UUID& client_id,
                                      const std::string& key,
                                      const TenantId& tenant_id,
-                                     Replica& replica)
+                                     Replica& replica,
+                                     const std::string& object_version = "",
+                                     bool allow_create = true)
         -> tl::expected<bool, ErrorCode>;
     // Caller must hold client_mutex_.
     std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
@@ -1574,6 +1576,7 @@ class MasterService {
     // appended to it on success.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
+        const std::string& object_version,
         std::vector<UUID>* mirror_clients = nullptr);
 
     // Cancels the offload task on `object_id`, releasing the source refcnt

@@ -29,6 +29,10 @@ TEST(LocalSsdCodecTest, RoundTripIsDeterministic) {
         .pending_offloads = {{"b", Offload("tenant", "b", 2)},
                              {"a", Offload("tenant", "a", 3)}}};
 
+    auto& versioned = state.at(UUID{1, 8}).pending_offloads.at("a");
+    versioned.object_version = "write-incarnation";
+    versioned.source_replica_id = 123;
+
     auto first = PackState(state);
     auto second = PackState(state);
     EXPECT_EQ(first, second);
@@ -36,6 +40,7 @@ TEST(LocalSsdCodecTest, RoundTripIsDeterministic) {
     auto decoded = LocalSsdCodec::Decode(&object.get());
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(PackState(*decoded), first);
+    EXPECT_EQ(decoded->at(UUID{1, 8}).pending_offloads.at("a"), versioned);
 }
 
 TEST(LocalSsdCodecTest, DecodesLegacySizeAndPreservesEncodedKey) {

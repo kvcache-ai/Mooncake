@@ -22,16 +22,20 @@ namespace {
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
-    const std::vector<StorageObjectMetadata>& metadatas) {
+    const std::vector<StorageObjectMetadata>& metadatas, bool versioned) {
     std::vector<OffloadTaskItem> tasks;
     tasks.reserve(storage_keys.size());
     for (size_t i = 0; i < storage_keys.size(); ++i) {
         auto [tenant_id, key] = TenantId::ParseScopedKey(storage_keys[i]);
         const int64_t size =
             i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
-                                        .key = std::move(key),
-                                        .size = size});
+        tasks.push_back(OffloadTaskItem{
+            .tenant_id = tenant_id.value(),
+            .key = std::move(key),
+            .size = size,
+            .object_version =
+                i < metadatas.size() ? metadatas[i].object_version : "",
+            .is_rescan = versioned});
     }
     return tasks;
 }
@@ -187,7 +191,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             for (auto& metadata : metadatas) {
                 metadata.transport_endpoint = local_rpc_addr_;
             }
-            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+            auto tasks = BuildOffloadTasksFromStorageKeys(
+                keys, metadatas,
+                config_.storage_backend_type == StorageBackendType::kBucket);
             auto add_object_result =
                 client_->NotifyOffloadSuccess(tasks, metadatas);
             if (!add_object_result) {
@@ -309,6 +315,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (offloading_objects.empty()) {
         return {};
     }
+    MutexLocker execution_lock(&offload_execution_mutex_);
+    BucketStorageBackend::ObjectVersions versions;
     std::unordered_map<std::string, int64_t> storage_object_sizes;
     std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
     storage_object_sizes.reserve(offloading_objects.size());
@@ -316,6 +324,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     for (const auto& task : offloading_objects) {
         const auto storage_key =
             TenantId(task.tenant_id).MakeScopedKey(task.key);
+        versions.emplace(storage_key, task.object_version);
         storage_object_sizes.emplace(storage_key, task.size);
         task_by_storage_key.emplace(storage_key, task);
     }
@@ -324,7 +333,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys);
+            storage_object_sizes, buckets_keys, versions);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -390,14 +399,17 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
         for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
             std::vector<std::string> user_keys;
+            std::unordered_map<std::string, OffloadTaskItem> source_tasks;
             user_keys.reserve(storage_keys.size());
             for (const auto& storage_key : storage_keys) {
-                user_keys.push_back(task_by_storage_key.at(storage_key).key);
+                const auto& task = task_by_storage_key.at(storage_key);
+                user_keys.push_back(task.key);
+                source_tasks.emplace(task.key, task);
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
             [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
-                user_keys, tenant_id, user_batch_object);
+                user_keys, tenant_id, user_batch_object, source_tasks);
             // BatchQuerySegmentSlices is now best-effort: it always returns
             // OK. Keys present in user_batch_object go to batch_object; the
             // rest are reported as failed.
@@ -498,11 +510,19 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             return res;
         };
-        auto offload_res = storage_backend_->BatchOffload(
-            host_batch_object, bucket_complete_handler,
+        auto eviction_handler =
             [this](const std::vector<std::string>& evicted_keys) {
                 return NotifyEvictedDiskReplicas(evicted_keys);
-            });
+            };
+        const auto bucket_backend =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+        auto offload_res = bucket_backend
+                               ? bucket_backend->BatchOffloadVersioned(
+                                     host_batch_object, bucket_complete_handler,
+                                     eviction_handler, versions)
+                               : storage_backend_->BatchOffload(
+                                     host_batch_object, bucket_complete_handler,
+                                     eviction_handler);
 
         // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
@@ -1046,15 +1066,26 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
 
 tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
-    std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
+    std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+    const std::unordered_map<std::string, OffloadTaskItem>& tasks) {
     auto batched_query_results = client_->BatchQuery(keys, tenant_id);
     if (batched_query_results.empty()) {
         return {};
     }
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
         if (batched_query_results[i]) {
+            const auto task = tasks.find(keys[i]);
+            if (task != tasks.end() && !task->second.object_version.empty() &&
+                task->second.object_version !=
+                    batched_query_results[i]->offload_version) {
+                continue;
+            }
             for (const auto& descriptor :
                  batched_query_results[i].value().replicas) {
+                if (task != tasks.end() &&
+                    task->second.source_replica_id != 0 &&
+                    task->second.source_replica_id != descriptor.id)
+                    continue;
                 if (client_->IsReplicaOnLocalMemory(descriptor)) {
                     const auto& memory_descriptor =
                         descriptor.get_memory_descriptor();
@@ -1247,7 +1278,10 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = local_rpc_addr_;
                 }
-                auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+                auto tasks = BuildOffloadTasksFromStorageKeys(
+                    keys, metadatas,
+                    config_.storage_backend_type ==
+                        StorageBackendType::kBucket);
                 auto add_object_result =
                     client_->NotifyOffloadSuccess(tasks, metadatas);
                 if (!add_object_result) {

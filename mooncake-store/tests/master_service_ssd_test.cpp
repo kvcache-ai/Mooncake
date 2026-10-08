@@ -88,6 +88,93 @@ void PutAndOffload(MasterService& service, const UUID& client_id,
                     .has_value());
 }
 
+TEST_F(MasterServiceSSDTest,
+       PreviousIncarnationCannotCompleteOrCancelReputOffload) {
+    auto service = CreateSsdAwareOffloadService();
+    const auto client = generate_uuid();
+    const auto mirror = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client, "offload_versions", 0x310000000);
+    MountMemoryAndLocalDisk(*service, mirror, "offload_mirror", 0x320000000);
+    const std::string key = "reused";
+    auto put = [&]() {
+        ASSERT_TRUE(service->PutStart(client, key, TenantId::Default(), 4096,
+                                      ReplicateConfig{.replica_num = 2}));
+        ASSERT_TRUE(service->PutEnd(client, key, TenantId::Default(),
+                                    ReplicaType::MEMORY));
+    };
+    put();
+    auto first = service->OffloadObjectHeartbeat(client, true);
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->size(), 1u);
+    ASSERT_FALSE(first->front().object_version.empty());
+    StorageObjectMetadata old_metadata{
+        1, 0, 0, 4096, "offload_versions", first->front().object_version};
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client, *first, {old_metadata}));
+    ASSERT_TRUE(service->Remove(key, TenantId::Default()));
+    put();
+    auto second = service->OffloadObjectHeartbeat(client, true);
+    ASSERT_TRUE(second);
+    ASSERT_EQ(second->size(), 1u);
+    EXPECT_NE(first->front().object_version, second->front().object_version);
+    auto pending_mirror = service->OffloadObjectHeartbeat(mirror, true);
+    ASSERT_TRUE(pending_mirror);
+    ASSERT_EQ(pending_mirror->size(), 1u);
+    EXPECT_EQ(pending_mirror->front().object_version,
+              second->front().object_version);
+
+    auto nack = old_metadata;
+    nack.data_size = -1;
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client, *first, {nack}));
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service.get(), {TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        const auto* tenant = accessor.GetTenantState();
+        ASSERT_NE(tenant, nullptr);
+        auto task = tenant->offloading_tasks.find(key);
+        ASSERT_NE(task, tenant->offloading_tasks.end());
+        const auto& replicas = accessor.Get().GetAllReplicas();
+        auto source = std::find_if(
+            replicas.begin(), replicas.end(), [&](const Replica& replica) {
+                return replica.id() == task->second.source_id;
+            });
+        ASSERT_NE(source, replicas.end());
+        EXPECT_EQ(source->get_refcnt(), 1u);
+    }
+
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client, *first, {old_metadata}));
+    auto rescan = first->front();
+    rescan.is_rescan = true;
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client, {rescan}, {old_metadata}));
+    rescan.object_version.clear();
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client, {rescan}, {old_metadata}));
+    auto current = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(current);
+    ASSERT_EQ(current->replicas.size(), 2u);
+    for (const auto& replica : current->replicas)
+        EXPECT_TRUE(replica.is_memory_replica());
+    EXPECT_EQ(current->offload_version, second->front().object_version);
+
+    StorageObjectMetadata new_metadata{
+        2, 0, 0, 4096, "offload_versions", second->front().object_version};
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client, *second, {new_metadata}));
+    current = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->replicas.size(), 3u);
+    {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service.get(), {TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        EXPECT_EQ(accessor.GetTenantState()->offloading_tasks.count(key), 0u);
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            EXPECT_EQ(replica.get_refcnt(), 0u);
+        }
+    }
+    EXPECT_TRUE(service->Remove(key, TenantId::Default()));
+}
+
 TEST_F(MasterServiceSSDTest, PutRevokeProcessingDiskKeepsSsdTotal) {
     auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
     auto& metrics = MasterMetricManager::instance();

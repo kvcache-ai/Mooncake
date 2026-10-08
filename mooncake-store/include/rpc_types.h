@@ -78,17 +78,21 @@ struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
     std::optional<uint64_t> object_checksum;
+    std::string offload_version;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
         std::vector<Replica::Descriptor>&& replicas_param,
         uint64_t lease_ttl_ms_param,
-        std::optional<uint64_t> object_checksum_param = std::nullopt)
+        std::optional<uint64_t> object_checksum_param = std::nullopt,
+        std::string offload_version_param = "")
         : replicas(std::move(replicas_param)),
           lease_ttl_ms(lease_ttl_ms_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          offload_version(std::move(offload_version_param)) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
+         offload_version);
 
 struct CachedQueryResultResponse {
     bool success;
