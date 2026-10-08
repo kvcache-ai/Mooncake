@@ -125,6 +125,9 @@ option(
   OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_FABRIC
+       "option for the libfabric transport in TENT (implied by USE_EFA/USE_CXI)"
+       OFF)
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 
