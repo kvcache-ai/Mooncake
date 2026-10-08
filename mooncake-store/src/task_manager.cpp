@@ -139,6 +139,10 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
         return ErrorCode::OK;
     }
 
+    if (task.status == TaskStatus::PENDING &&
+        manager_->total_pending_tasks_ > 0) {
+        manager_->total_pending_tasks_--;
+    }
     task.mark_complete(status, message);
 
     auto ps_it = manager_->processing_tasks_.find(client_id);
