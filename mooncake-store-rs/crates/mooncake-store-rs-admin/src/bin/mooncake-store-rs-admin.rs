@@ -1723,55 +1723,59 @@ mod tests {
 
     #[test]
     fn server_subcommand_parses_cleanup_flags() {
-        let args = Args::parse_from([
-            "mooncake-store-rs-admin",
-            "--metadata-url",
-            "redis://127.0.0.1:6379/0",
-            "server",
-            "--cleanup-interval-ms",
-            "2000",
-            "--cleanup-batch-size",
-            "64",
-            "--quota-reconcile-interval-ms",
-            "3000",
-            "--quota-reconcile-tenant",
-            "tenant-a",
-            "--quota-reconcile-tenant",
-            "tenant-b",
-        ]);
-        match args.command {
-            Command::Server(server_args) => {
-                assert_eq!(server_args.cleanup_interval_ms, 2_000);
-                assert_eq!(server_args.cleanup_batch_size, 64);
-                assert_eq!(server_args.quota_reconcile_interval_ms, 3_000);
-                assert_eq!(
-                    server_args.quota_reconcile_tenants,
-                    vec!["tenant-a".to_string(), "tenant-b".to_string()]
-                );
+        without_admin_server_env(|| {
+            let args = Args::parse_from([
+                "mooncake-store-rs-admin",
+                "--metadata-url",
+                "redis://127.0.0.1:6379/0",
+                "server",
+                "--cleanup-interval-ms",
+                "2000",
+                "--cleanup-batch-size",
+                "64",
+                "--quota-reconcile-interval-ms",
+                "3000",
+                "--quota-reconcile-tenant",
+                "tenant-a",
+                "--quota-reconcile-tenant",
+                "tenant-b",
+            ]);
+            match args.command {
+                Command::Server(server_args) => {
+                    assert_eq!(server_args.cleanup_interval_ms, 2_000);
+                    assert_eq!(server_args.cleanup_batch_size, 64);
+                    assert_eq!(server_args.quota_reconcile_interval_ms, 3_000);
+                    assert_eq!(
+                        server_args.quota_reconcile_tenants,
+                        vec!["tenant-a".to_string(), "tenant-b".to_string()]
+                    );
+                }
+                other => panic!("unexpected command: {other:?}"),
             }
-            other => panic!("unexpected command: {other:?}"),
-        }
+        });
     }
 
     #[test]
     fn policy_set_parses_expected_flags() {
-        let args = Args::parse_from([
-            "mooncake-store-rs-admin",
-            "--metadata-url",
-            "redis://127.0.0.1:6379/0",
-            "policy",
-            "set",
-            "--tenant",
-            "tenant-a",
-            "--domain",
-            "domain-a",
-            "--route-topk",
-            "3",
-            "--max-bytes",
-            "1024",
-            "--prefer-local",
-            "true",
-        ]);
+        let args = with_env_vars([("MC_STORE_ADMIN_UPDATED_BY", None)], || {
+            Args::parse_from([
+                "mooncake-store-rs-admin",
+                "--metadata-url",
+                "redis://127.0.0.1:6379/0",
+                "policy",
+                "set",
+                "--tenant",
+                "tenant-a",
+                "--domain",
+                "domain-a",
+                "--route-topk",
+                "3",
+                "--max-bytes",
+                "1024",
+                "--prefer-local",
+                "true",
+            ])
+        });
         match args.command {
             Command::Policy {
                 command:
@@ -1807,17 +1811,25 @@ mod tests {
 
     #[test]
     fn quota_reservations_parses_state_filter() {
-        let args = Args::parse_from([
-            "mooncake-store-rs-admin",
-            "--metadata-url",
-            "redis://127.0.0.1:6379/0",
-            "quota",
-            "reservations",
-            "--tenant",
-            "tenant-a",
-            "--state",
-            "pending",
-        ]);
+        let args = with_env_vars(
+            [
+                ("MC_STORE_ADMIN_TENANT", None),
+                ("MC_STORE_ADMIN_RESERVATION_STATE", None),
+            ],
+            || {
+                Args::parse_from([
+                    "mooncake-store-rs-admin",
+                    "--metadata-url",
+                    "redis://127.0.0.1:6379/0",
+                    "quota",
+                    "reservations",
+                    "--tenant",
+                    "tenant-a",
+                    "--state",
+                    "pending",
+                ])
+            },
+        );
         match args.command {
             Command::Quota {
                 command:
@@ -1835,18 +1847,27 @@ mod tests {
 
     #[test]
     fn quota_abort_parses_reservation_id_and_dry_run() {
-        let args = Args::parse_from([
-            "mooncake-store-rs-admin",
-            "--metadata-url",
-            "redis://127.0.0.1:6379/0",
-            "quota",
-            "abort",
-            "--tenant",
-            "tenant-a",
-            "--reservation-id",
-            "res-a",
-            "--dry-run",
-        ]);
+        let args = with_env_vars(
+            [
+                ("MC_STORE_ADMIN_TENANT", None),
+                ("MC_STORE_ADMIN_RESERVATION_ID", None),
+                ("MC_STORE_ADMIN_DRY_RUN", None),
+            ],
+            || {
+                Args::parse_from([
+                    "mooncake-store-rs-admin",
+                    "--metadata-url",
+                    "redis://127.0.0.1:6379/0",
+                    "quota",
+                    "abort",
+                    "--tenant",
+                    "tenant-a",
+                    "--reservation-id",
+                    "res-a",
+                    "--dry-run",
+                ])
+            },
+        );
         match args.command {
             Command::Quota {
                 command:
@@ -1866,16 +1887,24 @@ mod tests {
 
     #[test]
     fn quota_reconcile_parses_dry_run() {
-        let args = Args::parse_from([
-            "mooncake-store-rs-admin",
-            "--metadata-url",
-            "redis://127.0.0.1:6379/0",
-            "quota",
-            "reconcile",
-            "--tenant",
-            "tenant-a",
-            "--dry-run",
-        ]);
+        let args = with_env_vars(
+            [
+                ("MC_STORE_ADMIN_TENANT", None),
+                ("MC_STORE_ADMIN_DRY_RUN", None),
+            ],
+            || {
+                Args::parse_from([
+                    "mooncake-store-rs-admin",
+                    "--metadata-url",
+                    "redis://127.0.0.1:6379/0",
+                    "quota",
+                    "reconcile",
+                    "--tenant",
+                    "tenant-a",
+                    "--dry-run",
+                ])
+            },
+        );
         match args.command {
             Command::Quota {
                 command: QuotaCommand::Reconcile { scope, dry_run },

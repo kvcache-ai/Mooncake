@@ -2,7 +2,16 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
+ROOT_DIR=${MOONCAKE_ROOT_DIR:?MOONCAKE_ROOT_DIR must point to the Mooncake source root}
+STORE_RS_DIR=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must point to the Store-RS source directory}
+[[ "${ROOT_DIR}" == /* && -d "${ROOT_DIR}" ]] || {
+  echo "MOONCAKE_ROOT_DIR must be an absolute existing directory: ${ROOT_DIR}" >&2
+  exit 1
+}
+[[ "${STORE_RS_DIR}" == /* && -d "${STORE_RS_DIR}" ]] || {
+  echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${STORE_RS_DIR}" >&2
+  exit 1
+}
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../../lib/common.sh"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
@@ -16,7 +25,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/tests/client/test-client-rw-cli.sh [all|real|dummy]
 
-Build and execute the standalone mooncake-store-rs-client binary, then verify both
+Execute the installed mooncake-store-rs-client binary, then verify both
 repository-standard read/write validators:
 
 - `python/tests/store/rs/clients/dummy_client_rw.py` against the daemon dummy API
@@ -31,10 +40,12 @@ Environment:
   MC_STORE_RS_ROUTE_CONTROL   Route control mode (`embedded-wrh` by default)
   MC_STORE_RS_ROUTE_TOPK      Embedded WRH top-k authority count (default: 2)
   MC_STORE_RS_TEST_PROTOCOL   Transport protocol (`tcp` by default)
+  MOONCAKE_ROOT_DIR           Absolute Mooncake source directory
   MOONCAKE_STORE_RS_DIR       Absolute Store-RS source directory
-  MOONCAKE_ROOT_DIR            Absolute Mooncake source directory
-  MOONCAKE_BUILD_DIR           Absolute Mooncake CMake build directory
-  MC_STORE_RS_CLIENT_RW_BIN   Optional explicit standalone client binary path.
+  MOONCAKE_PYTHON_BIN         Interpreter in the isolated installed-package test environment
+  MC_STORE_RS_TRANSPORT_METADATA_URL
+                              Transfer Engine metadata URL (defaults to this test's Redis URL)
+  MC_STORE_RS_CLIENT_RW_BIN   Installed Store-RS client binary.
 EOF
 }
 
@@ -117,14 +128,14 @@ mc_scripts_require_command python3
 mc_scripts_require_command redis-cli
 mc_scripts_require_command redis-server
 
+cd "${ROOT_DIR}"
+unset MOONCAKE_ROOT_DIR MOONCAKE_STORE_RS_DIR
 mc_scripts_setup_root_store_rs_python
 export PYTHONDONTWRITEBYTECODE=1
 
 mc_scripts_start_local_redis_if_needed "${REDIS_PORT}" REDIS_STARTED
 
-cd "${REPO_ROOT}"
-
-BIN="${PYTHON_BIN%/*}/mooncake-store-rs-client"
+BIN="${MC_STORE_RS_CLIENT_RW_BIN:?MC_STORE_RS_CLIENT_RW_BIN must point to the installed Store-RS client binary}"
 
 if [[ ! -x "${BIN}" ]]; then
   echo "installed root wheel did not provide ${BIN}" >&2
@@ -134,6 +145,7 @@ fi
 RUN_ID=$(date +%s%N)
 KEYSPACE="mc/store-rs/test-client-rw-cli/${RUN_ID}"
 REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
+TRANSPORT_METADATA_URL="${MC_STORE_RS_TRANSPORT_METADATA_URL:-${REDIS_URL}}"
 DAEMON_A_TRANSPORT_PORT=$(allocate_port)
 DAEMON_B_TRANSPORT_PORT=$(allocate_port)
 DUMMY_RPC_PORT=$(allocate_port)
@@ -152,6 +164,7 @@ start_daemon() {
     "${BIN}"
     --local-hostname 127.0.0.1
     --metadata-url "${REDIS_URL}"
+    --transport-metadata-url "${TRANSPORT_METADATA_URL}"
     --storage-bytes $((64 * 1024 * 1024))
     --scratch-bytes $((16 * 1024 * 1024))
     --protocol "${PROTOCOL}"
@@ -238,6 +251,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
   "${PYTHON_BIN}" ./python/tests/store/rs/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
+    --transport_metadata_url "${TRANSPORT_METADATA_URL}" \
     --storage-bytes 0 \
     --scratch-bytes $((16 * 1024 * 1024)) \
     --protocol "${PROTOCOL}" \
@@ -256,6 +270,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
   "${PYTHON_BIN}" ./python/tests/store/rs/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
+    --transport_metadata_url "${TRANSPORT_METADATA_URL}" \
     --storage-bytes 0 \
     --scratch-bytes $((16 * 1024 * 1024)) \
     --protocol "${PROTOCOL}" \
@@ -275,6 +290,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
   "${PYTHON_BIN}" ./python/tests/store/rs/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
+    --transport_metadata_url "${TRANSPORT_METADATA_URL}" \
     --storage-bytes 0 \
     --scratch-bytes $((16 * 1024 * 1024)) \
     --protocol "${PROTOCOL}" \
@@ -293,6 +309,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
   "${PYTHON_BIN}" ./python/tests/store/rs/clients/real_client_rw.py \
     --local_host "127.0.0.1:$(allocate_port)" \
     --metadata_url "${REDIS_URL}" \
+    --transport_metadata_url "${TRANSPORT_METADATA_URL}" \
     --storage-bytes 0 \
     --scratch-bytes $((16 * 1024 * 1024)) \
     --protocol "${PROTOCOL}" \

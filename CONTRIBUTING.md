@@ -127,15 +127,18 @@ further changes are needed.
 
 ## Store-RS Test Entry Point
 
-Run the component Python compatibility validator from the repository root:
+Run the root Store-RS smoke entry point from the repository root after building
+the Rust workspace and installing the `python` CMake component to a prefix:
 
 ```bash
-mooncake-store-rs/scripts/e2e/run-python-compat-e2e.sh
+scripts/ci/run_store_rs_smoke.sh
 ```
 
-It requires a root wheel built with `WITH_STORE_RS=ON`. See the [Store-RS
-validation guide](docs/source/deployment/store-rs/testing.md) for the required
-Python environment and scenario-specific checks.
+It runs Store-RS library and binary unit tests, checks both installed Python
+backends and all three commands, then validates dummy and routed TCP/classic-TE
+read/write paths against the installed package. See the [Store-RS validation
+guide](docs/source/deployment/store-rs/testing.md) for its required paths and
+the scenario-specific commands for heavier coverage.
 
 ## Code Quality
 

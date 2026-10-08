@@ -76,11 +76,10 @@ MOONCAKE_STORE_BACKEND=rs .venv-store-rs/bin/python -c \
 
 ## Validate and continue
 
-For Python compatibility validation, use a root wheel built with
-`WITH_STORE_RS=ON` and run
-`mooncake-store-rs/scripts/e2e/run-python-compat-e2e.sh`. The [Python
-compatibility e2e guide](../deployment/store-rs/testing.md#local-validation)
-lists the required environment and scenario steps.
+For workspace unit tests and installed-package smoke coverage, run
+`scripts/ci/run_store_rs_smoke.sh` after installing the CMake `python`
+component. The [Store-RS validation guide](../deployment/store-rs/testing.md#local-validation)
+lists the required CMake paths and the direct commands for heavier scenarios.
 
 The [Store-RS deployment index](../deployment/store-rs/index.md) links to
 configuration, operator, and scenario-specific validation guides. For API

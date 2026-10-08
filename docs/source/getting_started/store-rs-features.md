@@ -505,10 +505,10 @@ The compatibility layer exposes two integration modes:
 
 Both paths are covered by repository validation scripts.
 
-The component Python compatibility validation entry point is
-`mooncake-store-rs/scripts/e2e/run-python-compat-e2e.sh`. See the
-[validation guide](../deployment/store-rs/testing.md) for its required
-environment and additional scenario-specific checks.
+The root validation entry point is `scripts/ci/run_store_rs_smoke.sh`. It
+covers the installed Python facade and the dummy and routed TCP/classic-TE
+read/write paths. See the [validation guide](../deployment/store-rs/testing.md)
+for required build inputs and direct commands for additional scenarios.
 
 Manual path-specific validators stay available as:
 

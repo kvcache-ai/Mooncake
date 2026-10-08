@@ -73,10 +73,10 @@ Check the Python import and the three standalone command entry points:
     .venv-store-rs/bin/mooncake-store-rs-admin --help
     .venv-store-rs/bin/mooncake-store-rs-bench --help
 
-For Python compatibility validation, run
-`mooncake-store-rs/scripts/e2e/run-python-compat-e2e.sh`. See the [Python
-compatibility e2e guide](../docs/source/deployment/store-rs/testing.md#local-validation)
-for the required environment and scenario steps.
+For workspace unit tests and installed-package smoke coverage, use
+`scripts/ci/run_store_rs_smoke.sh` from the repository root after installing
+the CMake `python` component. The [Store-RS validation guide](../docs/source/deployment/store-rs/testing.md#local-validation)
+lists the required paths and the separate commands for heavier scenarios.
 
 ## Runtime commands
 

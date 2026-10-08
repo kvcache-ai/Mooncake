@@ -1,12 +1,69 @@
 # Store-RS Test and Validation Guide
 
-Run component validation scripts from the Mooncake repository root unless a
-procedure says otherwise. Each scenario lists its required CMake artifacts,
-Python environment, and services. Run Rust unit-test commands from the
-`mooncake-store-rs` directory. Hardware-specific procedures state their
-topology requirements.
+Run Store-RS validation from the Mooncake repository root unless a procedure
+says otherwise. Each scenario lists its required CMake artifacts, Python
+environment, and services. Hardware-specific procedures state their topology
+requirements.
 
 ## Local Validation
+
+### Root Store-RS smoke
+
+Use the root smoke entry point for workspace unit tests and installed-package
+validation. It checks the default C++ facade and the Store-RS facade, exercises
+all three installed Store-RS commands, then runs dummy and routed TCP/classic-TE
+single and batch read/write assertions.
+
+The smoke consumes an existing root CMake build and its Python component
+install prefix. Configure the root CMake build with the options below. `SKBUILD`
+selects the `mooncake` package install layout, and `USE_REDIS` enables the
+Transfer Engine metadata used by the TCP/classic-TE scenario:
+
+Use a CPython environment with NumPy and pybind11 installed. CMake uses that
+environment's pybind11 CMake package and NumPy headers while building the
+Python component.
+
+```bash
+export MOONCAKE_ROOT_DIR="$PWD"
+export MOONCAKE_STORE_RS_DIR="$MOONCAKE_ROOT_DIR/mooncake-store-rs"
+export MOONCAKE_BUILD_DIR="$MOONCAKE_ROOT_DIR/build/store-rs-smoke"
+export MOONCAKE_PYTHON_PREFIX="$MOONCAKE_ROOT_DIR/build/store-rs-python-prefix"
+export MOONCAKE_CLASSIC_SHIM_LIB_PATH="$MOONCAKE_BUILD_DIR/mooncake-store-rs/native-shims/libmooncake_classic_shim.so"
+export MOONCAKE_TENT_SHIM_LIB_PATH="$MOONCAKE_BUILD_DIR/mooncake-store-rs/native-shims/libmooncake_tent_shim.so"
+export MOONCAKE_PYTHON_BIN="$(command -v python3)" # optional venv creator
+export PYBIND11_CMAKE_DIR="$("$MOONCAKE_PYTHON_BIN" -m pybind11 --cmakedir)"
+
+cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" \
+  -DSKBUILD=ON \
+  -DPython3_EXECUTABLE="$MOONCAKE_PYTHON_BIN" \
+  -Dpybind11_DIR="$PYBIND11_CMAKE_DIR" \
+  -DWITH_STORE=ON \
+  -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON \
+  -DWITH_TE=ON \
+  -DUSE_TENT=ON \
+  -DUSE_REDIS=ON \
+  -DBUILD_EXAMPLES=OFF \
+  -DBUILD_UNIT_TESTS=OFF \
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build "$MOONCAKE_BUILD_DIR" \
+  --target _fast_copy engine store transfer_engine mooncake_store \
+  mooncake_master mooncake_client build_store_rs \
+  --parallel
+cmake --install "$MOONCAKE_BUILD_DIR" --component python \
+  --prefix "$MOONCAKE_PYTHON_PREFIX"
+mkdir -p "$MOONCAKE_PYTHON_PREFIX/mooncake"
+cp -a "$MOONCAKE_ROOT_DIR/python/mooncake/." "$MOONCAKE_PYTHON_PREFIX/mooncake/"
+scripts/ci/run_store_rs_smoke.sh
+```
+
+The command runs `cargo test --workspace --lib --bins --release`, creates a
+temporary clean virtual environment from the assembled prefix, and consumes
+the exact CMake-installed Store-RS client for its data-path checks. CMake
+installs native artifacts and legacy modules; the `cp` command adds the
+root-owned Python package, including `mooncake.store` and the Store-RS facade.
+Set `MOONCAKE_PYTHON_BIN` to the configured CPython interpreter.
 
 ### Rust e2e
 
@@ -895,20 +952,27 @@ The scenarios above describe correctness coverage for the cold-tier design. Use 
 
 ## Python Validation Scenarios
 
-## Standard Read/Write Validation
+## Installed Package Read/Write Scenario
 
-Use the repository-standard entry point to validate both compatibility paths in one run:
+Run the installed-package read/write scenario directly when only the dummy and
+routed TCP/classic-TE data paths need validation. Provide the CMake-installed
+client binary and a clean Python environment containing the installed root
+package:
 
 ```bash
-mooncake-store-rs/scripts/tests/client/test-client-rw-cli.sh
+MOONCAKE_ROOT_DIR="$PWD" \
+MOONCAKE_STORE_RS_DIR="$PWD/mooncake-store-rs" \
+MOONCAKE_PYTHON_BIN=/path/to/installed-package-venv/bin/python \
+MC_STORE_RS_CLIENT_RW_BIN=/path/to/python-component-prefix/mooncake/mooncake-store-rs-client \
+mooncake-store-rs/scripts/tests/client/test-client-rw-cli.sh all
 ```
 
 This script:
 
-- builds the standalone `mooncake-store-rs-client` binary
+- consumes the explicitly selected installed `mooncake-store-rs-client` binary
 - starts two storage daemons against a temporary Redis metadata backend
-- validates dummy single-item, shm batch, and shm multi-buffer read/write
-- validates real routed write/read across separate real clients
+- validates dummy single-item, shm batch, and shm multi-buffer byte round trips
+- validates real routed TCP/classic-TE single and batch byte round trips across separate clients
 
 For path-specific manual checks, keep using the paired helper scripts below.
 
