@@ -409,19 +409,6 @@ class TransferEngineImpl {
 
     bool checkOverlap(void* addr, uint64_t length);
 
-#ifdef ENABLE_MULTI_PROTOCOL
-    struct RegisteredRecord {
-        Transport* transport;
-        void* addr;
-        uint64_t length;
-        std::string location;
-        bool remote_accessible;
-        bool update_metadata;
-    };
-    std::vector<RegisteredRecord> rollbackAllRegistrations(
-        const std::vector<RegisteredRecord>& records);
-#endif
-
     void setAutoDiscover(bool auto_discover) {
         auto_discover_config_ = {.enabled = auto_discover, .protocol = ""};
     }
@@ -460,6 +447,18 @@ class TransferEngineImpl {
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
     using TransportSet = std::unordered_set<std::shared_ptr<Transport>>;
     using RegisteredTransportMap = std::unordered_map<uintptr_t, TransportSet>;
+
+    struct RegisteredRecord {
+        Transport* transport;
+        void* addr;
+        uint64_t length;
+        std::string location;
+        bool remote_accessible;
+        bool update_metadata;
+    };
+
+    std::vector<RegisteredRecord> rollbackRegistrations(
+        const std::vector<RegisteredRecord>& records);
 
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
 

@@ -1747,6 +1747,105 @@ TEST_F(TransportTest, MultiProtocolRollbackFailureQuarantinesAddress) {
     }
 }
 
+TEST_F(TransportTest,
+       MultiProtocolUntrackedErrorDoesNotBlockCompletedTrackedAddress) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto registered = std::make_shared<BatchResultTransport>();
+    auto missing =
+        std::make_shared<BatchResultTransport>(ERR_ADDRESS_NOT_REGISTERED);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"registered", registered}, {"missing", missing}});
+
+    std::array<char, 1> tracked_buffer{};
+    std::array<char, 1> untracked_buffer{};
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>
+        register_map = {
+            {"registered", {{tracked_buffer.data(), tracked_buffer.size()}}},
+        };
+    ASSERT_EQ(engine.mp_registerLocalMemory(register_map), 0);
+
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>
+        unregister_map = {
+            {"registered", {{tracked_buffer.data(), tracked_buffer.size()}}},
+            {"missing", {{untracked_buffer.data(), untracked_buffer.size()}}},
+        };
+    EXPECT_EQ(engine.mp_unregisterLocalMemory(unregister_map),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(registered->unregisterCalls(), 1);
+    EXPECT_EQ(missing->unregisterCalls(), 1);
+    EXPECT_FALSE(
+        engine.checkOverlap(tracked_buffer.data(), tracked_buffer.size()));
+    EXPECT_EQ(engine.mp_registerLocalMemory(register_map), 0);
+}
+
+TEST_F(TransportTest,
+       MultiProtocolTrackedAddressesConvergeTogetherAcrossRetry) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto completed = std::make_shared<StatefulUnregisterTransport>();
+    auto transient = std::make_shared<StatefulUnregisterTransport>(1);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"completed", completed}, {"transient", transient}});
+
+    std::array<char, 1> completed_buffer{};
+    std::array<char, 1> transient_buffer{};
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>> buffer_map =
+        {
+            {"completed", {{completed_buffer.data(), completed_buffer.size()}}},
+            {"transient", {{transient_buffer.data(), transient_buffer.size()}}},
+        };
+    ASSERT_EQ(engine.mp_registerLocalMemory(buffer_map), 0);
+
+    EXPECT_EQ(engine.mp_unregisterLocalMemory(buffer_map), ERR_MEMORY);
+    EXPECT_EQ(completed->unregisterCalls(), 1);
+    EXPECT_EQ(transient->unregisterCalls(), 1);
+    EXPECT_TRUE(
+        engine.checkOverlap(completed_buffer.data(), completed_buffer.size()));
+    EXPECT_TRUE(
+        engine.checkOverlap(transient_buffer.data(), transient_buffer.size()));
+
+    EXPECT_EQ(engine.mp_unregisterLocalMemory(buffer_map), 0);
+    EXPECT_EQ(completed->unregisterCalls(), 1);
+    EXPECT_EQ(transient->unregisterCalls(), 2);
+    EXPECT_FALSE(
+        engine.checkOverlap(completed_buffer.data(), completed_buffer.size()));
+    EXPECT_FALSE(
+        engine.checkOverlap(transient_buffer.data(), transient_buffer.size()));
+}
+
+TEST_F(TransportTest,
+       MultiProtocolUnknownTransportOutranksMissingAddressDeterministically) {
+    for (bool insert_unknown_first : {false, true}) {
+        SCOPED_TRACE(insert_unknown_first);
+        TransferEngineImpl engine(false);
+        ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+        auto missing =
+            std::make_shared<BatchResultTransport>(ERR_ADDRESS_NOT_REGISTERED);
+        TransferEngineImplTestPeer::replaceTransports(engine,
+                                                      {{"a-missing", missing}});
+
+        std::array<char, 1> missing_buffer{};
+        std::array<char, 1> unknown_buffer{};
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>
+            buffer_map;
+        if (insert_unknown_first) {
+            buffer_map["z-unknown"] = {
+                {unknown_buffer.data(), unknown_buffer.size()}};
+        }
+        buffer_map["a-missing"] = {
+            {missing_buffer.data(), missing_buffer.size()}};
+        if (!insert_unknown_first) {
+            buffer_map["z-unknown"] = {
+                {unknown_buffer.data(), unknown_buffer.size()}};
+        }
+
+        EXPECT_EQ(engine.mp_unregisterLocalMemory(buffer_map),
+                  ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(missing->unregisterCalls(), 1);
+    }
+}
+
 #endif
 
 TEST_F(TransportTest, RegisterRejectsAddressWhileUnregisterIsInProgress) {

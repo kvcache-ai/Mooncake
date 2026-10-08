@@ -811,8 +811,11 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
     }
     if (shm_validation_lock.owns_lock()) shm_validation_lock.unlock();
 
-    std::vector<Transport*> successful_transports;
+    std::vector<RegisteredRecord> successful_registrations;
     for (auto transport : multi_transports_->listTransports()) {
+        RegisteredRecord record{
+            transport,         addr,           length, location,
+            remote_accessible, update_metadata};
         int ret = transport->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata);
         if (ret < 0) {
@@ -822,28 +825,18 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
             int cleanup_ret =
                 transport->unregisterLocalMemory(addr, update_metadata);
             if (cleanup_ret != 0) {
-                successful_transports.push_back(transport);
+                successful_registrations.push_back(record);
             }
-            bool rollback_failed = false;
-            for (auto it = successful_transports.rbegin();
-                 it != successful_transports.rend(); ++it) {
-                int rollback_ret =
-                    (*it)->unregisterLocalMemory(addr, update_metadata);
-                if (rollback_ret != 0) {
-                    rollback_failed = true;
-                    LOG(WARNING)
-                        << "Failed to roll back registration for "
-                        << (*it)->getName() << ", ret=" << rollback_ret;
-                }
-            }
+            auto rollback_failures =
+                rollbackRegistrations(successful_registrations);
             std::unordered_set<uintptr_t> quarantined_addresses;
-            if (rollback_failed) {
+            if (!rollback_failures.empty()) {
                 quarantined_addresses.insert(reinterpret_cast<uintptr_t>(addr));
             }
             releaseMemoryRegions(regions, &quarantined_addresses);
             return ret;
         }
-        successful_transports.push_back(transport);
+        successful_registrations.push_back(record);
     }
 
     commitMemoryRegions(regions);
@@ -925,6 +918,28 @@ void TransferEngineImpl::releaseUnregisterReservation(void* addr) {
     unregistering_memory_regions_.erase(reinterpret_cast<uintptr_t>(addr));
 }
 
+std::vector<TransferEngineImpl::RegisteredRecord>
+TransferEngineImpl::rollbackRegistrations(
+    const std::vector<RegisteredRecord>& records) {
+    LOG(INFO) << "Rolling back " << records.size() << " registered regions";
+
+    std::vector<RegisteredRecord> failures;
+    for (auto it = records.rbegin(); it != records.rend(); ++it) {
+        const auto& record = *it;
+        if (record.transport) {
+            int ret = record.transport->unregisterLocalMemory(
+                record.addr, record.update_metadata);
+            if (ret) {
+                LOG(WARNING) << "Failed to roll back registration for "
+                             << record.transport->getName()
+                             << ", addr=" << record.addr << ", ret=" << ret;
+                failures.push_back(record);
+            }
+        }
+    }
+    return failures;
+}
+
 #ifdef ENABLE_MULTI_PROTOCOL
 // Multi-protocol API (only available when ENABLE_MULTI_PROTOCOL is defined)
 // Supports registering memory for multiple protocols (CXL, TCP / RDMA)
@@ -995,7 +1010,7 @@ int TransferEngineImpl::mp_registerLocalMemory(
     std::vector<TransferEngineImpl::RegisteredRecord> success_records;
     RegisteredTransportMap registered_transport_map;
     auto rollback_and_release = [&] {
-        auto rollback_failures = rollbackAllRegistrations(success_records);
+        auto rollback_failures = rollbackRegistrations(success_records);
         std::unordered_set<uintptr_t> quarantined_addresses;
         for (const auto& record : rollback_failures) {
             quarantined_addresses.insert(
@@ -1065,28 +1080,6 @@ int TransferEngineImpl::mp_registerLocalMemory(
     return 0;
 }
 
-std::vector<TransferEngineImpl::RegisteredRecord>
-TransferEngineImpl::rollbackAllRegistrations(
-    const std::vector<RegisteredRecord>& records) {
-    LOG(INFO) << "Rolling back " << records.size() << " registered regions";
-
-    std::vector<RegisteredRecord> failures;
-    for (auto it = records.rbegin(); it != records.rend(); ++it) {
-        const auto& record = *it;
-        if (record.transport) {
-            int ret = record.transport->unregisterLocalMemory(
-                record.addr, record.update_metadata);
-            if (ret) {
-                LOG(WARNING) << "Failed to roll back registration for "
-                             << record.transport->getName()
-                             << ", addr=" << record.addr << ", ret=" << ret;
-                failures.push_back(record);
-            }
-        }
-    }
-    return failures;
-}
-
 int TransferEngineImpl::mp_unregisterLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
@@ -1137,14 +1130,20 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
     std::unordered_map<uintptr_t,
                        std::unordered_set<std::shared_ptr<Transport>>>
         newly_completed;
-    for (const auto& buffer_entry : buffer_map) {
-        const std::string& protocol = buffer_entry.first;
-        const std::vector<RegisteredBuffer>& buffer_list = buffer_entry.second;
+    std::vector<std::string> protocols;
+    protocols.reserve(buffer_map.size());
+    for (const auto& [protocol, _] : buffer_map) {
+        protocols.push_back(protocol);
+    }
+    std::sort(protocols.begin(), protocols.end());
+    for (const auto& protocol : protocols) {
+        const std::vector<RegisteredBuffer>& buffer_list =
+            buffer_map.at(protocol);
 
         auto transport_it = multi_transports_->transport_map_.find(protocol);
         if (transport_it == multi_transports_->transport_map_.end()) {
             LOG(ERROR) << "Transport " << protocol << " not found";
-            if (!first_error) first_error = -1;
+            recordUnregisterError(ERR_INVALID_ARGUMENT, first_error);
             continue;
         }
         const auto& transport = transport_it->second;
@@ -1170,7 +1169,7 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    bool all_complete = true;
+    bool all_tracked_complete = true;
     for (const auto& [address, tracked] : tracked_addresses) {
         if (tracked) {
             auto& completed = unregistered_transports_[address];
@@ -1178,16 +1177,17 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
             completed.insert(additions.begin(), additions.end());
             for (const auto& transport : registered_by_address[address]) {
                 if (completed.count(transport) == 0) {
-                    all_complete = false;
+                    all_tracked_complete = false;
                     break;
                 }
             }
         }
         unregistering_memory_regions_.erase(address);
     }
-    if (!first_error && all_complete) {
-        for (const auto& [address, _] : tracked_addresses) {
-            eraseMemoryRegionLocked(reinterpret_cast<void*>(address));
+    if (all_tracked_complete) {
+        for (const auto& [address, tracked] : tracked_addresses) {
+            if (tracked)
+                eraseMemoryRegionLocked(reinterpret_cast<void*>(address));
         }
     } else if (!first_error) {
         first_error = ERR_TOO_MANY_REQUESTS;
