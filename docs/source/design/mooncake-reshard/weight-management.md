@@ -156,9 +156,9 @@ residency or availability.
 ## Recovery and HA Rollout
 
 ```{warning}
-Removal in progress: references below to periodic Master snapshots and their
-restore format describe the retired legacy path. New HA recovery uses the
-standby-generated batch OpLog snapshot format.
+The periodic Master snapshot references below describe the retired legacy
+format. New HA recovery uses the standby-generated batch OpLog snapshot
+format.
 ```
 
 Weight metadata, leases, and operation records use durable-before-visible
