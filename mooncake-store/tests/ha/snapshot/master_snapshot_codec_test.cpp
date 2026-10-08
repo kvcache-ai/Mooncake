@@ -189,6 +189,30 @@ class MasterSnapshotCodecTest : public ::testing::Test {
         auto view = MakeStateView(*master_service_);
         auto saved = codec.Encode(view);
         ASSERT_TRUE(saved);
+        // A corrupt pending charge must identify the object and the failed
+        // billing check, including when a target disappeared before capture.
+        auto corrupt = *saved;
+        auto packed = msgpack::unpack(
+            reinterpret_cast<const char*>(saved->drain_jobs->data()),
+            saved->drain_jobs->size());
+        const auto* sections = packed.get().via.array.ptr;
+        ASSERT_EQ(1u, sections[1].via.array.size);
+        auto& charge = sections[1].via.array.ptr[0].via.array.ptr[7];
+        charge = msgpack::object(charge.as<uint64_t>() + 1);
+        msgpack::sbuffer buffer;
+        msgpack::pack(buffer, packed.get());
+        corrupt.drain_jobs =
+            std::vector<uint8_t>(buffer.data(), buffer.data() + buffer.size());
+        auto invalid = MakeMasterService();
+        MasterServiceTestPeer::StopDrainDispatcher(*invalid);
+        auto rejected = codec.Decode(invalid.get(), corrupt);
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(ErrorCode::DESERIALIZE_FAIL, rejected.error().code);
+        EXPECT_NE(std::string::npos, rejected.error().message.find("copy_key"));
+        EXPECT_NE(std::string::npos,
+                  rejected.error().message.find(TenantId::Default().value()));
+        EXPECT_NE(std::string::npos,
+                  rejected.error().message.find("pending quota charge"));
         config.initial_snapshot_payloads =
             std::make_shared<MasterSnapshotPayloads>(*saved);
         auto recovered = std::make_unique<MasterService>(config);
@@ -878,7 +902,21 @@ TEST_F(MasterSnapshotCodecTest,
         corrupt.drain_jobs =
             std::vector<uint8_t>(buffer.data(), buffer.data() + buffer.size());
         auto decoded = codec.Decode(target.get(), corrupt);
-        EXPECT_FALSE(decoded) << field;
+        ASSERT_FALSE(decoded) << field;
+        EXPECT_EQ(ErrorCode::DESERIALIZE_FAIL, decoded.error().code);
+        if (field != 0) {
+            EXPECT_NE(std::string::npos,
+                      decoded.error().message.find(UuidToString(*job)))
+                << field << ": " << decoded.error().message;
+        }
+        if (field == 5) {
+            EXPECT_NE(std::string::npos,
+                      decoded.error().message.find("max_concurrency"));
+        }
+        if (field == 9) {
+            EXPECT_NE(std::string::npos,
+                      decoded.error().message.find("job progress"));
+        }
         EXPECT_FALSE(target->QueryDrainJob(*job));
         MasterServiceTestPeer::ResetSnapshotState(*target);
     }
