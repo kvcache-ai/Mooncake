@@ -1805,6 +1805,9 @@ WrappedMasterService::RestoreFromBatchOpLogPromotion(
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
+    server.register_handler<&store::GatherReadDirectory::Publish,
+                            &store::GatherReadDirectory::Resolve>(
+        &wrapped_master_service.gather_directory);
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ProbeKey>(

@@ -27,6 +27,7 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "gather_read.h"
 
 namespace mooncake {
 
@@ -203,6 +204,15 @@ class Client {
     std::optional<StoreScatterTransferOperation> SubmitScatterNative(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
+
+    bool SupportsGatherRead() const {
+        return !transfer_engine_->isUsingTent() &&
+               (protocol_ == "tcp" || protocol_ == "rdma");
+    }
+    std::optional<store::GatherReadOperation> SubmitGatherRead(
+        const std::string& endpoint,
+        const std::vector<store::GatherReadRange>& ranges, void* destination,
+        size_t capacity);
 
     /**
      * @brief Transfers data using pre-queried object information
@@ -980,6 +990,15 @@ class Client {
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
+    std::unique_ptr<store::GatherReadService> gather_service_;
+    std::string gather_endpoint_;
+    std::mutex gather_clients_mutex_;
+    struct GatherPeer {
+        std::string endpoint;
+        std::chrono::steady_clock::time_point refresh_at{};
+        std::vector<std::unique_ptr<store::GatherReadClient>> clients;
+    };
+    std::unordered_map<std::string, GatherPeer> gather_clients_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 

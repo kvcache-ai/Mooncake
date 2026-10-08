@@ -21,6 +21,14 @@ namespace mooncake {
 
 template <auto Method>
 struct RpcNameTraits;
+template <>
+struct RpcNameTraits<&store::GatherReadDirectory::Publish> {
+    static constexpr const char* value = "PublishGatherEndpoint";
+};
+template <>
+struct RpcNameTraits<&store::GatherReadDirectory::Resolve> {
+    static constexpr const char* value = "ResolveGatherEndpoint";
+};
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
@@ -1448,4 +1456,13 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::PublishGatherEndpoint(
+    const std::string& owner, const std::string& endpoint, bool remove) {
+    return invoke_rpc<&store::GatherReadDirectory::Publish, void>(
+        owner, endpoint, remove);
+}
+tl::expected<std::string, ErrorCode> MasterClient::ResolveGatherEndpoint(
+    const std::string& owner) {
+    return invoke_rpc<&store::GatherReadDirectory::Resolve, std::string>(owner);
+}
 }  // namespace mooncake

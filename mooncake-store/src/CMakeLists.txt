@@ -105,6 +105,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
+    gather_read.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
@@ -167,6 +168,10 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
 
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
+  add_executable(store_gather_read_test ../tests/gather_read_test.cpp)
+  target_link_libraries(store_gather_read_test PRIVATE mooncake_store gtest
+                                                       gtest_main)
+  add_test(NAME store_gather_read_test COMMAND store_gather_read_test)
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
