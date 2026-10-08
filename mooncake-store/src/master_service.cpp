@@ -3315,7 +3315,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
     const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
     const TenantId& tenant_id) {
     if (keys.empty()) return {};
-    const char* invalid_reason = nullptr;
+    std::string_view invalid_reason;
     if (policy.lease_mode != ProbeLeaseMode::None &&
         policy.lease_mode != ProbeLeaseMode::LastHitOnly) {
         invalid_reason = "unknown lease mode";
@@ -3326,7 +3326,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
             invalid_reason = "key count is not divisible by candidate_size";
         }
     }
-    if (invalid_reason != nullptr) {
+    if (!invalid_reason.empty()) {
         LOG(WARNING) << "BatchProbeKey: " << invalid_reason
                      << ", lease_mode=" << static_cast<int>(policy.lease_mode)
                      << ", candidate_size=" << policy.candidate_size
