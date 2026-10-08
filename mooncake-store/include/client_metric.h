@@ -865,6 +865,81 @@ struct DfsMetric {
     }
 };
 
+#ifdef USE_NOF
+// Client-wide NoF metrics, counted per SPDK I/O.
+// Bytes and ops count successful completions.
+// Errors count submission and completion failures.
+struct NofMetric {
+    explicit NofMetric(std::map<std::string, std::string> labels = {})
+        : nof_read_bytes("mooncake_nof_read_bytes_total",
+                         "Total bytes successfully read from NoF", labels),
+          nof_write_bytes("mooncake_nof_write_bytes_total",
+                          "Total bytes successfully written to NoF", labels),
+          nof_read_ops("mooncake_nof_read_ops_total",
+                       "Total successful NoF read I/Os", labels),
+          nof_write_ops("mooncake_nof_write_ops_total",
+                        "Total successful NoF write I/Os", labels),
+          nof_read_errors(
+              "mooncake_nof_read_errors_total",
+              "Failed NoF read I/O attempts (submission or completion)",
+              labels),
+          nof_write_errors(
+              "mooncake_nof_write_errors_total",
+              "Failed NoF write I/O attempts (submission or completion)",
+              labels) {}
+
+    ylt::metric::counter_t nof_read_bytes;
+    ylt::metric::counter_t nof_write_bytes;
+    ylt::metric::counter_t nof_read_ops;
+    ylt::metric::counter_t nof_write_ops;
+    ylt::metric::counter_t nof_read_errors;
+    ylt::metric::counter_t nof_write_errors;
+
+    void ObserveRead(uint64_t bytes) {
+        nof_read_ops.inc();
+        nof_read_bytes.inc(bytes);
+    }
+
+    void ObserveWrite(uint64_t bytes) {
+        nof_write_ops.inc();
+        nof_write_bytes.inc(bytes);
+    }
+
+    void RecordReadErrors() { nof_read_errors.inc(); }
+
+    void RecordWriteErrors() { nof_write_errors.inc(); }
+
+    void serialize(std::string& str) {
+        nof_read_bytes.serialize(str);
+        nof_write_bytes.serialize(str);
+        nof_read_ops.serialize(str);
+        nof_write_ops.serialize(str);
+        nof_read_errors.serialize(str);
+        nof_write_errors.serialize(str);
+    }
+
+    std::string summary_metrics() {
+        std::stringstream ss;
+        ss << "=== NoF Metrics Summary ===\n";
+        ss << format_io_line("NoF Read", nof_read_bytes.value(),
+                             nof_read_ops.value(), nof_read_errors.value());
+        ss << format_io_line("NoF Write", nof_write_bytes.value(),
+                             nof_write_ops.value(), nof_write_errors.value());
+        return ss.str();
+    }
+
+   private:
+    std::string format_io_line(const std::string& label, int64_t bytes,
+                               int64_t ops, int64_t errors) {
+        std::stringstream ss;
+        ss << label << ": " << byte_size_to_string(bytes) << ", ops=" << ops
+           << ", errors=" << errors << '\n';
+        return ss.str();
+    }
+};
+
+#endif
+
 struct ClientMetricConfig {
     bool enabled = true;
     std::chrono::milliseconds reporting_interval{0};
@@ -879,6 +954,9 @@ struct ClientMetric {
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
     DfsMetric dfs_metric;
+#ifdef USE_NOF
+    NofMetric nof_metric;
+#endif
     AllocatorMetric allocator_metric;
     // Prometheus "info" pattern: the value carries no meaning and is always 1,
     // the version strings ride along as static labels next to any caller
