@@ -107,6 +107,73 @@ WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::SetKvSessionPin(
+    const std::string& session_id, bool pinned, const std::string& tenant_id) {
+    return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
+                                 ? std::string_view(tenant_id)
+                                 : TenantId::kDefaultValue,
+                             [&](const TenantId& resolved) {
+                                 return master_service_.SetKvSessionPin(
+                                     session_id, pinned, resolved);
+                             });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CloseKvSession(
+    const std::string& session_id, const std::string& tenant_id) {
+    return WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved) {
+            return master_service_.CloseKvSession(session_id, resolved);
+        });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::UpdateKvSession(
+    const std::string& session_id, const std::vector<std::string>& keep_keys,
+    const std::string& tenant_id) {
+    return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
+                                 ? std::string_view(tenant_id)
+                                 : TenantId::kDefaultValue,
+                             [&](const TenantId& resolved) {
+                                 return master_service_.UpdateKvSession(
+                                     session_id, keep_keys, resolved);
+                             });
+}
+
+tl::expected<KvSessionInfo, ErrorCode> WrappedMasterService::GetKvSession(
+    const std::string& session_id, const std::string& tenant_id) {
+    return WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved) {
+            return master_service_.GetKvSession(session_id, resolved);
+        });
+}
+
+tl::expected<KvSessionPage, ErrorCode> WrappedMasterService::ListKvSessionKeys(
+    const std::string& session_id, const std::string& cursor, uint64_t limit,
+    const std::string& tenant_id) {
+    return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
+                                 ? std::string_view(tenant_id)
+                                 : TenantId::kDefaultValue,
+                             [&](const TenantId& resolved) {
+                                 return master_service_.ListKvSessionKeys(
+                                     session_id, cursor, limit, resolved);
+                             });
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::AttachKvSession(const std::string& session_id,
+                                      const std::vector<std::string>& keys,
+                                      const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved) {
+            return master_service_.AttachKvSession(session_id, keys, resolved);
+        });
+}
+
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key, const std::string& tenant_id) {
     return execute_rpc(
@@ -496,7 +563,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     auto resolved_tenant_id = ResolveTenantIdForWrite(
         tenant_id, master_service_.IsTenantQuotaEnabled());
 
-    if (keys.size() != slice_lengths.size()) {
+    if (!config.ValidSessionShape(keys.size()) ||
+        keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
@@ -751,7 +819,8 @@ WrappedMasterService::BatchUpsertStart(
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results;
-    if (keys.size() != slice_lengths.size()) {
+    if (!config.ValidSessionShape(keys.size()) ||
+        keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
@@ -1805,6 +1874,27 @@ WrappedMasterService::RestoreFromBatchOpLogPromotion(
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
+    server.register_handler<&WrappedMasterService::SetKvSessionPin>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::CloseKvSession>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::UpdateKvSession>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::GetKvSession>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::ListKvSessionKeys>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::AttachKvSession>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::PutStartWithKvSessions>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::BatchPutStartWithKvSessions>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::UpsertStartWithKvSessions>(
+        &wrapped_master_service);
+    server.register_handler<
+        &WrappedMasterService::BatchUpsertStartWithKvSessions>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ProbeKey>(

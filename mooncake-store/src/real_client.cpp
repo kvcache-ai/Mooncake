@@ -7126,6 +7126,9 @@ std::vector<int> RealClient::batch_put_session_start(
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
+    if (!config.ValidSessionShape(keys.size())) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
     if (config.group_ids.has_value() &&
         config.group_ids->size() != keys.size()) {
         LOG(ERROR) << "batch_put_session_start: group_ids.size()="
@@ -7167,15 +7170,7 @@ std::vector<int> RealClient::batch_put_session_start(
         return results;
     }
 
-    ReplicateConfig start_config = config;
-    if (start_config.group_ids.has_value()) {
-        std::vector<std::string> filtered_group_ids;
-        filtered_group_ids.reserve(start_indices.size());
-        for (size_t idx : start_indices) {
-            filtered_group_ids.push_back(start_config.group_ids->at(idx));
-        }
-        start_config.group_ids = std::move(filtered_group_ids);
-    }
+    ReplicateConfig start_config = config.ForKeys(start_indices);
 
     auto start_responses =
         client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);

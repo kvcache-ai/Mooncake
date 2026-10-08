@@ -374,6 +374,11 @@ However, if the lease expires before a `Get` operation finishes reading the data
 
 The default lease TTL is 10 seconds and is configurable via a startup parameter of `master_service`.
 
+## KV Sessions
+
+[Session-aware membership and soft pin](session-kv.md) lets applications associate
+objects with multiple conversations and control their retention without rewriting data.
+
 ## Soft Pin
 
 For important and frequently used objects, such as system prompts, Mooncake Store provides a soft pin mechanism. When putting an object, it can be configured to enable soft pin. During eviction, objects that are not soft pinned are prioritized for eviction. Soft pinned objects are only evicted when memory is insufficient and no other objects are eligible for eviction.

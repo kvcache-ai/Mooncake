@@ -71,6 +71,33 @@ class QueryResult {
  */
 class Client {
    public:
+    tl::expected<void, ErrorCode> SetKvSessionPin(const std::string& session_id,
+                                                  bool pinned) {
+        return master_client_.SetKvSessionPin(session_id, pinned);
+    }
+    tl::expected<void, ErrorCode> CloseKvSession(
+        const std::string& session_id) {
+        return master_client_.CloseKvSession(session_id);
+    }
+    tl::expected<void, ErrorCode> UpdateKvSession(
+        const std::string& session_id,
+        const std::vector<std::string>& keep_keys) {
+        return master_client_.UpdateKvSession(session_id, keep_keys);
+    }
+    tl::expected<KvSessionInfo, ErrorCode> GetKvSession(
+        const std::string& session_id) {
+        return master_client_.GetKvSession(session_id);
+    }
+    tl::expected<KvSessionPage, ErrorCode> ListKvSessionKeys(
+        const std::string& session_id, const std::string& cursor,
+        uint64_t limit) {
+        return master_client_.ListKvSessionKeys(session_id, cursor, limit);
+    }
+    std::vector<tl::expected<void, ErrorCode>> AttachKvSession(
+        const std::string& session_id, const std::vector<std::string>& keys) {
+        return master_client_.AttachKvSession(session_id, keys);
+    }
+
     virtual ~Client();
 
     using WriteBufferStager =

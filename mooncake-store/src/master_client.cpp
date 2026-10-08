@@ -23,6 +23,56 @@ template <auto Method>
 struct RpcNameTraits;
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchUpsertStartWithKvSessions> {
+    static constexpr const char* value = "BatchUpsertStartWithKvSessions";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::UpsertStartWithKvSessions> {
+    static constexpr const char* value = "UpsertStartWithKvSessions";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutStartWithKvSessions> {
+    static constexpr const char* value = "BatchPutStartWithKvSessions";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutStartWithKvSessions> {
+    static constexpr const char* value = "PutStartWithKvSessions";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::SetKvSessionPin> {
+    static constexpr const char* value = "SetKvSessionPin";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CloseKvSession> {
+    static constexpr const char* value = "CloseKvSession";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::UpdateKvSession> {
+    static constexpr const char* value = "UpdateKvSession";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetKvSession> {
+    static constexpr const char* value = "GetKvSession";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::ListKvSessionKeys> {
+    static constexpr const char* value = "ListKvSessionKeys";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::AttachKvSession> {
+    static constexpr const char* value = "AttachKvSession";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
     static constexpr const char* value = "ExistKey";
 };
@@ -526,6 +576,42 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     return ErrorCode::OK;
 }
 
+tl::expected<void, ErrorCode> MasterClient::SetKvSessionPin(
+    const std::string& session_id, bool pinned) {
+    return invoke_rpc<&WrappedMasterService::SetKvSessionPin, void>(
+        session_id, pinned, tenant_id_.value());
+}
+
+tl::expected<void, ErrorCode> MasterClient::CloseKvSession(
+    const std::string& session_id) {
+    return invoke_rpc<&WrappedMasterService::CloseKvSession, void>(
+        session_id, tenant_id_.value());
+}
+
+tl::expected<void, ErrorCode> MasterClient::UpdateKvSession(
+    const std::string& session_id, const std::vector<std::string>& keep_keys) {
+    return invoke_rpc<&WrappedMasterService::UpdateKvSession, void>(
+        session_id, keep_keys, tenant_id_.value());
+}
+
+tl::expected<KvSessionInfo, ErrorCode> MasterClient::GetKvSession(
+    const std::string& session_id) {
+    return invoke_rpc<&WrappedMasterService::GetKvSession, KvSessionInfo>(
+        session_id, tenant_id_.value());
+}
+
+tl::expected<KvSessionPage, ErrorCode> MasterClient::ListKvSessionKeys(
+    const std::string& session_id, const std::string& cursor, uint64_t limit) {
+    return invoke_rpc<&WrappedMasterService::ListKvSessionKeys, KvSessionPage>(
+        session_id, cursor, limit, tenant_id_.value());
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::AttachKvSession(
+    const std::string& session_id, const std::vector<std::string>& keys) {
+    return invoke_batch_rpc<&WrappedMasterService::AttachKvSession, void>(
+        keys.size(), session_id, keys, tenant_id_.value());
+}
+
 tl::expected<bool, ErrorCode> MasterClient::ExistKey(
     const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::ExistKey");
@@ -669,6 +755,12 @@ MasterClient::PutStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
+    if (config.kv_sessions.has_value()) {
+        return invoke_rpc<&WrappedMasterService::PutStartWithKvSessions,
+                          std::vector<Replica::Descriptor>>(
+            client_id_, key, total_slice_length, config, tenant_id_.value());
+    }
+
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
         client_id_, key, total_slice_length, config, tenant_id_.value());
@@ -692,6 +784,14 @@ MasterClient::BatchPutStart(
             total_slice_length += slice_length;
         }
         total_slice_lengths.emplace_back(total_slice_length);
+    }
+
+    if (config.kv_sessions.has_value()) {
+        return invoke_batch_rpc<
+            &WrappedMasterService::BatchPutStartWithKvSessions,
+            std::vector<Replica::Descriptor>>(keys.size(), client_id_, keys,
+                                              total_slice_lengths, config,
+                                              tenant_id_.value());
     }
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
@@ -759,6 +859,12 @@ MasterClient::UpsertStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
+    if (config.kv_sessions.has_value()) {
+        return invoke_rpc<&WrappedMasterService::UpsertStartWithKvSessions,
+                          std::vector<Replica::Descriptor>>(
+            client_id_, key, total_slice_length, config, tenant_id_.value());
+    }
+
     auto result = invoke_rpc<&WrappedMasterService::UpsertStart,
                              std::vector<Replica::Descriptor>>(
         client_id_, key, total_slice_length, config, tenant_id_.value());
@@ -782,6 +888,14 @@ MasterClient::BatchUpsertStart(
             total += sl;
         }
         total_slice_lengths.emplace_back(total);
+    }
+
+    if (config.kv_sessions.has_value()) {
+        return invoke_batch_rpc<
+            &WrappedMasterService::BatchUpsertStartWithKvSessions,
+            std::vector<Replica::Descriptor>>(keys.size(), client_id_, keys,
+                                              total_slice_lengths, config,
+                                              tenant_id_.value());
     }
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,

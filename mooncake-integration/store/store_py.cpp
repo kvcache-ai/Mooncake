@@ -550,6 +550,14 @@ class MooncakeStorePyWrapper {
         return real_client;
     }
 
+    std::shared_ptr<Client> kv_session_client() const {
+        if (!store_ || !store_->client_) {
+            throw std::runtime_error(
+                "KV sessions require an initialized real Store client");
+        }
+        return store_->client_;
+    }
+
     bool is_client_initialized() const {
         // Check if the store and client are initialized
         // Dummy client does not use client_ instance
@@ -1168,46 +1176,13 @@ class MooncakeStorePyWrapper {
                                ReplicateConfig{});  // Default config
     }
 
-    ReplicateConfig MakeIndexedConfig(
-        const ReplicateConfig &config,
-        const std::vector<size_t> &original_indices) const {
-        if (!config.group_ids.has_value()) {
-            return config;
-        }
-
-        ReplicateConfig indexed_config = config;
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size());
-        for (size_t index : original_indices) {
-            group_ids.push_back(config.group_ids->at(index));
-        }
-        indexed_config.group_ids = std::move(group_ids);
-        return indexed_config;
-    }
-
-    ReplicateConfig MakeRepeatedIndexedConfig(
-        const ReplicateConfig &config,
-        const std::vector<size_t> &original_indices, int repeat_count) const {
-        if (!config.group_ids.has_value()) {
-            return config;
-        }
-
-        ReplicateConfig indexed_config = config;
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size() *
-                          static_cast<size_t>(repeat_count));
-        for (size_t index : original_indices) {
-            for (int i = 0; i < repeat_count; ++i) {
-                group_ids.push_back(config.group_ids->at(index));
-            }
-        }
-        indexed_config.group_ids = std::move(group_ids);
-        return indexed_config;
-    }
-
     std::vector<int> ValidateGroupIdsForBatchConfig(
         const ReplicateConfig &config, size_t key_count,
         const char *operation_name) const {
+        if (!config.ValidSessionShape(key_count)) {
+            return std::vector<int>(key_count,
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
         if (config.group_ids.has_value() &&
             config.group_ids->size() != key_count) {
             LOG(ERROR) << operation_name
@@ -1234,7 +1209,16 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            auto results = batch_put_tensor_infos_impl(tp_keys, *infos, config);
+            if (!config.ValidSessionShape(1)) {
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+            auto shard_config = config;
+            if (config.kv_sessions.has_value()) {
+                shard_config.kv_sessions =
+                    KvSessionTags(tp_size, config.kv_sessions->front());
+            }
+            auto results =
+                batch_put_tensor_infos_impl(tp_keys, *infos, shard_config);
             for (int ret : results) {
                 if (ret != 0) return ret;
             }
@@ -1387,7 +1371,7 @@ class MooncakeStorePyWrapper {
             if (all_chunk_keys.empty()) return final_results;
 
             ReplicateConfig chunk_config =
-                MakeRepeatedIndexedConfig(config, processed_indices, tp_size);
+                config.ForKeys(processed_indices, tp_size);
             std::vector<int> chunk_results = batch_put_tensor_infos_impl(
                 all_chunk_keys, all_chunk_infos, chunk_config);
             if (chunk_results.size() != all_chunk_keys.size()) {
@@ -1755,8 +1739,16 @@ class MooncakeStorePyWrapper {
             for (int rank = 0; rank < tp_size; ++rank) {
                 tp_keys.push_back(get_tp_key_name(key, rank));
             }
+            if (!config.ValidSessionShape(1)) {
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+            auto shard_config = config;
+            if (config.kv_sessions.has_value()) {
+                shard_config.kv_sessions =
+                    KvSessionTags(tp_size, config.kv_sessions->front());
+            }
             auto results =
-                batch_upsert_tensor_infos_impl(tp_keys, *infos, config);
+                batch_upsert_tensor_infos_impl(tp_keys, *infos, shard_config);
             if (results.size() != tp_keys.size()) {
                 LOG(ERROR) << "Upsert with TP returned " << results.size()
                            << " results, expected " << tp_keys.size();
@@ -2137,6 +2129,14 @@ PYBIND11_MODULE(store, m) {
         .value("ENABLE", SoftPinAction::ENABLE)
         .value("DISABLE", SoftPinAction::DISABLE);
 
+    py::class_<KvSessionInfo>(m, "KvSessionInfo")
+        .def_readonly("session_id", &KvSessionInfo::session_id)
+        .def_readonly("pinned", &KvSessionInfo::pinned)
+        .def_readonly("member_count", &KvSessionInfo::member_count);
+    py::class_<KvSessionPage>(m, "KvSessionPage")
+        .def_readonly("keys", &KvSessionPage::keys)
+        .def_readonly("next_cursor", &KvSessionPage::next_cursor);
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -2155,6 +2155,18 @@ PYBIND11_MODULE(store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_property(
+            "kv_sessions",
+            [](const ReplicateConfig &c) -> std::optional<KvSessionTags> {
+                if (!c.kv_sessions.has_value()) return std::nullopt;
+                return *c.kv_sessions;
+            },
+            [](ReplicateConfig &c, const std::optional<KvSessionTags> &tags) {
+                if (tags)
+                    c.kv_sessions = *tags;
+                else
+                    c.kv_sessions.reset();
+            })
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
@@ -2561,6 +2573,82 @@ PYBIND11_MODULE(store, m) {
             py::arg("key"), py::arg("force") = false,
             "Remove an object from the store. If force=True, skip lease and "
             "replication task checks.")
+        .def(
+            "get_kv_session",
+            [](MooncakeStorePyWrapper &self, const std::string &session_id) {
+                py::gil_scoped_release release;
+                auto result =
+                    self.kv_session_client()->GetKvSession(session_id);
+                if (!result) throw std::runtime_error(toString(result.error()));
+                return *result;
+            },
+            py::arg("session_id"))
+        .def(
+            "list_kv_session_keys",
+            [](MooncakeStorePyWrapper &self, const std::string &session_id,
+               const std::string &cursor, uint64_t limit) {
+                py::gil_scoped_release release;
+                auto result = self.kv_session_client()->ListKvSessionKeys(
+                    session_id, cursor, limit);
+                if (!result) throw std::runtime_error(toString(result.error()));
+                return *result;
+            },
+            py::arg("session_id"), py::arg("cursor") = "",
+            py::arg("limit") = 1024)
+        .def(
+            "pin_kv_session",
+            [](MooncakeStorePyWrapper &self, const std::string &session_id) {
+                py::gil_scoped_release release;
+                auto result =
+                    self.kv_session_client()->SetKvSessionPin(session_id, true);
+                if (!result) throw std::runtime_error(toString(result.error()));
+                return 0;
+            },
+            py::arg("session_id"))
+        .def(
+            "unpin_kv_session",
+            [](MooncakeStorePyWrapper &self, const std::string &session_id) {
+                py::gil_scoped_release release;
+                auto result = self.kv_session_client()->SetKvSessionPin(
+                    session_id, false);
+                if (!result) throw std::runtime_error(toString(result.error()));
+                return 0;
+            },
+            py::arg("session_id"))
+        .def(
+            "close_kv_session",
+            [](MooncakeStorePyWrapper &self, const std::string &session_id) {
+                py::gil_scoped_release release;
+                auto result =
+                    self.kv_session_client()->CloseKvSession(session_id);
+                if (!result) throw std::runtime_error(toString(result.error()));
+                return 0;
+            },
+            py::arg("session_id"))
+        .def(
+            "update_kv_session",
+            [](MooncakeStorePyWrapper &self, const std::string &session_id,
+               const std::vector<std::string> &keep_keys) {
+                py::gil_scoped_release release;
+                auto result = self.kv_session_client()->UpdateKvSession(
+                    session_id, keep_keys);
+                if (!result) throw std::runtime_error(toString(result.error()));
+                return 0;
+            },
+            py::arg("session_id"), py::arg("keep_keys"))
+        .def(
+            "attach_kv_session",
+            [](MooncakeStorePyWrapper &self, const std::string &session_id,
+               const std::vector<std::string> &keys) {
+                py::gil_scoped_release release;
+                auto results =
+                    self.kv_session_client()->AttachKvSession(session_id, keys);
+                std::vector<int> codes;
+                for (const auto &result : results)
+                    codes.push_back(result ? 0 : toInt(result.error()));
+                return codes;
+            },
+            py::arg("session_id"), py::arg("keys"))
         .def(
             "remove_by_regex",
             [](MooncakeStorePyWrapper &self, const std::string &str,

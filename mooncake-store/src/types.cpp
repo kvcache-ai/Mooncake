@@ -17,6 +17,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::CLIENT_NOT_FOUND, "CLIENT_NOT_FOUND"},
         {ErrorCode::NO_AVAILABLE_HANDLE, "NO_AVAILABLE_HANDLE"},
         {ErrorCode::INVALID_VERSION, "INVALID_VERSION"},
+        {ErrorCode::SESSION_NOT_FOUND, "SESSION_NOT_FOUND"},
+        {ErrorCode::SESSION_LIMIT_EXCEEDED, "SESSION_LIMIT_EXCEEDED"},
         {ErrorCode::INVALID_KEY, "INVALID_KEY"},
         {ErrorCode::WRITE_FAIL, "WRITE_FAIL"},
         {ErrorCode::INVALID_PARAMS, "INVALID_PARAMS"},

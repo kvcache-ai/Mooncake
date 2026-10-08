@@ -118,6 +118,8 @@ struct ObjectMetadata {
     // carry a generation token, so a stale End from the same client cannot
     // otherwise be distinguished from the current write.
     std::optional<PendingSoftPinAction> pending_soft_pin_action;
+    // Runtime-only; destruction removes reverse session membership as well.
+    std::unique_ptr<KvSessionMembership> kv_sessions;
     const bool hard_pinned{false};  // immutable, set at creation
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
