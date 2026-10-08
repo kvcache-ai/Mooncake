@@ -170,30 +170,10 @@ mooncake_master \
 
 ---
 
-### Snapshot & Restore — Backup / Disaster Recovery
+### Snapshot & Restore
 
-```{warning}
-Removal in progress: the legacy Master-generated snapshot and restore path
-described in this section is being retired. Do not use it for new deployments;
-use the standby-generated batch OpLog snapshot path for HA recovery instead.
-```
-
-```{caution}
-Metadata Snapshot And Restore is experimental feature.
-```
-
-Periodically persist master metadata to local disk or S3, enabling recovery from a recent snapshot after a crash.
-
-```bash
-export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots
-
-mooncake_master \
-  --enable_snapshot=true \
-  --snapshot_interval_seconds=300 \
-  --snapshot_retention_count=5 \
-  --snapshot_object_store_type=local \
-  --enable_snapshot_restore=true
-```
+The legacy Master-generated snapshot and restore path has been removed. HA
+recovery uses the standby-generated batch OpLog snapshot path described below.
 
 ---
 
@@ -390,17 +370,6 @@ HA leadership and metadata replication are configured separately:
 - `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
 
-For legacy catalog snapshot-based standby bootstrap, configure:
-
-```{warning}
-Removal in progress: legacy catalog-backed standby bootstrap is being removed.
-New HA deployments should use batch OpLog snapshots.
-```
-
-- `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
-- `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
-- `--snapshot_catalog_store_type` (str): Snapshot catalog store type: `embedded` (default) or `redis`.
-
 For the new batch OpLog snapshot path, configure:
 
 ```yaml
@@ -422,8 +391,8 @@ non-serving if recovery cannot prove a complete state.
 
 When a Standby starts, it follows this sequence:
 
-1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true` for legacy catalog snapshots, or `enable_oplog_snapshot=true` for batch OpLog snapshots):
-   - Legacy mode loads the latest snapshot from the configured catalog and object store. Batch OpLog mode loads the latest/fallback descriptor and manifest directly from the batch snapshot control keys.
+1. **Snapshot Bootstrap** (if `enable_oplog_snapshot=true`):
+   - Batch OpLog mode loads the latest/fallback descriptor and manifest directly from the batch snapshot control keys.
    - Rebuild object metadata and segment state from the snapshot baseline.
 2. **OpLog Catch-up**:
    - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
@@ -778,33 +747,20 @@ mooncake_master \
 | `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
 
-```{caution}
-Metadata Snapshot And Restore is experimental feature.
-```
-
-**Metadata Snapshot And Restore**
-
-```{warning}
-Removal in progress: these flags belong to the legacy Master-generated
-snapshot and restore path and will be removed.
-```
+**Batch OpLog Snapshot**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable_snapshot` | `false` | Enable periodic metadata snapshot |
-| `--snapshot_interval_seconds` | `600` (10 min) | Interval between snapshots |
-| `--snapshot_child_timeout_seconds` | `300` (5 min) | Timeout per snapshot child process |
-| `--snapshot_retention_count` | `2` | Number of recent snapshots retained |
+| `--enable_oplog` | `false` | Enable the primary batch OpLog writer and standby reader |
+| `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots |
+| `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch snapshot chunk |
+| `--snapshot_interval_seconds` | `600` (10 min) | Interval between standby batch snapshots |
 | `--snapshot_object_store_type` | required | Object store: `local` or `s3` |
-| `--snapshot_catalog_store_type` | empty | Catalog store: `embedded` or `redis` |
-| `--snapshot_catalog_store_connstring` | empty | Catalog store connection string (required for `redis`) |
-| `--snapshot_backup_dir` | empty | Optional local backup directory |
-| `--enable_snapshot_restore` | `false` | Restore from latest snapshot at startup |
 
-**Environment variable:** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (required when `--snapshot_object_store_type=local`) — persistent directory for local snapshots.
+**Environment variable:** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (required when `--snapshot_object_store_type=local`) — persistent directory for batch snapshots.
 
 ```{warning}
-The snapshot storage path is a **managed directory** exclusively controlled by Mooncake. Old snapshots exceeding `--snapshot_retention_count` are automatically deleted. Use a dedicated directory to avoid data loss.
+The snapshot storage path is a **managed directory** exclusively controlled by Mooncake. Use a dedicated directory to avoid data loss.
 ```
 
 ### Task Manager
