@@ -148,8 +148,12 @@ def run_case(
         samples["total_step"].append(sum(measured[name] for name in TOTAL_PHASES))
 
     # The components and the gather run after the step loop, each in its own
-    # windows, so no step iteration is ever timed with a probe inside it
+    # windows, so no step iteration is ever timed with a probe inside it. They run
+    # against a plan of the indices they use, taken here rather than inside a
+    # window: the wrappers' metadata has to describe the indices the component pass
+    # reads, and planning is not part of what a component measures.
     probe_indices = step.build_indices()
+    step.plan(probe_indices)
     samples["kv_write_component"] = [
         one_write_component(step, probe_indices) for _ in range(timed)
     ]
@@ -158,10 +162,12 @@ def run_case(
     ]
     samples["kv_gather"] = [one_gather(step, probe_indices) for _ in range(timed)]
 
+    read_bytes = step.read_bytes()
     result = {
         "kind": "kernel",
         "case": case.as_dict(),
         "configuration": step.as_dict(),
+        "read_bytes": read_bytes,
         "warmup": warmup,
         "timed": timed,
         "device_name": torch.cuda.get_device_name(device),
@@ -176,7 +182,9 @@ def run_case(
     gather_bytes = step.gather_bytes(probe_indices)
     result["gather_bytes"] = gather_bytes
     result["gather_rows"] = int(step.gather_rows(probe_indices).numel())
-    result["derived"] = derive(case, result["phases"], gather_bytes)
+    result["derived"] = derive(
+        case, result["phases"], gather_bytes, read_bytes["attention"]
+    )
     result["correctness"] = {
         "indices": step.check_indices(probe_indices),
         "history": step.check_history(probe_indices),
@@ -215,19 +223,19 @@ def short_step_attention(case, device, seed, extend_branch):
     return result
 
 
-def derive(case, phases, gather_bytes):
+def derive(case, phases, gather_bytes, read_bytes):
     """The figures the report quotes, divided by the step's own ledger.
 
     Bandwidth and the arithmetic rate divide logical bytes by the window those
-    bytes belong to: the valid KV the step reads, and the rows the probe moves.
-    The page-covered count is an allocation figure and is labelled as one; what
-    the memory system actually transfers is not observable without a profiler, so
-    no figure here claims it.
+    bytes belong to: the KV the branch's attention reads (the paged side's bytes
+    plus the ragged side's) and the rows the probe moves. The page capacity is an
+    allocation figure and is labelled as one; what the memory system actually
+    transfers is not observable without a profiler, so no figure here claims it.
 
     The write window carries no rate. It reads two regimes for the same calls —
-    around 0.1 ms and around 1.16 ms — so it prices the host's issue as much as
-    the device's execution, and a quotient of it would report whichever regime
-    the window caught.
+    around 0.1 ms and around 1.16 ms — so what it covers is not determined by the
+    measurement, and a quotient of it would report whichever regime the window
+    caught.
 
     The write and the attention are components, measured in passes of their own.
     Their share of the step is named as a component share, because the step
@@ -241,28 +249,28 @@ def derive(case, phases, gather_bytes):
     gather_ms = phases["kv_gather"]["p50"]
     step_ms = phases["total_step"]["p50"]
 
-    read_valid = case.kv_bytes_read_valid()
     flops = case.attention_flops()
 
     def per_second(milliseconds):
         return milliseconds / 1000.0
 
     return {
-        "attention_plan_us_per_layer": plan_ms * 1000.0 / case.num_layers,
+        # The plan runs once per step, so a per-layer figure for it is a
+        # normalisation by the layer count and not a measured per-layer window.
+        "attention_plan_us_per_step": plan_ms * 1000.0,
         "attention_component_us_per_layer": attention_ms * 1000.0 / case.num_layers,
         "kv_write_component_us_per_layer": write_ms * 1000.0 / case.num_layers,
         "indices_us_per_new_token": index_ms * 1000.0 / case.new_tokens,
         "attention_us_per_context_token": attention_ms * 1000.0 / case.context_tokens,
         "kv_gather_effective_gbps": gather_bytes / per_second(gather_ms) / 1e9,
-        "attention_effective_gbps": read_valid / per_second(attention_ms) / 1e9,
+        "attention_effective_gbps": read_bytes / per_second(attention_ms) / 1e9,
         "attention_tflops": flops / per_second(attention_ms) / 1e12,
-        "attention_arithmetic_intensity": flops / read_valid,
+        "attention_arithmetic_intensity": flops / read_bytes,
         "indices_share_of_step": index_ms / step_ms,
         "attention_plan_share_of_step": plan_ms / step_ms,
         "layer_loop_share_of_step": loop_ms / step_ms,
         "attention_component_share_of_step": attention_ms / step_ms,
         "kv_write_component_share_of_step": write_ms / step_ms,
         "components_share_of_step": (write_ms + attention_ms) / step_ms,
-        "kv_gather_share_of_attention_component": gather_ms / attention_ms,
         "total_tokens_per_s": case.new_tokens / per_second(step_ms),
     }

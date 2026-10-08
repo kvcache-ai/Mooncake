@@ -57,25 +57,25 @@ def case(
     )
 
 
-def test_ledger_counts_written_valid_and_page_covered_bytes():
+def test_ledger_counts_written_bytes_and_page_capacity():
     one = case()
-    # 128 queries written, 640 context tokens read, and 640 tokens covered by pages
+    # 128 queries written, and the step's 640 tokens covered by 10 whole pages
     assert one.new_tokens == 128
     assert one.context_tokens == 640
     assert one.pages == 10
     assert one.padding_tokens == 0
     per_token = 36 * 2 * 2 * 128 * 2
     assert one.kv_bytes_written() == 128 * per_token
-    assert one.kv_bytes_read_valid() == 640 * per_token
-    assert one.kv_bytes_read_pages() == 640 * per_token
+    assert one.kv_page_capacity_bytes() == 640 * per_token
 
 
-def test_padding_is_counted_when_the_last_page_is_not_full():
+def test_padding_is_counted_in_the_page_capacity():
     one = case(prefix_lens=(500,), new_lens=(100,))
     assert one.context_tokens == 600
     assert one.pages == 10  # 600 tokens over 64-token pages
     assert one.padding_tokens == 40
-    assert one.kv_bytes_read_pages() > one.kv_bytes_read_valid()
+    assert one.kv_page_capacity_bytes() == one.kv_bytes(10 * 64)
+    assert one.kv_page_capacity_bytes() > one.kv_bytes(one.context_tokens)
 
 
 def test_attention_pairs_follow_the_causal_mask():

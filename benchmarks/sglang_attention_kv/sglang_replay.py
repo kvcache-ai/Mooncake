@@ -50,10 +50,15 @@ from .cases import (
 
 # The wrapper backend and the page size SGLang plans the wrappers with: it hands
 # FlashInfer a token-level CSR stream, so every wrapper is planned as page_size=1
-# and every last_page_len is 1.
+# and every last_page_len is 1. The pool's page size is a separate figure, and it
+# reaches the kernels only through the addresses in that stream.
 FLASHINFER_BACKEND = "fa2"
 WRAPPER_PAGE_SIZE = 1
 WORKSPACE_BYTES = 384 * 1024 * 1024
+
+# The decode wrapper's tensor-core path, which is what FlashInferAttnBackend
+# builds for a decode step.
+DECODE_USE_TENSOR_CORES = True
 
 # Spare pages beyond what the case needs, so a layout can leave gaps.
 SPARE_PAGE_FRACTION = 8
@@ -362,7 +367,7 @@ class SglangStep:
             )
         else:
             self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace, "NHD", use_tensor_cores=True
+                self.workspace, "NHD", use_tensor_cores=DECODE_USE_TENSOR_CORES
             )
 
     # ------------------------------------------------------------ the step
@@ -522,15 +527,33 @@ class SglangStep:
     def gather_bytes(self, indices):
         """The bytes the probe moves: both K and V of the rows it reads, for every
         layer."""
-        rows = self.gather_rows(indices).numel()
-        return (
-            2
-            * self.case.num_layers
-            * rows
-            * self.case.num_kv_heads
-            * self.case.head_dim
-            * self.case.dtype_bytes
-        )
+        return self.case.kv_bytes(self.gather_rows(indices).numel())
+
+    def read_tokens(self):
+        """The tokens of KV the branch's attention reads, as (paged, ragged).
+
+        The paged side reads the sequence's cached history and the ragged side
+        reads the K/V this step computes, so which of the two is counted depends on
+        the branch: the two ragged branches hand their own tokens to the ragged
+        wrapper and let the paged wrapper see the history only, while the paged
+        branches read the whole context through the paged wrapper.
+        """
+        if self.branch == BRANCH_RAGGED_NO_PREFIX:
+            return 0, self.case.new_tokens
+        if self.branch == BRANCH_RAGGED_PREFIX_MERGE:
+            history = self.case.context_tokens - self.case.new_tokens
+            return history, self.case.new_tokens
+        return self.case.context_tokens, 0
+
+    def read_bytes(self):
+        """The KV bytes the attention window covers, split by the path that reads
+        them: the paged side's logical bytes, the ragged side's, and their sum.
+        That sum is what the window's bandwidth and its arithmetic intensity divide
+        by; the page capacity is a separate figure."""
+        paged_tokens, ragged_tokens = self.read_tokens()
+        paged = self.case.kv_bytes(paged_tokens)
+        ragged = self.case.kv_bytes(ragged_tokens)
+        return {"paged": paged, "ragged": ragged, "attention": paged + ragged}
 
     def gather(self, indices):
         """A read-only probe over the same rows: the same bytes, both tensors,
@@ -700,6 +723,7 @@ class SglangStep:
             "reads_before_write": self.reads_before_write,
             "attention_backend": f"flashinfer-{FLASHINFER_BACKEND}",
             "wrapper_page_size": WRAPPER_PAGE_SIZE,
+            "decode_use_tensor_cores": DECODE_USE_TENSOR_CORES,
             "kv_layout": "NHD",
             "kv_write_stream": "alternate" if KV_WRITE_ALT_STREAM else "step",
             "flashinfer_use_paged_env": use_paged_default(),

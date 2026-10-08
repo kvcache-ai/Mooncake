@@ -199,7 +199,7 @@ def run_steps(plan, device, jsonl_path, warmup, timed, errors, seed, extend_bran
                 f"[steps] {case.label} "
                 f"context={case.context_tokens} tokens "
                 f"pages={case.pages} "
-                f"kv={case.kv_bytes_read_pages() / 2**20:.1f} MiB"
+                f"page_capacity={case.kv_page_capacity_bytes() / 2**20:.1f} MiB"
             )
             record = run_case(
                 case,

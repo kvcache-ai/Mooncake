@@ -231,7 +231,8 @@ class KernelCase(StepShape):
             )
         return DTYPE_BYTES[self.dtype]
 
-    def _kv_bytes(self, tokens):
+    def kv_bytes(self, tokens):
+        """The KV of `tokens` tokens on one rank: K and V, every layer."""
         return (
             self.num_layers
             * 2
@@ -243,17 +244,15 @@ class KernelCase(StepShape):
 
     def kv_bytes_written(self):
         """Bytes this step writes: only the tokens it computes."""
-        return self._kv_bytes(self.new_tokens)
+        return self.kv_bytes(self.new_tokens)
 
-    def kv_bytes_read_valid(self):
-        """Bytes of the KV the step reads: every valid context token."""
-        return self._kv_bytes(self.context_tokens)
-
-    def kv_bytes_read_pages(self):
-        """Bytes the paged read covers: whole pages, so a last page that is not
-        full is read with its padding. Bandwidth over a paged read has to use this
-        count; the valid-token count would overstate the rate."""
-        return self._kv_bytes(self.pages * self.page_size)
+    def kv_page_capacity_bytes(self):
+        """The capacity the step's pages occupy: whole pages, so a last page that
+        is not full counts with its padding and `padding_tokens` states how many
+        tokens that is. This is an allocation figure. What a kernel reads is the
+        logical count for the path it takes, which `SglangStep.read_bytes` splits
+        into the paged side and the ragged side."""
+        return self.kv_bytes(self.pages * self.page_size)
 
     def attention_flops(self):
         """QK^T and PV are one multiply-add each, so a query-key pair costs 4
@@ -271,8 +270,7 @@ class KernelCase(StepShape):
         body.update(
             {
                 "kv_bytes_written": self.kv_bytes_written(),
-                "kv_bytes_read_valid": self.kv_bytes_read_valid(),
-                "kv_bytes_read_pages": self.kv_bytes_read_pages(),
+                "kv_page_capacity_bytes": self.kv_page_capacity_bytes(),
                 "attention_flops": self.attention_flops(),
                 "kv_layout": "NHD",
             }

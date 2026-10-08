@@ -20,9 +20,13 @@ from benchmarks.sglang_attention_kv.cases import (  # noqa: E402
     KernelCase,
     short_case,
 )
+from benchmarks.sglang_attention_kv import kernel_bench  # noqa: E402
 from benchmarks.sglang_attention_kv.kernel_bench import (  # noqa: E402
+    PHASES,
+    derive,
     one_attention_component,
     one_iteration,
+    run_case,
 )
 from benchmarks.sglang_attention_kv.sglang_replay import SglangStep  # noqa: E402
 
@@ -300,18 +304,107 @@ def test_the_merge_branch_is_causal_as_well():
     assert not step.unmasked_reference(query)["passed"]
 
 
-def test_the_attention_bandwidth_uses_the_valid_bytes():
-    """Normalised bandwidth divides the valid KV the step reads; the page-covered
-    count is an allocation figure and is reported beside it."""
+def test_the_read_ledger_splits_the_paged_side_from_the_ragged_side():
+    """A merge step reads its history through the paged wrapper and its own tokens
+    through the ragged one, so the bytes it reads are those two counts and not the
+    whole context of a paged step."""
     step, _ = prepared(step_case("extend", (500,), (100,)))
     case = step.case
+    read = step.read_bytes()
+    assert read["paged"] == case.kv_bytes(500)
+    assert read["ragged"] == case.kv_bytes(100)
+    assert read["attention"] == case.kv_bytes(600)
+    assert read["attention"] < case.kv_page_capacity_bytes()
+
+    paged_step, _ = prepared(step_case("prefill", (0,), (600,)))
+    paged_read = paged_step.read_bytes()
+    assert paged_read["paged"] == 0
+    assert paged_read["ragged"] == paged_step.case.kv_bytes(600)
+
+    extend_step, _ = prepared(
+        step_case("extend", (500,), (100,)), extend_branch=BRANCH_PAGED_EXTEND
+    )
+    extend_read = extend_step.read_bytes()
+    assert extend_read["paged"] == extend_step.case.kv_bytes(600)
+    assert extend_read["ragged"] == 0
+
+
+def test_the_attention_bandwidth_divides_the_bytes_the_branch_reads():
+    """The rate a row reports divides the KV the attention window covers. A derive
+    that divided the page capacity instead would report a different number, so this
+    fails if the ledger drifts back to the allocation figure."""
+    step, _ = prepared(step_case("extend", (500,), (100,)))
+    case = step.case
+    read = step.read_bytes()
     query = step.make_query()
     attention_ms = one_attention_component(step, query)
-    gbps = case.kv_bytes_read_valid() / (attention_ms / 1000.0) / 1e9
-    assert case.kv_bytes_read_valid() < case.kv_bytes_read_pages()
-    assert gbps == pytest.approx(
-        case.kv_bytes_read_valid() / (attention_ms / 1000.0) / 1e9, rel=1e-9
+    phases = {name: {"p50": attention_ms} for name in PHASES}
+    indices = step.build_indices()
+    derived = derive(case, phases, step.gather_bytes(indices), read["attention"])
+    per_second = attention_ms / 1000.0
+    assert derived["attention_effective_gbps"] == pytest.approx(
+        read["attention"] / per_second / 1e9, rel=1e-12
     )
+    assert derived["attention_arithmetic_intensity"] == pytest.approx(
+        case.attention_flops() / read["attention"], rel=1e-12
+    )
+    capacity_rate = case.kv_page_capacity_bytes() / per_second / 1e9
+    assert derived["attention_effective_gbps"] != pytest.approx(capacity_rate, rel=1e-3)
+
+
+def test_the_component_passes_run_against_a_plan_of_their_own_indices(monkeypatch):
+    """The components read the indices they built, so they have to run against a
+    plan of those and not the metadata the last timed iteration left behind. The
+    plan is taken outside every window, so it is not part of what a component
+    measures."""
+    case = short_case(step_case("extend", (256,), (128,)))
+    order = []
+    original_plan = SglangStep.plan
+
+    def plan(self, indices):
+        order.append("plan")
+        return original_plan(self, indices)
+
+    def iteration(step, query):
+        order.append("iteration")
+        return original_iteration(step, query)
+
+    def write_component(step, indices):
+        order.append("write_component")
+        return original_write(step, indices)
+
+    def attention_component(step, query):
+        order.append("attention_component")
+        return original_attention(step, query)
+
+    def gather(step, indices):
+        order.append("gather")
+        return original_gather(step, indices)
+
+    original_iteration = kernel_bench.one_iteration
+    original_write = kernel_bench.one_write_component
+    original_attention = kernel_bench.one_attention_component
+    original_gather = kernel_bench.one_gather
+    monkeypatch.setattr(SglangStep, "plan", plan)
+    monkeypatch.setattr(kernel_bench, "one_iteration", iteration)
+    monkeypatch.setattr(kernel_bench, "one_write_component", write_component)
+    monkeypatch.setattr(kernel_bench, "one_attention_component", attention_component)
+    monkeypatch.setattr(kernel_bench, "one_gather", gather)
+    run_case(case, DEVICE, warmup=1, timed=2)
+    # Each timed iteration plans for its own indices inside its window. The plan
+    # that follows them is the one the component passes run against, and it comes
+    # before the first component window. The correctness check builds a short step
+    # of its own afterwards, which is why only this prefix is compared.
+    expected = ["iteration", "plan"] * 3 + [
+        "plan",
+        "write_component",
+        "write_component",
+        "attention_component",
+        "attention_component",
+        "gather",
+        "gather",
+    ]
+    assert order[: len(expected)] == expected
 
 
 def test_the_step_loop_interleaves_write_and_read_per_layer(monkeypatch):

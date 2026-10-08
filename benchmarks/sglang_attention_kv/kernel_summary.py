@@ -29,8 +29,10 @@ CSV_COLUMNS = [
     "pages",
     "padding_tokens",
     "kv_bytes_written",
-    "kv_bytes_read_valid",
-    "kv_bytes_read_pages",
+    "kv_bytes_paged_read",
+    "kv_bytes_ragged_read",
+    "kv_bytes_attention_read",
+    "kv_bytes_page_capacity",
     "gather_rows",
     "gather_bytes",
     "attention_pairs",
@@ -45,8 +47,9 @@ CSV_COLUMNS = [
     "attention_passed",
 ]
 for _phase in REPORTED_PHASES:
-    # min as well as the percentiles: on a shared machine a co-tenant can slow a
-    # window for part of a run, and min is the uncontended floor of that phase.
+    # min as well as the percentiles: min is the smallest sample the window took
+    # in that row, and on a shared machine it is the one a slower sample during
+    # the run does not move.
     CSV_COLUMNS.extend(
         [
             f"{_phase}_min_ms",
@@ -57,7 +60,7 @@ for _phase in REPORTED_PHASES:
     )
 CSV_COLUMNS.extend(
     [
-        "attention_plan_us_per_layer",
+        "attention_plan_us_per_step",
         "attention_component_us_per_layer",
         "kv_write_component_us_per_layer",
         "indices_us_per_new_token",
@@ -72,7 +75,6 @@ CSV_COLUMNS.extend(
         "attention_component_share_of_step",
         "kv_write_component_share_of_step",
         "components_share_of_step",
-        "kv_gather_share_of_attention_component",
         "total_tokens_per_s",
     ]
 )
@@ -114,8 +116,10 @@ def kernel_summary(records):
             "pages": case["pages"],
             "padding_tokens": case["padding_tokens"],
             "kv_bytes_written": case["kv_bytes_written"],
-            "kv_bytes_read_valid": case["kv_bytes_read_valid"],
-            "kv_bytes_read_pages": case["kv_bytes_read_pages"],
+            "kv_bytes_paged_read": record["read_bytes"]["paged"],
+            "kv_bytes_ragged_read": record["read_bytes"]["ragged"],
+            "kv_bytes_attention_read": record["read_bytes"]["attention"],
+            "kv_bytes_page_capacity": case["kv_page_capacity_bytes"],
             "gather_rows": record["gather_rows"],
             "gather_bytes": record["gather_bytes"],
             "attention_pairs": case["attention_pairs"],

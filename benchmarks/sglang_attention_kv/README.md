@@ -26,12 +26,16 @@ and they are components rather than the schedule the step runs:
 
 | Component | What it covers |
 |---|---|
-| `kv_write_component` | all 36 `set_kv_buffer` calls of a step in one window, without the attention they interleave with |
-| `attention_component` | all 36 attention calls of a step in one window, without the writes |
-| `kv_gather` | a read-only probe: the same rows of K and V, moved with `index_select` and no arithmetic |
+| `kv_write_component` | one `set_kv_buffer` call per layer for the whole step, in one window, without the attention they interleave with |
+| `attention_component` | the branch's attention path for every layer of the step, in one window, without the writes. What that path is depends on the branch: one ragged call, a ragged call plus a paged call plus `merge_state`, one paged prefill call, or one paged decode call |
+| `kv_gather` | a read-only probe: the rows the branch's paged side reads (or the slots the step wrote, when it reads no paged KV), both K and V, moved with `index_select` and no arithmetic |
+
+The 36 calls the two write and attention components hold are the layer count of the model in
+[`RESULTS.md`](RESULTS.md); a step of another model holds that model's layers.
 
 None of the three is added to the step. Each runs after the timed loop, in windows of its own, so no
-step iteration is ever timed with a probe inside it. Their share of the step is named as a component
+step iteration is ever timed with a probe inside it, and the wrappers are planned against the probe's
+own indices before those passes rather than inside them. Their share of the step is named as a component
 share, because the step interleaves the two per layer.
 
 The structures the step is built on are SGLang's throughout: `ReqToTokenPool` for the request to token
@@ -108,28 +112,33 @@ declares a precision the paged attention kernels cannot run fails while the case
 
 ## 4. The ledger
 
-Every derived figure divides by one of these, and all of them are recorded per step:
+The read side is split by the path that reads it, because the branches read different KV: the two
+ragged branches hand their own tokens to the ragged wrapper and let the paged wrapper see the cached
+history only, while the paged branches read the whole context through the paged wrapper. Every figure
+below is recorded per step:
 
 | Quantity | Definition |
 |---|---|
 | `kv_bytes_written` | `layers * 2 * new_tokens * kv_heads * head_dim * dtype_bytes`: the tokens this step computes |
-| `kv_bytes_read_valid` | the same count over the step's valid context tokens |
-| `kv_bytes_read_pages` | the same count over whole pages, so a last page that is not full is counted with its padding; `padding_tokens` states how many tokens that is. It is an allocation figure — the capacity the pages occupy — and no bandwidth divides by it |
+| `kv_bytes_paged_read` | the same count over the tokens the branch's paged side reads: the cached history for `ragged_prefix_merge`, the whole context for `paged_extend` and `decode`, and nothing for `ragged_no_prefix` |
+| `kv_bytes_ragged_read` | the same count over the tokens the branch's ragged side reads: the step's own tokens for the two ragged branches, nothing for the paged ones |
+| `kv_bytes_attention_read` | `kv_bytes_paged_read + kv_bytes_ragged_read`: what the attention window covers |
+| `kv_bytes_page_capacity` | the same per-token count over whole pages, so a last page that is not full counts with its padding and `padding_tokens` states how many tokens that is. It is an allocation figure — the capacity the pages occupy — and no bandwidth divides by it |
 | `gather_bytes` | the bytes the read-only probe moves: both K and V of the `gather_rows` rows it reads, for every layer |
 | `attention_pairs` | `sum over sequences of new * prefix + new * (new + 1) / 2`: a causal mask aligned to the end of the context leaves each query the history and everything computed before it |
 | `attention_flops` | `layers * 4 * attention_pairs * qo_heads * head_dim`: QK^T and PV are one multiply-add each, so a query-key pair costs 4 operations, and every layer does that work |
-| `attention_arithmetic_intensity` | `attention_flops / kv_bytes_read_valid` |
+| `attention_arithmetic_intensity` | `attention_flops / kv_bytes_attention_read` |
 
-Bandwidth divides logical bytes by the window those bytes belong to: the valid KV a step reads
-(`attention_effective_gbps`) and the rows the probe moves (`kv_gather_effective_gbps`). What the memory
-system actually transfers is not observable without a profiler, so no figure here claims it: a paged
-read touches whole pages and a write may coalesce, and the page capacity is reported as the allocation
-figure it is rather than as traffic.
+Bandwidth divides logical bytes by the window those bytes belong to: the KV the branch's attention
+reads (`attention_effective_gbps`) and the rows the probe moves (`kv_gather_effective_gbps`). What the
+memory system actually transfers is not observable without a profiler, so no figure here claims it: a
+paged read touches whole pages and a write may coalesce, and the page capacity is reported as the
+allocation figure it is rather than as traffic.
 
-The write side carries no rate of its own. Its window reads two regimes for the same calls, around
-0.1 ms and around 1.16 ms, so it prices the host's issue of the `set_kv_buffer` calls as much as their
-execution on the device, and a quotient of it would report whichever regime the window happened to
-catch. `kv_write_component` is recorded as the window it is.
+The write side carries no rate of its own. Its window reads two regimes for the same calls, one around
+0.1 ms and one around 1.16 ms in the run in [`RESULTS.md`](RESULTS.md), so what the window covers is not
+determined by the measurement and a quotient of it would report whichever regime the window caught.
+`kv_write_component` is recorded as the window it is.
 
 ## 5. Correctness checks
 
@@ -214,9 +223,12 @@ per step, the page sizes 1 and 64, and both layouts.
   kernel_summary.csv   summary table, one row per measured step
 ```
 
-Every window carries min, p50, p95 and p99 over the timed iterations, the branch the step ran and the
-order it ran in, and the CSV also carries the derived figures of section 4 plus the result of every
-correctness check, so a reader can see which step a number came from and whether its check passed.
+Every window carries min, p50, p95 and p99 over the timed iterations. The branch the step ran, the
+order it ran in and the configuration it was built with are fields of the record beside them — the
+`configuration` object of `kernel.jsonl`, and the `branch`, `reads_before_write`, `attention_backend`,
+`wrapper_page_size`, `decode_use_tensor_cores` and `kv_write_stream` columns of the CSV — so a reader
+can see which step a number came from. The CSV also carries the derived figures of section 4 plus the
+result of every correctness check.
 
 ## 9. What one run measured
 
@@ -244,3 +256,14 @@ manifest of a run states every one of them.
 - The extension to a second GPU rank, or to a second model, changes the per-rank head counts and the
   per-token bytes; the manifest records both, and results from different shardings are only comparable
   through them.
+
+The replay fixes four settings, each stated in the record's `configuration` and in the CSV, so a row
+says which configuration it describes. They are the benchmark's own choices and not the only paths
+SGLang runs:
+
+| Setting | Value here | What a server does |
+|---|---|---|
+| `attention_backend` | `flashinfer-fa2` | whichever backend the server selects; this benchmark calls the FlashInfer wrappers, so it measures that backend |
+| `wrapper_page_size` | `1`, and every last-page length is 1 | the same: SGLang hands FlashInfer a token-level CSR stream, and the pool's page size is a separate figure that reaches the kernels only through the addresses in it |
+| `decode_use_tensor_cores` | `true` | `FlashInferAttnBackend` builds its decode wrapper with the tensor-core path; a deployment can turn it off |
+| `kv_write_stream` | `step` | a server leaves `MHATokenToKVPool`'s alternate stream on, which overlaps the write with the attention; writing on the step's own stream is what makes a per-phase breakdown describe the phase rather than whichever window syncs next |
