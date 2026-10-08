@@ -35,7 +35,6 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
-#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -852,7 +851,7 @@ int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
 #if defined(USE_CUDA) || defined(USE_SUPA)
-    if (!Environ::Get().GetWithNvidiaPeermem()) {
+    if (!globalConfig().with_nvidia_peermem) {
         for (auto &buffer : buffer_list) {
             int ret = registerLocalMemory(buffer.addr, buffer.length, location,
                                           true, false);
@@ -890,7 +889,7 @@ int RdmaTransport::registerLocalMemoryBatch(
 
         if (first_error) return first_error;
 #if defined(USE_CUDA) || defined(USE_SUPA)
-    }  // Environ::Get().GetWithNvidiaPeermem()
+    }  // globalConfig().with_nvidia_peermem
 #endif
 
     return metadata_->updateLocalSegmentDesc();
