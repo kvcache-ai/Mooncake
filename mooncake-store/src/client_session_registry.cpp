@@ -80,15 +80,18 @@ void ClientSessionRegistry::UpdateHostId(const UUID& client_id,
     if (host_id.empty()) {
         return;
     }
+    Slot slot;
     {
         std::shared_lock lock(mutex_);
-        const auto slot = FindSlotLocked(client_id);
+        slot = FindSlotLocked(client_id);
         if (!slot || slot->host_id == host_id) {
             return;
         }
     }
+    // The session may have been replaced between the two locks. A hint seen
+    // by the old incarnation must not land on its successor.
     std::unique_lock lock(mutex_);
-    if (const auto slot = FindSlotLocked(client_id)) {
+    if (FindSlotLocked(client_id) == slot) {
         slot->host_id = host_id;
     }
 }
