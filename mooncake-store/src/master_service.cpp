@@ -2829,6 +2829,17 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 }
                 const auto cleanup_plan =
                     BuildStaleHandleCleanupPlan(it->second, is_stale);
+                if ((cleanup_plan.would_invalidate || !it->second.IsValid()) &&
+                    !it->second.IsLeaseExpired()) {
+                    // This round would end the record: every replica is stale
+                    // or the metadata is already invalid. A live read lease
+                    // means ExistKey just reported the key as a hit, so
+                    // sweeping now flips the follow-up load to
+                    // OBJECT_NOT_FOUND mid-flight and drops bytes a remount
+                    // could still revive (#4508). Leave replicas and metadata
+                    // in place; the next sweep after lease expiry takes both.
+                    continue;
+                }
                 if (!cleanup_plan.removed_ids.empty()) {
                     if (enable_ha_) {
                         if (enable_oplog_) {
