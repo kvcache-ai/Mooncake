@@ -157,8 +157,9 @@ class GatherReadService::Impl {
                 "invalid gather service configuration (classic TE required)");
         }
 
-        owner_name_ =
-            owner_name.empty() ? engine_->getLocalIpAndPort() : owner_name;
+        auto local =
+            engine_->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        owner_name_ = owner_name.empty() && local ? local->name : owner_name;
         for (size_t i = 0; i < options.workers; ++i) {
             auto worker = std::make_unique<Worker>();
             const size_t size = options.chunk_bytes * options.pipeline_depth;
@@ -286,6 +287,13 @@ class GatherReadService::Impl {
                 return rejected("destination is not remotely registered");
         }
 
+        // ponytail: enable TCP only after it can fence destination-side writes.
+        auto descriptor = engine_->getMetadata()->getSegmentDescByID(segment);
+        if (!engine_->getTransport("rdma") || !descriptor ||
+            descriptor->protocol != "rdma")
+            return rejected(
+                "gather requires an RDMA destination and transport");
+
         // No allocations after the first write: all slots and request vectors
         // are persistent. Every exit drains all writes before reusing staging.
         struct Drain {
@@ -356,8 +364,14 @@ class GatherReadService::Impl {
     std::string open(const std::string& expected_owner) {
         if (!expected_owner.empty() && expected_owner != owner_name_) return {};
         std::lock_guard lock(sessions_mutex_);
+        if (sessions_.size() >= 4096) {
+            // An RPC holds a reference until its writes have drained.
+            std::erase_if(sessions_, [](const auto& entry) {
+                return entry.second.use_count() == 1;
+            });
+        }
         if (sessions_.size() >= 4096) return {};
-        auto id = UuidToString(generate_uuid());
+        auto id = incarnation_ + UuidToString(generate_uuid());
         sessions_.emplace(id, std::make_shared<Session>());
         return id;
     }
@@ -368,19 +382,25 @@ class GatherReadService::Impl {
     }
     GatherReadResult read(GatherRequest request) {
         auto state = session(request.session);
-        if (!state) return rejected("unknown session");
+        if (!state)
+            return {GatherReadCompletion::SessionExpired, "session retired", 0};
         std::lock_guard lock(state->mutex);
         if (request.sequence <= state->sequence)
             return rejected("operation already fenced");
         state->sequence = request.sequence;
+        state->result = {GatherReadCompletion::FailedDrained,
+                         "gather execution failed", 0};
         state->result = execute(request);
         return state->result;
     }
     GatherReadResult fence(std::string id, uint64_t sequence) {
         auto state = session(id);
-        // A missing session can mean an owner restart. Do not infer that the
-        // old owner's DMA has drained from a different process's reply.
-        if (!state) return {GatherReadCompletion::Unknown, "session lost", 0};
+        if (!state) {
+            if (id.starts_with(incarnation_))
+                return {GatherReadCompletion::FailedDrained,
+                        "session retired after draining", 0};
+            return {GatherReadCompletion::Unknown, "owner session lost", 0};
+        }
         std::lock_guard lock(state->mutex);
         if (sequence > state->sequence) {
             state->sequence = sequence;
@@ -390,10 +410,13 @@ class GatherReadService::Impl {
     }
     void close(std::string id) {
         std::lock_guard lock(sessions_mutex_);
-        sessions_.erase(id);
+        auto it = sessions_.find(id);
+        if (it != sessions_.end() && it->second.use_count() == 1)
+            sessions_.erase(it);
     }
     std::mutex sessions_mutex_;
     std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
+    const std::string incarnation_ = UuidToString(generate_uuid()) + "/";
 
     std::shared_ptr<TransferEngine> engine_;
     std::shared_mutex sources_mutex_;
@@ -499,6 +522,9 @@ GatherReadClient::~GatherReadClient() = default;
 bool GatherReadClient::available() const {
     return !impl_->busy.load() && !impl_->poisoned.load();
 }
+bool GatherReadClient::retired() const {
+    return !impl_->busy.load() && impl_->poisoned.load();
+}
 
 GatherReadOperation GatherReadClient::submitGatherRead(
     const std::vector<GatherReadRange>& ranges, void* destination,
@@ -527,18 +553,21 @@ GatherReadOperation GatherReadClient::submitGatherRead(
         return operation;
     }
     auto impl = impl_;
+    auto local =
+        impl->engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!local) {
+        state->promise.set_value(rejected("local segment is not registered"));
+        return operation;
+    }
     if (impl->poisoned.load() || impl->busy.exchange(true)) {
         state->promise.set_value(
             rejected("gather client busy or requires recovery"));
         return operation;
     }
     state->lifetime = std::move(lifetime);
-    state->request = {impl->session,
-                      ++impl->sequence,
-                      impl->engine->getLocalIpAndPort(),
-                      reinterpret_cast<uint64_t>(destination),
-                      capacity,
-                      ranges};
+    state->request = {impl->session, ++impl->sequence,
+                      local->name,   reinterpret_cast<uint64_t>(destination),
+                      capacity,      ranges};
     impl->client
         ->call_for<&GatherReadService::Impl::read>(impl->timeout,
                                                    state->request)
@@ -551,6 +580,8 @@ GatherReadOperation GatherReadClient::submitGatherRead(
                 auto& value = response.value();
                 if (value.has_value()) result = std::move(value.value());
             }
+            if (result.completion == GatherReadCompletion::SessionExpired)
+                impl->poisoned.store(true);
             if (!result.drained()) {
                 impl->poisoned.store(true);
                 std::thread([state, impl] {

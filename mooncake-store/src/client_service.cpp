@@ -491,9 +491,6 @@ Client::~Client() {
     if (!gather_endpoint_.empty())
         (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
                                                    gather_endpoint_, true);
-    // Stop heartbeats before retiring discovery and draining owner writes.
-    gather_service_.reset();
-    gather_clients_.clear();
 
     leader_monitor_running_ = false;
     if (leader_monitor_thread_.joinable()) {
@@ -509,6 +506,10 @@ Client::~Client() {
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
     task_thread_pool_.stop();
+
+    // Unmount callbacks must finish before the service and sources are drained.
+    gather_service_.reset();
+    gather_clients_.clear();
 
     // Make copies to avoid modifying while iterating
     std::vector<Segment> mounted_segments_copy;
@@ -3925,10 +3926,9 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             segment.te_endpoint = local_hostname_;
         }
 
-        // Only CPU memory on classic TCP/RDMA owners enables gather.
+        // Only CPU memory on classic RDMA owners enables gather.
         // Service setup failure leaves the existing direct path available.
-        if (!transfer_engine_->isUsingTent() &&
-            (protocol == "rdma" || protocol == "tcp") &&
+        if (SupportsGatherRead() && protocol == "rdma" &&
             !device::GetAcceleratorRegistry()
                  .RuntimeAccelerators()
                  .FindDeviceForPointer(buffer)) {
@@ -5656,10 +5656,16 @@ std::optional<store::GatherReadOperation> Client::SubmitGatherRead(
     const std::string& endpoint,
     const std::vector<store::GatherReadRange>& ranges, void* destination,
     size_t capacity) {
-    if (transfer_engine_->isUsingTent() || endpoint.empty())
-        return std::nullopt;
-    std::lock_guard lock(gather_clients_mutex_);
-    auto& peer = gather_clients_[endpoint];
+    if (!SupportsGatherRead() || endpoint.empty()) return std::nullopt;
+    std::shared_ptr<GatherPeer> peer_ptr;
+    {
+        std::lock_guard lock(gather_clients_mutex_);
+        auto& slot = gather_clients_[endpoint];
+        if (!slot) slot = std::make_shared<GatherPeer>();
+        peer_ptr = slot;
+    }
+    auto& peer = *peer_ptr;
+    std::lock_guard lock(peer.mutex);
     const auto now = std::chrono::steady_clock::now();
     if (now >= peer.refresh_at) {
         auto discovered = master_client_.ResolveGatherEndpoint(endpoint);
@@ -5670,6 +5676,8 @@ std::optional<store::GatherReadOperation> Client::SubmitGatherRead(
     }
     if (peer.endpoint.empty()) return std::nullopt;
     auto& clients = peer.clients;
+    std::erase_if(clients,
+                  [](const auto& client) { return client->retired(); });
     auto it =
         std::find_if(clients.begin(), clients.end(),
                      [](const auto& client) { return client->available(); });

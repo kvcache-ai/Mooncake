@@ -206,8 +206,8 @@ class Client {
         TransferIntent intent = TransferIntent::kUnspecified);
 
     bool SupportsGatherRead() const {
-        return !transfer_engine_->isUsingTent() &&
-               (protocol_ == "tcp" || protocol_ == "rdma");
+        return !transfer_engine_->isUsingTent() && protocol_ == "rdma" &&
+               transfer_engine_->getTransport("rdma");
     }
     std::optional<store::GatherReadOperation> SubmitGatherRead(
         const std::string& endpoint,
@@ -994,11 +994,13 @@ class Client {
     std::string gather_endpoint_;
     std::mutex gather_clients_mutex_;
     struct GatherPeer {
+        std::mutex mutex;
         std::string endpoint;
         std::chrono::steady_clock::time_point refresh_at{};
         std::vector<std::unique_ptr<store::GatherReadClient>> clients;
     };
-    std::unordered_map<std::string, GatherPeer> gather_clients_;
+    std::unordered_map<std::string, std::shared_ptr<GatherPeer>>
+        gather_clients_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
