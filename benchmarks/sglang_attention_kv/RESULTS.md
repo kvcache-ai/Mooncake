@@ -171,12 +171,12 @@ those rows carried both regimes inside its own pass: 0.240 ms at p50 and 1.180 m
 the measurement separates the host's issue of the calls from the device's execution of them, so the CSV
 records the write side as the window it is and derives no bandwidth or per-token cost from it.
 
-**A window can also be slowed on a shared machine.** In that earlier run five steps' attention windows
-read 181.141, 97.579, 85.132, 59.842 and 22.841 ms in rows whose loops were 84.738, 45.618, 39.522,
-28.320 and 12.098 ms, and re-measuring those steps read 84.568, 45.677, 39.615, 28.244 and 12.091 ms.
-This run has no such row. The min column of a window is the smallest sample it took in its row, which
-is the figure a slower sample during the run does not move: the largest loops of the matrix, the
-batch-4 prefills of 8192-token sequences at 242.3 to 242.5 ms, have a p95 0.73 ms above their min.
+**The same steps read differently in an earlier run.** In that earlier run five steps' attention
+windows read 181.141, 97.579, 85.132, 59.842 and 22.841 ms in rows whose loops were 84.738, 45.618,
+39.522, 28.320 and 12.098 ms, and re-measuring those steps read 84.568, 45.677, 39.615, 28.244 and
+12.091 ms. This run has no such row. The min column of a window is the smallest sample it took in its
+row, which is the figure a slower sample during the run does not move: the largest loops of the matrix,
+the batch-4 prefills of 8192-token sequences at 242.3 to 242.5 ms, have a p95 0.73 ms above their min.
 
 ## Reading a row back
 
