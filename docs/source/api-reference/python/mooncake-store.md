@@ -607,6 +607,36 @@ In the example above:
 - Source overflow is checked against the source object's size.
 - Full-object `get_into()` and ranged `get_into_ranges()` are different APIs; use `get_into()` when you want the whole object into one buffer.
 
+Gather endpoints are discovered through a separate, expiring Store RPC directory.
+Owners refresh their entries on existing heartbeats; readers cache discoveries.
+This does not change segment/object descriptors, allocator metadata, or snapshots.
+Missing entries or unsupported directory RPCs fall back to scatter.
+
+**Automatic gather/scatter selection:** for remote CPU memory replicas on
+classic RDMA/TCP Store owners, the Store can pack many small source fragments
+into registered chunks and pipeline ordinary Transfer Engine WRITEs into a
+contiguous destination. The API and per-fragment results remain unchanged.
+
+Selection is per owner and destination buffer, including ranges from multiple
+keys ordered by destination offset. The initial policy requires at least 256
+source runs, fragments of at most 1 KiB, at least 64 KiB total payload, and a
+contiguous, non-overlapping destination. Requests are bounded to 131,072 ranges
+and 512 MiB per gather operation. Small requests, large fragments, destination
+gaps, local-copy/shared-memory proxy paths, TENT, and owners without the capability use existing
+paths. Set `MC_STORE_GATHER_READ=0` on the reader to disable gather selection.
+This switch does not change buffer registration, allowing direct comparisons.
+
+Store output buffers registered on supported classic transports are published
+for remote access because gather uses owner-initiated WRITEs. Callers must keep
+buffers and registrations alive until the synchronous read returns, and must
+establish GPU visibility before consuming RDMA-written GPU data. Ordinary reads
+retain lease renewal; snapshot reads do not renew or change the selected
+snapshot. An owner rejection before any write can fall back to scatter.
+After a control-connection failure, the reader fences the original operation
+before returning; it does not replay writes. If the original owner/session
+cannot be reached, the read remains pending rather than allowing unsafe buffer
+reuse. Automatic recovery from a lost owner process is not provided.
+
 **Current limitation:** true ranged items currently require the selected source replica to be memory-backed. Whole-object reads still follow the normal full-read path, but partial reads through `get_into_ranges()` do not support non-memory replicas.
 
 ---
