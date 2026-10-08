@@ -617,4 +617,71 @@ TEST(MasterServiceOffloadScenarioTest,
         .Then(Objects(3, 15).NamedBy(key).AreReadable());
 }
 
+// A cycle that queues objects for disk offload must count them toward its
+// target. Before, a queued object freed no memory and so did not count, the
+// pass ran on through the whole expired population (and the shard-ordered
+// second pass), and with offload_force_evict it dropped ratio x base objects
+// of any age once the per-cycle cap was reached.
+TEST(MasterServiceOffloadScenarioTest, OffloadQueuedObjectsCountTowardTarget) {
+    constexpr size_t kObjectCount = 20;
+    constexpr size_t kTarget = 2;  // ceil(20 x 0.10)
+    const auto key = [](size_t index) {
+        return "queued_count_" + std::to_string(index);
+    };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterScenario scenario("offload-queued objects count toward the target",
+                            OffloadOnEvictConfig());
+    scenario.Given(MemoryNode("node").Capacity(64 * 1024 * 1024))
+        .When(MountLocalDisk("node"))
+        .Given(Objects(0, kTarget)
+                   .NamedBy(key)
+                   .Size(1_KB)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base))
+        .Given(Objects(kTarget, kObjectCount)
+                   .NamedBy(key)
+                   .Size(1_KB)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        .When(EvictMemory(0.10))
+        .When(OffloadHeartbeat("node").ExpectTasks({key(0), key(1)}, 1024))
+        .Then(Objects(0, kObjectCount).NamedBy(key).AreReadable());
+}
+
+// With offload_force_evict and a cap no larger than the target, the cycle
+// still ends at the target: the cap bounds what is queued, nothing is dropped
+// beyond it.
+TEST(MasterServiceOffloadScenarioTest, ForceEvictCapDoesNotDropPastTheTarget) {
+    constexpr size_t kObjectCount = 20;
+    constexpr size_t kTarget = 2;  // ceil(20 x 0.10)
+    const auto key = [](size_t index) {
+        return "queued_cap_" + std::to_string(index);
+    };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterServiceConfig config = OffloadForceEvictConfig();
+    config.offloading_queue_limit = kTarget;
+    config.offload_cap_ratio = 1.0;
+    MasterScenario scenario("force-evict cap does not drop past the target",
+                            config);
+    scenario.Given(MemoryNode("node").Capacity(64 * 1024 * 1024))
+        .When(MountLocalDisk("node"))
+        .Given(Objects(0, kTarget)
+                   .NamedBy(key)
+                   .Size(1_KB)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base))
+        .Given(Objects(kTarget, kObjectCount)
+                   .NamedBy(key)
+                   .Size(1_KB)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        .When(EvictMemory(0.10))
+        .When(OffloadHeartbeat("node").ExpectTasks({key(0), key(1)}, 1024))
+        .Then(Objects(0, kObjectCount).NamedBy(key).AreReadable());
+}
+
 }  // namespace mooncake::test
