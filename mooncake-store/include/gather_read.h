@@ -87,6 +87,7 @@ enum class GatherReadCompletion : uint8_t {
     FailedDrained,
     Unknown,
     Pending,
+    SessionExpired,
 };
 
 struct GatherReadResult {
@@ -94,9 +95,12 @@ struct GatherReadResult {
     std::string error;
     uint64_t bytes = 0;
     bool ok() const { return completion == GatherReadCompletion::Completed; }
+    bool rejected() const {
+        return completion == GatherReadCompletion::Rejected ||
+               completion == GatherReadCompletion::SessionExpired;
+    }
     bool drained() const {
-        return completion == GatherReadCompletion::Completed ||
-               completion == GatherReadCompletion::Rejected ||
+        return ok() || rejected() ||
                completion == GatherReadCompletion::FailedDrained;
     }
 };
@@ -162,6 +166,7 @@ class GatherReadClient {
         const std::string& expected_owner = "");
     ~GatherReadClient();
     bool available() const;
+    bool retired() const;
     // Concatenate ranges in their supplied order, including duplicates.
     // destination must be registered with remote_accessible=true in engine.
     // destination_lifetime must keep both allocation and registration alive;

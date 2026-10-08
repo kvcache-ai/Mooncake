@@ -4813,7 +4813,10 @@ RealClient::get_into_ranges_internal(
     if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
     // Choose only compatible contiguous-output groups. Both ordinary and
     // snapshot reads share this planner and preserve their lease semantics.
-    auto plans = store::PlanGatherReads(memory_transfers, gather_endpoints);
+    auto plans =
+        client_->SupportsGatherRead()
+            ? store::PlanGatherReads(memory_transfers, gather_endpoints)
+            : std::vector<store::GatherReadPlan>{};
     std::vector<std::pair<size_t, store::GatherReadOperation>> gathered;
     for (size_t i = 0; i < plans.size(); ++i) {
         auto &plan = plans[i];
@@ -4838,8 +4841,7 @@ RealClient::get_into_ranges_internal(
         } while (result.completion == store::GatherReadCompletion::Pending);
         // Rejection guarantees no writes: unsupported/busy owners safely use
         // scatter. A submitted, drained failure must not silently retry.
-        if (result.completion == store::GatherReadCompletion::Rejected)
-            continue;
+        if (result.rejected()) continue;
         for (size_t i : plans[index].transfers) {
             handled[i] = true;
             const auto &transfer = memory_transfers[i];
