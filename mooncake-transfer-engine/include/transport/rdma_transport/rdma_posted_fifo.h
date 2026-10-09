@@ -23,34 +23,17 @@
 
 namespace mooncake {
 
-// interval <= 1 keeps the historical "every WR is IBV_SEND_SIGNALED" path.
-// Otherwise a WR is signaled when:
-//   * unsignaled_since + 1 reaches the interval,
-//   * it is the last WR of this ibv_post_send chain (one CQE retires the
-//     burst so the SQ cannot fill with only unsignaled WRs), or
-//   * unsignaled_since + 1 reaches max_wr / 2 (hard cap vs SQ deadlock).
-inline bool shouldSignalRdmaWr(int unsignaled_since, int interval, int max_wr,
-                               bool last_in_chain) {
-    if (interval <= 1) return true;
-    const int count = unsignaled_since + 1;
-    if (count >= interval) return true;
-    if (max_wr >= 2 && count >= max_wr / 2) return true;
-    return last_in_chain;
+// Signal every k WRs and always the last WR of this ibv_post_send chain.
+// k = min(interval, max_wr/2). interval<=1 is handled by the caller (every
+// WR signaled, no FIFO). Each chain starts at index 0 because the previous
+// chain always ended signaled (or the endpoint was destroyed).
+inline int rdmaSignalPeriod(int interval, int max_wr) {
+    if (interval <= 1 || max_wr < 2) return 1;
+    return std::max(1, std::min(interval, max_wr / 2));
 }
 
-// interval==1 (and invalid <=1) keeps the historical 1:1 CQE path: no FIFO.
-inline bool useRdmaPostedFifo(int signal_interval) {
-    return signal_interval > 1;
-}
-
-// How many WRs this CQE retires for cq_outstanding.
-// Null wr_id: 0. No FIFO: 1 per non-null CQE. FIFO miss (stale): 0.
-// FIFO hit: drained_n (the prefix through this CQE).
-inline size_t wrRetiredByCqe(bool use_fifo, bool has_completed,
-                             size_t drained_n) {
-    if (!has_completed) return 0;
-    if (!use_fifo) return 1;
-    return drained_n;
+inline bool shouldSignalRdmaWr(int index, int wr_count, int period) {
+    return (index + 1) % period == 0 || index + 1 == wr_count;
 }
 
 // Pop posting-order WRs covered by this CQE. Failed and flushed WRs generate
@@ -60,7 +43,7 @@ inline size_t wrRetiredByCqe(bool use_fifo, bool has_completed,
 template <typename Slice>
 size_t collectPostedFifo(std::deque<Slice *> &q, Slice *completed,
                          std::vector<Slice *> &out) {
-    if (!completed || q.empty()) return 0;
+    if (q.empty()) return 0;
     const auto found = std::find(q.begin(), q.end(), completed);
     if (found == q.end()) return 0;
     const size_t n = static_cast<size_t>(std::distance(q.begin(), found) + 1);
@@ -68,29 +51,6 @@ size_t collectPostedFifo(std::deque<Slice *> &q, Slice *completed,
                std::next(q.begin(), static_cast<ptrdiff_t>(n)));
     q.erase(q.begin(), std::next(q.begin(), static_cast<ptrdiff_t>(n)));
     return n;
-}
-
-// How to stamp a drained slice from one CQE. The CQE's own WR (the last
-// drained entry) always keeps the hardware status. Prefix WRs:
-//   * SUCCESS CQE, or the first non-flush error on this QP: SUCCESS
-//     (RC completed them on the wire before the failing WR).
-//   * FLUSH_ERR, or any later error after the QP is already errored:
-//     WR_FLUSH_ERR (those WRs did not complete; do not claim SUCCESS).
-enum class DrainedSliceStatus {
-    kKeepCqe,
-    kSuccess,
-    kFlushErr,
-};
-
-inline DrainedSliceStatus drainedSliceStatus(bool cqe_success,
-                                             bool cqe_is_flush,
-                                             bool qp_already_errored,
-                                             size_t index, size_t drained_n) {
-    if (index + 1 >= drained_n) return DrainedSliceStatus::kKeepCqe;
-    if (cqe_success) return DrainedSliceStatus::kSuccess;
-    if (!cqe_is_flush && !qp_already_errored)
-        return DrainedSliceStatus::kSuccess;
-    return DrainedSliceStatus::kFlushErr;
 }
 
 }  // namespace mooncake
