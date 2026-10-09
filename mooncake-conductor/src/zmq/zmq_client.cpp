@@ -301,6 +301,17 @@ std::string ZMQClient::ProcessMessage() {
         return "";
     }
 
+    // A native SGLang PUB stream is ordered. A backwards live sequence can
+    // signal a publisher restart; replaying from our old high-water mark would
+    // silently discard the new stream while retaining stale cache ownership.
+    // Equal-sequence duplicates and older DEALER replay records remain valid.
+    if (config_.publisher_kind == common::PublisherKind::kSglang &&
+        last_live_seq != -1 && seq < last_live_seq) {
+        MarkStale("SGLang live sequence regressed from " +
+                  std::to_string(last_live_seq) + " to " + std::to_string(seq));
+        return "";
+    }
+
     const bool new_gap = last_live_seq != -1 &&
                          last_live_seq != std::numeric_limits<int64_t>::max() &&
                          seq > last_live_seq + 1;

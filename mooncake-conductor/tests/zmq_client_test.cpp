@@ -345,7 +345,9 @@ class MockPublisher {
                            std::string replay_topic = "",
                            bool bad_delimiter = false,
                            bool bad_sequence = false,
-                           PublisherKind publisher_kind = PublisherKind::kVllm)
+                           PublisherKind publisher_kind = PublisherKind::kVllm,
+                           std::string pub_endpoint = "tcp://127.0.0.1:*",
+                           std::string replay_endpoint = "tcp://127.0.0.1:*")
         : ctx_(1),
           pub_(ctx_, ZMQ_PUB),
           router_(ctx_, ZMQ_ROUTER),
@@ -355,9 +357,9 @@ class MockPublisher {
           bad_sequence_(bad_sequence),
           publisher_kind_(publisher_kind) {
         pub_.set(ZMQ_IPV6, 1);
-        pub_.bind("tcp://127.0.0.1:*");
+        pub_.bind(pub_endpoint);
         router_.set(ZMQ_IPV6, 1);
-        router_.bind("tcp://127.0.0.1:*");
+        router_.bind(replay_endpoint);
         replay_thread_ = std::thread([this] { HandleReplay(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -1292,6 +1294,86 @@ TEST(ZMQClient, FailedReconnectDoesNotRequestReplayUntilSuccess) {
     ASSERT_TRUE(publisher.WaitForReplayRequests(1, std::chrono::seconds(2)));
     EXPECT_EQ(publisher.ReplayRequestCount(), 1u);
     EXPECT_EQ(publisher.LastReplayFromSequence(), 11u);
+    client.Stop();
+}
+
+TEST(ZMQClient, SglangPublisherRestartInvalidatesTheOldLiveStream) {
+    auto publisher = std::make_unique<MockPublisher>(false, "", false, false,
+                                                     PublisherKind::kSglang);
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(*publisher);
+    config.publisher_kind = PublisherKind::kSglang;
+    const auto endpoint = publisher->PubEndpoint();
+    const auto replay_endpoint = publisher->RouterEndpoint();
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+    ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
+        publisher->Publish("", PackSglangStoredBatch(100), 10);
+    }));
+
+    publisher.reset();
+    publisher = std::make_unique<MockPublisher>(false, "", false, false,
+                                                PublisherKind::kSglang,
+                                                endpoint, replay_endpoint);
+    publisher->SetReplayMaxSequence(0);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (handler->StaleNotificationCount() == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        publisher->Publish("", PackSglangStoredBatch(200), 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    EXPECT_TRUE(client.IsStale());
+    EXPECT_NE(client.GetStaleReason().find("sequence regressed"),
+              std::string::npos);
+    EXPECT_EQ(client.GetLastSequence(), 10);
+    EXPECT_EQ(handler->StaleNotificationCount(), 1u);
+    EXPECT_TRUE(handler->WasSourceMarkedStale("test-pod", endpoint, 10));
+    EXPECT_FALSE(handler->FindBatch(0, endpoint).has_value());
+    client.Stop();
+}
+
+TEST(ZMQClient, SglangEqualLiveDuplicateDoesNotInvalidateSource) {
+    MockPublisher publisher(false, "", false, false, PublisherKind::kSglang);
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.publisher_kind = PublisherKind::kSglang;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+    ASSERT_TRUE(PublishUntilHandled(*handler, 10, config.endpoint, [&] {
+        publisher.Publish("", PackSglangStoredBatch(100), 10);
+    }));
+    publisher.Publish("", PackSglangStoredBatch(100), 10);
+    ASSERT_TRUE(PublishUntilHandled(*handler, 11, config.endpoint, [&] {
+        publisher.Publish("", PackSglangStoredBatch(101), 11);
+    }));
+    EXPECT_FALSE(client.IsStale());
+    EXPECT_EQ(handler->StaleNotificationCount(), 0u);
+    client.Stop();
+}
+
+TEST(ZMQClient, SglangLiveCatchupBehindReplayWatermarkDoesNotInvalidateSource) {
+    MockPublisher publisher(false, "", false, false, PublisherKind::kSglang);
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.publisher_kind = PublisherKind::kSglang;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+    ASSERT_TRUE(PublishUntilHandled(*handler, 10, config.endpoint, [&] {
+        publisher.Publish("", PackSglangStoredBatch(100), 10);
+    }));
+    ZMQClientTestPeer::MarkDisconnected(client);
+    ZMQClientTestPeer::HandleReconnect(client);
+    ASSERT_TRUE(
+        handler->WaitForBatch(15, config.endpoint, std::chrono::seconds(2)));
+    EXPECT_EQ(client.GetLastSequence(), 15);
+    publisher.Publish("", PackSglangStoredBatch(11), 11);
+    ASSERT_TRUE(PublishUntilHandled(*handler, 16, config.endpoint, [&] {
+        publisher.Publish("", PackSglangStoredBatch(16), 16);
+    }));
+    EXPECT_FALSE(client.IsStale());
+    EXPECT_EQ(handler->StaleNotificationCount(), 0u);
+    EXPECT_EQ(client.GetLastSequence(), 16);
     client.Stop();
 }
 
