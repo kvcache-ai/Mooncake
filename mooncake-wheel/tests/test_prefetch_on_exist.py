@@ -34,6 +34,7 @@ Prerequisites:
     ``MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760`` on the client.
 """
 
+import ctypes
 import os
 import time
 import unittest
@@ -216,6 +217,74 @@ class TestPrefetchOnExist(unittest.TestCase):
 
         got = self.store.get(cold_key)
         self.assertEqual(bytes(got), expected, "get after prefetch must be bit-exact")
+
+    def test_get_wait_success_carries_live_lease(self):
+        """ssd_get_wait_ms > 0: a get that arrives while the promotion is
+        still in flight waits for it, and the post-wait transfer must carry
+        a live lease. A QueryReadOnly result (lease_ttl_ms forced to 0)
+        would turn every successful wait into LEASE_EXPIRED at BatchGet's
+        post-transfer lease check."""
+        # The class shares one store across test methods; earlier tests
+        # already filled the 32MB segment, so reset it first.
+        # remove_all returns the number of removed objects (>= 0 on success).
+        self.assertGreaterEqual(self.store.remove_all(True), 0)
+        # Put the big key FIRST (empty segment has room for it), then
+        # overflow with small keys to evict it. After _make_cold_keys the
+        # segment is full and this put would fail with NO_AVAILABLE_HANDLE.
+        # 8MB stays under the offload bucket size limit (10MB in CI).
+        timestamp = int(time.time() * 1000)
+        big_key = f"prefetch_waitlease_big_{timestamp}"
+        big_value = os.urandom(8 * 1024 * 1024)
+        self.assertEqual(self.store.put(big_key, big_value), 0)
+        # The put lease (default_kv_lease_ttl=500ms) blocks eviction, and
+        # the overflow burst fits inside it; wait the lease out first, or
+        # nothing ever forces this object out of DRAM.
+        time.sleep(1.5)
+        self._make_cold_keys("waitlease")
+        # _find_cold_key polls every 1s and each poll grants a fresh lease,
+        # pinning the object in DRAM until the probe times out. Probe more
+        # rarely and keep applying overflow pressure only while unleased.
+        types = []
+        for round_i in range(6):
+            time.sleep(2.0)
+            descs = self.store.batch_get_replica_desc([big_key])
+            types = _replica_types(descs, big_key)
+            print(f"waitlease probe {round_i}: {types}")
+            if (
+                types
+                and all("MEMORY" not in t for t in types)
+                and any("LOCAL_DISK" in t for t in types)
+            ):
+                break
+            self._make_cold_keys(f"waitlease_more{round_i}", num_keys=40)
+        else:
+            self.fail(f"big key stayed resident, last={types}")
+        print(f"replica-type histogram: {types}")
+
+        self.assertEqual(self.store.is_exist(big_key, _prefetch_options(True)), 1)
+        # No sleep: the get path's own replica query takes longer than the
+        # pool job's task registration, so firing immediately lands the
+        # wait inside the promotion's in-flight window. Even a 25ms sleep
+        # lands after kCompleted on a fast SSD and skips the wait path.
+
+        capacity = len(big_value)
+        destination = (ctypes.c_ubyte * capacity)()
+        destination_ptr = ctypes.addressof(destination)
+        self.assertEqual(self.store.register_buffer(destination_ptr, capacity), 0)
+        try:
+            results = self.store.batch_get_into_multi_buffers(
+                [big_key], [[destination_ptr]], [[capacity]], False
+            )
+            print("batch_get results", list(results))
+            self.assertEqual(
+                list(results),
+                [capacity],
+                "post-wait get must succeed; a forced-expired lease turns "
+                "it into LEASE_EXPIRED",
+            )
+            self.assertEqual(bytes(destination), big_value)
+        finally:
+            self.store.unregister_buffer(destination_ptr)
 
     def test_exist_without_prefetch_does_not_promote(self):
         """Negative control: plain is_exist must not promote. Only
