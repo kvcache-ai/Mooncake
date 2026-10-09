@@ -457,19 +457,28 @@ int RdmaContext::disable() {
         return -1;
     }
 
-    cleanupResources();
-    status_ = DEVICE_DISABLED;
-    return 0;
+    return cleanupResources();
 }
 
-void RdmaContext::cleanupResources() {
+int RdmaContext::cleanupResources() {
+    std::unique_lock<std::shared_mutex> lifecycle(mr_lifecycle_mutex_);
+    std::unordered_set<ibv_mr*> registrations;
     {
         std::lock_guard<std::mutex> lock(mr_set_mutex_);
-        for (auto& entry : mr_set_) {
-            int ret = verbs_.ibv_dereg_mr(entry);
-            if (ret) PLOG(ERROR) << "ibv_dereg_mr";
+        registrations.swap(mr_set_);
+    }
+    for (auto it = registrations.begin(); it != registrations.end();) {
+        if (verbs_.ibv_dereg_mr(*it)) {
+            PLOG(ERROR) << "ibv_dereg_mr";
+            ++it;
+        } else {
+            it = registrations.erase(it);
         }
-        mr_set_.clear();
+    }
+    if (!registrations.empty()) {
+        std::lock_guard<std::mutex> lock(mr_set_mutex_);
+        mr_set_.swap(registrations);
+        return -1;
     }
     for (auto& entry : cq_list_) {
         delete entry;
@@ -503,6 +512,8 @@ void RdmaContext::cleanupResources() {
             PLOG(ERROR) << "ibv_close_device";
         native_context_ = nullptr;
     }
+    status_ = DEVICE_DISABLED;
+    return 0;
 }
 
 int RdmaContext::pause() {
@@ -537,6 +548,7 @@ int RdmaContext::resume() {
 
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
                                                 int access) {
+    std::shared_lock<std::shared_mutex> lifecycle(mr_lifecycle_mutex_);
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
@@ -615,6 +627,7 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
 }
 
 int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
+    std::shared_lock<std::shared_mutex> lifecycle(mr_lifecycle_mutex_);
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return -1;
@@ -639,20 +652,27 @@ int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
 }
 
 int RdmaContext::unregisterMemReg(MemReg id) {
+    std::shared_lock<std::shared_mutex> lifecycle(mr_lifecycle_mutex_);
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return -1;
     }
     auto entry = (ibv_mr*)id;
+    decltype(mr_set_)::node_type registration;
+    {
+        std::lock_guard<std::mutex> lock(mr_set_mutex_);
+        registration = mr_set_.extract(entry);
+    }
+    if (registration.empty()) return -1;
     // Cache addr/length before ibv_dereg_mr: entry is freed by dereg_mr, so
     // reading entry->addr/entry->length afterwards is a use-after-free.
     void* region_addr = entry->addr;
     size_t region_length = entry->length;
-    mr_set_mutex_.lock();
-    mr_set_.erase(entry);
-    mr_set_mutex_.unlock();
-
     if (verbs_.ibv_dereg_mr(entry)) {
+        {
+            std::lock_guard<std::mutex> lock(mr_set_mutex_);
+            mr_set_.insert(std::move(registration));
+        }
         const void* end = static_cast<const char*>(region_addr) + region_length;
         LOG(ERROR) << "Failed to unregister memory from " << region_addr
                    << " to " << end << " in RDMA device " << device_name_;
