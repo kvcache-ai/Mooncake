@@ -53,6 +53,8 @@ static GidSelectionSnapshot fillLocalHandshakeDesc(
     local_desc.qp_num = qp_num;
     local_desc.ready_ack = false;
     local_desc.ready_ack_supported = true;
+    local_desc.auto_gid_rank_supported = context.autoGidSelectionEnabled();
+    local_desc.auto_gid_rank = gid_selection.rank;
     local_desc.reply_msg.clear();
     return gid_selection;
 }
@@ -255,6 +257,7 @@ int RdmaEndPoint::deconstructLocked() {
 
     qp_list_.clear();
     peer_qp_num_list_.clear();
+    connected_auto_gid_.reset();
     delete[] wr_depth_list_;
     wr_depth_list_ = nullptr;
     return 0;
@@ -383,6 +386,29 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
 std::string RdmaEndPoint::peerNicPath() const {
     RWSpinlock::ReadGuard guard(lock_);
     return peer_nic_path_;
+}
+
+std::optional<AutoGidDataPathAttempt> RdmaEndPoint::autoGidDataPathAttempt()
+    const {
+    RWSpinlock::ReadGuard guard(lock_);
+    if (!connected_auto_gid_) return std::nullopt;
+    return AutoGidDataPathAttempt{
+        {connected_auto_gid_->gid_index, connected_auto_gid_->gid},
+        reinterpret_cast<uintptr_t>(this),
+        qp_generation_,
+        connected_auto_gid_->rank};
+}
+
+void RdmaEndPoint::rememberConnectedAutoGid(
+    const GidSelectionSnapshot &local_selection,
+    const HandShakeDesc &peer_desc) {
+    if (!context_.autoGidSelectionEnabled() ||
+        !peer_desc.auto_gid_rank_supported ||
+        peer_desc.auto_gid_rank != local_selection.rank) {
+        connected_auto_gid_.reset();
+        return;
+    }
+    connected_auto_gid_ = local_selection;
 }
 
 namespace {
@@ -661,10 +687,14 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // loopback mode
         if (context_.nicPath() == peer_nic_path_) {
-            int ret = doSetupConnection(context_.gid(), context_.lid(), qpNum(),
-                                        CONNECTED, nullptr, nullptr,
+            auto local_gid_selection = context_.gidSelection();
+            int ret = doSetupConnection(local_gid_selection.gid, context_.lid(),
+                                        qpNum(), CONNECTED, nullptr, nullptr,
                                         notificationQpNum());
             if (ret == 0) {
+                if (context_.autoGidSelectionEnabled()) {
+                    connected_auto_gid_ = local_gid_selection;
+                }
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
             }
             return ret;
@@ -822,11 +852,27 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 return rc;
             }
 
+            if (!connected() && local_desc.auto_gid_rank_supported &&
+                peer_desc.auto_gid_rank_supported &&
+                peer_desc.auto_gid_rank > local_gid_selection.rank) {
+                int reset_ret =
+                    resetConnection("synchronize auto GID rank from handshake");
+                if (reset_ret) return reset_ret;
+                auto sync_result =
+                    context_.ensureAutoGidRank(peer_desc.auto_gid_rank);
+                if (sync_result == GidRefreshResult::FAILED) {
+                    return ERR_DEVICE_NOT_FOUND;
+                }
+                qp_generation = qp_generation_;
+                status_.store(CONNECTING, std::memory_order_relaxed);
+                retry_with_new_gid = true;
+            }
+
             // Handle simultaneous open: if the peer initiates a connection
             // during our RPC and it is passively established in
             // setupConnectionsByPassive, send an explicit ready ACK after this
             // active RPC confirms that the peer's passive QPs are ready.
-            if (connected()) {
+            if (!retry_with_new_gid && connected()) {
                 if ((peer_qp_num_list_ == peer_desc.qp_num &&
                      (!notify_.enabled ||
                       peer_notify_qp_num_ == peer_desc.notify_qp_num))) {
@@ -859,7 +905,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 }
             }
 
-            if (!should_send_ready_ack) {
+            if (!retry_with_new_gid && !should_send_ready_ack) {
                 if (!peer_desc.reply_msg.empty()) {
                     LOG(ERROR) << "Rejected handshake request by peer "
                                << local_desc.peer_nic_path;
@@ -909,6 +955,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 }
 
                 if (ret == 0) {
+                    rememberConnectedAutoGid(local_gid_selection, peer_desc);
                     if (peer_desc.ready_ack_supported) {
                         should_send_ready_ack = true;
                         ready_ack_desc = local_desc;
@@ -1070,6 +1117,16 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         return ERR_REJECT_HANDSHAKE;
     }
 
+    if (peer_desc.auto_gid_rank_supported &&
+        context_.autoGidSelectionEnabled()) {
+        auto sync_result = context_.ensureAutoGidRank(peer_desc.auto_gid_rank);
+        if (sync_result == GidRefreshResult::FAILED) {
+            local_desc.reply_msg = "Requested auto GID rank is unavailable: " +
+                                   std::to_string(peer_desc.auto_gid_rank);
+            return ERR_DEVICE_NOT_FOUND;
+        }
+    }
+
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
     auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
     if (peer_server_name.empty() || peer_nic_name.empty()) {
@@ -1100,6 +1157,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                         &failure_info, peer_desc.notify_qp_num);
             if (ret == 0) {
                 describeNotification(local_desc);
+                rememberConnectedAutoGid(local_gid_selection, peer_desc);
                 if (peer_desc.ready_ack_supported) {
                     ready_wait_start_ts_.store(getCurrentTimeInNano(),
                                                std::memory_order_relaxed);

@@ -49,6 +49,12 @@ enum class AutoGidRetryAction {
     kRetryWithObservedChange = 2,
 };
 
+enum class AutoGidDataPathAction {
+    kRetrySameGid = 0,
+    kAdvanceGid = 1,
+    kIgnoreDuplicate = 2,
+};
+
 struct AutoGidCandidate {
     int gid_index = -1;
     std::string gid;
@@ -67,11 +73,68 @@ struct AutoGidSelection {
     std::string gid;
     AutoGidCandidateClass candidate_class =
         AutoGidCandidateClass::kFallbackNonzero;
+    uint32_t rank = 0;
 };
 
 struct AutoGidSelectionIdentity {
     int gid_index = -1;
     std::string gid;
+};
+
+struct AutoGidDataPathAttempt {
+    AutoGidSelectionIdentity selection;
+    uintptr_t endpoint_id = 0;
+    uint64_t qp_generation = 0;
+    uint32_t selection_rank = 0;
+};
+
+class AutoGidDataPathFailureTracker {
+   public:
+    AutoGidDataPathAction recordFailure(const AutoGidDataPathAttempt& attempt) {
+        if (!sameSelection(attempt.selection, attempt_.selection)) {
+            attempt_ = attempt;
+            pending_ = true;
+            exhausted_ = false;
+            return AutoGidDataPathAction::kRetrySameGid;
+        }
+        if (exhausted_) return AutoGidDataPathAction::kIgnoreDuplicate;
+        if (!pending_) {
+            attempt_ = attempt;
+            pending_ = true;
+            return AutoGidDataPathAction::kRetrySameGid;
+        }
+        if (attempt.endpoint_id == attempt_.endpoint_id &&
+            attempt.qp_generation == attempt_.qp_generation) {
+            return AutoGidDataPathAction::kIgnoreDuplicate;
+        }
+        attempt_ = attempt;
+        pending_ = false;
+        return AutoGidDataPathAction::kAdvanceGid;
+    }
+
+    void recordSuccess() {
+        pending_ = false;
+        exhausted_ = false;
+    }
+
+    void recordExhausted() {
+        // Keep observing successful completions so a recovered path can start
+        // a new campaign, while repeated failures remain suppressed.
+        pending_ = true;
+        exhausted_ = true;
+    }
+
+    bool pending() const { return pending_; }
+
+   private:
+    static bool sameSelection(const AutoGidSelectionIdentity& lhs,
+                              const AutoGidSelectionIdentity& rhs) {
+        return lhs.gid_index == rhs.gid_index && lhs.gid == rhs.gid;
+    }
+
+    AutoGidDataPathAttempt attempt_;
+    bool pending_ = false;
+    bool exhausted_ = false;
 };
 
 inline const char* autoGidCandidateClassToString(
@@ -191,6 +254,10 @@ inline std::vector<AutoGidSelection> rankAutoGidCandidates(
                           AutoGidCandidateClass::kFallbackNonzero});
     }
 
+    for (size_t rank = 0; rank < ranked.size(); ++rank) {
+        ranked[rank].rank = static_cast<uint32_t>(rank);
+    }
+
     return ranked;
 }
 
@@ -237,9 +304,11 @@ inline bool hasTriedAutoGidSelection(
 inline std::optional<AutoGidSelection> reselectAutoGidCandidate(
     const std::vector<AutoGidCandidate>& candidates, int current_gid_index,
     std::string_view current_gid,
-    const std::vector<AutoGidSelectionIdentity>& tried_selections = {}) {
+    const std::vector<AutoGidSelectionIdentity>& tried_selections = {},
+    uint32_t minimum_rank = 0) {
     auto ranked = rankAutoGidCandidates(candidates);
     for (const auto& selection : ranked) {
+        if (selection.rank < minimum_rank) continue;
         if (!didAutoGidSelectionChange(current_gid_index, current_gid,
                                        selection.gid_index, selection.gid)) {
             continue;

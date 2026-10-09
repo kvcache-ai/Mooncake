@@ -401,6 +401,88 @@ TEST(RdmaGidProbeTest, RetryActionRequiresObservedOrReprobedChange) {
               AutoGidRetryAction::kRetryWithObservedChange);
 }
 
+TEST(RdmaGidProbeTest, DataPathRetryRequiresTwoEndpointGenerations) {
+    AutoGidDataPathFailureTracker tracker;
+    AutoGidDataPathAttempt first{{5, "gid-5"}, 101, 11};
+    AutoGidDataPathAttempt fresh = first;
+    fresh.endpoint_id = 102;
+    fresh.qp_generation = 12;
+
+    EXPECT_EQ(tracker.recordFailure(first),
+              AutoGidDataPathAction::kRetrySameGid);
+    EXPECT_EQ(tracker.recordFailure(first),
+              AutoGidDataPathAction::kIgnoreDuplicate);
+    EXPECT_EQ(tracker.recordFailure(fresh), AutoGidDataPathAction::kAdvanceGid);
+}
+
+TEST(RdmaGidProbeTest, RankedCandidatesExposeRecoveryOrder) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeCandidate(/*gid_index=*/5, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/false,
+                      /*is_link_local_ipv6=*/false),
+        makeCandidate(/*gid_index=*/7, IBV_GID_TYPE_ROCE_V2,
+                      /*has_network_device=*/true,
+                      /*is_ipv4_mapped=*/false,
+                      /*is_link_local_ipv6=*/false),
+    };
+
+    auto ranked = rankAutoGidCandidates(candidates);
+    ASSERT_EQ(ranked.size(), 2u);
+    EXPECT_EQ(ranked[0].gid_index, 5);
+    EXPECT_EQ(ranked[0].rank, 0u);
+    EXPECT_EQ(ranked[1].gid_index, 7);
+    EXPECT_EQ(ranked[1].rank, 1u);
+}
+
+TEST(RdmaGidProbeTest, DataPathSelectionChangeStartsNewProbation) {
+    AutoGidDataPathFailureTracker tracker;
+    AutoGidDataPathAttempt gid5{{5, "gid-5"}, 101, 11};
+    AutoGidDataPathAttempt gid7{{7, "gid-7"}, 102, 12};
+    AutoGidDataPathAttempt fresh_gid5{{5, "gid-5"}, 103, 13};
+
+    ASSERT_EQ(tracker.recordFailure(gid5),
+              AutoGidDataPathAction::kRetrySameGid);
+    ASSERT_EQ(tracker.recordFailure(fresh_gid5),
+              AutoGidDataPathAction::kAdvanceGid);
+    EXPECT_EQ(tracker.recordFailure(gid7),
+              AutoGidDataPathAction::kRetrySameGid);
+}
+
+TEST(RdmaGidProbeTest, DataPathSuccessClearsProbation) {
+    AutoGidDataPathFailureTracker tracker;
+    AutoGidDataPathAttempt gid5{{5, "gid-5"}, 101, 11};
+    AutoGidDataPathAttempt fresh_gid5{{5, "gid-5"}, 102, 12};
+
+    ASSERT_EQ(tracker.recordFailure(gid5),
+              AutoGidDataPathAction::kRetrySameGid);
+    tracker.recordSuccess();
+    EXPECT_FALSE(tracker.pending());
+    ASSERT_EQ(tracker.recordFailure(gid5),
+              AutoGidDataPathAction::kRetrySameGid);
+    ASSERT_EQ(tracker.recordFailure(fresh_gid5),
+              AutoGidDataPathAction::kAdvanceGid);
+    tracker.recordSuccess();
+    EXPECT_FALSE(tracker.pending());
+}
+
+TEST(RdmaGidProbeTest, DataPathExhaustionSuppressesRepeatedCampaigns) {
+    AutoGidDataPathFailureTracker tracker;
+    AutoGidDataPathAttempt first{{5, "gid-5"}, 101, 11};
+    AutoGidDataPathAttempt fresh{{5, "gid-5"}, 102, 12};
+
+    ASSERT_EQ(tracker.recordFailure(first),
+              AutoGidDataPathAction::kRetrySameGid);
+    ASSERT_EQ(tracker.recordFailure(fresh), AutoGidDataPathAction::kAdvanceGid);
+    tracker.recordExhausted();
+    EXPECT_EQ(tracker.recordFailure(first),
+              AutoGidDataPathAction::kIgnoreDuplicate);
+    tracker.recordSuccess();
+    EXPECT_FALSE(tracker.pending());
+    EXPECT_EQ(tracker.recordFailure(first),
+              AutoGidDataPathAction::kRetrySameGid);
+}
+
 // Regression tests for #2729: a routable-fabric private-range IPv4 GID must
 // outrank a link-local IPv6 GID instead of tying with it in the degraded
 // tier (where the lowest-index tie-break used to pick fe80::).

@@ -101,6 +101,8 @@ class WorkerPool {
     void maybeActivateRecoveredContext();
     bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
                                          const std::string &failed_peer_path);
+    void recordAutoGidDataPathFailure(Transport::Slice *slice);
+    void recordAutoGidDataPathSuccess(Transport::Slice *slice);
 
     static bool isLocalWcFailure(const ibv_wc &wc);
 
@@ -161,6 +163,11 @@ class WorkerPool {
     // skips rail_state_lock_ while this is zero. Expired pauses are cleared on
     // the next locked isRailAvailable() for any path, not only the expired one.
     std::atomic<int> paused_rail_count_{0};
+
+    std::unordered_map<std::string, AutoGidDataPathFailureTracker>
+        auto_gid_failure_trackers_;
+    std::mutex auto_gid_failure_lock_;
+    std::atomic<bool> auto_gid_failure_pending_{false};
 
     // Rail monitor configuration
     const static int kRailErrorThreshold = 5;  // Errors before pause

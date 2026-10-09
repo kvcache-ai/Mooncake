@@ -1036,7 +1036,7 @@ std::string RdmaContext::gid() const { return gidSelection().gid; }
 
 GidSelectionSnapshot RdmaContext::gidSelection() const {
     std::lock_guard<std::mutex> guard(gid_lock_);
-    return {gidBytesToString(gid_.raw), gid_index_};
+    return {gidBytesToString(gid_.raw), gid_index_, auto_gid_selection_rank_};
 }
 
 int RdmaContext::gidIndex() const {
@@ -1227,7 +1227,7 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
 bool RdmaContext::reprobeAutoGid(
     const GidSelectionSnapshot &expected_selection,
     const std::vector<AutoGidSelectionIdentity> &tried_selections,
-    std::string *previous_gid, std::string *next_gid) {
+    std::string *previous_gid, std::string *next_gid, uint32_t minimum_rank) {
     std::lock_guard<std::mutex> reprobe_guard(gid_reprobe_lock_);
     std::string current_gid_string;
     std::string next_gid_string;
@@ -1293,8 +1293,9 @@ bool RdmaContext::reprobeAutoGid(
         candidates.push_back(candidate);
     }
 
-    auto selection = reselectAutoGidCandidate(
-        candidates, current_gid_index, current_gid_string, tried_selections);
+    auto selection = reselectAutoGidCandidate(candidates, current_gid_index,
+                                              current_gid_string,
+                                              tried_selections, minimum_rank);
     if (!selection.has_value()) {
         if (next_gid) {
             *next_gid = current_gid_string;
@@ -1328,6 +1329,7 @@ bool RdmaContext::reprobeAutoGid(
         std::lock_guard<std::mutex> guard(gid_lock_);
         gid_ = new_gid;
         gid_index_ = selection->gid_index;
+        auto_gid_selection_rank_ = selection->rank;
         next_gid_index = selection->gid_index;
         next_candidate_class = selection->candidate_class;
         if (next_gid) {
@@ -1347,12 +1349,34 @@ bool RdmaContext::reprobeAutoGid(
     return true;
 }
 
+GidRefreshResult RdmaContext::ensureAutoGidRank(uint32_t requested_rank,
+                                                std::string *previous_gid,
+                                                std::string *next_gid) {
+    auto current = gidSelection();
+    if (!autoGidSelectionEnabled()) return GidRefreshResult::FAILED;
+    if (requested_rank <= current.rank) {
+        if (next_gid) *next_gid = current.gid;
+        return GidRefreshResult::UNCHANGED;
+    }
+    if (requested_rank >
+        static_cast<uint32_t>(globalConfig().auto_gid_max_retries)) {
+        return GidRefreshResult::FAILED;
+    }
+
+    bool changed =
+        reprobeAutoGid(current, {}, previous_gid, next_gid, requested_rank);
+    auto latest = gidSelection();
+    if (latest.rank < requested_rank) return GidRefreshResult::FAILED;
+    return changed ? GidRefreshResult::CHANGED : GidRefreshResult::UNCHANGED;
+}
+
 GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
                                                 std::string *next_gid) {
     std::lock_guard<std::mutex> reprobe_guard(gid_reprobe_lock_);
     std::string current_gid_string;
     int current_gid_index = -1;
     int next_gid_index = -1;
+    uint32_t next_gid_rank = 0;
     uint32_t current_lid = 0;
     ibv_context *current_context = nullptr;
     uint8_t current_port = 0;
@@ -1419,6 +1443,7 @@ GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
             return GidRefreshResult::FAILED;
         }
         next_gid_index = selection->gid_index;
+        next_gid_rank = selection->rank;
     } else {
         next_gid_index = current_gid_index;
     }
@@ -1452,6 +1477,7 @@ GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
         std::lock_guard<std::mutex> guard(gid_lock_);
         gid_ = new_gid;
         gid_index_ = next_gid_index;
+        auto_gid_selection_rank_ = next_gid_rank;
     }
     if (previous_gid) *previous_gid = current_gid_string;
     if (next_gid) *next_gid = next_gid_string;
@@ -1646,6 +1672,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;
+        auto_gid_selection_rank_ = 0;
         if (gid_index < 0) {
             int found_gid_index = -1;
             gid_state = findBestGidIndex(device_name, context, port_attr, port,
