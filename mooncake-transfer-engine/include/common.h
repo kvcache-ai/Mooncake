@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -458,6 +459,48 @@ static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
     return len;
 }
 
+// writeFully variant for stream sockets. A peer that resets the connection
+// while we are mid-reply must turn into an EPIPE error here, not a SIGPIPE
+// that kills the whole process (the handshake daemon answers untrusted
+// peers, and the engine usually runs inside a larger host process).
+static inline ssize_t writeFullySocket(int fd, const void *buf, size_t len) {
+#ifdef SO_NOSIGPIPE
+    // macOS has no MSG_NOSIGNAL; disarm SIGPIPE on the socket instead.
+    // Idempotent, and handshake traffic is low-rate, so per-call is fine.
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+#ifdef MSG_NOSIGNAL
+    constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+    constexpr int kSendFlags = 0;
+#endif
+    char *pos = (char *)buf;
+    size_t nbytes = len;
+    while (nbytes) {
+        ssize_t rc = send(fd, pos, nbytes, kSendFlags);
+        if (rc < 0 && errno == EINTR)
+            continue;
+        else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // A blocking socket only reports EAGAIN once SO_SNDTIMEO fires;
+            // retrying here would spin forever, so fail the write instead.
+            LOG(WARNING) << "Socket write timed out: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        } else if (rc < 0) {
+            PLOG(ERROR) << "Socket write failed";
+            return rc;
+        } else if (rc == 0) {
+            LOG(WARNING) << "Socket write incompleted: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        }
+        pos += rc;
+        nbytes -= rc;
+    }
+    return len;
+}
+
 static inline ssize_t readFully(int fd, void *buf, size_t len) {
     // Set a timeout for read to avoid hanging forever.
     constexpr std::chrono::seconds kReadTimeout = std::chrono::seconds(300);
@@ -502,13 +545,14 @@ static inline int writeString(int fd, const HandShakeRequestType type,
     uint64_t length =
         str.size() +
         (type == HandShakeRequestType::OldProtocol ? 0 : sizeof(byte));
-    if (writeFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
+    if (writeFullySocket(fd, &length, sizeof(length)) !=
+        (ssize_t)sizeof(length))
         return ERR_SOCKET;
     if (type != HandShakeRequestType::OldProtocol) {
-        if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
+        if (writeFullySocket(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
             return ERR_SOCKET;
     }
-    if (writeFully(fd, str.data(), str.size()) != (ssize_t)str.size())
+    if (writeFullySocket(fd, str.data(), str.size()) != (ssize_t)str.size())
         return ERR_SOCKET;
     return 0;
 }
