@@ -84,6 +84,27 @@ std::string getLocalIpAddress() {
 
 class LocalHotCacheTest : public ::testing::Test {
    protected:
+    class EnvGuard {
+       public:
+        explicit EnvGuard(const char* key) : key_(key) {
+            if (const char* value = std::getenv(key_)) {
+                old_value_ = value;
+            }
+        }
+
+        ~EnvGuard() {
+            if (old_value_.has_value()) {
+                setenv(key_, old_value_->c_str(), 1);
+            } else {
+                unsetenv(key_);
+            }
+        }
+
+       private:
+        const char* key_;
+        std::optional<std::string> old_value_;
+    };
+
     static void SetUpTestSuite() {
         google::InitGoogleLogging("LocalHotCacheTest");
         FLAGS_logtostderr = 1;
@@ -1342,27 +1363,6 @@ TEST_F(LocalHotCacheTest, CacheBlockWriteAndRetrieve) {
 }
 
 TEST_F(LocalHotCacheTest, AdmissionSketchNotIncrementedOnCacheHit) {
-    class EnvGuard {
-       public:
-        explicit EnvGuard(const char* key) : key_(key) {
-            if (const char* value = std::getenv(key_)) {
-                old_value_ = value;
-            }
-        }
-
-        ~EnvGuard() {
-            if (old_value_.has_value()) {
-                setenv(key_, old_value_->c_str(), 1);
-            } else {
-                unsetenv(key_);
-            }
-        }
-
-       private:
-        const char* key_;
-        std::optional<std::string> old_value_;
-    };
-
     EnvGuard cache_size_guard("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     EnvGuard memcpy_guard("MC_STORE_MEMCPY");
     setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB
@@ -1501,6 +1501,87 @@ TEST_F(LocalHotCacheTest, AdmissionHelpersWithoutHotCache) {
     // Restore env
     if (prev) {
         setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", prev, 1);
+    }
+}
+
+TEST_F(LocalHotCacheTest, ExpiredReadsMustNotPopulateHotCache) {
+    EnvGuard cache_size_guard("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    EnvGuard block_size_guard("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
+    EnvGuard shm_guard("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
+    EnvGuard admission_guard("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD");
+    EnvGuard memcpy_guard("MC_STORE_MEMCPY");
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "8192", 1);
+    setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4096", 1);
+    setenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1", 1);
+    setenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD", "1", 1);
+    setenv("MC_STORE_MEMCPY", "1", 1);
+    auto created = CreateTestClient("127.0.0.1");
+    ASSERT_TRUE(created.has_value());
+    auto client = *created;
+    ASSERT_TRUE(client->IsHotCacheEnabled());
+    ASSERT_TRUE(client->GetHotCache()->IsShm());
+
+    for (int mode = 0; mode != 3; ++mode) {
+        SCOPED_TRACE(mode);
+        const std::string key = "expired-read-" + std::to_string(mode);
+        std::string source(64, 'B');
+        std::string destination(64, '?');
+        ASSERT_TRUE(
+            client->RegisterLocalMemory(source.data(), source.size(), "cpu:0")
+                .has_value());
+        ASSERT_TRUE(client
+                        ->RegisterLocalMemory(destination.data(),
+                                              destination.size(), "cpu:0",
+                                              false, false)
+                        .has_value());
+        MemoryDescriptor memory;
+        memory.buffer_descriptor.transport_endpoint_ =
+            client->GetTransportEndpoint();
+        memory.buffer_descriptor.buffer_address_ =
+            reinterpret_cast<uintptr_t>(source.data());
+        memory.buffer_descriptor.size_ = source.size();
+        Replica::Descriptor replica;
+        replica.id = 1;
+        replica.status = ReplicaStatus::COMPLETE;
+        replica.descriptor_variant = memory;
+        QueryResult expired({replica}, std::chrono::steady_clock::now() -
+                                           std::chrono::seconds(1));
+        std::vector<Slice> slices{{destination.data(), destination.size()}};
+        tl::expected<void, ErrorCode> result;
+        if (mode == 0) {
+            result = client->Get(key, expired, slices);
+        } else {
+            std::unordered_map<std::string, std::vector<Slice>> batch_slices{
+                {key, slices}};
+            result = client->BatchGet({key}, {expired}, batch_slices, mode == 2)
+                         .at(0);
+        }
+        ASSERT_FALSE(result.has_value());
+        ASSERT_EQ(result.error(), ErrorCode::LEASE_EXPIRED);
+        const auto count = client->GetAdmissionCount(key);
+        EXPECT_EQ(count, 0) << "Rejected data reached cache admission";
+
+        // Evidence for the baseline: wait for the already-submitted fill,
+        // then give the same key a fresh descriptor with the correct bytes.
+        if (count != 0) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!client->GetHotCache()->HasHotKey(key) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            ASSERT_TRUE(client->GetHotCache()->HasHotKey(key));
+        }
+        std::memset(source.data(), 'A', source.size());
+        QueryResult fresh({replica}, std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(60));
+        auto retry = client->Get(key, fresh, slices);
+        ASSERT_TRUE(retry.has_value());
+        EXPECT_EQ(destination, source)
+            << "Fresh read returned bytes from the rejected read";
+        ASSERT_TRUE(client->unregisterLocalMemory(destination.data(), false)
+                        .has_value());
+        ASSERT_TRUE(client->unregisterLocalMemory(source.data()).has_value());
     }
 }
 
