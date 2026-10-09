@@ -808,3 +808,15 @@ target_include_directories(tent_segment_desc_retry_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
+
+# Two concurrent peer streams, using the production TENT engine.
+if(BUILD_BENCHMARK)
+  add_executable(tent_peer_workload ../benchmark/peer_workload.cpp)
+  target_link_libraries(tent_peer_workload PRIVATE tent_link_group asio_shared)
+  target_include_directories(tent_peer_workload PRIVATE ../include)
+endif()
+
+add_executable(tent_peer_workload_test peer_workload_test.cpp)
+target_link_libraries(tent_peer_workload_test PRIVATE gtest gtest_main)
+target_include_directories(tent_peer_workload_test PRIVATE ../include)
+add_test(NAME tent_peer_workload_test COMMAND tent_peer_workload_test)

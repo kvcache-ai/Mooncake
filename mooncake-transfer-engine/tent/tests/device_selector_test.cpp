@@ -18,6 +18,9 @@
 #include "tent/transport/rdma/quota.h"
 
 #include "tent/transport/rdma/bw_arbitration.h"
+#include "tent/runtime/segment_manager.h"
+#include "tent/runtime/segment_registry.h"
+#include "tent/transport/rdma/gdr_reachability.h"
 
 #include <gtest/gtest.h>
 
@@ -26,6 +29,8 @@
 #include <utility>
 #include <algorithm>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 namespace mooncake {
 namespace tent {
@@ -57,6 +62,7 @@ std::unique_ptr<DeviceSelector> makeSelector(
 
 // Feed one completion whose observed bandwidth is `bytes_per_sec`.
 void observe(DeviceSelector& sel, double bytes_per_sec) {
+    ASSERT_TRUE(sel.chargeDevice(kDev, kMiB).ok());
     ASSERT_TRUE(sel.release(kDev, kMiB, kMiB / bytes_per_sec).ok());
 }
 
@@ -410,7 +416,7 @@ TEST(DeviceSelectorTransmitTest, LearningRatesAreClampedToUnitInterval) {
         sel->getSchedulingParams().transmit_bandwidth_learning_rate, 0.0);
 
     ASSERT_TRUE(sel->setDeviceBandwidth(kDev, 25.0).ok());
-    ASSERT_TRUE(sel->release(kDev, kMiB, kMiB / 3.1e9).ok());
+    observe(*sel, 3.1e9);
     runBatch(*sel, 1, kMiB, 1);  // one interval at 1 GB/s
     // alpha 1.0: the selection EWMA never learns; alpha 0.0: the transmit
     // estimate adopts each interval outright.
@@ -449,8 +455,7 @@ TEST(DeviceSelectorTransmitTest, RateIsIndependentOfBatchDepth) {
 TEST(DeviceSelectorTransmitTest, SelectionKeepsQueueingThatTransmitDrops) {
     auto sel = makeMeteredSelector();
     const double wire_s = kMiB / 1e9;
-    for (int i = 0; i < 2000; ++i)
-        ASSERT_TRUE(sel->release(kDev, kMiB, 2.0 * wire_s).ok());
+    for (int i = 0; i < 2000; ++i) observe(*sel, kMiB / (2.0 * wire_s));
     runBatch(*sel, 8, kMiB, 8);
     // A backed-up NIC should look slow to device selection...
     EXPECT_NEAR(sel->getAggregateEwmaBandwidth(), 0.5e9, 0.5e9 * 0.02);
@@ -551,7 +556,7 @@ TEST(DeviceSelectorTransmitTest, SmoothsSingleOutlier) {
 TEST(DeviceSelectorTransmitTest, ReleaseDoesNotFeedTheTransmitEstimate) {
     auto sel = makeSelector();
     ASSERT_TRUE(sel->setDeviceBandwidth(kDev, 25.0).ok());
-    ASSERT_TRUE(sel->release(kDev, kMiB, kMiB / 1e9).ok());
+    observe(*sel, 1e9);
     EXPECT_NE(sel->getAggregateEwmaBandwidth(), 3.125e9);
     EXPECT_DOUBLE_EQ(sel->getAggregateTransmitBandwidth(), 3.125e9);
 }
@@ -925,6 +930,321 @@ TEST(DeviceSelectorTransmitTest, PostedBytesTrackTheHardwareBacklog) {
     sel->notePostEnded(kDev, kMiB, kT0);
     EXPECT_EQ(sel->getPostedBytes(kDev), 0u);
     EXPECT_EQ(sel->getPostedBytes(7), 0u);  // unknown device
+}
+
+// Peer attribution tests use the real allocator. Each deterministic allocation
+// starts a fresh thread so the existing per-thread probe counter cannot turn a
+// test case into the 100th (round-robin) call.
+uint64_t peer_test_time = 1'000'000;
+uint64_t peerClock() { return peer_test_time; }
+using Mode = DeviceSelector::PeerScoring;
+using Source = DeviceSelector::FeedbackSource;
+constexpr uint64_t P = 11, Q = 12;
+
+std::unique_ptr<DeviceSelector> peerSelector(Mode mode) {
+    auto sel = std::make_unique<DeviceSelector>(peerClock);
+    auto topo = twoRdmaNics();
+    EXPECT_TRUE(sel->loadTopology(topo).ok());
+    auto params = sel->getSchedulingParams();
+    params.peer_accounting = true;
+    params.peer_scoring = mode;
+    params.enable_priority_filtering = false;
+    params.score_jitter_range = 0;
+    params.bandwidth_learning_rate = 0.01;
+    params.peer_feedback_ttl_ns = 1000;
+    sel->setSchedulingParams(params);
+    for (int dev : {0, 1}) EXPECT_TRUE(sel->setDeviceBandwidth(dev, 400).ok());
+    return sel;
+}
+
+void peerSample(DeviceSelector& sel, int dev, uint64_t peer, double rate) {
+    ASSERT_TRUE(sel.chargeDevice(dev, kMiB, peer).ok());
+    ASSERT_TRUE(sel.release(dev, kMiB, kMiB / rate, peer).ok());
+}
+
+std::vector<int> peerAllocate(DeviceSelector& sel, uint64_t peer,
+                              Source* source = nullptr, uint64_t mask = ~0ULL) {
+    std::vector<int> ids;
+    std::thread t([&] {
+        EXPECT_TRUE(sel.allocate(64 * kMiB, 32, 2 * kMiB, "cpu:0", ids,
+                                 PRIO_HIGH, mask, peer, source)
+                        .ok());
+    });
+    t.join();
+    for (int dev : ids) EXPECT_TRUE(sel.release(dev, 2 * kMiB, 0, peer).ok());
+    return ids;
+}
+
+int onZero(const std::vector<int>& ids) {
+    return std::count(ids.begin(), ids.end(), 0);
+}
+
+TEST(PeerAttribution, DisabledLedgerNeverReadsPeerClockOrCreatesEntries) {
+    DeviceSelector sel(+[]() -> uint64_t {
+        ADD_FAILURE() << "disabled peer accounting read the clock";
+        return 0;
+    });
+    auto topo = twoRdmaNics();
+    ASSERT_TRUE(sel.loadTopology(topo).ok());
+    ASSERT_FALSE(sel.getSchedulingParams().peer_accounting);
+    ASSERT_TRUE(sel.setDeviceBandwidth(0, 400).ok());
+    int chosen;
+    ASSERT_TRUE(sel.allocate(kMiB, "cpu:0", chosen).ok());
+    ASSERT_TRUE(sel.release(chosen, kMiB, 0.001).ok());
+    ASSERT_TRUE(sel.chargeDevice(0, kMiB, 0).ok());
+    ASSERT_TRUE(sel.release(0, kMiB, 0.001, 0).ok());
+    EXPECT_TRUE(sel.getPeerLedger(0).entries.empty());
+    EXPECT_EQ(sel.getPeerLedger(0).stats.accounting_errors, 0u);
+    EXPECT_EQ(sel.getDecisionStats().nic, 0u);
+}
+
+TEST(PeerAttribution, V3FallbackRetainsPeerQueueAndCountsSource) {
+    auto sel = peerSelector(Mode::FeedbackAndInflight);
+    Source source;
+    ASSERT_TRUE(sel->chargeDevice(0, 64 * kMiB, Q).ok());
+    auto ids = peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Nic);
+    EXPECT_EQ(onZero(ids), 16);  // fallback does not change peer queue scope
+    auto stats = sel->getDecisionStats();
+    EXPECT_EQ(stats.nic, 1u);
+    EXPECT_EQ(stats.cold_fallback, 1u);
+    peerSample(*sel, 0, P, 40e9);
+    peerSample(*sel, 1, P, 40e9);
+    peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Peer);
+    peer_test_time += 1001;
+    peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Nic);
+    stats = sel->getDecisionStats();
+    EXPECT_EQ(stats.peer, 1u);
+    EXPECT_EQ(stats.expired_fallback, 1u);
+    EXPECT_EQ(stats.aggregate, 3u);
+    ASSERT_TRUE(sel->release(0, 64 * kMiB, 0, Q).ok());
+}
+
+TEST(PeerAttribution, T1LabelSwapAndResidualInflight) {
+    for (auto mode : {Mode::Nic, Mode::Feedback, Mode::FeedbackAndInflight}) {
+        auto sel = peerSelector(mode);
+        for (int i = 0; i < 8; ++i) {
+            peerSample(*sel, 0, P, 40e9);
+            peerSample(*sel, 0, Q, 5e9);
+            peerSample(*sel, 1, Q, 40e9);
+            peerSample(*sel, 1, P, 5e9);
+        }
+        auto p = peerAllocate(*sel, P), q = peerAllocate(*sel, Q);
+        if (mode == Mode::Nic) {
+            EXPECT_EQ(p, q);
+        } else {
+            EXPECT_GT(onZero(p), 16);
+            EXPECT_EQ(onZero(p), 32 - onZero(q));
+        }
+        EXPECT_TRUE(sel->chargeDevice(0, 32 * kMiB, Q).ok());
+        EXPECT_TRUE(sel->chargeDevice(1, 32 * kMiB, P).ok());
+        auto residual = peerAllocate(*sel, P);
+        if (mode == Mode::Feedback) {
+            EXPECT_EQ(residual, p);
+        }
+        if (mode == Mode::FeedbackAndInflight) {
+            EXPECT_GT(onZero(residual), onZero(p));
+        }
+        std::cout << "T1 mode=" << int(mode) << " P=" << onZero(p) << "/"
+                  << 32 - onZero(p) << " Q=" << onZero(q) << "/"
+                  << 32 - onZero(q) << " residual_P=" << onZero(residual) << "/"
+                  << 32 - onZero(residual) << '\n';
+        EXPECT_TRUE(sel->release(0, 32 * kMiB, 0, Q).ok());
+        EXPECT_TRUE(sel->release(1, 32 * kMiB, 0, P).ok());
+    }
+}
+
+TEST(PeerAttribution, T2LocalCompetitionBlindSpot) {
+    for (auto mode :
+         {Mode::Static, Mode::Nic, Mode::Feedback, Mode::FeedbackAndInflight}) {
+        auto sel = peerSelector(mode);
+        for (int i = 0; i < 8; ++i)
+            for (int dev : {0, 1}) peerSample(*sel, dev, P, 40e9);
+        peerSample(*sel, 1, Q, 40e9);
+        ASSERT_TRUE(sel->chargeDevice(1, 64 * kMiB, Q).ok());
+        auto ids = peerAllocate(*sel, P);
+        if (mode == Mode::Nic || mode == Mode::Feedback) {
+            EXPECT_GT(onZero(ids), 28);
+        } else {
+            EXPECT_EQ(onZero(ids), 16);
+        }
+        std::cout << "T2 mode=" << int(mode) << " P=" << onZero(ids) << "/"
+                  << 32 - onZero(ids) << '\n';
+        ASSERT_TRUE(sel->release(1, 64 * kMiB, 0, Q).ok());
+    }
+}
+
+TEST(PeerAttribution, T3SinglePeerEventSequence) {
+    std::vector<std::vector<int>> reference;
+    for (auto mode : {Mode::Nic, Mode::Feedback, Mode::FeedbackAndInflight}) {
+        auto sel = peerSelector(mode);
+        std::vector<std::vector<int>> actual;
+        actual.push_back(peerAllocate(*sel, P));  // cold fallback
+        for (int i = 0; i < 8; ++i) {
+            peerSample(*sel, 0, P, 40e9);
+            peerSample(*sel, 1, P, 10e9);
+        }
+        actual.push_back(peerAllocate(*sel, P));
+        ASSERT_TRUE(sel->chargeDevice(0, 8 * kMiB, P).ok());
+        actual.push_back(peerAllocate(*sel, P));
+        ASSERT_TRUE(sel->release(0, 8 * kMiB, 0, P).ok());    // failed attempt
+        ASSERT_TRUE(sel->chargeDevice(1, 8 * kMiB, P).ok());  // retry moved
+        actual.push_back(peerAllocate(*sel, P));
+        ASSERT_TRUE(sel->release(1, 8 * kMiB, 0.002, P).ok());
+        ASSERT_TRUE(sel->setDeviceBandwidth(0, 100).ok());
+        ASSERT_TRUE(sel->setDeviceBandwidth(1, 200).ok());
+        actual.push_back(peerAllocate(*sel, P));
+        actual.push_back(peerAllocate(*sel, P, nullptr, 1));
+        if (mode == Mode::Nic) {
+            reference = actual;
+        } else {
+            EXPECT_EQ(actual, reference);
+        }
+    }
+}
+
+TEST(PeerAttribution, T3GdrExclusionIsCommonToAllVersions) {
+    auto& gdr = GdrReachability::instance();
+    gdr.reportLocalFailure("mlx5_0", 31);
+    gdr.reportLocalFailure("mlx5_0", 31);
+    EXPECT_FALSE(gdr.localReachable("mlx5_0", 31));
+    for (auto mode :
+         {Mode::Static, Mode::Nic, Mode::Feedback, Mode::FeedbackAndInflight}) {
+        auto sel = peerSelector(mode);
+        auto topo = sel->getTopology();
+        auto mem = topo->mem_list_[0];
+        mem.name = "cuda:31";
+        mem.type = Topology::MEM_CUDA;
+        topo->mem_list_.push_back(mem);
+        peerSample(*sel, 0, P, 40e9);
+        peerSample(*sel, 1, P, 5e9);
+        std::vector<int> ids;
+        EXPECT_TRUE(sel->allocate(64 * kMiB, 32, 2 * kMiB, "cuda:31", ids,
+                                  PRIO_HIGH, ~0ULL, P)
+                        .ok());
+        EXPECT_EQ(ids, std::vector<int>(32, 1));
+        for (int dev : ids) EXPECT_TRUE(sel->release(dev, 2 * kMiB, 0, P).ok());
+    }
+    gdr.reportLocalSuccess("mlx5_0", 31);
+}
+
+TEST(PeerAttribution, T4RequestWideFallbackExpiryAndRelearning) {
+    peer_test_time = 1'000'000;
+    auto sel = peerSelector(Mode::Feedback);
+    Source source;
+    peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Nic);
+    peerSample(*sel, 0, P, 40e9);
+    peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Nic);  // no mixed peer/NIC scoring
+    peerSample(*sel, 1, P, 10e9);
+    peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Peer);
+    peer_test_time += 1000;
+    peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Peer);  // TTL boundary is inclusive
+    ++peer_test_time;
+    peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Nic);
+    peerSample(*sel, 0, P, 40e9);
+    peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Nic);
+    peerSample(*sel, 1, P, 10e9);
+    peerAllocate(*sel, P, &source);
+    EXPECT_EQ(source, Source::Peer);
+    for (int dev : {0, 1}) {
+        auto ledger = sel->getPeerLedger(dev);
+        EXPECT_EQ(ledger.stats.cold, 1u);
+        EXPECT_EQ(ledger.stats.expired, 1u);
+        EXPECT_EQ(ledger.stats.relearned, 1u);
+        EXPECT_EQ(ledger.stats.relearn_delay_ns, 1u);
+    }
+}
+
+TEST(PeerAttribution, T4CloseReopenUsesColdSegmentId) {
+    SegmentManager manager(nullptr);
+    SegmentID first, again, reopened;
+    ASSERT_TRUE(manager.openRemote(first, "test-peer").ok());
+    ASSERT_TRUE(manager.openRemote(again, "test-peer").ok());
+    EXPECT_EQ(first, again);
+    auto sel = peerSelector(Mode::Feedback);
+    peerSample(*sel, 0, first, 40e9);
+    peerSample(*sel, 1, first, 40e9);
+    Source source;
+    peerAllocate(*sel, first, &source);
+    EXPECT_EQ(source, Source::Peer);
+    ASSERT_TRUE(manager.closeRemote(first).ok());
+    ASSERT_TRUE(manager.openRemote(reopened, "test-peer").ok());
+    EXPECT_GT(reopened, first);
+    peerAllocate(*sel, reopened, &source);
+    EXPECT_EQ(source, Source::Nic);
+}
+
+// Disabled by default: timing evidence is a manual microbenchmark, not a
+// correctness assertion or an RDMA performance result.
+TEST(PeerAttribution, DISABLED_HotPathTiming) {
+    using Clock = std::chrono::steady_clock;
+    for (auto mode :
+         {Mode::Static, Mode::Nic, Mode::Feedback, Mode::FeedbackAndInflight}) {
+        DeviceSelector::SchedulingParams params;
+        params.peer_accounting = true;
+        params.peer_scoring = mode;
+        params.enable_priority_filtering = false;
+        params.score_jitter_range = 0;
+        auto sel = makeTwoNicSelector(params);
+        for (int dev : {0, 1}) peerSample(*sel, dev, P, 10e9);
+        int64_t allocate_ns = 0, release_ns = 0;
+        std::vector<int> ids;
+        for (int i = 0; i < 20000; ++i) {
+            auto a = Clock::now();
+            ASSERT_TRUE(sel->allocate(64 * kMiB, 32, 2 * kMiB, "cpu:0", ids,
+                                      PRIO_HIGH, ~0ULL, P)
+                            .ok());
+            auto b = Clock::now();
+            for (int dev : ids)
+                ASSERT_TRUE(sel->release(dev, 2 * kMiB, 0.0001, P).ok());
+            auto c = Clock::now();
+            allocate_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                    .count();
+            release_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(c - b)
+                    .count();
+        }
+        std::cout << "hotpath mode=" << int(mode)
+                  << " allocate_ns_per_batch=" << allocate_ns / 20000.0
+                  << " release_ns_per_slice=" << release_ns / (20000.0 * 32)
+                  << '\n';
+    }
+}
+
+TEST(PeerAttribution, T4LiveEntriesSurviveCleanupNewIdIsCold) {
+    peer_test_time = 1'000'000;
+    auto sel = peerSelector(Mode::FeedbackAndInflight);
+    auto params = sel->getSchedulingParams();
+    params.peer_history_target = 2;
+    sel->setSchedulingParams(params);
+    peerSample(*sel, 0, P, 40e9);
+    ASSERT_TRUE(sel->chargeDevice(0, 123, P).ok());
+    peerSample(*sel, 0, Q, 40e9);
+    peer_test_time += 1001;
+    // P remains live. Old Q is reclaimable; a new SegmentID has no sample.
+    ASSERT_TRUE(sel->chargeDevice(0, 456, Q + 1).ok());
+    auto ledger = sel->getPeerLedger(0);
+    ASSERT_EQ(ledger.entries.size(), 2u);
+    EXPECT_EQ(ledger.stats.reclaimed, 1u);
+    EXPECT_EQ(ledger.nic_inflight, 579u);
+    Source source;
+    peerAllocate(*sel, Q + 1, &source, 1);
+    EXPECT_EQ(source, Source::Nic);
+    EXPECT_TRUE(sel->chargeDevice(0, 1, Q + 2).ok());
+    EXPECT_EQ(sel->getPeerLedger(0).entries.size(), 3u);
+    ASSERT_TRUE(sel->release(0, 1, 0, Q + 2).ok());
+    ASSERT_TRUE(sel->release(0, 123, 0, P).ok());
+    ASSERT_TRUE(sel->release(0, 456, 0, Q + 1).ok());
+    EXPECT_EQ(sel->getPeerLedger(0).stats.accounting_errors, 0u);
 }
 
 }  // namespace

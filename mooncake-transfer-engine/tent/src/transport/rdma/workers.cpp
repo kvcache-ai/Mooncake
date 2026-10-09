@@ -25,6 +25,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <stdexcept>
 #include <thread>
 
 #include "tent/transport/rdma/bw_arbitration.h"
@@ -144,6 +145,27 @@ Workers::Workers(RdmaTransport* transport)
     // ============================================================
     // Device Selection Scoring
     // ============================================================
+
+    params.peer_accounting =
+        conf->get("transports/rdma/peer_accounting", false);
+    const auto peer_scoring = conf->get("transports/rdma/peer_scoring", "v1");
+    if (peer_scoring == "v0")
+        params.peer_scoring = DeviceSelector::PeerScoring::Static;
+    else if (peer_scoring == "v1")
+        params.peer_scoring = DeviceSelector::PeerScoring::Nic;
+    else if (peer_scoring == "v2")
+        params.peer_scoring = DeviceSelector::PeerScoring::Feedback;
+    else if (peer_scoring == "v3")
+        params.peer_scoring = DeviceSelector::PeerScoring::FeedbackAndInflight;
+    else
+        throw std::invalid_argument("peer_scoring must be v0, v1, v2 or v3");
+    params.peer_feedback_ttl_ns = conf->get(
+        "transports/rdma/peer_feedback_ttl_ns", params.peer_feedback_ttl_ns);
+    params.peer_history_target = conf->get(
+        "transports/rdma/peer_history_target", params.peer_history_target);
+    params.peer_trace = conf->get("transports/rdma/peer_trace", false);
+    if (params.peer_accounting && !params.peer_feedback_ttl_ns)
+        throw std::invalid_argument("peer TTL must be positive");
 
     // Random jitter to avoid deterministic selection
     params.score_jitter_range =
@@ -462,7 +484,8 @@ void Workers::orderByDeadline(std::vector<RdmaSlice*>& slices, int dev_id,
 void Workers::rechargeSlice(RdmaSlice* slice, int dev_id) {
     if (!device_selector_ || !slice || dev_id < 0) return;
     if (slice->charged_dev.load(std::memory_order_relaxed) == dev_id) return;
-    if (auto status = device_selector_->chargeDevice(dev_id, slice->length);
+    if (auto status = device_selector_->chargeDevice(
+            dev_id, slice->length, slice->task->request.target_id);
         !status.ok()) {
         // A device the selector does not track (a topology/quota mismatch).
         // The transfer can still go, so the slice is not failed; it keeps
@@ -480,7 +503,9 @@ void Workers::rechargeSlice(RdmaSlice* slice, int dev_id) {
     // this is not a completion.
     const int prev =
         slice->charged_dev.exchange(dev_id, std::memory_order_acq_rel);
-    if (prev >= 0) device_selector_->release(prev, slice->length, 0.0);
+    if (prev >= 0)
+        device_selector_->release(prev, slice->length, 0.0,
+                                  slice->task->request.target_id);
 }
 
 bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
@@ -514,7 +539,8 @@ void Workers::releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
     const int charged =
         slice->charged_dev.exchange(-1, std::memory_order_acq_rel);
     if (charged >= 0)
-        device_selector_->release(charged, slice->length, latency);
+        device_selector_->release(charged, slice->length, latency,
+                                  slice->task->request.target_id);
 }
 
 Workers::WorkerContext* Workers::ownerContext(const RdmaSlice* slice) {
@@ -1542,7 +1568,9 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     if (slice->source_dev_id < 0) {
         CHECK_STATUS(device_selector_->allocate(
             slice->length, source.buffer->location, slice->source_dev_id,
-            slice->priority, slice->task->device_mask));
+            slice->priority, slice->task->device_mask,
+            slice->task->request.target_id, nullptr,
+            reinterpret_cast<uint64_t>(slice->task->request.source)));
         slice->charged_dev = slice->source_dev_id;
     }
 

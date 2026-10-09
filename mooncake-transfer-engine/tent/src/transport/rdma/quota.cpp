@@ -21,11 +21,38 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <iomanip>
 
 namespace mooncake {
 namespace tent {
+DeviceSelector::~DeviceSelector() {
+    if (!sched_params_.peer_accounting) return;
+    const auto d = getDecisionStats();
+    LOG(INFO) << "peer_decisions scope=process_lifetime"
+              << " total=" << d.nominal + d.nic + d.peer
+              << " nominal=" << d.nominal << " nic=" << d.nic
+              << " peer=" << d.peer << " cold_fallback=" << d.cold_fallback
+              << " expired_fallback=" << d.expired_fallback
+              << " aggregate=" << d.aggregate << " probe=" << d.probe
+              << " queue_scope="
+              << (sched_params_.peer_scoring == PeerScoring::Static ? "none"
+                  : sched_params_.peer_scoring ==
+                          PeerScoring::FeedbackAndInflight
+                      ? "peer"
+                      : "nic")
+              << " feedback_scope=per_decision_counts";
+    for (const auto& [id, dev] : devices_) {
+        const auto& s = dev.peer_stats;
+        LOG(INFO) << "peer_stats dev=" << id << " cold=" << s.cold
+                  << " expired=" << s.expired << " relearned=" << s.relearned
+                  << " relearn_delay_ns=" << s.relearn_delay_ns
+                  << " reclaimed=" << s.reclaimed
+                  << " accounting_errors=" << s.accounting_errors;
+    }
+}
+
 Status DeviceSelector::loadTopology(std::shared_ptr<Topology>& local_topology) {
     local_topology_ = local_topology;
     for (size_t dev_id = 0; dev_id < local_topology->getNicCount(); ++dev_id) {
@@ -64,12 +91,16 @@ Status DeviceSelector::setDeviceBandwidth(int dev_id, double gbps) {
                      << (gbps <= 0.0 ? "unknown" : "outside the valid range")
                      << ", assuming " << p.default_bandwidth_gbps << " Gbps";
     }
+    std::unique_lock<std::mutex> lock(dev.peer_mutex, std::defer_lock);
+    if (sched_params_.peer_accounting) lock.lock();
     dev.bw_gbps.store(gbps, std::memory_order_relaxed);
     // A worker completing between these stores clamps the old EWMA against
     // the new rate once; the seeds below overwrite it.
     const double seed = theoreticalBandwidth(dev);
     dev.ewma_bandwidth_bps.store(seed, std::memory_order_relaxed);
     dev.ewma_transmit_bps.store(seed, std::memory_order_relaxed);
+    for (auto& [peer, info] : dev.peers)
+        info.bandwidth.store(seed, std::memory_order_relaxed);
     return Status::OK();
 }
 
@@ -97,8 +128,30 @@ Status DeviceSelector::enableSharedQuota(const std::string& shm_name) {
 Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                                 uint64_t slice_bytes,
                                 const std::string& location,
-                                std::vector<int>& slice_dev_ids, int priority,
+                                std::vector<int>& ids, int priority,
                                 uint64_t device_mask) {
+    return allocate(total_length, num_slices, slice_bytes, location, ids,
+                    priority, device_mask, std::nullopt);
+}
+
+Status DeviceSelector::allocate(uint64_t length, const std::string& location,
+                                int& chosen, int priority, uint64_t mask) {
+    return allocate(length, location, chosen, priority, mask, std::nullopt);
+}
+
+Status DeviceSelector::chargeDevice(int dev_id, uint64_t length) {
+    return chargeDevice(dev_id, length, std::nullopt);
+}
+
+Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
+    return release(dev_id, length, latency, std::nullopt);
+}
+
+Status DeviceSelector::allocate(
+    uint64_t total_length, uint32_t num_slices, uint64_t slice_bytes,
+    const std::string& location, std::vector<int>& slice_dev_ids, int priority,
+    uint64_t device_mask, std::optional<uint64_t> peer,
+    FeedbackSource* feedback, uint64_t request_key) {
     slice_dev_ids.clear();
     slice_dev_ids.reserve(num_slices);
     auto entry = local_topology_->getMemEntry(location);
@@ -159,9 +212,14 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
     }
 
     std::vector<DeviceSelector::Candidate> tl_candidates;
-    Status status = buildCandidates(entry, slice_bytes, device_mask,
-                                    tl_candidates, priority);
+    FeedbackSource source = FeedbackSource::Nic;
+    uint64_t decision_ns = 0;
+    Status status =
+        buildCandidates(entry, slice_bytes, device_mask, tl_candidates,
+                        priority, peer, source, decision_ns);
+    if (feedback) *feedback = source;
     if (!status.ok()) return status;
+    bool probe_mode = false;
     if (num_slices == 1) {
         selectSinglePath(tl_candidates, num_slices, total_length,
                          slice_dev_ids);
@@ -169,9 +227,64 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
         // Probe mode: every 100th call uses round-robin distribution
         // to ensure all devices are sampled for EWMA updates
         thread_local uint64_t tl_call_count = 0;
-        bool probe_mode = ((++tl_call_count % 100) == 0);
+        probe_mode = ((++tl_call_count % 100) == 0);
         selectMultiPath(tl_candidates, num_slices, total_length, slice_bytes,
                         slice_dev_ids, probe_mode);
+    }
+    if (sched_params_.peer_accounting && num_slices > 1) {
+        aggregate_decisions_.fetch_add(1, std::memory_order_relaxed);
+        if (probe_mode)
+            probe_decisions_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Keep the planner unchanged; charge its actual slice lengths through
+    // the same peer/NIC ledger used by retry and completion paths.
+    uint64_t offset = 0;
+    size_t charged = 0;
+    for (size_t i = 0; i < slice_dev_ids.size(); ++i) {
+        uint64_t bytes = i + 1 == slice_dev_ids.size()
+                             ? total_length - offset
+                             : std::min(slice_bytes, total_length - offset);
+        status = chargeDevice(slice_dev_ids[i], bytes, peer);
+        if (!status.ok()) break;
+        offset += bytes;
+        ++charged;
+    }
+    if (!status.ok()) {
+        uint64_t returned = 0;
+        for (size_t i = 0; i < charged; ++i) {
+            uint64_t bytes =
+                i + 1 == slice_dev_ids.size()
+                    ? total_length - returned
+                    : std::min(slice_bytes, total_length - returned);
+            release(slice_dev_ids[i], bytes, 0.0, peer);
+            returned += bytes;
+        }
+        slice_dev_ids.clear();
+        return status;
+    }
+    if (sched_params_.peer_accounting && sched_params_.peer_trace) {
+        for (const auto& c : tl_candidates) {
+            uint64_t bytes = 0, off = 0;
+            for (size_t i = 0; i < slice_dev_ids.size(); ++i) {
+                uint64_t n = i + 1 == slice_dev_ids.size()
+                                 ? total_length - off
+                                 : std::min(slice_bytes, total_length - off);
+                if (slice_dev_ids[i] == c.dev_id) bytes += n;
+                off += n;
+            }
+            LOG(INFO) << "peer_allocation peer=" << peer.value_or(0)
+                      << " peer_present=" << peer.has_value()
+                      << " request_key=" << request_key
+                      << " now_ns=" << decision_ns
+                      << " num_slices=" << num_slices << " probe=" << probe_mode
+                      << " candidates=" << tl_candidates.size()
+                      << " feedback=" << static_cast<int>(source)
+                      << " dev=" << c.dev_id << " inflight=" << c.inflight
+                      << " nic_inflight=" << c.nic_inflight
+                      << " samples=" << c.samples
+                      << " last_sample_ns=" << c.last_sample_ns
+                      << " bandwidth=" << c.bandwidth << " bytes=" << bytes;
+        }
     }
     return Status::OK();
 }
@@ -221,29 +334,18 @@ int DeviceSelector::getDeviceRank(const std::string& location,
     return 0;
 }
 
-Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
-                                       uint64_t slice_bytes,
-                                       uint64_t device_mask,
-                                       std::vector<Candidate>& candidates,
-                                       int request_priority) {
+Status DeviceSelector::buildCandidates(
+    const Topology::MemEntry* entry, uint64_t slice_bytes, uint64_t device_mask,
+    std::vector<Candidate>& candidates, int request_priority,
+    std::optional<uint64_t> peer, FeedbackSource& feedback, uint64_t& now) {
     // Helper lambda to add candidate device
     // Score formula: predicted_time × numa_penalty + random_jitter
     // Lower score = better candidate
     auto add_candidate = [&](int dev_id, size_t rank) {
-        auto& dev = devices_[dev_id];
-        uint64_t inflight = dev.getInflightBytes();
-        double ewma_bw = dev.getEwmaBandwidth();
-        double predicted_time =
-            static_cast<double>(inflight + slice_bytes) / ewma_bw;
-        double rank_penalty = sched_params_.numa_tier_weights[rank];
-        double score = predicted_time * rank_penalty;
-        score +=
-            (SimpleRandom::Get().next(10) * sched_params_.score_jitter_range);
-        bool is_cross_numa = (rank > 0);
-        Candidate c;
+        Candidate c{};
         c.dev_id = dev_id;
-        c.score = score;
-        c.is_cross_numa = is_cross_numa;
+        c.rank = rank;
+        c.is_cross_numa = rank > 0;
         candidates.push_back(c);
     };
 
@@ -280,6 +382,69 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         return Status::DeviceNotFound(noEligibleDeviceReason());
     }
 
+    const bool accounting = sched_params_.peer_accounting;
+    const auto mode =
+        accounting ? sched_params_.peer_scoring : PeerScoring::Nic;
+    const bool wants_peer = mode == PeerScoring::Feedback ||
+                            mode == PeerScoring::FeedbackAndInflight;
+    bool use_peer = wants_peer, cold = false, expired = false;
+    for (auto& c : candidates) {
+        auto& dev = devices_[c.dev_id];
+        if (!accounting) {
+            c.nic_inflight = c.inflight = dev.getInflightBytes();
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(dev.peer_mutex);
+        auto it = peer ? dev.peers.find(*peer) : dev.peers.end();
+        c.samples = it == dev.peers.end() ? 0 : it->second.samples;
+        c.last_sample_ns =
+            it == dev.peers.end() ? 0 : it->second.last_sample_ns;
+        c.nic_inflight = dev.getInflightBytes();
+        c.inflight = mode == PeerScoring::Static ? 0
+                     : mode == PeerScoring::FeedbackAndInflight
+                         ? (it == dev.peers.end() ? 0 : it->second.inflight)
+                         : c.nic_inflight;
+        c.bandwidth = c.samples
+                          ? it->second.bandwidth.load(std::memory_order_relaxed)
+                          : 0;
+    }
+    // All candidate snapshots precede this common monotonic decision time.
+    // No sampled last_sample_ns can be later than the timestamp in the trace.
+    if (accounting) now = peerNow();
+    for (auto& c : candidates) {
+        c.peer_valid =
+            c.samples && now >= c.last_sample_ns &&
+            now - c.last_sample_ns <= sched_params_.peer_feedback_ttl_ns;
+        cold |= c.samples == 0;
+        expired |= c.samples && !c.peer_valid;
+        use_peer = use_peer && c.peer_valid;
+    }
+    feedback = mode == PeerScoring::Static ? FeedbackSource::Nominal
+               : use_peer                  ? FeedbackSource::Peer
+                                           : FeedbackSource::Nic;
+    if (accounting) {
+        feedback_counts_[static_cast<int>(feedback)].fetch_add(
+            1, std::memory_order_relaxed);
+        // Disjoint reasons: cold takes precedence when both occur.
+        if (wants_peer && !use_peer) {
+            if (cold)
+                cold_fallback_.fetch_add(1, std::memory_order_relaxed);
+            else if (expired)
+                expired_fallback_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    for (auto& c : candidates) {
+        const auto& dev = devices_[c.dev_id];
+        if (!use_peer)
+            c.bandwidth = mode == PeerScoring::Static
+                              ? theoreticalBandwidth(dev)
+                              : dev.getEwmaBandwidth();
+        c.score = (static_cast<double>(c.inflight) + slice_bytes) /
+                  c.bandwidth * sched_params_.numa_tier_weights[c.rank];
+        c.score +=
+            SimpleRandom::Get().next(10) * sched_params_.score_jitter_range;
+    }
+
     std::sort(
         candidates.begin(), candidates.end(),
         [this](const Candidate& a, const Candidate& b) {
@@ -298,10 +463,6 @@ void DeviceSelector::selectSinglePath(const std::vector<Candidate>& candidates,
 
     const Candidate& best = candidates[0];
     int dev_id = best.dev_id;
-    auto& dev = devices_[dev_id];
-
-    dev.addInflight(total_length);
-    dev.total_bytes.fetch_add(total_length, std::memory_order_relaxed);
 
     for (uint32_t i = 0; i < num_slices; ++i) {
         slice_dev_ids.push_back(dev_id);
@@ -314,7 +475,6 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
                                      std::vector<int>& slice_dev_ids,
                                      bool probe_mode) {
     if (candidates.empty()) return;
-    const size_t first = slice_dev_ids.size();
     if (probe_mode) {
         // Probe mode: round-robin distribution to ensure all devices are
         // sampled Activates every 100th call to prevent EWMA starvation
@@ -361,23 +521,6 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
             }
         }
     }
-    // Charge each device what its slices actually carry, in the caller's
-    // slice order, so release() (which returns the slice's length) balances
-    // per device; ceil(total / n) per slice would not. The last slice takes
-    // what is left rather than a whole block -- planRdmaSlices() folds a
-    // short tail into it -- so it can be longer than slice_bytes, and
-    // charging it a block would leave the fold released but never charged.
-    uint64_t offset = 0;
-    for (size_t i = first; i < slice_dev_ids.size(); ++i) {
-        const uint64_t bytes =
-            (i + 1 == slice_dev_ids.size())
-                ? total_length - offset
-                : std::min(slice_bytes, total_length - offset);
-        offset += bytes;
-        auto& dev = devices_[slice_dev_ids[i]];
-        dev.addInflight(bytes);
-        dev.total_bytes.fetch_add(bytes, std::memory_order_relaxed);
-    }
 }
 
 Status DeviceSelector::allocate(uint64_t length, const std::string& location,
@@ -387,10 +530,14 @@ Status DeviceSelector::allocate(uint64_t length, const std::string& location,
 
 Status DeviceSelector::allocate(uint64_t length, const std::string& location,
                                 int& chosen_dev_id, int priority,
-                                uint64_t device_mask) {
+                                uint64_t device_mask,
+                                std::optional<uint64_t> peer,
+                                FeedbackSource* feedback,
+                                uint64_t request_key) {
     std::vector<int> slice_dev_ids;
-    Status status = allocate(length, 1, length, location, slice_dev_ids,
-                             priority, device_mask);
+    Status status =
+        allocate(length, 1, length, location, slice_dev_ids, priority,
+                 device_mask, peer, feedback, request_key);
     if (!status.ok()) return status;
     if (slice_dev_ids.empty()) {
         return Status::DeviceNotFound("allocation failed");
@@ -399,12 +546,44 @@ Status DeviceSelector::allocate(uint64_t length, const std::string& location,
     return Status::OK();
 }
 
-Status DeviceSelector::chargeDevice(int dev_id, uint64_t length) {
+Status DeviceSelector::chargeDevice(int dev_id, uint64_t length,
+                                    std::optional<uint64_t> peer) {
     auto it = devices_.find(dev_id);
     if (it == devices_.end())
         return Status::InvalidArgument("device not found");
     // Inflight is only tracked in smart mode; see allocate() and release().
-    if (smart_selection_enabled_) it->second.addInflight(length);
+    auto& dev = it->second;
+    if (smart_selection_enabled_) {
+        if (!sched_params_.peer_accounting) {
+            dev.addInflight(length);
+        } else {
+            std::lock_guard<std::mutex> lock(dev.peer_mutex);
+            if (!peer) {
+                ++dev.peer_stats.accounting_errors;
+            } else {
+                auto found = dev.peers.find(*peer);
+                if (found == dev.peers.end()) {
+                    // Every map access is under this mutex and no reference
+                    // escapes it, so idle entries have no concurrent holders.
+                    for (auto p = dev.peers.begin();
+                         p != dev.peers.end() &&
+                         dev.peers.size() >=
+                             sched_params_.peer_history_target;) {
+                        if (p->second.inflight == 0) {
+                            p = dev.peers.erase(p);
+                            ++dev.peer_stats.reclaimed;
+                        } else
+                            ++p;
+                    }
+                    found = dev.peers.try_emplace(*peer).first;
+                    found->second.bandwidth.store(theoreticalBandwidth(dev));
+                    ++dev.peer_stats.cold;
+                }
+                found->second.inflight += length;
+            }
+            dev.addInflight(length);
+        }
+    }
     // Each attempt is bytes this NIC is asked to move, so a retry -- or a
     // first attempt that fell back to another NIC -- counts again here:
     // total_bytes is a lifetime traffic figure, not a request count.
@@ -535,7 +714,8 @@ void DeviceSelector::maybeSampleTransmit(int dev_id, uint64_t now_ns) {
         static_cast<double>(completed - before) / ((busy - busy_before) / 1e9));
 }
 
-Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
+Status DeviceSelector::release(int dev_id, uint64_t length, double latency,
+                               std::optional<uint64_t> peer) {
     auto it = devices_.find(dev_id);
     if (it == devices_.end())
         return Status::InvalidArgument("device not found");
@@ -544,16 +724,103 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     // Inflight is only ever charged in smart mode; releasing in baseline mode
     // would drive the unsigned counter below zero.
     if (!smart_selection_enabled_) return Status::OK();
+    if (!sched_params_.peer_accounting) {
+        // Original NIC path: worker charged_dev.exchange(-1) owns settlement.
+        dev.releaseInflight(length);
+        if (latency > 0.0)
+            learnRate(dev, dev.ewma_bandwidth_bps,
+                      sched_params_.bandwidth_learning_rate,
+                      static_cast<double>(length) / latency);
+        return Status::OK();
+    }
+    std::lock_guard<std::mutex> lock(dev.peer_mutex);
+    // The worker consumes charge ownership exactly once. A peer bookkeeping
+    // error must not strand that NIC charge; still reject an underflow.
+    if (dev.getInflightBytes() < length) {
+        ++dev.peer_stats.accounting_errors;
+        return Status::InvalidArgument("unmatched NIC release");
+    }
     dev.releaseInflight(length);
-
-    // A release with no latency sample -- cancelled, timed out, failed,
-    // swept off a queue pair, or moved to another device -- learns nothing.
-    if (latency <= 0.0) return Status::OK();
-
-    learnRate(dev, dev.ewma_bandwidth_bps,
-              sched_params_.bandwidth_learning_rate,
-              static_cast<double>(length) / latency);
+    if (latency > 0.0)
+        learnRate(dev, dev.ewma_bandwidth_bps,
+                  sched_params_.bandwidth_learning_rate,
+                  static_cast<double>(length) / latency);
+    auto found = peer ? dev.peers.find(*peer) : dev.peers.end();
+    if (found == dev.peers.end() || found->second.inflight < length) {
+        ++dev.peer_stats.accounting_errors;
+        return Status::InvalidArgument("unmatched peer release; NIC settled");
+    }
+    auto& info = found->second;
+    info.inflight -= length;
+    if (latency > 0.0) {
+        const uint64_t now = peerNow();
+        countExpiry(dev, info, now);
+        if (info.expiry_counted) {
+            ++dev.peer_stats.relearned;
+            dev.peer_stats.relearn_delay_ns +=
+                now - info.last_sample_ns - sched_params_.peer_feedback_ttl_ns;
+        }
+        if (sched_params_.peer_trace)
+            LOG(INFO) << "peer_sample dev=" << dev_id << " peer=" << *peer
+                      << " now_ns=" << now << " samples=" << info.samples + 1
+                      << " previous_sample_ns=" << info.last_sample_ns
+                      << " bytes=" << length << " latency_s=" << latency;
+        info.expiry_counted = false;
+        info.last_sample_ns = now;
+        ++info.samples;
+        learnRate(dev, info.bandwidth, sched_params_.bandwidth_learning_rate,
+                  static_cast<double>(length) / latency);
+    }
+    if (!info.inflight &&
+        dev.peers.size() > sched_params_.peer_history_target) {
+        dev.peers.erase(found);
+        ++dev.peer_stats.reclaimed;
+    }
     return Status::OK();
+}
+
+DeviceSelector::DecisionStats DeviceSelector::getDecisionStats() const {
+    return {feedback_counts_[0].load(std::memory_order_relaxed),
+            feedback_counts_[1].load(std::memory_order_relaxed),
+            feedback_counts_[2].load(std::memory_order_relaxed),
+            cold_fallback_.load(std::memory_order_relaxed),
+            expired_fallback_.load(std::memory_order_relaxed),
+            aggregate_decisions_.load(std::memory_order_relaxed),
+            probe_decisions_.load(std::memory_order_relaxed)};
+}
+
+uint64_t DeviceSelector::peerNow() const {
+    return clock_ ? clock_()
+                  : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+}
+
+bool DeviceSelector::peerExpired(const PeerInfo& info, uint64_t now) const {
+    return now >= info.last_sample_ns &&
+           now - info.last_sample_ns > sched_params_.peer_feedback_ttl_ns;
+}
+
+void DeviceSelector::countExpiry(DeviceInfo& dev, PeerInfo& info,
+                                 uint64_t now) {
+    if (info.samples && !info.expiry_counted && peerExpired(info, now)) {
+        info.expiry_counted = true;
+        ++dev.peer_stats.expired;
+    }
+}
+
+DeviceSelector::PeerLedger DeviceSelector::getPeerLedger(int dev_id) const {
+    PeerLedger result{};
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return result;
+    const auto& dev = it->second;
+    std::lock_guard<std::mutex> lock(dev.peer_mutex);
+    result.nic_inflight = dev.getInflightBytes();
+    result.stats = dev.peer_stats;
+    for (const auto& [peer, info] : dev.peers)
+        result.entries.push_back({peer, info.inflight, info.samples,
+                                  info.last_sample_ns, info.bandwidth.load()});
+    return result;
 }
 
 Status DeviceSelector::getNicLoadStats(std::vector<NicLoadStats>& stats) const {

@@ -33,6 +33,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
@@ -257,6 +259,167 @@ TEST(QuotaAccounting, BaselineModeKeepsInflightZero) {
     for (int dev : dev_ids) ASSERT_TRUE(sel->release(dev, 512, 0.001).ok());
     EXPECT_EQ(InflightOf(*sel, "mlx5_0"), 0u);  // not ~2^64 (no underflow)
     EXPECT_EQ(InflightOf(*sel, "mlx5_1"), 0u);
+}
+
+void CheckPeerConservation(DeviceSelector& sel) {
+    for (int dev : {0, 1}) {
+        auto state = sel.getPeerLedger(dev);
+        uint64_t sum = 0;
+        for (const auto& peer : state.entries) sum += peer.inflight;
+        EXPECT_EQ(sum, state.nic_inflight);
+        EXPECT_EQ(state.stats.accounting_errors, 0u);
+    }
+}
+
+TEST(QuotaAccounting, PeerConservationAcrossTailFailureAndRecharge) {
+    for (auto mode :
+         {DeviceSelector::PeerScoring::Static, DeviceSelector::PeerScoring::Nic,
+          DeviceSelector::PeerScoring::Feedback,
+          DeviceSelector::PeerScoring::FeedbackAndInflight}) {
+        auto sel = MakeSelector(true);
+        auto params = sel->getSchedulingParams();
+        params.peer_accounting = true;
+        params.peer_scoring = mode;
+        sel->setSchedulingParams(params);
+        std::vector<int> ids;
+        ASSERT_TRUE(
+            sel->allocate(1000, 3, 300, "cpu:0", ids, PRIO_HIGH, ~0ULL, 11)
+                .ok());
+        CheckPeerConservation(*sel);
+        int single = -1;
+        ASSERT_TRUE(
+            sel->allocate(37, "cpu:0", single, PRIO_HIGH, ~0ULL, 12).ok());
+        CheckPeerConservation(*sel);
+        ASSERT_TRUE(sel->chargeDevice(1 - single, 37, 12).ok());
+        CheckPeerConservation(*sel);
+        ASSERT_TRUE(sel->release(single, 37, 0, 12).ok());
+        CheckPeerConservation(*sel);
+        ASSERT_TRUE(sel->release(1 - single, 37, 0.001, 12).ok());
+        for (size_t i = 0; i < ids.size(); ++i) {
+            ASSERT_TRUE(
+                sel->release(ids[i], i == 2 ? 400 : 300, i == 1 ? 0 : 0.001, 11)
+                    .ok());
+            CheckPeerConservation(*sel);
+        }
+        EXPECT_EQ(TotalInflight(*sel), 0u);
+    }
+}
+
+TEST(QuotaAccounting, CostCaseUses32Actual64KiBWriteSlices) {
+    const uint64_t length = 2 * 1024 * 1024, block = 64 * 1024;
+    const auto plan = planRdmaSlices(length, block, 32);
+    ASSERT_EQ(plan.count, 32u);
+    ASSERT_EQ(plan.block_size, block);
+    ASSERT_EQ(length - (plan.count - 1) * plan.block_size, block);
+    for (bool accounting : {false, true}) {
+        auto sel = MakeSelector(true);
+        auto params = sel->getSchedulingParams();
+        params.peer_accounting = accounting;
+        sel->setSchedulingParams(params);
+        std::vector<int> ids;
+        ASSERT_TRUE(sel->allocate(length, plan.count, plan.block_size, "cpu:0",
+                                  ids, PRIO_HIGH, ~0ULL, 0)
+                        .ok());
+        ASSERT_EQ(ids.size(), plan.count);
+        EXPECT_EQ(TotalInflight(*sel), length);
+        for (int dev : ids) ASSERT_TRUE(sel->release(dev, block, 0, 0).ok());
+        EXPECT_EQ(TotalInflight(*sel), 0u);
+        if (accounting) CheckPeerConservation(*sel);
+    }
+}
+
+TEST(QuotaAccounting, LiveEntriesAboveHistoryTargetNeverRejectAllocation) {
+    auto sel = MakeSelector(true);
+    auto params = sel->getSchedulingParams();
+    params.peer_accounting = true;
+    params.peer_history_target = 1;
+    params.enable_priority_filtering = false;
+    params.score_jitter_range = 0;
+    params.peer_scoring = DeviceSelector::PeerScoring::Static;
+    sel->setSchedulingParams(params);
+    ASSERT_TRUE(sel->chargeDevice(1, 10, 11).ok());
+    std::vector<int> ids;
+    ASSERT_TRUE(
+        sel->allocate(1000, 4, 250, "cpu:0", ids, PRIO_HIGH, ~0ULL, 12).ok());
+    EXPECT_EQ(TotalInflight(*sel), 1010u);
+    CheckPeerConservation(*sel);
+    for (int dev : ids) ASSERT_TRUE(sel->release(dev, 250, 0, 12).ok());
+    ASSERT_TRUE(sel->release(1, 10, 0, 11).ok());
+    CheckPeerConservation(*sel);
+    EXPECT_LE(sel->getPeerLedger(1).entries.size(), 1u);
+}
+
+TEST(QuotaAccounting, IdleUnexpiredHistoryCanBeEvicted) {
+    auto sel = MakeSelector(true);
+    auto params = sel->getSchedulingParams();
+    params.peer_accounting = true;
+    params.peer_history_target = 1;
+    sel->setSchedulingParams(params);
+    ASSERT_TRUE(sel->chargeDevice(0, 100, 0).ok());
+    ASSERT_TRUE(sel->release(0, 100, 0.001, 0).ok());
+    ASSERT_TRUE(sel->chargeDevice(0, 100, 1).ok());
+    auto ledger = sel->getPeerLedger(0);
+    ASSERT_EQ(ledger.entries.size(), 1u);
+    EXPECT_EQ(ledger.entries[0].peer, 1u);
+    EXPECT_EQ(ledger.entries[0].samples, 0u);
+    EXPECT_EQ(ledger.stats.reclaimed, 1u);
+    ASSERT_TRUE(sel->release(0, 100, 0, 1).ok());
+    CheckPeerConservation(*sel);
+}
+
+TEST(QuotaAccounting, ConcurrentPeersHaveAtomicConservationSnapshots) {
+    auto sel = MakeSelector(true);
+    auto params = sel->getSchedulingParams();
+    params.peer_accounting = true;
+    params.peer_history_target = 1;
+    sel->setSchedulingParams(params);
+    std::atomic<int> running{2};
+    auto work = [&](uint64_t peer) {
+        for (int i = 0; i < 1000; ++i) {
+            EXPECT_TRUE(sel->chargeDevice(i % 2, 100, peer).ok());
+            EXPECT_TRUE(sel->release(i % 2, 100, 0.001, peer).ok());
+        }
+        --running;
+    };
+    std::thread a(work, 11), b(work, 12);
+    while (running.load()) CheckPeerConservation(*sel);
+    a.join();
+    b.join();
+    CheckPeerConservation(*sel);
+    EXPECT_EQ(TotalInflight(*sel), 0u);
+}
+
+// Deliberate accounting corruption: kept separate from conservation tests.
+TEST(QuotaAccountingNegative, MissingPeerStillSettlesOwnedNicCharge) {
+    auto sel = MakeSelector(true);
+    auto params = sel->getSchedulingParams();
+    params.peer_accounting = true;
+    sel->setSchedulingParams(params);
+    ASSERT_TRUE(sel->chargeDevice(0, 100, 11).ok());
+    EXPECT_FALSE(sel->release(0, 100, 0, 12).ok());
+    EXPECT_EQ(sel->getInflightBytes(0), 0u);
+    EXPECT_EQ(sel->getPeerLedger(0).stats.accounting_errors, 1u);
+    EXPECT_FALSE(sel->release(0, 100, 0, 11).ok());  // no unsigned underflow
+    EXPECT_EQ(sel->getInflightBytes(0), 0u);
+}
+
+TEST(QuotaAccountingNegative, MissingPeerIsNotLegalPeerZero) {
+    auto sel = MakeSelector(true);
+    auto params = sel->getSchedulingParams();
+    params.peer_accounting = true;
+    sel->setSchedulingParams(params);
+    ASSERT_TRUE(sel->chargeDevice(0, 100, 0).ok());
+    ASSERT_TRUE(
+        sel->chargeDevice(0, 50).ok());  // legacy overload, unattributed
+    auto ledger = sel->getPeerLedger(0);
+    ASSERT_EQ(ledger.entries.size(), 1u);
+    EXPECT_EQ(ledger.entries[0].peer, 0u);
+    EXPECT_EQ(ledger.entries[0].inflight, 100u);
+    EXPECT_EQ(ledger.nic_inflight, 150u);
+    ASSERT_TRUE(sel->release(0, 100, 0, 0).ok());
+    EXPECT_FALSE(sel->release(0, 50, 0).ok());
+    EXPECT_EQ(sel->getInflightBytes(0), 0u);
+    EXPECT_EQ(sel->getPeerLedger(0).stats.accounting_errors, 2u);
 }
 
 }  // namespace tent

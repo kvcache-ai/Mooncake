@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <shared_mutex>
 #include <mutex>
+#include <optional>
 
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
@@ -67,11 +68,49 @@ class SharedSlotManager;
  */
 class DeviceSelector {
    public:
+    enum class PeerScoring { Static, Nic, Feedback, FeedbackAndInflight };
+    enum class FeedbackSource { Nominal, Nic, Peer };
+    struct PeerInfo {
+        uint64_t inflight = 0;
+        std::atomic<double> bandwidth{0};
+        uint64_t samples = 0;
+        uint64_t last_sample_ns = 0;
+        bool expiry_counted = false;
+    };
+    struct PeerStats {
+        uint64_t cold = 0, expired = 0, relearned = 0;
+        uint64_t relearn_delay_ns = 0, accounting_errors = 0;
+        uint64_t reclaimed = 0;
+    };
+    struct PeerSnapshot {
+        uint64_t peer, inflight, samples, last_sample_ns;
+        double bandwidth;
+    };
+    // One locked snapshot includes the NIC total for conservation checks.
+    struct PeerLedger {
+        uint64_t nic_inflight;
+        PeerStats stats;
+        std::vector<PeerSnapshot> entries;
+    };
+    PeerLedger getPeerLedger(int dev_id) const;
+
+    struct DecisionStats {
+        uint64_t nominal, nic, peer, cold_fallback, expired_fallback;
+        uint64_t aggregate, probe;
+    };
+    DecisionStats getDecisionStats() const;
+
     // Candidate device for allocation
     struct Candidate {
         int dev_id;
         double score;
         bool is_cross_numa;
+        size_t rank;
+        uint64_t inflight;
+        uint64_t nic_inflight;
+        double bandwidth;
+        bool peer_valid;
+        uint64_t samples, last_sample_ns;
     };
 
     // 64-byte aligned so the padding below really does put each hot atomic
@@ -127,6 +166,9 @@ class DeviceSelector {
         std::atomic<uint64_t> busy_ns{0};
         std::atomic<uint64_t> busy_since{0};
         uint64_t padding7[3];
+        mutable std::mutex peer_mutex;
+        std::unordered_map<uint64_t, PeerInfo> peers;
+        PeerStats peer_stats;
 
         uint64_t getInflightBytes() const {
             return inflight_bytes.load(std::memory_order_relaxed);
@@ -154,8 +196,9 @@ class DeviceSelector {
     };
 
    public:
-    DeviceSelector() = default;
-    ~DeviceSelector() = default;
+    // An optional monotonic clock makes feedback expiry deterministic in tests.
+    explicit DeviceSelector(uint64_t (*clock)() = nullptr) : clock_(clock) {}
+    ~DeviceSelector();
 
     DeviceSelector(const DeviceSelector &) = delete;
     DeviceSelector &operator=(const DeviceSelector &) = delete;
@@ -197,20 +240,26 @@ class DeviceSelector {
     // actually carry, so release(), which returns a slice's real length,
     // balances. Charging every slice slice_bytes would leave the folded tail
     // released but never charged, and inflight_bytes is unsigned.
+    // Preserve legacy overloads; absence is never silently peer ID zero.
     Status allocate(uint64_t total_length, uint32_t num_slices,
                     uint64_t slice_bytes, const std::string &location,
                     std::vector<int> &slice_dev_ids, int priority = PRIO_HIGH,
                     uint64_t device_mask = ~0ULL);
-
+    Status allocate(uint64_t total_length, uint32_t num_slices,
+                    uint64_t slice_bytes, const std::string &location,
+                    std::vector<int> &slice_dev_ids, int priority,
+                    uint64_t device_mask, std::optional<uint64_t> peer,
+                    FeedbackSource *feedback = nullptr,
+                    uint64_t request_key = 0);
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id);
-
-    // Allocate one device for the per-slice path. Small requests do not go
-    // through the aggregate allocator, but must still honor the request
-    // priority and transport policy's device mask. Keep the three-argument
-    // overload above for source and binary compatibility.
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id, int priority, uint64_t device_mask);
+    Status allocate(uint64_t length, const std::string &location,
+                    int &chosen_dev_id, int priority, uint64_t device_mask,
+                    std::optional<uint64_t> peer,
+                    FeedbackSource *feedback = nullptr,
+                    uint64_t request_key = 0);
 
     // The NIC's own backlog: `notePosted` when a WR reaches the hardware,
     // `notePostEnded` when it leaves the queue pair (completion, sweep or
@@ -250,14 +299,20 @@ class DeviceSelector {
     // for a caller that has already settled on it: a retry re-posting a
     // slice whose charge the failure path returned, or a first attempt
     // falling back from the NIC the allocator picked. release() balances
-    // it. Fails only for a device the selector does not know.
+    // it. A missing peer is distinct from the valid peer ID 0. Legacy callers
+    // still charge the NIC; missing attribution is counted when enabled.
+    // Fails only for an unknown device.
     Status chargeDevice(int dev_id, uint64_t length);
+    Status chargeDevice(int dev_id, uint64_t length,
+                        std::optional<uint64_t> peer);
 
     // Return a slice's inflight charge and learn from its completion.
     // `latency` is a successful attempt's post->completion time and feeds
     // the selection EWMA; <= 0 means no sample. The transmit estimate is
     // fed by the meter instead, see maybeSampleTransmit().
     Status release(int dev_id, uint64_t length, double latency);
+    Status release(int dev_id, uint64_t length, double latency,
+                   std::optional<uint64_t> peer);
 
     Status getNicLoadStats(std::vector<NicLoadStats> &stats) const;
 
@@ -292,6 +347,16 @@ class DeviceSelector {
     int getDevicePriority(int dev_id) const;
 
     struct SchedulingParams {
+        // Startup-only: changing accounting while charges exist is unsupported.
+        bool peer_accounting = false;
+        PeerScoring peer_scoring = PeerScoring::Nic;
+        uint64_t peer_feedback_ttl_ns = 1'000'000'000;
+        // Idle-history retention target, never an admission limit. Live
+        // entries survive above it; early eviction restarts cold feedback.
+        size_t peer_history_target = 4096;
+        // Diagnostic runs only: allocation inputs and sample intervals.
+        bool peer_trace = false;
+
         // NUMA tier penalties (rank 0 = local, should be smallest)
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};
@@ -374,6 +439,13 @@ class DeviceSelector {
     std::shared_ptr<SharedSlotManager> slot_manager_;
     bool smart_selection_enabled_ = true;
     SchedulingParams sched_params_;
+    uint64_t (*clock_)();
+    std::atomic<uint64_t> feedback_counts_[3]{};
+    std::atomic<uint64_t> cold_fallback_{0}, expired_fallback_{0};
+    std::atomic<uint64_t> aggregate_decisions_{0}, probe_decisions_{0};
+    uint64_t peerNow() const;
+    bool peerExpired(const PeerInfo &info, uint64_t now) const;
+    void countExpiry(DeviceInfo &dev, PeerInfo &info, uint64_t now);
 
     // Bytes/s the device is rated for: bw_gbps when it is inside the
     // configured [min, max], default_bandwidth_gbps otherwise.
@@ -412,7 +484,8 @@ class DeviceSelector {
     Status buildCandidates(const Topology::MemEntry *entry,
                            uint64_t slice_bytes, uint64_t device_mask,
                            std::vector<Candidate> &candidates,
-                           int request_priority = PRIO_HIGH);
+                           int request_priority, std::optional<uint64_t> peer,
+                           FeedbackSource &feedback, uint64_t &now);
 
     void selectSinglePath(const std::vector<Candidate> &candidates,
                           uint32_t num_slices, uint64_t total_length,

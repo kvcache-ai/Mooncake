@@ -1550,9 +1550,11 @@ class RdmaContextLinkSpeedEventTest : public ::testing::Test {
             selector_->setDeviceBandwidth(kDev, context_->linkSpeedGbps())
                 .ok());
         ASSERT_TRUE(selector_->setDeviceAvailable(kDev, true).ok());
-        for (int i = 0; i < 64; ++i)
+        for (int i = 0; i < 64; ++i) {
+            ASSERT_TRUE(selector_->chargeDevice(kDev, 1 << 20).ok());
             ASSERT_TRUE(
                 selector_->release(kDev, 1 << 20, (1 << 20) / 45e9).ok());
+        }
         ASSERT_NEAR(selector_->getAggregateEwmaBandwidth(), 45e9, 45e9 * 0.02);
     }
 
@@ -1913,6 +1915,7 @@ class RdmaWorkersTimeoutTest : public ::testing::Test {
 
         // Charge the slice to the NIC exactly as selectOptimalDevice() does.
         task_ = RdmaTaskStorage::Get().allocate();
+        task_->request.target_id = 0;
         task_->num_slices = 1;
         task_->status_word = PENDING;
         task_->first_error = PENDING;
@@ -2041,6 +2044,7 @@ class RdmaWorkersArbitrationTest : public ::testing::Test {
     // by the selector exactly as selectOptimalDevice() charges it.
     RdmaSlice* makeSlice(uint64_t length, uint64_t window_ns) {
         auto* task = RdmaTaskStorage::Get().allocate();
+        task->request.target_id = 0;
         task->num_slices = 1;
         task->status_word = PENDING;
         task->first_error = PENDING;
@@ -2130,6 +2134,7 @@ class RdmaWorkersChargeTest : public ::testing::Test {
         workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
         selector_ = workers_->getDeviceSelector();
         auto params = selector_->getSchedulingParams();
+        params.peer_accounting = true;
         params.bandwidth_learning_rate = 0.0;  // adopt the sample
         selector_->setSchedulingParams(params);
         for (int dev : {0, 1}) {
@@ -2138,6 +2143,7 @@ class RdmaWorkersChargeTest : public ::testing::Test {
         }
 
         task_ = RdmaTaskStorage::Get().allocate();
+        task_->request.target_id = 41;
         task_->num_slices = 1;
         task_->status_word = PENDING;
         task_->first_error = PENDING;
@@ -2150,7 +2156,7 @@ class RdmaWorkersChargeTest : public ::testing::Test {
         // Allocated on NIC 0, as submitTransferTasks charges it.
         int chosen = -1;
         ASSERT_TRUE(
-            selector_->allocate(kLen, "cpu:0", chosen, PRIO_HIGH, 1ULL << 0)
+            selector_->allocate(kLen, "cpu:0", chosen, PRIO_HIGH, 1ULL << 0, 41)
                 .ok());
         ASSERT_EQ(chosen, 0);
         slice_->source_dev_id = chosen;
@@ -2159,6 +2165,14 @@ class RdmaWorkersChargeTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, kNow, 0.0);
+        for (int dev : {0, 1}) {
+            auto ledger = selector_->getPeerLedger(dev);
+            EXPECT_EQ(ledger.nic_inflight, 0u);
+            EXPECT_EQ(ledger.stats.accounting_errors, 0u);
+            for (const auto& peer : ledger.entries)
+                EXPECT_EQ(peer.inflight, 0u);
+        }
         RdmaSliceStorage::Get().deallocate(slice_);
         task_->deref();
     }
@@ -2169,6 +2183,18 @@ class RdmaWorkersChargeTest : public ::testing::Test {
     RdmaTask* task_ = nullptr;
     RdmaSlice* slice_ = nullptr;
 };
+
+TEST_F(RdmaWorkersChargeTest, LivePeerHistoryTargetDoesNotRejectRetry) {
+    auto params = selector_->getSchedulingParams();
+    params.peer_history_target = 1;
+    selector_->setSchedulingParams(params);
+    ASSERT_TRUE(selector_->chargeDevice(1, 123, 99).ok());
+    RdmaTransportTestPeer::rechargeSlice(*workers_, slice_, 1);
+    EXPECT_EQ(slice_->charged_dev, 1);
+    EXPECT_EQ(selector_->getInflightBytes(0), 0u);
+    EXPECT_EQ(selector_->getInflightBytes(1), kLen + 123);
+    ASSERT_TRUE(selector_->release(1, 123, 0, 99).ok());
+}
 
 // The CQ error path returns a slice's charge before re-submitting it, and
 // the retry picks its device again. Without a fresh charge the NIC's
@@ -2264,6 +2290,7 @@ TEST(RdmaWorkersOwnershipTest, SweepByAnotherLaneIsRoutedToTheOwner) {
 
     // Lane B enqueued and posted the slice.
     auto* task = RdmaTaskStorage::Get().allocate();
+    task->request.target_id = 0;
     task->num_slices = 1;
     task->status_word = PENDING;
     task->first_error = PENDING;
@@ -2320,6 +2347,8 @@ class RdmaWorkersCompletionTest : public ::testing::Test {
     static constexpr uint64_t kLen = 1 << 20;
     static constexpr uint64_t kNow = 1'000'000'000;
 
+    virtual bool peerAccounting() const { return false; }
+
     void SetUp() override {
         auto topology = std::make_shared<Topology>();
         ASSERT_TRUE(topology
@@ -2340,12 +2369,14 @@ class RdmaWorkersCompletionTest : public ::testing::Test {
         selector_ = workers_->getDeviceSelector();
         ASSERT_TRUE(selector_->setDeviceAvailable(kDev, true).ok());
         auto params = selector_->getSchedulingParams();
+        params.peer_accounting = peerAccounting();
         params.transmit_bandwidth_learning_rate = 0.0;  // adopt outright
         params.transmit_meter_interval_ns = 0;          // sample on demand
         selector_->setSchedulingParams(params);
         ASSERT_TRUE(selector_->setDeviceBandwidth(kDev, 25.0).ok());
 
         task_ = RdmaTaskStorage::Get().allocate();
+        task_->request.target_id = 0;
         task_->num_slices = 1;
         task_->status_word = PENDING;
         task_->first_error = PENDING;
@@ -2361,7 +2392,9 @@ class RdmaWorkersCompletionTest : public ::testing::Test {
         slice_->enqueue_ts = kNow - kLen;
         slice_->submit_ts = kNow;
         int chosen = -1;
-        ASSERT_TRUE(selector_->allocate(kLen, "cpu:0", chosen).ok());
+        ASSERT_TRUE(
+            selector_->allocate(kLen, "cpu:0", chosen, PRIO_HIGH, ~0ULL, 0)
+                .ok());
         ASSERT_EQ(chosen, kDev);
         slice_->source_dev_id = chosen;
         slice_->charged_dev = chosen;
@@ -2394,6 +2427,7 @@ class RdmaWorkersCompletionTest : public ::testing::Test {
     // way asyncPostSend does it.
     RdmaSlice* makeSlice(uint64_t submit_ts) {
         auto* task = RdmaTaskStorage::Get().allocate();
+        task->request.target_id = 0;
         task->num_slices = 1;
         task->status_word = PENDING;
         task->first_error = PENDING;
@@ -2407,7 +2441,9 @@ class RdmaWorkersCompletionTest : public ::testing::Test {
         slice->enqueue_ts = submit_ts - kLen;
         slice->submit_ts = submit_ts;
         int chosen = -1;
-        EXPECT_TRUE(selector_->allocate(kLen, "cpu:0", chosen).ok());
+        EXPECT_TRUE(
+            selector_->allocate(kLen, "cpu:0", chosen, PRIO_HIGH, ~0ULL, 0)
+                .ok());
         slice->source_dev_id = chosen;
         slice->charged_dev = chosen;
         slice->ep_weak_ptr = endpoint_;
@@ -2556,6 +2592,42 @@ TEST_F(RdmaWorkersCompletionTest, FlushedCompletionTeachesNothing) {
     EXPECT_DOUBLE_EQ(selector_->getTransmitBandwidth(kDev), 3.125e9);  // seed
 }
 
+class RdmaPeerCompletionTest : public RdmaWorkersCompletionTest {
+    bool peerAccounting() const override { return true; }
+};
+
+TEST_F(RdmaPeerCompletionTest, PeerZeroSettlesOnCanceledCompletionExactlyOnce) {
+    task_->cancel_requested.store(true);
+    complete(IBV_WC_WR_FLUSH_ERR);
+    EXPECT_EQ(task_->status_word, CANCELED);
+    EXPECT_EQ(slice_->charged_dev, -1);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, kNow, 0);
+    const auto ledger = selector_->getPeerLedger(kDev);
+    EXPECT_EQ(ledger.nic_inflight, 0u);
+    ASSERT_EQ(ledger.entries.size(), 1u);
+    EXPECT_EQ(ledger.entries[0].peer, 0u);
+    EXPECT_EQ(ledger.entries[0].inflight, 0u);
+    EXPECT_EQ(ledger.stats.accounting_errors, 0u);
+}
+
+class RdmaPeerCompletionNegativeTest : public RdmaPeerCompletionTest {};
+
+TEST_F(RdmaPeerCompletionNegativeTest, BadPeerCannotStrandNicOrSettleTwice) {
+    ASSERT_TRUE(selector_->chargeDevice(kDev, 123, 99).ok());
+    task_->request.target_id = 88;  // deliberately corrupt attribution
+    task_->cancel_requested.store(true);
+    complete(IBV_WC_WR_FLUSH_ERR);
+    EXPECT_EQ(task_->status_word, CANCELED);
+    EXPECT_EQ(slice_->charged_dev, -1);
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 123u);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice_, kNow, 0);
+    EXPECT_EQ(selector_->getInflightBytes(kDev),
+              123u);  // other charge untouched
+    EXPECT_EQ(selector_->getPeerLedger(kDev).stats.accounting_errors, 1u);
+    ASSERT_TRUE(selector_->release(kDev, 123, 0, 99).ok());
+    EXPECT_EQ(selector_->getInflightBytes(kDev), 0u);
+}
+
 // A queue pair shared by two worker lanes (the qp_pools layout): the lane
 // that sweeps a completion off it is not the lane that enqueued the slices,
 // so acknowledge() hands back slices belonging to somebody else. Everything
@@ -2680,6 +2752,7 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     // A slice with a task behind it, not yet posted anywhere.
     RdmaSlice* makeSlice() {
         auto* task = RdmaTaskStorage::Get().allocate();
+        task->request.target_id = 0;
         task->num_slices = 1;
         task->status_word = PENDING;
         task->first_error = PENDING;
@@ -2700,6 +2773,7 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     // queue pair.
     RdmaSlice* postSlice(int lane, uint64_t enqueue_ts) {
         auto* task = RdmaTaskStorage::Get().allocate();
+        task->request.target_id = 0;
         task->num_slices = 1;
         task->status_word = PENDING;
         task->first_error = PENDING;
