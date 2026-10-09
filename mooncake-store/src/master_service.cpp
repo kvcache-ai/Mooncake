@@ -2838,6 +2838,33 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     // OBJECT_NOT_FOUND mid-flight and drops bytes a remount
                     // could still revive (#4508). Leave replicas and metadata
                     // in place; the next sweep after lease expiry takes both.
+                    //
+                    // A promotion task anchored to the key is just as dead as
+                    // the record (its source replica is stale), so cancel it
+                    // now: keeping it would let a dead holder pin the
+                    // cluster-wide in-flight cap until the lease lapses.
+                    auto task_it =
+                        tenant_state.promotion_tasks.find(stale_keys[j].second);
+                    if (task_it != tenant_state.promotion_tasks.end()) {
+                        if (auto* source = it->second.GetReplicaByID(
+                                task_it->second.source_id);
+                            source != nullptr) {
+                            source->dec_refcnt();
+                        }
+                        if (task_it->second.alloc_id != 0) {
+                            const ReplicaID alloc_id = task_it->second.alloc_id;
+                            EraseReplicasWithCacheTotalAccounting(
+                                it->second, [alloc_id](const Replica& replica) {
+                                    return replica.id() == alloc_id;
+                                });
+                        }
+                        const UUID holder_id = task_it->second.holder_id;
+                        ErasePromotionTaskIfPresent(tenant_state,
+                                                    stale_keys[j].second);
+                        local_ssd_manager_.RemovePromotion(holder_id,
+                                                           it->second.tenant_id,
+                                                           it->second.user_key);
+                    }
                     continue;
                 }
                 if (!cleanup_plan.removed_ids.empty()) {
@@ -13006,6 +13033,19 @@ void MasterService::NofHeartbeatThreadFunc() {
     }
 }
 
+// A memory replica whose allocator is already gone (segment unmounted)
+// fails Serializer<AllocatedBuffer>: the segment lookup needs the live
+// allocator. The sweep normally reaps such replicas within one pass, but the
+// #4508 lease gate can keep a doomed record (and its dead replicas) until the
+// read lease lapses. Persist must not fail the whole shard on them, and a
+// restart could never revive those bytes anyway, so dead replicas are left
+// out; the record itself still goes in, even when that leaves it with none.
+// It comes back invisible to reads (IsValid() is false) and the sweep reaps
+// it once the persisted lease lapses, same as if no restart had happened.
+static bool IsSnapshotSerializableReplica(const Replica& replica) {
+    return !replica.is_memory_replica() || !replica.has_invalid_mem_handle();
+}
+
 tl::expected<std::vector<uint8_t>, SerializationError>
 MasterService::MetadataSerializer::Serialize(
     const WeightMetadataSnapshot* frozen_weight_metadata) {
@@ -13302,26 +13342,31 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
     // MetadataShard format: map with "metadata" field
     packer.pack_map(1);
 
-    // Serialize metadata
-    packer.pack("metadata");
-    size_t metadata_count = 0;
-    for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-        metadata_count += tenant_state.metadata.size();
-    }
-    packer.pack_array(metadata_count);
-
     // Sort tenant/key pairs to ensure consistent serialization order.
     // NOTE: sort may be slow for large shards.
     struct SortedEntry {
         std::string tenant_id;
         std::string key;
         const ObjectMetadata* metadata;
+        std::vector<const Replica*> serializable_replicas;
     };
     std::vector<SortedEntry> sorted_entries;
-    sorted_entries.reserve(metadata_count);
+    size_t total_metadata = 0;
+    for (const auto& [tenant_id, tenant_state] : shard.tenants) {
+        total_metadata += tenant_state.metadata.size();
+    }
+    sorted_entries.reserve(total_metadata);
     for (const auto& [tenant_id, tenant_state] : shard.tenants) {
         for (const auto& [key, metadata] : tenant_state.metadata) {
-            sorted_entries.push_back({tenant_id.value(), key, &metadata});
+            auto& entry = sorted_entries.emplace_back(
+                SortedEntry{tenant_id.value(), key, &metadata, {}});
+            // Replicas whose backing store is already gone cannot be
+            // serialized; see IsSnapshotSerializableReplica.
+            for (const auto& replica : metadata.GetAllReplicas()) {
+                if (IsSnapshotSerializableReplica(replica)) {
+                    entry.serializable_replicas.push_back(&replica);
+                }
+            }
         }
     }
     std::sort(sorted_entries.begin(), sorted_entries.end(),
@@ -13332,13 +13377,18 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
                   return lhs.key < rhs.key;
               });
 
+    // Serialize metadata
+    packer.pack("metadata");
+    packer.pack_array(sorted_entries.size());
+
     for (const auto& entry : sorted_entries) {
         // Each metadata item format: [tenant_id, key, metadata_object].
         packer.pack_array(3);
         packer.pack(entry.tenant_id);
         packer.pack(entry.key);
 
-        auto result = SerializeMetadata(*entry.metadata, packer);
+        auto result = SerializeMetadata(*entry.metadata,
+                                        entry.serializable_replicas, packer);
         if (!result) {
             return tl::make_unexpected(SerializationError(
                 result.error().code,
@@ -13441,7 +13491,8 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::SerializeMetadata(
-    const ObjectMetadata& metadata, MsgpackPacker& packer) const {
+    const ObjectMetadata& metadata, const std::vector<const Replica*>& replicas,
+    MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
@@ -13450,7 +13501,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
                              // replicas_count, data_type, hard_pinned, group_id
-    array_size += metadata.CountReplicas();  // One element per replica
+    array_size += replicas.size();  // One element per replica
     if (metadata.object_checksum.has_value()) {
         ++array_size;
     }
@@ -13482,15 +13533,15 @@ MasterService::MetadataSerializer::SerializeMetadata(
     packer.pack(uint64_t(0));
 
     // Serialize replicas count
-    packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
+    packer.pack(static_cast<uint32_t>(replicas.size()));
 
     // Serialize data_type
     packer.pack(static_cast<uint8_t>(metadata.data_type));
 
     // Serialize replicas
-    for (const auto& replica : metadata.GetAllReplicas()) {
+    for (const auto* replica : replicas) {
         auto result = Serializer<Replica>::serialize(
-            replica, service_->segment_manager_.getView(), packer);
+            *replica, service_->segment_manager_.getView(), packer);
         if (!result) {
             return tl::unexpected(result.error());
         }
