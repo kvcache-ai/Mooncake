@@ -11997,6 +11997,10 @@ bool MasterService::BatchEvict(double evict_ratio_target,
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
     std::vector<long> local_pending_offloads(num_threads, 0);
+    // Oldest in-flight offload per thread, so a stalled queue (owners dead,
+    // tasks waiting for the orphan expiry) reads differently from a busy one.
+    std::vector<std::chrono::system_clock::time_point> local_oldest_offload(
+        num_threads, std::chrono::system_clock::time_point::max());
     std::vector<std::vector<std::chrono::system_clock::time_point>>
         local_soft_pin(num_threads);
 
@@ -12016,6 +12020,12 @@ bool MasterService::BatchEvict(double evict_ratio_target,
                     shard_metadata_count += tenant_state.metadata.size();
                     shard_pending_offloads +=
                         tenant_state.offloading_tasks.size();
+                    for (const auto& [task_key, task] :
+                         tenant_state.offloading_tasks) {
+                        if (task.start_time < local_oldest_offload[t]) {
+                            local_oldest_offload[t] = task.start_time;
+                        }
+                    }
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end(); ++it) {
                         if (it->second.IsHardPinned()) continue;
@@ -12055,6 +12065,17 @@ bool MasterService::BatchEvict(double evict_ratio_target,
     long object_count = 0;
     for (auto v : local_object_count) object_count += v;
     for (auto v : local_pending_offloads) pending_offloads += v;
+    auto oldest_offload = std::chrono::system_clock::time_point::max();
+    for (const auto& v : local_oldest_offload) {
+        if (v < oldest_offload) oldest_offload = v;
+    }
+    const long oldest_offload_age_s =
+        (pending_offloads > 0 &&
+         oldest_offload != std::chrono::system_clock::time_point::max())
+            ? std::chrono::duration_cast<std::chrono::seconds>(now -
+                                                               oldest_offload)
+                  .count()
+            : 0;
     if (offload_on_evict_) {
         offload_room = std::max<long>(0, offload_cap - pending_offloads);
     }
@@ -12481,7 +12502,8 @@ bool MasterService::BatchEvict(double evict_ratio_target,
         LOG(INFO) << "[EVICT] offload queue full: " << pending_offloads
                   << " object(s) in flight to the owners (cap " << offload_cap
                   << "), " << offload_queued_this_cycle
-                  << " queued this cycle; waiting for the owners";
+                  << " queued this cycle, oldest in flight "
+                  << oldest_offload_age_s << " s; waiting for the owners";
     }
     if (offload_on_evict_ && !freed_now && offload_deferred_count > 0) {
         LOG(WARNING) << "[EVICT] No memory freed this cycle; "
